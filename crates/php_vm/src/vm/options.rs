@@ -1,9 +1,8 @@
 use crate::bytecode::BytecodeLayoutProfile;
-use crate::include::{IncludeCache, IncludeLoader};
+use crate::include::{IncludeCache, IncludeCompiler, IncludeLoader};
 use crate::inline_cache::InlineCacheMode;
 use crate::quickening::{QuickeningMode, QuickeningSiteSnapshot};
 use crate::tiering::TieringOptions;
-use php_optimizer::OptimizationLevel;
 use php_runtime::RuntimeContext;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,8 +22,8 @@ pub struct VmOptions {
     pub include_loader: Option<IncludeLoader>,
     /// Optional shared include cache for path resolution and compiled includes.
     pub include_cache: Option<Arc<IncludeCache>>,
-    /// Optimization level used when includes are compiled at runtime.
-    pub include_optimization_level: OptimizationLevel,
+    /// Executor-owned compiler used by runtime include and eval operations.
+    pub include_compiler: Option<Arc<dyn IncludeCompiler>>,
     /// Deterministic runtime context used to seed CLI globals and superglobals.
     pub runtime_context: RuntimeContext,
     /// Capture deterministic instruction trace events.
@@ -121,7 +120,7 @@ impl Default for VmOptions {
             max_steps: 100_000,
             include_loader: None,
             include_cache: None,
-            include_optimization_level: OptimizationLevel::O0,
+            include_compiler: default_include_compiler(),
             runtime_context: RuntimeContext::default(),
             trace: false,
             trace_runtime: false,
@@ -152,6 +151,18 @@ impl Default for VmOptions {
             reuse_class_context_frames: true,
         }
     }
+}
+
+#[cfg(not(test))]
+fn default_include_compiler() -> Option<Arc<dyn IncludeCompiler>> {
+    None
+}
+
+#[cfg(test)]
+fn default_include_compiler() -> Option<Arc<dyn IncludeCompiler>> {
+    Some(Arc::new(
+        crate::test_include_compiler::TestIncludeCompiler::baseline(),
+    ))
 }
 
 fn trace_includes_from_env() -> bool {

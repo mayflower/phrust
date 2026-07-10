@@ -5,8 +5,7 @@ use crate::error::VmError;
 use php_diagnostics::{
     DiagnosticEnvelope, DiagnosticLayer, DiagnosticPhase, DiagnosticSeverity, DiagnosticSuggestion,
 };
-use php_optimizer::{OptimizationLevel, PassContext, PassPipeline};
-use php_runtime::{FilesystemCapabilities, phar};
+use php_runtime::{FilesystemCapabilities, object::normalize_class_name, phar};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
@@ -28,10 +27,81 @@ pub struct LoadedInclude {
 }
 
 #[derive(Clone, Debug)]
-struct ValidatedLoadedInclude {
+pub struct ValidatedIncludeSource {
     loaded: LoadedInclude,
     identity: OpenedSourceIdentity,
     bytes_hashed: u64,
+}
+
+impl ValidatedIncludeSource {
+    /// Returns the exact source bytes and canonical path validated by the loader.
+    #[must_use]
+    pub const fn loaded(&self) -> &LoadedInclude {
+        &self.loaded
+    }
+
+    /// Consumes the validation envelope and returns its source payload.
+    #[must_use]
+    pub fn into_loaded(self) -> LoadedInclude {
+        self.loaded
+    }
+
+    /// Consumes the source and preserves only cache-validation metadata.
+    #[must_use]
+    pub fn into_dependency(self) -> IncludeDependency {
+        IncludeDependency {
+            canonical_path: self.loaded.canonical_path,
+            source_identity: self.identity,
+        }
+    }
+}
+
+/// Opaque identity metadata for one source consumed during compilation.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct IncludeDependency {
+    canonical_path: PathBuf,
+    source_identity: OpenedSourceIdentity,
+}
+
+/// Opaque identity for one compiler configuration and dependency map.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct IncludeCompilerFingerprint(String);
+
+impl IncludeCompilerFingerprint {
+    /// Creates a stable fingerprint. Concrete compilers own its contents.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+/// Result of compiling one validated include source.
+#[derive(Debug)]
+pub struct CompiledInclude {
+    /// Executable unit consumed by the VM.
+    pub unit: CompiledUnit,
+    /// Exact dependency identities opened while building the unit.
+    pub dependencies: Vec<IncludeDependency>,
+}
+
+/// Compiler port consumed by the VM include and eval paths.
+///
+/// The concrete implementation belongs to the executor layer. This port lives
+/// beside its VM consumer so `php_executor -> php_vm` remains a one-way crate
+/// dependency and the VM never calls frontend, lowering, or optimizer APIs.
+pub trait IncludeCompiler: std::fmt::Debug + Send + Sync {
+    /// Identifies all compiler settings that affect generated code.
+    fn fingerprint(&self, loader: &IncludeLoader) -> IncludeCompilerFingerprint;
+
+    /// Compiles an include source already validated by the include loader.
+    fn compile_include(
+        &self,
+        source: ValidatedIncludeSource,
+        loader: &IncludeLoader,
+    ) -> Result<CompiledInclude, VmError>;
+
+    /// Compiles an in-memory eval source for immediate VM execution.
+    fn compile_eval(&self, source_path: &str, source: &str) -> Result<CompiledUnit, VmError>;
 }
 
 /// Identity of the exact bytes read from one stable opened file generation.
@@ -477,12 +547,9 @@ impl IncludeCache {
         &self,
         loader: &IncludeLoader,
         resolved: &ResolvedIncludePath,
-        optimization_level: OptimizationLevel,
+        compiler: &dyn IncludeCompiler,
     ) -> Result<Arc<CompiledUnit>, VmError> {
-        let compiler = IncludeCompilerIdentity::current(
-            optimization_level,
-            loader.compilation_dependency_fingerprint(),
-        );
+        let compiler_fingerprint = compiler.fingerprint(loader);
         loop {
             let validation_mode = if self.immutable_identity_only_allowed(resolved) {
                 IncludeValidationMode::IdentityOnly
@@ -499,9 +566,12 @@ impl IncludeCache {
                 PrimarySourceValidation::IdentityOnly(&resolved.fingerprint),
                 |loaded| PrimarySourceValidation::Content(&loaded.identity),
             );
-            if let Some(compiled) =
-                self.lookup_compiled_include(resolved, &compiler, validation, validation_mode)?
-            {
+            if let Some(compiled) = self.lookup_compiled_include(
+                resolved,
+                &compiler_fingerprint,
+                validation,
+                validation_mode,
+            )? {
                 return Ok(compiled);
             }
 
@@ -510,9 +580,12 @@ impl IncludeCache {
                 continue;
             };
 
-            if let Some(compiled) =
-                self.lookup_compiled_include(resolved, &compiler, validation, validation_mode)?
-            {
+            if let Some(compiled) = self.lookup_compiled_include(
+                resolved,
+                &compiler_fingerprint,
+                validation,
+                validation_mode,
+            )? {
                 return Ok(compiled);
             }
 
@@ -521,24 +594,20 @@ impl IncludeCache {
                 None => self.load_and_record_validation(loader, resolved)?,
             };
             self.stats.compile_misses.fetch_add(1, Ordering::Relaxed);
-            let source_identity = validated.identity;
+            let source_identity = validated.identity.clone();
             let canonical_path = validated.loaded.canonical_path.clone();
-            let mut resolver = LoaderCompilationResolver::new(loader);
-            let compiled = match compile_loaded_include_with_dependencies(
-                validated.loaded,
-                optimization_level,
-                &mut resolver,
-            ) {
-                Ok((compiled, local_dependencies)) => {
+            let compiled = match compiler.compile_include(validated, loader) {
+                Ok(compilation) => {
+                    let local_dependencies = compilation.dependencies;
                     self.record_compiled_dependency_reads(&local_dependencies);
                     let key = CompiledIncludeKey::new(
                         canonical_path,
                         source_identity,
                         local_dependencies,
-                        compiler.clone(),
+                        compiler_fingerprint.clone(),
                     );
                     let shard_index = self.compile_shard_index(&key);
-                    let compiled = Arc::new(compiled);
+                    let compiled = Arc::new(compilation.unit);
                     let compiled = {
                         let mut shard = self.compile_shards[shard_index]
                             .write()
@@ -560,7 +629,7 @@ impl IncludeCache {
     fn lookup_compiled_include(
         &self,
         resolved: &ResolvedIncludePath,
-        compiler: &IncludeCompilerIdentity,
+        compiler: &IncludeCompilerFingerprint,
         validation: PrimarySourceValidation<'_>,
         validation_mode: IncludeValidationMode,
     ) -> Result<Option<Arc<CompiledUnit>>, VmError> {
@@ -800,7 +869,7 @@ impl IncludeCache {
         &self,
         loader: &IncludeLoader,
         resolved: &ResolvedIncludePath,
-    ) -> Result<ValidatedLoadedInclude, VmError> {
+    ) -> Result<ValidatedIncludeSource, VmError> {
         let loaded = loader.load_validated_resolved(resolved).inspect_err(|_| {
             self.stats
                 .conservative_misses
@@ -810,7 +879,7 @@ impl IncludeCache {
         Ok(loaded)
     }
 
-    fn record_content_validation(&self, loaded: &ValidatedLoadedInclude) {
+    fn record_content_validation(&self, loaded: &ValidatedIncludeSource) {
         self.stats.source_reads.fetch_add(1, Ordering::Relaxed);
         self.stats
             .source_bytes_hashed
@@ -820,7 +889,7 @@ impl IncludeCache {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_compiled_dependency_reads(&self, dependencies: &[CompiledIncludeDependencyKey]) {
+    fn record_compiled_dependency_reads(&self, dependencies: &[IncludeDependency]) {
         let count = dependencies.len() as u64;
         let bytes = dependencies
             .iter()
@@ -1117,20 +1186,20 @@ impl IncludeLoader {
         declaration: impl AsRef<str>,
         path: impl Into<PathBuf>,
     ) -> Self {
-        self.compilation_dependencies.insert(
-            php_ir::module::normalize_class_name(declaration.as_ref()),
-            path.into(),
-        );
+        self.compilation_dependencies
+            .insert(normalize_class_name(declaration.as_ref()), path.into());
         self
     }
 
     fn compilation_dependency(&self, declaration: &str) -> Option<&Path> {
         self.compilation_dependencies
-            .get(&php_ir::module::normalize_class_name(declaration))
+            .get(&normalize_class_name(declaration))
             .map(PathBuf::as_path)
     }
 
-    fn compilation_dependency_fingerprint(&self) -> u64 {
+    /// Fingerprints explicit declaration-to-file mappings for compiler caches.
+    #[must_use]
+    pub fn compilation_dependency_fingerprint(&self) -> u64 {
         let mut serialized = Vec::new();
         for (declaration, path) in &self.compilation_dependencies {
             serialized.extend_from_slice(declaration.as_bytes());
@@ -1139,6 +1208,27 @@ impl IncludeLoader {
             serialized.push(b'\n');
         }
         fnv1a_64(&serialized)
+    }
+
+    /// Loads the explicitly mapped source for a normalized declaration name.
+    ///
+    /// Resolution and root enforcement remain loader responsibilities. The
+    /// compiler validates that the source actually provides the declaration.
+    pub fn load_compilation_dependency(
+        &self,
+        declaration: &str,
+    ) -> Result<Option<ValidatedIncludeSource>, VmError> {
+        let Some(path) = self.compilation_dependency(declaration) else {
+            return Ok(None);
+        };
+        let path = path.to_string_lossy();
+        let resolved = self.resolve_with_include_path(
+            None,
+            &path,
+            &[],
+            self.allowed_roots.first().map(PathBuf::as_path),
+        )?;
+        self.load_validated_resolved(&resolved).map(Some)
     }
 
     /// Converts an include/require error string to the shared diagnostic envelope.
@@ -1453,15 +1543,15 @@ impl IncludeLoader {
         })
     }
 
-    fn load_validated_resolved(
+    pub fn load_validated_resolved(
         &self,
         resolved: &ResolvedIncludePath,
-    ) -> Result<ValidatedLoadedInclude, VmError> {
+    ) -> Result<ValidatedIncludeSource, VmError> {
         let canonical_text = resolved.canonical_path.to_string_lossy();
         if phar::is_phar_uri(&canonical_text) {
             let loaded = self.load_phar_include(&canonical_text)?;
             let bytes_hashed = loaded.source.len() as u64;
-            return Ok(ValidatedLoadedInclude {
+            return Ok(ValidatedIncludeSource {
                 identity: OpenedSourceIdentity {
                     generation: resolved.fingerprint.clone(),
                     content_hash: fnv1a_64(loaded.source.as_bytes()),
@@ -1536,7 +1626,7 @@ impl IncludeLoader {
     }
 }
 
-fn read_validated_file(path: &Path) -> Result<ValidatedLoadedInclude, VmError> {
+fn read_validated_file(path: &Path) -> Result<ValidatedIncludeSource, VmError> {
     const MAX_STABLE_READ_ATTEMPTS: usize = 3;
 
     for _ in 0..MAX_STABLE_READ_ATTEMPTS {
@@ -1557,7 +1647,7 @@ fn read_validated_file(path: &Path) -> Result<ValidatedLoadedInclude, VmError> {
         }
         let bytes_hashed = bytes.len() as u64;
         let content_hash = fnv1a_64(&bytes);
-        return Ok(ValidatedLoadedInclude {
+        return Ok(ValidatedIncludeSource {
             loaded: LoadedInclude {
                 canonical_path: path.to_path_buf(),
                 source: php_source_from_bytes(bytes),
@@ -1871,28 +1961,14 @@ impl IncludeResolutionKey {
 struct CompiledIncludeKey {
     canonical_path: PathBuf,
     source_identity: OpenedSourceIdentity,
-    local_dependencies: Vec<CompiledIncludeDependencyKey>,
-    compiler: IncludeCompilerIdentity,
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct IncludeCompilerIdentity {
-    compiler_version: &'static str,
-    debug_assertions: bool,
-    optimization_level: &'static str,
-    compilation_dependency_fingerprint: u64,
+    local_dependencies: Vec<IncludeDependency>,
+    compiler: IncludeCompilerFingerprint,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CompiledIncludeLookupKey {
     canonical_path: PathBuf,
-    compiler: IncludeCompilerIdentity,
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct CompiledIncludeDependencyKey {
-    canonical_path: PathBuf,
-    source_identity: OpenedSourceIdentity,
+    compiler: IncludeCompilerFingerprint,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1911,8 +1987,8 @@ impl CompiledIncludeKey {
     fn new(
         canonical_path: PathBuf,
         source_identity: OpenedSourceIdentity,
-        local_dependencies: Vec<CompiledIncludeDependencyKey>,
-        compiler: IncludeCompilerIdentity,
+        local_dependencies: Vec<IncludeDependency>,
+        compiler: IncludeCompilerFingerprint,
     ) -> Self {
         Self {
             canonical_path,
@@ -1923,22 +1999,8 @@ impl CompiledIncludeKey {
     }
 }
 
-impl IncludeCompilerIdentity {
-    fn current(
-        optimization_level: OptimizationLevel,
-        compilation_dependency_fingerprint: u64,
-    ) -> Self {
-        Self {
-            compiler_version: env!("CARGO_PKG_VERSION"),
-            debug_assertions: cfg!(debug_assertions),
-            optimization_level: optimization_level.as_str(),
-            compilation_dependency_fingerprint,
-        }
-    }
-}
-
 impl CompiledIncludeLookupKey {
-    fn new(canonical_path: PathBuf, compiler: IncludeCompilerIdentity) -> Self {
+    fn new(canonical_path: PathBuf, compiler: IncludeCompilerFingerprint) -> Self {
         Self {
             canonical_path,
             compiler,
@@ -1953,256 +2015,6 @@ impl CompiledIncludeLookupKey {
     }
 }
 
-pub(crate) fn compile_loaded_include(
-    loaded: LoadedInclude,
-    optimization_level: OptimizationLevel,
-) -> Result<CompiledUnit, VmError> {
-    let mut resolver = NoCompilationResolver;
-    compile_loaded_include_with_dependencies(loaded, optimization_level, &mut resolver)
-        .map(|(compiled, _)| compiled)
-}
-
-pub(crate) fn compile_loaded_include_with_loader(
-    loaded: LoadedInclude,
-    optimization_level: OptimizationLevel,
-    loader: &IncludeLoader,
-) -> Result<CompiledUnit, VmError> {
-    let mut resolver = LoaderCompilationResolver::new(loader);
-    compile_loaded_include_with_dependencies(loaded, optimization_level, &mut resolver)
-        .map(|(compiled, _)| compiled)
-}
-
-trait CompilationResolver {
-    fn resolve_trait(
-        &mut self,
-        request: &php_ir::UnresolvedTraitRequest,
-    ) -> Result<Option<ValidatedLoadedInclude>, VmError>;
-}
-
-struct NoCompilationResolver;
-
-impl CompilationResolver for NoCompilationResolver {
-    fn resolve_trait(
-        &mut self,
-        _request: &php_ir::UnresolvedTraitRequest,
-    ) -> Result<Option<ValidatedLoadedInclude>, VmError> {
-        Ok(None)
-    }
-}
-
-struct LoaderCompilationResolver<'a> {
-    loader: &'a IncludeLoader,
-}
-
-impl<'a> LoaderCompilationResolver<'a> {
-    const fn new(loader: &'a IncludeLoader) -> Self {
-        Self { loader }
-    }
-}
-
-impl CompilationResolver for LoaderCompilationResolver<'_> {
-    fn resolve_trait(
-        &mut self,
-        request: &php_ir::UnresolvedTraitRequest,
-    ) -> Result<Option<ValidatedLoadedInclude>, VmError> {
-        let Some(path) = self.loader.compilation_dependency(&request.normalized_name) else {
-            return Ok(None);
-        };
-        let path = path.to_string_lossy();
-        let resolved = self.loader.resolve_with_include_path(
-            None,
-            &path,
-            &[],
-            self.loader.allowed_roots().first().map(PathBuf::as_path),
-        )?;
-        let loaded = self.loader.load_validated_resolved(&resolved)?;
-        let probe = php_ir::CompilationSession::new(
-            loaded.loaded.canonical_path.to_string_lossy().into_owned(),
-            loaded.loaded.source.clone(),
-        );
-        if !probe
-            .declared_trait_names(probe.entry())
-            .iter()
-            .any(|name| name == &request.normalized_name)
-        {
-            return Err(include_error(
-                "E_PHP_VM_INCLUDE_DEPENDENCY_MISMATCH",
-                format!(
-                    "mapped file {} does not declare trait `{}`",
-                    loaded.loaded.canonical_path.display(),
-                    request.normalized_name
-                ),
-            )
-            .with_context("declaration", &request.normalized_name)
-            .with_context("canonical_path", loaded.loaded.canonical_path.display()));
-        }
-        Ok(Some(loaded))
-    }
-}
-
-fn compile_loaded_include_with_dependencies(
-    loaded: LoadedInclude,
-    optimization_level: OptimizationLevel,
-    resolver: &mut dyn CompilationResolver,
-) -> Result<(CompiledUnit, Vec<CompiledIncludeDependencyKey>), VmError> {
-    let entry_path = loaded.canonical_path.clone();
-    let mut session = php_ir::CompilationSession::new(
-        loaded.canonical_path.to_string_lossy().into_owned(),
-        loaded.source,
-    );
-    let mut local_dependencies = Vec::new();
-    let mut providers = HashMap::<String, php_ir::CompilationFileId>::new();
-    for name in session.declared_trait_names(session.entry()) {
-        providers.insert(name, session.entry());
-    }
-    let mut next_file = 0;
-    while next_file < session.files().len() {
-        let file_id = session.files()[next_file].id();
-        if session.files()[next_file].frontend().has_errors() {
-            return Err(include_error(
-                "E_PHP_VM_INCLUDE_COMPILE_ERROR",
-                format!(
-                    "{} failed frontend analysis",
-                    session.files()[next_file].path()
-                ),
-            )
-            .with_context("path", session.files()[next_file].path())
-            .with_context("stage", "frontend"));
-        }
-        let requests = session.unresolved_trait_requests(file_id);
-        for request in requests {
-            if let Some(provider) = providers.get(&request.normalized_name).copied() {
-                let provider_source = &session.files()[provider.index()];
-                session.add_dependency(
-                    file_id,
-                    &request.normalized_name,
-                    provider_source.path().to_owned(),
-                    provider_source.source().to_owned(),
-                );
-                continue;
-            }
-            let Some(validated) = resolver.resolve_trait(&request)? else {
-                continue;
-            };
-            let path = validated.loaded.canonical_path.clone();
-            let dependency = session.add_dependency(
-                file_id,
-                &request.normalized_name,
-                path.to_string_lossy().into_owned(),
-                validated.loaded.source,
-            );
-            for declared in session.declared_trait_names(dependency) {
-                if let Some(previous) = providers.insert(declared.clone(), dependency)
-                    && previous != dependency
-                {
-                    return Err(include_error(
-                        "E_PHP_VM_INCLUDE_DUPLICATE_DECLARATION",
-                        format!("duplicate trait declaration `{declared}`"),
-                    )
-                    .with_context("declaration", declared));
-                }
-            }
-            local_dependencies.push(CompiledIncludeDependencyKey {
-                canonical_path: path,
-                source_identity: validated.identity,
-            });
-        }
-        next_file += 1;
-    }
-
-    if let Some(cycle) = session.dependency_cycle() {
-        let paths = cycle
-            .edges
-            .iter()
-            .map(|edge| session.files()[edge.requester.index()].path())
-            .chain(
-                cycle
-                    .edges
-                    .last()
-                    .map(|edge| session.files()[edge.dependency.index()].path()),
-            )
-            .collect::<Vec<_>>();
-        let declarations = cycle
-            .edges
-            .iter()
-            .map(|edge| edge.declaration.as_str())
-            .collect::<Vec<_>>();
-        return Err(include_error(
-            "E_PHP_VM_INCLUDE_DEPENDENCY_CYCLE",
-            format!("declaration dependency cycle: {}", paths.join(" -> ")),
-        )
-        .with_context("paths", paths.join(":"))
-        .with_context("declarations", declarations.join(":")));
-    }
-
-    let mut lowering =
-        php_ir::lower_compilation_session(&session, php_ir::LoweringOptions::default());
-
-    if !lowering.diagnostics.is_empty() || lowering.verification.is_err() {
-        let detail = ir_lowering_failure_detail(&lowering);
-        return Err(include_error(
-            "E_PHP_VM_INCLUDE_COMPILE_ERROR",
-            format!(
-                "{} failed IR lowering: {detail}",
-                session.files()[session.entry().index()].path()
-            ),
-        )
-        .with_context("path", session.files()[session.entry().index()].path())
-        .with_context("stage", "ir_lowering")
-        .with_context("detail", detail)
-        .with_context(
-            "local_trait_files",
-            session
-                .files()
-                .iter()
-                .filter(|file| file.id() != session.entry())
-                .map(|file| file.path().to_owned())
-                .collect::<Vec<_>>()
-                .join(":"),
-        ));
-    }
-    if optimization_level.runs_pipeline() {
-        PassPipeline::performance()
-            .run(&mut lowering.unit, &PassContext::new(optimization_level))
-            .map_err(|error| {
-                include_error(
-                    "E_PHP_VM_INCLUDE_COMPILE_ERROR",
-                    format!("{} optimizer failed: {error}", entry_path.display()),
-                )
-                .with_context("path", entry_path.display())
-                .with_context("stage", "optimizer")
-            })?;
-    }
-    Ok((CompiledUnit::new(lowering.unit), local_dependencies))
-}
-
-fn ir_lowering_failure_detail(lowering: &php_ir::LoweringResult) -> String {
-    if let Some(diagnostic) = lowering.diagnostics.first() {
-        return format!("{}: {}", diagnostic.id, diagnostic.message);
-    }
-    if let Err(error) = &lowering.verification {
-        return format!("IR verification failed: {error:?}");
-    }
-    "unknown IR lowering failure".to_string()
-}
-
-#[cfg(test)]
-fn missing_local_trait_names(lowering: &php_ir::LoweringResult) -> Vec<String> {
-    let mut traits = Vec::new();
-    for diagnostic in &lowering.diagnostics {
-        let Some(missing_trait) = diagnostic.missing_trait() else {
-            continue;
-        };
-        if !traits
-            .iter()
-            .any(|existing| existing == &missing_trait.normalized_name)
-        {
-            traits.push(missing_trait.normalized_name.clone());
-        }
-    }
-    traits
-}
-
 fn default_include_cache_shards() -> usize {
     std::thread::available_parallelism().map_or(16, |count| count.get().clamp(1, 64))
 }
@@ -2210,6 +2022,9 @@ fn default_include_cache_shards() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_include_compiler::{
+        TestIncludeCompiler, TestOptimizationLevel as OptimizationLevel,
+    };
     use php_ir::instruction::{BinaryOp, InstructionKind};
     use std::fs::{FileTimes, OpenOptions};
     use std::sync::Barrier;
@@ -2612,14 +2427,22 @@ mod tests {
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("first resolve");
         let first = cache
-            .get_or_compile_include(&loader, &first_resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &first_resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("first compile");
         fixture.write("lib.php", "<?php echo 'two'; echo '!';\n");
         let second_resolved = cache
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("second resolve");
         let second = cache
-            .get_or_compile_include(&loader, &second_resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &second_resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("second compile");
 
         assert!(!Arc::ptr_eq(&first, &second));
@@ -2642,7 +2465,11 @@ mod tests {
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("resolve include");
         let first = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("first compile");
 
         replace_preserving_metadata(
@@ -2653,7 +2480,11 @@ mod tests {
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("resolve replacement");
         let second = cache
-            .get_or_compile_include(&loader, &resolved_after_replace, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved_after_replace,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("compile replacement");
 
         assert!(!Arc::ptr_eq(&first, &second));
@@ -2675,7 +2506,11 @@ mod tests {
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("resolve include");
         let first = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("first compile");
 
         rewrite_preserving_metadata(
@@ -2683,7 +2518,11 @@ mod tests {
             "<?php class CachedMutable { public $other = null; }\n",
         );
         let second = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("compile rewritten source");
 
         assert!(!Arc::ptr_eq(&first, &second));
@@ -2706,14 +2545,22 @@ mod tests {
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("first resolve");
         let first = cache
-            .get_or_compile_include(&loader, &first_resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &first_resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("first compile");
         fixture.write("lib.php", "<?php echo 'changed and longer';\n");
         let trusted_resolved = cache
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("trusted resolve");
         let trusted = cache
-            .get_or_compile_include(&loader, &trusted_resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &trusted_resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("trusted compile lookup");
         assert!(Arc::ptr_eq(&first, &trusted));
         assert!(cache.cache_stats().immutable_release_hits >= 2);
@@ -2723,7 +2570,11 @@ mod tests {
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("fresh resolve after clear");
         let fresh = cache
-            .get_or_compile_include(&loader, &fresh_resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &fresh_resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("fresh compile after clear");
         assert!(!Arc::ptr_eq(&first, &fresh));
     }
@@ -2739,10 +2590,18 @@ mod tests {
             .expect("resolve include");
 
         let baseline = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("baseline include compile");
         let optimized = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O2)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O2),
+            )
             .expect("optimized include compile");
         let stats = cache.cache_stats();
 
@@ -2753,54 +2612,23 @@ mod tests {
     }
 
     #[test]
-    fn compiler_identity_includes_version_profile_and_optimization() {
-        let baseline = IncludeCompilerIdentity::current(OptimizationLevel::O0, 0);
-        let optimized = IncludeCompilerIdentity::current(OptimizationLevel::O2, 0);
-        let different_version = IncludeCompilerIdentity {
-            compiler_version: "different",
-            ..baseline.clone()
-        };
-        let different_profile = IncludeCompilerIdentity {
-            debug_assertions: !baseline.debug_assertions,
-            ..baseline.clone()
-        };
-        let different_dependencies = IncludeCompilerIdentity {
-            compilation_dependency_fingerprint: 1,
-            ..baseline.clone()
-        };
+    fn compiler_fingerprint_is_opaque_and_includes_dependencies() {
+        let fixture = IncludeCacheFixture::new("compiler-fingerprint");
+        let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
+        let mapped_loader = loader
+            .clone()
+            .with_compilation_dependency("Demo\\Shared", "shared.php");
+        let baseline = TestIncludeCompiler::new(OptimizationLevel::O0).fingerprint(&loader);
+        let optimized = TestIncludeCompiler::new(OptimizationLevel::O2).fingerprint(&loader);
+        let different_dependencies =
+            TestIncludeCompiler::new(OptimizationLevel::O0).fingerprint(&mapped_loader);
 
         assert_ne!(baseline, optimized);
-        assert_ne!(baseline, different_version);
-        assert_ne!(baseline, different_profile);
         assert_ne!(baseline, different_dependencies);
-    }
-
-    #[test]
-    fn missing_trait_resolution_uses_typed_payload_not_rendered_message() {
-        let source = concat!(
-            "<?php namespace Demo; ",
-            "use Vendor\\Package\\Odd_used_by_Trait as LocalAlias; ",
-            "class Owner { use LocalAlias; }"
+        assert_ne!(
+            baseline,
+            IncludeCompilerFingerprint::new("different compiler")
         );
-        let frontend = php_semantics::analyze_source(source);
-        let mut lowering = php_ir::lower_frontend_result(
-            &frontend,
-            php_ir::LoweringOptions {
-                source_path: "typed-trait.php".to_string(),
-                source_text: Some(source.to_string()),
-                ..php_ir::LoweringOptions::default()
-            },
-        );
-
-        let expected = vec!["vendor\\package\\odd_used_by_trait".to_string()];
-        assert_eq!(missing_local_trait_names(&lowering), expected);
-        lowering
-            .diagnostics
-            .iter_mut()
-            .find(|diagnostic| diagnostic.missing_trait().is_some())
-            .expect("missing-trait diagnostic")
-            .message = "rendering can change without changing compiler control flow".to_string();
-        assert_eq!(missing_local_trait_names(&lowering), expected);
     }
 
     #[test]
@@ -2814,11 +2642,19 @@ mod tests {
             .expect("resolve include");
 
         let first = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("first compile");
         let source_reads_after_first = cache.cache_stats().source_reads;
         let second = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("second lookup");
         let stats = cache.cache_stats();
 
@@ -2847,10 +2683,18 @@ mod tests {
             .expect("resolve include");
 
         let first = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("first compile");
         let second = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("second lookup");
         let stats = cache.cache_stats();
 
@@ -2885,7 +2729,11 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     cache
-                        .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+                        .get_or_compile_include(
+                            &loader,
+                            &resolved,
+                            &TestIncludeCompiler::new(OptimizationLevel::O0),
+                        )
                         .expect("concurrent compile")
                 })
             })
@@ -2935,7 +2783,11 @@ mod tests {
             .expect("resolve include");
 
         let compiled = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("compile provider registry");
         let class = compiled
             .unit()
@@ -2991,7 +2843,11 @@ mod tests {
             .expect("resolve include");
 
         let error = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect_err("a mismatched declaration mapping must fail closed");
 
         assert_eq!(error.code(), "E_PHP_VM_INCLUDE_DEPENDENCY_MISMATCH");
@@ -3028,10 +2884,18 @@ mod tests {
             .expect("resolve include");
 
         let first = cache
-            .get_or_compile_include(&first_loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &first_loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("compile first mapping");
         let second = cache
-            .get_or_compile_include(&second_loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &second_loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("compile second mapping");
 
         assert!(!Arc::ptr_eq(&first, &second));
@@ -3065,7 +2929,11 @@ mod tests {
             .expect("resolve include");
 
         let compiled = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("compile nested traits");
         let class = compiled
             .unit()
@@ -3112,7 +2980,11 @@ mod tests {
             .expect("resolve include");
 
         let error = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect_err("an unmapped sibling trait must not be discovered by scanning");
         assert_eq!(error.code(), "E_PHP_VM_INCLUDE_COMPILE_ERROR");
         assert!(error.render_message().contains("E_PHP_IR_TRAIT_NOT_FOUND"));
@@ -3143,7 +3015,11 @@ mod tests {
             .expect("resolve include");
 
         let error = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect_err("duplicate trait must fail");
         assert_eq!(error.code(), "E_PHP_VM_INCLUDE_DUPLICATE_DECLARATION");
         assert!(error.render_message().contains("shared\\duplicatetrait"));
@@ -3169,10 +3045,18 @@ mod tests {
             .expect("resolve include");
 
         let first = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect_err("dependency cycle must fail");
         let second = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect_err("dependency cycle must remain deterministic");
         assert_eq!(first.code(), "E_PHP_VM_INCLUDE_DEPENDENCY_CYCLE");
         assert_eq!(first, second);
@@ -3207,7 +3091,11 @@ mod tests {
             )
             .expect("resolve include");
         let first = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("first compile");
 
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -3216,7 +3104,11 @@ mod tests {
             "<?php\nnamespace Demo\\Providers\\Http\\Traits;\ntrait WithHttpTransporterTrait { private $second = null; }\n",
         );
         let second = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("second compile");
 
         assert!(!Arc::ptr_eq(&first, &second));
@@ -3272,7 +3164,11 @@ mod tests {
             )
             .expect("resolve include");
         let first = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("first compile");
 
         replace_preserving_metadata(
@@ -3280,7 +3176,11 @@ mod tests {
             "<?php\nnamespace Demo\\Providers\\Http\\Traits;\ntrait WithHttpTransporterTrait { private $other = null; }\n",
         );
         let second = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("compile replacement dependency");
 
         assert!(!Arc::ptr_eq(&first, &second));
@@ -3318,7 +3218,11 @@ mod tests {
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("resolve first target");
         let first = cache
-            .get_or_compile_include(&loader, &first_resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &first_resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("compile first target");
 
         fs::remove_file(&link).expect("remove first symlink");
@@ -3327,7 +3231,11 @@ mod tests {
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("resolve replacement target");
         let second = cache
-            .get_or_compile_include(&loader, &second_resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &second_resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect("compile replacement target");
 
         assert!(!Arc::ptr_eq(&first, &second));
@@ -3631,7 +3539,11 @@ mod tests {
         poison_rwlock(&cache.compile_shards[0]);
 
         let error = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect_err("poisoned compile lock should return an error");
 
         assert_eq!(error.code(), "E_PHP_VM_INCLUDE_CACHE_POISONED");
@@ -3653,7 +3565,11 @@ mod tests {
         poison_mutex(&cache.compile_locks[0].in_progress);
 
         let error = cache
-            .get_or_compile_include(&loader, &resolved, OptimizationLevel::O0)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &TestIncludeCompiler::new(OptimizationLevel::O0),
+            )
             .expect_err("poisoned compile coordination lock should return an error");
 
         assert_eq!(error.code(), "E_PHP_VM_INCLUDE_CACHE_POISONED");

@@ -52,6 +52,8 @@ pub mod quickening;
 pub mod region_profile;
 #[doc(hidden)]
 pub mod std_builtins;
+#[cfg(test)]
+mod test_include_compiler;
 #[doc(hidden)]
 pub mod tiering;
 #[doc(hidden)]
@@ -72,10 +74,12 @@ pub mod api {
     };
     pub use crate::error::{VmError, VmErrorSeverity};
     pub use crate::include::{
-        ComposerFingerprintTransition, DeploymentRootFingerprint, DeploymentRootMode, IncludeCache,
-        IncludeCacheStats, IncludeDirectoryVersion, IncludeLoader, IncludePathFileFingerprint,
-        LoadedInclude, ResolvedIncludePath, composer_autoload_map_fingerprint,
-        include_directory_version, negative_include_cache_enabled,
+        CompiledInclude, ComposerFingerprintTransition, DeploymentRootFingerprint,
+        DeploymentRootMode, IncludeCache, IncludeCacheStats, IncludeCompiler,
+        IncludeCompilerFingerprint, IncludeDependency, IncludeDirectoryVersion, IncludeLoader,
+        IncludePathFileFingerprint, LoadedInclude, ResolvedIncludePath, ValidatedIncludeSource,
+        composer_autoload_map_fingerprint, include_directory_version,
+        negative_include_cache_enabled,
     };
     pub use crate::inline_cache::{FunctionCallSiteSnapshot, InlineCacheMode};
     pub use crate::persistent_feedback::PersistentFeedbackEpochs;
@@ -215,8 +219,9 @@ pub use fallback::{
 pub use frame::{CallStack, Frame, RegisterFile};
 #[doc(hidden)]
 pub use include::{
-    IncludeCache, IncludeCacheStats, IncludeLoader, IncludePathFileFingerprint, LoadedInclude,
-    ResolvedIncludePath,
+    CompiledInclude, IncludeCache, IncludeCacheStats, IncludeCompiler, IncludeCompilerFingerprint,
+    IncludeDependency, IncludeLoader, IncludePathFileFingerprint, LoadedInclude,
+    ResolvedIncludePath, ValidatedIncludeSource,
 };
 #[doc(hidden)]
 pub use inline_cache::{

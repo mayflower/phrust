@@ -1,6 +1,7 @@
 use crate::diagnostics::{
     execution_output_from_vm, frontend_diagnostic_envelopes, render_frontend_diagnostics,
 };
+use crate::include_compiler::ExecutorIncludeCompiler;
 use crate::input::{
     PhpCompileInput, PhpExecutionError, PhpExecutionInput, PhpExecutionOutput, PhpExecutionStatus,
     PhpExecutorOptions, PhpRequestExecutionInput,
@@ -137,6 +138,9 @@ impl PhpExecutor {
         runtime_context = runtime_context.with_filesystem_capabilities(capabilities);
         let vm = Vm::with_options(VmOptions {
             include_loader,
+            include_compiler: Some(std::sync::Arc::new(ExecutorIncludeCompiler::new(
+                self.options.include_optimization_level,
+            ))),
             runtime_context,
             collect_counters: input.collect_counters,
             collect_profile_spans: input.collect_profile_spans,
@@ -264,8 +268,8 @@ mod tests {
             expected.optimization_level
         );
         assert_eq!(
-            executor.options.vm_options.include_optimization_level,
-            expected.vm_options.include_optimization_level
+            executor.options.include_optimization_level,
+            expected.include_optimization_level
         );
         assert_eq!(
             executor.options.vm_options.execution_format,

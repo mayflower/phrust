@@ -14,6 +14,7 @@ mod cache;
 mod diagnostics;
 mod engine_compat;
 mod executor;
+mod include_compiler;
 mod input;
 mod pipeline;
 mod profile;
@@ -25,6 +26,7 @@ pub use cache::{
 pub use diagnostics::{render_diagnostic_envelope, usage_diagnostic, write_diagnostic_envelope};
 pub use engine_compat::{CliIniOptions, EngineInput, execute_php, lint_php, read_script};
 pub use executor::{CompiledPhpScript, PhpExecutor};
+pub use include_compiler::ExecutorIncludeCompiler;
 pub use input::{
     PhpCompileInput, PhpExecutionError, PhpExecutionInput, PhpExecutionOutput, PhpExecutionStatus,
     PhpExecutorOptions, PhpRequestExecutionInput,

@@ -333,7 +333,8 @@ mod tests {
     };
     use php_diagnostics::DiagnosticOutputFormat;
     use php_executor::{
-        EngineProfileName, IncludeLoader, OptimizationLevel, PhpExecutionOutput, PhpExecutionStatus,
+        EngineProfileName, ExecutorIncludeCompiler, IncludeLoader, OptimizationLevel,
+        PhpExecutionOutput, PhpExecutionStatus,
     };
     use php_runtime::api::{
         RuntimeContext, RuntimeHttpRequestContext, RuntimeHttpResponseState, SessionState,
@@ -537,10 +538,7 @@ mod tests {
         assert!(!options.vm_options.internal_function_dispatch_cache);
         assert_eq!(options.vm_options.jit, JitMode::Off);
         assert!(!options.vm_options.tiering.enabled);
-        assert_eq!(
-            options.vm_options.include_optimization_level,
-            OptimizationLevel::O0
-        );
+        assert_eq!(options.include_optimization_level, OptimizationLevel::O0);
         assert_eq!(
             options.vm_options.dense_jump_threading,
             DenseJumpThreadingMode::Off
@@ -562,7 +560,7 @@ mod tests {
 
         assert_eq!(engine.compile_optimization_level, OptimizationLevel::O2);
         assert_eq!(
-            options.vm_options.include_optimization_level,
+            options.include_optimization_level,
             engine.compile_optimization_level
         );
     }
@@ -757,7 +755,11 @@ mod tests {
         state
             .engine
             .include_cache
-            .get_or_compile_include(&loader, &resolved, state.engine.compile_optimization_level)
+            .get_or_compile_include(
+                &loader,
+                &resolved,
+                &ExecutorIncludeCompiler::new(state.engine.compile_optimization_level),
+            )
             .expect("preloaded include cache hit");
         let include_stats_after_hit = state.engine.include_cache.cache_stats();
         assert_eq!(include_stats_after_hit.compile_hits, 1);

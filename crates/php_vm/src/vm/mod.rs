@@ -51,9 +51,7 @@ use crate::counters::{MethodCallProfileObservation, PropertyFetchProfileObservat
 use crate::deopt::GuardKind;
 use crate::error::VmError;
 use crate::frame::{CallStack, Frame, FrameActivationContext, FrameTraceArgument, TraceArguments};
-use crate::include::{
-    IncludeCacheStats, LoadedInclude, compile_loaded_include, compile_loaded_include_with_loader,
-};
+use crate::include::{IncludeCacheStats, LoadedInclude};
 use crate::inline_cache::{
     AutoloadClassLookupCacheKey, AutoloadClassLookupCacheTarget, AutoloadClassLookupEpochs,
     AutoloadClassLookupKind, CallReferenceMask, ClassConstantStaticPropertyCacheKind,
@@ -44145,25 +44143,39 @@ impl Vm {
                     );
                 }
                 let before_compile = cache.cache_stats();
-                let included = match cache.get_or_compile_include(
-                    loader,
-                    &resolved,
-                    self.options.include_optimization_level,
-                ) {
-                    Ok(included) => included,
-                    Err(message) => {
-                        self.record_include_cache_stats_delta(before_compile, cache.cache_stats());
-                        return include_failure(
-                            output,
-                            compiled,
-                            instruction_span,
-                            kind,
-                            message,
-                            state,
-                            stack_trace(compiled, stack),
-                        );
-                    }
+                let Some(include_compiler) = self.options.include_compiler.as_deref() else {
+                    return include_failure(
+                        output,
+                        compiled,
+                        instruction_span,
+                        kind,
+                        include_vm_error(
+                            "E_PHP_VM_INCLUDE_COMPILER_UNAVAILABLE",
+                            "include compiler is not configured",
+                        ),
+                        state,
+                        stack_trace(compiled, stack),
+                    );
                 };
+                let included =
+                    match cache.get_or_compile_include(loader, &resolved, include_compiler) {
+                        Ok(included) => included,
+                        Err(message) => {
+                            self.record_include_cache_stats_delta(
+                                before_compile,
+                                cache.cache_stats(),
+                            );
+                            return include_failure(
+                                output,
+                                compiled,
+                                instruction_span,
+                                kind,
+                                message,
+                                state,
+                                stack_trace(compiled, stack),
+                            );
+                        }
+                    };
                 self.record_include_cache_stats_delta(before_compile, cache.cache_stats());
                 let after_compile = cache.cache_stats();
                 self.record_include_trace_event(format!(
@@ -44378,15 +44390,34 @@ impl Vm {
         let compiled_from_shared_cache = compiled_include.is_some();
         let included = match compiled_include {
             Some(included) => included,
-            None => match if let Some(loader) = &self.options.include_loader {
-                compile_loaded_include_with_loader(
-                    loaded,
-                    self.options.include_optimization_level,
-                    loader,
-                )
-            } else {
-                compile_loaded_include(loaded, self.options.include_optimization_level)
-            } {
+            None => match self
+                .options
+                .include_compiler
+                .as_deref()
+                .ok_or_else(|| {
+                    include_vm_error(
+                        "E_PHP_VM_INCLUDE_COMPILER_UNAVAILABLE",
+                        "include compiler is not configured",
+                    )
+                })
+                .and_then(|compiler| {
+                    let loader = self.options.include_loader.as_ref().ok_or_else(|| {
+                        include_vm_error(
+                            "E_PHP_VM_INCLUDE_DISABLED",
+                            "include loader is not configured",
+                        )
+                    })?;
+                    let resolved = loader.resolve_with_include_path(
+                        None,
+                        &loaded.canonical_path.to_string_lossy(),
+                        &[],
+                        loader.allowed_roots().first().map(PathBuf::as_path),
+                    )?;
+                    let validated = loader.load_validated_resolved(&resolved)?;
+                    compiler
+                        .compile_include(validated, loader)
+                        .map(|compilation| compilation.unit)
+                }) {
                 Ok(included) => {
                     self.record_counter_include_compile_miss();
                     included
@@ -47802,30 +47833,19 @@ impl Vm {
         state.bump_lookup_epoch();
         let source_path = format!("eval://{}", state.eval_counter);
         let source = format!("<?php {code}");
-        let frontend = php_semantics::analyze_source(&source);
-        if frontend.has_errors() {
+        let Some(include_compiler) = self.options.include_compiler.as_deref() else {
             return eval_failure(
                 output,
-                format!("E_PHP_VM_EVAL_PARSE_ERROR: {source_path} failed frontend analysis"),
+                "E_PHP_VM_EVAL_COMPILER_UNAVAILABLE: eval compiler is not configured",
                 stack_trace(compiled, stack),
             );
-        }
-        let lowering = php_ir::lower_frontend_result(
-            &frontend,
-            php_ir::LoweringOptions {
-                source_path: source_path.clone(),
-                source_text: Some(source.clone()),
-                ..php_ir::LoweringOptions::default()
-            },
-        );
-        if !lowering.diagnostics.is_empty() || lowering.verification.is_err() {
-            return eval_failure(
-                output,
-                format!("E_PHP_VM_EVAL_COMPILE_ERROR: {source_path} failed IR lowering"),
-                stack_trace(compiled, stack),
-            );
-        }
-        let evaluated = CompiledUnit::new(lowering.unit);
+        };
+        let evaluated = match include_compiler.compile_eval(&source_path, &source) {
+            Ok(evaluated) => evaluated,
+            Err(error) => {
+                return eval_failure(output, error.render_message(), stack_trace(compiled, stack));
+            }
+        };
         let has_named_function_declarations = evaluated
             .unit()
             .function_table

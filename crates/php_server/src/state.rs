@@ -10,8 +10,9 @@ use crate::{
 use crate::{multipart::MultipartConfig, routing::RouteConfig, session_store::SessionStore};
 use php_diagnostics::DiagnosticOutputFormat;
 use php_executor::{
-    CompiledScriptCache, CompiledScriptCacheLookup, EngineProfileName, IncludeCache, IncludeLoader,
-    OptimizationLevel, PhpExecutionError, PhpExecutor, PhpExecutorOptions, PhpScriptCacheInput,
+    CompiledScriptCache, CompiledScriptCacheLookup, EngineProfileName, ExecutorIncludeCompiler,
+    IncludeCache, IncludeLoader, OptimizationLevel, PhpExecutionError, PhpExecutor,
+    PhpExecutorOptions, PhpScriptCacheInput,
 };
 use php_vm::api::{
     DenseIncludeMode, DenseJumpThreadingMode, InlineCacheMode, JitMode, QuickeningMode,
@@ -149,7 +150,7 @@ impl ServerEngineState {
         if let Some(mode) = self.dense_includes {
             options.vm_options.dense_include_execution = mode;
         }
-        options.vm_options.include_optimization_level = self.compile_optimization_level;
+        options.include_optimization_level = self.compile_optimization_level;
         if self.perf_ablation.disable_dense_includes {
             options.vm_options.dense_include_execution = DenseIncludeMode::Off;
         }
@@ -167,7 +168,7 @@ impl ServerEngineState {
             options.vm_options.tiering.enabled = false;
         }
         if self.perf_ablation.disable_include_o2 {
-            options.vm_options.include_optimization_level = OptimizationLevel::O0;
+            options.include_optimization_level = OptimizationLevel::O0;
         }
         if self.perf_ablation.disable_dense_jump_threading {
             options.vm_options.dense_jump_threading = DenseJumpThreadingMode::Off;
@@ -353,7 +354,11 @@ fn preload_include_cache_entry(
     state
         .engine
         .include_cache
-        .get_or_compile_include(&loader, &resolved, state.engine.compile_optimization_level)
+        .get_or_compile_include(
+            &loader,
+            &resolved,
+            &ExecutorIncludeCompiler::new(state.engine.compile_optimization_level),
+        )
         .map_err(|error| PhpExecutionError::Engine(format!("{error:?}")))?;
     Ok(())
 }

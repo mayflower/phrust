@@ -409,22 +409,28 @@ impl Vm {
             }
         };
 
-        let compile_result = if let Some(cache) = &self.options.include_cache {
-            cache
-                .get_or_compile_include(loader, &resolved, self.options.include_optimization_level)
-                .map(|_| ())
-        } else {
-            loader
-                .load_resolved(resolved.canonical_path.clone())
-                .and_then(|loaded| {
-                    compile_loaded_include_with_loader(
-                        loaded,
-                        self.options.include_optimization_level,
-                        loader,
-                    )
-                    .map(|_| ())
-                })
-        };
+        let compile_result = self
+            .options
+            .include_compiler
+            .as_deref()
+            .ok_or_else(|| {
+                include_vm_error(
+                    "E_PHP_VM_INCLUDE_COMPILER_UNAVAILABLE",
+                    "include compiler is not configured",
+                )
+            })
+            .and_then(|compiler| {
+                if let Some(cache) = &self.options.include_cache {
+                    cache
+                        .get_or_compile_include(loader, &resolved, compiler)
+                        .map(|_| ())
+                } else {
+                    loader
+                        .load_validated_resolved(&resolved)
+                        .and_then(|source| compiler.compile_include(source, loader))
+                        .map(|_| ())
+                }
+            });
         if let Err(message) = compile_result {
             if let Err(result) = self.emit_opcache_compile_warning(
                 compiled,

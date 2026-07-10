@@ -813,7 +813,6 @@ where
         trace_runtime: run_options.trace_runtime,
         trace_includes: run_options.trace_includes,
         collect_counters,
-        include_optimization_level: run_options.include_opt_level,
         execution_format: run_options.execution_format,
         superinstructions: run_options.superinstructions,
         last_use_moves: run_options.last_use_moves,
@@ -945,6 +944,7 @@ where
     let started = Instant::now();
     let executor = PhpExecutor::with_options(PhpExecutorOptions {
         optimization_level: run_options.opt_level,
+        include_optimization_level: run_options.include_opt_level,
         vm_options,
         collect_quickening_feedback: persistent_feedback.write_path.is_some(),
     });
