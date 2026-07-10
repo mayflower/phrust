@@ -4839,7 +4839,7 @@ impl<'a> BuiltinFilesystemContext<'a> {
 pub(in crate::builtins) struct BuiltinHttpContext<'a> {
     http_response: RuntimeHttpResponseState,
     http_response_state: Option<&'a mut RuntimeHttpResponseState>,
-    filter_inputs: Arc<BTreeMap<i64, crate::PhpArray>>,
+    filter_inputs: Rc<BTreeMap<i64, crate::PhpArray>>,
     upload_registry: Option<&'a mut UploadRegistry>,
 }
 
@@ -5310,11 +5310,11 @@ impl<'a> BuiltinContext<'a> {
 
     /// Sets a deterministic request-input array for `filter_input`.
     pub fn set_filter_input_array(&mut self, source: i64, array: crate::PhpArray) {
-        Arc::make_mut(&mut self.http.filter_inputs).insert(source, array);
+        Rc::make_mut(&mut self.http.filter_inputs).insert(source, array);
     }
 
     /// Shares request-input arrays materialized once during request setup.
-    pub fn set_filter_input_arrays_shared(&mut self, arrays: Arc<BTreeMap<i64, crate::PhpArray>>) {
+    pub fn set_filter_input_arrays_shared(&mut self, arrays: Rc<BTreeMap<i64, crate::PhpArray>>) {
         self.http.filter_inputs = arrays;
     }
 

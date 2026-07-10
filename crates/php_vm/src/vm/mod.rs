@@ -1249,7 +1249,7 @@ struct ExecutionState {
     ini: IniRegistry,
     default_timezone: String,
     env: Arc<Vec<(String, String)>>,
-    filter_input_arrays: Arc<BTreeMap<i64, PhpArray>>,
+    filter_input_arrays: Rc<BTreeMap<i64, PhpArray>>,
     resources: ResourceTable,
     stdin: Option<php_runtime::ResourceRef>,
     stdout: Option<php_runtime::ResourceRef>,
@@ -2880,10 +2880,10 @@ impl Vm {
         let prepared_class_validation = unit.prepared_class_validation(|| {
             validate_class_table(&unit).map_err(|error| {
                 let (message, diagnostic) = error.into_parts();
-                PreparedClassValidationError {
+                Box::new(PreparedClassValidationError {
                     message,
                     diagnostic,
-                }
+                })
             })
         });
         if self.options.revalidate_prepared_unit {
@@ -61558,7 +61558,7 @@ fn execute_builtin_entry(
     }
     context.set_default_timezone_state(&mut state.default_timezone);
     context.set_diagnostic_display(diagnostic_display);
-    context.set_filter_input_arrays_shared(Arc::clone(&state.filter_input_arrays));
+    context.set_filter_input_arrays_shared(Rc::clone(&state.filter_input_arrays));
     context.set_pcre_cache_state(&mut state.pcre_cache);
     context.set_preg_last_error_state(&mut state.preg_last_error);
     context.set_json_last_error(state.json_last_error);
@@ -61662,14 +61662,14 @@ fn execute_builtin_entry(
     }
 }
 
-fn request_filter_input_arrays(runtime_context: &RuntimeContext) -> Arc<BTreeMap<i64, PhpArray>> {
+fn request_filter_input_arrays(runtime_context: &RuntimeContext) -> Rc<BTreeMap<i64, PhpArray>> {
     let mut arrays = BTreeMap::new();
     for source in [0, 1, 2, 4, 5] {
         if let Some(array) = runtime_context.filter_input_array(source) {
             arrays.insert(source, array);
         }
     }
-    Arc::new(arrays)
+    Rc::new(arrays)
 }
 
 fn sorted_request_env(env: &Arc<Vec<(String, String)>>) -> Arc<Vec<(String, String)>> {

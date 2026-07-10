@@ -1036,6 +1036,7 @@ impl ArrayStorage {
         let old_pointer = storage.internal_pointer;
         let mut pointer = None;
         let mut entries = Vec::with_capacity(storage.live_len);
+        #[allow(clippy::mutable_key_type)] // ArrayKey hash/eq are byte-pure.
         let mut index = StableKeyMap::with_capacity_and_hasher(storage.live_len, StableKeyState);
         for (old_index, entry) in std::mem::take(&mut storage.entries).into_iter().enumerate() {
             let Some(entry) = entry else {

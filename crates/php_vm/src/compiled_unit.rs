@@ -58,7 +58,7 @@ struct CompiledUnitInner {
 #[derive(Debug)]
 struct PreparedUnit {
     ir_verification_errors: OnceLock<usize>,
-    class_validation: OnceLock<Result<(), PreparedClassValidationError>>,
+    class_validation: OnceLock<Result<(), Box<PreparedClassValidationError>>>,
     ir_verification_runs: AtomicU64,
     class_validation_runs: AtomicU64,
     function_facts: Box<[OnceLock<PreparedFunctionFacts>]>,
@@ -262,8 +262,8 @@ impl CompiledUnit {
     /// Returns cached static class validation, computing it at most once.
     pub(crate) fn prepared_class_validation(
         &self,
-        prepare: impl FnOnce() -> Result<(), PreparedClassValidationError>,
-    ) -> Result<(), PreparedClassValidationError> {
+        prepare: impl FnOnce() -> Result<(), Box<PreparedClassValidationError>>,
+    ) -> Result<(), Box<PreparedClassValidationError>> {
         self.inner
             .prepared
             .class_validation
