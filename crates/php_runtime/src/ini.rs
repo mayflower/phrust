@@ -1,5 +1,6 @@
 //! Deterministic standard-library INI/config registry.
 
+use std::sync::Arc;
 /// One supported INI entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IniEntrySnapshot {
@@ -26,23 +27,29 @@ struct IniEntry {
 
 /// Small, deterministic registry for Composer-typical INI checks.
 #[derive(Clone, Debug, Eq, PartialEq)]
+
 pub struct IniRegistry {
-    entries: Vec<IniEntry>,
+    /// Shared entry table: cloning a registry is a refcount bump, and the
+    /// first mutation after a clone copies the table (ini_set is rare while
+    /// registries are cloned into every builtin invocation context).
+    entries: Arc<Vec<IniEntry>>,
 }
 
 impl Default for IniRegistry {
     fn default() -> Self {
         Self {
-            entries: default_entries()
-                .into_iter()
-                .map(|(extension, name, value, access)| IniEntry {
-                    extension,
-                    name,
-                    global_value: value,
-                    local_value: value.to_owned(),
-                    access,
-                })
-                .collect(),
+            entries: Arc::new(
+                default_entries()
+                    .into_iter()
+                    .map(|(extension, name, value, access)| IniEntry {
+                        extension,
+                        name,
+                        global_value: value,
+                        local_value: value.to_owned(),
+                        access,
+                    })
+                    .collect(),
+            ),
         }
     }
 }
@@ -112,7 +119,7 @@ impl IniRegistry {
     }
 
     fn lookup_mut(&mut self, name: &str) -> Option<&mut IniEntry> {
-        self.entries
+        Arc::make_mut(&mut self.entries)
             .iter_mut()
             .find(|entry| entry.name.eq_ignore_ascii_case(name))
     }

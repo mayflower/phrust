@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 /// SysV message queue would-block errno used by the deterministic backend.
@@ -2960,7 +2961,7 @@ pub struct RuntimeSourceSpan {
 
 pub(in crate::builtins) struct BuiltinIoContext<'a> {
     output: &'a mut OutputBuffer,
-    php_input: Vec<u8>,
+    php_input: Arc<[u8]>,
     diagnostic_display: PhpDiagnosticDisplayOptions,
     diagnostics: Vec<RuntimeDiagnostic>,
 }
@@ -2969,7 +2970,7 @@ impl<'a> BuiltinIoContext<'a> {
     fn new(output: &'a mut OutputBuffer) -> Self {
         Self {
             output,
-            php_input: Vec::new(),
+            php_input: Arc::from(Vec::new()),
             diagnostic_display: PhpDiagnosticDisplayOptions::default(),
             diagnostics: Vec::new(),
         }
@@ -3146,7 +3147,7 @@ pub struct BuiltinContext<'a> {
     sessions: BuiltinSessionContext<'a>,
     ini: IniRegistry,
     default_timezone: String,
-    env: Vec<(String, String)>,
+    env: Arc<Vec<(String, String)>>,
     network_requests_enabled: bool,
 }
 
@@ -3166,7 +3167,7 @@ impl<'a> BuiltinContext<'a> {
             sessions: BuiltinSessionContext::default(),
             ini: IniRegistry::default(),
             default_timezone: datetime::DEFAULT_TIMEZONE.to_string(),
-            env: Vec::new(),
+            env: Arc::new(Vec::new()),
             network_requests_enabled: false,
         }
     }
@@ -3187,15 +3188,24 @@ impl<'a> BuiltinContext<'a> {
             sessions: BuiltinSessionContext::default(),
             ini: IniRegistry::default(),
             default_timezone: datetime::DEFAULT_TIMEZONE.to_string(),
-            env: Vec::new(),
+            env: Arc::new(Vec::new()),
             network_requests_enabled: false,
         }
     }
 
-    /// Sets deterministic request-local environment entries.
-    pub fn set_env_entries(&mut self, mut env: Vec<(String, String)>) {
-        env.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-        self.env = env;
+    /// Sets deterministic request-local environment entries. Pre-sorted
+    /// tables (the common case: the VM keeps its request env sorted) are
+    /// shared without copying.
+    pub fn set_env_entries(&mut self, env: Arc<Vec<(String, String)>>) {
+        if env.windows(2).all(|pair| {
+            pair[0].0 <= pair[1].0 && !(pair[0].0 == pair[1].0 && pair[0].1 > pair[1].1)
+        }) {
+            self.env = env;
+            return;
+        }
+        let mut owned = env.as_ref().clone();
+        owned.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        self.env = Arc::new(owned);
     }
 
     /// Reads a deterministic request-local environment value.
@@ -3381,8 +3391,8 @@ impl<'a> BuiltinContext<'a> {
     }
 
     /// Sets deterministic bytes exposed through `php://input`.
-    pub fn set_php_input(&mut self, input: Vec<u8>) {
-        self.io.php_input = input;
+    pub fn set_php_input(&mut self, input: impl Into<Arc<[u8]>>) {
+        self.io.php_input = input.into();
     }
 
     /// Deterministic bytes exposed through `php://input`.

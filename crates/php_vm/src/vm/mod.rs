@@ -1190,6 +1190,9 @@ struct ExecutionState {
     included_once: Vec<PathBuf>,
     include_stack: Vec<PathBuf>,
     cwd: PathBuf,
+    /// Request-invariant: network builtins explicitly enabled via env.
+    /// Precomputed once so builtin dispatch does not rescan the env table.
+    network_requests_enabled: bool,
     static_locals: HashMap<(u32, String), ReferenceCell>,
     static_properties: HashMap<(String, String), Value>,
     enum_cases: HashMap<(String, String), ObjectRef>,
@@ -2809,6 +2812,12 @@ impl Vm {
             ini: self.options.runtime_context.ini_registry(),
             default_timezone: php_runtime::datetime::DEFAULT_TIMEZONE.to_owned(),
             env: self.options.runtime_context.env.clone(),
+            network_requests_enabled: self
+                .options
+                .runtime_context
+                .env
+                .iter()
+                .any(|(name, value)| name == "PHRUST_NET_TESTS" && value == "1"),
             spl_autoload_extensions: ".inc,.php".to_owned(),
             upload_registry: self.options.runtime_context.upload_registry(),
             session: self.options.runtime_context.session.clone(),
@@ -61235,15 +61244,10 @@ fn execute_builtin_entry(
     );
     context.set_include_path(include_path);
     context.set_ini_registry(state.ini.clone());
-    context.set_network_requests_enabled(
-        runtime_context
-            .env
-            .iter()
-            .any(|(name, value)| name == "PHRUST_NET_TESTS" && value == "1"),
-    );
-    context.set_env_entries(state.env.as_ref().clone());
+    context.set_network_requests_enabled(state.network_requests_enabled);
+    context.set_env_entries(Arc::clone(&state.env));
     if let php_runtime::RuntimeRequestMode::Http(request) = &runtime_context.request_mode {
-        context.set_php_input(request.raw_body.to_vec());
+        context.set_php_input(Arc::clone(&request.raw_body));
     }
     context.set_default_timezone(if state.default_timezone.is_empty() {
         php_runtime::datetime::DEFAULT_TIMEZONE.to_owned()
@@ -61251,7 +61255,15 @@ fn execute_builtin_entry(
         state.default_timezone.clone()
     });
     context.set_diagnostic_display(diagnostic_display);
-    set_filter_input_arrays(&mut context, runtime_context);
+    // Only the filter_* builtins read the input-source arrays; building all
+    // five superglobal snapshots for every builtin call dominated the
+    // per-dispatch setup cost.
+    if matches!(
+        entry.name(),
+        "filter_input" | "filter_input_array" | "filter_has_var"
+    ) {
+        set_filter_input_arrays(&mut context, runtime_context);
+    }
     context.set_pcre_cache_state(&mut state.pcre_cache);
     context.set_preg_last_error_state(&mut state.preg_last_error);
     context.set_json_last_error(state.json_last_error);

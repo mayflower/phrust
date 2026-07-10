@@ -6521,6 +6521,10 @@ mod tests {
 
     #[test]
     fn class_table_compile_errors_render_php_fatal_line() {
+        // `run` reads error-format environment variables; hold the lock so
+        // concurrently running env-mutating tests cannot flip the rendering
+        // path mid-test.
+        let _guard = ENV_LOCK.lock().expect("env lock");
         let path = std::env::temp_dir().join(format!(
             "phrust-vm-cli-visibility-{}.php",
             std::process::id()
