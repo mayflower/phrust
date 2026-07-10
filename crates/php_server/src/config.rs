@@ -23,7 +23,10 @@ const DEFAULT_MAX_EXECUTION_MS: u64 = 30_000;
 const DEFAULT_MAX_VM_STEPS: usize = 100_000;
 const DEFAULT_SCRIPT_CACHE_SHARDS: usize = 16;
 const DEFAULT_SCRIPT_CACHE_MAX_ENTRIES: usize = 4096;
-const DEFAULT_SCRIPT_CACHE_CHECK_INTERVAL_MS: u64 = 0;
+// Serve cached entry scripts without canonicalize/stat/retain for the same
+// opcache.revalidate_freq window the include cache defaults to; 0 restores
+// per-request metadata validation.
+const DEFAULT_SCRIPT_CACHE_CHECK_INTERVAL_MS: u64 = 2_000;
 const DEFAULT_SESSION_COOKIE_NAME: &str = "PHPSESSID";
 const DEFAULT_SESSION_COOKIE_PATH: &str = "/";
 const DEFAULT_MAX_IN_FLIGHT: usize = 200;
@@ -702,7 +705,7 @@ Options:\n\
   --script-cache-shards <n>    compiled script cache shard count (default: 16)\n\
   --script-cache-max-entries <n> maximum compiled script cache entries (default: 4096)\n\
   --script-cache-preload <file> preload newline-delimited script paths at startup\n\
-  --script-cache-check-interval-ms <n> skip stat checks for this many milliseconds (default: 0)\n\
+  --script-cache-check-interval-ms <n> skip stat checks for this many milliseconds (default: 2000; 0 validates every request)\n\
   --strict-preload             fail startup when preload entries cannot compile\n\
   --enable-cache-clear-endpoint enable loopback-only POST /__phrust/cache/clear\n\
   --help                       show this help\n"
@@ -1232,7 +1235,7 @@ mod tests {
         assert_eq!(config.script_cache_shards, 16);
         assert_eq!(config.script_cache_max_entries, 4096);
         assert_eq!(config.script_cache_preload, None);
-        assert_eq!(config.script_cache_check_interval_ms, 0);
+        assert_eq!(config.script_cache_check_interval_ms, 2_000);
         assert!(!config.strict_preload);
         assert!(!config.cache_clear_endpoint_enabled);
         assert!(config.front_controller.is_none());

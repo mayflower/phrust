@@ -242,7 +242,13 @@ pub(crate) async fn execute_php_request(
         "script cache lookup started",
         || BTreeMap::from([("script_path".to_string(), script_path.display().to_string())]),
     );
-    let script_cache_before = state.engine.script_cache.cache_stats();
+    // Cache-stat deltas only surface through the perf-trace/request-profile
+    // writers; snapshotting locks every script-cache shard, so skip it when
+    // no trace consumer is configured.
+    let collect_cache_trace_counters =
+        state.perf_trace.is_some() || state.request_profile.is_some();
+    let script_cache_before =
+        collect_cache_trace_counters.then(|| state.engine.script_cache.cache_stats());
     let script_cache_started = Instant::now();
     let lookup = match state.compile_script(&script_path) {
         Ok(lookup) => {
@@ -306,27 +312,29 @@ pub(crate) async fn execute_php_request(
         "script_cache_lookup",
         script_cache_started.elapsed(),
     );
-    let script_cache_after = state.engine.script_cache.cache_stats();
-    trace.counters.extend([
-        (
-            "entry_script_cache_hits",
-            script_cache_after
-                .hits
-                .saturating_sub(script_cache_before.hits),
-        ),
-        (
-            "entry_script_cache_misses",
-            script_cache_after
-                .misses
-                .saturating_sub(script_cache_before.misses),
-        ),
-        (
-            "entry_script_source_reads",
-            script_cache_after
-                .source_reads
-                .saturating_sub(script_cache_before.source_reads),
-        ),
-    ]);
+    if let Some(script_cache_before) = &script_cache_before {
+        let script_cache_after = state.engine.script_cache.cache_stats();
+        trace.counters.extend([
+            (
+                "entry_script_cache_hits",
+                script_cache_after
+                    .hits
+                    .saturating_sub(script_cache_before.hits),
+            ),
+            (
+                "entry_script_cache_misses",
+                script_cache_after
+                    .misses
+                    .saturating_sub(script_cache_before.misses),
+            ),
+            (
+                "entry_script_source_reads",
+                script_cache_after
+                    .source_reads
+                    .saturating_sub(script_cache_before.source_reads),
+            ),
+        ]);
+    }
     let script_cache_hit = Some(lookup.hit);
     let Some(cpu_permit) = acquire_cpu_execution_permit(&state).await else {
         let response = response::text(
@@ -520,7 +528,8 @@ pub(crate) async fn execute_php_request(
             )])
         },
     );
-    let include_cache_before = state.engine.include_cache.cache_stats();
+    let include_cache_before =
+        collect_cache_trace_counters.then(|| state.engine.include_cache.cache_stats());
     let profile_requested = request_profile_requested(&state, &parts.headers);
     let result = execute_compiled_php_in_blocking_region(
         Arc::clone(&state),
@@ -537,69 +546,71 @@ pub(crate) async fn execute_php_request(
         "php_vm_execution",
         execution_started.elapsed(),
     );
-    let include_cache_after = state.engine.include_cache.cache_stats();
-    trace.counters.extend([
-        (
-            "include_resolution_hits",
-            include_cache_after
-                .resolution_hits
-                .saturating_sub(include_cache_before.resolution_hits),
-        ),
-        (
-            "include_resolution_misses",
-            include_cache_after
-                .resolution_misses
-                .saturating_sub(include_cache_before.resolution_misses),
-        ),
-        (
-            "include_compile_hits",
-            include_cache_after
-                .compile_hits
-                .saturating_sub(include_cache_before.compile_hits),
-        ),
-        (
-            "include_compile_misses",
-            include_cache_after
-                .compile_misses
-                .saturating_sub(include_cache_before.compile_misses),
-        ),
-        (
-            "include_source_reads",
-            include_cache_after
-                .source_reads
-                .saturating_sub(include_cache_before.source_reads),
-        ),
-        (
-            "include_source_bytes_hashed",
-            include_cache_after
-                .source_bytes_hashed
-                .saturating_sub(include_cache_before.source_bytes_hashed),
-        ),
-        (
-            "include_content_validations",
-            include_cache_after
-                .content_validations
-                .saturating_sub(include_cache_before.content_validations),
-        ),
-        (
-            "include_identity_only_hits",
-            include_cache_after
-                .identity_only_hits
-                .saturating_sub(include_cache_before.identity_only_hits),
-        ),
-        (
-            "include_content_mismatches",
-            include_cache_after
-                .content_mismatches
-                .saturating_sub(include_cache_before.content_mismatches),
-        ),
-        (
-            "include_conservative_misses",
-            include_cache_after
-                .conservative_misses
-                .saturating_sub(include_cache_before.conservative_misses),
-        ),
-    ]);
+    if let Some(include_cache_before) = &include_cache_before {
+        let include_cache_after = state.engine.include_cache.cache_stats();
+        trace.counters.extend([
+            (
+                "include_resolution_hits",
+                include_cache_after
+                    .resolution_hits
+                    .saturating_sub(include_cache_before.resolution_hits),
+            ),
+            (
+                "include_resolution_misses",
+                include_cache_after
+                    .resolution_misses
+                    .saturating_sub(include_cache_before.resolution_misses),
+            ),
+            (
+                "include_compile_hits",
+                include_cache_after
+                    .compile_hits
+                    .saturating_sub(include_cache_before.compile_hits),
+            ),
+            (
+                "include_compile_misses",
+                include_cache_after
+                    .compile_misses
+                    .saturating_sub(include_cache_before.compile_misses),
+            ),
+            (
+                "include_source_reads",
+                include_cache_after
+                    .source_reads
+                    .saturating_sub(include_cache_before.source_reads),
+            ),
+            (
+                "include_source_bytes_hashed",
+                include_cache_after
+                    .source_bytes_hashed
+                    .saturating_sub(include_cache_before.source_bytes_hashed),
+            ),
+            (
+                "include_content_validations",
+                include_cache_after
+                    .content_validations
+                    .saturating_sub(include_cache_before.content_validations),
+            ),
+            (
+                "include_identity_only_hits",
+                include_cache_after
+                    .identity_only_hits
+                    .saturating_sub(include_cache_before.identity_only_hits),
+            ),
+            (
+                "include_content_mismatches",
+                include_cache_after
+                    .content_mismatches
+                    .saturating_sub(include_cache_before.content_mismatches),
+            ),
+            (
+                "include_conservative_misses",
+                include_cache_after
+                    .conservative_misses
+                    .saturating_sub(include_cache_before.conservative_misses),
+            ),
+        ]);
+    }
     match result {
         Ok(mut output) => {
             append_vm_counters_to_trace(&mut trace, output.counters.as_ref());
