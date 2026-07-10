@@ -15,7 +15,7 @@ use std::sync::{
     Arc, Condvar, Mutex, RwLock,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Result of loading one include target.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,6 +175,62 @@ pub fn include_directory_version(dir: &Path) -> Option<IncludeDirectoryVersion> 
 }
 
 /// Result of resolving one include target without loading its contents.
+/// Cache slot for a resolved include: the resolution plus the monotonic
+/// stamp of its last successful filesystem validation.
+/// Cache slot for a compiled include: the unit plus the monotonic stamp of
+/// its last successful source/dependency validation.
+#[derive(Debug)]
+struct CachedCompiledInclude {
+    compiled: Arc<CompiledUnit>,
+    validated_at_nanos: AtomicU64,
+}
+
+impl CachedCompiledInclude {
+    fn new(compiled: Arc<CompiledUnit>, epoch: Instant) -> Self {
+        Self {
+            compiled,
+            validated_at_nanos: AtomicU64::new(epoch.elapsed().as_nanos() as u64),
+        }
+    }
+
+    fn freshly_validated(&self, epoch: Instant, interval: Duration) -> bool {
+        let now = epoch.elapsed().as_nanos() as u64;
+        let stamped = self.validated_at_nanos.load(Ordering::Relaxed);
+        now.saturating_sub(stamped) < interval.as_nanos() as u64
+    }
+
+    fn touch(&self, epoch: Instant) {
+        self.validated_at_nanos
+            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+struct CachedIncludeResolution {
+    resolved: ResolvedIncludePath,
+    validated_at_nanos: AtomicU64,
+}
+
+impl CachedIncludeResolution {
+    fn new(resolved: ResolvedIncludePath, epoch: Instant) -> Self {
+        Self {
+            resolved,
+            validated_at_nanos: AtomicU64::new(epoch.elapsed().as_nanos() as u64),
+        }
+    }
+
+    fn freshly_validated(&self, epoch: Instant, interval: Duration) -> bool {
+        let now = epoch.elapsed().as_nanos() as u64;
+        let stamped = self.validated_at_nanos.load(Ordering::Relaxed);
+        now.saturating_sub(stamped) < interval.as_nanos() as u64
+    }
+
+    fn touch(&self, epoch: Instant) {
+        self.validated_at_nanos
+            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedIncludePath {
     /// Canonical path used for once tracking and source maps.
@@ -268,9 +324,17 @@ impl NegativeIncludeEntry {
 /// Shared process-local include cache for resolution and compiled include units.
 #[derive(Debug)]
 pub struct IncludeCache {
-    resolution_shards: Vec<RwLock<HashMap<IncludeResolutionKey, ResolvedIncludePath>>>,
+    resolution_shards: Vec<RwLock<HashMap<IncludeResolutionKey, Arc<CachedIncludeResolution>>>>,
+    /// How long a validated resolution may be served without re-checking the
+    /// filesystem (fingerprint stat, candidate re-canonicalization, directory
+    /// version). Zero keeps the historical per-hit validation. Mirrors
+    /// opcache.revalidate_freq: production servers accept a bounded staleness
+    /// window instead of three filesystem probes per include per request.
+    revalidation_interval: Duration,
+    /// Monotonic base for entry validation stamps.
+    revalidation_epoch: Instant,
     negative_shards: Vec<RwLock<HashMap<IncludeResolutionKey, NegativeIncludeEntry>>>,
-    compile_shards: Vec<RwLock<HashMap<CompiledIncludeKey, Arc<CompiledUnit>>>>,
+    compile_shards: Vec<RwLock<HashMap<CompiledIncludeKey, Arc<CachedCompiledInclude>>>>,
     compile_lookup_shards: Vec<RwLock<HashMap<CompiledIncludeLookupKey, CompiledIncludeKey>>>,
     compile_locks: Vec<IncludeCompileLockShard>,
     stats: IncludeCacheCounters,
@@ -297,11 +361,25 @@ impl IncludeCache {
     /// Creates a cache with at least one shard.
     #[must_use]
     pub fn new(shards: usize) -> Self {
+        Self::new_with_revalidation_interval(
+            shards,
+            include_revalidation_interval_from_env().unwrap_or(Duration::ZERO),
+        )
+    }
+
+    /// Creates a cache with an explicit revalidation window. Zero validates
+    /// every hit against the filesystem (fingerprint, candidate symlink
+    /// target, directory version); tests asserting invalidation semantics
+    /// use this to opt out of the deployment default.
+    #[must_use]
+    pub fn new_with_revalidation_interval(shards: usize, revalidation_interval: Duration) -> Self {
         let shard_count = shards.max(1);
         Self {
             resolution_shards: (0..shard_count)
                 .map(|_| RwLock::new(HashMap::new()))
                 .collect(),
+            revalidation_interval,
+            revalidation_epoch: Instant::now(),
             negative_shards: (0..shard_count)
                 .map(|_| RwLock::new(HashMap::new()))
                 .collect(),
@@ -397,12 +475,19 @@ impl IncludeCache {
     ) -> Result<ResolvedIncludePath, VmError> {
         let key = IncludeResolutionKey::new(loader, including_file, path, include_path, cwd);
         let shard_index = self.resolution_shard_index(&key);
-        if let Some(resolved) = {
+        if let Some(cached) = {
             let shard = self.resolution_shards[shard_index]
                 .read()
                 .map_err(|_| include_cache_lock_error("resolution", "lookup"))?;
             shard.get(&key).cloned()
         } {
+            if self.revalidation_interval > Duration::ZERO
+                && cached.freshly_validated(self.revalidation_epoch, self.revalidation_interval)
+            {
+                self.stats.resolution_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(cached.resolved.clone());
+            }
+            let resolved = &cached.resolved;
             let target_is_current = resolution_path_targets(
                 resolved.resolution_path.as_deref(),
                 &resolved.canonical_path,
@@ -412,13 +497,14 @@ impl IncludeCache {
                 self.stats
                     .immutable_release_hits
                     .fetch_add(1, Ordering::Relaxed);
-                return Ok(resolved);
+                return Ok(resolved.clone());
             }
             match include_path_file_fingerprint(&resolved.canonical_path) {
                 Ok(current) if target_is_current && current == resolved.fingerprint => {
                     self.stats.resolution_hits.fetch_add(1, Ordering::Relaxed);
-                    self.observe_directory_version(&resolved);
-                    return Ok(resolved);
+                    self.observe_directory_version(resolved);
+                    cached.touch(self.revalidation_epoch);
+                    return Ok(resolved.clone());
                 }
                 Ok(_) | Err(_) => {
                     let mut shard = self.resolution_shards[shard_index]
@@ -450,7 +536,12 @@ impl IncludeCache {
         let mut shard = self.resolution_shards[shard_index]
             .write()
             .map_err(|_| include_cache_lock_error("resolution", "insert"))?;
-        shard.entry(key).or_insert_with(|| resolved.clone());
+        shard.entry(key).or_insert_with(|| {
+            Arc::new(CachedIncludeResolution::new(
+                resolved.clone(),
+                self.revalidation_epoch,
+            ))
+        });
         Ok(resolved)
     }
 
@@ -612,7 +703,17 @@ impl IncludeCache {
                         let mut shard = self.compile_shards[shard_index]
                             .write()
                             .map_err(|_| include_cache_lock_error("compiled", "insert"))?;
-                        Arc::clone(shard.entry(key.clone()).or_insert(compiled))
+                        Arc::clone(
+                            &shard
+                                .entry(key.clone())
+                                .or_insert_with(|| {
+                                    Arc::new(CachedCompiledInclude::new(
+                                        compiled,
+                                        self.revalidation_epoch,
+                                    ))
+                                })
+                                .compiled,
+                        )
                     };
                     self.insert_compiled_lookup_index(&key)?;
                     Ok(compiled)
@@ -650,11 +751,17 @@ impl IncludeCache {
                 .map_err(|_| include_cache_lock_error("compiled", "lookup"))?;
             shard
                 .get_key_value(&full_key)
-                .map(|(key, compiled)| (key.clone(), Arc::clone(compiled)))
+                .map(|(key, slot)| (key.clone(), Arc::clone(slot)))
         };
-        let Some((key, compiled)) = hit else {
+        let Some((key, slot)) = hit else {
             return Ok(None);
         };
+        if self.revalidation_interval > Duration::ZERO
+            && slot.freshly_validated(self.revalidation_epoch, self.revalidation_interval)
+        {
+            self.stats.compile_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(Arc::clone(&slot.compiled)));
+        }
         if !self.primary_source_is_fresh(&key, validation) {
             self.invalidate_compiled_include(&key, false)?;
             return Ok(None);
@@ -667,7 +774,8 @@ impl IncludeCache {
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 self.stats.compile_hits.fetch_add(1, Ordering::Relaxed);
-                Ok(Some(compiled))
+                slot.touch(self.revalidation_epoch);
+                Ok(Some(Arc::clone(&slot.compiled)))
             }
             Ok(false) | Err(_) => {
                 self.invalidate_compiled_include(&key, true)?;
@@ -1725,6 +1833,23 @@ fn include_cache_lock_error(cache: &'static str, operation: &'static str) -> VmE
     .with_context("operation", operation)
 }
 
+/// Reads the include revalidation window override, when set: how long a
+/// cached resolution may be served without filesystem probes. The default is
+/// the embedder's choice: the CLI validates every hit (reference `php` runs
+/// without opcache, so a mid-script rewrite of an include must be observed),
+/// while the server defaults to the opcache deployment window
+/// (`opcache.validate_timestamps=1` with `opcache.revalidate_freq=2`).
+pub fn include_revalidation_interval_from_env() -> Option<Duration> {
+    std::env::var("PHRUST_INCLUDE_REVALIDATE_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+/// Server-parity default for serving cached includes without filesystem
+/// probes (opcache.revalidate_freq).
+pub const SERVER_INCLUDE_REVALIDATION_INTERVAL: Duration = Duration::from_secs(2);
+
 pub fn include_path_file_fingerprint(path: &Path) -> Result<IncludePathFileFingerprint, VmError> {
     let metadata = fs::metadata(path).map_err(|error| include_metadata_error(path, error))?;
     Ok(include_file_fingerprint(&metadata))
@@ -2122,7 +2247,7 @@ mod tests {
         let fixture = IncludeCacheFixture::new("resolution");
         fixture.write("lib.php", "<?php echo 'lib';\n");
         let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
 
         let first = cache
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
@@ -2147,7 +2272,7 @@ mod tests {
     fn negative_include_cache_replays_identical_diagnostics_and_invalidates_on_create() {
         let fixture = IncludeCacheFixture::new("negative-cache");
         let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
 
         let first = cache
             .resolve_with_include_path(&loader, None, "missing.php", &[], Some(&fixture.root))
@@ -2178,7 +2303,7 @@ mod tests {
     fn negative_include_cache_blocks_unversionable_candidates() {
         let fixture = IncludeCacheFixture::new("negative-blocked");
         let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
 
         // The candidate's parent directory does not exist, so a deeper chain
         // could appear without changing any observed version — not cacheable.
@@ -2228,7 +2353,7 @@ mod tests {
         fixture.write("locked/lib.php", "<?php\n");
         let locked = fixture.root.join("locked");
         let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
 
         // Remove search permission so canonicalize fails with EACCES, not
         // NotFound. Skip if running as root (permission bits are ignored).
@@ -2260,7 +2385,7 @@ mod tests {
     fn negative_include_cache_clears_and_bounds_capacity() {
         let fixture = IncludeCacheFixture::new("negative-capacity");
         let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
 
         let _ = cache
             .resolve_with_include_path(&loader, None, "gone.php", &[], Some(&fixture.root))
@@ -2353,7 +2478,7 @@ mod tests {
 
     #[test]
     fn composer_fingerprint_transitions_attribute_staleness() {
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         assert_eq!(
             cache.note_composer_fingerprint(Some("composer-map-v1:aa")),
             ComposerFingerprintTransition::Unchanged,
@@ -2378,7 +2503,7 @@ mod tests {
     #[test]
     fn deployment_root_fingerprint_counts_present_missing_and_stale() {
         let fixture = IncludeCacheFixture::new("deployment-root");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
 
         cache.set_deployment_root_fingerprint(DeploymentRootFingerprint::observe(
             &fixture.root.join("missing"),
@@ -2421,7 +2546,7 @@ mod tests {
         let fixture = IncludeCacheFixture::new("compiled-stale");
         fixture.write("lib.php", "<?php echo 'one';\n");
         let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
 
         let first_resolved = cache
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
@@ -2460,7 +2585,7 @@ mod tests {
             "<?php class CachedPrimary { public $first = null; }\n",
         );
         let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         let resolved = cache
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("resolve include");
@@ -2501,7 +2626,7 @@ mod tests {
             "<?php class CachedMutable { public $first = null; }\n",
         );
         let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         let resolved = cache
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("resolve include");
@@ -2584,7 +2709,7 @@ mod tests {
         let fixture = IncludeCacheFixture::new("compiled-optimization");
         fixture.write("lib.php", "<?php echo 1 + 2;\n");
         let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         let resolved = loader
             .resolve_with_include_path(None, "lib.php", &[], Some(&fixture.root))
             .expect("resolve include");
@@ -2636,7 +2761,7 @@ mod tests {
         let fixture = IncludeCacheFixture::new("compiled-hit-content-validation");
         fixture.write("lib.php", "<?php echo 'cached';\n");
         let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         let resolved = cache
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("resolve include");
@@ -2673,7 +2798,7 @@ mod tests {
         let fixture = IncludeCacheFixture::new("compiled-hit-immutable-identity");
         fixture.write("lib.php", "<?php echo 'cached';\n");
         let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         cache.set_deployment_root_fingerprint(DeploymentRootFingerprint::observe(
             &fixture.root,
             DeploymentRootMode::ImmutableDeclared,
@@ -2772,7 +2897,7 @@ mod tests {
                 "Demo\\Providers\\Http\\Traits\\WithHttpTransporterTrait",
                 "src/Providers/Http/Traits/WithHttpTransporterTrait.php",
             );
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         let resolved = loader
             .resolve_with_include_path(
                 None,
@@ -2923,7 +3048,7 @@ mod tests {
             .expect("loader")
             .with_compilation_dependency("Demo\\Traits\\OuterTrait", "src/Traits/OuterTrait.php")
             .with_compilation_dependency("Demo\\Traits\\InnerTrait", "src/Traits/InnerTrait.php");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         let resolved = loader
             .resolve_with_include_path(None, "src/Registry.php", &[], Some(&fixture.root))
             .expect("resolve include");
@@ -2974,7 +3099,7 @@ mod tests {
             "<?php namespace Missing; trait AbsentTrait {}",
         );
         let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         let resolved = loader
             .resolve_with_include_path(None, "src/Registry.php", &[], Some(&fixture.root))
             .expect("resolve include");
@@ -3009,7 +3134,7 @@ mod tests {
             .expect("loader")
             .with_compilation_dependency("Shared\\FirstTrait", "a/FirstTrait.php")
             .with_compilation_dependency("Shared\\SecondTrait", "b/SecondTrait.php");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         let resolved = loader
             .resolve_with_include_path(None, "src/Registry.php", &[], Some(&fixture.root))
             .expect("resolve include");
@@ -3039,7 +3164,7 @@ mod tests {
         let loader = IncludeLoader::for_root(&fixture.root)
             .expect("loader")
             .with_compilation_dependency("Demo\\B", "src/B.php");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         let resolved = loader
             .resolve_with_include_path(None, "src/A.php", &[], Some(&fixture.root))
             .expect("resolve include");
@@ -3081,7 +3206,7 @@ mod tests {
                 "Demo\\Providers\\Http\\Traits\\WithHttpTransporterTrait",
                 "src/Providers/Http/Traits/WithHttpTransporterTrait.php",
             );
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         let resolved = loader
             .resolve_with_include_path(
                 None,
@@ -3154,7 +3279,7 @@ mod tests {
                 "Demo\\Providers\\Http\\Traits\\WithHttpTransporterTrait",
                 "src/Providers/Http/Traits/WithHttpTransporterTrait.php",
             );
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         let resolved = loader
             .resolve_with_include_path(
                 None,
@@ -3213,7 +3338,7 @@ mod tests {
         let link = fixture.root.join("lib.php");
         symlink(fixture.root.join("first.php"), &link).expect("create first symlink");
         let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         let first_resolved = cache
             .resolve_with_include_path(&loader, None, "lib.php", &[], Some(&fixture.root))
             .expect("resolve first target");
@@ -3513,7 +3638,7 @@ mod tests {
         let fixture = IncludeCacheFixture::new("poison-resolution");
         fixture.write("lib.php", "<?php echo 'lib';\n");
         let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         poison_rwlock(&cache.resolution_shards[0]);
 
         let error = cache
@@ -3532,7 +3657,7 @@ mod tests {
         let fixture = IncludeCacheFixture::new("poison-compiled");
         fixture.write("lib.php", "<?php echo 'lib';\n");
         let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         let resolved = loader
             .resolve_with_include_path(None, "lib.php", &[], Some(&fixture.root))
             .expect("resolve include");
@@ -3558,7 +3683,7 @@ mod tests {
         let fixture = IncludeCacheFixture::new("poison-compile-lock");
         fixture.write("lib.php", "<?php echo 'lib';\n");
         let loader = IncludeLoader::for_root(&fixture.root).expect("loader");
-        let cache = IncludeCache::new(1);
+        let cache = IncludeCache::new_with_revalidation_interval(1, Duration::ZERO);
         let resolved = loader
             .resolve_with_include_path(None, "lib.php", &[], Some(&fixture.root))
             .expect("resolve include");

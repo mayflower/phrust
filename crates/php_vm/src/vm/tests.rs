@@ -189,7 +189,10 @@ var_dump(opcache_is_script_cached($invalid));
         source,
         VmOptions {
             include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
-            include_cache: Some(Arc::new(IncludeCache::new(1))),
+            include_cache: Some(Arc::new(IncludeCache::new_with_revalidation_interval(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             runtime_context: RuntimeContext::default().with_cwd(root.clone()),
             ..VmOptions::default()
         },
@@ -5210,7 +5213,10 @@ fn require_once_skips_file_loaded_by_plain_require() {
             echo class_exists('LoadedByRequire', false) ? 'ok' : 'bad';
         ";
     std::fs::write(root.join("index.php"), source).expect("entry source should be written");
-    let cache = Arc::new(IncludeCache::new(1));
+    let cache = Arc::new(IncludeCache::new_with_revalidation_interval(
+        1,
+        std::time::Duration::ZERO,
+    ));
     let result = execute_source_with_options_and_path(
         source,
         VmOptions {
@@ -5229,7 +5235,10 @@ fn require_once_skips_file_loaded_by_plain_require() {
 
 #[test]
 fn include_cache_preserves_include_once_request_tracking() {
-    let cache = Arc::new(IncludeCache::new(1));
+    let cache = Arc::new(IncludeCache::new_with_revalidation_interval(
+        1,
+        std::time::Duration::ZERO,
+    ));
     let result = execute_fixture_file_with_options(
         "fixtures/runtime/valid/includes/include-once.php",
         VmOptions {
@@ -5253,7 +5262,10 @@ fn include_cache_preserves_include_once_request_tracking() {
 
 #[test]
 fn include_trace_records_cache_and_once_decisions() {
-    let cache = Arc::new(IncludeCache::new(1));
+    let cache = Arc::new(IncludeCache::new_with_revalidation_interval(
+        1,
+        std::time::Duration::ZERO,
+    ));
     let result = execute_fixture_file_with_options(
         "fixtures/runtime/valid/includes/include-once.php",
         VmOptions {
@@ -5315,7 +5327,10 @@ fn include_trace_records_repeated_normal_include_compile_cache_hits() {
         "<?php $count++; echo $count, '|';\n",
     )
     .expect("common include should be written");
-    let cache = Arc::new(IncludeCache::new(1));
+    let cache = Arc::new(IncludeCache::new_with_revalidation_interval(
+        1,
+        std::time::Duration::ZERO,
+    ));
     let result = execute_source_with_options_and_path(
         "<?php $count = 0; include 'common.php'; include './common.php'; echo $count, \"\\n\";",
         VmOptions {
@@ -5523,7 +5538,10 @@ fn include_once_tracking_is_request_local_with_shared_compile_cache() {
     std::fs::write(root.join("once.php"), "<?php $count++;\n")
         .expect("once include should be written");
     let source = "<?php $count = 0; include_once 'once.php'; include_once './once.php'; echo $count, \"\\n\";";
-    let cache = Arc::new(IncludeCache::new(1));
+    let cache = Arc::new(IncludeCache::new_with_revalidation_interval(
+        1,
+        std::time::Duration::ZERO,
+    ));
     let options = || VmOptions {
         include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
         include_cache: Some(Arc::clone(&cache)),
@@ -5567,7 +5585,10 @@ fn include_cache_keeps_globals_and_declarations_request_local() {
             ",
     )
     .expect("request-state include should be written");
-    let cache = Arc::new(IncludeCache::new(1));
+    let cache = Arc::new(IncludeCache::new_with_revalidation_interval(
+        1,
+        std::time::Duration::ZERO,
+    ));
     let options = || VmOptions {
         include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
         include_cache: Some(Arc::clone(&cache)),
@@ -5608,7 +5629,10 @@ fn include_cache_invalidates_dynamic_declaration_strict_types_after_file_edit() 
             "<?php function prompt07_rewritten_takes_int(int $value): void { echo 'weak=', $value; } prompt07_rewritten_takes_int('42');\n",
         )
         .expect("weak include should be written");
-    let cache = Arc::new(IncludeCache::new(1));
+    let cache = Arc::new(IncludeCache::new_with_revalidation_interval(
+        1,
+        std::time::Duration::ZERO,
+    ));
     let options = || VmOptions {
         include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
         include_cache: Some(Arc::clone(&cache)),
@@ -5795,7 +5819,10 @@ fn include_trace_records_deep_finite_chain_without_recompilation() {
     std::fs::write(root.join("b.php"), "<?php include 'c.php'; echo 'b|';\n")
         .expect("b include should be written");
     std::fs::write(root.join("c.php"), "<?php echo 'c|';\n").expect("c include should be written");
-    let cache = Arc::new(IncludeCache::new(1));
+    let cache = Arc::new(IncludeCache::new_with_revalidation_interval(
+        1,
+        std::time::Duration::ZERO,
+    ));
     let result = execute_source_with_options_and_path(
         "<?php include 'a.php'; include 'a.php'; echo \"done\\n\";",
         VmOptions {
@@ -5842,7 +5869,10 @@ fn include_trace_detects_recursive_cycle_with_stack() {
         "<?php require 'a.php'; echo 'after';",
         VmOptions {
             include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
-            include_cache: Some(Arc::new(IncludeCache::new(1))),
+            include_cache: Some(Arc::new(IncludeCache::new_with_revalidation_interval(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             runtime_context: RuntimeContext::default().with_cwd(root.clone()),
             trace_includes: true,
             ..VmOptions::default()
@@ -5964,7 +5994,10 @@ fn negative_include_cache_preserves_missing_include_diagnostics() {
     ));
     std::fs::create_dir_all(&root).expect("create fixture root");
     let loader = IncludeLoader::for_root(root.clone()).expect("loader");
-    let cache = std::sync::Arc::new(IncludeCache::new(1));
+    let cache = std::sync::Arc::new(IncludeCache::new_with_revalidation_interval(
+        1,
+        std::time::Duration::ZERO,
+    ));
     let source =
         "<?php\necho 'a|';\ninclude 'nope.php';\necho 'b|';\ninclude 'nope.php';\necho 'c';";
     let result = execute_source_with_options(
@@ -21477,7 +21510,10 @@ fn dense_bytecode_auto_executes_include() {
             execution_format: ExecutionFormat::Auto,
             dense_include_execution: DenseIncludeMode::Auto,
             include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
-            include_cache: Some(Arc::new(IncludeCache::new(1))),
+            include_cache: Some(Arc::new(IncludeCache::new_with_revalidation_interval(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             runtime_context: RuntimeContext::default().with_cwd(root.clone()),
             collect_counters: true,
             collect_profile_spans: false,
@@ -21559,7 +21595,10 @@ version_probe();
             execution_format: ExecutionFormat::Auto,
             dense_include_execution: DenseIncludeMode::Auto,
             include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
-            include_cache: Some(Arc::new(IncludeCache::new(1))),
+            include_cache: Some(Arc::new(IncludeCache::new_with_revalidation_interval(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             runtime_context: RuntimeContext::default().with_cwd(root.clone()),
             collect_counters: true,
             collect_profile_spans: false,

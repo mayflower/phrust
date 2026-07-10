@@ -306,7 +306,9 @@ impl Vm {
                     }
                 }
                 fiber.set_state(FiberState::Running);
-                self.record_runtime_trace_event("fiber start transition=not-started->running");
+                self.record_runtime_trace_event(|| {
+                    "fiber start transition=not-started->running".to_owned()
+                });
                 let result = self.call_fiber_callable(
                     compiled,
                     fiber.clone(),
@@ -318,7 +320,9 @@ impl Vm {
                 );
                 if !result.status.is_success() {
                     fiber.set_state(FiberState::Errored);
-                    self.record_runtime_trace_event("fiber start transition=running->errored");
+                    self.record_runtime_trace_event(|| {
+                        "fiber start transition=running->errored".to_owned()
+                    });
                     return Err(result);
                 }
                 if let Some(suspension) = result.fiber_suspension {
@@ -326,14 +330,18 @@ impl Vm {
                         .fiber_continuations
                         .insert(fiber.id(), suspension.continuations);
                     fiber.set_state(FiberState::Suspended);
-                    self.record_runtime_trace_event(format!(
-                        "fiber start transition=running->suspended value={}",
-                        trace_value(&suspension.value)
-                    ));
+                    self.record_runtime_trace_event(|| {
+                        format!(
+                            "fiber start transition=running->suspended value={}",
+                            trace_value(&suspension.value)
+                        )
+                    });
                     return Ok(suspension.value);
                 }
                 fiber.terminate(result.return_value);
-                self.record_runtime_trace_event("fiber start transition=running->terminated");
+                self.record_runtime_trace_event(|| {
+                    "fiber start transition=running->terminated".to_owned()
+                });
                 Ok(Value::Null)
             }
             "isstarted" => {
@@ -386,10 +394,12 @@ impl Vm {
                     .map(|arg| arg.value.clone())
                     .unwrap_or(Value::Null);
                 fiber.set_state(FiberState::Running);
-                self.record_runtime_trace_event(format!(
-                    "fiber resume transition=suspended->running input={}",
-                    trace_value(&resume_value)
-                ));
+                self.record_runtime_trace_event(|| {
+                    format!(
+                        "fiber resume transition=suspended->running input={}",
+                        trace_value(&resume_value)
+                    )
+                });
                 let result = self.resume_fiber_continuations(
                     compiled,
                     fiber.clone(),
@@ -401,7 +411,9 @@ impl Vm {
                 );
                 if !result.status.is_success() {
                     fiber.set_state(FiberState::Errored);
-                    self.record_runtime_trace_event("fiber resume transition=running->errored");
+                    self.record_runtime_trace_event(|| {
+                        "fiber resume transition=running->errored".to_owned()
+                    });
                     return Err(result);
                 }
                 if let Some(suspension) = result.fiber_suspension {
@@ -409,14 +421,18 @@ impl Vm {
                         .fiber_continuations
                         .insert(fiber.id(), suspension.continuations);
                     fiber.set_state(FiberState::Suspended);
-                    self.record_runtime_trace_event(format!(
-                        "fiber resume transition=running->suspended value={}",
-                        trace_value(&suspension.value)
-                    ));
+                    self.record_runtime_trace_event(|| {
+                        format!(
+                            "fiber resume transition=running->suspended value={}",
+                            trace_value(&suspension.value)
+                        )
+                    });
                     return Ok(suspension.value);
                 }
                 fiber.terminate(result.return_value);
-                self.record_runtime_trace_event("fiber resume transition=running->terminated");
+                self.record_runtime_trace_event(|| {
+                    "fiber resume transition=running->terminated".to_owned()
+                });
                 Ok(Value::Null)
             }
             "throw" => {
@@ -462,10 +478,12 @@ impl Vm {
                     ));
                 };
                 fiber.set_state(FiberState::Running);
-                self.record_runtime_trace_event(format!(
-                    "fiber throw transition=suspended->running input={}",
-                    trace_value(&throwable)
-                ));
+                self.record_runtime_trace_event(|| {
+                    format!(
+                        "fiber throw transition=suspended->running input={}",
+                        trace_value(&throwable)
+                    )
+                });
                 let result = self.resume_fiber_continuations(
                     compiled,
                     fiber.clone(),
@@ -477,7 +495,9 @@ impl Vm {
                 );
                 if !result.status.is_success() {
                     fiber.set_state(FiberState::Errored);
-                    self.record_runtime_trace_event("fiber throw transition=running->errored");
+                    self.record_runtime_trace_event(|| {
+                        "fiber throw transition=running->errored".to_owned()
+                    });
                     return Err(result);
                 }
                 if let Some(suspension) = result.fiber_suspension {
@@ -485,14 +505,18 @@ impl Vm {
                         .fiber_continuations
                         .insert(fiber.id(), suspension.continuations);
                     fiber.set_state(FiberState::Suspended);
-                    self.record_runtime_trace_event(format!(
-                        "fiber throw transition=running->suspended value={}",
-                        trace_value(&suspension.value)
-                    ));
+                    self.record_runtime_trace_event(|| {
+                        format!(
+                            "fiber throw transition=running->suspended value={}",
+                            trace_value(&suspension.value)
+                        )
+                    });
                     return Ok(suspension.value);
                 }
                 fiber.terminate(result.return_value);
-                self.record_runtime_trace_event("fiber throw transition=running->terminated");
+                self.record_runtime_trace_event(|| {
+                    "fiber throw transition=running->terminated".to_owned()
+                });
                 Ok(Value::Null)
             }
             "getreturn" => {

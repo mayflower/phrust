@@ -2195,20 +2195,20 @@ impl FunctionCall<'_> {
         &self,
         fallback_compiled: &CompiledUnit,
     ) -> arguments::ArgumentBindingPolicy {
+        // A span's FileId is only meaningful inside the unit that produced
+        // it. Resolve per-file strictness against the caller unit when the
+        // call carries one; otherwise trust the explicit call-site flag. The
+        // fallback-unit span resolution stays last: it is only correct for
+        // intra-unit calls, where the binder unit and the span's unit agree.
         let strict_types = self
-            .call_span
-            .map(|span| {
-                self.error_context_compiled
-                    .as_ref()
-                    .unwrap_or(fallback_compiled)
-                    .unit()
-                    .strict_types_for_span(span)
-            })
+            .error_context_compiled
+            .as_ref()
+            .zip(self.call_span)
+            .map(|(caller, span)| caller.unit().strict_types_for_span(span))
             .or(self.call_site_strict_types)
             .or_else(|| {
-                self.error_context_compiled
-                    .as_ref()
-                    .map(|compiled| compiled.unit().strict_types)
+                self.call_span
+                    .map(|span| fallback_compiled.unit().strict_types_for_span(span))
             })
             .unwrap_or(fallback_compiled.unit().strict_types);
         arguments::ArgumentBindingPolicy {
@@ -6844,13 +6844,16 @@ impl Vm {
         ));
     }
 
-    fn record_runtime_trace_event(&self, event: impl AsRef<str>) {
+    /// Lazily records one runtime trace line. The event closure only runs
+    /// when tracing is enabled, so hot paths never pay for the string.
+    fn record_runtime_trace_event(&self, event: impl FnOnce() -> String) {
         if !self.options.trace_runtime {
             return;
         }
         let mut trace = self.trace.borrow_mut();
         let step = trace.len() + 1;
-        trace.push(format!("step={step} runtime {}", event.as_ref()));
+        let event = event();
+        trace.push(format!("step={step} runtime {event}"));
     }
 
     fn record_gc_root_trace_event(&self, stack: &CallStack, state: &ExecutionState) {
@@ -6859,12 +6862,14 @@ impl Vm {
         }
         let root_count = gc_root_count_from_vm_roots(stack, state);
         let snapshot = gc_snapshot_from_vm_roots(stack, state);
-        self.record_runtime_trace_event(format!(
-            "gc-roots roots={} entities={} cycle_candidates={}",
-            root_count,
-            snapshot.nodes.len(),
-            snapshot.cycle_candidates.len()
-        ));
+        self.record_runtime_trace_event(|| {
+            format!(
+                "gc-roots roots={} entities={} cycle_candidates={}",
+                root_count,
+                snapshot.nodes.len(),
+                snapshot.cycle_candidates.len()
+            )
+        });
     }
 
     #[cfg(not(feature = "jit-cranelift"))]
@@ -13434,11 +13439,13 @@ impl Vm {
                                 return result;
                             }
                         };
-                        self.record_runtime_trace_event(format!(
-                            "foreach init iterator=r{} kind={}",
-                            iterator,
-                            format_foreach_iterator_kind(&foreach_iterator)
-                        ));
+                        self.record_runtime_trace_event(|| {
+                            format!(
+                                "foreach init iterator=r{} kind={}",
+                                iterator,
+                                format_foreach_iterator_kind(&foreach_iterator)
+                            )
+                        });
                         foreach_iterators.insert(RegId::new(iterator), foreach_iterator);
                     }
                     DenseOpcode::ForeachNext => {
@@ -16070,20 +16077,21 @@ impl Vm {
         };
 
         if let Some((entry_key, entry_value)) = &next_value {
-            self.record_runtime_trace_event(format!(
-                "foreach next iterator=r{} status=value key={} value={}",
-                iterator.raw(),
-                entry_key
-                    .as_ref()
-                    .map(trace_value)
-                    .unwrap_or_else(|| "None".to_owned()),
-                trace_value(entry_value)
-            ));
+            self.record_runtime_trace_event(|| {
+                format!(
+                    "foreach next iterator=r{} status=value key={} value={}",
+                    iterator.raw(),
+                    entry_key
+                        .as_ref()
+                        .map(trace_value)
+                        .unwrap_or_else(|| "None".to_owned()),
+                    trace_value(entry_value)
+                )
+            });
         } else {
-            self.record_runtime_trace_event(format!(
-                "foreach next iterator=r{} status=done",
-                iterator.raw()
-            ));
+            self.record_runtime_trace_event(|| {
+                format!("foreach next iterator=r{} status=done", iterator.raw())
+            });
         }
         Ok(next_value)
     }
@@ -19483,7 +19491,10 @@ impl Vm {
                                 &class_owner,
                                 constructor.method.function,
                                 FunctionCall::new(values, Vec::new())
-                                    .with_call_site_strict_types(compiled.unit().strict_types)
+                                    .with_call_site_strict_types(call_site_strictness(
+                                        compiled,
+                                        Some(instruction.span),
+                                    ))
                                     .with_call_span(instruction.span)
                                     .with_this(object.clone())
                                     .with_class_context_handles(
@@ -20939,7 +20950,10 @@ impl Vm {
                                 &class_owner,
                                 constructor.method.function,
                                 FunctionCall::new(values, Vec::new())
-                                    .with_call_site_strict_types(compiled.unit().strict_types)
+                                    .with_call_site_strict_types(call_site_strictness(
+                                        compiled,
+                                        Some(instruction.span),
+                                    ))
                                     .with_call_span(instruction.span)
                                     .with_this(object.clone())
                                     .with_class_context_handles(
@@ -26555,11 +26569,13 @@ impl Vm {
                                 }
                             }
                         };
-                        self.record_runtime_trace_event(format!(
-                            "foreach init iterator=r{} kind={}",
-                            iterator.raw(),
-                            format_foreach_iterator_kind(&foreach_iterator)
-                        ));
+                        self.record_runtime_trace_event(|| {
+                            format!(
+                                "foreach init iterator=r{} kind={}",
+                                iterator.raw(),
+                                format_foreach_iterator_kind(&foreach_iterator)
+                            )
+                        });
                         foreach_iterators.insert(*iterator, foreach_iterator);
                     }
                     InstructionKind::ForeachNext {
@@ -26836,10 +26852,9 @@ impl Vm {
                             }
                         };
                         let Some((entry_key, entry_value)) = next_value else {
-                            self.record_runtime_trace_event(format!(
-                                "foreach next iterator=r{} status=done",
-                                iterator.raw()
-                            ));
+                            self.record_runtime_trace_event(|| {
+                                format!("foreach next iterator=r{} status=done", iterator.raw())
+                            });
                             if let Err(message) = stack
                                 .frame_mut(frame_index)
                                 .expect("frame is active")
@@ -26850,15 +26865,17 @@ impl Vm {
                             }
                             continue;
                         };
-                        self.record_runtime_trace_event(format!(
-                            "foreach next iterator=r{} status=value key={} value={}",
-                            iterator.raw(),
-                            entry_key
-                                .as_ref()
-                                .map(trace_value)
-                                .unwrap_or_else(|| "None".to_owned()),
-                            trace_value(&entry_value)
-                        ));
+                        self.record_runtime_trace_event(|| {
+                            format!(
+                                "foreach next iterator=r{} status=value key={} value={}",
+                                iterator.raw(),
+                                entry_key
+                                    .as_ref()
+                                    .map(trace_value)
+                                    .unwrap_or_else(|| "None".to_owned()),
+                                trace_value(&entry_value)
+                            )
+                        });
                         let frame = stack.frame_mut(frame_index).expect("frame is active");
                         if let Err(message) = frame.registers.set(*has_value, Value::Bool(true)) {
                             return self.runtime_error(output, compiled, stack, message);
@@ -26971,11 +26988,13 @@ impl Vm {
                                 visited_keys: Vec::new(),
                             },
                         );
-                        self.record_runtime_trace_event(format!(
-                            "foreach init-ref iterator=r{} local={}",
-                            iterator.raw(),
-                            local.raw()
-                        ));
+                        self.record_runtime_trace_event(|| {
+                            format!(
+                                "foreach init-ref iterator=r{} local={}",
+                                iterator.raw(),
+                                local.raw()
+                            )
+                        });
                     }
                     InstructionKind::ForeachNextRef {
                         has_value,
@@ -27010,10 +27029,9 @@ impl Vm {
                             .into_iter()
                             .find(|candidate| !visited_keys.contains(candidate))
                         else {
-                            self.record_runtime_trace_event(format!(
-                                "foreach next-ref iterator=r{} status=done",
-                                iterator.raw()
-                            ));
+                            self.record_runtime_trace_event(|| {
+                                format!("foreach next-ref iterator=r{} status=done", iterator.raw())
+                            });
                             if let Err(message) = stack
                                 .frame_mut(frame_index)
                                 .expect("frame was pushed")
@@ -27038,11 +27056,13 @@ impl Vm {
                             );
                         };
                         visited_keys.push(entry_key.clone());
-                        self.record_runtime_trace_event(format!(
-                            "foreach next-ref iterator=r{} status=value key={}",
-                            iterator.raw(),
-                            format_array_key_for_trace(&entry_key)
-                        ));
+                        self.record_runtime_trace_event(|| {
+                            format!(
+                                "foreach next-ref iterator=r{} status=value key={}",
+                                iterator.raw(),
+                                format_array_key_for_trace(&entry_key)
+                            )
+                        });
                         let cell = match ensure_dim_reference_cell(
                             stack,
                             local,
@@ -29458,7 +29478,10 @@ impl Vm {
                             &class_owner,
                             method_entry.function,
                             FunctionCall::new(values, Vec::new())
-                                .with_call_site_strict_types(compiled.unit().strict_types)
+                                .with_call_site_strict_types(call_site_strictness(
+                                    compiled,
+                                    Some(instruction.span),
+                                ))
                                 .with_call_span(instruction.span)
                                 .with_this(object.clone())
                                 .with_class_context_handles(
@@ -30465,7 +30488,10 @@ impl Vm {
                         let called_class =
                             called_class_for_static_call(compiled, stack, class_name, &class);
                         let mut call = FunctionCall::new(values, Vec::new())
-                            .with_call_site_strict_types(compiled.unit().strict_types)
+                            .with_call_site_strict_types(call_site_strictness(
+                                compiled,
+                                Some(instruction.span),
+                            ))
                             .with_call_span(instruction.span)
                             .with_class_context_handles(
                                 self.class_name_handles(&declaring_class.name).normalized,
@@ -30570,7 +30596,10 @@ impl Vm {
                             }
                         };
                         let mut call = FunctionCall::new(values, payload.captures.clone())
-                            .with_call_site_strict_types(compiled.unit().strict_types)
+                            .with_call_site_strict_types(call_site_strictness(
+                                compiled,
+                                Some(instruction.span),
+                            ))
                             .inherit_fiber_context(&running_fiber)
                             .with_call_span(instruction.span)
                             .with_error_context(compiled.clone());
@@ -35254,7 +35283,7 @@ impl Vm {
         let normalized = name.to_ascii_lowercase();
         let make_call = |args| {
             let call = FunctionCall::new(args, Vec::new())
-                .with_call_site_strict_types(compiled.unit().strict_types)
+                .with_call_site_strict_types(call_site_strictness(compiled, call_span))
                 .with_optional_call_span(call_span);
             if allow_by_ref_value_warnings {
                 call.with_by_ref_value_warnings()
@@ -35484,7 +35513,7 @@ impl Vm {
                 compiled,
                 function,
                 FunctionCall::new(args, Vec::new())
-                    .with_call_site_strict_types(compiled.unit().strict_types)
+                    .with_call_site_strict_types(call_site_strictness(compiled, call_span))
                     .inherit_fiber_context(running_fiber)
                     .with_optional_call_span(call_span),
                 output,
@@ -35509,7 +35538,7 @@ impl Vm {
                     &owner,
                     function,
                     FunctionCall::new(args, Vec::new())
-                        .with_call_site_strict_types(compiled.unit().strict_types)
+                        .with_call_site_strict_types(call_site_strictness(compiled, call_span))
                         .inherit_fiber_context(running_fiber)
                         .with_optional_call_span(call_span),
                     output,
@@ -36359,7 +36388,7 @@ impl Vm {
                 return result;
             }
             let call = FunctionCall::new(args, Vec::new())
-                .with_call_site_strict_types(compiled.unit().strict_types)
+                .with_call_site_strict_types(call_site_strictness(compiled, call_span))
                 .with_optional_call_span(call_span)
                 .with_this(object.clone())
                 .with_class_context_handles(
@@ -36443,7 +36472,7 @@ impl Vm {
             dense_plan,
             method_function,
             FunctionCall::new(args, Vec::new())
-                .with_call_site_strict_types(compiled.unit().strict_types)
+                .with_call_site_strict_types(call_site_strictness(compiled, call_span))
                 .with_optional_call_span(call_span)
                 .with_this(object.clone())
                 .with_class_context_handles(
@@ -36997,7 +37026,7 @@ impl Vm {
             &class_owner,
             resolved.method.function,
             FunctionCall::new(args, Vec::new())
-                .with_call_site_strict_types(compiled.unit().strict_types)
+                .with_call_site_strict_types(call_site_strictness(compiled, call_span))
                 .with_optional_call_span(call_span)
                 .with_this(object.clone())
                 .with_class_context_handles(
@@ -37093,7 +37122,7 @@ impl Vm {
             &class_owner,
             resolved.method.function,
             FunctionCall::new(args, Vec::new())
-                .with_call_site_strict_types(compiled.unit().strict_types)
+                .with_call_site_strict_types(call_site_strictness(compiled, call_span))
                 .with_class_context_handles(
                     self.class_name_handles(&resolved.class.name).normalized,
                     self.class_name_handles(&class.display_name).display,
@@ -37218,19 +37247,23 @@ impl Vm {
                         ) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
-                        self.record_runtime_trace_event(format!(
-                            "object-dispatch class={} method={} declaring_class={}",
-                            object.class_name(),
-                            resolved.method.name,
-                            resolved.class.name
-                        ));
+                        self.record_runtime_trace_event(|| {
+                            format!(
+                                "object-dispatch class={} method={} declaring_class={}",
+                                object.class_name(),
+                                resolved.method.name,
+                                resolved.class.name
+                            )
+                        });
                         let class_owner =
                             class_owner_in_state(compiled, state, &resolved.class.name);
                         return self.execute_function(
                             &class_owner,
                             resolved.method.function,
                             FunctionCall::new(args, Vec::new())
-                                .with_call_site_strict_types(compiled.unit().strict_types)
+                                .with_call_site_strict_types(call_site_strictness(
+                                    compiled, call_span,
+                                ))
                                 .with_optional_call_span(call_span)
                                 .with_this(object.clone())
                                 .with_class_context_handles(
@@ -37668,18 +37701,20 @@ impl Vm {
         ) {
             return self.runtime_error(output, compiled, stack, message);
         }
-        self.record_runtime_trace_event(format!(
-            "object-dispatch class={} method={} declaring_class={}",
-            object.class_name(),
-            method_entry.name,
-            declaring_class.name
-        ));
+        self.record_runtime_trace_event(|| {
+            format!(
+                "object-dispatch class={} method={} declaring_class={}",
+                object.class_name(),
+                method_entry.name,
+                declaring_class.name
+            )
+        });
         let class_owner = class_owner_in_state(compiled, state, &declaring_class.name);
         self.execute_function(
             &class_owner,
             method_entry.function,
             FunctionCall::new(args, Vec::new())
-                .with_call_site_strict_types(compiled.unit().strict_types)
+                .with_call_site_strict_types(call_site_strictness(compiled, call_span))
                 .with_optional_call_span(call_span)
                 .with_this(object.clone())
                 .with_class_context_handles(
@@ -40391,7 +40426,7 @@ impl Vm {
             &class_owner,
             resolved.method.function,
             FunctionCall::new(magic_args, Vec::new())
-                .with_call_site_strict_types(compiled.unit().strict_types)
+                .with_call_site_strict_types(call_site_strictness(compiled, call_span))
                 .with_optional_call_span(call_span)
                 .with_this(object.clone())
                 .with_class_context_handles(
@@ -40464,7 +40499,7 @@ impl Vm {
             &class_owner,
             resolved.method.function,
             FunctionCall::new(magic_args, Vec::new())
-                .with_call_site_strict_types(compiled.unit().strict_types)
+                .with_call_site_strict_types(call_site_strictness(compiled, call_span))
                 .with_optional_call_span(call_span)
                 .with_class_context_handles(
                     self.class_name_handles(&resolved.class.name).normalized,
@@ -40509,10 +40544,12 @@ impl Vm {
             }
         }
         generator.set_state(GeneratorState::Running);
-        self.record_runtime_trace_event(format!(
-            "generator state function={} transition=created->running",
-            generator.function()
-        ));
+        self.record_runtime_trace_event(|| {
+            format!(
+                "generator state function={} transition=created->running",
+                generator.function()
+            )
+        });
         let args = generator
             .args()
             .into_iter()
@@ -40548,31 +40585,37 @@ impl Vm {
         );
         if !result.status.is_success() {
             generator.set_state(GeneratorState::Errored);
-            self.record_runtime_trace_event(format!(
-                "generator state function={} transition=running->errored",
-                generator.function()
-            ));
+            self.record_runtime_trace_event(|| {
+                format!(
+                    "generator state function={} transition=running->errored",
+                    generator.function()
+                )
+            });
             return Err(result);
         }
         if let Some(yielded) = result.yielded {
             generator.suspend(yielded.key.clone(), yielded.value.clone());
-            self.record_runtime_trace_event(format!(
-                "generator suspend function={} key={} value={}",
-                generator.function(),
-                yielded
-                    .key
-                    .as_ref()
-                    .map(trace_value)
-                    .unwrap_or_else(|| "None".to_owned()),
-                trace_value(&yielded.value)
-            ));
+            self.record_runtime_trace_event(|| {
+                format!(
+                    "generator suspend function={} key={} value={}",
+                    generator.function(),
+                    yielded
+                        .key
+                        .as_ref()
+                        .map(trace_value)
+                        .unwrap_or_else(|| "None".to_owned()),
+                    trace_value(&yielded.value)
+                )
+            });
             Ok(Some((yielded.key, yielded.value)))
         } else {
             generator.close(result.return_value);
-            self.record_runtime_trace_event(format!(
-                "generator state function={} transition=running->closed",
-                generator.function()
-            ));
+            self.record_runtime_trace_event(|| {
+                format!(
+                    "generator state function={} transition=running->closed",
+                    generator.function()
+                )
+            });
             Ok(None)
         }
     }
@@ -40624,14 +40667,16 @@ impl Vm {
             ));
         };
         generator.set_state(GeneratorState::Running);
-        self.record_runtime_trace_event(format!(
-            "generator state function={} transition=suspended->running input={}",
-            generator.function(),
-            match &input {
-                GeneratorResumeInput::Value(value) => format!("value({})", trace_value(value)),
-                GeneratorResumeInput::Throw(value) => format!("throw({})", trace_value(value)),
-            }
-        ));
+        self.record_runtime_trace_event(|| {
+            format!(
+                "generator state function={} transition=suspended->running input={}",
+                generator.function(),
+                match &input {
+                    GeneratorResumeInput::Value(value) => format!("value({})", trace_value(value)),
+                    GeneratorResumeInput::Throw(value) => format!("throw({})", trace_value(value)),
+                }
+            )
+        });
         let result = self.execute_function(
             compiled,
             FunctionId::new(generator.function()),
@@ -40645,32 +40690,38 @@ impl Vm {
         if !result.status.is_success() {
             generator.set_state(GeneratorState::Errored);
             state.generator_continuations.remove(&generator.id());
-            self.record_runtime_trace_event(format!(
-                "generator state function={} transition=running->errored",
-                generator.function()
-            ));
+            self.record_runtime_trace_event(|| {
+                format!(
+                    "generator state function={} transition=running->errored",
+                    generator.function()
+                )
+            });
             return Err(result);
         }
         if let Some(yielded) = result.yielded {
             generator.suspend(yielded.key.clone(), yielded.value.clone());
-            self.record_runtime_trace_event(format!(
-                "generator suspend function={} key={} value={}",
-                generator.function(),
-                yielded
-                    .key
-                    .as_ref()
-                    .map(trace_value)
-                    .unwrap_or_else(|| "None".to_owned()),
-                trace_value(&yielded.value)
-            ));
+            self.record_runtime_trace_event(|| {
+                format!(
+                    "generator suspend function={} key={} value={}",
+                    generator.function(),
+                    yielded
+                        .key
+                        .as_ref()
+                        .map(trace_value)
+                        .unwrap_or_else(|| "None".to_owned()),
+                    trace_value(&yielded.value)
+                )
+            });
             Ok(Some((yielded.key, yielded.value)))
         } else {
             state.generator_continuations.remove(&generator.id());
             generator.close(result.return_value);
-            self.record_runtime_trace_event(format!(
-                "generator state function={} transition=running->closed",
-                generator.function()
-            ));
+            self.record_runtime_trace_event(|| {
+                format!(
+                    "generator state function={} transition=running->closed",
+                    generator.function()
+                )
+            });
             Ok(None)
         }
     }
@@ -40820,11 +40871,13 @@ impl Vm {
             .next()
             .map(|arg| arg.value)
             .unwrap_or(Value::Null);
-        self.record_runtime_trace_event(format!(
-            "fiber suspend transition=running->suspended state={:?} value={}",
-            fiber.state(),
-            trace_value(&value)
-        ));
+        self.record_runtime_trace_event(|| {
+            format!(
+                "fiber suspend transition=running->suspended state={:?} value={}",
+                fiber.state(),
+                trace_value(&value)
+            )
+        });
         let Some(frame) = stack.pop() else {
             return Err(self.runtime_error(
                 output,
@@ -43955,7 +44008,7 @@ impl Vm {
         let class_owner = class_owner_in_state(compiled, state, &declaring_class.name);
         let called_class = called_class_for_static_call(compiled, stack, class_name, &class);
         let mut call = FunctionCall::new(args, Vec::new())
-            .with_call_site_strict_types(compiled.unit().strict_types)
+            .with_call_site_strict_types(call_site_strictness(compiled, call_span))
             .with_class_context_handles(
                 self.class_name_handles(&declaring_class.name).normalized,
                 self.class_name_handles(&called_class).display,
@@ -49728,6 +49781,16 @@ struct ClassNameHandles {
 /// Late-static-binding handle for a receiver object. The stored display name
 /// already carries the PHP-visible spelling, so the shared handle is reused
 /// directly unless a leading root slash still needs stripping.
+/// Call-site strictness resolved at the caller: per-file when the site has a
+/// span (linked multi-file units mix strict and weak files in one unit), the
+/// unit flag otherwise. Spans are unit-local, so this must only ever be
+/// called with the unit that produced the span.
+fn call_site_strictness(compiled: &CompiledUnit, span: Option<IrSpan>) -> bool {
+    span.map_or(compiled.unit().strict_types, |span| {
+        compiled.unit().strict_types_for_span(span)
+    })
+}
+
 fn object_called_class_handle(object: &ObjectRef) -> Arc<str> {
     let display = object.display_name_handle();
     if display.starts_with('\\') {

@@ -163,7 +163,7 @@ impl Vm {
             CallableValue::UserFunction { name } => {
                 let make_call = |args, captures| {
                     let call = FunctionCall::new(args, captures)
-                        .with_call_site_strict_types(compiled.unit().strict_types)
+                        .with_call_site_strict_types(call_site_strictness(compiled, call_span))
                         .with_optional_call_span(call_span);
                     if allow_by_ref_value_warnings {
                         call.with_by_ref_value_warnings()
@@ -203,7 +203,7 @@ impl Vm {
             }
             CallableValue::Closure(payload) => {
                 let mut call = FunctionCall::new(args, payload.captures)
-                    .with_call_site_strict_types(compiled.unit().strict_types)
+                    .with_call_site_strict_types(call_site_strictness(compiled, call_span))
                     .with_optional_call_span(call_span)
                     .with_error_context(compiled.clone());
                 let closure_owner = closure_owner_for_function(

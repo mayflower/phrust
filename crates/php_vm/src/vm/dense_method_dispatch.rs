@@ -305,7 +305,7 @@ impl Vm {
             {
                 let declaring = self.class_name_handles(&declaring_class.name).normalized;
                 FunctionCall::new(args, Vec::new())
-                    .with_call_site_strict_types(compiled.unit().strict_types)
+                    .with_call_site_strict_types(call_site_strictness(compiled, call_span))
                     .with_optional_call_span(call_span)
                     .with_this(object.clone())
                     .with_class_context_handles(
@@ -778,7 +778,7 @@ impl Vm {
             {
                 let declaring = self.class_name_handles(&declaring_class.name).normalized;
                 let mut call = FunctionCall::new(args, Vec::new())
-                    .with_call_site_strict_types(compiled.unit().strict_types)
+                    .with_call_site_strict_types(call_site_strictness(compiled, call_span))
                     .with_class_context_handles(
                         declaring.clone(),
                         self.class_name_handles(&called_class).display,
@@ -898,7 +898,7 @@ impl Vm {
             {
                 let declaring = self.class_name_handles(&declaring_class.name).normalized;
                 let mut call = FunctionCall::new(args, Vec::new())
-                    .with_call_site_strict_types(compiled.unit().strict_types)
+                    .with_call_site_strict_types(call_site_strictness(compiled, call_span))
                     .with_optional_call_span(call_span)
                     .with_class_context_handles(
                         declaring.clone(),
@@ -1046,7 +1046,7 @@ impl Vm {
                 {
                     let declaring = self.class_name_handles(&constructor.class.name).normalized;
                     FunctionCall::new(args, Vec::new())
-                        .with_call_site_strict_types(compiled.unit().strict_types)
+                        .with_call_site_strict_types(call_site_strictness(compiled, call_span))
                         .with_optional_call_span(call_span)
                         .with_this(object.clone())
                         .with_class_context_handles(

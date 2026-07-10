@@ -16,7 +16,10 @@ use php_diagnostics::{
     DiagnosticCause, DiagnosticEnvelope, DiagnosticLayer, DiagnosticPhase, DiagnosticSeverity,
     DiagnosticSuggestion,
 };
-use php_executor::{CompiledScriptCache, DeploymentRootFingerprint, IncludeCache};
+use php_executor::{
+    CompiledScriptCache, DeploymentRootFingerprint, IncludeCache,
+    SERVER_INCLUDE_REVALIDATION_INTERVAL, include_revalidation_interval_from_env,
+};
 use std::{
     collections::BTreeMap,
     fmt,
@@ -226,7 +229,14 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     } else {
         CompiledScriptCache::disabled()
     });
-    let include_cache = Arc::new(IncludeCache::new(config.script_cache_shards));
+    // Server default mirrors an opcache deployment (validate_timestamps=1,
+    // revalidate_freq=2): cached includes serve without filesystem probes for
+    // two seconds. PHRUST_INCLUDE_REVALIDATE_MS overrides; 0 validates every
+    // hit like the reference CLI.
+    let include_cache = Arc::new(IncludeCache::new_with_revalidation_interval(
+        config.script_cache_shards,
+        include_revalidation_interval_from_env().unwrap_or(SERVER_INCLUDE_REVALIDATION_INTERVAL),
+    ));
     // Deployment-root fingerprint: metadata + counters only. A root that
     // cannot be observed counts as `deployment_fingerprint_missing` and keeps
     // every fingerprint-gated persistent reuse blocked.

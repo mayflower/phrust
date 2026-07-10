@@ -77,9 +77,10 @@ pub mod api {
         CompiledInclude, ComposerFingerprintTransition, DeploymentRootFingerprint,
         DeploymentRootMode, IncludeCache, IncludeCacheStats, IncludeCompiler,
         IncludeCompilerFingerprint, IncludeDependency, IncludeDirectoryVersion, IncludeLoader,
-        IncludePathFileFingerprint, LoadedInclude, ResolvedIncludePath, ValidatedIncludeSource,
+        IncludePathFileFingerprint, LoadedInclude, ResolvedIncludePath,
+        SERVER_INCLUDE_REVALIDATION_INTERVAL, ValidatedIncludeSource,
         composer_autoload_map_fingerprint, include_directory_version,
-        negative_include_cache_enabled,
+        include_revalidation_interval_from_env, negative_include_cache_enabled,
     };
     pub use crate::inline_cache::{FunctionCallSiteSnapshot, InlineCacheMode};
     pub use crate::persistent_feedback::PersistentFeedbackEpochs;

@@ -1110,9 +1110,10 @@ pub(crate) fn execute_compiled_php_with_state(
             collect_layout_source_attribution: mode.collects_source_attribution(),
         },
     );
+    let mut output = output;
     let absorbed = state
         .engine
-        .absorb_quickening_feedback(output.quickening_feedback.clone());
+        .absorb_quickening_feedback(std::mem::take(&mut output.quickening_feedback));
     if absorbed > 0 {
         state
             .metrics
