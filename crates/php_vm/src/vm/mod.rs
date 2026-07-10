@@ -1252,7 +1252,6 @@ struct ExecutionState {
     default_timezone: String,
     env: Arc<Vec<(String, String)>>,
     filter_input_arrays: Arc<BTreeMap<i64, PhpArray>>,
-    network_requests_enabled: bool,
     resources: ResourceTable,
     stdin: Option<php_runtime::ResourceRef>,
     stdout: Option<php_runtime::ResourceRef>,
@@ -5187,10 +5186,12 @@ impl Vm {
         unit_id: UnitId,
         function_id: FunctionId,
         instruction_index: u32,
+        opcode: DenseOpcode,
     ) {
         if !self.options.tiering.enabled
             || !self.options.quickening.enabled()
             || self.adaptive_tiny_unit_setup_skipped.get()
+            || !dense_quickening_candidate_opcode(opcode)
         {
             return;
         }
@@ -5331,7 +5332,9 @@ impl Vm {
         }
         let key = (compiled_unit_cache_key(compiled), function_id.raw());
         if let Some(plan) = self.last_use_move_plans.borrow().get(&key) {
-            return Some(Rc::clone(plan));
+            return (!plan.is_empty()
+                && (plan.move_checks_enabled() || plan.has_array_release_reads()))
+            .then(|| Rc::clone(plan));
         }
         let plan = Rc::new(crate::last_use::LastUseMovePlan::analyze(dense_function));
         self.record_counter_last_use_move_ineligible(&plan);
@@ -5341,7 +5344,8 @@ impl Vm {
         self.last_use_move_plans
             .borrow_mut()
             .insert(key, Rc::clone(&plan));
-        Some(plan)
+        (!plan.is_empty() && (plan.move_checks_enabled() || plan.has_array_release_reads()))
+            .then_some(plan)
     }
 
     /// Reads a dense source operand, moving the value out of its register when
@@ -5359,6 +5363,7 @@ impl Vm {
     ) -> Result<Value, String> {
         if let Some(plan) = move_plan
             && operand.kind == DenseOperandKind::Register
+            && plan.move_checks_enabled()
         {
             if let Some(counters) = self.counters.borrow_mut().as_mut() {
                 counters.record_last_use_move_consultation();
@@ -8705,7 +8710,12 @@ impl Vm {
                 };
                 self.record_counter_bytecode_instruction(instruction.opcode);
                 self.record_counter_superinstruction_executed(instruction.opcode);
-                self.observe_dense_quickening(unit_id, function_id, dense_instruction_index);
+                self.observe_dense_quickening(
+                    unit_id,
+                    function_id,
+                    dense_instruction_index,
+                    instruction.opcode,
+                );
                 match instruction.opcode {
                     DenseOpcode::Nop => {}
                     DenseOpcode::DeclareFunction => {
@@ -15563,10 +15573,10 @@ impl Vm {
         value: &Value,
         span: IrSpan,
     ) -> Result<bool, VmResult> {
-        let Some(local_value) = read_local_value(stack, local) else {
+        let Some(object) = local_effective_object(stack, local) else {
             return Ok(false);
         };
-        let object = match userland_arrayaccess_object(compiled, state, &local_value) {
+        let object = match userland_arrayaccess_object_from_object(compiled, state, object) {
             Ok(Some(object)) => object,
             Ok(None) => return Ok(false),
             Err(message) => {
@@ -58432,6 +58442,14 @@ fn userland_arrayaccess_object(
     let Value::Object(object) = effective_value(value) else {
         return Ok(None);
     };
+    userland_arrayaccess_object_from_object(compiled, state, object)
+}
+
+fn userland_arrayaccess_object_from_object(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    object: ObjectRef,
+) -> Result<Option<ObjectRef>, String> {
     if spl_runtime_marker(&object).is_some_and(|class| is_spl_array_access_runtime_class(&class)) {
         return Ok(None);
     }
@@ -62938,6 +62956,24 @@ fn rich_quickening_candidate_kind(kind: &InstructionKind) -> bool {
     )
 }
 
+/// Dense opcodes with a quickening candidate or guard arm in the dispatch
+/// loop. Keeping this exhaustive allowlist next to the rich classifier avoids
+/// creating and updating quickening entries for bytecode that can never
+/// specialize.
+fn dense_quickening_candidate_opcode(opcode: DenseOpcode) -> bool {
+    matches!(
+        opcode,
+        DenseOpcode::BinaryAdd
+            | DenseOpcode::BinarySub
+            | DenseOpcode::BinaryMul
+            | DenseOpcode::BinaryConcat
+            | DenseOpcode::BinaryConcatEcho
+            | DenseOpcode::JumpIfFalse
+            | DenseOpcode::JumpIfTrue
+            | DenseOpcode::JumpIf
+    )
+}
+
 /// True when a function body can observe its call-argument vector: a
 /// direct call to a func_get_args-style builtin, or any dynamic dispatch
 /// or include/eval that could reach one. Bodies that cannot observe the
@@ -63457,10 +63493,10 @@ fn local_alias_state_at_frame(stack: &CallStack, frame_index: usize, local: Loca
 }
 
 fn local_array_is_packed_fast(stack: &CallStack, local: LocalId) -> bool {
-    let Some(value) = read_local_value(stack, local) else {
-        return false;
-    };
-    matches!(effective_value(&value), Value::Array(array) if array.is_packed_fast())
+    stack
+        .current()
+        .and_then(|frame| frame.locals.get_slot(local))
+        .is_some_and(slot_effective_array_is_packed_fast)
 }
 
 fn local_array_is_packed_fast_at_frame(
@@ -63468,10 +63504,59 @@ fn local_array_is_packed_fast_at_frame(
     frame_index: usize,
     local: LocalId,
 ) -> bool {
-    let Some(value) = read_local_value_at_frame(stack, frame_index, local) else {
-        return false;
-    };
-    matches!(effective_value(&value), Value::Array(array) if array.is_packed_fast())
+    stack
+        .frames()
+        .get(frame_index)
+        .and_then(|frame| frame.locals.get_slot(local))
+        .is_some_and(slot_effective_array_is_packed_fast)
+}
+
+/// Checks packed-array layout through a local slot without cloning its array
+/// handle. The prior read/effective-value path cloned ordinary arrays twice
+/// around every dimension write merely to inspect their layout.
+fn slot_effective_array_is_packed_fast(slot: &Slot) -> bool {
+    fn value_is_packed_after_one_deref(value: &Value) -> bool {
+        match value {
+            Value::Array(array) => array.is_packed_fast(),
+            Value::Reference(cell) => cell
+                .try_with_value(
+                    |value| matches!(value, Value::Array(array) if array.is_packed_fast()),
+                )
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    match slot {
+        Slot::Value(value) => value_is_packed_after_one_deref(value),
+        Slot::Reference(cell) => cell
+            .try_with_value(value_is_packed_after_one_deref)
+            .unwrap_or(false),
+    }
+}
+
+/// Returns a local's effective object handle without cloning non-object values.
+/// Array-dimension writes use this to probe for userland `ArrayAccess`; normal
+/// arrays and scalars stay borrowed and allocate no transient value handle.
+fn local_effective_object(stack: &CallStack, local: LocalId) -> Option<ObjectRef> {
+    fn object_after_one_deref(value: &Value) -> Option<ObjectRef> {
+        match value {
+            Value::Object(object) => Some(object.clone()),
+            Value::Reference(cell) => cell
+                .try_with_value(|value| match value {
+                    Value::Object(object) => Some(object.clone()),
+                    _ => None,
+                })
+                .ok()
+                .flatten(),
+            _ => None,
+        }
+    }
+
+    match stack.current()?.locals.get_slot(local)? {
+        Slot::Value(value) => object_after_one_deref(value),
+        Slot::Reference(cell) => cell.try_with_value(object_after_one_deref).ok().flatten(),
+    }
 }
 
 fn local_array_has_cow_or_reference_fallback(stack: &CallStack, local: LocalId) -> bool {

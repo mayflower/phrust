@@ -9589,6 +9589,33 @@ fn discarded_register_values_are_consumed_without_array_handle_clone() {
 }
 
 #[test]
+fn dense_array_layout_probes_borrow_local_handles() {
+    let result = execute_source_with_options(
+        "<?php $values = []; for ($i = 0; $i < 32; $i++) { $values[] = $i; } echo count($values);",
+        VmOptions {
+            collect_counters: true,
+            collect_profile_spans: false,
+            collect_layout_source_attribution: true,
+            execution_format: ExecutionFormat::Bytecode,
+            ..VmOptions::default()
+        },
+    );
+
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(result.output.as_bytes(), b"32");
+    let counters = result.counters.expect("counters");
+    assert_eq!(
+        counters
+            .array_handle_clone_by_source_family
+            .get(layout_source::ARRAY_ELEMENT_WRITE.name())
+            .copied()
+            .unwrap_or_default(),
+        0,
+        "packed-layout probes must borrow the local array: {counters:?}"
+    );
+}
+
+#[test]
 fn rich_echo_borrows_register_operand_for_fast_scalar_output() {
     let result = Vm::with_options(VmOptions {
         collect_counters: true,
@@ -9915,6 +9942,33 @@ fn quickening_observation_skips_non_candidate_rich_instructions() {
     assert_eq!(on.diagnostics, off.diagnostics);
     let counters = on.counters.expect("on counters");
     assert!(counters.instructions_executed > 12, "{counters:?}");
+    assert_eq!(counters.quickening_attempts, 0, "{counters:?}");
+    assert_eq!(counters.quickening_specialized, 0, "{counters:?}");
+    assert_eq!(counters.quickening_guard_hits, 0, "{counters:?}");
+}
+
+#[test]
+fn quickening_observation_skips_non_candidate_dense_instructions() {
+    // Dense loads and echoes have no specialization arm. They must not
+    // allocate or update quickening sites merely because a unit contains many
+    // of them.
+    let source = "<?php echo \"a\"; echo \"b\"; echo \"c\"; echo \"d\"; echo \"e\"; echo \"f\"; echo \"g\"; echo \"h\"; echo \"i\"; echo \"j\"; echo \"k\"; echo \"l\";";
+    let result = execute_source_with_options(
+        source,
+        VmOptions {
+            collect_counters: true,
+            collect_profile_spans: false,
+            collect_layout_source_attribution: true,
+            execution_format: ExecutionFormat::Bytecode,
+            quickening: QuickeningMode::On,
+            ..VmOptions::default()
+        },
+    );
+
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(result.output.as_bytes(), b"abcdefghijkl");
+    let counters = result.counters.expect("counters");
+    assert!(counters.bytecode_instructions_executed > 12, "{counters:?}");
     assert_eq!(counters.quickening_attempts, 0, "{counters:?}");
     assert_eq!(counters.quickening_specialized, 0, "{counters:?}");
     assert_eq!(counters.quickening_guard_hits, 0, "{counters:?}");
