@@ -869,6 +869,121 @@ pub struct DenseExecutionPlan {
     /// constructed outside the VM's plan builder; callers fall back to the
     /// per-(unit, function) memo caches.
     pub call_shape_meta: Vec<DenseCallShapeMeta>,
+    /// Slot-indexed function-call inline-cache entries, addressed by the
+    /// `cache_slot` ids the plan builder assigns to dense call instructions.
+    /// A warm call is one indexed load plus guard compares instead of the
+    /// keyed inline-cache table walks. Empty when a plan is constructed
+    /// outside the VM's plan builder.
+    pub call_slots: DenseCallSlotTable,
+}
+
+/// One slot-indexed dense function-call cache entry. The callee name is a
+/// compile-time operand of the owning instruction, so the guards are only
+/// the populating VM instance (request isolation), the function-table epoch
+/// (same invalidation the keyed table uses), and the observed call shape.
+#[derive(Clone, Debug, Default)]
+struct DenseCallSlotEntry {
+    vm_nonce: u64,
+    epoch: crate::inline_cache::InvalidationEpoch,
+    shape: Option<crate::inline_cache::FunctionCallShape>,
+    target: Option<crate::inline_cache::FunctionCallCacheTarget>,
+}
+
+/// Slot-indexed function-call inline-cache storage attached to a dense plan.
+///
+/// Plans live in a per-thread cache and are shared per thread through `Arc`,
+/// so interior mutability is single-threaded by construction. Equality
+/// deliberately ignores the mutable entries (plan equality means structural
+/// equality), and cloning a plan yields cold slots of the same capacity.
+#[derive(Debug, Default)]
+pub struct DenseCallSlotTable {
+    entries: std::cell::RefCell<Vec<DenseCallSlotEntry>>,
+}
+
+impl DenseCallSlotTable {
+    /// Creates a table with `count` cold slots.
+    #[must_use]
+    pub fn with_slot_count(count: u32) -> Self {
+        Self {
+            entries: std::cell::RefCell::new(vec![DenseCallSlotEntry::default(); count as usize]),
+        }
+    }
+
+    /// Returns the cached target when every guard matches.
+    #[must_use]
+    pub fn hit(
+        &self,
+        slot: DenseCacheSlotId,
+        vm_nonce: u64,
+        epoch: crate::inline_cache::InvalidationEpoch,
+        shape: &crate::inline_cache::FunctionCallShape,
+    ) -> Option<crate::inline_cache::FunctionCallCacheTarget> {
+        let entries = self.entries.borrow();
+        let entry = entries.get(slot.index())?;
+        if entry.vm_nonce != vm_nonce || entry.epoch != epoch {
+            return None;
+        }
+        if entry.shape.as_ref() != Some(shape) {
+            return None;
+        }
+        entry.target.clone()
+    }
+
+    /// Installs a resolved target under the given guards.
+    pub fn store(
+        &self,
+        slot: DenseCacheSlotId,
+        vm_nonce: u64,
+        epoch: crate::inline_cache::InvalidationEpoch,
+        shape: crate::inline_cache::FunctionCallShape,
+        target: crate::inline_cache::FunctionCallCacheTarget,
+    ) {
+        let mut entries = self.entries.borrow_mut();
+        let Some(entry) = entries.get_mut(slot.index()) else {
+            return;
+        };
+        entry.vm_nonce = vm_nonce;
+        entry.epoch = epoch;
+        entry.shape = Some(shape);
+        entry.target = Some(target);
+    }
+}
+
+impl Clone for DenseCallSlotTable {
+    fn clone(&self) -> Self {
+        Self::with_slot_count(self.entries.borrow().len() as u32)
+    }
+}
+
+impl PartialEq for DenseCallSlotTable {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DenseCallSlotTable {}
+
+/// Assigns sequential `cache_slot` ids to every dense call-function
+/// instruction and registers them in the unit's cache-slot side table.
+/// Returns the number of slots assigned. Runs when the VM builds an
+/// execution plan; serialized dense artifacts are unaffected.
+#[must_use]
+pub fn assign_function_call_cache_slots(unit: &mut DenseBytecodeUnit) -> u32 {
+    let mut next = unit.cache_slots.len() as u32;
+    for function in &mut unit.functions {
+        for instruction in &mut function.instructions {
+            if matches!(
+                instruction.opcode,
+                DenseOpcode::CallFunction | DenseOpcode::CallFunctionDiscard
+            ) && instruction.cache_slot.is_none()
+            {
+                instruction.cache_slot = Some(DenseCacheSlotId::new(next));
+                unit.cache_slots.push("function_call".to_owned());
+                next += 1;
+            }
+        }
+    }
+    next
 }
 
 /// Function-invariant facts the dense call path consults on every call.
@@ -1239,6 +1354,7 @@ fn lower_mixed_plan(unit: &IrUnit) -> DenseExecutionPlan {
         unit: dense,
         functions,
         call_shape_meta: Vec::new(),
+        call_slots: DenseCallSlotTable::default(),
     }
 }
 

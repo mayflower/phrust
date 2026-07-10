@@ -2672,6 +2672,10 @@ fn function_call_target_is_builtin(target: &FunctionCallCacheTarget) -> bool {
 #[derive(Clone, Debug)]
 pub struct Vm {
     options: VmOptions,
+    /// Thread-unique instance nonce guarding slot-indexed inline-cache
+    /// entries on thread-shared dense plans: entries populated by another
+    /// request's VM never validate for this one.
+    vm_nonce: u64,
     trace: RefCell<Vec<String>>,
     counters: RefCell<Option<VmCounters>>,
     literal_pool: RefCell<LiteralPool>,
@@ -2736,8 +2740,17 @@ impl Vm {
     #[must_use]
     pub fn with_options(options: VmOptions) -> Self {
         let tiering = TieringState::new(options.tiering.clone());
+        thread_local! {
+            static VM_NONCE: Cell<u64> = const { Cell::new(0) };
+        }
+        let vm_nonce = VM_NONCE.with(|nonce| {
+            let next = nonce.get().wrapping_add(1);
+            nonce.set(next);
+            next
+        });
         Self {
             options,
+            vm_nonce,
             trace: RefCell::new(Vec::new()),
             counters: RefCell::new(None),
             literal_pool: RefCell::new(LiteralPool::default()),
@@ -8004,6 +8017,8 @@ impl Vm {
             }
             self.record_counter_bytecode_lowered_families(&plan.unit);
             self.record_counter_bytecode_lower_success();
+            let slot_count = crate::bytecode::assign_function_call_cache_slots(&mut plan.unit);
+            plan.call_slots = crate::bytecode::DenseCallSlotTable::with_slot_count(slot_count);
             return Ok(plan);
         }
 
@@ -8047,6 +8062,7 @@ impl Vm {
         }
         self.record_counter_bytecode_lowered_families(&dense);
         self.record_counter_bytecode_lower_success();
+        let slot_count = crate::bytecode::assign_function_call_cache_slots(&mut dense);
         let functions = dense
             .functions
             .iter()
@@ -8056,6 +8072,7 @@ impl Vm {
             unit: dense,
             functions,
             call_shape_meta: Vec::new(),
+            call_slots: crate::bytecode::DenseCallSlotTable::with_slot_count(slot_count),
         })
     }
 
@@ -11433,57 +11450,104 @@ impl Vm {
                                 )),
                             },
                         };
-                        self.observe_dense_call_inline_cache(
-                            compiled,
-                            function_id,
-                            BlockId::new(block_index),
-                            InstrId::new(dense_instruction_index),
-                            InlineCacheKind::FunctionCall,
-                        );
-                        let cached_target = self.lookup_function_call_inline_cache(
-                            compiled,
-                            function_id,
-                            BlockId::new(block_index),
-                            InstrId::new(dense_instruction_index),
-                            &lowered_name,
-                            epoch,
-                            &call_shape,
-                        );
-                        let target = if let Some(target) = cached_target {
+                        // Slot-indexed L1 in front of the keyed inline-cache
+                        // table: the plan builder assigned this call site a
+                        // numeric cache slot, so a warm repeat is an indexed
+                        // load plus nonce/epoch/shape guards. The keyed table
+                        // stays the L2 — it still learns sites, feeds
+                        // persistent-feedback export, and serves rich sites.
+                        let call_slot = if self.options.inline_caches.enabled() {
+                            plan.and_then(|plan| instruction.cache_slot.map(|slot| (plan, slot)))
+                        } else {
+                            None
+                        };
+                        let slot_target = call_slot.and_then(|(plan, slot)| {
+                            plan.call_slots.hit(slot, self.vm_nonce, epoch, &call_shape)
+                        });
+                        let target = if let Some(target) = slot_target {
                             self.record_counter_dense_call_ic_hit();
+                            // Keep the tiering IC-stability signal alive for
+                            // slot-served sites: a monomorphic hit event with
+                            // no keyed-table walk behind it.
+                            if self.options.tiering.enabled {
+                                self.record_inline_cache_site_event(
+                                    function_id,
+                                    InstrId::new(dense_instruction_index),
+                                    InlineCacheObservation {
+                                        kind: Some(InlineCacheKind::FunctionCall),
+                                        monomorphic: true,
+                                        ..InlineCacheObservation::hit()
+                                    },
+                                );
+                            }
+                            self.record_counter_function_call_ic(true);
+                            if function_call_target_is_builtin(&target) {
+                                self.record_counter_builtin_call_ic(true);
+                            }
                             target
                         } else {
-                            self.record_counter_dense_call_ic_miss();
-                            let lowered_str =
-                                std::str::from_utf8(lowered_name.as_bytes()).unwrap_or_default();
-                            let Some(resolved) =
-                                self.resolve_function_call_target(compiled, state, lowered_str)
-                            else {
-                                self.record_counter_dense_call_fallback("unknown_function");
-                                let diagnostic = undefined_function(
-                                    name,
-                                    RuntimeSourceSpan::default(),
-                                    stack_trace(compiled, stack),
-                                );
-                                let result = VmResult::runtime_error_with_diagnostic(
-                                    output.clone(),
-                                    diagnostic.message().to_owned(),
-                                    diagnostic,
-                                );
-                                stack.pop_recycle();
-                                return result;
-                            };
-                            self.install_function_call_inline_cache(
+                            self.observe_dense_call_inline_cache(
+                                compiled,
+                                function_id,
+                                BlockId::new(block_index),
+                                InstrId::new(dense_instruction_index),
+                                InlineCacheKind::FunctionCall,
+                            );
+                            let cached_target = self.lookup_function_call_inline_cache(
                                 compiled,
                                 function_id,
                                 BlockId::new(block_index),
                                 InstrId::new(dense_instruction_index),
                                 &lowered_name,
                                 epoch,
-                                call_shape,
-                                resolved.clone(),
+                                &call_shape,
                             );
-                            resolved
+                            let target = if let Some(target) = cached_target {
+                                self.record_counter_dense_call_ic_hit();
+                                target
+                            } else {
+                                self.record_counter_dense_call_ic_miss();
+                                let lowered_str = std::str::from_utf8(lowered_name.as_bytes())
+                                    .unwrap_or_default();
+                                let Some(resolved) =
+                                    self.resolve_function_call_target(compiled, state, lowered_str)
+                                else {
+                                    self.record_counter_dense_call_fallback("unknown_function");
+                                    let diagnostic = undefined_function(
+                                        name,
+                                        RuntimeSourceSpan::default(),
+                                        stack_trace(compiled, stack),
+                                    );
+                                    let result = VmResult::runtime_error_with_diagnostic(
+                                        output.clone(),
+                                        diagnostic.message().to_owned(),
+                                        diagnostic,
+                                    );
+                                    stack.pop_recycle();
+                                    return result;
+                                };
+                                self.install_function_call_inline_cache(
+                                    compiled,
+                                    function_id,
+                                    BlockId::new(block_index),
+                                    InstrId::new(dense_instruction_index),
+                                    &lowered_name,
+                                    epoch,
+                                    call_shape.clone(),
+                                    resolved.clone(),
+                                );
+                                resolved
+                            };
+                            if let Some((plan, slot)) = call_slot {
+                                plan.call_slots.store(
+                                    slot,
+                                    self.vm_nonce,
+                                    epoch,
+                                    call_shape.clone(),
+                                    target.clone(),
+                                );
+                            }
+                            target
                         };
                         self.record_counter_dense_direct_call_hit();
                         // R1.2 fast lane: the IC resolved a current-unit dense
