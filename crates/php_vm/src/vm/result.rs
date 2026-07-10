@@ -37,10 +37,13 @@ pub struct VmResult {
     pub(super) return_ref: Option<ReferenceCell>,
     /// Deterministic trace events captured when `VmOptions::trace` is enabled.
     pub trace: Vec<String>,
-    /// Optional performance VM/runtime counters.
-    pub counters: Option<VmCounters>,
-    /// Optional performance tiering stats.
-    pub tiering_stats: Option<TieringStats>,
+    /// Optional performance VM/runtime counters. Boxed: the flat counter
+    /// struct is multiple kilobytes and only the outermost `execute`
+    /// boundary attaches it, while every nested function return moves a
+    /// `VmResult` by value.
+    pub counters: Option<Box<VmCounters>>,
+    /// Optional performance tiering stats. Boxed for the same reason.
+    pub tiering_stats: Option<Box<TieringStats>>,
 }
 
 /// VM control-flow signal, kept separate from runtime diagnostics.
@@ -296,5 +299,20 @@ mod tests {
         assert_eq!(json["context"]["block_id"], "2");
         assert_eq!(json["context"]["instruction_id"], "3");
         assert_eq!(json["context"]["opcode"], "jump");
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    /// `VmResult` is returned by value from every nested function call, so
+    /// inline payload growth multiplies across the whole interpreter. The
+    /// unboxed counters struct alone once pushed this to ~5.7 KB per return.
+    #[test]
+    fn vm_result_stays_call_sized() {
+        let size = std::mem::size_of::<super::VmResult>();
+        assert!(
+            size <= 768,
+            "VmResult grew to {size} bytes; it is moved by value on every function return — box new large fields"
+        );
     }
 }

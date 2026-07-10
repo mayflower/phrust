@@ -3113,10 +3113,10 @@ impl Vm {
                 counters.record_persistent_engine_footprint(interned_names, interned_name_bytes);
                 counters.fold_scratch_counters();
             }
-            result.counters = self.counters.borrow().clone();
+            result.counters = self.counters.borrow().clone().map(Box::new);
         }
         if self.options.tiering.collect_stats {
-            result.tiering_stats = Some(self.tiering.borrow().stats());
+            result.tiering_stats = Some(Box::new(self.tiering.borrow().stats()));
         }
         result.output = output;
         result
