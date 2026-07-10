@@ -825,6 +825,27 @@ pub struct DenseExecutionPlan {
     pub unit: DenseBytecodeUnit,
     /// Per-function execution decision.
     pub functions: Vec<DenseFunctionPlan>,
+    /// Function-invariant call-shape facts, index-aligned with the IR unit's
+    /// functions. Computed once when the plan is built so per-call dispatch
+    /// does no hashed memo lookups or body re-scans. Empty when a plan is
+    /// constructed outside the VM's plan builder; callers fall back to the
+    /// per-(unit, function) memo caches.
+    pub call_shape_meta: Vec<DenseCallShapeMeta>,
+}
+
+/// Function-invariant facts the dense call path consults on every call.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DenseCallShapeMeta {
+    /// Body contains try/catch/finally regions.
+    pub has_try_or_finally: bool,
+    /// Body may hold a destructor-sensitive value across an instruction.
+    pub may_hold_destructor_sensitive_value: bool,
+    /// Method body contains an inline-blocking construct.
+    pub has_inline_blocker: bool,
+    /// Body never observes its argument vector (func_get_args and friends).
+    pub elide_frame_args: bool,
+    /// Every parameter binds directly (no by-ref/variadic/typed-default mix).
+    pub params_bind_direct: bool,
 }
 
 impl DenseExecutionPlan {
@@ -1179,6 +1200,7 @@ fn lower_mixed_plan(unit: &IrUnit) -> DenseExecutionPlan {
     DenseExecutionPlan {
         unit: dense,
         functions,
+        call_shape_meta: Vec::new(),
     }
 }
 

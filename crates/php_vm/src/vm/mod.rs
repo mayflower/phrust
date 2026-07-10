@@ -34,9 +34,9 @@ use spl::*;
 
 use crate::aliasing::{AliasState, slot_alias_state};
 use crate::bytecode::{
-    DenseBytecodeUnit, DenseCallArg, DenseCallableKind, DenseClosureCapture, DenseExecutionPlan,
-    DenseFunction, DenseFunctionPlan, DenseInstruction, DenseOpcode, DenseOperand,
-    DenseOperandKind, DenseOperands, SuperinstructionSelectionReport,
+    DenseBytecodeUnit, DenseCallArg, DenseCallShapeMeta, DenseCallableKind, DenseClosureCapture,
+    DenseExecutionPlan, DenseFunction, DenseFunctionPlan, DenseInstruction, DenseOpcode,
+    DenseOperand, DenseOperandKind, DenseOperands, SuperinstructionSelectionReport,
 };
 use crate::compiled_unit::{CompiledUnit, DenseExecutionArtifactKey, DenseExecutionArtifactMode};
 #[cfg(feature = "jit-cranelift")]
@@ -1590,133 +1590,88 @@ fn gc_roots_from_vm(stack: &CallStack, state: &ExecutionState) -> Vec<GcRoot> {
     roots
 }
 
-fn php_visible_root_object_ids(stack: &CallStack, state: &ExecutionState) -> HashSet<u64> {
-    // The root scan reads every live register, local, and object snapshot;
-    // its clones are scan overhead, not program dataflow.
-    let _source = layout_source::enter(layout_source::GC_ROOT_SCAN);
-    let mut object_ids = HashSet::new();
-    let mut seen = HashSet::new();
-    for frame in stack.frames() {
-        for (_, value) in frame.registers.iter() {
-            collect_reachable_object_ids(value, &mut seen, &mut object_ids);
-        }
-        for (_, slot) in frame.locals.iter() {
-            collect_reachable_object_ids(&slot.read(), &mut seen, &mut object_ids);
-        }
-    }
-    for cell in state.static_locals.values() {
-        collect_reachable_object_ids(&Value::Reference(cell.clone()), &mut seen, &mut object_ids);
-    }
-    for value in state.static_properties.values() {
-        collect_reachable_object_ids(value, &mut seen, &mut object_ids);
-    }
-    for object in state.enum_cases.values() {
-        object_ids.insert(object.id());
-    }
-    for entry in &state.shutdown_functions {
-        collect_reachable_object_ids(&entry.callback, &mut seen, &mut object_ids);
-        for arg in &entry.args {
-            collect_reachable_object_ids(&arg.value, &mut seen, &mut object_ids);
-        }
-    }
-    for callback in state.autoload_registry.callbacks() {
-        collect_reachable_object_ids(
-            &Value::Callable(Box::new(callback.clone())),
-            &mut seen,
-            &mut object_ids,
-        );
-    }
-    collect_reachable_object_ids(
-        &Value::Array(state.globals.globals_array()),
-        &mut seen,
-        &mut object_ids,
-    );
-    for continuation in state.generator_continuations.values() {
-        for (_, value) in continuation.frame.registers.iter() {
-            collect_reachable_object_ids(value, &mut seen, &mut object_ids);
-        }
-        for (_, slot) in continuation.frame.locals.iter() {
-            collect_reachable_object_ids(&slot.read(), &mut seen, &mut object_ids);
-        }
-    }
-    for continuations in state.fiber_continuations.values() {
-        for continuation in continuations {
-            for (_, value) in continuation.frame.registers.iter() {
-                collect_reachable_object_ids(value, &mut seen, &mut object_ids);
-            }
-            for (_, slot) in continuation.frame.locals.iter() {
-                collect_reachable_object_ids(&slot.read(), &mut seen, &mut object_ids);
-            }
-        }
-    }
-    object_ids
+fn php_visible_root_object_ids(stack: &CallStack, state: &ExecutionState) -> GcObjectIdSet {
+    collect_root_object_ids(stack, state, true)
 }
 
 fn php_visible_non_register_root_object_ids(
     stack: &CallStack,
     state: &ExecutionState,
-) -> HashSet<u64> {
-    let mut object_ids = HashSet::new();
-    let mut seen = HashSet::new();
+) -> GcObjectIdSet {
+    collect_root_object_ids(stack, state, false)
+}
+
+fn collect_root_object_ids(
+    stack: &CallStack,
+    state: &ExecutionState,
+    include_current_registers: bool,
+) -> GcObjectIdSet {
+    // The root scan walks every live register, local, and object graph. It
+    // traverses borrowed values and only refcount-bumps container handles
+    // into the work list; per-value deep clones are scan overhead.
+    let _source = layout_source::enter(layout_source::GC_ROOT_SCAN);
+    let mut object_ids = GcObjectIdSet::default();
+    let mut seen = GcSeenSet::default();
+    let mut pending = Vec::new();
     for frame in stack.frames() {
+        if include_current_registers {
+            for (_, value) in frame.registers.iter() {
+                gc_note_value(value, &mut seen, &mut object_ids, &mut pending);
+            }
+        }
         for (_, slot) in frame.locals.iter() {
-            collect_reachable_object_ids(&slot.read(), &mut seen, &mut object_ids);
+            gc_note_slot(slot, &mut seen, &mut object_ids, &mut pending);
         }
     }
     for cell in state.static_locals.values() {
-        collect_reachable_object_ids(&Value::Reference(cell.clone()), &mut seen, &mut object_ids);
+        gc_note_reference(cell, &mut seen, &mut pending);
     }
     for value in state.static_properties.values() {
-        collect_reachable_object_ids(value, &mut seen, &mut object_ids);
+        gc_note_value(value, &mut seen, &mut object_ids, &mut pending);
     }
     for object in state.enum_cases.values() {
         object_ids.insert(object.id());
     }
     for entry in &state.shutdown_functions {
-        collect_reachable_object_ids(&entry.callback, &mut seen, &mut object_ids);
+        gc_note_value(&entry.callback, &mut seen, &mut object_ids, &mut pending);
         for arg in &entry.args {
-            collect_reachable_object_ids(&arg.value, &mut seen, &mut object_ids);
+            gc_note_value(&arg.value, &mut seen, &mut object_ids, &mut pending);
         }
     }
     for callback in state.autoload_registry.callbacks() {
-        collect_reachable_object_ids(
-            &Value::Callable(Box::new(callback.clone())),
-            &mut seen,
-            &mut object_ids,
-        );
+        gc_note_callable(callback, &mut seen, &mut object_ids, &mut pending);
     }
-    collect_reachable_object_ids(
-        &Value::Array(state.globals.globals_array()),
-        &mut seen,
-        &mut object_ids,
-    );
+    gc_note_array(&state.globals.globals_array(), &mut seen, &mut pending);
     for continuation in state.generator_continuations.values() {
         for (_, value) in continuation.frame.registers.iter() {
-            collect_reachable_object_ids(value, &mut seen, &mut object_ids);
+            gc_note_value(value, &mut seen, &mut object_ids, &mut pending);
         }
         for (_, slot) in continuation.frame.locals.iter() {
-            collect_reachable_object_ids(&slot.read(), &mut seen, &mut object_ids);
+            gc_note_slot(slot, &mut seen, &mut object_ids, &mut pending);
         }
     }
     for continuations in state.fiber_continuations.values() {
         for continuation in continuations {
             for (_, value) in continuation.frame.registers.iter() {
-                collect_reachable_object_ids(value, &mut seen, &mut object_ids);
+                gc_note_value(value, &mut seen, &mut object_ids, &mut pending);
             }
             for (_, slot) in continuation.frame.locals.iter() {
-                collect_reachable_object_ids(&slot.read(), &mut seen, &mut object_ids);
+                gc_note_slot(slot, &mut seen, &mut object_ids, &mut pending);
             }
         }
     }
+    gc_drain_reachable(&mut seen, &mut object_ids, &mut pending);
     object_ids
 }
 
-fn preserved_destructor_object_ids(preserved: &[Value]) -> HashSet<u64> {
-    let mut seen = HashSet::new();
-    let mut object_ids = HashSet::new();
+fn preserved_destructor_object_ids(preserved: &[Value]) -> GcObjectIdSet {
+    let mut seen = GcSeenSet::default();
+    let mut object_ids = GcObjectIdSet::default();
+    let mut pending = Vec::new();
     for value in preserved {
-        collect_reachable_object_ids(value, &mut seen, &mut object_ids);
+        gc_note_value(value, &mut seen, &mut object_ids, &mut pending);
     }
+    gc_drain_reachable(&mut seen, &mut object_ids, &mut pending);
     object_ids
 }
 
@@ -1726,78 +1681,172 @@ fn destructor_candidates_for_value(value: &Value) -> Vec<ObjectRef> {
     candidates
 }
 
-fn collect_reachable_object_ids(
+/// Multiply-shift hasher for the GC scan's process-local entity ids. The
+/// scan visits ~10^6 nodes per WordPress request and SipHash on the seen-sets
+/// shows up in clean profiles; sequential ids need only multiplicative
+/// dispersion.
+#[derive(Default)]
+struct GcIdHasher(u64);
+
+impl std::hash::Hasher for GcIdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.0 = (self.0 ^ u64::from(value)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0 ^ value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type GcIdBuildHasher = std::hash::BuildHasherDefault<GcIdHasher>;
+type GcSeenSet = HashSet<GcEntityId, GcIdBuildHasher>;
+type GcObjectIdSet = HashSet<u64, GcIdBuildHasher>;
+
+/// Container handle queued by the reachability walk. Holding the handle is a
+/// refcount bump; contents are traversed borrowed when the entry is drained.
+enum GcPendingEntity {
+    Array(PhpArray),
+    Object(ObjectRef),
+    Reference(ReferenceCell),
+}
+
+/// Notes one value for the reachability walk: records object ids, and queues
+/// unseen containers for traversal. Scalars never clone.
+fn gc_note_value(
     value: &Value,
-    seen: &mut HashSet<GcEntityId>,
-    object_ids: &mut HashSet<u64>,
+    seen: &mut GcSeenSet,
+    object_ids: &mut GcObjectIdSet,
+    pending: &mut Vec<GcPendingEntity>,
 ) {
-    let mut pending = vec![value.clone()];
-    while let Some(value) = pending.pop() {
-        match value {
-            Value::Array(array) => {
-                let id = GcEntityId::new(GcEntityKind::Array, array.gc_debug_id() as u64);
-                if !seen.insert(id) {
-                    continue;
+    match value {
+        Value::Array(array) => gc_note_array(array, seen, pending),
+        Value::Object(object) => gc_note_object(object, seen, object_ids, pending),
+        Value::Reference(cell) => gc_note_reference(cell, seen, pending),
+        Value::Callable(callable) => gc_note_callable(callable, seen, object_ids, pending),
+        Value::Null
+        | Value::Bool(_)
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::String(_)
+        | Value::Resource(_)
+        | Value::Generator(_)
+        | Value::Fiber(_)
+        | Value::Uninitialized => {}
+    }
+}
+
+fn gc_note_slot(
+    slot: &Slot,
+    seen: &mut GcSeenSet,
+    object_ids: &mut GcObjectIdSet,
+    pending: &mut Vec<GcPendingEntity>,
+) {
+    match slot {
+        Slot::Value(value) => gc_note_value(value, seen, object_ids, pending),
+        Slot::Reference(cell) => gc_note_reference(cell, seen, pending),
+    }
+}
+
+fn gc_note_array(array: &PhpArray, seen: &mut GcSeenSet, pending: &mut Vec<GcPendingEntity>) {
+    let id = GcEntityId::new(GcEntityKind::Array, array.gc_debug_id() as u64);
+    if seen.insert(id) {
+        pending.push(GcPendingEntity::Array(array.clone()));
+    }
+}
+
+fn gc_note_object(
+    object: &ObjectRef,
+    seen: &mut GcSeenSet,
+    object_ids: &mut GcObjectIdSet,
+    pending: &mut Vec<GcPendingEntity>,
+) {
+    object_ids.insert(object.id());
+    let id = GcEntityId::new(GcEntityKind::Object, object.id());
+    if seen.insert(id) {
+        pending.push(GcPendingEntity::Object(object.clone()));
+    }
+}
+
+fn gc_note_reference(
+    cell: &ReferenceCell,
+    seen: &mut GcSeenSet,
+    pending: &mut Vec<GcPendingEntity>,
+) {
+    let id = GcEntityId::new(GcEntityKind::Reference, cell.gc_debug_id() as u64);
+    if seen.insert(id) {
+        pending.push(GcPendingEntity::Reference(cell.clone()));
+    }
+}
+
+fn gc_note_callable(
+    callable: &CallableValue,
+    seen: &mut GcSeenSet,
+    object_ids: &mut GcObjectIdSet,
+    pending: &mut Vec<GcPendingEntity>,
+) {
+    match callable {
+        CallableValue::Closure(payload) => {
+            for capture in &payload.captures {
+                if let Some(value) = &capture.value {
+                    gc_note_value(value, seen, object_ids, pending);
                 }
-                for (_, value) in array.iter() {
-                    pending.push(value.clone());
+                if let Some(cell) = &capture.reference {
+                    gc_note_reference(cell, seen, pending);
                 }
             }
-            Value::Object(object) => {
-                object_ids.insert(object.id());
-                let id = GcEntityId::new(GcEntityKind::Object, object.id());
-                if !seen.insert(id) {
-                    continue;
-                }
-                for (_, value) in object.properties_snapshot() {
-                    pending.push(value);
+            if let Some(bound_this) = &payload.bound_this {
+                gc_note_object(bound_this, seen, object_ids, pending);
+            }
+        }
+        CallableValue::BoundMethod {
+            target: CallableMethodTarget::Object(object),
+            ..
+        } => {
+            gc_note_object(object, seen, object_ids, pending);
+        }
+        CallableValue::UserFunction { .. }
+        | CallableValue::InternalBuiltin { .. }
+        | CallableValue::BoundMethod {
+            target: CallableMethodTarget::Class(_),
+            ..
+        }
+        | CallableValue::MethodPlaceholder { .. }
+        | CallableValue::UnresolvedDynamic { .. } => {}
+    }
+}
+
+/// Drains queued containers, traversing their contents borrowed.
+fn gc_drain_reachable(
+    seen: &mut GcSeenSet,
+    object_ids: &mut GcObjectIdSet,
+    pending: &mut Vec<GcPendingEntity>,
+) {
+    while let Some(entity) = pending.pop() {
+        match entity {
+            GcPendingEntity::Array(array) => {
+                for (_, element) in array.iter() {
+                    gc_note_value(element, seen, object_ids, pending);
                 }
             }
-            Value::Reference(cell) => {
-                let id = GcEntityId::new(GcEntityKind::Reference, cell.gc_debug_id() as u64);
-                if !seen.insert(id) {
-                    continue;
-                }
-                pending.push(cell.get());
+            GcPendingEntity::Object(object) => {
+                object.visit_property_values(|value| {
+                    gc_note_value(value, seen, object_ids, pending);
+                });
             }
-            Value::Callable(callable) => match *callable {
-                CallableValue::Closure(payload) => {
-                    for capture in payload.captures {
-                        if let Some(value) = capture.value {
-                            pending.push(value);
-                        }
-                        if let Some(cell) = capture.reference {
-                            pending.push(Value::Reference(cell));
-                        }
-                    }
-                    if let Some(bound_this) = payload.bound_this {
-                        pending.push(Value::Object(bound_this));
-                    }
-                }
-                CallableValue::BoundMethod {
-                    target: CallableMethodTarget::Object(object),
-                    ..
-                } => {
-                    pending.push(Value::Object(object));
-                }
-                CallableValue::UserFunction { .. }
-                | CallableValue::InternalBuiltin { .. }
-                | CallableValue::BoundMethod {
-                    target: CallableMethodTarget::Class(_),
-                    ..
-                }
-                | CallableValue::MethodPlaceholder { .. }
-                | CallableValue::UnresolvedDynamic { .. } => {}
-            },
-            Value::Null
-            | Value::Bool(_)
-            | Value::Int(_)
-            | Value::Float(_)
-            | Value::String(_)
-            | Value::Resource(_)
-            | Value::Generator(_)
-            | Value::Fiber(_)
-            | Value::Uninitialized => {}
+            GcPendingEntity::Reference(cell) => {
+                let value = cell.borrow();
+                gc_note_value(&value, seen, object_ids, pending);
+            }
         }
     }
 }
@@ -1823,16 +1872,16 @@ fn collect_destructor_candidate_objects(
                 return;
             }
             candidates.push(object.clone());
-            for (_, value) in object.properties_snapshot() {
-                collect_destructor_candidate_objects(&value, seen, candidates);
-            }
+            object.visit_property_values(|value| {
+                collect_destructor_candidate_objects(value, seen, candidates);
+            });
         }
         Value::Reference(cell) => {
             let id = GcEntityId::new(GcEntityKind::Reference, cell.gc_debug_id() as u64);
             if !seen.insert(id) {
                 return;
             }
-            let value = cell.get();
+            let value = cell.borrow();
             collect_destructor_candidate_objects(&value, seen, candidates);
         }
         Value::Callable(callable) => match callable.as_ref() {
@@ -2186,6 +2235,24 @@ struct FrameShapeFlags {
     has_try_or_finally: bool,
     may_hold_destructor_sensitive_value: bool,
     has_inline_blocker: bool,
+}
+
+/// Precomputes the function-invariant call-shape facts for every function in
+/// a unit. Runs once per built execution plan; the per-call dispatch path
+/// indexes the result instead of consulting hashed memo caches.
+fn dense_call_shape_meta_for_unit(unit: &php_ir::module::IrUnit) -> Vec<DenseCallShapeMeta> {
+    unit.functions
+        .iter()
+        .map(|function| DenseCallShapeMeta {
+            has_try_or_finally: function_has_try_or_finally(function),
+            may_hold_destructor_sensitive_value: function_may_hold_destructor_sensitive_value(
+                function,
+            ),
+            has_inline_blocker: method_body_has_inline_blocker(function),
+            elide_frame_args: !function_body_observes_argument_vector(function),
+            params_bind_direct: arguments::params_bind_direct(function),
+        })
+        .collect()
 }
 
 fn frame_reuse_call_shape_blocked_reason(
@@ -7800,7 +7867,11 @@ impl Vm {
         }
 
         #[allow(clippy::arc_with_non_send_sync)] // plan sharing predates a Send-safe design
-        let plan = Arc::new(self.build_dense_execution_plan(compiled)?);
+        let plan = Arc::new({
+            let mut plan = self.build_dense_execution_plan(compiled)?;
+            plan.call_shape_meta = dense_call_shape_meta_for_unit(compiled.unit());
+            plan
+        });
         DENSE_EXECUTION_PLAN_THREAD_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             if cache.len() >= DENSE_EXECUTION_PLAN_THREAD_CACHE_MAX {
@@ -7914,6 +7985,7 @@ impl Vm {
         Ok(DenseExecutionPlan {
             unit: dense,
             functions,
+            call_shape_meta: Vec::new(),
         })
     }
 
@@ -8174,7 +8246,20 @@ impl Vm {
             );
         }
         let mut diagnostics = Vec::new();
-        let frame_shape = self.frame_shape_flags(compiled, function_id, ir_function);
+        // Function-invariant call-shape facts come from the execution plan
+        // when it carries them (one Vec index) and fall back to the hashed
+        // per-(unit, function) memo caches for plan-less calls.
+        let call_shape_meta = plan
+            .and_then(|plan| plan.call_shape_meta.get(function_id.index()))
+            .copied();
+        let frame_shape = match call_shape_meta {
+            Some(meta) => FrameShapeFlags {
+                has_try_or_finally: meta.has_try_or_finally,
+                may_hold_destructor_sensitive_value: meta.may_hold_destructor_sensitive_value,
+                has_inline_blocker: meta.has_inline_blocker,
+            },
+            None => self.frame_shape_flags(compiled, function_id, ir_function),
+        };
         let frame_reuse_call_shape_reason = frame_reuse_call_shape_blocked_reason(
             ir_function,
             &call,
@@ -8183,7 +8268,10 @@ impl Vm {
         );
         let frame_layout = call_frame_layout_class(ir_function, &call, frame_shape);
         let argument_policy = call.argument_binding_policy(compiled);
-        let elide_frame_args = self.frame_args_elidable(compiled, function_id, ir_function);
+        let elide_frame_args = match call_shape_meta {
+            Some(meta) => meta.elide_frame_args,
+            None => self.frame_args_elidable(compiled, function_id, ir_function),
+        };
         self.record_counter_direct_frame(frame_layout, ir_function, elide_frame_args);
         // R1 fast path: an exact-arity plain-positional by-value call binds its
         // arguments straight into the callee frame's locals, reusing the
@@ -10863,8 +10951,10 @@ impl Vm {
                             )
                             && let Some(callee) = compiled.unit().functions.get(function.index())
                             && args.len() == callee.params.len()
-                            && arguments::params_bind_direct(callee)
-                            && self.frame_args_elidable(compiled, *function, callee)
+                            && let Some(callee_meta) =
+                                plan.call_shape_meta.get(function.index()).copied()
+                            && callee_meta.params_bind_direct
+                            && callee_meta.elide_frame_args
                         {
                             let mut positional = Vec::with_capacity(args.len());
                             for arg in args {
@@ -15446,12 +15536,17 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> VmResult {
-        let function_profile = compiled
-            .unit()
-            .functions
-            .get(function_id.index())
-            .map(|function| (function.name.clone(), function.flags.is_method));
         let profile_boundary = self.request_profile_boundary_start();
+        // The name clone only pays off when a profile boundary is active;
+        // unprofiled requests skip it on every call.
+        let function_profile = profile_boundary.is_some().then(|| {
+            compiled
+                .unit()
+                .functions
+                .get(function_id.index())
+                .map(|function| (function.name.clone(), function.flags.is_method))
+        });
+        let function_profile = function_profile.flatten();
         let result = self.execute_function_inner(compiled, function_id, call, output, stack, state);
         if let Some((name, is_method)) = function_profile {
             self.record_counter_function_profile(&name, is_method, profile_boundary);
@@ -35677,9 +35772,10 @@ impl Vm {
                             // without this a densely executed function/method
                             // would silently vanish from the profiler's
                             // per-name attribution.
-                            let function_profile =
-                                Some((ir_function.name.clone(), ir_function.flags.is_method));
                             let profile_boundary = self.request_profile_boundary_start();
+                            let function_profile = profile_boundary
+                                .is_some()
+                                .then(|| (ir_function.name.clone(), ir_function.flags.is_method));
                             let result = self.execute_bytecode_function(
                                 unit,
                                 &active_plan.unit,
@@ -42180,7 +42276,7 @@ impl Vm {
         handlers: &mut Vec<ExceptionHandler>,
         pending_control: &mut Option<PendingControl>,
         candidates: Vec<ObjectRef>,
-        rooted_object_ids: &HashSet<u64>,
+        rooted_object_ids: &GcObjectIdSet,
         scope_override: Option<&str>,
     ) -> DestructorSweep {
         for object in candidates {

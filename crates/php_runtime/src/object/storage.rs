@@ -583,6 +583,20 @@ impl ObjectRef {
         self.storage.borrow().snapshot()
     }
 
+    /// Visits every present property value (declared slots, then dynamic
+    /// properties) without materializing a snapshot vector. Covers the same
+    /// value set as [`Self::properties_snapshot`]; property names and order
+    /// are not exposed.
+    pub fn visit_property_values(&self, mut visit: impl FnMut(&Value)) {
+        let storage = self.storage.borrow();
+        for value in storage.declared_slots.iter().flatten() {
+            visit(value);
+        }
+        for value in storage.dynamic_properties.values() {
+            visit(value);
+        }
+    }
+
     /// Attempts to snapshot runtime properties without panicking on nested borrows.
     pub fn try_properties_snapshot(&self) -> Result<Vec<(String, Value)>, BorrowError> {
         self.storage.try_borrow().map(|storage| storage.snapshot())
