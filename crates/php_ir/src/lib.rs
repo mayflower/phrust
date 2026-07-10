@@ -13,6 +13,7 @@ pub const IR_LOWERING_REVISION: u32 = 3;
 
 pub mod block;
 pub mod builder;
+pub mod compilation;
 pub mod constants;
 pub mod display;
 pub mod function;
@@ -28,6 +29,10 @@ pub mod verify;
 
 pub use block::{BasicBlock, Terminator};
 pub use builder::IrBuilder;
+pub use compilation::{
+    CompilationCycle, CompilationDependency, CompilationFileId, CompilationSession,
+    CompilationSource, UnresolvedTraitRequest,
+};
 pub use constants::IrConstant;
 pub use function::{FunctionFlags, IrCapture, IrFunction, IrParam, IrReturnType};
 pub use ids::{BlockId, ClassId, ConstId, FileId, FunctionId, InstrId, LocalId, RegId, UnitId};
@@ -38,7 +43,7 @@ pub use instruction::{
 pub use lower::{
     LoweringContext, LoweringDiagnostic, LoweringDiagnosticPayload, LoweringOptions,
     LoweringResult, MISSING_TRAIT_DIAGNOSTIC_CODE, MissingTraitDiagnostic, MissingTraitOwnerKind,
-    UnsupportedFeature, lower_frontend_result,
+    UnsupportedFeature, lower_compilation_session, lower_frontend_result,
 };
 pub use module::{
     AttributeEntry, ClassEntry, ClassEnumBackingType, ClassEnumCaseEntry, ClassFlags,

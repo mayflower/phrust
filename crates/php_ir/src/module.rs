@@ -330,6 +330,19 @@ pub struct IrUnit {
     pub classes: Vec<ClassEntry>,
     /// File/source table.
     pub files: Vec<FileEntry>,
+    /// Top-level functions for linked source files in dependency execution order.
+    ///
+    /// The final entry is the primary file. Single-file units leave this empty
+    /// and execute `entry` directly for backward-compatible serialization.
+    #[serde(default)]
+    pub linked_file_entries: Vec<FunctionId>,
+    /// Per-file `declare(strict_types=1)` metadata indexed by [`FileId`].
+    ///
+    /// `strict_types` remains the entry-file compatibility value. Multi-file
+    /// compilation must use this table so dependency methods retain the mode
+    /// of the file that declared them.
+    #[serde(default)]
+    pub file_strict_types: Vec<bool>,
     /// Entry function.
     pub entry: FunctionId,
     /// File-level `declare(strict_types=1)` for the current single-file unit.
@@ -351,10 +364,30 @@ impl IrUnit {
             constant_table: Vec::new(),
             classes: Vec::new(),
             files: Vec::new(),
+            linked_file_entries: Vec::new(),
+            file_strict_types: Vec::new(),
             entry: FunctionId::new(0),
             strict_types: false,
             source_map: IrSourceMap::new(),
         }
+    }
+
+    /// Returns the strict-types mode of the source file containing `span`.
+    #[must_use]
+    pub fn strict_types_for_span(&self, span: IrSpan) -> bool {
+        self.file_strict_types
+            .get(span.file.index())
+            .copied()
+            .unwrap_or(self.strict_types)
+    }
+
+    /// Returns the strict-types mode of the file declaring `function`.
+    #[must_use]
+    pub fn strict_types_for_function(&self, function: FunctionId) -> bool {
+        self.functions
+            .get(function.index())
+            .map(|function| self.strict_types_for_span(function.span))
+            .unwrap_or(self.strict_types)
     }
 }
 

@@ -12,6 +12,7 @@ mod calls;
 mod dense_method_dispatch;
 mod ext_redis;
 mod generator_fiber;
+mod include_execution;
 mod layout_source;
 mod operand_read;
 mod options;
@@ -2138,7 +2139,15 @@ impl FunctionCall<'_> {
         fallback_compiled: &CompiledUnit,
     ) -> arguments::ArgumentBindingPolicy {
         let strict_types = self
-            .call_site_strict_types
+            .call_span
+            .map(|span| {
+                self.error_context_compiled
+                    .as_ref()
+                    .unwrap_or(fallback_compiled)
+                    .unit()
+                    .strict_types_for_span(span)
+            })
+            .or(self.call_site_strict_types)
             .or_else(|| {
                 self.error_context_compiled
                     .as_ref()
@@ -3346,33 +3355,6 @@ impl Vm {
         }
     }
 
-    fn record_counter_dense_include_entry_attempt(&self) {
-        if !self.options.collect_counters {
-            return;
-        }
-        if let Some(counters) = self.counters.borrow_mut().as_mut() {
-            counters.record_dense_include_entry_attempt();
-        }
-    }
-
-    fn record_counter_dense_include_entry_success(&self) {
-        if !self.options.collect_counters {
-            return;
-        }
-        if let Some(counters) = self.counters.borrow_mut().as_mut() {
-            counters.record_dense_include_entry_success();
-        }
-    }
-
-    fn record_counter_dense_include_entry_fallback(&self, reason: &str, path: &str) {
-        if !self.options.collect_counters {
-            return;
-        }
-        if let Some(counters) = self.counters.borrow_mut().as_mut() {
-            counters.record_dense_include_entry_fallback(reason, path);
-        }
-    }
-
     fn record_counter_dense_block_entry(&self, function: u32, block: u32) {
         if !self.options.collect_counters {
             return;
@@ -3441,33 +3423,6 @@ impl Vm {
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_autoload();
-        }
-    }
-
-    fn record_counter_include_compile_miss(&self) {
-        if !self.options.collect_counters {
-            return;
-        }
-        if let Some(counters) = self.counters.borrow_mut().as_mut() {
-            counters.record_include_compile_miss();
-        }
-    }
-
-    fn record_counter_include_once_skip(&self) {
-        if !self.options.collect_counters {
-            return;
-        }
-        if let Some(counters) = self.counters.borrow_mut().as_mut() {
-            counters.record_include_once_skip();
-        }
-    }
-
-    fn record_counter_include_stale_invalidation_by_reason(&self, reason: &str) {
-        if !self.options.collect_counters {
-            return;
-        }
-        if let Some(counters) = self.counters.borrow_mut().as_mut() {
-            counters.record_include_stale_invalidation_by_reason(reason);
         }
     }
 
@@ -6800,15 +6755,6 @@ impl Vm {
         trace.push(format!("step={step} runtime {}", event.as_ref()));
     }
 
-    fn record_include_trace_event(&self, event: impl AsRef<str>) {
-        if !(self.options.trace_includes || self.options.trace_runtime) {
-            return;
-        }
-        let mut trace = self.trace.borrow_mut();
-        let step = trace.len() + 1;
-        trace.push(format!("step={step} include {}", event.as_ref()));
-    }
-
     fn record_gc_root_trace_event(&self, stack: &CallStack, state: &ExecutionState) {
         if !self.options.trace_runtime {
             return;
@@ -8178,67 +8124,6 @@ impl Vm {
                 }
             }
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn execute_include_entry(
-        &self,
-        included: &CompiledUnit,
-        call: FunctionCall<'_>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> VmResult {
-        let included_path_label = included
-            .unit()
-            .files
-            .first()
-            .map(|file| file.path.clone())
-            .unwrap_or_default();
-        if self.options.dense_include_execution.is_enabled()
-            && self.options.execution_format.attempts_bytecode()
-        {
-            self.record_counter_dense_include_entry_attempt();
-            match self.try_execute_dense_function_entry(
-                included,
-                included.unit().entry,
-                call,
-                output,
-                stack,
-                state,
-            ) {
-                BytecodeFunctionAttempt::Executed(result, BytecodeFunctionTier::Dense) => {
-                    self.record_counter_dense_include_entry_success();
-                    return *result;
-                }
-                BytecodeFunctionAttempt::Executed(
-                    result,
-                    BytecodeFunctionTier::RichFallback(reason),
-                ) => {
-                    self.record_counter_dense_include_entry_fallback(&reason, &included_path_label);
-                    return *result;
-                }
-                BytecodeFunctionAttempt::Unsupported(message, call) => {
-                    let reason = dense_bytecode_unsupported_reason(&message);
-                    self.record_counter_bytecode_unsupported_reason(reason);
-                    self.record_counter_dense_include_entry_fallback(reason, &included_path_label);
-                    if self.options.execution_format.is_strict_bytecode() {
-                        return VmResult::unsupported(output.clone(), message);
-                    }
-                    self.record_counter_bytecode_unsupported_fallback();
-                    self.record_counter_bytecode_auto_fallback_reason(reason);
-                    return self.execute_function(
-                        included,
-                        included.unit().entry,
-                        call,
-                        output,
-                        stack,
-                        state,
-                    );
-                }
-            }
-        }
-        self.execute_function(included, included.unit().entry, call, output, stack, state)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -45213,28 +45098,6 @@ impl Vm {
             .functions
             .get(function_id.index())
             .is_some_and(|function| function.flags.is_top_level);
-        let call = FunctionCall {
-            positional_values: Vec::new(),
-            args: Vec::new(),
-            captures: Vec::new(),
-            call_span: Some(instruction_span),
-            call_site_strict_types: Some(compiled.unit().strict_types),
-            error_context_compiled: None,
-            allow_by_ref_value_warnings: false,
-            by_ref_warning_callable_name: None,
-            this_value: None,
-            scope_class: None,
-            called_class: None,
-            declaring_class: None,
-            shared_top_level_locals: Some(&mut shared),
-            shared_top_level_bind_missing_globals: caller_is_top_level,
-            running_generator: None,
-            resume_continuation: None,
-            resume_input: None,
-            running_fiber: None,
-            resume_fiber_continuation: None,
-            resume_fiber_input: None,
-        };
         let included_path = included
             .unit()
             .files
@@ -45254,7 +45117,16 @@ impl Vm {
         self.include_execution_depth
             .set(prior_include_depth.saturating_add(1));
         let include_profile_boundary = self.request_profile_boundary_start();
-        let mut result = self.execute_include_entry(&included, call, output, stack, state);
+        let mut result = self.execute_linked_include_entries(
+            compiled,
+            &included,
+            instruction_span,
+            caller_is_top_level,
+            &mut shared,
+            output,
+            stack,
+            state,
+        );
         self.include_execution_depth.set(prior_include_depth);
         self.record_counter_include_profile(
             &included_path.display().to_string(),

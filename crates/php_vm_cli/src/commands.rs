@@ -1,4 +1,7 @@
 //! php-vm command implementation.
+mod phase_timing;
+
+use phase_timing::PhaseTimingCollector;
 use php_bytecode_cache::{
     CacheArtifact, CacheFingerprint, CacheFingerprintInput, CacheHeader, CachedIrArtifact,
     PHP_TARGET_VERSION,
@@ -42,44 +45,6 @@ const EXIT_RUNTIME_ERROR: i32 = 3;
 const EXIT_UNSUPPORTED: i32 = 4;
 const EXIT_USAGE: i32 = 5;
 const EXIT_PHP_FATAL_ERROR: i32 = 255;
-
-#[derive(Debug)]
-struct PhaseTimingCollector {
-    report: PhaseTimingReport,
-    started: Instant,
-}
-
-impl PhaseTimingCollector {
-    fn new(command: impl Into<String>, path: impl Into<String>) -> Self {
-        Self {
-            report: PhaseTimingReport::new(command, path),
-            started: Instant::now(),
-        }
-    }
-
-    fn record_phase(&mut self, name: impl Into<String>, started: Instant) {
-        self.report
-            .phases
-            .insert(name.into(), started.elapsed().as_secs_f64() * 1000.0);
-    }
-
-    fn add_phase_ms(&mut self, name: impl Into<String>, elapsed_ms: f64) {
-        self.report.phases.insert(name.into(), elapsed_ms);
-    }
-
-    fn count(&mut self, name: impl Into<String>, value: u64) {
-        self.report.counts.insert(name.into(), value);
-    }
-
-    fn flag(&mut self, name: impl Into<String>, value: impl Into<String>) {
-        self.report.flags.insert(name.into(), value.into());
-    }
-
-    fn finish(mut self) -> PhaseTimingReport {
-        self.report.total_internal_ms = self.started.elapsed().as_secs_f64() * 1000.0;
-        self.report
-    }
-}
 
 pub(crate) fn main_entry() {
     let mut stdin = io::stdin();

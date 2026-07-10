@@ -5528,6 +5528,127 @@ fn include_cache_invalidates_dynamic_declaration_strict_types_after_file_edit() 
 }
 
 #[test]
+fn linked_trait_calls_use_the_declaring_files_strict_types_mode() {
+    let root = std::env::temp_dir().join(format!(
+        "phrust-vm-linked-trait-strict-types-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(root.join("Traits")).expect("trait directory should be created");
+    std::fs::write(
+        root.join("Registry.php"),
+        "<?php
+            namespace Demo;
+            use Demo\\Traits\\WeakCalls;
+            use Demo\\Traits\\StrictCalls;
+            function accepts_int(int $value): void { echo $value, '|'; }
+            class Registry { use WeakCalls; use StrictCalls; }
+        ",
+    )
+    .expect("registry should be written");
+    std::fs::write(
+        root.join("Traits/WeakCalls.php"),
+        "<?php declare(strict_types=0); namespace Demo\\Traits;
+            trait WeakCalls { public function weakCall(): void { \\Demo\\accepts_int('41'); } }
+        ",
+    )
+    .expect("weak trait should be written");
+    std::fs::write(
+        root.join("Traits/StrictCalls.php"),
+        "<?php declare(strict_types=1); namespace Demo\\Traits;
+            trait StrictCalls { public function strictCall(): void { \\Demo\\accepts_int('42'); } }
+        ",
+    )
+    .expect("strict trait should be written");
+    let result = execute_source_with_options_and_path(
+        "<?php include 'Registry.php'; $registry = new Demo\\Registry(); $registry->weakCall(); $registry->strictCall(); echo 'unreachable';",
+        VmOptions {
+            include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
+            runtime_context: RuntimeContext::default().with_cwd(root.clone()),
+            ..VmOptions::default()
+        },
+        root.join("main.php").to_string_lossy().into_owned(),
+    );
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+    assert!(
+        result.output.to_string_lossy().starts_with("41|"),
+        "{}",
+        result.output.to_string_lossy()
+    );
+    assert!(
+        result.output.to_string_lossy().contains("TypeError"),
+        "{}",
+        result.output.to_string_lossy()
+    );
+    assert!(!result.output.to_string_lossy().contains("unreachable"));
+}
+
+#[test]
+fn linked_trait_files_preserve_execution_order_interfaces_and_reflection_paths() {
+    let root = std::env::temp_dir().join(format!(
+        "phrust-vm-linked-trait-observability-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(root.join("Traits")).expect("trait directory should be created");
+    std::fs::write(
+        root.join("Registry.php"),
+        "<?php namespace Demo;
+            interface Contract { public function send(): string; }
+            use Demo\\Traits\\PRIMARYTRAIT as First;
+            use Demo\\Traits\\SecondaryTrait;
+            echo 'root|';
+            class Registry implements Contract {
+                use First, SecondaryTrait {
+                    First::send insteadof SecondaryTrait;
+                    SecondaryTrait::send as backup;
+                }
+            }
+        ",
+    )
+    .expect("registry should be written");
+    let primary_path = root.join("Traits/PrimaryTrait.php");
+    std::fs::write(
+        &primary_path,
+        "<?php namespace Demo\\Traits; echo 'primary|';
+            trait PrimaryTrait { public function send(): string { return 'primary'; } }
+        ",
+    )
+    .expect("primary trait should be written");
+    let canonical_primary_path =
+        std::fs::canonicalize(&primary_path).expect("primary trait path should canonicalize");
+    std::fs::write(
+        root.join("Traits/SecondaryTrait.php"),
+        "<?php namespace Demo\\Traits; echo 'secondary|';
+            trait SecondaryTrait { public function send(): string { return 'secondary'; } }
+        ",
+    )
+    .expect("secondary trait should be written");
+    let result = execute_source_with_options_and_path(
+        "<?php include 'Registry.php';
+            $registry = new Demo\\Registry();
+            echo $registry->send(), '|', $registry->backup(), '|';
+            echo count(get_included_files()), '|';
+            echo (new ReflectionMethod(Demo\\Registry::class, 'send'))->getFileName();
+        ",
+        VmOptions {
+            include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
+            runtime_context: RuntimeContext::default().with_cwd(root.clone()),
+            ..VmOptions::default()
+        },
+        root.join("main.php").to_string_lossy().into_owned(),
+    );
+    let expected = format!(
+        "primary|secondary|root|primary|secondary|4|{}",
+        canonical_primary_path.display()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(result.output.to_string_lossy(), expected);
+}
+
+#[test]
 fn include_trace_records_deep_finite_chain_without_recompilation() {
     let root = std::env::temp_dir().join(format!("phrust-vm-include-chain-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("temp include root should be created");

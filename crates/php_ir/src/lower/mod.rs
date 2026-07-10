@@ -44,133 +44,17 @@ mod control_flow;
 mod declarations;
 mod diagnostics;
 mod expressions;
+mod session;
 mod statements;
 
 pub use context::{LoweringContext, LoweringOptions, LoweringResult};
 pub use diagnostics::*;
 use expressions::cast_kind;
+pub use session::{lower_compilation_session, lower_frontend_result};
 
 const AUTO_GLOBAL_NAMES: &[&str] = &[
     "argc", "argv", "_SERVER", "_ENV", "_GET", "_POST", "_COOKIE", "_FILES", "_REQUEST", "_SESSION",
 ];
-
-/// Lowers a Semantic frontend frontend result into a minimal runtime IR unit.
-#[must_use]
-pub fn lower_frontend_result(
-    frontend: &FrontendResult,
-    options: LoweringOptions,
-) -> LoweringResult {
-    let mut builder = IrBuilder::new(options.unit_id);
-    let strict_types = frontend
-        .database()
-        .module(frontend.module().module_id())
-        .and_then(|module| module.file_directives().strict_types())
-        .is_some_and(|directive| matches!(directive.value(), DeclareValue::Int(1)));
-    builder.set_strict_types(strict_types);
-    let file = builder.add_file(options.source_path.clone());
-    let module_span = frontend
-        .database()
-        .source_map()
-        .span(frontend.module().module_id())
-        .unwrap_or_else(|| TextRange::new(0, frontend.module().source_bytes()));
-    let function = builder.start_function(
-        "main",
-        FunctionFlags {
-            is_top_level: true,
-            ..FunctionFlags::default()
-        },
-        span_from_range(file, module_span),
-    );
-    let prelude_block = builder.append_block(function);
-    let block = builder.append_block(function);
-    let null_const = builder.intern_constant(IrConstant::Null);
-    let module_ir_span = span_from_range(file, module_span);
-    let module_origin = format!("hir:module:{}", frontend.module().module_id().raw());
-    builder.add_source_map(
-        IrSourceMapTarget::Function { function },
-        module_origin.clone(),
-        module_ir_span,
-    );
-    builder.add_source_map(
-        IrSourceMapTarget::Block {
-            function,
-            block: prelude_block,
-        },
-        module_origin.clone(),
-        module_ir_span,
-    );
-    builder.add_source_map(
-        IrSourceMapTarget::Block { function, block },
-        module_origin.clone(),
-        module_ir_span,
-    );
-
-    let mut context = LoweringContext::new(frontend, options, file);
-    context.function_names.insert(function, String::new());
-    context.namespace_names.insert(function, String::new());
-    let block = context.lower_global_constant_declarations(&mut builder, function, block);
-    context.lower_function_declarations(&mut builder, function);
-    context.lower_class_declarations(&mut builder, function);
-    let current_block = context.lower_top_level(&mut builder, function, block);
-    if context.options.emit_unsupported_instructions
-        && !builder.is_terminated(function, current_block)
-    {
-        for diagnostic in &context.diagnostics {
-            let instruction = builder.emit(
-                function,
-                current_block,
-                InstructionKind::Unsupported {
-                    diagnostic_id: diagnostic.id.clone(),
-                },
-                diagnostic.span,
-            );
-            builder.add_source_map(
-                IrSourceMapTarget::Instruction {
-                    function,
-                    block: current_block,
-                    instruction,
-                },
-                diagnostic.id.clone(),
-                diagnostic.span,
-            );
-        }
-    }
-    if !builder.is_terminated(function, current_block) {
-        builder.terminate_return(
-            function,
-            current_block,
-            Some(Operand::Constant(null_const)),
-            span_from_range(file, module_span),
-        );
-        builder.add_source_map(
-            IrSourceMapTarget::Terminator {
-                function,
-                block: current_block,
-            },
-            module_origin.clone(),
-            module_ir_span,
-        );
-    }
-    context.emit_early_diagnostics(&mut builder, function, prelude_block);
-    builder.terminate_jump(function, prelude_block, block, module_ir_span);
-    builder.add_source_map(
-        IrSourceMapTarget::Terminator {
-            function,
-            block: prelude_block,
-        },
-        module_origin,
-        module_ir_span,
-    );
-    builder.set_entry(function);
-    let unit = builder.finish();
-    let verification = verify_unit(&unit);
-
-    LoweringResult {
-        unit,
-        diagnostics: context.diagnostics,
-        verification,
-    }
-}
 
 fn local_name(name: &str) -> &str {
     if let Some(inner) = name

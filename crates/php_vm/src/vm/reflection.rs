@@ -369,7 +369,8 @@ impl Vm {
                         CallableMethodTarget::Object(object) => object.class_name(),
                         CallableMethodTarget::Class(class_name) => class_name.clone(),
                     };
-                    reflection_method_object(compiled, &class_name, method)
+                    let owner = class_owner_in_state(compiled, state, &class_name);
+                    reflection_method_object(&owner, &class_name, method)
                 }
                 _ => Err(
                     "E_PHP_VM_REFLECTION_UNSUPPORTED_CALLABLE: callable reflection supports user functions and closures in the reflection-clone MVP"
@@ -392,7 +393,8 @@ impl Vm {
             "reflectionmethod" => {
             let class = reflection_string_arg(&args, 0, "ReflectionMethod::__construct")?;
             let method = reflection_string_arg(&args, 1, "ReflectionMethod::__construct")?;
-            reflection_method_object(compiled, &class, &method)
+            let owner = class_owner_in_state(compiled, state, &class);
+            reflection_method_object(&owner, &class, &method)
         }
             "reflectionproperty" => {
             let class = reflection_string_arg(&args, 0, "ReflectionProperty::__construct")?;

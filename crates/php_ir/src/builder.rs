@@ -37,7 +37,21 @@ impl IrBuilder {
             id,
             path: path.into(),
         });
+        self.unit.file_strict_types.push(false);
         id
+    }
+
+    /// Records the strict-types mode for one source file.
+    pub fn set_file_strict_types(&mut self, file: FileId, strict_types: bool) {
+        if let Some(slot) = self.unit.file_strict_types.get_mut(file.index()) {
+            *slot = strict_types;
+        }
+    }
+
+    /// Returns a snapshot of classes already lowered into this unit.
+    #[must_use]
+    pub fn classes(&self) -> &[ClassEntry] {
+        &self.unit.classes
     }
 
     /// Adds a constant and returns its ID.
@@ -384,6 +398,11 @@ impl IrBuilder {
     /// Sets the entry function.
     pub fn set_entry(&mut self, function: FunctionId) {
         self.unit.entry = function;
+    }
+
+    /// Records top-level linked-file functions in dependency execution order.
+    pub fn set_linked_file_entries(&mut self, entries: Vec<FunctionId>) {
+        self.unit.linked_file_entries = entries;
     }
 
     /// Sets file-level `declare(strict_types=1)` metadata for this IR unit.

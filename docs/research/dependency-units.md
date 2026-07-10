@@ -1,9 +1,24 @@
 # Dependency Units
 
-Dependency units are metadata-only groups for future module-level compilation.
-The current planner lives in `php_vm` because it consumes VM-ready `IrUnit`
-metadata, include behavior, autoload lookup observations, and cache-facing
-fingerprints. It does not change execution, cache hits, or bytecode layout.
+Dependency units are metadata-only groups for future module-level optimization.
+The planner lives in `php_vm` because it consumes VM-ready `IrUnit` metadata,
+include behavior, autoload lookup observations, and cache-facing fingerprints.
+It does not change execution, cache hits, or bytecode layout.
+
+This planner is distinct from the executable `php_ir::CompilationSession`.
+Include compilation now uses that session to own immutable source files, stable
+file IDs, typed trait-declaration requests, and explicit dependency edges. Each
+source is parsed and analyzed independently, dependency files are lowered in a
+deterministic graph order into one linked `IrUnit`, and every IR span continues
+to reference its original file-table entry. No PHP source is concatenated or
+rewritten. The include layer supplies the declaration resolver; the compiler
+does not infer Composer or PSR mappings by scanning source lines.
+
+The linked unit retains entry-file `strict_types` as a compatibility field and
+also records `file_strict_types[FileId]` for dependency-owned functions. Exact
+dependency content identities are included in the compiled-include cache key,
+so edits, same-metadata rewrites, and atomic replacements invalidate the root
+artifact.
 
 ## Graph Shape
 
@@ -97,6 +112,7 @@ Future module-level compilation can use this graph to:
   optimization;
 - reject or replan native code when any dependency edge becomes stale.
 
-The current implementation intentionally stops at planning and reporting. It
-does not introduce cross-function optimization, persistent native code caching,
-filesystem watchers, or SAPI/server behavior.
+The dependency-unit planner intentionally stops at planning and reporting. The
+separate compilation session links declarations needed to compile an include;
+it does not introduce cross-function optimization, persistent native code
+caching, filesystem watchers, or SAPI/server behavior.
