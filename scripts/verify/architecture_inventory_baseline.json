@@ -39,20 +39,20 @@
       "max_lines": 5264
     },
     "crates/php_jit/src/copy_patch.rs": {
-      "max_bytes": 214682,
-      "max_lines": 5497
+      "max_bytes": 215327,
+      "max_lines": 5514
     },
     "crates/php_phpt_tools/src/commands/mod.rs": {
-      "max_bytes": 239133,
-      "max_lines": 6634
+      "max_bytes": 239719,
+      "max_lines": 6645
     },
     "crates/php_runtime/src/builtins/context.rs": {
-      "max_bytes": 196336,
-      "max_lines": 6014
+      "max_bytes": 200160,
+      "max_lines": 6106
     },
     "crates/php_runtime/src/builtins/modules/core.rs": {
-      "max_bytes": 468123,
-      "max_lines": 14284
+      "max_bytes": 468535,
+      "max_lines": 14297
     },
     "crates/php_std/src/extensions.rs": {
       "max_bytes": 272557,
@@ -62,12 +62,52 @@
       "max_bytes": 256988,
       "max_lines": 7036
     },
+    "crates/php_vm/src/include/cache.rs": {
+      "max_bytes": 4501,
+      "max_lines": 135
+    },
+    "crates/php_vm/src/include/compiled_cache.rs": {
+      "max_bytes": 20827,
+      "max_lines": 575
+    },
+    "crates/php_vm/src/include/compiler.rs": {
+      "max_bytes": 1802,
+      "max_lines": 47
+    },
+    "crates/php_vm/src/include/diagnostics.rs": {
+      "max_bytes": 1920,
+      "max_lines": 55
+    },
+    "crates/php_vm/src/include/metadata.rs": {
+      "max_bytes": 8770,
+      "max_lines": 232
+    },
+    "crates/php_vm/src/include/metrics.rs": {
+      "max_bytes": 6321,
+      "max_lines": 135
+    },
+    "crates/php_vm/src/include/mod.rs": {
+      "max_bytes": 1241,
+      "max_lines": 35
+    },
+    "crates/php_vm/src/include/resolution_cache.rs": {
+      "max_bytes": 11033,
+      "max_lines": 296
+    },
+    "crates/php_vm/src/include/resolver.rs": {
+      "max_bytes": 24737,
+      "max_lines": 622
+    },
+    "crates/php_vm/src/include/source.rs": {
+      "max_bytes": 8587,
+      "max_lines": 242
+    },
     "crates/php_vm/src/vm/builtin_classes.rs": {
       "max_bytes": 330490,
       "max_lines": 8744
     },
     "crates/php_vm/src/vm/mod.rs": {
-      "max_bytes": 2818678,
+      "max_bytes": 2818824,
       "max_lines": 68229
     },
     "crates/php_vm/src/vm/spl.rs": {
@@ -492,9 +532,9 @@
     "php_vm:php_diagnostics:normal:false",
     "php_vm:php_ir:normal:false",
     "php_vm:php_jit:normal:true",
-    "php_vm:php_optimizer:normal:false",
+    "php_vm:php_optimizer:dev:false",
     "php_vm:php_runtime:normal:false",
-    "php_vm:php_semantics:normal:false",
+    "php_vm:php_semantics:dev:false",
     "php_vm:php_source:normal:false",
     "php_vm:php_std:normal:false",
     "php_vm:php_testkit:dev:false",

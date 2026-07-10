@@ -15,7 +15,8 @@ before changing a subsystem.
 - [Runtime and VM](../runtime/README.md), including
   [runtime values](../runtime/values.md),
   [VM structure](../runtime/vm-structure.md), and
-  [runtime cache architecture](../runtime/cache-architecture.md).
+  [runtime cache architecture](../runtime/cache-architecture.md), plus the
+  [include subsystem ownership contract](include-subsystem.md).
 - [Standard library](../stdlib/README.md) and
   [builtin modules](../runtime/builtin-modules.md).
 - [Server architecture](../server-architecture.md) and
