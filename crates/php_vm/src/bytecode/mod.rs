@@ -209,6 +209,7 @@ pub enum DenseOpcode {
     AssignStaticProperty = 92,
     IssetStaticProperty = 93,
     EmptyStaticProperty = 94,
+    UnsetProperty = 95,
 }
 
 impl DenseOpcode {
@@ -324,6 +325,7 @@ impl DenseOpcode {
             Self::AssignStaticProperty => "assign_static_property",
             Self::IssetStaticProperty => "isset_static_property",
             Self::EmptyStaticProperty => "empty_static_property",
+            Self::UnsetProperty => "unset_property",
         }
     }
 
@@ -588,6 +590,8 @@ pub enum DenseOperands {
         property: DenseOperand,
         value: DenseOperand,
     },
+    /// Instance property unset operands.
+    UnsetProperty { object: DenseOperand, property: u32 },
     /// Instance property array-dimension unset operands.
     UnsetPropertyDim {
         object: DenseOperand,
@@ -2046,7 +2050,8 @@ fn select_dense_single_rule(instruction: &DenseInstruction) -> Option<RuleKind> 
         | DenseOpcode::AssignDynamicProperty
         | DenseOpcode::AssignStaticProperty
         | DenseOpcode::IssetStaticProperty
-        | DenseOpcode::EmptyStaticProperty => None,
+        | DenseOpcode::EmptyStaticProperty
+        | DenseOpcode::UnsetProperty => None,
     }
 }
 
@@ -2758,6 +2763,13 @@ fn lower_instruction(
                 object: lower_operand(*object),
                 property: lower_operand(*property),
                 value: lower_operand(*value),
+            },
+        ),
+        InstructionKind::UnsetProperty { object, property } => (
+            DenseOpcode::UnsetProperty,
+            DenseOperands::UnsetProperty {
+                object: lower_operand(*object),
+                property: push_name(names, property).index() as u32,
             },
         ),
         InstructionKind::UnsetPropertyDim {
@@ -3572,6 +3584,10 @@ fn verify_instruction(
             verify_operand(*property, unit, function, errors);
             verify_operand(*value, unit, function, errors);
         }
+        (DenseOpcode::UnsetProperty, DenseOperands::UnsetProperty { object, property }) => {
+            verify_operand(*object, unit, function, errors);
+            verify_name(*property, unit, errors);
+        }
         (
             DenseOpcode::UnsetPropertyDim,
             DenseOperands::UnsetPropertyDim {
@@ -4251,6 +4267,9 @@ fn render_operands(operands: &DenseOperands) -> String {
                 render_operand(*property),
                 render_operand(*value)
             )
+        }
+        DenseOperands::UnsetProperty { object, property } => {
+            format!("{} n{property}", render_operand(*object))
         }
         DenseOperands::UnsetPropertyDim {
             object,

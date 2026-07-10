@@ -620,6 +620,9 @@ pub(crate) fn collect_defs_uses(
             }
             push_use(uses, *value);
         }
+        DenseOperands::UnsetProperty { object, .. } => {
+            push_use(uses, *object);
+        }
         DenseOperands::UnsetPropertyDim { object, dims, .. } => {
             push_use(uses, *object);
             for dim in dims {

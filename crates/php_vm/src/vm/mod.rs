@@ -9570,6 +9570,109 @@ impl Vm {
                             return result;
                         }
                     }
+                    DenseOpcode::UnsetProperty => {
+                        let DenseOperands::UnsetProperty { object, property } =
+                            &instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let object_operand = *object;
+                        let Some(property) = dense.names.get(*property as usize) else {
+                            let result = self.runtime_error(
+                                output,
+                                compiled,
+                                stack,
+                                format!("invalid dense bytecode property name n{property}"),
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let property = property.clone();
+                        let object = match self.read_dense_operand(compiled, stack, object_operand)
+                        {
+                            Ok(Value::Object(object)) => object,
+                            Ok(other) => {
+                                let result = self.runtime_error(
+                                    output,
+                                    compiled,
+                                    stack,
+                                    format!(
+                                        "E_PHP_VM_PROPERTY_FETCH_NON_OBJECT: cannot unset property {property} on {}",
+                                        value_type_name(&other)
+                                    ),
+                                );
+                                stack.pop_recycle();
+                                return result;
+                            }
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let span = dense_instruction_span(dense, instruction);
+                        match self.unset_property_value(
+                            compiled, &object, &property, span, output, stack, state,
+                        ) {
+                            Ok(()) => {}
+                            Err(StaticPropertyAssignError::Vm(result)) => {
+                                let result = *result;
+                                if let Some(throwable) = state
+                                    .pending_throw
+                                    .take()
+                                    .or_else(|| runtime_error_throwable(&result))
+                                {
+                                    return self
+                                        .propagate_exception(output, stack, state, throwable);
+                                }
+                                stack.pop_recycle();
+                                return result;
+                            }
+                            Err(StaticPropertyAssignError::Raise(span, message)) => {
+                                let mut exception_handlers = Vec::new();
+                                let mut pending_control = None;
+                                match self.raise_runtime_error(
+                                    compiled,
+                                    output,
+                                    stack,
+                                    state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    span,
+                                    message,
+                                ) {
+                                    RaiseOutcome::Caught(_) => {
+                                        let result = self.runtime_error(
+                                            output,
+                                            compiled,
+                                            stack,
+                                            "E_PHP_VM_DENSE_UNSET_PROPERTY_HANDLER: dense functions have no local exception handlers".to_string(),
+                                        );
+                                        stack.pop_recycle();
+                                        return result;
+                                    }
+                                    RaiseOutcome::Done(result) => {
+                                        if state.pending_throw.is_none() {
+                                            stack.pop_recycle();
+                                        }
+                                        return *result;
+                                    }
+                                }
+                            }
+                            Err(StaticPropertyAssignError::Fatal(message)) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        }
+                    }
                     DenseOpcode::UnsetPropertyDim => {
                         let DenseOperands::UnsetPropertyDim {
                             object,
@@ -23278,101 +23381,37 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let class = compiled.lookup_class(&object.class_name());
-                        let scope = current_scope_class(compiled, stack);
-                        let declared = match class {
-                            Some(class) => match lookup_property_in_hierarchy(
-                                compiled,
-                                class,
-                                property,
-                                scope.as_deref(),
-                            ) {
-                                Ok(property) => property,
-                                Err(message) => {
-                                    return self.runtime_error(output, compiled, stack, message);
-                                }
-                            },
-                            None => None,
-                        };
-                        if let Some(resolved) = declared {
-                            if let Err(message) = validate_property_access(
-                                compiled,
-                                stack,
-                                resolved.class,
-                                resolved.property,
-                            ) {
-                                match self.call_magic_property_method(
+                        match self.unset_property_value(
+                            compiled,
+                            &object,
+                            property,
+                            instruction.span,
+                            output,
+                            stack,
+                            state,
+                        ) {
+                            Ok(()) => {}
+                            Err(StaticPropertyAssignError::Vm(result)) => return *result,
+                            Err(StaticPropertyAssignError::Raise(span, message)) => {
+                                match self.raise_runtime_error(
                                     compiled,
-                                    object.clone(),
-                                    "__unset",
-                                    property,
-                                    vec![CallArgument::positional(Value::String(
-                                        PhpString::from_test_str(property),
-                                    ))],
                                     output,
                                     stack,
                                     state,
+                                    &mut exception_handlers,
+                                    &mut pending_control,
+                                    span,
+                                    message,
                                 ) {
-                                    Ok(Some(_)) => {}
-                                    Ok(None) => {
-                                        match self.raise_runtime_error(
-                                            compiled,
-                                            output,
-                                            stack,
-                                            state,
-                                            &mut exception_handlers,
-                                            &mut pending_control,
-                                            instruction.span,
-                                            message,
-                                        ) {
-                                            RaiseOutcome::Caught(target) => {
-                                                block_id = target;
-                                                continue 'dispatch;
-                                            }
-                                            RaiseOutcome::Done(result) => return *result,
-                                        }
+                                    RaiseOutcome::Caught(target) => {
+                                        block_id = target;
+                                        continue 'dispatch;
                                     }
-                                    Err(result) => return result,
+                                    RaiseOutcome::Done(result) => return *result,
                                 }
-                                continue;
                             }
-                            if resolved.property.flags.is_static {
-                                emit_static_property_as_non_static_notice(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    resolved.class,
-                                    resolved.property,
-                                    instruction.span,
-                                );
-                                object.unset_property(property);
-                                continue;
-                            }
-                            let storage_name =
-                                property_storage_name(resolved.class, resolved.property);
-                            if resolved.property.flags.is_typed {
-                                object.set_property(storage_name, Value::Uninitialized);
-                            } else {
-                                object.unset_property(&storage_name);
-                            }
-                        } else {
-                            match self.call_magic_property_method(
-                                compiled,
-                                object.clone(),
-                                "__unset",
-                                property,
-                                vec![CallArgument::positional(Value::String(
-                                    PhpString::from_test_str(property),
-                                ))],
-                                output,
-                                stack,
-                                state,
-                            ) {
-                                Ok(Some(_)) | Ok(None) => {
-                                    object.unset_property(property);
-                                }
-                                Err(result) => return result,
+                            Err(StaticPropertyAssignError::Fatal(message)) => {
+                                return self.runtime_error(output, compiled, stack, message);
                             }
                         }
                     }
@@ -43481,6 +43520,102 @@ impl Vm {
     /// are returned for the caller to route; `cache_site` supplies the
     /// inline-cache key.
     #[allow(clippy::too_many_arguments)]
+    /// Shared instance-property unset: SPL array-as-props containers route
+    /// through offsetUnset; declared properties validate visibility (with a
+    /// `__unset` fallback) and honor typed-property reset semantics; unknown
+    /// properties try `__unset` before removing dynamic storage. Both
+    /// interpreters call this; the caller maps `Raise` into its own handler
+    /// context.
+    fn unset_property_value(
+        &self,
+        compiled: &CompiledUnit,
+        object: &ObjectRef,
+        property: &str,
+        span: IrSpan,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<(), StaticPropertyAssignError> {
+        if spl_array_object_uses_array_as_props(object) {
+            return spl_container_offset_unset(
+                object,
+                &Value::String(PhpString::from_test_str(property)),
+            )
+            .map_err(StaticPropertyAssignError::Fatal);
+        }
+        let class = compiled.lookup_class(&object.class_name());
+        let scope = current_scope_class(compiled, stack);
+        let declared = match class {
+            Some(class) => {
+                match lookup_property_in_hierarchy(compiled, class, property, scope.as_deref()) {
+                    Ok(property) => property,
+                    Err(message) => return Err(StaticPropertyAssignError::Fatal(message)),
+                }
+            }
+            None => None,
+        };
+        if let Some(resolved) = declared {
+            if let Err(message) =
+                validate_property_access(compiled, stack, resolved.class, resolved.property)
+            {
+                return match self.call_magic_property_method(
+                    compiled,
+                    object.clone(),
+                    "__unset",
+                    property,
+                    vec![CallArgument::positional(Value::String(
+                        PhpString::from_test_str(property),
+                    ))],
+                    output,
+                    stack,
+                    state,
+                ) {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => Err(StaticPropertyAssignError::Raise(span, message)),
+                    Err(result) => Err(StaticPropertyAssignError::Vm(Box::new(result))),
+                };
+            }
+            if resolved.property.flags.is_static {
+                emit_static_property_as_non_static_notice(
+                    compiled,
+                    output,
+                    stack,
+                    state,
+                    resolved.class,
+                    resolved.property,
+                    span,
+                );
+                object.unset_property(property);
+                return Ok(());
+            }
+            let storage_name = property_storage_name(resolved.class, resolved.property);
+            if resolved.property.flags.is_typed {
+                object.set_property(storage_name, Value::Uninitialized);
+            } else {
+                object.unset_property(&storage_name);
+            }
+            return Ok(());
+        }
+        match self.call_magic_property_method(
+            compiled,
+            object.clone(),
+            "__unset",
+            property,
+            vec![CallArgument::positional(Value::String(
+                PhpString::from_test_str(property),
+            ))],
+            output,
+            stack,
+            state,
+        ) {
+            Ok(Some(_)) | Ok(None) => {
+                object.unset_property(property);
+                Ok(())
+            }
+            Err(result) => Err(StaticPropertyAssignError::Vm(Box::new(result))),
+        }
+    }
+
     /// Shared static-property assignment: autoload, class/property
     /// resolution, static/visibility/type/readonly validation, and the
     /// lvalue write. Returns the assigned value plus the replaced effective
@@ -67977,7 +68112,8 @@ fn dense_opcode_family(opcode: DenseOpcode) -> &'static str {
         | DenseOpcode::AssignDynamicProperty
         | DenseOpcode::AssignStaticProperty
         | DenseOpcode::IssetStaticProperty
-        | DenseOpcode::EmptyStaticProperty => "properties",
+        | DenseOpcode::EmptyStaticProperty
+        | DenseOpcode::UnsetProperty => "properties",
         DenseOpcode::InstanceOf
         | DenseOpcode::FetchClassConstant
         | DenseOpcode::FetchStaticProperty

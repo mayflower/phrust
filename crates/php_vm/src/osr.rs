@@ -623,6 +623,9 @@ fn collect_instruction_slots(instruction: &DenseInstruction, slots: &mut BTreeSe
             slots.insert(OsrVmSlot::Register(*dst));
             collect_operand_slot(*object, slots);
         }
+        DenseOperands::UnsetProperty { object, .. } => {
+            collect_operand_slot(*object, slots);
+        }
         DenseOperands::UnsetPropertyDim { object, dims, .. } => {
             collect_operand_slot(*object, slots);
             for dim in dims {
