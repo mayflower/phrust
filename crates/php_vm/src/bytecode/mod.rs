@@ -204,6 +204,7 @@ pub enum DenseOpcode {
     CloneObject = 88,
     /// `object->property[dims...] = value` (or `[] =` append).
     AssignPropertyDim = 89,
+    UnsetPropertyDim = 90,
 }
 
 impl DenseOpcode {
@@ -314,6 +315,7 @@ impl DenseOpcode {
             Self::FetchStaticProperty => "fetch_static_property",
             Self::CloneObject => "clone_object",
             Self::AssignPropertyDim => "assign_property_dim",
+            Self::UnsetPropertyDim => "unset_property_dim",
         }
     }
 
@@ -563,6 +565,12 @@ pub enum DenseOperands {
         dims: Vec<DenseOperand>,
         append: bool,
         value: DenseOperand,
+    },
+    /// Instance property array-dimension unset operands.
+    UnsetPropertyDim {
+        object: DenseOperand,
+        property: u32,
+        dims: Vec<DenseOperand>,
     },
     /// Property dimension isset/empty probe operands.
     PropertyDimProbe {
@@ -2011,7 +2019,8 @@ fn select_dense_single_rule(instruction: &DenseInstruction) -> Option<RuleKind> 
         | DenseOpcode::EmptyProperty
         | DenseOpcode::FetchStaticProperty
         | DenseOpcode::CloneObject
-        | DenseOpcode::AssignPropertyDim => None,
+        | DenseOpcode::AssignPropertyDim
+        | DenseOpcode::UnsetPropertyDim => None,
     }
 }
 
@@ -2711,9 +2720,18 @@ fn lower_instruction(
                 value: lower_operand(*value),
             },
         ),
-        InstructionKind::UnsetPropertyDim { .. } => {
-            return unsupported_instruction(instruction, "property dimension unset".to_owned());
-        }
+        InstructionKind::UnsetPropertyDim {
+            object,
+            property,
+            dims,
+        } => (
+            DenseOpcode::UnsetPropertyDim,
+            DenseOperands::UnsetPropertyDim {
+                object: lower_operand(*object),
+                property: push_name(names, property).index() as u32,
+                dims: dims.iter().copied().map(lower_operand).collect(),
+            },
+        ),
         InstructionKind::Echo { src } => (
             DenseOpcode::Echo,
             DenseOperands::Operand {
@@ -3463,6 +3481,20 @@ fn verify_instruction(
             verify_operand(*value, unit, function, errors);
         }
         (
+            DenseOpcode::UnsetPropertyDim,
+            DenseOperands::UnsetPropertyDim {
+                object,
+                property,
+                dims,
+            },
+        ) => {
+            verify_operand(*object, unit, function, errors);
+            verify_name(*property, unit, errors);
+            for dim in dims {
+                verify_operand(*dim, unit, function, errors);
+            }
+        }
+        (
             DenseOpcode::BindReferenceDim,
             DenseOperands::BindReferenceDim {
                 local,
@@ -4085,6 +4117,18 @@ fn render_operands(operands: &DenseOperands) -> String {
                 dims.join(", "),
                 if *append { " append" } else { "" },
                 render_operand(*value)
+            )
+        }
+        DenseOperands::UnsetPropertyDim {
+            object,
+            property,
+            dims,
+        } => {
+            let dims: Vec<_> = dims.iter().copied().map(render_operand).collect();
+            format!(
+                "{} n{property} [{}]",
+                render_operand(*object),
+                dims.join(", ")
             )
         }
         DenseOperands::InstanceOf {

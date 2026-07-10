@@ -9193,6 +9193,72 @@ impl Vm {
                             return result;
                         }
                     }
+                    DenseOpcode::UnsetPropertyDim => {
+                        let DenseOperands::UnsetPropertyDim {
+                            object,
+                            property,
+                            dims,
+                        } = &instruction.operands
+                        else {
+                            let result = self.invalid_bytecode_operand_shape(
+                                output,
+                                compiled,
+                                stack,
+                                instruction,
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let object_operand = *object;
+                        let Some(property) = dense.names.get(*property as usize) else {
+                            let result = self.runtime_error(
+                                output,
+                                compiled,
+                                stack,
+                                format!("invalid dense bytecode property name n{property}"),
+                            );
+                            stack.pop_recycle();
+                            return result;
+                        };
+                        let property = property.clone();
+                        let object = match self.read_dense_operand(compiled, stack, object_operand)
+                        {
+                            Ok(Value::Object(object)) => object,
+                            Ok(other) => {
+                                let result = self.runtime_error(
+                                    output,
+                                    compiled,
+                                    stack,
+                                    format!(
+                                        "E_PHP_VM_PROPERTY_FETCH_NON_OBJECT: cannot unset property {property} on {}",
+                                        value_type_name(&other)
+                                    ),
+                                );
+                                stack.pop_recycle();
+                                return result;
+                            }
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        let dims = match self.read_dense_dim_operands(compiled, stack, dims) {
+                            Ok(dims) => dims,
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
+                        };
+                        if let Err(message) =
+                            unset_property_dim(compiled, state, stack, &object, &property, &dims)
+                        {
+                            let result = self.runtime_error(output, compiled, stack, message);
+                            stack.pop_recycle();
+                            return result;
+                        }
+                    }
                     DenseOpcode::AssignPropertyDim => {
                         let DenseOperands::AssignPropertyDim {
                             dst,
@@ -67495,7 +67561,8 @@ fn dense_opcode_family(opcode: DenseOpcode) -> &'static str {
         | DenseOpcode::UnsetDim => "arrays",
         DenseOpcode::FetchProperty
         | DenseOpcode::AssignProperty
-        | DenseOpcode::AssignPropertyDim => "properties",
+        | DenseOpcode::AssignPropertyDim
+        | DenseOpcode::UnsetPropertyDim => "properties",
         DenseOpcode::InstanceOf
         | DenseOpcode::FetchClassConstant
         | DenseOpcode::FetchStaticProperty
