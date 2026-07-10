@@ -878,6 +878,9 @@ pub struct DenseExecutionPlan {
     /// Slot-indexed property fetch/assign inline-cache entries, sharing the
     /// `cache_slot` id space with `call_slots`.
     pub property_slots: DensePropertySlotTable,
+    /// Slot-indexed method-call inline-cache entries, sharing the same id
+    /// space.
+    pub method_slots: DenseMethodSlotTable,
 }
 
 /// One slot-indexed dense function-call cache entry. The callee name is a
@@ -979,6 +982,7 @@ pub fn assign_function_call_cache_slots(unit: &mut DenseBytecodeUnit) -> u32 {
                 DenseOpcode::CallFunction | DenseOpcode::CallFunctionDiscard => "function_call",
                 DenseOpcode::FetchProperty => "property_fetch",
                 DenseOpcode::AssignProperty => "property_assign",
+                DenseOpcode::CallMethod => "method_call",
                 _ => continue,
             };
             if instruction.cache_slot.is_none() {
@@ -1139,6 +1143,94 @@ impl PartialEq for DensePropertySlotTable {
 }
 
 impl Eq for DensePropertySlotTable {}
+
+/// One slot-indexed dense method-call cache entry; guards mirror
+/// [`DensePropertySlotEntry`] (the method name is a compile-time operand).
+#[derive(Clone, Debug, Default)]
+struct DenseMethodSlotEntry {
+    vm_nonce: u64,
+    epoch: crate::inline_cache::InvalidationEpoch,
+    receiver_class: Option<std::sync::Arc<str>>,
+    scope: Option<Option<String>>,
+    target: Option<crate::inline_cache::MethodCallCacheTarget>,
+}
+
+/// Slot-indexed method-call inline-cache storage attached to a dense plan;
+/// same lifecycle and equality semantics as [`DenseCallSlotTable`].
+#[derive(Debug, Default)]
+pub struct DenseMethodSlotTable {
+    entries: std::cell::RefCell<Vec<DenseMethodSlotEntry>>,
+}
+
+impl DenseMethodSlotTable {
+    /// Creates a table with `count` cold slots.
+    #[must_use]
+    pub fn with_slot_count(count: u32) -> Self {
+        Self {
+            entries: std::cell::RefCell::new(vec![DenseMethodSlotEntry::default(); count as usize]),
+        }
+    }
+
+    /// Returns the cached target when every guard matches.
+    #[must_use]
+    pub fn hit(
+        &self,
+        slot: DenseCacheSlotId,
+        vm_nonce: u64,
+        epoch: crate::inline_cache::InvalidationEpoch,
+        receiver_class: &str,
+        scope: Option<&str>,
+    ) -> Option<crate::inline_cache::MethodCallCacheTarget> {
+        let entries = self.entries.borrow();
+        let entry = entries.get(slot.index())?;
+        (entry.vm_nonce == vm_nonce
+            && entry.epoch == epoch
+            && entry.receiver_class.as_deref() == Some(receiver_class)
+            && entry
+                .scope
+                .as_ref()
+                .is_some_and(|cached| cached.as_deref() == scope))
+        .then(|| entry.target.clone())
+        .flatten()
+    }
+
+    /// Installs a resolved target under the given guards.
+    pub fn store(
+        &self,
+        slot: DenseCacheSlotId,
+        vm_nonce: u64,
+        epoch: crate::inline_cache::InvalidationEpoch,
+        receiver_class: std::sync::Arc<str>,
+        scope: Option<String>,
+        target: crate::inline_cache::MethodCallCacheTarget,
+    ) {
+        let mut entries = self.entries.borrow_mut();
+        let Some(entry) = entries.get_mut(slot.index()) else {
+            return;
+        };
+        *entry = DenseMethodSlotEntry {
+            vm_nonce,
+            epoch,
+            receiver_class: Some(receiver_class),
+            scope: Some(scope),
+            target: Some(target),
+        };
+    }
+}
+
+impl Clone for DenseMethodSlotTable {
+    fn clone(&self) -> Self {
+        Self::with_slot_count(self.entries.borrow().len() as u32)
+    }
+}
+
+impl PartialEq for DenseMethodSlotTable {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DenseMethodSlotTable {}
 
 /// Function-invariant facts the dense call path consults on every call.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1510,6 +1602,7 @@ fn lower_mixed_plan(unit: &IrUnit) -> DenseExecutionPlan {
         call_shape_meta: Vec::new(),
         call_slots: DenseCallSlotTable::default(),
         property_slots: DensePropertySlotTable::default(),
+        method_slots: DenseMethodSlotTable::default(),
     }
 }
 

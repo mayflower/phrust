@@ -16,6 +16,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
+        method_slot: Option<crate::bytecode::DenseCacheSlotId>,
     ) -> VmResult {
         let object = match callable_resolve_reference(object) {
             Value::Generator(generator) => {
@@ -52,6 +53,27 @@ impl Vm {
                 );
             }
         };
+
+        // Slot-indexed L1: a warm monomorphic repeat skips the runtime-class
+        // probes, the class-table lookup and clone, the method-name
+        // normalization, and the keyed inline-cache walks. Entries only ever
+        // come from keyed hits, so an L1 hit implies this receiver class
+        // already took the regular dispatch path.
+        if let Some((slot_plan, slot)) = plan.zip(method_slot)
+            && let Some(target) = slot_plan.method_slots.hit(
+                slot,
+                self.vm_nonce,
+                state.lookup_epoch(),
+                &object.class_name_handle(),
+                current_scope_class(compiled, stack).as_deref(),
+            )
+        {
+            self.record_counter_dense_call_ic_hit();
+            self.record_counter_dense_method_call_hit();
+            return self.execute_method_call_target(
+                compiled, target, object, args, call_span, output, stack, state, &None, plan,
+            );
+        }
 
         let receiver_class = object.class_name();
         if is_hash_context_runtime_class(&receiver_class)
@@ -163,6 +185,18 @@ impl Vm {
             epoch,
         );
         if let Some(target) = cached_target {
+            // Warm the slot from the keyed hit so the next repeat takes the
+            // indexed load.
+            if let Some((slot_plan, slot)) = plan.zip(method_slot) {
+                slot_plan.method_slots.store(
+                    slot,
+                    self.vm_nonce,
+                    epoch,
+                    object.class_name_handle(),
+                    scope.clone(),
+                    target.clone(),
+                );
+            }
             self.record_counter_dense_call_ic_hit();
             self.record_counter_dense_method_call_hit();
             return self.execute_method_call_target(

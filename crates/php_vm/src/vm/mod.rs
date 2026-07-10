@@ -8021,6 +8021,7 @@ impl Vm {
             plan.call_slots = crate::bytecode::DenseCallSlotTable::with_slot_count(slot_count);
             plan.property_slots =
                 crate::bytecode::DensePropertySlotTable::with_slot_count(slot_count);
+            plan.method_slots = crate::bytecode::DenseMethodSlotTable::with_slot_count(slot_count);
             return Ok(plan);
         }
 
@@ -8076,6 +8077,7 @@ impl Vm {
             call_shape_meta: Vec::new(),
             call_slots: crate::bytecode::DenseCallSlotTable::with_slot_count(slot_count),
             property_slots: crate::bytecode::DensePropertySlotTable::with_slot_count(slot_count),
+            method_slots: crate::bytecode::DenseMethodSlotTable::with_slot_count(slot_count),
         })
     }
 
@@ -12366,6 +12368,11 @@ impl Vm {
                             output,
                             stack,
                             state,
+                            if self.options.inline_caches.enabled() {
+                                instruction.cache_slot
+                            } else {
+                                None
+                            },
                         );
                         if !result.status.is_success() {
                             self.record_counter_dense_call_fallback("dispatch_error");
