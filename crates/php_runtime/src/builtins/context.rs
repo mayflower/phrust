@@ -1,22 +1,35 @@
 //! Runtime services passed to internal builtins.
 
 use crate::{
-    FilesystemCapabilities, IniRegistry, MysqlState, OutputBuffer, PHP_E_DEPRECATED, PHP_E_NOTICE,
-    PHP_E_WARNING, PcreCache, PhpArray, PhpDiagnosticChannel, PhpDiagnosticDisplayOptions,
-    PostgresState, ReferenceCell, ResourceTable, RuntimeDiagnostic, RuntimeHttpResponseState,
-    RuntimeSeverity, SessionLoadCallback, SessionState, UploadRegistry, Value, datetime,
-    emit_php_diagnostic, pcre,
+    FilesystemCapabilities, IniRegistry, MysqlState, ObjectRef, OutputBuffer, PHP_E_DEPRECATED,
+    PHP_E_NOTICE, PHP_E_WARNING, PcreCache, PhpArray, PhpDiagnosticChannel,
+    PhpDiagnosticDisplayOptions, PostgresState, ReferenceCell, ResourceTable, RuntimeDiagnostic,
+    RuntimeHttpResponseState, RuntimeSeverity, SessionLoadCallback, SessionState, UploadRegistry,
+    Value, datetime, emit_php_diagnostic, pcre,
 };
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use curl::easy::{Handler, WriteError};
+use curl::multi::{Easy2Handle, Multi};
+use imap::{ClientBuilder, ConnectionMode};
+use ldap3::result::LdapError;
+use ldap3::{LdapConn, Scope, SearchEntry};
+use ssh2::{HashType, Session as Ssh2BackendSession, Sftp as Ssh2BackendSftp};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::io::{Cursor, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
+use suppaftp::types::{FileType, FormatControl, Response};
+use suppaftp::{FtpStream, Mode, Status};
 
 /// SysV message queue would-block errno used by the deterministic backend.
 pub const SYSVMSG_EAGAIN: i64 = libc::EAGAIN as i64;
 pub const SYSVMSG_EINVAL: i64 = libc::EINVAL as i64;
+pub const SYSVMSG_IPC_NOWAIT: i64 = libc::IPC_NOWAIT as i64;
 
 /// Request-local state for the CLI-only `pcntl` extension.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -83,6 +96,181 @@ impl PcntlState {
     }
 }
 
+/// Request-local state for ext/curl handles and libcurl multi runtimes.
+#[derive(Default)]
+pub struct CurlState {
+    handles: BTreeMap<u64, CurlHandleState>,
+    pub(in crate::builtins) multis: BTreeMap<u64, CurlMultiRuntimeState>,
+    pub(in crate::builtins) shares: BTreeMap<u64, CurlShareRuntimeState>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CurlHandleState {
+    closed: bool,
+    options: BTreeMap<i64, Value>,
+}
+
+#[derive(Default)]
+pub(in crate::builtins) struct CurlEasyCollector {
+    pub headers: Vec<u8>,
+    current_header_block: Vec<u8>,
+    pub body: Vec<u8>,
+}
+
+impl Handler for CurlEasyCollector {
+    fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
+        self.body.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn header(&mut self, data: &[u8]) -> bool {
+        if data.starts_with(b"HTTP/") {
+            self.current_header_block.clear();
+        }
+        self.current_header_block.extend_from_slice(data);
+        if data == b"\r\n" {
+            self.headers.clone_from(&self.current_header_block);
+        }
+        true
+    }
+}
+
+pub(in crate::builtins) struct CurlMultiRuntimeState {
+    pub multi: Multi,
+    pub transfers: BTreeMap<u64, CurlMultiTransferState>,
+    pub pending: VecDeque<CurlMultiDone>,
+    pub closed: bool,
+}
+
+impl Default for CurlMultiRuntimeState {
+    fn default() -> Self {
+        Self {
+            multi: Multi::new(),
+            transfers: BTreeMap::new(),
+            pending: VecDeque::new(),
+            closed: false,
+        }
+    }
+}
+
+pub(in crate::builtins) struct CurlMultiTransferState {
+    pub object: ObjectRef,
+    pub easy: Easy2Handle<CurlEasyCollector>,
+    pub completed: bool,
+}
+
+#[derive(Clone)]
+pub(in crate::builtins) struct CurlMultiDone {
+    pub handle: ObjectRef,
+    pub result: i64,
+}
+
+#[derive(Debug, Default)]
+pub(in crate::builtins) struct CurlShareRuntimeState {
+    pub shared_options: BTreeSet<i64>,
+    pub closed: bool,
+}
+
+impl std::fmt::Debug for CurlState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CurlState")
+            .field("handles", &self.handles)
+            .field("multis", &self.multis.keys().collect::<Vec<_>>())
+            .field("shares", &self.shares)
+            .finish()
+    }
+}
+
+impl CurlState {
+    /// Ensures a handle has request-local cURL state.
+    pub fn reset_handle(&mut self, handle_id: u64) {
+        self.handles.insert(handle_id, CurlHandleState::default());
+    }
+
+    /// Copies request-local cURL state from one handle identity to another.
+    pub fn copy_handle(&mut self, source_id: u64, target_id: u64) {
+        let state = self.handles.get(&source_id).cloned().unwrap_or_default();
+        self.handles.insert(target_id, state);
+    }
+
+    /// Marks a cURL handle as closed.
+    pub fn close_handle(&mut self, handle_id: u64) {
+        self.handles.entry(handle_id).or_default().closed = true;
+    }
+
+    /// Returns whether a cURL handle has been closed.
+    #[must_use]
+    pub fn is_closed(&self, handle_id: u64) -> bool {
+        self.handles
+            .get(&handle_id)
+            .map(|state| state.closed)
+            .unwrap_or(false)
+    }
+
+    /// Stores a PHP-visible cURL option in request-local typed state.
+    pub fn set_option(&mut self, handle_id: u64, option: i64, value: Value) {
+        self.handles
+            .entry(handle_id)
+            .or_default()
+            .options
+            .insert(option, value);
+    }
+
+    /// Returns a snapshot of request-local cURL options for execution.
+    #[must_use]
+    pub fn options_snapshot(&self, handle_id: u64) -> BTreeMap<i64, Value> {
+        self.handles
+            .get(&handle_id)
+            .map(|state| state.options.clone())
+            .unwrap_or_default()
+    }
+
+    /// Creates or resets a request-local libcurl multi runtime.
+    pub fn reset_multi(&mut self, multi_id: u64) {
+        self.multis
+            .insert(multi_id, CurlMultiRuntimeState::default());
+    }
+
+    /// Returns mutable request-local libcurl multi runtime state.
+    pub(in crate::builtins) fn multi_mut(
+        &mut self,
+        multi_id: u64,
+    ) -> Option<&mut CurlMultiRuntimeState> {
+        self.multis.get_mut(&multi_id)
+    }
+
+    /// Removes any active transfer for a handle from all multi runtimes.
+    pub fn detach_handle_from_multis(&mut self, handle_id: u64) {
+        for multi in self.multis.values_mut() {
+            multi.transfers.remove(&handle_id);
+            multi.pending.retain(|done| done.handle.id() != handle_id);
+        }
+    }
+
+    /// Marks a multi runtime closed.
+    pub fn close_multi(&mut self, multi_id: u64) {
+        if let Some(multi) = self.multis.get_mut(&multi_id) {
+            multi.closed = true;
+            multi.transfers.clear();
+            multi.pending.clear();
+        }
+    }
+
+    /// Creates or resets a request-local cURL share runtime.
+    pub fn reset_share(&mut self, share_id: u64) {
+        self.shares
+            .insert(share_id, CurlShareRuntimeState::default());
+    }
+
+    /// Returns mutable request-local share state.
+    pub(in crate::builtins) fn share_mut(
+        &mut self,
+        share_id: u64,
+    ) -> Option<&mut CurlShareRuntimeState> {
+        self.shares.get_mut(&share_id)
+    }
+}
+
 /// Request-local state for loopback-gated FTP connections.
 #[derive(Debug, Default)]
 pub struct FtpState {
@@ -91,33 +279,53 @@ pub struct FtpState {
 }
 
 /// Request-local state for the LDAP facade.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Debug, Default)]
 pub struct LdapState {
     next_connection_id: i64,
     next_result_id: i64,
     next_entry_id: i64,
     connections: BTreeMap<i64, LdapConnectionState>,
+    backends: BTreeMap<i64, LdapConn>,
     results: BTreeMap<i64, LdapResultState>,
     entries: BTreeMap<i64, LdapResultEntryState>,
     global_options: BTreeMap<i64, Value>,
 }
 
 /// Request-local state for the IMAP facade.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Debug, Default)]
 pub struct ImapState {
     next_connection_id: i64,
     connections: BTreeMap<i64, ImapConnectionState>,
+    backends: BTreeMap<i64, ImapBackendState>,
     last_errors: Vec<String>,
     last_alerts: Vec<String>,
 }
 
-/// Request-local state for the SSH2 facade.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Request-local state for the SSH2 facade and opt-in libssh2 backend.
+#[derive(Default)]
 pub struct Ssh2State {
     next_session_id: i64,
     next_sftp_id: i64,
     sessions: BTreeMap<i64, Ssh2SessionState>,
     sftp_handles: BTreeMap<i64, Ssh2SftpState>,
+    backends: BTreeMap<i64, Ssh2BackendState>,
+    sftp_backends: BTreeMap<i64, Ssh2BackendSftp>,
+}
+
+impl std::fmt::Debug for Ssh2State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ssh2State")
+            .field("next_session_id", &self.next_session_id)
+            .field("next_sftp_id", &self.next_sftp_id)
+            .field("sessions", &self.sessions)
+            .field("sftp_handles", &self.sftp_handles)
+            .field("backends", &self.backends.keys().collect::<Vec<_>>())
+            .field(
+                "sftp_backends",
+                &self.sftp_backends.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -135,12 +343,35 @@ struct Ssh2SftpState {
     closed: bool,
 }
 
+struct Ssh2BackendState {
+    session: Ssh2BackendSession,
+}
+
+impl std::fmt::Debug for Ssh2BackendState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ssh2BackendState").finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct ImapConnectionState {
     mailbox: String,
     flags: i64,
     closed: bool,
     deleted_messages: BTreeSet<i64>,
+}
+
+struct ImapBackendState {
+    session: imap::Session<imap::Connection>,
+    mailbox: imap::types::Mailbox,
+}
+
+impl std::fmt::Debug for ImapBackendState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImapBackendState")
+            .field("mailbox", &self.mailbox)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -188,6 +419,53 @@ impl Ssh2State {
         id
     }
 
+    /// Opens a libssh2 backend for an existing request-local session handle.
+    pub fn connect_backend(&mut self, id: i64) -> bool {
+        let Some(session_state) = self.sessions.get(&id) else {
+            return false;
+        };
+        if session_state.closed {
+            return false;
+        }
+        let port = match u16::try_from(session_state.port) {
+            Ok(port) => port,
+            Err(_) => {
+                self.set_error(id, "invalid SSH2 port");
+                return false;
+            }
+        };
+        let address = (session_state.host.as_str(), port);
+        let tcp = match TcpStream::connect(address) {
+            Ok(tcp) => tcp,
+            Err(error) => {
+                self.set_error(id, error.to_string());
+                return false;
+            }
+        };
+        let mut backend = match Ssh2BackendSession::new() {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.set_error(id, error.to_string());
+                return false;
+            }
+        };
+        backend.set_tcp_stream(tcp);
+        if let Err(error) = backend.handshake() {
+            self.set_error(id, error.to_string());
+            return false;
+        }
+        self.backends
+            .insert(id, Ssh2BackendState { session: backend });
+        self.set_error(id, "");
+        true
+    }
+
+    /// Returns whether a live backend is attached to the request-local session.
+    #[must_use]
+    pub fn has_backend(&self, id: i64) -> bool {
+        self.backends.contains_key(&id)
+    }
+
     /// Returns whether a request-local SSH2 session is open.
     #[must_use]
     pub fn is_open(&self, id: i64) -> bool {
@@ -202,6 +480,23 @@ impl Ssh2State {
             return false;
         };
         session.closed = true;
+        if let Some(backend) = self.backends.remove(&id) {
+            let _ = backend
+                .session
+                .disconnect(None, "ssh2_disconnect called", None);
+        }
+        self.sftp_backends.retain(|sftp_id, _| {
+            self.sftp_handles
+                .get(sftp_id)
+                .is_some_and(|sftp| sftp.session_id != id)
+        });
+        for sftp in self
+            .sftp_handles
+            .values_mut()
+            .filter(|sftp| sftp.session_id == id)
+        {
+            sftp.closed = true;
+        }
         true
     }
 
@@ -216,6 +511,9 @@ impl Ssh2State {
     #[must_use]
     pub fn error(&self, id: i64) -> Option<String> {
         self.sessions.get(&id).map(|session| {
+            if session.last_error.is_empty() {
+                return String::new();
+            }
             format!(
                 "{} for {}:{}",
                 session.last_error, session.host, session.port
@@ -223,11 +521,100 @@ impl Ssh2State {
         })
     }
 
+    /// Authenticates a live SSH2 session with a password.
+    pub fn auth_password_backend(
+        &mut self,
+        id: i64,
+        username: &str,
+        password: &str,
+    ) -> Option<bool> {
+        let backend = self.backends.get_mut(&id)?;
+        match backend.session.userauth_password(username, password) {
+            Ok(()) => {
+                if let Some(session) = self.sessions.get_mut(&id) {
+                    session.authenticated = backend.session.authenticated();
+                    session.last_error.clear();
+                }
+                Some(true)
+            }
+            Err(error) => {
+                self.set_error(id, error.to_string());
+                Some(false)
+            }
+        }
+    }
+
+    /// Authenticates a live SSH2 session with public/private key files.
+    pub fn auth_pubkey_file_backend(
+        &mut self,
+        id: i64,
+        username: &str,
+        pubkey: &Path,
+        privatekey: &Path,
+        passphrase: Option<&str>,
+    ) -> Option<bool> {
+        let backend = self.backends.get_mut(&id)?;
+        match backend
+            .session
+            .userauth_pubkey_file(username, Some(pubkey), privatekey, passphrase)
+        {
+            Ok(()) => {
+                if let Some(session) = self.sessions.get_mut(&id) {
+                    session.authenticated = backend.session.authenticated();
+                    session.last_error.clear();
+                }
+                Some(true)
+            }
+            Err(error) => {
+                self.set_error(id, error.to_string());
+                Some(false)
+            }
+        }
+    }
+
+    /// Executes a command through a live SSH2 session and returns stdout bytes.
+    pub fn exec_backend(&mut self, id: i64, command: &str) -> Option<Vec<u8>> {
+        let backend = self.backends.get_mut(&id)?;
+        let mut channel = match backend.session.channel_session() {
+            Ok(channel) => channel,
+            Err(error) => {
+                self.set_error(id, error.to_string());
+                return None;
+            }
+        };
+        if let Err(error) = channel.exec(command) {
+            self.set_error(id, error.to_string());
+            return None;
+        }
+        let mut output = Vec::new();
+        if let Err(error) = channel.read_to_end(&mut output) {
+            self.set_error(id, error.to_string());
+            return None;
+        }
+        if let Err(error) = channel.wait_close() {
+            self.set_error(id, error.to_string());
+            return None;
+        }
+        self.set_error(id, "");
+        Some(output)
+    }
+
     /// Creates a request-local SFTP handle attached to a session.
     pub fn sftp(&mut self, session_id: i64) -> Option<i64> {
         if !self.is_open(session_id) {
             return None;
         }
+        let backend_sftp = if let Some(backend) = self.backends.get(&session_id) {
+            match backend.session.sftp() {
+                Ok(sftp) => Some(sftp),
+                Err(error) => {
+                    self.set_error(session_id, error.to_string());
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
         let id = if self.next_sftp_id <= 0 {
             1
         } else {
@@ -241,6 +628,9 @@ impl Ssh2State {
                 closed: false,
             },
         );
+        if let Some(sftp) = backend_sftp {
+            self.sftp_backends.insert(id, sftp);
+        }
         Some(id)
     }
 
@@ -253,6 +643,89 @@ impl Ssh2State {
             .is_some_and(|sftp| self.is_open(sftp.session_id))
     }
 
+    /// Copies a remote SCP file to a local path through the live SSH2 backend.
+    pub fn scp_recv_backend(&mut self, id: i64, remote: &Path, local: &Path) -> Option<bool> {
+        let backend = self.backends.get_mut(&id)?;
+        let (mut remote_file, _) = match backend.session.scp_recv(remote) {
+            Ok(file) => file,
+            Err(error) => {
+                self.set_error(id, error.to_string());
+                return Some(false);
+            }
+        };
+        let mut bytes = Vec::new();
+        if let Err(error) = remote_file.read_to_end(&mut bytes) {
+            self.set_error(id, error.to_string());
+            return Some(false);
+        }
+        if let Err(error) = std::fs::write(local, bytes) {
+            self.set_error(id, error.to_string());
+            return Some(false);
+        }
+        self.set_error(id, "");
+        Some(true)
+    }
+
+    /// Copies a local file to a remote SCP path through the live SSH2 backend.
+    pub fn scp_send_backend(
+        &mut self,
+        id: i64,
+        local: &Path,
+        remote: &Path,
+        mode: i32,
+    ) -> Option<bool> {
+        let bytes = match std::fs::read(local) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.set_error(id, error.to_string());
+                return if self.backends.contains_key(&id) {
+                    Some(false)
+                } else {
+                    None
+                };
+            }
+        };
+        let backend = self.backends.get_mut(&id)?;
+        let mut remote_file = match backend
+            .session
+            .scp_send(remote, mode, bytes.len() as u64, None)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                self.set_error(id, error.to_string());
+                return Some(false);
+            }
+        };
+        if let Err(error) = remote_file.write_all(&bytes) {
+            self.set_error(id, error.to_string());
+            return Some(false);
+        }
+        if let Err(error) = remote_file.send_eof() {
+            self.set_error(id, error.to_string());
+            return Some(false);
+        }
+        if let Err(error) = remote_file.wait_eof() {
+            self.set_error(id, error.to_string());
+            return Some(false);
+        }
+        if let Err(error) = remote_file.close() {
+            self.set_error(id, error.to_string());
+            return Some(false);
+        }
+        self.set_error(id, "");
+        Some(true)
+    }
+
+    /// Returns the live host-key fingerprint bytes for a session.
+    pub fn fingerprint_backend(&mut self, id: i64, hash: Ssh2FingerprintHash) -> Option<Vec<u8>> {
+        let backend = self.backends.get(&id)?;
+        let hash_type = match hash {
+            Ssh2FingerprintHash::Md5 => HashType::Md5,
+            Ssh2FingerprintHash::Sha1 => HashType::Sha1,
+        };
+        backend.session.host_key_hash(hash_type).map(<[u8]>::to_vec)
+    }
+
     /// Returns whether a session is marked authenticated.
     #[must_use]
     pub fn is_authenticated(&self, id: i64) -> bool {
@@ -260,6 +733,13 @@ impl Ssh2State {
             .get(&id)
             .is_some_and(|session| session.authenticated && !session.closed)
     }
+}
+
+/// Hash algorithm selected by SSH2 fingerprint flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ssh2FingerprintHash {
+    Md5,
+    Sha1,
 }
 
 impl ImapState {
@@ -289,6 +769,9 @@ impl ImapState {
             return false;
         };
         connection.closed = true;
+        if let Some(mut backend) = self.backends.remove(&id) {
+            let _ = backend.session.logout();
+        }
         true
     }
 
@@ -316,6 +799,144 @@ impl ImapState {
             .get(&id)
             .filter(|connection| !connection.closed)
             .map(|connection| connection.flags)
+    }
+
+    /// Opens a live IMAP backend session for an existing request-local handle.
+    pub fn open_backend(
+        &mut self,
+        id: i64,
+        config: &ImapConnectionConfig,
+        user: &str,
+        password: &str,
+    ) -> bool {
+        if !self.is_open(id) {
+            return false;
+        }
+        let mode = if config.ssl {
+            ConnectionMode::Tls
+        } else {
+            ConnectionMode::Plaintext
+        };
+        let builder = ClientBuilder::new(config.host.as_str(), config.port)
+            .mode(mode)
+            .danger_skip_tls_verify(config.novalidate_cert);
+        let client = match builder.connect() {
+            Ok(client) => client,
+            Err(error) => {
+                self.push_error(error.to_string());
+                return false;
+            }
+        };
+        let mut session = match client.login(user, password) {
+            Ok(session) => session,
+            Err((error, _client)) => {
+                self.push_error(error.to_string());
+                return false;
+            }
+        };
+        let mailbox = match session.select(&config.mailbox) {
+            Ok(mailbox) => mailbox,
+            Err(error) => {
+                self.push_error(error.to_string());
+                let _ = session.logout();
+                return false;
+            }
+        };
+        self.backends
+            .insert(id, ImapBackendState { session, mailbox });
+        true
+    }
+
+    /// Returns whether a live backend is attached to a request-local handle.
+    #[must_use]
+    pub fn has_backend(&self, id: i64) -> bool {
+        self.backends.contains_key(&id)
+    }
+
+    /// Returns live mailbox metadata for check/status/info functions.
+    pub fn backend_mailbox(&mut self, id: i64) -> Option<ImapMailboxSnapshot> {
+        let backend = self.backends.get_mut(&id)?;
+        if let Err(error) = backend.session.noop() {
+            self.push_error(error.to_string());
+            return None;
+        }
+        Some(ImapMailboxSnapshot::from(&backend.mailbox))
+    }
+
+    /// Fetches live message header bytes from the backend.
+    pub fn backend_fetch_header(&mut self, id: i64, message: i64) -> Option<Vec<u8>> {
+        let backend = self.backends.get_mut(&id)?;
+        let fetches = match backend
+            .session
+            .fetch(message.to_string(), "BODY.PEEK[HEADER]")
+        {
+            Ok(fetches) => fetches,
+            Err(error) => {
+                self.push_error(error.to_string());
+                return None;
+            }
+        };
+        fetches
+            .iter()
+            .next()
+            .and_then(|message| message.header().map(<[u8]>::to_vec))
+    }
+
+    /// Fetches live message body bytes from the backend.
+    pub fn backend_fetch_body(&mut self, id: i64, message: i64) -> Option<Vec<u8>> {
+        let backend = self.backends.get_mut(&id)?;
+        let fetches = match backend.session.fetch(message.to_string(), "BODY.PEEK[]") {
+            Ok(fetches) => fetches,
+            Err(error) => {
+                self.push_error(error.to_string());
+                return None;
+            }
+        };
+        fetches
+            .iter()
+            .next()
+            .and_then(|message| message.body().map(<[u8]>::to_vec))
+    }
+
+    /// Fetches live header summaries from the backend.
+    pub fn backend_headers(&mut self, id: i64) -> Option<Vec<String>> {
+        let count = self.backends.get(&id)?.mailbox.exists;
+        if count == 0 {
+            return Some(Vec::new());
+        }
+        let backend = self.backends.get_mut(&id)?;
+        let fetches = match backend.session.fetch("1:*", "BODY.PEEK[HEADER]") {
+            Ok(fetches) => fetches,
+            Err(error) => {
+                self.push_error(error.to_string());
+                return None;
+            }
+        };
+        Some(
+            fetches
+                .iter()
+                .filter_map(|message| {
+                    message
+                        .header()
+                        .map(|header| String::from_utf8_lossy(header).into_owned())
+                })
+                .collect(),
+        )
+    }
+
+    /// Searches the live backend and returns matching message numbers.
+    pub fn backend_search(&mut self, id: i64, criteria: &str) -> Option<Vec<i64>> {
+        let backend = self.backends.get_mut(&id)?;
+        let matches = match backend.session.search(criteria) {
+            Ok(matches) => matches,
+            Err(error) => {
+                self.push_error(error.to_string());
+                return None;
+            }
+        };
+        let mut messages = matches.into_iter().map(i64::from).collect::<Vec<_>>();
+        messages.sort_unstable();
+        Some(messages)
     }
 
     /// Marks a message as deleted in request-local state.
@@ -366,6 +987,38 @@ impl ImapState {
     }
 }
 
+/// Parsed PHP IMAP mailbox connection string.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImapConnectionConfig {
+    pub host: String,
+    pub port: u16,
+    pub ssl: bool,
+    pub novalidate_cert: bool,
+    pub mailbox: String,
+}
+
+/// Stable mailbox metadata exposed to IMAP builtins.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImapMailboxSnapshot {
+    pub exists: i64,
+    pub recent: i64,
+    pub unseen: i64,
+    pub uid_next: i64,
+    pub uid_validity: i64,
+}
+
+impl From<&imap::types::Mailbox> for ImapMailboxSnapshot {
+    fn from(mailbox: &imap::types::Mailbox) -> Self {
+        Self {
+            exists: i64::from(mailbox.exists),
+            recent: i64::from(mailbox.recent),
+            unseen: mailbox.unseen.map_or(0, i64::from),
+            uid_next: mailbox.uid_next.map_or(0, i64::from),
+            uid_validity: mailbox.uid_validity.map_or(0, i64::from),
+        }
+    }
+}
+
 impl LdapState {
     /// Creates a request-local LDAP connection handle without opening sockets.
     pub fn connect(&mut self, uri: Option<String>, port: i64) -> i64 {
@@ -403,6 +1056,7 @@ impl LdapState {
             return false;
         };
         connection.closed = true;
+        self.backends.remove(&id);
         true
     }
 
@@ -419,6 +1073,110 @@ impl LdapState {
         if let Some(connection) = self.connections.get_mut(&id) {
             connection.last_errno = errno;
             connection.last_error = error.into();
+        }
+    }
+
+    /// Returns the configured LDAP URI for a request-local connection handle.
+    #[must_use]
+    pub fn connection_uri(&self, id: i64) -> Option<String> {
+        let connection = self.connections.get(&id)?;
+        (!connection.closed)
+            .then(|| normalized_ldap_uri(connection.uri.as_deref(), connection.port))
+    }
+
+    /// Binds a live LDAP backend for a request-local connection handle.
+    pub fn bind_backend(&mut self, id: i64, url: &str, bind_dn: &str, password: &str) -> bool {
+        let Some(connection) = self.connections.get(&id) else {
+            return false;
+        };
+        if connection.closed {
+            return false;
+        }
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.backends.entry(id) {
+            match LdapConn::new(url) {
+                Ok(backend) => {
+                    entry.insert(backend);
+                }
+                Err(error) => {
+                    let (errno, message) = ldap_backend_error(error);
+                    if let Some(connection) = self.connections.get_mut(&id) {
+                        connection.last_errno = errno;
+                        connection.last_error = message;
+                    }
+                    return false;
+                }
+            }
+        }
+        let Some(backend) = self.backends.get_mut(&id) else {
+            self.set_connection_error(id, -1, "LDAP backend unavailable");
+            return false;
+        };
+        let bind = backend
+            .simple_bind(bind_dn, password)
+            .and_then(|result| result.success());
+        match bind {
+            Ok(_) => {
+                self.set_connection_error(id, 0, ldap_error_message(0));
+                true
+            }
+            Err(error) => {
+                self.set_ldap_backend_error(id, error);
+                false
+            }
+        }
+    }
+
+    /// Runs a live LDAP search and stores its result/entry handles.
+    pub fn search_backend(
+        &mut self,
+        id: i64,
+        url: &str,
+        base: &str,
+        scope: LdapSearchScope,
+        filter: &str,
+        attributes: Vec<String>,
+    ) -> Option<i64> {
+        if !self.is_open(id) {
+            return None;
+        }
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.backends.entry(id) {
+            match LdapConn::new(url) {
+                Ok(backend) => {
+                    entry.insert(backend);
+                }
+                Err(error) => {
+                    let (errno, message) = ldap_backend_error(error);
+                    if let Some(connection) = self.connections.get_mut(&id) {
+                        connection.last_errno = errno;
+                        connection.last_error = message;
+                    }
+                    return None;
+                }
+            }
+        }
+        let scope = match scope {
+            LdapSearchScope::Base => Scope::Base,
+            LdapSearchScope::OneLevel => Scope::OneLevel,
+            LdapSearchScope::Subtree => Scope::Subtree,
+        };
+        let Some(backend) = self.backends.get_mut(&id) else {
+            self.set_connection_error(id, -1, "LDAP backend unavailable");
+            return None;
+        };
+        let search = backend
+            .search(base, scope, filter, attributes)
+            .and_then(|result| result.success());
+        match search {
+            Ok((entries, _)) => {
+                self.set_connection_error(id, 0, ldap_error_message(0));
+                Some(self.store_search_entries(
+                    entries.into_iter().map(SearchEntry::construct).collect(),
+                ))
+            }
+            Err(error) => {
+                self.set_ldap_backend_error(id, error);
+                None
+            }
         }
     }
 
@@ -551,9 +1309,70 @@ impl LdapState {
         let mut output = PhpArray::new();
         output.insert(
             crate::ArrayKey::String(crate::PhpString::from("count")),
-            Value::Int(0),
+            Value::Int(result.entries.len() as i64),
         );
+        for (index, entry_id) in result.entries.iter().copied().enumerate() {
+            let Some(entry) = self.entries.get(&entry_id) else {
+                continue;
+            };
+            let mut entry_array = entry.attributes.clone();
+            entry_array.insert(
+                crate::ArrayKey::String(crate::PhpString::from("dn")),
+                Value::string(entry.dn.clone()),
+            );
+            output.insert(
+                crate::ArrayKey::Int(index as i64),
+                Value::Array(entry_array),
+            );
+        }
         Some(output)
+    }
+
+    fn store_search_entries(&mut self, entries: Vec<SearchEntry>) -> i64 {
+        let result_id = if self.next_result_id <= 0 {
+            1
+        } else {
+            self.next_result_id
+        };
+        self.next_result_id = result_id.saturating_add(1);
+        let mut entry_ids = Vec::with_capacity(entries.len());
+        let mut previous_entry_id = None;
+        for entry in entries {
+            let entry_id = if self.next_entry_id <= 0 {
+                1
+            } else {
+                self.next_entry_id
+            };
+            self.next_entry_id = entry_id.saturating_add(1);
+            if let Some(previous_entry_id) = previous_entry_id
+                && let Some(previous) = self.entries.get_mut(&previous_entry_id)
+            {
+                previous.next_entry_id = Some(entry_id);
+            }
+            previous_entry_id = Some(entry_id);
+            entry_ids.push(entry_id);
+            self.entries.insert(
+                entry_id,
+                LdapResultEntryState {
+                    dn: entry.dn,
+                    attributes: ldap_attributes_array(entry.attrs, entry.bin_attrs),
+                    next_entry_id: None,
+                },
+            );
+        }
+        self.results.insert(
+            result_id,
+            LdapResultState {
+                entries: entry_ids,
+                freed: false,
+            },
+        );
+        result_id
+    }
+
+    fn set_ldap_backend_error(&mut self, id: i64, error: LdapError) {
+        let (errno, message) = ldap_backend_error(error);
+        self.set_connection_error(id, errno, message);
     }
 }
 
@@ -573,6 +1392,14 @@ pub(crate) const OPT_SERVER_CONTROLS: i64 = 18;
 pub(crate) const OPT_CLIENT_CONTROLS: i64 = 19;
 pub(crate) const OPT_DEBUG_LEVEL: i64 = 20481;
 pub(crate) const OPT_X_TLS_REQUIRE_CERT: i64 = 24582;
+
+/// LDAP search scope used by the runtime LDAP facade.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LdapSearchScope {
+    Base,
+    OneLevel,
+    Subtree,
+}
 
 fn is_supported_ldap_option(option: i64) -> bool {
     matches!(
@@ -626,33 +1453,167 @@ fn ldap_error_message(errno: i64) -> &'static str {
     }
 }
 
-#[derive(Debug)]
+fn normalized_ldap_uri(uri: Option<&str>, port: i64) -> String {
+    let raw = uri
+        .map(str::trim)
+        .filter(|uri| !uri.is_empty())
+        .unwrap_or("ldap://localhost");
+    if raw.starts_with("ldapi://") {
+        return raw.to_owned();
+    }
+    let with_scheme = if raw.contains("://") {
+        raw.to_owned()
+    } else {
+        format!("ldap://{raw}")
+    };
+    let Some((scheme, rest)) = with_scheme.split_once("://") else {
+        return with_scheme;
+    };
+    let split = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..split];
+    let suffix = &rest[split..];
+    let has_port = authority
+        .rsplit_once(':')
+        .is_some_and(|(_, candidate)| candidate.parse::<u16>().is_ok());
+    if has_port {
+        with_scheme
+    } else {
+        format!("{scheme}://{authority}:{port}{suffix}")
+    }
+}
+
+fn ldap_backend_error(error: LdapError) -> (i64, String) {
+    match error {
+        LdapError::LdapResult { result } => {
+            let errno = i64::from(result.rc);
+            let message = if result.text.is_empty() {
+                ldap_error_message(errno).to_owned()
+            } else {
+                result.text
+            };
+            (errno, message)
+        }
+        error => (81, error.to_string()),
+    }
+}
+
+fn ldap_attributes_array(
+    attrs: HashMap<String, Vec<String>>,
+    bin_attrs: HashMap<String, Vec<Vec<u8>>>,
+) -> PhpArray {
+    let mut names = attrs
+        .keys()
+        .chain(bin_attrs.keys())
+        .cloned()
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+
+    let mut output = PhpArray::new();
+    output.insert(
+        crate::ArrayKey::String(crate::PhpString::from("count")),
+        Value::Int(names.len() as i64),
+    );
+    for (index, name) in names.into_iter().enumerate() {
+        output.insert(
+            crate::ArrayKey::Int(index as i64),
+            Value::string(name.clone()),
+        );
+        let values = if let Some(values) = attrs.get(&name) {
+            ldap_text_values_array(values)
+        } else {
+            ldap_binary_values_array(bin_attrs.get(&name).into_iter().flatten())
+        };
+        output.insert(
+            crate::ArrayKey::String(crate::PhpString::from_bytes(name.into_bytes())),
+            Value::Array(values),
+        );
+    }
+    output
+}
+
+fn ldap_text_values_array(values: &[String]) -> PhpArray {
+    let mut output = PhpArray::new();
+    output.insert(
+        crate::ArrayKey::String(crate::PhpString::from("count")),
+        Value::Int(values.len() as i64),
+    );
+    for (index, value) in values.iter().enumerate() {
+        output.insert(
+            crate::ArrayKey::Int(index as i64),
+            Value::string(value.clone()),
+        );
+    }
+    output
+}
+
+fn ldap_binary_values_array<'a>(values: impl Iterator<Item = &'a Vec<u8>>) -> PhpArray {
+    let values = values.collect::<Vec<_>>();
+    let mut output = PhpArray::new();
+    output.insert(
+        crate::ArrayKey::String(crate::PhpString::from("count")),
+        Value::Int(values.len() as i64),
+    );
+    for (index, value) in values.into_iter().enumerate() {
+        output.insert(
+            crate::ArrayKey::Int(index as i64),
+            Value::String(crate::PhpString::from_bytes(value.clone())),
+        );
+    }
+    output
+}
+
 struct FtpEntry {
-    stream: TcpStream,
+    client: FtpStream,
     passive: bool,
     timeout: Duration,
     auto_seek: bool,
     use_pasv_address: bool,
 }
 
+impl std::fmt::Debug for FtpEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FtpEntry")
+            .field("passive", &self.passive)
+            .field("timeout", &self.timeout)
+            .field("auto_seek", &self.auto_seek)
+            .field("use_pasv_address", &self.use_pasv_address)
+            .finish_non_exhaustive()
+    }
+}
+
 impl FtpState {
     /// Opens a plain FTP control connection and validates the server greeting.
-    pub fn connect(&mut self, host: &str, port: u16, timeout_secs: u64) -> Result<i64, i32> {
-        let host = loopback_host(host).ok_or(libc::EACCES)?;
+    pub fn connect(
+        &mut self,
+        host: &str,
+        port: u16,
+        timeout_secs: u64,
+        allow_configured_live_endpoint: bool,
+    ) -> Result<i64, i32> {
+        let host = if allow_configured_live_endpoint {
+            host.to_owned()
+        } else {
+            loopback_host(host).ok_or(libc::EACCES)?.to_owned()
+        };
         let timeout = Duration::from_secs(timeout_secs.max(1));
-        let mut stream = TcpStream::connect((host, port)).map_err(raw_errno)?;
-        let _ = stream.set_read_timeout(Some(timeout));
-        let _ = stream.set_write_timeout(Some(timeout));
-        let response = read_ftp_response(&mut stream).map_err(raw_errno)?;
-        if response.code != 220 {
-            return Err(libc::ECONNREFUSED);
-        }
+        let address = (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(raw_errno)?
+            .next()
+            .ok_or(libc::ECONNREFUSED)?;
+        let mut client =
+            FtpStream::connect_timeout(address, timeout).map_err(|_| libc::ECONNREFUSED)?;
+        let _ = client.get_ref().set_read_timeout(Some(timeout));
+        let _ = client.get_ref().set_write_timeout(Some(timeout));
+        client.set_mode(Mode::Passive);
+        client.set_passive_nat_workaround(true);
         let id = if self.next_id <= 0 { 1 } else { self.next_id };
         self.next_id = id.saturating_add(1);
         self.connections.insert(
             id,
             FtpEntry {
-                stream,
+                client,
                 passive: false,
                 timeout,
                 auto_seek: true,
@@ -665,163 +1626,125 @@ impl FtpState {
     /// Authenticates with USER/PASS.
     pub fn login(&mut self, id: i64, user: &str, password: &str) -> Result<bool, i32> {
         let entry = self.connection_mut(id)?;
-        let response = send_ftp_command(&mut entry.stream, &format!("USER {user}"))?;
-        match response.code {
-            230 => Ok(true),
-            331 => {
-                let response = send_ftp_command(&mut entry.stream, &format!("PASS {password}"))?;
-                Ok(response.code == 230)
-            }
-            _ => Ok(false),
-        }
+        Ok(entry.client.login(user, password).is_ok())
     }
 
     /// Returns the current remote directory from PWD.
     pub fn pwd(&mut self, id: i64) -> Result<Option<String>, i32> {
         let entry = self.connection_mut(id)?;
-        let response = send_ftp_command(&mut entry.stream, "PWD")?;
-        if response.code != 257 {
-            return Ok(None);
-        }
-        Ok(response
-            .lines
-            .last()
-            .and_then(|line| parse_ftp_quoted_path(line)))
+        Ok(entry.client.pwd().ok())
     }
 
     /// Changes the remote directory with CWD.
     pub fn chdir(&mut self, id: i64, path: &str) -> Result<bool, i32> {
         let entry = self.connection_mut(id)?;
-        let response = send_ftp_command(&mut entry.stream, &format!("CWD {path}"))?;
-        Ok(response.code == 250)
+        Ok(entry.client.cwd(path).is_ok())
     }
 
     /// Changes to the parent directory with CDUP.
     pub fn cdup(&mut self, id: i64) -> Result<bool, i32> {
         let entry = self.connection_mut(id)?;
-        let response = send_ftp_command(&mut entry.stream, "CDUP")?;
-        Ok(response.code == 200 || response.code == 250)
+        Ok(entry.client.cdup().is_ok())
     }
 
     /// Runs an EXEC command on servers that support SITE EXEC.
     pub fn exec(&mut self, id: i64, command: &str) -> Result<bool, i32> {
         let entry = self.connection_mut(id)?;
-        let response = send_ftp_command(&mut entry.stream, &format!("SITE EXEC {command}"))?;
-        Ok((200..300).contains(&response.code))
+        Ok(entry.client.site(format!("EXEC {command}")).is_ok())
     }
 
     /// Sends a raw FTP command and returns response lines without CRLF.
     pub fn raw(&mut self, id: i64, command: &str) -> Result<Vec<String>, i32> {
         let entry = self.connection_mut(id)?;
-        Ok(send_ftp_command(&mut entry.stream, command)?.lines)
+        let response = entry
+            .client
+            .custom_command(command, &RAW_COMMAND_OK_STATUSES)
+            .map_err(|_| libc::EIO)?;
+        Ok(vec![ftp_response_line(response)])
     }
 
     /// Creates a remote directory and returns the path reported by the server.
     pub fn mkdir(&mut self, id: i64, path: &str) -> Result<Option<String>, i32> {
         let entry = self.connection_mut(id)?;
-        let response = send_ftp_command(&mut entry.stream, &format!("MKD {path}"))?;
-        if response.code != 257 && response.code != 250 {
-            return Ok(None);
-        }
-        Ok(response
-            .lines
-            .last()
-            .and_then(|line| parse_ftp_quoted_path(line))
-            .or_else(|| Some(path.to_owned())))
+        Ok(entry.client.mkdir(path).is_ok().then(|| path.to_owned()))
     }
 
     /// Removes a remote directory.
     pub fn rmdir(&mut self, id: i64, path: &str) -> Result<bool, i32> {
         let entry = self.connection_mut(id)?;
-        let response = send_ftp_command(&mut entry.stream, &format!("RMD {path}"))?;
-        Ok((200..300).contains(&response.code))
+        Ok(entry.client.rmdir(path).is_ok())
     }
 
     /// Deletes a remote file.
     pub fn delete(&mut self, id: i64, path: &str) -> Result<bool, i32> {
         let entry = self.connection_mut(id)?;
-        let response = send_ftp_command(&mut entry.stream, &format!("DELE {path}"))?;
-        Ok((200..300).contains(&response.code))
+        Ok(entry.client.rm(path).is_ok())
     }
 
     /// Renames a remote path through RNFR/RNTO.
     pub fn rename(&mut self, id: i64, from: &str, to: &str) -> Result<bool, i32> {
         let entry = self.connection_mut(id)?;
-        let response = send_ftp_command(&mut entry.stream, &format!("RNFR {from}"))?;
-        if response.code != 350 {
-            return Ok(false);
-        }
-        let response = send_ftp_command(&mut entry.stream, &format!("RNTO {to}"))?;
-        Ok((200..300).contains(&response.code))
+        Ok(entry.client.rename(from, to).is_ok())
     }
 
     /// Sends a SITE command.
     pub fn site(&mut self, id: i64, command: &str) -> Result<bool, i32> {
         let entry = self.connection_mut(id)?;
-        let response = send_ftp_command(&mut entry.stream, &format!("SITE {command}"))?;
-        Ok((200..300).contains(&response.code))
+        Ok(entry.client.site(command).is_ok())
     }
 
     /// Sends an ALLO command and returns the server response line.
     pub fn alloc(&mut self, id: i64, size: i64) -> Result<(bool, Option<String>), i32> {
         let entry = self.connection_mut(id)?;
-        let response = send_ftp_command(&mut entry.stream, &format!("ALLO {size}"))?;
-        Ok((
-            response.code == 200 || response.code == 202,
-            response.lines.last().cloned(),
-        ))
+        match entry.client.custom_command(
+            format!("ALLO {size}"),
+            &[Status::CommandOk, Status::CommandNotImplemented],
+        ) {
+            Ok(response) => Ok((true, Some(ftp_response_line(response)))),
+            Err(_) => Ok((false, None)),
+        }
     }
 
     /// Sends SITE CHMOD and returns the permission on success.
     pub fn chmod(&mut self, id: i64, permissions: i64, path: &str) -> Result<Option<i64>, i32> {
         let entry = self.connection_mut(id)?;
-        let response = send_ftp_command(
-            &mut entry.stream,
-            &format!("SITE CHMOD {permissions:o} {path}"),
-        )?;
-        Ok(((200..300).contains(&response.code)).then_some(permissions))
+        Ok(entry
+            .client
+            .site(format!("CHMOD {permissions:o} {path}"))
+            .is_ok()
+            .then_some(permissions))
     }
 
     /// Returns the server system type from SYST.
     pub fn systype(&mut self, id: i64) -> Result<Option<String>, i32> {
         let entry = self.connection_mut(id)?;
-        let response = send_ftp_command(&mut entry.stream, "SYST")?;
-        if response.code != 215 {
-            return Ok(None);
-        }
-        Ok(response
-            .lines
-            .last()
-            .map(|line| line.strip_prefix("215 ").unwrap_or(line).trim().to_owned()))
+        Ok(entry
+            .client
+            .custom_command("SYST", &[Status::Name])
+            .ok()
+            .and_then(|response| response.as_string().ok())
+            .map(|line| strip_ftp_status_prefix(&line).to_owned()))
     }
 
     /// Returns SIZE, or -1 when the server does not return a numeric 213 value.
     pub fn size(&mut self, id: i64, path: &str) -> Result<i64, i32> {
         let entry = self.connection_mut(id)?;
-        let response = send_ftp_command(&mut entry.stream, &format!("SIZE {path}"))?;
-        if response.code != 213 {
-            return Ok(-1);
-        }
-        Ok(response
-            .lines
-            .last()
-            .and_then(|line| line.get(4..))
-            .and_then(|value| value.trim().parse::<i64>().ok())
+        Ok(entry
+            .client
+            .size(path)
+            .ok()
+            .and_then(|size| i64::try_from(size).ok())
             .unwrap_or(-1))
     }
 
     /// Returns MDTM, or -1 when the server does not return a numeric 213 value.
     pub fn mdtm(&mut self, id: i64, path: &str) -> Result<i64, i32> {
         let entry = self.connection_mut(id)?;
-        let response = send_ftp_command(&mut entry.stream, &format!("MDTM {path}"))?;
-        if response.code != 213 {
-            return Ok(-1);
-        }
-        Ok(response
-            .lines
-            .last()
-            .and_then(|line| line.get(4..))
-            .and_then(|value| value.trim().parse::<i64>().ok())
+        Ok(entry
+            .client
+            .mdtm(path)
+            .ok()
+            .and_then(|value| value.format("%Y%m%d%H%M%S").to_string().parse().ok())
             .unwrap_or(-1))
     }
 
@@ -829,12 +1752,19 @@ impl FtpState {
     pub fn set_passive(&mut self, id: i64, enabled: bool) -> Result<bool, i32> {
         let entry = self.connection_mut(id)?;
         entry.passive = enabled;
+        entry
+            .client
+            .set_mode(if enabled { Mode::Passive } else { Mode::Active });
         Ok(true)
     }
 
     /// Reads an NLST response through a passive data connection.
     pub fn nlist(&mut self, id: i64, path: &str) -> Result<Option<Vec<String>>, i32> {
-        self.read_passive_listing(id, &format!("NLST {path}"))
+        let entry = self.connection_mut(id)?;
+        if !entry.passive {
+            return Ok(None);
+        }
+        Ok(entry.client.nlst(non_empty_path(path)).ok())
     }
 
     /// Reads a LIST response through a passive data connection.
@@ -844,17 +1774,25 @@ impl FtpState {
         path: &str,
         recursive: bool,
     ) -> Result<Option<Vec<String>>, i32> {
-        let command = if recursive {
-            format!("LIST -R {path}")
+        let entry = self.connection_mut(id)?;
+        if !entry.passive {
+            return Ok(None);
+        }
+        let path = if recursive {
+            format!("-R {path}")
         } else {
-            format!("LIST {path}")
+            path.to_owned()
         };
-        self.read_passive_listing(id, &command)
+        Ok(entry.client.list(non_empty_path(&path)).ok())
     }
 
     /// Reads an MLSD response through a passive data connection.
     pub fn mlsd(&mut self, id: i64, path: &str) -> Result<Option<Vec<String>>, i32> {
-        self.read_passive_listing(id, &format!("MLSD {path}"))
+        let entry = self.connection_mut(id)?;
+        if !entry.passive {
+            return Ok(None);
+        }
+        Ok(entry.client.mlsd(non_empty_path(path)).ok())
     }
 
     /// Retrieves a remote file through a passive data connection.
@@ -869,26 +1807,19 @@ impl FtpState {
         if !entry.passive {
             return Ok(None);
         }
-        set_transfer_type(entry, mode)?;
+        set_suppaftp_transfer_type(entry, mode)?;
         if offset > 0 {
-            let response = send_ftp_command(&mut entry.stream, &format!("REST {offset}"))?;
-            if response.code != 350 {
-                return Ok(None);
-            }
+            let offset = usize::try_from(offset).map_err(|_| libc::EINVAL)?;
+            entry
+                .client
+                .resume_transfer(offset)
+                .map_err(|_| libc::EIO)?;
         }
-        let mut data = open_passive_data_connection(entry)?;
-        let response = send_ftp_command(&mut entry.stream, &format!("RETR {path}"))?;
-        if response.code != 125 && response.code != 150 {
-            return Ok(None);
-        }
-        let mut bytes = Vec::new();
-        data.read_to_end(&mut bytes).map_err(raw_errno)?;
-        drop(data);
-        let final_response = read_ftp_response(&mut entry.stream).map_err(raw_errno)?;
-        if final_response.code != 226 && final_response.code != 250 {
-            return Ok(None);
-        }
-        Ok(Some(bytes))
+        Ok(entry
+            .client
+            .retr_as_buffer(path)
+            .ok()
+            .map(Cursor::into_inner))
     }
 
     /// Stores a remote file through a passive data connection.
@@ -905,24 +1836,21 @@ impl FtpState {
         if !entry.passive {
             return Ok(false);
         }
-        set_transfer_type(entry, mode)?;
+        set_suppaftp_transfer_type(entry, mode)?;
         if offset > 0 {
-            let response = send_ftp_command(&mut entry.stream, &format!("REST {offset}"))?;
-            if response.code != 350 {
-                return Ok(false);
-            }
+            let offset = usize::try_from(offset).map_err(|_| libc::EINVAL)?;
+            entry
+                .client
+                .resume_transfer(offset)
+                .map_err(|_| libc::EIO)?;
         }
-        let mut data = open_passive_data_connection(entry)?;
-        let command = if append { "APPE" } else { "STOR" };
-        let response = send_ftp_command(&mut entry.stream, &format!("{command} {path}"))?;
-        if response.code != 125 && response.code != 150 {
-            return Ok(false);
-        }
-        data.write_all(bytes).map_err(raw_errno)?;
-        data.flush().map_err(raw_errno)?;
-        drop(data);
-        let final_response = read_ftp_response(&mut entry.stream).map_err(raw_errno)?;
-        Ok(final_response.code == 226 || final_response.code == 250)
+        let mut reader = Cursor::new(bytes);
+        let result = if append {
+            entry.client.append_file(path, &mut reader)
+        } else {
+            entry.client.put_file(path, &mut reader)
+        };
+        Ok(result.is_ok())
     }
 
     /// Returns one FTP option value.
@@ -944,8 +1872,11 @@ impl FtpState {
         match (option, value) {
             (0, FtpOptionValue::Int(seconds)) if seconds > 0 => {
                 entry.timeout = Duration::from_secs(u64::try_from(seconds).unwrap_or(u64::MAX));
-                let _ = entry.stream.set_read_timeout(Some(entry.timeout));
-                let _ = entry.stream.set_write_timeout(Some(entry.timeout));
+                let _ = entry.client.get_ref().set_read_timeout(Some(entry.timeout));
+                let _ = entry
+                    .client
+                    .get_ref()
+                    .set_write_timeout(Some(entry.timeout));
                 Ok(true)
             }
             (1, FtpOptionValue::Bool(enabled)) => {
@@ -954,6 +1885,7 @@ impl FtpState {
             }
             (2, FtpOptionValue::Bool(enabled)) => {
                 entry.use_pasv_address = enabled;
+                entry.client.set_passive_nat_workaround(!enabled);
                 Ok(true)
             }
             _ => Ok(false),
@@ -965,7 +1897,7 @@ impl FtpState {
         let Some(mut entry) = self.connections.remove(&id) else {
             return Err(libc::EBADF);
         };
-        let _ = send_ftp_command(&mut entry.stream, "QUIT");
+        let _ = entry.client.quit();
         Ok(true)
     }
 
@@ -977,32 +1909,6 @@ impl FtpState {
 
     fn connection_mut(&mut self, id: i64) -> Result<&mut FtpEntry, i32> {
         self.connections.get_mut(&id).ok_or(libc::EBADF)
-    }
-
-    fn read_passive_listing(&mut self, id: i64, command: &str) -> Result<Option<Vec<String>>, i32> {
-        let entry = self.connection_mut(id)?;
-        if !entry.passive {
-            return Ok(None);
-        }
-        let mut data = open_passive_data_connection(entry)?;
-        let response = send_ftp_command(&mut entry.stream, command)?;
-        if response.code != 125 && response.code != 150 {
-            return Ok(None);
-        }
-        let mut bytes = Vec::new();
-        data.read_to_end(&mut bytes).map_err(raw_errno)?;
-        drop(data);
-        let final_response = read_ftp_response(&mut entry.stream).map_err(raw_errno)?;
-        if final_response.code != 226 && final_response.code != 250 {
-            return Ok(None);
-        }
-        let text = String::from_utf8_lossy(&bytes);
-        Ok(Some(
-            text.lines()
-                .map(|line| line.trim_end_matches('\r').to_owned())
-                .filter(|line| !line.is_empty())
-                .collect(),
-        ))
     }
 }
 
@@ -1019,6 +1925,7 @@ pub struct SocketState {
     next_id: i64,
     last_error: i32,
     sockets: BTreeMap<i64, SocketEntry>,
+    options: BTreeMap<i64, BTreeMap<(i64, i64), i64>>,
 }
 
 #[derive(Debug)]
@@ -1030,6 +1937,10 @@ enum SocketEntry {
     },
     Listener(TcpListener),
     Stream(TcpStream),
+    #[cfg(unix)]
+    UnixListener(UnixListener),
+    #[cfg(unix)]
+    UnixStream(UnixStream),
     Closed,
 }
 
@@ -1046,12 +1957,13 @@ impl SocketState {
                 protocol,
             },
         );
+        self.options.insert(id, BTreeMap::new());
         self.last_error = 0;
         id
     }
 
-    /// Binds a TCP listener to a loopback address.
-    pub fn bind_tcp_listener(&mut self, id: i64, address: &str, port: u16) -> Result<(), i32> {
+    /// Binds a stream listener to a loopback TCP address or Unix socket path.
+    pub fn bind_stream_listener(&mut self, id: i64, address: &str, port: u16) -> Result<(), i32> {
         let Some(entry) = self.sockets.get_mut(&id) else {
             return Err(libc::EBADF);
         };
@@ -1063,8 +1975,16 @@ impl SocketState {
         else {
             return Err(libc::EINVAL);
         };
+        if *socket_type != i64::from(libc::SOCK_STREAM) {
+            return Err(libc::EAFNOSUPPORT);
+        }
+        if *domain == i64::from(libc::AF_UNIX) {
+            if *protocol != 0 {
+                return Err(libc::EPROTONOSUPPORT);
+            }
+            return bind_unix_listener(entry, address);
+        }
         if *domain != i64::from(libc::AF_INET)
-            || *socket_type != i64::from(libc::SOCK_STREAM)
             || (*protocol != 0 && *protocol != i64::from(libc::IPPROTO_TCP))
         {
             return Err(libc::EAFNOSUPPORT);
@@ -1094,18 +2014,42 @@ impl SocketState {
                 self.last_error = 0;
                 Ok(())
             }
+            #[cfg(unix)]
+            Some(SocketEntry::UnixListener(_)) => {
+                self.last_error = 0;
+                Ok(())
+            }
             Some(_) => Err(libc::EINVAL),
             None => Err(libc::EBADF),
         }
     }
 
-    /// Connects a TCP stream socket to a loopback listener.
-    pub fn connect_tcp(&mut self, id: i64, address: &str, port: u16) -> Result<(), i32> {
+    /// Connects a stream socket to a loopback TCP listener or Unix socket path.
+    pub fn connect_stream(&mut self, id: i64, address: &str, port: u16) -> Result<(), i32> {
         let Some(entry) = self.sockets.get_mut(&id) else {
             return Err(libc::EBADF);
         };
-        if !matches!(entry, SocketEntry::Created { .. }) {
+        let SocketEntry::Created {
+            domain,
+            socket_type,
+            protocol,
+        } = entry
+        else {
             return Err(libc::EINVAL);
+        };
+        if *socket_type != i64::from(libc::SOCK_STREAM) {
+            return Err(libc::EAFNOSUPPORT);
+        }
+        if *domain == i64::from(libc::AF_UNIX) {
+            if *protocol != 0 {
+                return Err(libc::EPROTONOSUPPORT);
+            }
+            return connect_unix_stream(entry, address);
+        }
+        if *domain != i64::from(libc::AF_INET)
+            || (*protocol != 0 && *protocol != i64::from(libc::IPPROTO_TCP))
+        {
+            return Err(libc::EAFNOSUPPORT);
         }
         let connect_address = if address == "localhost" {
             "127.0.0.1"
@@ -1127,27 +2071,42 @@ impl SocketState {
 
     /// Accepts one connection from a listener and returns a new socket ID.
     pub fn accept(&mut self, id: i64) -> Result<i64, i32> {
-        let listener = match self.sockets.get(&id) {
-            Some(SocketEntry::Listener(listener)) => listener,
-            Some(_) => return Err(libc::EINVAL),
-            None => return Err(libc::EBADF),
-        };
-        match listener.accept() {
-            Ok((stream, _addr)) => {
-                let id = if self.next_id <= 0 { 1 } else { self.next_id };
-                self.next_id = id.saturating_add(1);
-                self.sockets.insert(id, SocketEntry::Stream(stream));
-                self.last_error = 0;
-                Ok(id)
-            }
-            Err(error) => Err(raw_errno(error)),
+        match self.sockets.get(&id) {
+            Some(SocketEntry::Listener(listener)) => match listener.accept() {
+                Ok((stream, _addr)) => self.insert_accepted(SocketEntry::Stream(stream)),
+                Err(error) => Err(raw_errno(error)),
+            },
+            #[cfg(unix)]
+            Some(SocketEntry::UnixListener(listener)) => match listener.accept() {
+                Ok((stream, _addr)) => self.insert_accepted(SocketEntry::UnixStream(stream)),
+                Err(error) => Err(raw_errno(error)),
+            },
+            Some(_) => Err(libc::EINVAL),
+            None => Err(libc::EBADF),
         }
+    }
+
+    fn insert_accepted(&mut self, entry: SocketEntry) -> Result<i64, i32> {
+        let id = if self.next_id <= 0 { 1 } else { self.next_id };
+        self.next_id = id.saturating_add(1);
+        self.sockets.insert(id, entry);
+        self.options.insert(id, BTreeMap::new());
+        self.last_error = 0;
+        Ok(id)
     }
 
     /// Writes bytes to a connected stream.
     pub fn write(&mut self, id: i64, bytes: &[u8]) -> Result<usize, i32> {
         match self.sockets.get_mut(&id) {
             Some(SocketEntry::Stream(stream)) => match stream.write(bytes) {
+                Ok(written) => {
+                    self.last_error = 0;
+                    Ok(written)
+                }
+                Err(error) => Err(raw_errno(error)),
+            },
+            #[cfg(unix)]
+            Some(SocketEntry::UnixStream(stream)) => match stream.write(bytes) {
                 Ok(written) => {
                     self.last_error = 0;
                     Ok(written)
@@ -1173,27 +2132,47 @@ impl SocketState {
                     Err(error) => Err(raw_errno(error)),
                 }
             }
+            #[cfg(unix)]
+            Some(SocketEntry::UnixStream(stream)) => {
+                let mut buffer = vec![0; length];
+                match stream.read(&mut buffer) {
+                    Ok(read) => {
+                        buffer.truncate(read);
+                        self.last_error = 0;
+                        Ok(buffer)
+                    }
+                    Err(error) => Err(raw_errno(error)),
+                }
+            }
             Some(_) => Err(libc::EINVAL),
             None => Err(libc::EBADF),
         }
     }
 
-    /// Returns the local address for a bound or connected socket.
+    /// Returns the local socket name for a bound or connected socket.
     #[must_use]
-    pub fn local_addr(&self, id: i64) -> Option<SocketAddr> {
+    pub fn local_name(&self, id: i64) -> Option<(String, Option<u16>)> {
         match self.sockets.get(&id)? {
-            SocketEntry::Listener(listener) => listener.local_addr().ok(),
-            SocketEntry::Stream(stream) => stream.local_addr().ok(),
+            SocketEntry::Listener(listener) => tcp_name(listener.local_addr().ok()),
+            SocketEntry::Stream(stream) => tcp_name(stream.local_addr().ok()),
+            #[cfg(unix)]
+            SocketEntry::UnixListener(listener) => unix_name(listener.local_addr().ok()),
+            #[cfg(unix)]
+            SocketEntry::UnixStream(stream) => unix_name(stream.local_addr().ok()),
             SocketEntry::Created { .. } | SocketEntry::Closed => None,
         }
     }
 
-    /// Returns the peer address for a connected stream socket.
+    /// Returns the peer socket name for a connected stream socket.
     #[must_use]
-    pub fn peer_addr(&self, id: i64) -> Option<SocketAddr> {
+    pub fn peer_name(&self, id: i64) -> Option<(String, Option<u16>)> {
         match self.sockets.get(&id)? {
-            SocketEntry::Stream(stream) => stream.peer_addr().ok(),
+            SocketEntry::Stream(stream) => tcp_name(stream.peer_addr().ok()),
+            #[cfg(unix)]
+            SocketEntry::UnixStream(stream) => unix_name(stream.peer_addr().ok()),
             SocketEntry::Created { .. } | SocketEntry::Listener(_) | SocketEntry::Closed => None,
+            #[cfg(unix)]
+            SocketEntry::UnixListener(_) => None,
         }
     }
 
@@ -1213,9 +2192,72 @@ impl SocketState {
                 }
                 Err(error) => Err(raw_errno(error)),
             },
+            #[cfg(unix)]
+            Some(SocketEntry::UnixStream(stream)) => match stream.shutdown(shutdown) {
+                Ok(()) => {
+                    self.last_error = 0;
+                    Ok(())
+                }
+                Err(error) => Err(raw_errno(error)),
+            },
             Some(_) => Err(libc::EINVAL),
             None => Err(libc::EBADF),
         }
+    }
+
+    /// Sets a supported socket option on a live socket handle.
+    pub fn set_option(&mut self, id: i64, level: i64, option: i64, value: i64) -> Result<(), i32> {
+        if !is_supported_socket_option(level, option) {
+            return Err(libc::ENOPROTOOPT);
+        }
+        match self.sockets.get_mut(&id) {
+            Some(SocketEntry::Stream(stream))
+                if level == i64::from(libc::IPPROTO_TCP)
+                    && option == i64::from(libc::TCP_NODELAY) =>
+            {
+                stream.set_nodelay(value != 0).map_err(raw_errno)?;
+            }
+            Some(
+                SocketEntry::Created { .. } | SocketEntry::Listener(_) | SocketEntry::Stream(_),
+            ) => {}
+            #[cfg(unix)]
+            Some(SocketEntry::UnixListener(_) | SocketEntry::UnixStream(_)) => {}
+            Some(SocketEntry::Closed) => return Err(libc::EBADF),
+            None => return Err(libc::EBADF),
+        }
+        self.options
+            .entry(id)
+            .or_default()
+            .insert((level, option), i64::from(value != 0));
+        self.last_error = 0;
+        Ok(())
+    }
+
+    /// Returns a supported socket option from the live handle or stored state.
+    pub fn option(&self, id: i64, level: i64, option: i64) -> Result<i64, i32> {
+        if !is_supported_socket_option(level, option) {
+            return Err(libc::ENOPROTOOPT);
+        }
+        match self.sockets.get(&id) {
+            Some(SocketEntry::Stream(stream))
+                if level == i64::from(libc::IPPROTO_TCP)
+                    && option == i64::from(libc::TCP_NODELAY) =>
+            {
+                return stream.nodelay().map(i64::from).map_err(raw_errno);
+            }
+            Some(
+                SocketEntry::Created { .. } | SocketEntry::Listener(_) | SocketEntry::Stream(_),
+            ) => {}
+            #[cfg(unix)]
+            Some(SocketEntry::UnixListener(_) | SocketEntry::UnixStream(_)) => {}
+            Some(SocketEntry::Closed) => return Err(libc::EBADF),
+            None => return Err(libc::EBADF),
+        }
+        Ok(self
+            .options
+            .get(&id)
+            .and_then(|options| options.get(&(level, option)).copied())
+            .unwrap_or(0))
     }
 
     /// Closes a socket ID.
@@ -1242,15 +2284,80 @@ impl SocketState {
     }
 }
 
+fn is_supported_socket_option(level: i64, option: i64) -> bool {
+    matches!(
+        (level as i32, option as i32),
+        (libc::SOL_SOCKET, libc::SO_REUSEADDR)
+            | (libc::SOL_SOCKET, libc::SO_KEEPALIVE)
+            | (libc::IPPROTO_TCP, libc::TCP_NODELAY)
+    )
+}
+
+fn tcp_name(addr: Option<SocketAddr>) -> Option<(String, Option<u16>)> {
+    addr.map(|addr| (addr.ip().to_string(), Some(addr.port())))
+}
+
+#[cfg(unix)]
+fn bind_unix_listener(entry: &mut SocketEntry, path: &str) -> Result<(), i32> {
+    if path.is_empty() {
+        return Err(libc::EINVAL);
+    }
+    match UnixListener::bind(path) {
+        Ok(listener) => {
+            *entry = SocketEntry::UnixListener(listener);
+            Ok(())
+        }
+        Err(error) => Err(raw_errno(error)),
+    }
+}
+
+#[cfg(not(unix))]
+fn bind_unix_listener(_entry: &mut SocketEntry, _path: &str) -> Result<(), i32> {
+    Err(libc::EAFNOSUPPORT)
+}
+
+#[cfg(unix)]
+fn connect_unix_stream(entry: &mut SocketEntry, path: &str) -> Result<(), i32> {
+    if path.is_empty() {
+        return Err(libc::EINVAL);
+    }
+    match UnixStream::connect(path) {
+        Ok(stream) => {
+            *entry = SocketEntry::UnixStream(stream);
+            Ok(())
+        }
+        Err(error) => Err(raw_errno(error)),
+    }
+}
+
+#[cfg(not(unix))]
+fn connect_unix_stream(_entry: &mut SocketEntry, _path: &str) -> Result<(), i32> {
+    Err(libc::EAFNOSUPPORT)
+}
+
+#[cfg(unix)]
+fn unix_name(addr: Option<std::os::unix::net::SocketAddr>) -> Option<(String, Option<u16>)> {
+    let addr = addr?;
+    let path = addr.as_pathname()?;
+    Some((path.to_string_lossy().into_owned(), None))
+}
+
 fn raw_errno(error: std::io::Error) -> i32 {
     error.raw_os_error().unwrap_or(libc::EIO)
 }
 
-#[derive(Debug)]
-struct FtpResponse {
-    code: i32,
-    lines: Vec<String>,
-}
+const RAW_COMMAND_OK_STATUSES: [Status; 10] = [
+    Status::CommandOk,
+    Status::CommandNotImplemented,
+    Status::System,
+    Status::Directory,
+    Status::File,
+    Status::Help,
+    Status::Name,
+    Status::RequestedFileActionOk,
+    Status::PathCreated,
+    Status::RequestFilePending,
+];
 
 fn loopback_host(host: &str) -> Option<&'static str> {
     match host {
@@ -1260,130 +2367,43 @@ fn loopback_host(host: &str) -> Option<&'static str> {
     }
 }
 
-fn send_ftp_command(stream: &mut TcpStream, command: &str) -> Result<FtpResponse, i32> {
-    stream.write_all(command.as_bytes()).map_err(raw_errno)?;
-    stream.write_all(b"\r\n").map_err(raw_errno)?;
-    stream.flush().map_err(raw_errno)?;
-    read_ftp_response(stream).map_err(raw_errno)
-}
-
-fn read_ftp_response(stream: &mut TcpStream) -> std::io::Result<FtpResponse> {
-    let first = read_ftp_line(stream)?;
-    let code = parse_ftp_code(&first).unwrap_or(0);
-    let mut lines = vec![first.clone()];
-    if first.as_bytes().get(3) == Some(&b'-') {
-        let terminator = format!("{code:03} ");
-        loop {
-            let line = read_ftp_line(stream)?;
-            let done = line.starts_with(&terminator);
-            lines.push(line);
-            if done {
-                break;
-            }
-        }
-    }
-    Ok(FtpResponse { code, lines })
-}
-
-fn read_ftp_line(stream: &mut TcpStream) -> std::io::Result<String> {
-    let mut bytes = Vec::new();
-    let mut byte = [0_u8; 1];
-    loop {
-        stream.read_exact(&mut byte)?;
-        bytes.push(byte[0]);
-        if byte[0] == b'\n' {
-            break;
-        }
-    }
-    if bytes.ends_with(b"\r\n") {
-        bytes.truncate(bytes.len().saturating_sub(2));
-    } else if bytes.ends_with(b"\n") {
-        bytes.truncate(bytes.len().saturating_sub(1));
-    }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-fn parse_ftp_code(line: &str) -> Option<i32> {
-    line.get(..3)?.parse().ok()
-}
-
-fn open_passive_data_connection(entry: &mut FtpEntry) -> Result<TcpStream, i32> {
-    let response = send_ftp_command(&mut entry.stream, "PASV")?;
-    if response.code != 227 {
-        return Err(libc::ECONNREFUSED);
-    }
-    let endpoint = response
-        .lines
-        .last()
-        .and_then(|line| parse_pasv_endpoint(line))
-        .ok_or(libc::EINVAL)?;
-    if !is_loopback_address(&endpoint.host) {
-        return Err(libc::EACCES);
-    }
-    let stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).map_err(raw_errno)?;
-    let _ = stream.set_read_timeout(Some(entry.timeout));
-    let _ = stream.set_write_timeout(Some(entry.timeout));
-    Ok(stream)
-}
-
-fn set_transfer_type(entry: &mut FtpEntry, mode: i64) -> Result<(), i32> {
-    let code = match mode {
-        1 => "A",
-        2 => "I",
+fn set_suppaftp_transfer_type(entry: &mut FtpEntry, mode: i64) -> Result<(), i32> {
+    let file_type = match mode {
+        1 => FileType::Ascii(FormatControl::Default),
+        2 => FileType::Binary,
         _ => return Err(libc::EINVAL),
     };
-    let response = send_ftp_command(&mut entry.stream, &format!("TYPE {code}"))?;
-    if response.code == 200 {
-        Ok(())
+    entry.client.transfer_type(file_type).map_err(|_| libc::EIO)
+}
+
+fn non_empty_path(path: &str) -> Option<&str> {
+    (!path.is_empty()).then_some(path)
+}
+
+fn ftp_response_line(response: Response) -> String {
+    let body = response.as_string().unwrap_or_default();
+    let code = response.status as u32;
+    let code_prefix = format!("{code} ");
+    if body.is_empty() {
+        code.to_string()
+    } else if body.starts_with(&code_prefix) {
+        body
     } else {
-        Err(libc::EIO)
+        format!("{code} {body}")
     }
 }
 
-#[derive(Debug)]
-struct PassiveEndpoint {
-    host: String,
-    port: u16,
-}
-
-fn parse_pasv_endpoint(line: &str) -> Option<PassiveEndpoint> {
-    let start = line.find('(')?;
-    let end = line[start + 1..].find(')')? + start + 1;
-    let values = line[start + 1..end]
-        .split(',')
-        .map(str::trim)
-        .map(str::parse::<u16>)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-    if values.len() != 6 || values[..4].iter().any(|value| *value > 255) {
-        return None;
+fn strip_ftp_status_prefix(line: &str) -> &str {
+    if line.len() > 4
+        && line.as_bytes()[..3]
+            .iter()
+            .all(|byte| byte.is_ascii_digit())
+        && line.as_bytes()[3] == b' '
+    {
+        &line[4..]
+    } else {
+        line
     }
-    let host = format!("{}.{}.{}.{}", values[0], values[1], values[2], values[3]);
-    let port = values[4].checked_mul(256)?.checked_add(values[5])?;
-    Some(PassiveEndpoint { host, port })
-}
-
-fn is_loopback_address(address: &str) -> bool {
-    address == "localhost" || address == "::1" || address.starts_with("127.")
-}
-
-fn parse_ftp_quoted_path(line: &str) -> Option<String> {
-    let start = line.find('"')?;
-    let mut output = String::new();
-    let mut chars = line[start + 1..].chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '"' {
-            if chars.peek() == Some(&'"') {
-                let _ = chars.next();
-                output.push('"');
-            } else {
-                return Some(output);
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-    None
 }
 
 pub(in crate::builtins) const JSON_ERROR_NONE: i64 = 0;
@@ -1563,8 +2583,8 @@ impl GettextState {
     }
 }
 
-/// Request-local deterministic backend for `shmop`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Host System V shared-memory backend for `shmop`.
+#[derive(Debug)]
 pub struct ShmopState {
     next_id: i64,
     segments: BTreeMap<i64, ShmopSegment>,
@@ -1581,18 +2601,23 @@ impl Default for ShmopState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct ShmopSegment {
     key: Option<i64>,
-    data: Vec<u8>,
+    shmid: libc::c_int,
+    addr: usize,
+    size: usize,
     deleted: bool,
 }
 
+#[allow(unsafe_code)] // direct SysV shared-memory mapping access, bounds checked
 impl ShmopSegment {
-    fn new(key: Option<i64>, size: usize) -> Self {
+    fn new(key: Option<i64>, shmid: libc::c_int, addr: usize, size: usize) -> Self {
         Self {
             key,
-            data: vec![0; size],
+            shmid,
+            addr,
+            size,
             deleted: false,
         }
     }
@@ -1600,26 +2625,48 @@ impl ShmopSegment {
     /// Segment byte length.
     #[must_use]
     pub fn size(&self) -> usize {
-        self.data.len()
+        self.size
     }
 
     /// Reads a binary-safe range from the segment.
     #[must_use]
     pub fn read(&self, offset: usize, size: usize) -> Vec<u8> {
-        let end = offset.saturating_add(size).min(self.data.len());
-        self.data[offset..end].to_vec()
+        let end = offset.saturating_add(size).min(self.size);
+        let read = end.saturating_sub(offset);
+        if read == 0 {
+            return Vec::new();
+        }
+        // SAFETY: `addr` is a live `shmat` mapping owned by this segment and
+        // `read` is clamped to the segment length above.
+        unsafe { std::slice::from_raw_parts((self.addr as *const u8).add(offset), read).to_vec() }
     }
 
     /// Writes bytes into the segment and returns the count written.
     pub fn write(&mut self, offset: usize, data: &[u8]) -> usize {
-        let end = offset.saturating_add(data.len()).min(self.data.len());
+        let end = offset.saturating_add(data.len()).min(self.size);
         let written = end.saturating_sub(offset);
-        self.data[offset..end].copy_from_slice(&data[..written]);
+        if written != 0 {
+            // SAFETY: `addr` is a live writable `shmat` mapping for this
+            // segment and `written` is clamped to the segment length above.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    (self.addr as *mut u8).add(offset),
+                    written,
+                );
+            }
+        }
         written
     }
 
     /// Marks the segment deleted while existing handles may still read it.
     pub fn delete(&mut self) {
+        // SAFETY: direct SysV IPC call; the result is intentionally ignored
+        // here because PHP exposes deletion as a best-effort boolean and the
+        // caller already checked that this segment is live.
+        unsafe {
+            libc::shmctl(self.shmid, libc::IPC_RMID, std::ptr::null_mut());
+        }
         self.deleted = true;
     }
 
@@ -1630,22 +2677,41 @@ impl ShmopSegment {
     }
 }
 
+#[allow(unsafe_code)] // direct SysV shared-memory detach during resource drop
+impl Drop for ShmopSegment {
+    fn drop(&mut self) {
+        if self.addr != 0 {
+            // SAFETY: `addr` was returned by `shmat` for this segment. Detach
+            // is idempotent at the OS resource level for this mapping owner.
+            unsafe {
+                libc::shmdt(self.addr as *const libc::c_void);
+            }
+            self.addr = 0;
+        }
+    }
+}
+
 impl ShmopState {
-    /// Opens or creates a segment. Key `0` creates private segments.
-    pub fn open(&mut self, key: i64, mode: char, size: usize) -> Option<i64> {
+    /// Opens or creates a System V shared-memory segment. Key `0` creates
+    /// private segments.
+    pub fn open(&mut self, key: i64, mode: char, permissions: i64, size: usize) -> Option<i64> {
         let keyed_id = (key != 0)
             .then(|| self.keyed_segments.get(&key).copied())
             .flatten();
         match mode {
-            'a' | 'w' => keyed_id.filter(|id| self.segment(*id).is_some()),
+            'a' | 'w' => keyed_id
+                .filter(|id| self.segment(*id).is_some())
+                .or_else(|| self.attach_existing_segment(key, mode == 'a')),
             'c' => keyed_id
                 .filter(|id| self.segment(*id).is_some())
-                .or_else(|| Some(self.create_segment((key != 0).then_some(key), size))),
+                .or_else(|| {
+                    self.create_segment((key != 0).then_some(key), mode, permissions, size)
+                }),
             'n' => {
                 if keyed_id.is_some_and(|id| self.segment(id).is_some()) {
                     None
                 } else {
-                    Some(self.create_segment((key != 0).then_some(key), size))
+                    self.create_segment((key != 0).then_some(key), mode, permissions, size)
                 }
             }
             _ => None,
@@ -1682,15 +2748,99 @@ impl ShmopState {
         true
     }
 
-    fn create_segment(&mut self, key: Option<i64>, size: usize) -> i64 {
+    fn attach_existing_segment(&mut self, key: i64, read_only: bool) -> Option<i64> {
+        if key == 0 {
+            return None;
+        }
+        let shmid = shmop_shmget(key as libc::key_t, 1, 0).ok()?;
+        let size = shmop_segment_size(shmid)?;
+        let addr = shmop_attach(shmid, read_only).ok()?;
         let id = self.next_id;
         self.next_id += 1;
-        self.segments.insert(id, ShmopSegment::new(key, size));
+        self.segments
+            .insert(id, ShmopSegment::new(Some(key), shmid, addr, size));
+        self.keyed_segments.insert(key, id);
+        Some(id)
+    }
+
+    fn create_segment(
+        &mut self,
+        key: Option<i64>,
+        mode: char,
+        permissions: i64,
+        size: usize,
+    ) -> Option<i64> {
+        let key_t = key
+            .map(|key| key as libc::key_t)
+            .unwrap_or(libc::IPC_PRIVATE);
+        let permissions = permissions as libc::c_int;
+        let shmid = match mode {
+            'n' => {
+                shmop_shmget(key_t, size, libc::IPC_CREAT | libc::IPC_EXCL | permissions).ok()?
+            }
+            'c' => {
+                if key.is_some() {
+                    shmop_shmget(key_t, 1, 0)
+                        .or_else(|_| shmop_shmget(key_t, size, libc::IPC_CREAT | permissions))
+                        .ok()?
+                } else {
+                    shmop_shmget(key_t, size, libc::IPC_CREAT | permissions).ok()?
+                }
+            }
+            _ => return None,
+        };
+        let size = shmop_segment_size(shmid).unwrap_or(size);
+        let addr = shmop_attach(shmid, false).ok()?;
+        let id = self.next_id;
+        self.next_id += 1;
+        self.segments
+            .insert(id, ShmopSegment::new(key, shmid, addr, size));
         if let Some(key) = key {
             self.keyed_segments.insert(key, id);
         }
-        id
+        Some(id)
     }
+}
+
+#[allow(unsafe_code)] // direct SysV IPC call, result checked
+fn shmop_shmget(key: libc::key_t, size: usize, flags: libc::c_int) -> Result<libc::c_int, i32> {
+    // SAFETY: direct SysV IPC call; return value is checked for `-1`.
+    let shmid = unsafe { libc::shmget(key, size, flags) };
+    if shmid == -1 {
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO))
+    } else {
+        Ok(shmid)
+    }
+}
+
+#[allow(unsafe_code)] // direct SysV IPC attach, sentinel result checked
+fn shmop_attach(shmid: libc::c_int, read_only: bool) -> Result<usize, i32> {
+    let flags = if read_only { libc::SHM_RDONLY } else { 0 };
+    // SAFETY: direct SysV IPC call; return value is checked against `(void*)-1`.
+    let addr = unsafe { libc::shmat(shmid, std::ptr::null(), flags) };
+    if addr as isize == -1 {
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO))
+    } else {
+        Ok(addr as usize)
+    }
+}
+
+#[allow(unsafe_code)] // direct SysV IPC metadata call, result checked
+#[allow(clippy::useless_conversion)] // shm_segsz type varies by platform libc
+fn shmop_segment_size(shmid: libc::c_int) -> Option<usize> {
+    let mut stats = std::mem::MaybeUninit::<libc::shmid_ds>::zeroed();
+    // SAFETY: `stats` points to valid writable storage for `IPC_STAT`.
+    let result = unsafe { libc::shmctl(shmid, libc::IPC_STAT, stats.as_mut_ptr()) };
+    if result == -1 {
+        return None;
+    }
+    // SAFETY: `shmctl(IPC_STAT)` succeeded, so the kernel initialized `stats`.
+    let stats = unsafe { stats.assume_init() };
+    stats.shm_segsz.try_into().ok()
 }
 
 /// Request-local noninteractive readline state.
@@ -1789,7 +2939,7 @@ impl ReadlineState {
     }
 }
 
-/// Request-local deterministic backend for System V message queues.
+/// System V message queue backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SysvMessageQueueState {
     next_id: i64,
@@ -1809,28 +2959,38 @@ impl Default for SysvMessageQueueState {
     }
 }
 
-/// Request-local message queue metadata and pending messages.
+/// System V message queue metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SysvMessageQueue {
     key: i64,
+    msqid: libc::c_int,
     permissions: i64,
     owner_uid: i64,
     owner_gid: i64,
-    messages: Vec<SysvMessage>,
     removed: bool,
     max_bytes: i64,
 }
 
 impl SysvMessageQueue {
-    fn new(key: i64, permissions: i64) -> Self {
+    fn new(key: i64, msqid: libc::c_int, permissions: i64) -> Self {
+        let stats = sysvmsg_stat(msqid).ok();
         Self {
             key,
+            msqid,
             permissions,
-            owner_uid: current_uid(),
-            owner_gid: current_gid(),
-            messages: Vec::new(),
+            owner_uid: stats
+                .as_ref()
+                .map(|stats| stats.owner_uid)
+                .unwrap_or_else(current_uid),
+            owner_gid: stats
+                .as_ref()
+                .map(|stats| stats.owner_gid)
+                .unwrap_or_else(current_gid),
             removed: false,
-            max_bytes: 16_384,
+            max_bytes: stats
+                .as_ref()
+                .map(|stats| stats.max_bytes)
+                .unwrap_or(16_384),
         }
     }
 
@@ -1844,6 +3004,12 @@ impl SysvMessageQueue {
     #[must_use]
     pub const fn permissions(&self) -> i64 {
         self.permissions
+    }
+
+    /// Host message-queue id.
+    #[must_use]
+    pub const fn msqid(&self) -> libc::c_int {
+        self.msqid
     }
 
     /// Updates queue permissions.
@@ -1876,16 +3042,17 @@ impl SysvMessageQueue {
     /// Current pending message count.
     #[must_use]
     pub fn message_count(&self) -> usize {
-        self.messages.len()
+        sysvmsg_stat(self.msqid)
+            .map(|stats| stats.message_count)
+            .unwrap_or(0)
     }
 
     /// Current pending payload byte count.
     #[must_use]
     pub fn byte_count(&self) -> usize {
-        self.messages
-            .iter()
-            .map(|message| message.payload.len())
-            .sum()
+        sysvmsg_stat(self.msqid)
+            .map(|stats| stats.byte_count)
+            .unwrap_or(0)
     }
 
     /// Maximum byte budget reported by queue metadata.
@@ -1897,6 +3064,26 @@ impl SysvMessageQueue {
     /// Updates queue metadata byte budget.
     pub fn set_max_bytes(&mut self, max_bytes: i64) {
         self.max_bytes = max_bytes.max(0);
+    }
+
+    /// Applies queue settings through the host `msgctl(IPC_SET)` interface.
+    pub fn apply_settings(
+        &mut self,
+        permissions: Option<i64>,
+        owner_uid: Option<i64>,
+        owner_gid: Option<i64>,
+        max_bytes: Option<i64>,
+    ) -> bool {
+        let Ok(stats) =
+            sysvmsg_apply_settings(self.msqid, permissions, owner_uid, owner_gid, max_bytes)
+        else {
+            return false;
+        };
+        self.permissions = stats.permissions;
+        self.owner_uid = stats.owner_uid;
+        self.owner_gid = stats.owner_gid;
+        self.max_bytes = stats.max_bytes;
+        true
     }
 }
 
@@ -1939,7 +3126,7 @@ impl SysvMessage {
 }
 
 impl SysvMessageQueueState {
-    /// Opens or creates a request-local queue for a key.
+    /// Opens or creates a System V queue for a key.
     pub fn get_queue(&mut self, key: i64, permissions: i64) -> i64 {
         if let Some(id) = self.keyed_queues.get(&key).copied()
             && self.queue(id).is_some()
@@ -1947,10 +3134,22 @@ impl SysvMessageQueueState {
             return id;
         }
 
+        let flags = libc::IPC_CREAT | permissions as libc::c_int;
+        let msqid = match sysvmsg_msgget(key as libc::key_t, flags) {
+            Ok(msqid) => msqid,
+            Err(_) => {
+                let id = self.next_id;
+                self.next_id += 1;
+                self.queues
+                    .insert(id, SysvMessageQueue::new(key, -1, permissions));
+                self.keyed_queues.insert(key, id);
+                return id;
+            }
+        };
         let id = self.next_id;
         self.next_id += 1;
         self.queues
-            .insert(id, SysvMessageQueue::new(key, permissions));
+            .insert(id, SysvMessageQueue::new(key, msqid, permissions));
         self.keyed_queues.insert(key, id);
         id
     }
@@ -1972,17 +3171,22 @@ impl SysvMessageQueueState {
         self.keyed_queues
             .get(&key)
             .is_some_and(|id| self.queue(*id).is_some())
+            || sysvmsg_msgget(key as libc::key_t, 0).is_ok()
     }
 
     /// Returns a live queue.
     #[must_use]
     pub fn queue(&self, id: i64) -> Option<&SysvMessageQueue> {
-        self.queues.get(&id).filter(|queue| !queue.removed)
+        self.queues
+            .get(&id)
+            .filter(|queue| !queue.removed && queue.msqid >= 0 && sysvmsg_stat(queue.msqid).is_ok())
     }
 
     /// Returns a live queue mutably.
     pub fn queue_mut(&mut self, id: i64) -> Option<&mut SysvMessageQueue> {
-        self.queues.get_mut(&id).filter(|queue| !queue.removed)
+        self.queues
+            .get_mut(&id)
+            .filter(|queue| !queue.removed && queue.msqid >= 0 && sysvmsg_stat(queue.msqid).is_ok())
     }
 
     /// Removes a queue and keyed lookup.
@@ -1993,19 +3197,25 @@ impl SysvMessageQueueState {
         if queue.removed {
             return false;
         }
+        if queue.msqid < 0 || sysvmsg_msgctl_remove(queue.msqid).is_err() {
+            return false;
+        }
         queue.removed = true;
-        queue.messages.clear();
         self.keyed_queues.remove(&queue.key);
         true
     }
 
     /// Enqueues one message.
-    pub fn send(&mut self, id: i64, message: SysvMessage) -> bool {
+    pub fn send(&mut self, id: i64, message: SysvMessage, flags: i64) -> Result<(), i32> {
         let Some(queue) = self.queue_mut(id) else {
-            return false;
+            return Err(libc::EINVAL);
         };
-        queue.messages.push(message);
-        true
+        sysvmsg_send(
+            queue.msqid,
+            message.message_type(),
+            message.payload(),
+            flags,
+        )
     }
 
     /// Enqueues serialized payload bytes while keeping queue internals private.
@@ -2015,27 +3225,387 @@ impl SysvMessageQueueState {
         message_type: i64,
         payload: Vec<u8>,
         serialized: bool,
-    ) -> bool {
-        self.send(id, SysvMessage::new(message_type, payload, serialized))
+        flags: i64,
+    ) -> Result<(), i32> {
+        self.send(
+            id,
+            SysvMessage::new(message_type, payload, serialized),
+            flags,
+        )
     }
 
     /// Receives and removes one matching message.
-    pub fn receive(&mut self, id: i64, desired_type: i64, except: bool) -> Option<SysvMessage> {
-        let queue = self.queue_mut(id)?;
-        let index = queue.messages.iter().position(|message| {
-            let message_type = message.message_type();
-            if except {
-                message_type != desired_type
-            } else if desired_type == 0 {
-                true
-            } else if desired_type > 0 {
-                message_type == desired_type
-            } else {
-                message_type <= desired_type.abs()
-            }
-        })?;
-        Some(queue.messages.remove(index))
+    pub fn receive(
+        &mut self,
+        id: i64,
+        desired_type: i64,
+        flags: i64,
+        max_size: usize,
+    ) -> Result<Option<SysvMessage>, i32> {
+        let Some(queue) = self.queue_mut(id) else {
+            return Err(libc::EINVAL);
+        };
+        match sysvmsg_receive(queue.msqid, desired_type, flags, max_size) {
+            Ok(message) => Ok(Some(message)),
+            Err(error) if error == libc::ENOMSG => Ok(None),
+            Err(error) => Err(error),
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SysvMessageQueueStats {
+    owner_uid: i64,
+    owner_gid: i64,
+    permissions: i64,
+    message_count: usize,
+    byte_count: usize,
+    max_bytes: i64,
+}
+
+#[allow(unsafe_code)] // direct SysV message queue call, result checked
+fn sysvmsg_msgget(key: libc::key_t, flags: libc::c_int) -> Result<libc::c_int, i32> {
+    // SAFETY: direct SysV IPC call; return value is checked for `-1`.
+    let msqid = unsafe { sysvmsg_ffi::msgget(key, flags) };
+    if msqid == -1 {
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO))
+    } else {
+        Ok(msqid)
+    }
+}
+
+fn sysvmsg_stat(msqid: libc::c_int) -> Result<SysvMessageQueueStats, i32> {
+    sysvmsg_ffi::stat(msqid)
+}
+
+fn sysvmsg_apply_settings(
+    msqid: libc::c_int,
+    permissions: Option<i64>,
+    owner_uid: Option<i64>,
+    owner_gid: Option<i64>,
+    max_bytes: Option<i64>,
+) -> Result<SysvMessageQueueStats, i32> {
+    sysvmsg_ffi::apply_settings(msqid, permissions, owner_uid, owner_gid, max_bytes)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+mod sysvmsg_ffi {
+    #![allow(unsafe_code)]
+
+    use super::SysvMessageQueueStats;
+
+    pub(super) unsafe fn msgget(key: libc::key_t, flags: libc::c_int) -> libc::c_int {
+        // SAFETY: the caller handles the raw return value.
+        unsafe { libc::msgget(key, flags) }
+    }
+
+    pub(super) unsafe fn msgsnd(
+        msqid: libc::c_int,
+        msgp: *const libc::c_void,
+        msgsz: libc::size_t,
+        msgflg: libc::c_int,
+    ) -> libc::c_int {
+        // SAFETY: the caller provides a valid System V message buffer.
+        unsafe { libc::msgsnd(msqid, msgp, msgsz, msgflg) }
+    }
+
+    pub(super) unsafe fn msgrcv(
+        msqid: libc::c_int,
+        msgp: *mut libc::c_void,
+        msgsz: libc::size_t,
+        msgtyp: libc::c_long,
+        msgflg: libc::c_int,
+    ) -> libc::ssize_t {
+        // SAFETY: the caller provides a valid mutable System V message buffer.
+        unsafe { libc::msgrcv(msqid, msgp, msgsz, msgtyp, msgflg) }
+    }
+
+    pub(super) fn stat(msqid: libc::c_int) -> Result<SysvMessageQueueStats, i32> {
+        let mut stats = std::mem::MaybeUninit::<libc::msqid_ds>::zeroed();
+        // SAFETY: `stats` points to valid writable storage for `IPC_STAT`.
+        let result = unsafe { libc::msgctl(msqid, libc::IPC_STAT, stats.as_mut_ptr()) };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO));
+        }
+        // SAFETY: `msgctl(IPC_STAT)` succeeded, so the kernel initialized stats.
+        let stats = unsafe { stats.assume_init() };
+        Ok(SysvMessageQueueStats {
+            owner_uid: stats.msg_perm.uid as i64,
+            owner_gid: stats.msg_perm.gid as i64,
+            permissions: stats.msg_perm.mode as i64,
+            message_count: stats.msg_qnum as usize,
+            byte_count: stats.msg_cbytes as usize,
+            max_bytes: stats.msg_qbytes as i64,
+        })
+    }
+
+    pub(super) fn apply_settings(
+        msqid: libc::c_int,
+        permissions: Option<i64>,
+        owner_uid: Option<i64>,
+        owner_gid: Option<i64>,
+        max_bytes: Option<i64>,
+    ) -> Result<SysvMessageQueueStats, i32> {
+        let mut stats = std::mem::MaybeUninit::<libc::msqid_ds>::zeroed();
+        // SAFETY: `stats` points to valid writable storage for `IPC_STAT`.
+        let result = unsafe { libc::msgctl(msqid, libc::IPC_STAT, stats.as_mut_ptr()) };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO));
+        }
+        // SAFETY: `msgctl(IPC_STAT)` succeeded, so the kernel initialized stats.
+        let mut stats = unsafe { stats.assume_init() };
+        if let Some(value) = permissions {
+            stats.msg_perm.mode = value as _;
+        }
+        if let Some(value) = owner_uid {
+            stats.msg_perm.uid = value as _;
+        }
+        if let Some(value) = owner_gid {
+            stats.msg_perm.gid = value as _;
+        }
+        if let Some(value) = max_bytes {
+            stats.msg_qbytes = value.max(0) as _;
+        }
+        // SAFETY: `stats` points to initialized queue metadata for `IPC_SET`.
+        let result = unsafe { libc::msgctl(msqid, libc::IPC_SET, &mut stats) };
+        if result == -1 {
+            Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO))
+        } else {
+            stat(msqid)
+        }
+    }
+
+    pub(super) fn remove(msqid: libc::c_int) -> Result<(), i32> {
+        // SAFETY: direct SysV IPC call; return value is checked for `-1`.
+        let result = unsafe { libc::msgctl(msqid, libc::IPC_RMID, std::ptr::null_mut()) };
+        if result == -1 {
+            Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod sysvmsg_ffi {
+    #![allow(unsafe_code)]
+
+    use super::SysvMessageQueueStats;
+
+    #[repr(C, packed(4))]
+    struct DarwinIpcPerm {
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+        cuid: libc::uid_t,
+        cgid: libc::gid_t,
+        mode: libc::mode_t,
+        seq: libc::c_ushort,
+        key: libc::key_t,
+    }
+
+    #[repr(C, packed(4))]
+    struct DarwinMsqidDs {
+        msg_perm: DarwinIpcPerm,
+        msg_first: i32,
+        msg_last: i32,
+        msg_cbytes: libc::c_ulong,
+        msg_qnum: libc::c_ulong,
+        msg_qbytes: libc::c_ulong,
+        msg_lspid: libc::pid_t,
+        msg_lrpid: libc::pid_t,
+        msg_stime: libc::time_t,
+        msg_pad1: i32,
+        msg_rtime: libc::time_t,
+        msg_pad2: i32,
+        msg_ctime: libc::time_t,
+        msg_pad3: i32,
+        msg_pad4: [i32; 4],
+    }
+
+    unsafe extern "C" {
+        pub(super) fn msgget(key: libc::key_t, flags: libc::c_int) -> libc::c_int;
+        pub(super) fn msgsnd(
+            msqid: libc::c_int,
+            msgp: *const libc::c_void,
+            msgsz: libc::size_t,
+            msgflg: libc::c_int,
+        ) -> libc::c_int;
+        pub(super) fn msgrcv(
+            msqid: libc::c_int,
+            msgp: *mut libc::c_void,
+            msgsz: libc::size_t,
+            msgtyp: libc::c_long,
+            msgflg: libc::c_int,
+        ) -> libc::ssize_t;
+        fn msgctl(msqid: libc::c_int, cmd: libc::c_int, buf: *mut DarwinMsqidDs) -> libc::c_int;
+    }
+
+    pub(super) fn stat(msqid: libc::c_int) -> Result<SysvMessageQueueStats, i32> {
+        let mut stats = std::mem::MaybeUninit::<DarwinMsqidDs>::zeroed();
+        // SAFETY: `stats` points to valid writable storage for `IPC_STAT`.
+        let result = unsafe { msgctl(msqid, libc::IPC_STAT, stats.as_mut_ptr()) };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO));
+        }
+        // SAFETY: `msgctl(IPC_STAT)` succeeded, so the kernel initialized stats.
+        let stats = unsafe { stats.assume_init() };
+        Ok(stats_to_public(&stats))
+    }
+
+    pub(super) fn apply_settings(
+        msqid: libc::c_int,
+        permissions: Option<i64>,
+        owner_uid: Option<i64>,
+        owner_gid: Option<i64>,
+        max_bytes: Option<i64>,
+    ) -> Result<SysvMessageQueueStats, i32> {
+        let mut stats = std::mem::MaybeUninit::<DarwinMsqidDs>::zeroed();
+        // SAFETY: `stats` points to valid writable storage for `IPC_STAT`.
+        let result = unsafe { msgctl(msqid, libc::IPC_STAT, stats.as_mut_ptr()) };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO));
+        }
+        // SAFETY: `msgctl(IPC_STAT)` succeeded, so the kernel initialized stats.
+        let mut stats = unsafe { stats.assume_init() };
+        if let Some(value) = permissions {
+            stats.msg_perm.mode = value as _;
+        }
+        if let Some(value) = owner_uid {
+            stats.msg_perm.uid = value as _;
+        }
+        if let Some(value) = owner_gid {
+            stats.msg_perm.gid = value as _;
+        }
+        if let Some(value) = max_bytes {
+            stats.msg_qbytes = value.max(0) as _;
+        }
+        // SAFETY: `stats` points to initialized queue metadata for `IPC_SET`.
+        let result = unsafe { msgctl(msqid, libc::IPC_SET, &mut stats) };
+        if result == -1 {
+            Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO))
+        } else {
+            stat(msqid)
+        }
+    }
+
+    pub(super) fn remove(msqid: libc::c_int) -> Result<(), i32> {
+        // SAFETY: direct SysV IPC call; return value is checked for `-1`.
+        let result = unsafe { msgctl(msqid, libc::IPC_RMID, std::ptr::null_mut()) };
+        if result == -1 {
+            Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn stats_to_public(stats: &DarwinMsqidDs) -> SysvMessageQueueStats {
+        SysvMessageQueueStats {
+            owner_uid: stats.msg_perm.uid as i64,
+            owner_gid: stats.msg_perm.gid as i64,
+            permissions: stats.msg_perm.mode as i64,
+            message_count: stats.msg_qnum as usize,
+            byte_count: stats.msg_cbytes as usize,
+            max_bytes: stats.msg_qbytes as i64,
+        }
+    }
+}
+
+fn sysvmsg_msgctl_remove(msqid: libc::c_int) -> Result<(), i32> {
+    sysvmsg_ffi::remove(msqid)
+}
+
+#[allow(unsafe_code)] // constructs and submits a System V message buffer
+fn sysvmsg_send(
+    msqid: libc::c_int,
+    message_type: i64,
+    payload: &[u8],
+    flags: i64,
+) -> Result<(), i32> {
+    let header_len = std::mem::size_of::<libc::c_long>();
+    let word_len = std::mem::size_of::<libc::c_long>();
+    let total = header_len.saturating_add(payload.len());
+    let words = total.div_ceil(word_len).max(1);
+    let mut buffer = vec![0 as libc::c_long; words];
+    buffer[0] = message_type as libc::c_long;
+    // SAFETY: `buffer` is aligned for `c_long` and large enough for header plus
+    // payload by construction.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            payload.as_ptr(),
+            (buffer.as_mut_ptr() as *mut u8).add(header_len),
+            payload.len(),
+        );
+    }
+    // SAFETY: buffer layout matches System V `struct msgbuf`.
+    let result = unsafe {
+        sysvmsg_ffi::msgsnd(
+            msqid,
+            buffer.as_ptr().cast(),
+            payload.len(),
+            flags as libc::c_int,
+        )
+    };
+    if result == -1 {
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO))
+    } else {
+        Ok(())
+    }
+}
+
+#[allow(unsafe_code)] // receives and reads a System V message buffer
+fn sysvmsg_receive(
+    msqid: libc::c_int,
+    desired_type: i64,
+    flags: i64,
+    max_size: usize,
+) -> Result<SysvMessage, i32> {
+    let header_len = std::mem::size_of::<libc::c_long>();
+    let word_len = std::mem::size_of::<libc::c_long>();
+    let total = header_len.saturating_add(max_size);
+    let words = total.div_ceil(word_len).max(1);
+    let mut buffer = vec![0 as libc::c_long; words];
+    // SAFETY: buffer layout matches System V `struct msgbuf`.
+    let read = unsafe {
+        sysvmsg_ffi::msgrcv(
+            msqid,
+            buffer.as_mut_ptr().cast(),
+            max_size,
+            desired_type as libc::c_long,
+            flags as libc::c_int,
+        )
+    };
+    if read == -1 {
+        return Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO));
+    }
+    let read = read as usize;
+    // SAFETY: `read` is the payload byte count returned by `msgrcv`, and the
+    // buffer was allocated with `max_size` payload capacity.
+    let payload = unsafe {
+        std::slice::from_raw_parts((buffer.as_ptr() as *const u8).add(header_len), read).to_vec()
+    };
+    Ok(SysvMessage::new(buffer[0] as i64, payload, true))
 }
 
 #[allow(unsafe_code)] // direct libc call, result checked
@@ -2240,6 +3810,7 @@ impl SysvSemaphore {
 
     #[allow(unsafe_code)] // direct libc call, result checked
     #[cfg(unix)]
+    #[allow(unsafe_code)] // direct SysV semaphore syscall, errno checked
     fn open(
         key: i64,
         max_acquire: i64,
@@ -2344,6 +3915,7 @@ impl SysvSemaphore {
 
     #[allow(unsafe_code)] // direct libc call, result checked
     #[cfg(unix)]
+    #[allow(unsafe_code)] // direct SysV semaphore syscall, errno checked
     fn remove(&mut self) -> Result<(), SysvSemaphoreError> {
         if let Err(error) = sysvsem_ipc_stat(self.semid) {
             return Err(SysvSemaphoreError::Warning(format!(
@@ -2377,7 +3949,7 @@ fn sysvsem_op(
     }
 }
 
-#[allow(unsafe_code)] // direct libc call, result checked
+#[allow(unsafe_code)] // direct SysV semaphore syscall, errno checked
 #[cfg(unix)]
 fn sysvsem_semop_retry(semid: libc::c_int, ops: &mut [libc::sembuf]) -> Result<(), libc::c_int> {
     loop {
@@ -2392,7 +3964,7 @@ fn sysvsem_semop_retry(semid: libc::c_int, ops: &mut [libc::sembuf]) -> Result<(
     }
 }
 
-#[allow(unsafe_code)] // direct libc call, result checked
+#[allow(unsafe_code)] // direct SysV semaphore syscall, errno checked
 #[cfg(unix)]
 fn sysvsem_semctl_getval(
     semid: libc::c_int,
@@ -2406,7 +3978,7 @@ fn sysvsem_semctl_getval(
     }
 }
 
-#[allow(unsafe_code)] // direct libc call, result checked
+#[allow(unsafe_code)] // direct SysV semaphore syscall, errno checked
 #[cfg(unix)]
 fn sysvsem_semctl_setval(
     semid: libc::c_int,
@@ -2421,7 +3993,7 @@ fn sysvsem_semctl_setval(
     }
 }
 
-#[allow(unsafe_code)] // direct libc call, result checked
+#[allow(unsafe_code)] // direct SysV semaphore syscall, errno checked
 #[cfg(unix)]
 fn sysvsem_ipc_stat(semid: libc::c_int) -> Result<(), libc::c_int> {
     let mut stat = std::mem::MaybeUninit::<libc::semid_ds>::zeroed();
@@ -2445,8 +4017,11 @@ fn sysvsem_errno_message(error: libc::c_int) -> String {
     std::io::Error::from_raw_os_error(error).to_string()
 }
 
-/// Request-local deterministic backend for System V shared variables.
-#[derive(Clone, Debug, Eq, PartialEq)]
+const SYSVSHM_MAGIC: &[u8; 8] = b"PHRSHM1\0";
+const SYSVSHM_HEADER_LEN: usize = SYSVSHM_MAGIC.len() + 4;
+
+/// System V shared variable backend.
+#[derive(Debug)]
 pub struct SysvSharedMemoryState {
     next_id: i64,
     segments: BTreeMap<i64, SysvSharedMemorySegment>,
@@ -2467,25 +4042,26 @@ impl Default for SysvSharedMemoryState {
     }
 }
 
-/// Request-local shared variable segment.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Host System V shared variable segment.
+#[derive(Debug)]
 pub struct SysvSharedMemorySegment {
     key: i64,
+    shmid: libc::c_int,
+    addr: usize,
     size: i64,
     permissions: i64,
-    values: BTreeMap<i64, Value>,
-    value_sizes: BTreeMap<i64, usize>,
     removed: bool,
 }
 
+#[allow(unsafe_code)] // direct shared-memory slice views over a live shmat mapping
 impl SysvSharedMemorySegment {
-    fn new(key: i64, size: i64, permissions: i64) -> Self {
+    fn new(key: i64, shmid: libc::c_int, addr: usize, size: i64, permissions: i64) -> Self {
         Self {
             key,
+            shmid,
+            addr,
             size: size.max(0),
             permissions,
-            values: BTreeMap::new(),
-            value_sizes: BTreeMap::new(),
             removed: false,
         }
     }
@@ -2505,58 +4081,170 @@ impl SysvSharedMemorySegment {
     /// Current stored serialized byte usage.
     #[must_use]
     pub fn byte_count(&self) -> usize {
-        self.value_sizes.values().copied().sum()
+        self.read_entries().values().map(std::vec::Vec::len).sum()
     }
 
     /// Returns whether replacing one key with `size` bytes fits in the segment.
     #[must_use]
     pub fn can_store(&self, key: i64, size: usize) -> bool {
-        let previous = self.value_sizes.get(&key).copied().unwrap_or(0);
-        self.byte_count()
-            .saturating_sub(previous)
-            .saturating_add(size)
-            <= self.size as usize
+        let mut entries = self.read_entries();
+        entries.insert(key, vec![0; size]);
+        sysvshm_encoded_len(&entries) <= self.size as usize
     }
 
-    /// Stores one shared variable value.
-    pub fn put(&mut self, key: i64, value: Value, size: usize) {
-        self.value_sizes.insert(key, size);
-        self.values.insert(key, value);
+    /// Stores one serialized shared variable value.
+    pub fn put_serialized(&mut self, key: i64, serialized: Vec<u8>) -> bool {
+        let mut entries = self.read_entries();
+        entries.insert(key, serialized);
+        self.write_entries(&entries)
     }
 
     /// Reads one shared variable value.
     #[must_use]
     pub fn get(&self, key: i64) -> Option<Value> {
-        self.values.get(&key).cloned()
+        let serialized = self.read_entries().remove(&key)?;
+        crate::unserialize(
+            &crate::PhpString::from_bytes(serialized),
+            crate::UnserializeOptions::default(),
+        )
+        .ok()
     }
 
     /// Returns whether a variable key exists.
     #[must_use]
     pub fn has(&self, key: i64) -> bool {
-        self.values.contains_key(&key)
+        self.read_entries().contains_key(&key)
     }
 
     /// Removes one variable key.
     pub fn remove_var(&mut self, key: i64) -> bool {
-        self.value_sizes.remove(&key);
-        self.values.remove(&key).is_some()
+        let mut entries = self.read_entries();
+        if entries.remove(&key).is_none() {
+            return false;
+        }
+        self.write_entries(&entries)
+    }
+
+    fn exists(&self) -> bool {
+        !self.removed && shmop_segment_size(self.shmid).is_some()
+    }
+
+    fn read_entries(&self) -> BTreeMap<i64, Vec<u8>> {
+        let bytes = self.data();
+        if bytes.len() < SYSVSHM_HEADER_LEN || &bytes[..SYSVSHM_MAGIC.len()] != SYSVSHM_MAGIC {
+            return BTreeMap::new();
+        }
+        let mut offset = SYSVSHM_MAGIC.len();
+        let Some(count_bytes) = bytes.get(offset..offset + 4) else {
+            return BTreeMap::new();
+        };
+        let mut count_field = [0; 4];
+        count_field.copy_from_slice(count_bytes);
+        let count = u32::from_le_bytes(count_field) as usize;
+        offset += 4;
+        let mut entries = BTreeMap::new();
+        for _ in 0..count {
+            let Some(key_bytes) = bytes.get(offset..offset + 8) else {
+                return BTreeMap::new();
+            };
+            let mut key_field = [0; 8];
+            key_field.copy_from_slice(key_bytes);
+            let key = i64::from_le_bytes(key_field);
+            offset += 8;
+            let Some(len_bytes) = bytes.get(offset..offset + 4) else {
+                return BTreeMap::new();
+            };
+            let mut len_field = [0; 4];
+            len_field.copy_from_slice(len_bytes);
+            let len = u32::from_le_bytes(len_field) as usize;
+            offset += 4;
+            let Some(payload) = bytes.get(offset..offset.saturating_add(len)) else {
+                return BTreeMap::new();
+            };
+            offset += len;
+            entries.insert(key, payload.to_vec());
+        }
+        entries
+    }
+
+    fn write_entries(&mut self, entries: &BTreeMap<i64, Vec<u8>>) -> bool {
+        let encoded_len = sysvshm_encoded_len(entries);
+        if encoded_len > self.size as usize {
+            return false;
+        }
+        let data = self.data_mut();
+        data.fill(0);
+        data[..SYSVSHM_MAGIC.len()].copy_from_slice(SYSVSHM_MAGIC);
+        let mut offset = SYSVSHM_MAGIC.len();
+        data[offset..offset + 4].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        offset += 4;
+        for (key, payload) in entries {
+            data[offset..offset + 8].copy_from_slice(&key.to_le_bytes());
+            offset += 8;
+            data[offset..offset + 4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            offset += 4;
+            data[offset..offset + payload.len()].copy_from_slice(payload);
+            offset += payload.len();
+        }
+        true
+    }
+
+    fn data(&self) -> &[u8] {
+        if self.addr == 0 || self.size <= 0 {
+            return &[];
+        }
+        // SAFETY: `addr` is a live `shmat` mapping owned by this segment and
+        // `size` is the mapped segment size discovered from the kernel.
+        unsafe { std::slice::from_raw_parts(self.addr as *const u8, self.size as usize) }
+    }
+
+    fn data_mut(&mut self) -> &mut [u8] {
+        if self.addr == 0 || self.size <= 0 {
+            return &mut [];
+        }
+        // SAFETY: `addr` is a live writable `shmat` mapping owned by this
+        // segment and `size` is the mapped segment size discovered from the kernel.
+        unsafe { std::slice::from_raw_parts_mut(self.addr as *mut u8, self.size as usize) }
+    }
+}
+
+#[allow(unsafe_code)] // direct SysV shared-memory detach during resource drop
+impl Drop for SysvSharedMemorySegment {
+    fn drop(&mut self) {
+        if self.addr != 0 {
+            // SAFETY: `addr` was returned by `shmat`; errors during drop cannot
+            // be surfaced usefully and do not affect PHP-visible state.
+            unsafe {
+                libc::shmdt(self.addr as *const libc::c_void);
+            }
+            self.addr = 0;
+        }
     }
 }
 
 impl SysvSharedMemoryState {
-    /// Attaches to or creates a request-local shared variable segment.
-    pub fn attach(&mut self, key: i64, size: i64, permissions: i64) -> i64 {
+    /// Attaches to or creates a host System V shared variable segment.
+    pub fn attach(&mut self, key: i64, size: i64, permissions: i64) -> Result<i64, i32> {
         if let Some(id) = self.keyed_segments.get(&key).copied()
             && self.segment(id).is_some()
         {
-            return id;
+            return Ok(id);
         }
+        let shmid = shmop_shmget(
+            key as libc::key_t,
+            size as usize,
+            libc::IPC_CREAT | permissions as libc::c_int,
+        )?;
+        let mapped_size = shmop_segment_size(shmid).unwrap_or(size as usize) as i64;
+        let addr = shmop_attach(shmid, false)?;
         let id = self.next_id;
         self.next_id += 1;
-        self.segments
-            .insert(id, SysvSharedMemorySegment::new(key, size, permissions));
+        self.segments.insert(
+            id,
+            SysvSharedMemorySegment::new(key, shmid, addr, mapped_size, permissions),
+        );
         self.keyed_segments.insert(key, id);
-        id
+        Ok(id)
     }
 
     /// Binds a PHP-visible shared-memory object handle to a request-local segment.
@@ -2595,17 +4283,18 @@ impl SysvSharedMemoryState {
     /// Returns a live segment.
     #[must_use]
     pub fn segment(&self, id: i64) -> Option<&SysvSharedMemorySegment> {
-        self.segments.get(&id).filter(|segment| !segment.removed)
+        self.segments.get(&id).filter(|segment| segment.exists())
     }
 
     /// Returns a live segment mutably.
     pub fn segment_mut(&mut self, id: i64) -> Option<&mut SysvSharedMemorySegment> {
         self.segments
             .get_mut(&id)
-            .filter(|segment| !segment.removed)
+            .filter(|segment| segment.exists())
     }
 
     /// Removes a segment and keyed lookup.
+    #[allow(unsafe_code)] // direct SysV shared-memory removal and detach
     pub fn remove(&mut self, id: i64) -> bool {
         let Some(segment) = self.segments.get_mut(&id) else {
             return false;
@@ -2613,12 +4302,31 @@ impl SysvSharedMemoryState {
         if segment.removed {
             return false;
         }
+        // SAFETY: direct SysV IPC call; return value is checked for `-1`.
+        if unsafe { libc::shmctl(segment.shmid, libc::IPC_RMID, std::ptr::null_mut()) } == -1 {
+            return false;
+        }
+        if segment.addr != 0 {
+            // SAFETY: `addr` was returned by `shmat`; detaching here releases
+            // the host key immediately after `IPC_RMID` while the PHP handle
+            // remains valid for destroyed-handle diagnostics.
+            unsafe {
+                libc::shmdt(segment.addr as *const libc::c_void);
+            }
+            segment.addr = 0;
+        }
         segment.removed = true;
-        segment.values.clear();
-        segment.value_sizes.clear();
         self.keyed_segments.remove(&segment.key);
         true
     }
+}
+
+fn sysvshm_encoded_len(entries: &BTreeMap<i64, Vec<u8>>) -> usize {
+    SYSVSHM_HEADER_LEN
+        + entries
+            .values()
+            .map(|payload| 8usize.saturating_add(4).saturating_add(payload.len()))
+            .sum::<usize>()
 }
 
 /// Request-local state for `strtok`.
@@ -2749,7 +4457,7 @@ impl IconvEncodingState {
     }
 }
 
-/// Request-local APCu entry.
+/// Process-local APCu entry.
 #[derive(Clone, Debug, PartialEq)]
 struct ApcuEntry {
     value: Value,
@@ -2762,25 +4470,138 @@ impl ApcuEntry {
     }
 }
 
-/// Request-local APCu store.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct ApcuState {
+enum ApcuClock {
+    #[default]
+    System,
+    Fixed(SystemTime),
+}
+
+impl ApcuClock {
+    fn now(&self) -> SystemTime {
+        match self {
+            Self::System => SystemTime::now(),
+            Self::Fixed(now) => *now,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ApcuStore {
     entries: BTreeMap<Vec<u8>, ApcuEntry>,
     hits: u64,
     misses: u64,
     inserts: u64,
+    clock: ApcuClock,
+}
+
+/// Process-local APCu store handle.
+#[derive(Clone, Debug)]
+pub struct ApcuState {
+    store: Rc<Mutex<ApcuStore>>,
+}
+
+impl Default for ApcuState {
+    fn default() -> Self {
+        process_apcu_state()
+    }
+}
+
+impl PartialEq for ApcuState {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.store, &other.store)
+    }
 }
 
 impl ApcuState {
+    /// Creates an isolated store for tests or deliberate request-local modes.
+    #[must_use]
+    pub fn isolated() -> Self {
+        Self {
+            store: Rc::new(Mutex::new(ApcuStore::default())),
+        }
+    }
+
+    /// Creates an isolated store with a fixed deterministic clock.
+    #[must_use]
+    pub fn isolated_at(now: SystemTime) -> Self {
+        let store = ApcuStore {
+            clock: ApcuClock::Fixed(now),
+            ..Default::default()
+        };
+        Self {
+            store: Rc::new(Mutex::new(store)),
+        }
+    }
+
+    /// Advances the deterministic clock used by isolated test stores.
+    pub fn set_test_now(&mut self, now: SystemTime) {
+        self.lock_store().clock = ApcuClock::Fixed(now);
+    }
+
     /// Stores a value, replacing any existing key.
     pub fn store(&mut self, key: Vec<u8>, value: Value, ttl: i64) {
-        let expires_at = ttl_expiration(ttl);
-        self.entries.insert(key, ApcuEntry { value, expires_at });
-        self.inserts += 1;
+        self.lock_store().store(key, value, ttl);
     }
 
     /// Stores a value only when the key does not already exist.
     pub fn add(&mut self, key: Vec<u8>, value: Value, ttl: i64) -> bool {
+        self.lock_store().add(key, value, ttl)
+    }
+
+    /// Fetches a value when the key exists and has not expired.
+    #[must_use]
+    pub fn fetch(&mut self, key: &[u8]) -> Option<Value> {
+        self.lock_store().fetch(key)
+    }
+
+    /// Returns true when the key exists and has not expired.
+    #[must_use]
+    pub fn exists(&mut self, key: &[u8]) -> bool {
+        self.lock_store().exists(key)
+    }
+
+    /// Deletes a key and reports whether it existed.
+    pub fn delete(&mut self, key: &[u8]) -> bool {
+        self.lock_store().delete(key)
+    }
+
+    /// Clears all APCu entries.
+    pub fn clear(&mut self) {
+        self.lock_store().clear();
+    }
+
+    /// Increments an integer value and returns the new value.
+    pub fn increment(&mut self, key: &[u8], step: i64) -> Option<i64> {
+        self.lock_store().adjust_integer(key, step)
+    }
+
+    /// Decrements an integer value and returns the new value.
+    pub fn decrement(&mut self, key: &[u8], step: i64) -> Option<i64> {
+        self.lock_store().adjust_integer(key, step.checked_neg()?)
+    }
+
+    /// Returns a stable statistics snapshot for PHP-visible info functions.
+    #[must_use]
+    pub fn stats(&mut self) -> ApcuStats {
+        self.lock_store().stats()
+    }
+
+    fn lock_store(&self) -> MutexGuard<'_, ApcuStore> {
+        self.store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl ApcuStore {
+    fn store(&mut self, key: Vec<u8>, value: Value, ttl: i64) {
+        let expires_at = self.ttl_expiration(ttl);
+        self.entries.insert(key, ApcuEntry { value, expires_at });
+        self.inserts += 1;
+    }
+
+    fn add(&mut self, key: Vec<u8>, value: Value, ttl: i64) -> bool {
         self.purge_expired();
         if self.entries.contains_key(&key) {
             return false;
@@ -2789,9 +4610,7 @@ impl ApcuState {
         true
     }
 
-    /// Fetches a value when the key exists and has not expired.
-    #[must_use]
-    pub fn fetch(&mut self, key: &[u8]) -> Option<Value> {
+    fn fetch(&mut self, key: &[u8]) -> Option<Value> {
         self.purge_expired();
         match self.entries.get(key) {
             Some(entry) => {
@@ -2805,36 +4624,20 @@ impl ApcuState {
         }
     }
 
-    /// Returns true when the key exists and has not expired.
-    #[must_use]
-    pub fn exists(&mut self, key: &[u8]) -> bool {
+    fn exists(&mut self, key: &[u8]) -> bool {
         self.fetch(key).is_some()
     }
 
-    /// Deletes a key and reports whether it existed.
-    pub fn delete(&mut self, key: &[u8]) -> bool {
+    fn delete(&mut self, key: &[u8]) -> bool {
         self.purge_expired();
         self.entries.remove(key).is_some()
     }
 
-    /// Clears all APCu entries.
-    pub fn clear(&mut self) {
+    fn clear(&mut self) {
         self.entries.clear();
     }
 
-    /// Increments an integer value and returns the new value.
-    pub fn increment(&mut self, key: &[u8], step: i64) -> Option<i64> {
-        self.adjust_integer(key, step)
-    }
-
-    /// Decrements an integer value and returns the new value.
-    pub fn decrement(&mut self, key: &[u8], step: i64) -> Option<i64> {
-        self.adjust_integer(key, step.checked_neg()?)
-    }
-
-    /// Returns a stable statistics snapshot for PHP-visible info functions.
-    #[must_use]
-    pub fn stats(&mut self) -> ApcuStats {
+    fn stats(&mut self) -> ApcuStats {
         self.purge_expired();
         ApcuStats {
             entries: self.entries.len() as u64,
@@ -2858,9 +4661,27 @@ impl ApcuState {
     }
 
     fn purge_expired(&mut self) {
-        let now = SystemTime::now();
+        let now = self.clock.now();
         self.entries.retain(|_, entry| !entry.is_expired(now));
     }
+
+    fn ttl_expiration(&self, ttl: i64) -> Option<SystemTime> {
+        if ttl <= 0 {
+            None
+        } else {
+            self.clock
+                .now()
+                .checked_add(Duration::from_secs(ttl as u64))
+        }
+    }
+}
+
+thread_local! {
+    static PROCESS_APCU_STATE: ApcuState = ApcuState::isolated();
+}
+
+fn process_apcu_state() -> ApcuState {
+    PROCESS_APCU_STATE.with(Clone::clone)
 }
 
 /// Stable APCu statistics snapshot.
@@ -2870,14 +4691,6 @@ pub struct ApcuStats {
     pub hits: u64,
     pub misses: u64,
     pub inserts: u64,
-}
-
-fn ttl_expiration(ttl: i64) -> Option<SystemTime> {
-    if ttl <= 0 {
-        None
-    } else {
-        Some(SystemTime::now() + Duration::from_secs(ttl as u64))
-    }
 }
 
 /// Request-local OpenSSL error queue.
@@ -3046,6 +4859,8 @@ pub(in crate::builtins) struct BuiltinExtensionState<'a> {
     sysvsem_state_slot: Option<&'a mut SysvSemaphoreState>,
     sysvshm_state: SysvSharedMemoryState,
     sysvshm_state_slot: Option<&'a mut SysvSharedMemoryState>,
+    curl_state: CurlState,
+    curl_state_slot: Option<&'a mut CurlState>,
     pcntl_state: PcntlState,
     pcntl_state_slot: Option<&'a mut PcntlState>,
     ftp_state: FtpState,
@@ -3110,6 +4925,8 @@ impl<'a> Default for BuiltinExtensionState<'a> {
             sysvsem_state_slot: None,
             sysvshm_state: SysvSharedMemoryState::default(),
             sysvshm_state_slot: None,
+            curl_state: CurlState::default(),
+            curl_state_slot: None,
             pcntl_state: PcntlState::default(),
             pcntl_state_slot: None,
             ftp_state: FtpState::default(),
@@ -3489,12 +5306,12 @@ impl<'a> BuiltinContext<'a> {
         }
     }
 
-    /// Sets request-local APCu state.
+    /// Sets an APCu state handle. Default handles share process-local storage.
     pub fn set_apcu_state(&mut self, state: &'a mut ApcuState) {
         self.extensions.apcu_state_slot = Some(state);
     }
 
-    /// Mutable request-local APCu state.
+    /// Mutable APCu state handle.
     pub fn apcu_state(&mut self) -> &mut ApcuState {
         match self.extensions.apcu_state_slot.as_deref_mut() {
             Some(state) => state,
@@ -3634,6 +5451,28 @@ impl<'a> BuiltinContext<'a> {
             Some(state) => state,
             None => &mut self.extensions.sysvshm_state,
         }
+    }
+
+    /// Uses VM-owned cURL state for request-local cURL builtins.
+    pub fn set_curl_state(&mut self, state: &'a mut CurlState) {
+        self.extensions.curl_state_slot = Some(state);
+    }
+
+    /// Returns request-local cURL state.
+    pub fn curl_state(&mut self) -> &mut CurlState {
+        match self.extensions.curl_state_slot.as_deref_mut() {
+            Some(state) => state,
+            None => &mut self.extensions.curl_state,
+        }
+    }
+
+    /// Returns immutable request-local cURL state.
+    #[must_use]
+    pub fn curl_state_ref(&self) -> &CurlState {
+        self.extensions
+            .curl_state_slot
+            .as_deref()
+            .unwrap_or(&self.extensions.curl_state)
     }
 
     /// Uses VM-owned PCNTL state for request-local PCNTL builtins.

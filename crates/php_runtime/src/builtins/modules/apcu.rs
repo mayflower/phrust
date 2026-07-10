@@ -1,8 +1,9 @@
-//! Request-local APCu MVP.
+//! Process-local APCu compatibility helpers.
 
 use super::core::{arity_error, assign_reference_arg, conversion_error, int_arg, string_arg};
 use crate::builtins::{
-    BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinResult, RuntimeSourceSpan,
+    BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError, BuiltinResult,
+    RuntimeSourceSpan,
 };
 use crate::convert::to_bool;
 use crate::{ArrayKey, PhpArray, PhpString, Value};
@@ -30,6 +31,7 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         builtin_apcu_enabled,
         BuiltinCompatibility::Php,
     ),
+    BuiltinEntry::new("apcu_entry", builtin_apcu_entry, BuiltinCompatibility::Php),
     BuiltinEntry::new(
         "apcu_exists",
         builtin_apcu_exists,
@@ -93,6 +95,24 @@ fn builtin_apcu_add(
         args[1].clone(),
         ttl,
     )))
+}
+
+fn builtin_apcu_entry(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(arity_error("apcu_entry", "two or three arguments"));
+    }
+    let key = string_arg("apcu_entry", &args[0])?;
+    if let Some(value) = context.apcu_state().fetch(key.as_bytes()) {
+        return Ok(value);
+    }
+    Err(BuiltinError::new(
+        "E_PHP_RUNTIME_BUILTIN_CALLBACK",
+        "apcu_entry(): callable execution requires VM mediation",
+    ))
 }
 
 fn builtin_apcu_fetch(
@@ -180,7 +200,7 @@ fn builtin_apcu_cache_info(
     result.insert(string_key("num_entries"), Value::Int(stats.entries as i64));
     result.insert(string_key("expunges"), Value::Int(0));
     result.insert(string_key("mem_size"), Value::Int(0));
-    result.insert(string_key("memory_type"), Value::string("request-local"));
+    result.insert(string_key("memory_type"), Value::string("process-local"));
     if !limited {
         result.insert(string_key("cache_list"), Value::Array(PhpArray::new()));
     }
@@ -268,9 +288,11 @@ mod tests {
     }
 
     #[test]
-    fn counters_and_info_cover_request_local_cache_slice() {
+    fn counters_and_info_cover_process_local_cache_slice() {
         let mut output = OutputBuffer::default();
         let mut context = BuiltinContext::new(&mut output);
+        let mut apcu = crate::ApcuState::isolated();
+        context.set_apcu_state(&mut apcu);
 
         assert_eq!(
             call_with_context(
@@ -304,5 +326,30 @@ mod tests {
             panic!("expected sma info array");
         };
         assert_eq!(sma.get(&string_key("num_seg")), Some(&Value::Int(1)));
+    }
+
+    #[test]
+    fn default_state_is_shared_across_context_handles() {
+        let key = b"__phrust_apcu_process_shared_unit_test".to_vec();
+        let mut first = crate::ApcuState::default();
+        let mut second = crate::ApcuState::default();
+        first.delete(&key);
+
+        first.store(key.clone(), Value::string("shared"), 0);
+
+        assert_eq!(second.fetch(&key), Some(Value::string("shared")));
+        second.delete(&key);
+    }
+
+    #[test]
+    fn ttl_expiry_uses_controllable_clock_for_isolated_state() {
+        let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let mut apcu = crate::ApcuState::isolated_at(base);
+
+        apcu.store(b"ttl".to_vec(), Value::string("value"), 10);
+        assert_eq!(apcu.fetch(b"ttl"), Some(Value::string("value")));
+
+        apcu.set_test_now(base + std::time::Duration::from_secs(11));
+        assert_eq!(apcu.fetch(b"ttl"), None);
     }
 }

@@ -118,6 +118,11 @@ impl Vm {
             }
             return result;
         }
+        if name == "apcu_entry" {
+            return self.execute_apcu_entry_with_callback(
+                entry, values, output, stack, state, compiled, call_span,
+            );
+        }
         if name == "curl_exec" {
             return self.execute_curl_exec_with_callbacks(
                 entry, values, output, stack, state, compiled, call_span,
@@ -139,6 +144,10 @@ impl Vm {
             return self.execute_xml_parse_with_handlers(
                 entry, values, output, stack, state, compiled, call_span,
             );
+        }
+        if name == "opcache_compile_file" {
+            return self
+                .execute_opcache_compile_file(values, output, stack, state, compiled, call_span);
         }
         if name == "stream_wrapper_register" {
             return self.execute_stream_wrapper_register(values, output, stack, state, compiled);
@@ -195,6 +204,59 @@ impl Vm {
             state,
             compiled,
         )
+    }
+
+    fn execute_apcu_entry_with_callback(
+        &self,
+        entry: BuiltinEntry,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        compiled: &CompiledUnit,
+        call_span: Option<php_ir::IrSpan>,
+    ) -> VmResult {
+        if values.len() < 2 || values.len() > 3 {
+            return execute_builtin_entry(
+                entry,
+                values,
+                output,
+                &self.options.runtime_context,
+                state,
+                builtin_source_span(compiled, call_span),
+            );
+        }
+        let key = match to_string(&values[0]) {
+            Ok(key) => key,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        if let Some(value) = state.apcu_state.fetch(key.as_bytes()) {
+            return VmResult::success_no_output(Some(value));
+        }
+        let ttl = match values.get(2) {
+            Some(value) => match to_int(value) {
+                Ok(ttl) => ttl,
+                Err(message) => return self.runtime_error(output, compiled, stack, message),
+            },
+            None => 0,
+        };
+        let result = self.call_callable_with_call_span(
+            compiled,
+            values[1].clone(),
+            vec![CallArgument::positional(Value::String(key.clone()))],
+            call_span,
+            output,
+            stack,
+            state,
+        );
+        if !result.status.is_success() {
+            return result;
+        }
+        let value = result.return_value.unwrap_or(Value::Null);
+        state
+            .apcu_state
+            .store(key.as_bytes().to_vec(), value.clone(), ttl);
+        VmResult::success_no_output(Some(value))
     }
 
     fn try_execute_sysvmsg_send_with_serialization(
@@ -259,7 +321,7 @@ impl Vm {
             }
         };
 
-        let Some(queue) = state.sysvmsg_state.queue(queue_id) else {
+        if state.sysvmsg_state.queue(queue_id).is_none() {
             if let Err(result) = self
                 .emit_sysvmsg_send_invalid_queue_warning(compiled, output, stack, state, call_span)
             {
@@ -270,31 +332,152 @@ impl Vm {
                 OutputBuffer::new(),
                 Some(Value::Bool(false)),
             ));
-        };
-
-        if !blocking && queue.byte_count() + payload.len() > queue.max_bytes() as usize {
-            assign_optional_reference(values.get(5), Value::Int(php_runtime::api::SYSVMSG_EAGAIN));
-            return Some(VmResult::success(
-                OutputBuffer::new(),
-                Some(Value::Bool(false)),
-            ));
         }
 
-        let sent = state
-            .sysvmsg_state
-            .send_payload(queue_id, message_type, payload, true);
-        assign_optional_reference(
-            values.get(5),
-            Value::Int(if sent {
-                0
-            } else {
-                php_runtime::api::SYSVMSG_EAGAIN
-            }),
-        );
+        let send_flags = if blocking {
+            0
+        } else {
+            php_runtime::api::SYSVMSG_IPC_NOWAIT
+        };
+        let sent =
+            state
+                .sysvmsg_state
+                .send_payload(queue_id, message_type, payload, true, send_flags);
+        assign_optional_reference(values.get(5), Value::Int(sent.err().map_or(0, i64::from)));
         Some(VmResult::success(
             OutputBuffer::new(),
-            Some(Value::Bool(sent)),
+            Some(Value::Bool(sent.is_ok())),
         ))
+    }
+
+    fn execute_opcache_compile_file(
+        &self,
+        values: Vec<Value>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        compiled: &CompiledUnit,
+        call_span: Option<php_ir::IrSpan>,
+    ) -> VmResult {
+        if values.len() != 1 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_OPCACHE_ARITY: opcache_compile_file expects one argument",
+            );
+        }
+
+        let path = match to_string(&values[0]) {
+            Ok(path) => path.to_string_lossy(),
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        let Some(loader) = &self.options.include_loader else {
+            if let Err(result) = self.emit_opcache_compile_warning(
+                compiled,
+                output,
+                stack,
+                state,
+                call_span,
+                "opcache_compile_file(): include loader is not configured",
+            ) {
+                return result;
+            }
+            return VmResult::success_no_output(Some(Value::Bool(false)));
+        };
+
+        let include_path = state_include_path(state);
+        let cwd = state.cwd.clone();
+        let resolved = match if let Some(cache) = &self.options.include_cache {
+            cache.resolve_with_include_path(loader, None, &path, &include_path, Some(&cwd))
+        } else {
+            loader.resolve_with_include_path(None, &path, &include_path, Some(&cwd))
+        } {
+            Ok(resolved) => resolved,
+            Err(message) => {
+                if let Err(result) = self.emit_opcache_compile_warning(
+                    compiled,
+                    output,
+                    stack,
+                    state,
+                    call_span,
+                    format!("opcache_compile_file(): {}", message.render_message()),
+                ) {
+                    return result;
+                }
+                return VmResult::success_no_output(Some(Value::Bool(false)));
+            }
+        };
+
+        let compile_result = if let Some(cache) = &self.options.include_cache {
+            cache
+                .get_or_compile_include(loader, &resolved, self.options.include_optimization_level)
+                .map(|_| ())
+        } else {
+            loader
+                .load_resolved(resolved.canonical_path.clone())
+                .and_then(|loaded| {
+                    compile_loaded_include(loaded, self.options.include_optimization_level)
+                        .map(|_| ())
+                })
+        };
+        if let Err(message) = compile_result {
+            if let Err(result) = self.emit_opcache_compile_warning(
+                compiled,
+                output,
+                stack,
+                state,
+                call_span,
+                format!("opcache_compile_file(): {}", message.render_message()),
+            ) {
+                return result;
+            }
+            return VmResult::success_no_output(Some(Value::Bool(false)));
+        }
+
+        state
+            .opcache_state
+            .compile_script(resolved.canonical_path.to_string_lossy().into_owned());
+        VmResult::success_no_output(Some(Value::Bool(true)))
+    }
+
+    fn emit_opcache_compile_warning(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        call_span: Option<php_ir::IrSpan>,
+        message: impl Into<String>,
+    ) -> Result<(), VmResult> {
+        let diagnostic = RuntimeDiagnostic::new(
+            "E_PHP_VM_OPCACHE_COMPILE_FILE",
+            RuntimeSeverity::Warning,
+            message,
+            builtin_source_span(compiled, call_span),
+            stack_trace(compiled, stack),
+            Some(php_runtime::PhpReferenceClassification::Warning),
+        );
+        let handled = self.dispatch_error_handler(
+            compiled,
+            output,
+            stack,
+            state,
+            php_runtime::PHP_E_WARNING,
+            &diagnostic,
+        )?;
+        if !handled && error_reporting_allows(state, php_runtime::PHP_E_WARNING) {
+            Self::record_last_error(state, php_runtime::PHP_E_WARNING, &diagnostic);
+            emit_vm_diagnostic(
+                output,
+                state,
+                &diagnostic,
+                php_runtime::PhpDiagnosticChannel::Warning,
+                php_runtime::PHP_E_WARNING,
+            );
+            state.diagnostics.push(diagnostic);
+        }
+        Ok(())
     }
 
     fn emit_sysvmsg_send_invalid_queue_warning(

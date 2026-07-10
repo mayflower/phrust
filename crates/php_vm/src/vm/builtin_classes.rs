@@ -5,7 +5,14 @@
 #![allow(clippy::result_large_err)]
 
 use super::prelude::*;
-use std::io::Seek;
+use php_runtime::builtins::{
+    SoapParsedBody, build_soap_envelope, igbinary_serialize_value, igbinary_unserialize_value,
+    load_wsdl, msgpack_pack_value, msgpack_unpack_value, parse_soap_response, parse_wsdl,
+    soap_http_post,
+};
+use std::fmt;
+use std::io::{BufRead, BufReader, Seek};
+use std::net::{TcpStream, ToSocketAddrs};
 
 pub(super) fn is_std_class_runtime_class(class_name: &str) -> bool {
     class_name
@@ -616,6 +623,151 @@ pub(super) const MEMCACHED_STORE_PROPERTY: &str = "__memcached_store";
 pub(super) const MEMCACHED_SERVERS_PROPERTY: &str = "__memcached_servers";
 pub(super) const MEMCACHED_OPTIONS_PROPERTY: &str = "__memcached_options";
 pub(super) const MEMCACHED_RESULT_CODE_PROPERTY: &str = "__memcached_result_code";
+const MEMCACHED_OPT_SERIALIZER: i64 = -1003;
+const MEMCACHED_SERIALIZER_NONE: i64 = 0;
+const MEMCACHED_SERIALIZER_PHP: i64 = 1;
+const MEMCACHED_SERIALIZER_IGBINARY: i64 = 2;
+const MEMCACHED_SERIALIZER_MSGPACK: i64 = 5;
+
+#[derive(Default)]
+pub(super) struct MemcachedClientState {
+    clients: HashMap<u64, MemcachedClient>,
+    last_errors: HashMap<u64, String>,
+}
+
+impl fmt::Debug for MemcachedClientState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemcachedClientState")
+            .field("clients", &self.clients.keys().collect::<Vec<_>>())
+            .field("last_errors", &self.last_errors)
+            .finish()
+    }
+}
+
+impl MemcachedClientState {
+    fn add_server(
+        &mut self,
+        object: &ObjectRef,
+        host: &str,
+        port: i64,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        match MemcachedClient::connect(host, port, timeout) {
+            Ok(client) => {
+                self.clients.insert(object.id(), client);
+                self.last_errors.remove(&object.id());
+                Ok(())
+            }
+            Err(error) => {
+                self.clients.remove(&object.id());
+                self.last_errors.insert(object.id(), error);
+                Err("connection failed".to_owned())
+            }
+        }
+    }
+
+    fn client_mut(&mut self, object: &ObjectRef) -> Option<&mut MemcachedClient> {
+        self.clients.get_mut(&object.id())
+    }
+}
+
+struct MemcachedClient {
+    reader: BufReader<TcpStream>,
+}
+
+impl MemcachedClient {
+    fn connect(host: &str, port: i64, timeout: Duration) -> Result<Self, String> {
+        let address = format!("{host}:{port}");
+        let mut addrs = address
+            .to_socket_addrs()
+            .map_err(|error| format!("resolve {address}: {error}"))?;
+        let Some(addr) = addrs.next() else {
+            return Err(format!("resolve {address}: no socket addresses"));
+        };
+        let stream = TcpStream::connect_timeout(&addr, timeout)
+            .map_err(|error| format!("connect {addr}: {error}"))?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| format!("set read timeout: {error}"))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|error| format!("set write timeout: {error}"))?;
+        Ok(Self {
+            reader: BufReader::new(stream),
+        })
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let stream = self.reader.get_mut();
+        stream
+            .write_all(bytes)
+            .and_then(|()| stream.flush())
+            .map_err(|error| error.to_string())
+    }
+
+    fn read_line(&mut self) -> Result<String, String> {
+        let mut line = String::new();
+        self.reader
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?;
+        Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+    }
+
+    fn store(
+        &mut self,
+        command: &str,
+        key: &str,
+        value: &[u8],
+        expiration: i64,
+    ) -> Result<bool, String> {
+        self.write_bytes(format!("{command} {key} 0 {expiration} {}\r\n", value.len()).as_bytes())?;
+        self.write_bytes(value)?;
+        self.write_bytes(b"\r\n")?;
+        Ok(self.read_line()? == "STORED")
+    }
+
+    fn get_many(&mut self, keys: &[String]) -> Result<HashMap<String, Vec<u8>>, String> {
+        self.write_bytes(format!("get {}\r\n", keys.join(" ")).as_bytes())?;
+        let mut values = HashMap::new();
+        loop {
+            let line = self.read_line()?;
+            if line == "END" {
+                break;
+            }
+            let parts = line.split_whitespace().collect::<Vec<_>>();
+            if parts.len() != 4 || parts[0] != "VALUE" {
+                return Err(format!("unexpected memcached response: {line}"));
+            }
+            let key = parts[1].to_owned();
+            let len = parts[3]
+                .parse::<usize>()
+                .map_err(|error| format!("invalid value length: {error}"))?;
+            let mut value = vec![0; len + 2];
+            self.reader
+                .read_exact(&mut value)
+                .map_err(|error| error.to_string())?;
+            value.truncate(len);
+            values.insert(key, value);
+        }
+        Ok(values)
+    }
+
+    fn delete(&mut self, key: &str) -> Result<bool, String> {
+        self.write_bytes(format!("delete {key}\r\n").as_bytes())?;
+        Ok(self.read_line()? == "DELETED")
+    }
+
+    fn counter(&mut self, command: &str, key: &str, offset: i64) -> Result<Option<i64>, String> {
+        self.write_bytes(format!("{command} {key} {offset}\r\n").as_bytes())?;
+        let line = self.read_line()?;
+        if line == "NOT_FOUND" {
+            return Ok(None);
+        }
+        line.parse::<i64>()
+            .map(Some)
+            .map_err(|error| format!("invalid counter response: {error}"))
+    }
+}
 
 pub(super) fn new_soap_object(
     class_name: &str,
@@ -838,6 +990,48 @@ fn call_soap_client_method(
             object.set_property("__last_request_headers", Value::Null);
             object.set_property("__last_response_headers", Value::Null);
             object.set_property("__cookies", Value::Array(PhpArray::new()));
+            if !matches!(values[0], Value::Null) {
+                let wsdl_uri = to_string(&values[0])?.to_string_lossy();
+                let wsdl = load_wsdl(&wsdl_uri)?;
+                let info = parse_wsdl(&wsdl)?;
+                object.set_property(
+                    "__soap_wsdl_target_namespace",
+                    info.target_namespace
+                        .as_deref()
+                        .map(|value| Value::String(PhpString::from(value)))
+                        .unwrap_or(Value::Null),
+                );
+                object.set_property(
+                    "__soap_wsdl_location",
+                    info.location
+                        .as_deref()
+                        .map(|value| Value::String(PhpString::from(value)))
+                        .unwrap_or(Value::Null),
+                );
+                object.set_property(
+                    "__soap_wsdl_operations",
+                    Value::packed_array(
+                        info.operations
+                            .iter()
+                            .map(|name| Value::String(PhpString::from(name.as_str())))
+                            .collect(),
+                    ),
+                );
+            } else {
+                object.set_property("__soap_wsdl_target_namespace", Value::Null);
+                object.set_property("__soap_wsdl_location", Value::Null);
+                object.set_property("__soap_wsdl_operations", Value::Array(PhpArray::new()));
+            }
+            if let Some(location) = soap_option_string(object, "location") {
+                object.set_property(
+                    "location",
+                    Value::String(PhpString::from(location.as_str())),
+                );
+            } else if let Some(Value::String(location)) =
+                object.get_property("__soap_wsdl_location")
+            {
+                object.set_property("location", Value::String(location));
+            }
             Ok(Value::Null)
         }
         "__getlastrequest" => Ok(object.get_property("__last_request").unwrap_or(Value::Null)),
@@ -853,7 +1047,10 @@ fn call_soap_client_method(
         "__getcookies" => Ok(object
             .get_property("__cookies")
             .unwrap_or_else(|| Value::Array(PhpArray::new()))),
-        "__getfunctions" | "__gettypes" => Ok(Value::Null),
+        "__getfunctions" => Ok(object
+            .get_property("__soap_wsdl_operations")
+            .unwrap_or_else(|| Value::Array(PhpArray::new()))),
+        "__gettypes" => Ok(Value::Array(PhpArray::new())),
         "__setcookie" => {
             validate_arg_count(
                 &format!("{}::__setCookie", object.display_name()),
@@ -900,11 +1097,172 @@ fn call_soap_client_method(
             );
             Ok(Value::Bool(true))
         }
-        "__call" | "__soapcall" | "__dorequest" => Err(format!(
-            "E_PHP_VM_UNSUPPORTED_SOAP: method {}::{method} requires WSDL, XML serialization, and HTTP transport support",
-            object.display_name()
-        )),
+        "__call" => {
+            validate_arg_count(
+                &format!("{}::__call", object.display_name()),
+                values.len(),
+                2,
+                2,
+            )?;
+            soap_client_soap_call(object, &values[0], &values[1])
+        }
+        "__soapcall" => {
+            validate_arg_count(
+                &format!("{}::__soapCall", object.display_name()),
+                values.len(),
+                2,
+                5,
+            )?;
+            soap_client_soap_call(object, &values[0], &values[1])
+        }
+        "__dorequest" => {
+            validate_arg_count(
+                &format!("{}::__doRequest", object.display_name()),
+                values.len(),
+                4,
+                5,
+            )?;
+            let request = to_string(&values[0])?.to_string_lossy();
+            let location = to_string(&values[1])?.to_string_lossy();
+            let action = to_string(&values[2])?.to_string_lossy();
+            let one_way = values.get(4).map(to_bool).transpose()?.unwrap_or(false);
+            soap_client_do_request(object, &request, &location, &action, one_way)
+        }
         _ => unknown_soap_method(object, method),
+    }
+}
+
+fn soap_client_soap_call(
+    object: &ObjectRef,
+    function_name: &Value,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let method = to_string(function_name)?.to_string_lossy();
+    let namespace = soap_client_namespace(object)?;
+    let location = soap_client_location(object)?;
+    let args = soap_call_arguments(arguments);
+    let request = build_soap_envelope(&method, &namespace, &args);
+    let response = soap_client_do_request(object, &request, &location, &method, false)?;
+    match response {
+        Value::String(response) => soap_response_value(&response.to_string_lossy()),
+        Value::Null => Ok(Value::Null),
+        value => Ok(value),
+    }
+}
+
+fn soap_client_do_request(
+    object: &ObjectRef,
+    request: &str,
+    location: &str,
+    action: &str,
+    one_way: bool,
+) -> Result<Value, String> {
+    object.set_property("__last_request", Value::String(PhpString::from(request)));
+    let request_headers = format!(
+        "POST {location} HTTP/1.1\r\nContent-Type: text/xml; charset=utf-8\r\nSOAPAction: \"{action}\"\r\n"
+    );
+    object.set_property(
+        "__last_request_headers",
+        Value::String(PhpString::from(request_headers.as_str())),
+    );
+    let response = soap_http_post(location, request, Some(action))?;
+    object.set_property(
+        "__last_response_headers",
+        Value::String(PhpString::from(response.headers.as_str())),
+    );
+    object.set_property(
+        "__last_response",
+        Value::String(PhpString::from(response.body.as_str())),
+    );
+    if one_way {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::String(PhpString::from(response.body.as_str())))
+    }
+}
+
+fn soap_response_value(response: &str) -> Result<Value, String> {
+    match parse_soap_response(response)? {
+        SoapParsedBody::Return(value) => Ok(value),
+        SoapParsedBody::Fault {
+            code,
+            string,
+            detail,
+        } => {
+            let detail = detail
+                .map(|value| Value::String(PhpString::from(value.as_str())))
+                .unwrap_or(Value::Null);
+            let fault = new_soap_object(
+                "SoapFault",
+                vec![
+                    CallArgument::positional(Value::String(PhpString::from(code.as_str()))),
+                    CallArgument::positional(Value::String(PhpString::from(string.as_str()))),
+                    CallArgument::positional(Value::Null),
+                    CallArgument::positional(detail),
+                ],
+            )?;
+            Ok(Value::Object(fault))
+        }
+    }
+}
+
+fn soap_client_namespace(object: &ObjectRef) -> Result<String, String> {
+    if let Some(namespace) = soap_option_string(object, "uri") {
+        return Ok(namespace);
+    }
+    if let Some(Value::String(namespace)) = object.get_property("__soap_wsdl_target_namespace") {
+        let namespace = namespace.to_string_lossy();
+        if !namespace.is_empty() {
+            return Ok(namespace);
+        }
+    }
+    Err("E_PHP_VM_SOAP_CONFIGURATION: SoapClient requires uri in non-WSDL mode".to_owned())
+}
+
+fn soap_client_location(object: &ObjectRef) -> Result<String, String> {
+    if let Some(Value::String(location)) = object.get_property("location") {
+        let location = location.to_string_lossy();
+        if !location.is_empty() {
+            return Ok(location);
+        }
+    }
+    if let Some(location) = soap_option_string(object, "location") {
+        return Ok(location);
+    }
+    if let Some(Value::String(location)) = object.get_property("__soap_wsdl_location") {
+        let location = location.to_string_lossy();
+        if !location.is_empty() {
+            return Ok(location);
+        }
+    }
+    Err("E_PHP_VM_SOAP_CONFIGURATION: SoapClient requires location or WSDL soap:address".to_owned())
+}
+
+fn soap_option_string(object: &ObjectRef, name: &str) -> Option<String> {
+    let Some(Value::Array(options)) = object.get_property("__soap_options") else {
+        return None;
+    };
+    options
+        .get(&ArrayKey::String(PhpString::from(name)))
+        .and_then(|value| to_string(value).ok())
+        .map(|value| value.to_string_lossy())
+        .filter(|value| !value.is_empty())
+}
+
+fn soap_call_arguments(arguments: &Value) -> Vec<(String, Value)> {
+    match arguments {
+        Value::Array(array) => array
+            .iter()
+            .enumerate()
+            .map(|(index, (key, value))| {
+                let name = match key {
+                    ArrayKey::String(name) => name.to_string_lossy(),
+                    ArrayKey::Int(_) => format!("param{index}"),
+                };
+                (name, value.clone())
+            })
+            .collect(),
+        value => vec![("param0".to_owned(), value.clone())],
     }
 }
 
@@ -967,11 +1325,234 @@ fn call_soap_server_method(
             Ok(Value::Null)
         }
         "setpersistence" | "setclass" | "setobject" => Ok(Value::Null),
-        "fault" | "handle" => Err(format!(
-            "E_PHP_VM_UNSUPPORTED_SOAP: method {}::{method} requires local SOAP server dispatch support",
-            object.display_name()
-        )),
+        "fault" => {
+            validate_arg_count(
+                &format!("{}::fault", object.display_name()),
+                values.len(),
+                2,
+                5,
+            )?;
+            let code = to_string(&values[0])?.to_string_lossy();
+            let message = to_string(&values[1])?.to_string_lossy();
+            let response = soap_fault_envelope(&code, &message);
+            object.set_property(
+                "__last_response",
+                Value::String(PhpString::from(response.as_str())),
+            );
+            Ok(Value::String(PhpString::from(response.as_str())))
+        }
+        "handle" => {
+            validate_arg_count(
+                &format!("{}::handle", object.display_name()),
+                values.len(),
+                0,
+                1,
+            )?;
+            let request = values
+                .first()
+                .map(to_string)
+                .transpose()?
+                .map(|value| value.to_string_lossy())
+                .unwrap_or_default();
+            let response = if request.is_empty() {
+                soap_fault_envelope("Server", "SOAP request body is required")
+            } else {
+                match php_runtime::xml_backend::parse_document(&request) {
+                    Ok(_) => soap_fault_envelope(
+                        "Server",
+                        "SOAP server callback dispatch is not implemented",
+                    ),
+                    Err(error) => soap_fault_envelope("Client", &error),
+                }
+            };
+            object.set_property(
+                "__last_response",
+                Value::String(PhpString::from(response.as_str())),
+            );
+            Ok(Value::String(PhpString::from(response.as_str())))
+        }
         _ => unknown_soap_method(object, method),
+    }
+}
+
+fn soap_fault_envelope(code: &str, message: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"><SOAP-ENV:Body><SOAP-ENV:Fault><faultcode>{}</faultcode><faultstring>{}</faultstring></SOAP-ENV:Fault></SOAP-ENV:Body></SOAP-ENV:Envelope>"#,
+        soap_escape_text(code),
+        soap_escape_text(message)
+    )
+}
+
+fn soap_escape_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod soap_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn positional(value: Value) -> CallArgument {
+        CallArgument::positional(value)
+    }
+
+    fn soap_options(location: &str, uri: &str) -> Value {
+        let mut options = PhpArray::new();
+        options.insert(
+            ArrayKey::String(PhpString::from("location")),
+            Value::String(PhpString::from(location)),
+        );
+        options.insert(
+            ArrayKey::String(PhpString::from("uri")),
+            Value::String(PhpString::from(uri)),
+        );
+        Value::Array(options)
+    }
+
+    #[test]
+    fn soap_client_parses_local_wsdl_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "phrust-soap-wsdl-{}-{}.wsdl",
+            std::process::id(),
+            "metadata"
+        ));
+        std::fs::write(
+            &path,
+            r#"<definitions targetNamespace="urn:test" xmlns="http://schemas.xmlsoap.org/wsdl/" xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"><portType name="DemoPort"><operation name="echo"/></portType><binding name="DemoBinding" type="DemoPort"><operation name="echo"><soap:operation soapAction="urn:test#echo"/></operation></binding><service name="Demo"><port name="DemoPort" binding="DemoBinding"><soap:address location="http://127.0.0.1:18081/soap"/></port></service></definitions>"#,
+        )
+        .unwrap();
+
+        let client = new_soap_object(
+            "SoapClient",
+            vec![positional(Value::String(PhpString::from(
+                path.to_string_lossy().as_ref(),
+            )))],
+        )
+        .unwrap();
+        let functions = call_soap_method(&client, "__getFunctions", Vec::new()).unwrap();
+
+        assert_eq!(
+            functions.packed_elements().unwrap(),
+            vec![&Value::String(PhpString::from("echo"))]
+        );
+        assert_eq!(
+            client.get_property("location"),
+            Some(Value::String(PhpString::from(
+                "http://127.0.0.1:18081/soap"
+            )))
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn soap_client_soap_call_posts_to_loopback_and_parses_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = Vec::new();
+            let mut chunk = [0; 1024];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                assert_ne!(read, 0);
+                buffer.extend_from_slice(&chunk[..read]);
+                if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header_end = buffer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = String::from_utf8_lossy(&buffer[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length:")
+                        .or_else(|| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap();
+            while buffer.len() - header_end < content_length {
+                let read = stream.read(&mut chunk).unwrap();
+                assert_ne!(read, 0);
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8_lossy(&buffer[header_end..]).into_owned();
+            let response = r#"<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"><SOAP-ENV:Body><ns1:echoResponse xmlns:ns1="urn:test"><return>ok</return></ns1:echoResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+            request
+        });
+
+        let client = new_soap_object(
+            "SoapClient",
+            vec![
+                positional(Value::Null),
+                positional(soap_options(&url, "urn:test")),
+            ],
+        )
+        .unwrap();
+        let result = call_soap_method(
+            &client,
+            "__soapCall",
+            vec![
+                positional(Value::String(PhpString::from("echo"))),
+                positional(Value::packed_array(vec![Value::String(PhpString::from(
+                    "hello",
+                ))])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(result, Value::String(PhpString::from("ok")));
+        let request = server.join().unwrap();
+        assert!(request.contains("<ns1:echo"));
+        assert!(request.contains("<param0>hello</param0>"));
+        assert!(
+            client
+                .get_property("__last_response")
+                .and_then(|value| to_string(&value).ok())
+                .map(|value| value.to_string_lossy().contains("echoResponse"))
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn soap_server_handle_parses_request_and_returns_fault_response() {
+        let server = new_soap_object("SoapServer", vec![positional(Value::Null)]).unwrap();
+        let request =
+            build_soap_envelope("echo", "urn:test", &[("param0".to_owned(), Value::Int(1))]);
+        let response = call_soap_method(
+            &server,
+            "handle",
+            vec![positional(Value::String(PhpString::from(request.as_str())))],
+        )
+        .unwrap();
+
+        let response = to_string(&response).unwrap().to_string_lossy();
+        assert!(response.contains("<SOAP-ENV:Fault>"));
+        assert!(response.contains("callback dispatch is not implemented"));
+        assert_eq!(
+            server
+                .get_property("__last_response")
+                .and_then(|value| to_string(&value).ok())
+                .map(|value| value.to_string_lossy()),
+            Some(response)
+        );
     }
 }
 
@@ -1115,12 +1696,12 @@ pub(super) fn memcached_class_constant_value(class_name: &str, constant: &str) -
         "RES_SUCCESS" => MEMCACHED_RES_SUCCESS,
         "RES_FAILURE" => MEMCACHED_RES_FAILURE,
         "RES_NOTFOUND" | "RES_NOT_FOUND" => MEMCACHED_RES_NOTFOUND,
-        "OPT_SERIALIZER" => -1003,
-        "SERIALIZER_PHP" => 1,
-        "SERIALIZER_IGBINARY" => 2,
+        "OPT_SERIALIZER" => MEMCACHED_OPT_SERIALIZER,
+        "SERIALIZER_PHP" => MEMCACHED_SERIALIZER_PHP,
+        "SERIALIZER_IGBINARY" => MEMCACHED_SERIALIZER_IGBINARY,
         "SERIALIZER_JSON" => 3,
         "SERIALIZER_JSON_ARRAY" => 4,
-        "SERIALIZER_MSGPACK" => 5,
+        "SERIALIZER_MSGPACK" => MEMCACHED_SERIALIZER_MSGPACK,
         "OPT_COMPRESSION" => -1001,
         "OPT_PREFIX_KEY" => -1002,
         "OPT_LIBKETAMA_COMPATIBLE" => 16,
@@ -1141,6 +1722,7 @@ pub(super) fn call_memcached_method(
     object: &ObjectRef,
     method: &str,
     args: Vec<CallArgument>,
+    state: &mut MemcachedClientState,
 ) -> Result<Value, String> {
     let method = normalize_method_name(method);
     let values = call_args_to_positional(&format!("Memcached::{method}"), args)?;
@@ -1150,8 +1732,8 @@ pub(super) fn call_memcached_method(
             memcached_reset_object(object);
             Ok(Value::Null)
         }
-        "addserver" => memcached_add_server(object, &values),
-        "addservers" => memcached_add_servers(object, &values),
+        "addserver" => memcached_add_server(state, object, &values),
+        "addservers" => memcached_add_servers(state, object, &values),
         "getserverlist" => {
             validate_memcached_arg_count("Memcached::getServerList", values.len(), 0, 0)?;
             memcached_success(
@@ -1161,16 +1743,16 @@ pub(super) fn call_memcached_method(
                     .unwrap_or_else(empty_array_value),
             )
         }
-        "set" => memcached_set(object, &values, MemcachedWriteMode::Set),
-        "add" => memcached_set(object, &values, MemcachedWriteMode::Add),
-        "replace" => memcached_set(object, &values, MemcachedWriteMode::Replace),
-        "get" => memcached_get(object, &values),
-        "getmulti" => memcached_get_multi(object, &values),
-        "setmulti" => memcached_set_multi(object, &values),
-        "delete" => memcached_delete(object, &values),
+        "set" => memcached_set(state, object, &values, MemcachedWriteMode::Set),
+        "add" => memcached_set(state, object, &values, MemcachedWriteMode::Add),
+        "replace" => memcached_set(state, object, &values, MemcachedWriteMode::Replace),
+        "get" => memcached_get(state, object, &values),
+        "getmulti" => memcached_get_multi(state, object, &values),
+        "setmulti" => memcached_set_multi(state, object, &values),
+        "delete" => memcached_delete(state, object, &values),
         "deletemulti" => memcached_delete_multi(object, &values),
-        "increment" => memcached_counter(object, &values, 1),
-        "decrement" => memcached_counter(object, &values, -1),
+        "increment" => memcached_counter(state, object, &values, 1),
+        "decrement" => memcached_counter(state, object, &values, -1),
         "touch" => memcached_touch(object, &values),
         "flush" => {
             validate_memcached_arg_count("Memcached::flush", values.len(), 0, 1)?;
@@ -1204,7 +1786,7 @@ pub(super) fn call_memcached_method(
             memcached_success(object, Value::Array(PhpArray::new()))
         }
         other => Err(format!(
-            "E_PHP_VM_MEMCACHED_METHOD_GAP: method Memcached::{other} is not implemented in the deterministic Memcached fake backend"
+            "E_PHP_VM_MEMCACHED_METHOD_GAP: method Memcached::{other} is not implemented by the endpoint-backed Memcached client"
         )),
     }
 }
@@ -1260,6 +1842,81 @@ pub(super) fn memcached_result_message(code: i64) -> &'static str {
     }
 }
 
+fn memcached_key(value: &Value) -> Result<String, String> {
+    let key = php_string_to_lossy_string(&to_string(value)?);
+    if key.is_empty() || key.bytes().any(|byte| byte <= b' ' || byte == 0x7f) {
+        return Err("E_PHP_VM_MEMCACHED_KEY: Memcached key contains invalid whitespace".to_owned());
+    }
+    Ok(key)
+}
+
+fn memcached_serializer(object: &ObjectRef) -> i64 {
+    let options = match object.get_property(MEMCACHED_OPTIONS_PROPERTY) {
+        Some(Value::Array(array)) => array,
+        _ => return MEMCACHED_SERIALIZER_NONE,
+    };
+    let key = ArrayKey::String(PhpString::from(
+        MEMCACHED_OPT_SERIALIZER.to_string().as_str(),
+    ));
+    options
+        .get(&key)
+        .and_then(|value| to_int(value).ok())
+        .unwrap_or(MEMCACHED_SERIALIZER_NONE)
+}
+
+fn memcached_unsupported_serializer(serializer: i64) -> String {
+    format!(
+        "E_PHP_VM_MEMCACHED_SERIALIZER_GAP: Memcached serializer {serializer} is not implemented for endpoint-backed value payloads"
+    )
+}
+
+fn memcached_encode_cache_value(object: &ObjectRef, value: &Value) -> Result<Vec<u8>, String> {
+    match memcached_serializer(object) {
+        MEMCACHED_SERIALIZER_NONE => redis_value_bytes(value),
+        MEMCACHED_SERIALIZER_PHP => serialize_value(value)
+            .map(|encoded| encoded.as_bytes().to_vec())
+            .map_err(|error| {
+                format!(
+                    "E_PHP_VM_MEMCACHED_SERIALIZE: failed to PHP-serialize Memcached value: {}",
+                    error.message()
+                )
+            }),
+        MEMCACHED_SERIALIZER_IGBINARY => igbinary_serialize_value(value)
+            .map(|encoded| encoded.as_bytes().to_vec())
+            .map_err(|message| {
+                format!("E_PHP_VM_MEMCACHED_SERIALIZE: failed to igbinary-serialize Memcached value: {message}")
+            }),
+        MEMCACHED_SERIALIZER_MSGPACK => msgpack_pack_value(value)
+            .map(|encoded| encoded.as_bytes().to_vec())
+            .map_err(|message| {
+                format!("E_PHP_VM_MEMCACHED_SERIALIZE: failed to MessagePack-serialize Memcached value: {message}")
+            }),
+        other => Err(memcached_unsupported_serializer(other)),
+    }
+}
+
+fn memcached_decode_cache_bytes(object: &ObjectRef, bytes: Vec<u8>) -> Result<Value, String> {
+    let input = PhpString::from_bytes(bytes);
+    match memcached_serializer(object) {
+        MEMCACHED_SERIALIZER_NONE => Ok(Value::String(input)),
+        MEMCACHED_SERIALIZER_PHP => {
+            unserialize_value(&input, UnserializeOptions::default()).map_err(|error| {
+                format!(
+                    "E_PHP_VM_MEMCACHED_UNSERIALIZE: failed to PHP-unserialize Memcached value: {}",
+                    error.message()
+                )
+            })
+        }
+        MEMCACHED_SERIALIZER_IGBINARY => igbinary_unserialize_value(&input).map_err(|message| {
+            format!("E_PHP_VM_MEMCACHED_UNSERIALIZE: failed to igbinary-unserialize Memcached value: {message}")
+        }),
+        MEMCACHED_SERIALIZER_MSGPACK => msgpack_unpack_value(&input).map_err(|message| {
+            format!("E_PHP_VM_MEMCACHED_UNSERIALIZE: failed to MessagePack-unserialize Memcached value: {message}")
+        }),
+        other => Err(memcached_unsupported_serializer(other)),
+    }
+}
+
 pub(super) fn memcached_success(object: &ObjectRef, value: Value) -> Result<Value, String> {
     memcached_set_result(object, MEMCACHED_RES_SUCCESS);
     Ok(value)
@@ -1270,8 +1927,19 @@ pub(super) fn memcached_not_found(object: &ObjectRef, value: Value) -> Result<Va
     Ok(value)
 }
 
-pub(super) fn memcached_add_server(object: &ObjectRef, values: &[Value]) -> Result<Value, String> {
+pub(super) fn memcached_add_server(
+    state: &mut MemcachedClientState,
+    object: &ObjectRef,
+    values: &[Value],
+) -> Result<Value, String> {
     validate_memcached_arg_count("Memcached::addServer", values.len(), 2, 3)?;
+    let host = php_string_to_lossy_string(&to_string(&values[0])?);
+    let port = to_int(&values[1])?;
+    let timeout = Duration::from_millis(150);
+    if state.add_server(object, &host, port, timeout).is_err() {
+        memcached_set_result(object, MEMCACHED_RES_FAILURE);
+        return Ok(Value::Bool(false));
+    }
     let mut servers = match object.get_property(MEMCACHED_SERVERS_PROPERTY) {
         Some(Value::Array(array)) => array,
         _ => PhpArray::new(),
@@ -1285,88 +1953,159 @@ pub(super) fn memcached_add_server(object: &ObjectRef, values: &[Value]) -> Resu
     memcached_success(object, Value::Bool(true))
 }
 
-pub(super) fn memcached_add_servers(object: &ObjectRef, values: &[Value]) -> Result<Value, String> {
+pub(super) fn memcached_add_servers(
+    state: &mut MemcachedClientState,
+    object: &ObjectRef,
+    values: &[Value],
+) -> Result<Value, String> {
     validate_memcached_arg_count("Memcached::addServers", values.len(), 1, 1)?;
     let servers = redis_array_value_entries(&values[0], "Memcached::addServers")?;
-    let mut current = match object.get_property(MEMCACHED_SERVERS_PROPERTY) {
-        Some(Value::Array(array)) => array,
-        _ => PhpArray::new(),
-    };
     for (_, server) in servers {
-        current.append(server);
+        let entries = redis_array_value_entries(&server, "Memcached::addServers")?
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+        if entries.len() < 2 {
+            memcached_set_result(object, MEMCACHED_RES_FAILURE);
+            return Ok(Value::Bool(false));
+        }
+        if memcached_add_server(state, object, &entries)? != Value::Bool(true) {
+            return Ok(Value::Bool(false));
+        }
     }
-    object.set_property(MEMCACHED_SERVERS_PROPERTY, Value::Array(current));
     memcached_success(object, Value::Bool(true))
 }
 
 pub(super) fn memcached_set(
+    state: &mut MemcachedClientState,
     object: &ObjectRef,
     values: &[Value],
     mode: MemcachedWriteMode,
 ) -> Result<Value, String> {
     validate_memcached_arg_count("Memcached::set", values.len(), 2, 4)?;
-    let mut store = memcached_store(object);
-    let key = redis_key(&values[0])?;
-    let exists = store.get(&key).is_some();
-    let should_write = match mode {
-        MemcachedWriteMode::Set => true,
-        MemcachedWriteMode::Add => !exists,
-        MemcachedWriteMode::Replace => exists,
+    let Some(client) = state.client_mut(object) else {
+        memcached_set_result(object, MEMCACHED_RES_FAILURE);
+        return Ok(Value::Bool(false));
     };
-    if !should_write {
-        return memcached_not_found(object, Value::Bool(false));
+    let command = match mode {
+        MemcachedWriteMode::Set => "set",
+        MemcachedWriteMode::Add => "add",
+        MemcachedWriteMode::Replace => "replace",
+    };
+    let key = memcached_key(&values[0])?;
+    let value = memcached_encode_cache_value(object, &values[1])?;
+    let expiration = values.get(2).map(to_int).transpose()?.unwrap_or(0);
+    match client.store(command, &key, &value, expiration) {
+        Ok(true) => memcached_success(object, Value::Bool(true)),
+        Ok(false) => memcached_not_found(object, Value::Bool(false)),
+        Err(error) => {
+            state.last_errors.insert(object.id(), error);
+            memcached_set_result(object, MEMCACHED_RES_FAILURE);
+            Ok(Value::Bool(false))
+        }
     }
-    store.insert(key, values[1].clone());
-    memcached_set_store(object, store);
-    memcached_success(object, Value::Bool(true))
 }
 
-pub(super) fn memcached_get(object: &ObjectRef, values: &[Value]) -> Result<Value, String> {
+pub(super) fn memcached_get(
+    state: &mut MemcachedClientState,
+    object: &ObjectRef,
+    values: &[Value],
+) -> Result<Value, String> {
     validate_memcached_arg_count("Memcached::get", values.len(), 1, 3)?;
-    let store = memcached_store(object);
-    match store.get(&redis_key(&values[0])?).cloned() {
-        Some(value) => memcached_success(object, value),
-        None => memcached_not_found(object, Value::Bool(false)),
+    let Some(client) = state.client_mut(object) else {
+        memcached_set_result(object, MEMCACHED_RES_FAILURE);
+        return Ok(Value::Bool(false));
+    };
+    let key = memcached_key(&values[0])?;
+    match client.get_many(std::slice::from_ref(&key)) {
+        Ok(values) => match values.get(&key) {
+            Some(value) => {
+                let value = memcached_decode_cache_bytes(object, value.clone())?;
+                memcached_success(object, value)
+            }
+            None => memcached_not_found(object, Value::Bool(false)),
+        },
+        Err(error) => {
+            state.last_errors.insert(object.id(), error);
+            memcached_set_result(object, MEMCACHED_RES_FAILURE);
+            Ok(Value::Bool(false))
+        }
     }
 }
 
-pub(super) fn memcached_get_multi(object: &ObjectRef, values: &[Value]) -> Result<Value, String> {
+pub(super) fn memcached_get_multi(
+    state: &mut MemcachedClientState,
+    object: &ObjectRef,
+    values: &[Value],
+) -> Result<Value, String> {
     validate_memcached_arg_count("Memcached::getMulti", values.len(), 1, 2)?;
     let keys = redis_array_value_entries(&values[0], "Memcached::getMulti")?;
-    let store = memcached_store(object);
+    let Some(client) = state.client_mut(object) else {
+        memcached_set_result(object, MEMCACHED_RES_FAILURE);
+        return Ok(Value::Bool(false));
+    };
+    let key_strings = keys
+        .iter()
+        .map(|(_, key_value)| memcached_key(key_value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let values = match client.get_many(&key_strings) {
+        Ok(values) => values,
+        Err(error) => {
+            state.last_errors.insert(object.id(), error);
+            memcached_set_result(object, MEMCACHED_RES_FAILURE);
+            return Ok(Value::Bool(false));
+        }
+    };
     let mut result = PhpArray::new();
-    for (_, key_value) in keys {
-        let key = redis_key(&key_value)?;
-        if let Some(value) = store.get(&key).cloned() {
-            result.insert(key, value);
+    for key in key_strings {
+        if let Some(value) = values.get(&key) {
+            result.insert(
+                ArrayKey::String(PhpString::from(key.as_str())),
+                memcached_decode_cache_bytes(object, value.clone())?,
+            );
         }
     }
     memcached_success(object, Value::Array(result))
 }
 
-pub(super) fn memcached_set_multi(object: &ObjectRef, values: &[Value]) -> Result<Value, String> {
+pub(super) fn memcached_set_multi(
+    state: &mut MemcachedClientState,
+    object: &ObjectRef,
+    values: &[Value],
+) -> Result<Value, String> {
     validate_memcached_arg_count("Memcached::setMulti", values.len(), 1, 2)?;
-    let mut store = memcached_store(object);
     for (key, value) in redis_array_value_entries(&values[0], "Memcached::setMulti")? {
-        let key = match key {
-            ArrayKey::Int(index) => ArrayKey::String(PhpString::from(index.to_string().as_str())),
-            ArrayKey::String(name) => ArrayKey::String(name),
+        let key_value = match key {
+            ArrayKey::Int(index) => Value::Int(index),
+            ArrayKey::String(name) => Value::String(name),
         };
-        store.insert(key, value);
+        if memcached_set(state, object, &[key_value, value], MemcachedWriteMode::Set)?
+            != Value::Bool(true)
+        {
+            return Ok(Value::Bool(false));
+        }
     }
-    memcached_set_store(object, store);
     memcached_success(object, Value::Bool(true))
 }
 
-pub(super) fn memcached_delete(object: &ObjectRef, values: &[Value]) -> Result<Value, String> {
+pub(super) fn memcached_delete(
+    state: &mut MemcachedClientState,
+    object: &ObjectRef,
+    values: &[Value],
+) -> Result<Value, String> {
     validate_memcached_arg_count("Memcached::delete", values.len(), 1, 2)?;
-    let mut store = memcached_store(object);
-    let removed = store.remove(&redis_key(&values[0])?).is_some();
-    memcached_set_store(object, store);
-    if removed {
-        memcached_success(object, Value::Bool(true))
-    } else {
-        memcached_not_found(object, Value::Bool(false))
+    let Some(client) = state.client_mut(object) else {
+        memcached_set_result(object, MEMCACHED_RES_FAILURE);
+        return Ok(Value::Bool(false));
+    };
+    match client.delete(&memcached_key(&values[0])?) {
+        Ok(true) => memcached_success(object, Value::Bool(true)),
+        Ok(false) => memcached_not_found(object, Value::Bool(false)),
+        Err(error) => {
+            state.last_errors.insert(object.id(), error);
+            memcached_set_result(object, MEMCACHED_RES_FAILURE);
+            Ok(Value::Bool(false))
+        }
     }
 }
 
@@ -1385,25 +2124,37 @@ pub(super) fn memcached_delete_multi(
 }
 
 pub(super) fn memcached_counter(
+    state: &mut MemcachedClientState,
     object: &ObjectRef,
     values: &[Value],
     direction: i64,
 ) -> Result<Value, String> {
     validate_memcached_arg_count("Memcached::counter", values.len(), 1, 4)?;
-    let mut store = memcached_store(object);
-    let key = redis_key(&values[0])?;
-    let current = store.get(&key).map(to_int).transpose()?;
-    let offset = values.get(1).map(to_int).transpose()?.unwrap_or(1);
-    let next = match current {
-        Some(current) => current.saturating_add(offset * direction).max(0),
-        None => match values.get(2).map(to_int).transpose()? {
-            Some(initial) => initial,
-            None => return memcached_not_found(object, Value::Bool(false)),
-        },
+    let Some(client) = state.client_mut(object) else {
+        memcached_set_result(object, MEMCACHED_RES_FAILURE);
+        return Ok(Value::Bool(false));
     };
-    store.insert(key, Value::Int(next));
-    memcached_set_store(object, store);
-    memcached_success(object, Value::Int(next))
+    let key = memcached_key(&values[0])?;
+    let offset = values.get(1).map(to_int).transpose()?.unwrap_or(1);
+    let command = if direction >= 0 { "incr" } else { "decr" };
+    match client.counter(command, &key, offset) {
+        Ok(Some(next)) => memcached_success(object, Value::Int(next)),
+        Ok(None) => match values.get(2).map(to_int).transpose()? {
+            Some(initial) => {
+                let initial_bytes = initial.to_string().into_bytes();
+                match client.store("add", &key, &initial_bytes, 0) {
+                    Ok(true) => memcached_success(object, Value::Int(initial)),
+                    _ => memcached_not_found(object, Value::Bool(false)),
+                }
+            }
+            None => memcached_not_found(object, Value::Bool(false)),
+        },
+        Err(error) => {
+            state.last_errors.insert(object.id(), error);
+            memcached_set_result(object, MEMCACHED_RES_FAILURE);
+            Ok(Value::Bool(false))
+        }
+    }
 }
 
 pub(super) fn memcached_touch(object: &ObjectRef, values: &[Value]) -> Result<Value, String> {
@@ -1459,6 +2210,58 @@ pub(super) fn memcached_set_options(object: &ObjectRef, values: &[Value]) -> Res
     memcached_success(object, Value::Bool(true))
 }
 
+#[cfg(test)]
+mod memcached_tests {
+    use super::*;
+
+    fn object_with_serializer(serializer: i64) -> ObjectRef {
+        let object = new_memcached_object("Memcached", Vec::new()).unwrap();
+        let mut options = PhpArray::new();
+        options.insert(
+            redis_key(&Value::Int(MEMCACHED_OPT_SERIALIZER)).unwrap(),
+            Value::Int(serializer),
+        );
+        object.set_property(MEMCACHED_OPTIONS_PROPERTY, Value::Array(options));
+        object
+    }
+
+    fn structured_payload() -> Value {
+        Value::packed_array(vec![
+            Value::Int(1),
+            Value::string("two"),
+            Value::packed_array(vec![Value::Bool(false), Value::Null]),
+        ])
+    }
+
+    #[test]
+    fn memcached_msgpack_serializer_roundtrips_structured_payloads() {
+        let object = object_with_serializer(MEMCACHED_SERIALIZER_MSGPACK);
+        let payload = structured_payload();
+
+        let encoded = memcached_encode_cache_value(&object, &payload).unwrap();
+
+        assert_ne!(encoded, b"Array".to_vec());
+        assert_eq!(
+            memcached_decode_cache_bytes(&object, encoded).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn memcached_igbinary_serializer_roundtrips_structured_payloads() {
+        let object = object_with_serializer(MEMCACHED_SERIALIZER_IGBINARY);
+        let payload = structured_payload();
+
+        let encoded = memcached_encode_cache_value(&object, &payload).unwrap();
+
+        assert_ne!(encoded, b"Array".to_vec());
+        assert_eq!(
+            memcached_decode_cache_bytes(&object, encoded).unwrap(),
+            payload
+        );
+    }
+}
+
 pub(super) fn memcached_append_prepend(
     object: &ObjectRef,
     values: &[Value],
@@ -1504,7 +2307,14 @@ pub(super) fn internal_phar_instanceof(object_class: &str, target_class: &str) -
     if !is_phar_runtime_class(object_class) {
         return None;
     }
-    Some(normalize_class_name(object_class) == normalize_class_name(target_class))
+    let object_class = normalize_class_name(object_class);
+    let target_class = normalize_class_name(target_class);
+    Some(match object_class.as_str() {
+        "phar" => matches!(target_class.as_str(), "phar" | "arrayaccess" | "countable"),
+        "phardata" => matches!(target_class.as_str(), "phardata"),
+        "pharfileinfo" => matches!(target_class.as_str(), "pharfileinfo" | "splfileinfo"),
+        _ => false,
+    })
 }
 
 pub(super) fn new_phar_object(
@@ -1568,10 +2378,24 @@ pub(super) fn new_phar_object(
             "E_PHP_VM_PHAR_DATA_GAP: PharData tar/zip archive objects are not implemented in the PHAR MVP"
                 .to_owned(),
         ),
-        "pharfileinfo" => Err(
-            "E_PHP_VM_PHAR_FILEINFO_GAP: PharFileInfo objects are created by archive iteration, which is not implemented in the PHAR MVP"
-                .to_owned(),
-        ),
+        "pharfileinfo" => {
+            let values = call_args_to_positional("PharFileInfo::__construct", args)?;
+            validate_phar_arg_count("PharFileInfo::__construct", values.len(), 1, 1)?;
+            let uri = to_string(&values[0])?.to_string_lossy();
+            let parsed =
+                php_runtime::phar::parse_uri(&uri, &runtime_context.cwd, &runtime_context.filesystem)
+                    .map_err(|error| format!("{}: {}", error.diagnostic_id(), error.message()))?;
+            let archive = php_runtime::PharArchive::open(&parsed.archive_path)
+                .map_err(|error| format!("{}: {}", error.diagnostic_id(), error.message()))?;
+            let entry = archive.entry(&parsed.entry_path).cloned().ok_or_else(|| {
+                format!(
+                    "E_PHP_VM_PHAR_ENTRY_MISSING: PHAR entry `{}` not found in `{}`",
+                    parsed.entry_path,
+                    parsed.archive_path.display()
+                )
+            })?;
+            Ok(phar_file_info_object(&parsed.archive_path, &entry))
+        }
         _ => Err(format!(
             "E_PHP_VM_UNKNOWN_CLASS: class {class_name} is not defined"
         )),
@@ -1579,10 +2403,19 @@ pub(super) fn new_phar_object(
 }
 
 pub(super) fn phar_runtime_class(name: &str) -> RuntimeClassEntry {
+    let normalized = normalize_class_name(name);
+    let interfaces = match normalized.as_str() {
+        "phar" => vec!["ArrayAccess".to_owned(), "Countable".to_owned()],
+        _ => Vec::new(),
+    };
+    let parent = match normalized.as_str() {
+        "pharfileinfo" => Some("splfileinfo".to_owned()),
+        _ => None,
+    };
     RuntimeClassEntry {
-        name: normalize_class_name(name),
-        parent: None,
-        interfaces: Vec::new(),
+        name: normalized,
+        parent,
+        interfaces,
         methods: Vec::new(),
         properties: Vec::new(),
         constants: Vec::new(),
@@ -1615,6 +2448,9 @@ pub(super) fn call_phar_method(
     runtime_context: &RuntimeContext,
 ) -> Result<Value, String> {
     let class_name = object.class_name();
+    if normalize_class_name(&class_name) == "pharfileinfo" {
+        return call_phar_file_info_method(object, method, args, runtime_context);
+    }
     if normalize_class_name(&class_name) != "phar" {
         return Err(format!(
             "E_PHP_VM_PHAR_CLASS_GAP: {class_name} object methods are not implemented in the PHAR MVP"
@@ -1640,6 +2476,19 @@ pub(super) fn call_phar_method(
                 .get_property("__phar_stub")
                 .unwrap_or_else(|| Value::string(Vec::new())))
         }
+        "getmetadata" => {
+            validate_phar_arg_count("Phar::getMetadata", args.len(), 0, 1)?;
+            let path = phar_object_path(object)?;
+            if !runtime_context.filesystem.allows_path(&path) {
+                return Err(format!(
+                    "E_PHP_VM_PHAR_PATH_DENIED: PHAR archive path {} is outside allowed filesystem roots",
+                    path.display()
+                ));
+            }
+            let archive = php_runtime::PharArchive::open(&path)
+                .map_err(|error| format!("{}: {}", error.diagnostic_id(), error.message()))?;
+            phar_metadata_value(&archive.metadata)
+        }
         "count" => {
             validate_phar_arg_count("Phar::count", args.len(), 0, 1)?;
             Ok(object
@@ -1660,6 +2509,12 @@ pub(super) fn call_phar_method(
                 .map_err(|error| format!("{}: {}", error.diagnostic_id(), error.message()))?;
             Ok(Value::Bool(archive.entry(&entry).is_some()))
         }
+        "offsetget" => {
+            validate_phar_arg_count("Phar::offsetGet", args.len(), 1, 1)?;
+            let entry = to_string(&args[0].value)?.to_string_lossy();
+            let (path, entry) = phar_archive_entry(object, &entry, runtime_context)?;
+            Ok(Value::Object(phar_file_info_object(&path, &entry)))
+        }
         _ if spl_file_method_is_supported(&method) => {
             call_spl_file_method(object, &method, args, runtime_context)
         }
@@ -1667,6 +2522,94 @@ pub(super) fn call_phar_method(
             "E_PHP_VM_UNKNOWN_METHOD: method Phar::{method} is not implemented"
         )),
     }
+}
+
+fn phar_archive_entry(
+    object: &ObjectRef,
+    entry: &str,
+    runtime_context: &RuntimeContext,
+) -> Result<(PathBuf, php_runtime::PharEntry), String> {
+    let path = phar_object_path(object)?;
+    if !runtime_context.filesystem.allows_path(&path) {
+        return Err(format!(
+            "E_PHP_VM_PHAR_PATH_DENIED: PHAR archive path {} is outside allowed filesystem roots",
+            path.display()
+        ));
+    }
+    let archive = php_runtime::PharArchive::open(&path)
+        .map_err(|error| format!("{}: {}", error.diagnostic_id(), error.message()))?;
+    let entry = archive.entry(entry).cloned().ok_or_else(|| {
+        format!(
+            "E_PHP_VM_PHAR_ENTRY_MISSING: PHAR entry `{entry}` not found in `{}`",
+            path.display()
+        )
+    })?;
+    Ok((path, entry))
+}
+
+fn phar_file_info_object(archive_path: &Path, entry: &php_runtime::PharEntry) -> ObjectRef {
+    let object =
+        ObjectRef::new_with_display_name(&phar_runtime_class("PharFileInfo"), "PharFileInfo");
+    let pathname = format!("phar://{}/{}", archive_path.display(), entry.name);
+    spl_file_set_path(&object, &pathname);
+    object.set_property(
+        "__phar_archive_path",
+        Value::string(archive_path.to_string_lossy().as_bytes().to_vec()),
+    );
+    object.set_property(
+        "__phar_entry_name",
+        Value::string(entry.name.as_bytes().to_vec()),
+    );
+    object.set_property(
+        "__phar_entry_contents",
+        Value::string(entry.contents.clone()),
+    );
+    object.set_property(
+        "__phar_entry_metadata",
+        Value::string(entry.metadata.clone()),
+    );
+    object
+}
+
+fn call_phar_file_info_method(
+    object: &ObjectRef,
+    method: &str,
+    args: Vec<CallArgument>,
+    runtime_context: &RuntimeContext,
+) -> Result<Value, String> {
+    let method = normalize_method_name(method);
+    match method.as_str() {
+        "getcontent" => {
+            validate_phar_arg_count("PharFileInfo::getContent", args.len(), 0, 0)?;
+            Ok(object
+                .get_property("__phar_entry_contents")
+                .unwrap_or_else(|| Value::string(Vec::new())))
+        }
+        "getmetadata" => {
+            validate_phar_arg_count("PharFileInfo::getMetadata", args.len(), 0, 1)?;
+            match object.get_property("__phar_entry_metadata") {
+                Some(Value::String(metadata)) => phar_metadata_value(metadata.as_bytes()),
+                _ => Ok(Value::Null),
+            }
+        }
+        _ if spl_file_method_is_supported(&method) => {
+            call_spl_file_method(object, &method, args, runtime_context)
+        }
+        _ => Err(format!(
+            "E_PHP_VM_UNKNOWN_METHOD: method PharFileInfo::{method} is not implemented"
+        )),
+    }
+}
+
+fn phar_metadata_value(metadata: &[u8]) -> Result<Value, String> {
+    if metadata.is_empty() {
+        return Ok(Value::Null);
+    }
+    php_runtime::unserialize(
+        &php_runtime::PhpString::from_bytes(metadata.to_vec()),
+        php_runtime::UnserializeOptions::default(),
+    )
+    .map_err(|error| format!("E_PHP_VM_PHAR_METADATA: {}", error.message()))
 }
 
 pub(super) fn phar_object_path(object: &ObjectRef) -> Result<PathBuf, String> {
@@ -1774,6 +2717,8 @@ pub(super) fn new_fileinfo_object(
         Some(Value::Null | Value::Uninitialized) | None => None,
         Some(value) => Some(to_string(value)?.to_string_lossy()),
     };
+    php_runtime::builtins::validate_fileinfo_options(flags, magic_file.as_deref())
+        .map_err(|message| format!("E_PHP_VM_FILEINFO_MAGIC: {message}"))?;
     let object = ObjectRef::new_with_display_name(&fileinfo_runtime_class(), "finfo");
     object.set_property("__fileinfo_flags", Value::Int(flags));
     object.set_property(
@@ -1831,6 +2776,7 @@ pub(super) fn zip_class_constant_value(class_name: &str, constant: &str) -> Opti
         "FL_OVERWRITE" => ZIP_FL_OVERWRITE,
         "FL_OPEN_FILE_NOW" => ZIP_FL_OPEN_FILE_NOW,
         "LENGTH_TO_END" => ZIP_LENGTH_TO_END,
+        "CM_DEFAULT" => ZIP_CM_DEFAULT,
         "CM_STORE" => ZIP_CM_STORE,
         "CM_DEFLATE" => ZIP_CM_DEFLATE,
         "CM_BZIP2" => ZIP_CM_BZIP2,
@@ -1842,6 +2788,7 @@ pub(super) fn zip_class_constant_value(class_name: &str, constant: &str) -> Opti
         "EM_AES_256" => ZIP_EM_AES_256,
         "ER_OK" => 0,
         "ER_EXISTS" => ZIP_ER_EXISTS,
+        "ER_COMPNOTSUPP" => ZIP_ER_COMPNOTSUPP,
         "ER_RDONLY" => ZIP_ER_RDONLY,
         "AFL_RDONLY" => ZIP_AFL_RDONLY,
         "AFL_CREATE_OR_KEEP_FILE_FOR_EMPTY_ARCHIVE" => {
@@ -1863,7 +2810,7 @@ pub(super) fn new_mysqli_object(
             validate_mysqli_arg_count("mysqli::__construct", values.len(), 0, 6)?;
             let object = mysqli_object(None);
             if !values.is_empty()
-                && let Some(id) = mysqli_connect_from_test_dsn(mysql)
+                && let Some(id) = mysqli_connect_from_values(mysql, &values)
             {
                 mysqli_set_connection_id(&object, id);
             }
@@ -1928,7 +2875,7 @@ pub(super) fn call_mysqli_connection_method(
                 mysql.close(old_id);
                 object.unset_property("__mysqli_connection");
             }
-            if let Some(id) = mysqli_connect_from_test_dsn(mysql) {
+            if let Some(id) = mysqli_connect_from_values(mysql, &values) {
                 mysqli_set_connection_id(object, id);
                 sync_mysqli_error_properties(object, mysql);
                 Ok(Value::Bool(true))
@@ -1959,6 +2906,59 @@ pub(super) fn call_mysqli_connection_method(
                     Ok(Value::Bool(false))
                 }
             }
+        }
+        "multiquery" | "multi_query" => {
+            validate_mysqli_arg_count("mysqli::multi_query", values.len(), 1, 1)?;
+            let Some(id) = mysqli_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let sql = to_string(&values[0])?.to_string_lossy();
+            let ok = mysql.multi_query(id, &sql).is_ok();
+            sync_mysqli_error_properties(object, mysql);
+            Ok(Value::Bool(ok))
+        }
+        "storeresult" | "store_result" => {
+            validate_mysqli_arg_count("mysqli::store_result", values.len(), 0, 1)?;
+            if values.first().map(to_int).transpose()?.is_some_and(|mode| {
+                mode != php_runtime::MYSQLI_STORE_RESULT && mode != php_runtime::MYSQLI_USE_RESULT
+            }) {
+                return Ok(Value::Bool(false));
+            }
+            let Some(id) = mysqli_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let Some(result_id) = mysql.store_result(id) else {
+                return Ok(Value::Bool(false));
+            };
+            let result = mysqli_result_object(result_id);
+            result.set_property("num_rows", Value::Int(mysql.num_rows(result_id)));
+            Ok(Value::Object(result))
+        }
+        "useresult" | "use_result" => {
+            validate_mysqli_arg_count("mysqli::use_result", values.len(), 0, 0)?;
+            let Some(id) = mysqli_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let Some(result_id) = mysql.store_result(id) else {
+                return Ok(Value::Bool(false));
+            };
+            let result = mysqli_result_object(result_id);
+            result.set_property("num_rows", Value::Int(mysql.num_rows(result_id)));
+            Ok(Value::Object(result))
+        }
+        "moreresults" | "more_results" => {
+            validate_mysqli_arg_count("mysqli::more_results", values.len(), 0, 0)?;
+            let Some(id) = mysqli_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            Ok(Value::Bool(mysql.more_results(id)))
+        }
+        "nextresult" | "next_result" => {
+            validate_mysqli_arg_count("mysqli::next_result", values.len(), 0, 0)?;
+            let Some(id) = mysqli_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            Ok(Value::Bool(mysql.next_result(id)))
         }
         "realescapestring" | "real_escape_string" | "escape_string" => {
             validate_mysqli_arg_count("mysqli::real_escape_string", values.len(), 1, 1)?;
@@ -2002,6 +3002,58 @@ pub(super) fn call_mysqli_connection_method(
             };
             let charset = to_string(&values[0])?.to_string_lossy();
             Ok(Value::Bool(mysql.set_charset(id, &charset).is_ok()))
+        }
+        "options" => {
+            validate_mysqli_arg_count("mysqli::options", values.len(), 2, 2)?;
+            let option = to_int(&values[0])?;
+            mysqli_set_option(object, option, values[1].clone());
+            Ok(Value::Bool(true))
+        }
+        "ping" => {
+            validate_mysqli_arg_count("mysqli::ping", values.len(), 0, 0)?;
+            let Some(id) = mysqli_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let ok = mysql.ping(id).is_ok();
+            sync_mysqli_error_properties(object, mysql);
+            Ok(Value::Bool(ok))
+        }
+        "autocommit" => {
+            validate_mysqli_arg_count("mysqli::autocommit", values.len(), 1, 1)?;
+            let Some(id) = mysqli_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let mode = mysqli_bool_value(&values[0]);
+            let ok = mysql.autocommit(id, mode).is_ok();
+            sync_mysqli_error_properties(object, mysql);
+            Ok(Value::Bool(ok))
+        }
+        "begintransaction" | "begin_transaction" => {
+            validate_mysqli_arg_count("mysqli::begin_transaction", values.len(), 0, 2)?;
+            let Some(id) = mysqli_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let ok = mysql.begin_transaction(id).is_ok();
+            sync_mysqli_error_properties(object, mysql);
+            Ok(Value::Bool(ok))
+        }
+        "commit" => {
+            validate_mysqli_arg_count("mysqli::commit", values.len(), 0, 2)?;
+            let Some(id) = mysqli_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let ok = mysql.commit(id).is_ok();
+            sync_mysqli_error_properties(object, mysql);
+            Ok(Value::Bool(ok))
+        }
+        "rollback" => {
+            validate_mysqli_arg_count("mysqli::rollback", values.len(), 0, 2)?;
+            let Some(id) = mysqli_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let ok = mysql.rollback(id).is_ok();
+            sync_mysqli_error_properties(object, mysql);
+            Ok(Value::Bool(ok))
         }
         "prepare" => {
             validate_mysqli_arg_count("mysqli::prepare", values.len(), 1, 1)?;
@@ -2118,6 +3170,19 @@ pub(super) fn call_mysqli_stmt_method(
         "getresult" | "get_result" => {
             let values = call_args_to_positional("mysqli_stmt::get_result", args)?;
             validate_mysqli_arg_count("mysqli_stmt::get_result", values.len(), 0, 0)?;
+            let Some(id) = mysqli_stmt_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            let Some(result_id) = mysql.stmt_result(id) else {
+                return Ok(Value::Bool(false));
+            };
+            let result = mysqli_result_object(result_id);
+            result.set_property("num_rows", Value::Int(mysql.num_rows(result_id)));
+            Ok(Value::Object(result))
+        }
+        "resultmetadata" | "result_metadata" => {
+            let values = call_args_to_positional("mysqli_stmt::result_metadata", args)?;
+            validate_mysqli_arg_count("mysqli_stmt::result_metadata", values.len(), 0, 0)?;
             let Some(id) = mysqli_stmt_id(object) else {
                 return Ok(Value::Bool(false));
             };
@@ -2248,6 +3313,62 @@ pub(super) fn mysqli_connect_from_test_dsn(mysql: &mut php_runtime::MysqlState) 
     }
 }
 
+pub(super) fn mysqli_connect_from_values(
+    mysql: &mut php_runtime::MysqlState,
+    values: &[Value],
+) -> Option<i64> {
+    if mysqli_sqlite_compat_enabled() {
+        return mysql.connect_sqlite_compat().ok();
+    }
+    if values.is_empty() {
+        return mysqli_connect_from_test_dsn(mysql);
+    }
+    let options = match mysqli_connect_options_from_values(values) {
+        Ok(options) => options,
+        Err(message) => {
+            mysql.record_connect_error(2005, message);
+            return None;
+        }
+    };
+    match mysql.connect(&options) {
+        Ok(id) => Some(id),
+        Err(error) => {
+            mysql.record_connect_error(error.mysql_errno(), error.message);
+            None
+        }
+    }
+}
+
+fn mysqli_connect_options_from_values(
+    values: &[Value],
+) -> Result<php_runtime::MysqlConnectOptions, String> {
+    let host = mysqli_optional_string_value(values.first())?.unwrap_or_else(|| "localhost".into());
+    let user = mysqli_optional_string_value(values.get(1))?.unwrap_or_default();
+    let password = mysqli_optional_string_value(values.get(2))?.unwrap_or_default();
+    let database = mysqli_optional_string_value(values.get(3))?;
+    let port = match values.get(4) {
+        Some(Value::Null) | None => None,
+        Some(value) => u16::try_from(to_int(value)?).ok(),
+    };
+    let socket = mysqli_optional_string_value(values.get(5))?;
+    php_runtime::MysqlConnectOptions::from_parts_with_socket(
+        &host,
+        &user,
+        &password,
+        database.as_deref(),
+        port,
+        socket.as_deref(),
+    )
+    .map_err(|error| error.message)
+}
+
+fn mysqli_optional_string_value(value: Option<&Value>) -> Result<Option<String>, String> {
+    match value {
+        Some(Value::Null) | None => Ok(None),
+        Some(value) => Ok(Some(to_string(value)?.to_string_lossy())),
+    }
+}
+
 pub(super) fn mysqli_sqlite_compat_enabled() -> bool {
     std::env::var(php_runtime::MYSQLI_SQLITE_COMPAT_ENV).is_ok_and(|value| {
         matches!(
@@ -2358,6 +3479,26 @@ pub(super) fn mysqli_connection_id(object: &ObjectRef) -> Option<i64> {
     match object.get_property("__mysqli_connection") {
         Some(Value::Int(id)) => Some(id),
         _ => None,
+    }
+}
+
+pub(super) fn mysqli_set_option(object: &ObjectRef, option: i64, value: Value) {
+    let mut options = match object.get_property("__mysqli_options") {
+        Some(Value::Array(options)) => options,
+        _ => PhpArray::new(),
+    };
+    options.insert(ArrayKey::Int(option), value);
+    object.set_property("__mysqli_options", Value::Array(options));
+}
+
+pub(super) fn mysqli_bool_value(value: &Value) -> bool {
+    match value {
+        Value::Bool(value) => *value,
+        Value::Int(value) => *value != 0,
+        Value::Null | Value::Uninitialized => false,
+        Value::String(value) => !value.is_empty() && value.as_bytes() != b"0",
+        Value::Reference(cell) => mysqli_bool_value(&cell.get()),
+        _ => true,
     }
 }
 
@@ -2528,6 +3669,7 @@ pub(super) fn call_zip_method(
                     Value::string(path.to_string_lossy().as_bytes().to_vec()),
                 );
                 object.set_property("__zip_write_mode", Value::Bool(true));
+                object.set_property("__zip_open_flags", Value::Int(flags));
                 object.set_property("__zip_archive_flags", Value::Int(archive_flags));
                 let (entries, comment) = if path.exists() && flags & ZIP_OVERWRITE == 0 {
                     zip_load_write_state(&path).unwrap_or_else(|_| (PhpArray::new(), Vec::new()))
@@ -2561,6 +3703,7 @@ pub(super) fn call_zip_method(
                 Value::string(path.to_string_lossy().as_bytes().to_vec()),
             );
             object.set_property("__zip_write_mode", Value::Bool(true));
+            object.set_property("__zip_open_flags", Value::Int(flags));
             object.set_property("__zip_archive_flags", Value::Int(archive_flags));
             object.set_property("__zip_write_entries", Value::Array(entries));
             object.set_property("__zip_comment", Value::string(comment));
@@ -2955,6 +4098,66 @@ pub(super) fn call_zip_method(
                 object, &name, comment,
             )?))
         }
+        "setcompressionname" => {
+            validate_zip_arg_count("ZipArchive::setCompressionName", values.len(), 2, 3)?;
+            if !zip_object_write_mode(object) {
+                return Ok(Value::Bool(false));
+            }
+            if let Some(value) = zip_readonly_mutation_value(object) {
+                return Ok(value);
+            }
+            let name = zip_normalize_entry_name(&to_string(&values[0])?.to_string_lossy(), false)?;
+            let method = to_int(&values[1])?;
+            Ok(Value::Bool(zip_set_pending_compression_name(
+                object, &name, method,
+            )?))
+        }
+        "setcompressionindex" => {
+            validate_zip_arg_count("ZipArchive::setCompressionIndex", values.len(), 2, 3)?;
+            if !zip_object_write_mode(object) {
+                return Ok(Value::Bool(false));
+            }
+            if let Some(value) = zip_readonly_mutation_value(object) {
+                return Ok(value);
+            }
+            let index = to_int(&values[0])?;
+            let method = to_int(&values[1])?;
+            Ok(Value::Bool(zip_set_pending_compression_index(
+                object, index, method,
+            )?))
+        }
+        "unchangearchive" => {
+            validate_zip_arg_count("ZipArchive::unchangeArchive", values.len(), 0, 0)?;
+            if !zip_object_write_mode(object) {
+                return Ok(Value::Bool(false));
+            }
+            Ok(Value::Bool(zip_unchange_archive(object)?))
+        }
+        "unchangeall" => {
+            validate_zip_arg_count("ZipArchive::unchangeAll", values.len(), 0, 0)?;
+            if !zip_object_write_mode(object) {
+                return Ok(Value::Bool(false));
+            }
+            Ok(Value::Bool(zip_unchange_all(object)?))
+        }
+        "unchangeindex" => {
+            validate_zip_arg_count("ZipArchive::unchangeIndex", values.len(), 1, 1)?;
+            if !zip_object_write_mode(object) {
+                return Ok(Value::Bool(false));
+            }
+            Ok(Value::Bool(zip_unchange_index(
+                object,
+                to_int(&values[0])?,
+            )?))
+        }
+        "unchangename" => {
+            validate_zip_arg_count("ZipArchive::unchangeName", values.len(), 1, 1)?;
+            if !zip_object_write_mode(object) {
+                return Ok(Value::Bool(false));
+            }
+            let name = zip_normalize_entry_name(&to_string(&values[0])?.to_string_lossy(), false)?;
+            Ok(Value::Bool(zip_unchange_name(object, &name)?))
+        }
         "getarchiveflag" => {
             validate_zip_arg_count("ZipArchive::getArchiveFlag", values.len(), 1, 2)?;
             Ok(Value::Int(
@@ -3053,6 +4256,13 @@ pub(super) fn zip_archive_flags(object: &ObjectRef) -> i64 {
 
 pub(super) fn zip_archive_flag_enabled(object: &ObjectRef, flag: i64) -> bool {
     zip_archive_flags(object) & flag != 0
+}
+
+pub(super) fn zip_object_open_flags(object: &ObjectRef) -> i64 {
+    match object.get_property("__zip_open_flags") {
+        Some(Value::Int(flags)) => flags,
+        _ => 0,
+    }
 }
 
 pub(super) fn zip_set_archive_flag(object: &ObjectRef, flag: i64, enabled: bool) {
@@ -3312,6 +4522,7 @@ pub(super) fn zip_load_write_state(path: &Path) -> Result<(PhpArray, Vec<u8>), S
         let compressed_size = file.compressed_size() as i64;
         let crc = file.crc32() as i64;
         let comment = file.comment().as_bytes().to_vec();
+        let compression_method = zip_compression_method_id(file.compression());
         let contents = zip_read_file(&mut file, None)?;
         let key = ArrayKey::String(PhpString::from_bytes(name.as_bytes().to_vec()));
         entries.insert(
@@ -3324,6 +4535,7 @@ pub(super) fn zip_load_write_state(path: &Path) -> Result<(PhpArray, Vec<u8>), S
                 compressed_size,
                 crc,
                 comment,
+                compression_method,
             )),
         );
     }
@@ -3338,6 +4550,7 @@ pub(super) fn zip_write_entry(
     compressed_size: i64,
     crc: i64,
     comment: Vec<u8>,
+    compression_method: i64,
 ) -> PhpArray {
     let mut entry = PhpArray::new();
     zip_array_insert(&mut entry, "kind", Value::string(kind));
@@ -3347,7 +4560,16 @@ pub(super) fn zip_write_entry(
     zip_array_insert(&mut entry, "comp_size", Value::Int(compressed_size));
     zip_array_insert(&mut entry, "crc", Value::Int(crc));
     zip_array_insert(&mut entry, "comment", Value::string(comment));
+    zip_array_insert(&mut entry, "comp_method", Value::Int(compression_method));
     entry
+}
+
+pub(super) fn zip_compression_method_id(method: zip::CompressionMethod) -> i64 {
+    match method {
+        zip::CompressionMethod::Stored => ZIP_CM_STORE,
+        zip::CompressionMethod::Deflated => ZIP_CM_DEFLATE,
+        _ => ZIP_CM_DEFAULT,
+    }
 }
 
 pub(super) fn zip_pending_entries(object: &ObjectRef) -> PhpArray {
@@ -3519,6 +4741,159 @@ pub(super) fn zip_set_pending_comment_name(
     Ok(true)
 }
 
+pub(super) fn zip_set_pending_compression_index(
+    object: &ObjectRef,
+    index: i64,
+    method: i64,
+) -> Result<bool, String> {
+    if !zip_writable_compression_method(method) {
+        object.set_property("status", Value::Int(ZIP_ER_COMPNOTSUPP));
+        object.set_property("lastId", Value::Int(-1));
+        return Ok(false);
+    }
+    if index < 0 {
+        return Ok(false);
+    }
+    let index = index as usize;
+    let mut entries = zip_pending_entry_pairs(object)?;
+    if index >= entries.len() {
+        return Ok(false);
+    }
+    let size = zip_entry_int(&entries[index].1, "size").unwrap_or(0);
+    zip_array_insert(
+        &mut entries[index].1,
+        "comp_method",
+        Value::Int(ZIP_CM_STORE),
+    );
+    zip_array_insert(&mut entries[index].1, "comp_size", Value::Int(size));
+    zip_store_pending_entry_pairs(object, entries, index as i64);
+    Ok(true)
+}
+
+pub(super) fn zip_set_pending_compression_name(
+    object: &ObjectRef,
+    name: &str,
+    method: i64,
+) -> Result<bool, String> {
+    if !zip_writable_compression_method(method) {
+        object.set_property("status", Value::Int(ZIP_ER_COMPNOTSUPP));
+        object.set_property("lastId", Value::Int(-1));
+        return Ok(false);
+    }
+    let mut entries = zip_pending_entry_pairs(object)?;
+    let Some(index) = entries.iter().position(|(_, entry)| {
+        zip_entry_string(entry, "name").is_ok_and(|entry_name| entry_name == name)
+    }) else {
+        return Ok(false);
+    };
+    let size = zip_entry_int(&entries[index].1, "size").unwrap_or(0);
+    zip_array_insert(
+        &mut entries[index].1,
+        "comp_method",
+        Value::Int(ZIP_CM_STORE),
+    );
+    zip_array_insert(&mut entries[index].1, "comp_size", Value::Int(size));
+    zip_store_pending_entry_pairs(object, entries, index as i64);
+    Ok(true)
+}
+
+pub(super) fn zip_writable_compression_method(method: i64) -> bool {
+    matches!(method, ZIP_CM_DEFAULT | ZIP_CM_STORE)
+}
+
+type ZipEntryPairs = Vec<(String, PhpArray)>;
+type ZipOriginalState = (ZipEntryPairs, Vec<u8>);
+
+pub(super) fn zip_original_state(object: &ObjectRef) -> Result<ZipOriginalState, String> {
+    let Some(path) = zip_object_path(object) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    if zip_object_open_flags(object) & ZIP_OVERWRITE != 0 || !path.exists() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let (entries, comment) = zip_load_write_state(&path)?;
+    Ok((zip_entry_pairs_from_array(entries)?, comment))
+}
+
+pub(super) fn zip_entry_pairs_from_array(entries: PhpArray) -> Result<ZipEntryPairs, String> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(position, (_, value))| {
+            let Value::Array(entry) = value else {
+                return Err(format!(
+                    "E_PHP_VM_ZIP_WRITE_STATE: zip pending entry {position} must be array, {} found",
+                    value_type_name(value)
+                ));
+            };
+            let name = zip_entry_string(entry, "name")?;
+            Ok((name, entry.clone()))
+        })
+        .collect()
+}
+
+pub(super) fn zip_unchange_archive(object: &ObjectRef) -> Result<bool, String> {
+    let (_, comment) = zip_original_state(object)?;
+    object.set_property("__zip_comment", Value::string(comment));
+    object.set_property("comment", zip_object_comment_value(object));
+    object.set_property("status", Value::Int(0));
+    object.set_property("lastId", Value::Int(-1));
+    Ok(true)
+}
+
+pub(super) fn zip_unchange_all(object: &ObjectRef) -> Result<bool, String> {
+    let (entries, comment) = zip_original_state(object)?;
+    zip_store_pending_entry_pairs(object, entries, -1);
+    object.set_property("__zip_comment", Value::string(comment));
+    object.set_property("comment", zip_object_comment_value(object));
+    Ok(true)
+}
+
+pub(super) fn zip_unchange_index(object: &ObjectRef, index: i64) -> Result<bool, String> {
+    if index < 0 {
+        return Ok(false);
+    }
+    let index = index as usize;
+    let (original_entries, _) = zip_original_state(object)?;
+    let mut entries = zip_pending_entry_pairs(object)?;
+    if let Some((original_name, original_entry)) = original_entries.get(index).cloned() {
+        if index < entries.len() {
+            entries.remove(index);
+        }
+        entries.retain(|(name, _)| name != &original_name);
+        if index <= entries.len() {
+            entries.insert(index, (original_name, original_entry));
+        } else {
+            entries.push((original_name, original_entry));
+        }
+        zip_store_pending_entry_pairs(object, entries, index as i64);
+        return Ok(true);
+    }
+    if index >= entries.len() {
+        return Ok(false);
+    }
+    entries.remove(index);
+    zip_store_pending_entry_pairs(object, entries, -1);
+    Ok(true)
+}
+
+pub(super) fn zip_unchange_name(object: &ObjectRef, name: &str) -> Result<bool, String> {
+    let entries = zip_pending_entry_pairs(object)?;
+    if let Some(index) = entries.iter().position(|(_, entry)| {
+        zip_entry_string(entry, "name").is_ok_and(|entry_name| entry_name == name)
+    }) {
+        return zip_unchange_index(object, index as i64);
+    }
+    let (original_entries, _) = zip_original_state(object)?;
+    if let Some(index) = original_entries
+        .iter()
+        .position(|(entry_name, _)| entry_name == name)
+    {
+        return zip_unchange_index(object, index as i64);
+    }
+    Ok(false)
+}
+
 pub(super) fn zip_truncate_bytes(mut bytes: Vec<u8>, max_len: Option<usize>) -> Vec<u8> {
     if let Some(max_len) = max_len {
         bytes.truncate(max_len);
@@ -3580,7 +4955,16 @@ pub(super) fn zip_append_write_entry(
         return Ok(false);
     }
     let size = contents.len() as i64;
-    let entry = zip_write_entry(kind, name, contents, size, size, 0, Vec::new());
+    let entry = zip_write_entry(
+        kind,
+        name,
+        contents,
+        size,
+        size,
+        0,
+        Vec::new(),
+        ZIP_CM_STORE,
+    );
     entries.insert(key, Value::Array(entry));
     let last_id = existing_index.unwrap_or_else(|| entries.iter().len().saturating_sub(1));
     object.set_property("numFiles", Value::Int(entries.iter().len() as i64));
@@ -3667,9 +5051,7 @@ pub(super) fn zip_rename_pending_at(
     Ok(true)
 }
 
-pub(super) fn zip_pending_entry_pairs(
-    object: &ObjectRef,
-) -> Result<Vec<(String, PhpArray)>, String> {
+pub(super) fn zip_pending_entry_pairs(object: &ObjectRef) -> Result<ZipEntryPairs, String> {
     zip_pending_entries(object)
         .iter()
         .enumerate()
@@ -3688,7 +5070,7 @@ pub(super) fn zip_pending_entry_pairs(
 
 pub(super) fn zip_store_pending_entry_pairs(
     object: &ObjectRef,
-    entries: Vec<(String, PhpArray)>,
+    entries: ZipEntryPairs,
     last_id: i64,
 ) {
     let mut array = PhpArray::new();
@@ -4131,7 +5513,8 @@ pub(super) fn new_pdo_object(
                 mysql,
                 postgres,
                 runtime_context,
-            )?;
+            )
+            .map_err(|message| format!("E_PHP_VM_PDO_EXCEPTION: {message}"))?;
             Ok(pdo_object(driver, id))
         }
         "pdostatement" => Err(
@@ -4213,7 +5596,8 @@ pub(super) fn call_pdo_connection_method(
                 mysql,
                 postgres,
                 runtime_context,
-            )?;
+            )
+            .map_err(|message| format!("E_PHP_VM_PDO_EXCEPTION: {message}"))?;
             if let Some(old_id) = pdo_connection_id(object) {
                 match old_driver {
                     PdoDriver::Sqlite => {
@@ -4257,32 +5641,59 @@ pub(super) fn call_pdo_connection_method(
             let Some(id) = pdo_connection_id(object) else {
                 return Ok(Value::Bool(false));
             };
-            Ok(Value::Bool(match pdo_driver(object) {
+            let success = match pdo_driver(object) {
                 PdoDriver::Sqlite => sqlite.exec(id, "BEGIN"),
                 PdoDriver::Mysql => mysql.exec_changes(id, "START TRANSACTION").is_ok(),
                 PdoDriver::Pgsql => postgres.exec_changes(id, "BEGIN").is_ok(),
-            }))
+            };
+            if success {
+                object.set_property("__pdo_in_transaction", Value::Bool(true));
+            }
+            Ok(Value::Bool(success))
         }
         "commit" => {
             validate_pdo_arg_count("PDO::commit", values.len(), 0, 0)?;
             let Some(id) = pdo_connection_id(object) else {
                 return Ok(Value::Bool(false));
             };
-            Ok(Value::Bool(match pdo_driver(object) {
+            let success = match pdo_driver(object) {
                 PdoDriver::Sqlite => sqlite.exec(id, "COMMIT"),
                 PdoDriver::Mysql => mysql.exec_changes(id, "COMMIT").is_ok(),
                 PdoDriver::Pgsql => postgres.exec_changes(id, "COMMIT").is_ok(),
-            }))
+            };
+            if success {
+                object.set_property("__pdo_in_transaction", Value::Bool(false));
+            }
+            Ok(Value::Bool(success))
         }
         "rollback" => {
             validate_pdo_arg_count("PDO::rollBack", values.len(), 0, 0)?;
             let Some(id) = pdo_connection_id(object) else {
                 return Ok(Value::Bool(false));
             };
-            Ok(Value::Bool(match pdo_driver(object) {
+            let success = match pdo_driver(object) {
                 PdoDriver::Sqlite => sqlite.exec(id, "ROLLBACK"),
                 PdoDriver::Mysql => mysql.exec_changes(id, "ROLLBACK").is_ok(),
                 PdoDriver::Pgsql => postgres.exec_changes(id, "ROLLBACK").is_ok(),
+            };
+            if success {
+                object.set_property("__pdo_in_transaction", Value::Bool(false));
+            }
+            Ok(Value::Bool(success))
+        }
+        "intransaction" => {
+            validate_pdo_arg_count("PDO::inTransaction", values.len(), 0, 0)?;
+            let Some(id) = pdo_connection_id(object) else {
+                return Ok(Value::Bool(false));
+            };
+            Ok(Value::Bool(match pdo_driver(object) {
+                PdoDriver::Sqlite => sqlite.in_transaction(id).unwrap_or(false),
+                PdoDriver::Mysql | PdoDriver::Pgsql => {
+                    matches!(
+                        object.get_property("__pdo_in_transaction"),
+                        Some(Value::Bool(true))
+                    )
+                }
             }))
         }
         "lastinsertid" => {
@@ -5436,6 +6847,7 @@ pub(super) fn pdo_mysql_connect_options_from_dsn(
     let mut database = None;
     let mut port = None;
     let mut charset = None;
+    let mut unix_socket = None;
     for segment in body.split(';').filter(|segment| !segment.is_empty()) {
         let Some((key, value)) = segment.split_once('=') else {
             return Err(format!(
@@ -5451,20 +6863,17 @@ pub(super) fn pdo_mysql_connect_options_from_dsn(
                 })?);
             }
             "charset" => charset = Some(value.trim().to_owned()),
-            "unix_socket" => {
-                return Err(
-                    "E_PHP_VM_PDO_MYSQL_DSN_GAP: unix_socket DSNs are not implemented".to_owned(),
-                );
-            }
+            "unix_socket" => unix_socket = Some(value.trim().to_owned()),
             _ => {}
         }
     }
-    let options = php_runtime::MysqlConnectOptions::from_parts(
+    let options = php_runtime::MysqlConnectOptions::from_parts_with_socket(
         &host,
         username,
         password,
         database.as_deref(),
         port,
+        unix_socket.as_deref().filter(|socket| !socket.is_empty()),
     )
     .map_err(|error| format!("E_PHP_VM_PDO_MYSQL_DSN: {error}"))?;
     Ok((options, charset))
@@ -5680,6 +7089,8 @@ pub(super) fn is_xml_runtime_class(class_name: &str) -> bool {
             | "domcomment"
             | "domcdatasection"
             | "domnodelist"
+            | "domnamednodemap"
+            | "domxpath"
             | "simplexmlelement"
             | "xmlparser"
             | "xmlreader"
@@ -5753,6 +7164,19 @@ pub(super) fn new_xml_runtime_object(
             validate_xml_arg_count("DOMNodeList::__construct", &args, 0, 0)?;
             Ok(php_runtime::xml::new_dom_node_list(Vec::new()))
         }
+        "domnamednodemap" => {
+            validate_xml_arg_count("DOMNamedNodeMap::__construct", &args, 0, 0)?;
+            Ok(php_runtime::xml::new_dom_named_node_map(&[]))
+        }
+        "domxpath" => {
+            validate_xml_arg_count("DOMXPath::__construct", &args, 1, 1)?;
+            let Value::Object(document) = args[0].value.clone() else {
+                return Err(
+                    "E_PHP_VM_XML_TYPE_ERROR: DOMXPath::__construct expects DOMDocument".to_owned(),
+                );
+            };
+            Ok(php_runtime::xml::new_dom_xpath(&document))
+        }
         "simplexmlelement" => {
             validate_xml_arg_count("SimpleXMLElement::__construct", &args, 1, 1)?;
             let xml = xml_string_arg("SimpleXMLElement::__construct", args[0].value.clone())?;
@@ -5796,9 +7220,30 @@ pub(super) fn call_xml_runtime_method(
             let xml = xml_string_arg("DOMDocument::loadXML", args[0].clone())?;
             php_runtime::xml::dom_document_load_xml(object, &xml)
         }
+        ("domdocument", "load") => {
+            validate_xml_value_count("DOMDocument::load", &args, 1, 1)?;
+            let path = xml_string_arg("DOMDocument::load", args[0].clone())?;
+            let source = xml_reader_open_source(&path, runtime_context)?;
+            php_runtime::xml::dom_document_load_xml(object, &source)
+        }
         ("domdocument", "savexml") => {
             validate_xml_value_count("DOMDocument::saveXML", &args, 0, 0)?;
             Ok(php_runtime::xml::dom_document_save_xml(object))
+        }
+        ("domdocument", "save") => {
+            validate_xml_value_count("DOMDocument::save", &args, 1, 1)?;
+            let path = xml_string_arg("DOMDocument::save", args[0].clone())?;
+            let Value::String(bytes) = php_runtime::xml::dom_document_save_xml(object) else {
+                return Ok(Value::Bool(false));
+            };
+            if matches!(
+                simplexml_write_xml_file(runtime_context, &path, bytes.as_bytes()),
+                Value::Bool(true)
+            ) {
+                Ok(Value::Int(bytes.as_bytes().len() as i64))
+            } else {
+                Ok(Value::Bool(false))
+            }
         }
         ("domdocument", "createelement") => {
             validate_xml_value_count("DOMDocument::createElement", &args, 1, 2)?;
@@ -5852,6 +7297,14 @@ pub(super) fn call_xml_runtime_method(
                 object, &name,
             ))
         }
+        ("domdocument", "getelementsbytagnamens") => {
+            validate_xml_value_count("DOMDocument::getElementsByTagNameNS", &args, 2, 2)?;
+            let namespace = xml_string_arg("DOMDocument::getElementsByTagNameNS", args[0].clone())?;
+            let local = xml_string_arg("DOMDocument::getElementsByTagNameNS", args[1].clone())?;
+            Ok(php_runtime::xml::dom_document_get_elements_by_tag_name_ns(
+                object, &namespace, &local,
+            ))
+        }
         ("domelement", "getelementsbytagname") => {
             validate_xml_value_count("DOMElement::getElementsByTagName", &args, 1, 1)?;
             let name = xml_string_arg("DOMElement::getElementsByTagName", args[0].clone())?;
@@ -5859,10 +7312,30 @@ pub(super) fn call_xml_runtime_method(
                 object, &name,
             ))
         }
+        ("domelement", "getelementsbytagnamens") => {
+            validate_xml_value_count("DOMElement::getElementsByTagNameNS", &args, 2, 2)?;
+            let namespace = xml_string_arg("DOMElement::getElementsByTagNameNS", args[0].clone())?;
+            let local = xml_string_arg("DOMElement::getElementsByTagNameNS", args[1].clone())?;
+            Ok(php_runtime::xml::dom_element_get_elements_by_tag_name_ns(
+                object, &namespace, &local,
+            ))
+        }
         ("domelement", "getattribute") => {
             validate_xml_value_count("DOMElement::getAttribute", &args, 1, 1)?;
             let name = xml_string_arg("DOMElement::getAttribute", args[0].clone())?;
             Ok(php_runtime::xml::dom_element_get_attribute(object, &name))
+        }
+        ("domelement", "hasattribute") => {
+            validate_xml_value_count("DOMElement::hasAttribute", &args, 1, 1)?;
+            let name = xml_string_arg("DOMElement::hasAttribute", args[0].clone())?;
+            Ok(php_runtime::xml::dom_element_has_attribute(object, &name))
+        }
+        ("domelement", "getattributenode") => {
+            validate_xml_value_count("DOMElement::getAttributeNode", &args, 1, 1)?;
+            let name = xml_string_arg("DOMElement::getAttributeNode", args[0].clone())?;
+            Ok(php_runtime::xml::dom_element_get_attribute_node(
+                object, &name,
+            ))
         }
         ("domelement", "setattribute") => {
             validate_xml_value_count("DOMElement::setAttribute", &args, 2, 2)?;
@@ -5870,6 +7343,13 @@ pub(super) fn call_xml_runtime_method(
             let value = xml_string_arg("DOMElement::setAttribute", args[1].clone())?;
             Ok(php_runtime::xml::dom_element_set_attribute(
                 object, &name, &value,
+            ))
+        }
+        ("domelement", "removeattribute") => {
+            validate_xml_value_count("DOMElement::removeAttribute", &args, 1, 1)?;
+            let name = xml_string_arg("DOMElement::removeAttribute", args[0].clone())?;
+            Ok(php_runtime::xml::dom_element_remove_attribute(
+                object, &name,
             ))
         }
         ("domelement", "setattributenode") => {
@@ -5897,6 +7377,28 @@ pub(super) fn call_xml_runtime_method(
             validate_xml_value_count("DOMNodeList::item", &args, 1, 1)?;
             let index = to_int(&args[0])?;
             Ok(php_runtime::xml::dom_node_list_item(object, index))
+        }
+        ("domnamednodemap", "item") => {
+            validate_xml_value_count("DOMNamedNodeMap::item", &args, 1, 1)?;
+            let index = to_int(&args[0])?;
+            Ok(php_runtime::xml::dom_named_node_map_item(object, index))
+        }
+        ("domnamednodemap", "getnameditem") => {
+            validate_xml_value_count("DOMNamedNodeMap::getNamedItem", &args, 1, 1)?;
+            let name = xml_string_arg("DOMNamedNodeMap::getNamedItem", args[0].clone())?;
+            Ok(php_runtime::xml::dom_named_node_map_get_named_item(
+                object, &name,
+            ))
+        }
+        ("domxpath", "query") => {
+            validate_xml_value_count("DOMXPath::query", &args, 1, 1)?;
+            let expression = xml_string_arg("DOMXPath::query", args[0].clone())?;
+            Ok(php_runtime::xml::dom_xpath_query(object, &expression))
+        }
+        ("domxpath", "evaluate") => {
+            validate_xml_value_count("DOMXPath::evaluate", &args, 1, 1)?;
+            let expression = xml_string_arg("DOMXPath::evaluate", args[0].clone())?;
+            Ok(php_runtime::xml::dom_xpath_evaluate(object, &expression))
         }
         ("simplexmlelement", "asxml") | ("simplexmlelement", "savexml") => {
             let display_method = if method == "savexml" {
@@ -6043,6 +7545,11 @@ pub(super) fn call_xml_runtime_method(
             validate_xml_value_count("XMLWriter::openMemory", &args, 0, 0)?;
             Ok(php_runtime::xml::xml_writer_open_memory(object))
         }
+        ("xmlwriter", "openuri") => {
+            validate_xml_value_count("XMLWriter::openUri", &args, 1, 1)?;
+            let uri = xml_string_arg("XMLWriter::openUri", args[0].clone())?;
+            Ok(xml_writer_open_uri(object, &uri, runtime_context))
+        }
         ("xmlwriter", "startdocument") => {
             validate_xml_value_count("XMLWriter::startDocument", &args, 0, 0)?;
             Ok(php_runtime::xml::xml_writer_start_document(object))
@@ -6097,8 +7604,14 @@ pub(super) fn call_xml_runtime_method(
             Ok(php_runtime::xml::xml_writer_end_document(object))
         }
         ("xmlwriter", "outputmemory") => {
-            validate_xml_value_count("XMLWriter::outputMemory", &args, 0, 0)?;
-            Ok(php_runtime::xml::xml_writer_output_memory(object))
+            validate_xml_value_count("XMLWriter::outputMemory", &args, 0, 1)?;
+            let flush = args.first().map(to_bool).transpose()?.unwrap_or(true);
+            Ok(php_runtime::xml::xml_writer_output_memory(object, flush))
+        }
+        ("xmlwriter", "flush") => {
+            validate_xml_value_count("XMLWriter::flush", &args, 0, 1)?;
+            let empty = args.first().map(to_bool).transpose()?.unwrap_or(true);
+            Ok(xml_writer_flush(object, empty, runtime_context))
         }
         _ => Err(format!(
             "E_PHP_VM_UNKNOWN_METHOD: method {}::{method} is not implemented in the XML runtime slice",
@@ -6115,40 +7628,50 @@ pub(super) fn call_normalizer_static_method(
     match method.as_str() {
         "normalize" => {
             validate_xml_value_count("Normalizer::normalize", &args, 1, 2)?;
-            let _ = xml_string_arg("Normalizer::normalize", args[0].clone())?;
+            let input = xml_string_arg("Normalizer::normalize", args[0].clone())?;
             let form = args
                 .get(1)
                 .map(to_int)
                 .transpose()?
                 .unwrap_or(NORMALIZER_FORM_C);
-            if form != NORMALIZER_FORM_C {
-                return Err(
-                    "E_PHP_RUNTIME_UNSUPPORTED_INTL: Normalizer::normalize only supports NFC"
-                        .to_owned(),
-                );
-            }
-            Ok(args[0].clone())
+            php_runtime::builtins::normalize_string(&input, form)
+                .map(|value| Value::string(value.into_bytes()))
+                .ok_or_else(|| {
+                    "E_PHP_RUNTIME_INTL_NORMALIZER_FORM: Normalizer::normalize(): Argument #2 ($form) must be a valid normalization form".to_owned()
+                })
         }
         "isnormalized" => {
             validate_xml_value_count("Normalizer::isNormalized", &args, 1, 2)?;
-            let _ = xml_string_arg("Normalizer::isNormalized", args[0].clone())?;
+            let input = xml_string_arg("Normalizer::isNormalized", args[0].clone())?;
             let form = args
                 .get(1)
                 .map(to_int)
                 .transpose()?
                 .unwrap_or(NORMALIZER_FORM_C);
-            if form != NORMALIZER_FORM_C {
-                return Err(
-                    "E_PHP_RUNTIME_UNSUPPORTED_INTL: Normalizer::isNormalized only supports NFC"
-                        .to_owned(),
-                );
-            }
-            Ok(Value::Bool(true))
+            php_runtime::builtins::is_normalized_string(&input, form)
+                .map(Value::Bool)
+                .ok_or_else(|| {
+                    "E_PHP_RUNTIME_INTL_NORMALIZER_FORM: Normalizer::isNormalized(): Argument #2 ($form) must be a valid normalization form".to_owned()
+                })
         }
         _ => Err(format!(
             "E_PHP_VM_UNKNOWN_METHOD: method Normalizer::{method} is not implemented"
         )),
     }
+}
+
+pub(super) fn intl_class_constant_value(class_name: &str, constant: &str) -> Option<Value> {
+    if normalize_class_name(class_name) != "normalizer" {
+        return None;
+    }
+    let value = match constant {
+        "FORM_D" | "NFD" => php_runtime::builtins::NORMALIZER_FORM_D,
+        "FORM_KD" | "NFKD" => php_runtime::builtins::NORMALIZER_FORM_KD,
+        "FORM_C" | "NFC" => php_runtime::builtins::NORMALIZER_FORM_C,
+        "FORM_KC" | "NFKC" => php_runtime::builtins::NORMALIZER_FORM_KC,
+        _ => return None,
+    };
+    Some(Value::Int(value))
 }
 
 pub(super) fn internal_extension_static_class(class_name: &str) -> bool {
@@ -6208,6 +7731,13 @@ pub(super) fn call_xmlwriter_static_method(
             validate_xml_value_count("XMLWriter::toMemory", &args, 0, 0)?;
             let object = php_runtime::xml::new_xml_writer();
             let _ = php_runtime::xml::xml_writer_open_memory(&object);
+            Ok(Value::Object(object))
+        }
+        "touri" => {
+            validate_xml_value_count("XMLWriter::toUri", &args, 1, 1)?;
+            let uri = xml_string_arg("XMLWriter::toUri", args[0].clone())?;
+            let object = php_runtime::xml::new_xml_writer();
+            let _ = php_runtime::xml::xml_writer_open_uri(&object, &uri);
             Ok(Value::Object(object))
         }
         _ => Err(format!(
@@ -6342,6 +7872,41 @@ pub(super) fn simplexml_write_xml_file(
         .open(&resolved)
         .and_then(|mut file| file.write_all(bytes))
         .map_or(Value::Bool(false), |_| Value::Bool(true))
+}
+
+pub(super) fn xml_writer_open_uri(
+    object: &ObjectRef,
+    uri: &str,
+    runtime_context: &RuntimeContext,
+) -> Value {
+    if matches!(
+        simplexml_write_xml_file(runtime_context, uri, &[]),
+        Value::Bool(true)
+    ) {
+        php_runtime::xml::xml_writer_open_uri(object, uri)
+    } else {
+        Value::Bool(false)
+    }
+}
+
+pub(super) fn xml_writer_flush(
+    object: &ObjectRef,
+    empty: bool,
+    runtime_context: &RuntimeContext,
+) -> Value {
+    let Some(uri) = php_runtime::xml::xml_writer_uri(object) else {
+        return php_runtime::xml::xml_writer_flush_memory(object, empty);
+    };
+    let bytes = php_runtime::xml::xml_writer_pending_bytes(object);
+    if matches!(
+        simplexml_write_xml_file(runtime_context, &uri, &bytes),
+        Value::Bool(true)
+    ) {
+        php_runtime::xml::xml_writer_clear_buffer(object);
+        Value::Int(bytes.len() as i64)
+    } else {
+        Value::Bool(false)
+    }
 }
 
 pub(super) fn xml_reader_open_source(

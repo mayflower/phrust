@@ -594,6 +594,7 @@ mod tests {
         "apcu_dec",
         "apcu_delete",
         "apcu_enabled",
+        "apcu_entry",
         "apcu_exists",
         "apcu_fetch",
         "apcu_inc",
@@ -683,6 +684,7 @@ mod tests {
         "FT_PEEK",
         "FT_PREFETCHTEXT",
         "FT_UID",
+        "IMAGETYPE_SVG",
         "MESSAGEPACK_OPT_ASSOC",
         "MESSAGEPACK_OPT_FORCE_F32",
         "MESSAGEPACK_OPT_PHPONLY",
@@ -739,6 +741,8 @@ mod tests {
         "SA_UIDVALIDITY",
         "SA_UNSEEN",
         "SE_UID",
+        "SODIUM_CRYPTO_PWHASH_BYTES_MAX",
+        "SODIUM_CRYPTO_PWHASH_BYTES_MIN",
         "SORTARRIVAL",
         "SORTCC",
         "SORTDATE",
@@ -1216,15 +1220,30 @@ mod tests {
 
         for name in [
             "gd_info",
+            "imagealphablending",
+            "imagecolorallocate",
+            "imagecolorallocatealpha",
+            "imagecolortransparent",
+            "imagecopy",
+            "imagecopymerge",
             "imagecopyresampled",
+            "imagecopyresized",
             "imagecreatefromjpeg",
             "imagecreatefrompng",
             "imagecreatefromstring",
             "imagecreatetruecolor",
             "imagetypes",
             "imagedestroy",
+            "imagefill",
+            "imagefilledrectangle",
+            "imageflip",
             "imagejpeg",
+            "imageline",
             "imagepng",
+            "imagerectangle",
+            "imagerotate",
+            "imagesavealpha",
+            "imagescale",
             "imagesx",
             "imagesy",
         ] {
@@ -2122,6 +2141,71 @@ mod tests {
                 .enabled_constant("PCRE_VERSION_MINOR")
                 .and_then(crate::ConstantDescriptor::value),
             Some(ConstantValue::Int(44))
+        );
+    }
+
+    #[test]
+    fn curl_extension_tracks_common_app_constants() {
+        let registry = ExtensionRegistry::standard_library();
+
+        for name in [
+            "CURLOPT_ACCEPT_ENCODING",
+            "CURLOPT_AUTOREFERER",
+            "CURLOPT_COOKIE",
+            "CURLOPT_COOKIEFILE",
+            "CURLOPT_COOKIEJAR",
+            "CURLOPT_COOKIESESSION",
+            "CURLOPT_DNS_CACHE_TIMEOUT",
+            "CURLOPT_HTTPGET",
+            "CURLOPT_HTTPPROXYTUNNEL",
+            "CURLOPT_IPRESOLVE",
+            "CURLOPT_NOPROXY",
+            "CURLOPT_PORT",
+            "CURLOPT_PROXYUSERNAME",
+            "CURLOPT_PROXYPASSWORD",
+            "CURLOPT_TCP_NODELAY",
+            "CURLOPT_USERNAME",
+            "CURLOPT_PASSWORD",
+            "CURLOPT_SSLCERT",
+            "CURLOPT_SSLKEY",
+            "CURLOPT_SSLVERSION",
+            "CURLOPT_VERBOSE",
+            "CURLINFO_CONTENT_TYPE",
+            "CURLINFO_NAMELOOKUP_TIME",
+            "CURLINFO_CONNECT_TIME",
+            "CURLINFO_PRETRANSFER_TIME",
+            "CURLINFO_STARTTRANSFER_TIME",
+            "CURLINFO_HTTP_CONNECTCODE",
+            "CURLINFO_REDIRECT_TIME",
+            "CURLINFO_REDIRECT_COUNT",
+            "CURLINFO_REQUEST_SIZE",
+            "CURLINFO_SIZE_DOWNLOAD",
+            "CURL_VERSION_LIBZ",
+            "CURL_VERSION_HTTP2",
+            "CURL_VERSION_HTTP3",
+            "CURLPROTO_ALL",
+            "CURLPROTO_FTP",
+            "CURL_IPRESOLVE_V4",
+            "CURL_SSLVERSION_TLSv1_2",
+            "CURL_HTTP_VERSION_2_0",
+        ] {
+            assert!(
+                registry.enabled_constant(name).is_some(),
+                "{name} should be registered as a curl constant"
+            );
+        }
+
+        assert_eq!(
+            registry
+                .enabled_constant("CURLOPT_ACCEPT_ENCODING")
+                .and_then(ConstantDescriptor::value),
+            Some(ConstantValue::Int(10102))
+        );
+        assert_eq!(
+            registry
+                .enabled_constant("CURL_VERSION_HTTP2")
+                .and_then(ConstantDescriptor::value),
+            Some(ConstantValue::Int(65536))
         );
     }
 

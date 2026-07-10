@@ -11,7 +11,7 @@ imports rather than ad hoc root imports.
 | Values and containers | `array`, `string`, `types`, `value`, `reference`, `convert` | PHP value representation, conversion, references, COW-visible helpers |
 | Request and IO services | `context`, `output`, `error_output`, `diagnostic`, `resource`, `ini`, `globals`, `autoload`, `status` | Request-local state, streams/resources, output, diagnostics, globals, include/autoload metadata |
 | Object and control-flow state | `object`, `callable`, `generator`, `fiber`, `gc` | Runtime object metadata, callables, suspension state, debug GC roots |
-| Builtin service layer | `builtins`, `datetime`, `pcre`, `serialization`, `session`, `tokenizer`, `xml`, `phar`, `sqlite`, `db` | Shared state and helpers used by standard-library functions |
+| Builtin service layer | `builtins`, `datetime`, `pcre`, `serialization`, `session`, `tokenizer`, `xml`, `xml_backend`, `phar`, `sqlite`, `db` | Shared state and helpers used by standard-library functions |
 | Instrumentation and integration | `jit_array`, `layout_stats`, `numeric_string` | JIT/runtime ABI helpers, counters, and measurement-only metadata |
 
 Every top-level runtime module must be represented in this table. New modules

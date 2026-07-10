@@ -1317,6 +1317,13 @@ pub(super) fn standard_library_standard_extension() -> ExtensionDescriptor {
             "standard",
         ))
         .with_function(FunctionDescriptor::php("stream_copy_to_stream", "standard"))
+        .with_function(FunctionDescriptor::php("stream_filter_append", "standard"))
+        .with_function(FunctionDescriptor::php("stream_filter_prepend", "standard"))
+        .with_function(FunctionDescriptor::php(
+            "stream_filter_register",
+            "standard",
+        ))
+        .with_function(FunctionDescriptor::php("stream_filter_remove", "standard"))
         .with_function(FunctionDescriptor::php("stream_get_contents", "standard"))
         .with_function(FunctionDescriptor::php("stream_get_meta_data", "standard"))
         .with_function(FunctionDescriptor::php("stream_get_wrappers", "standard"))
@@ -1330,6 +1337,21 @@ pub(super) fn standard_library_standard_extension() -> ExtensionDescriptor {
         .with_function(FunctionDescriptor::php(
             "stream_wrapper_register",
             "standard",
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "STREAM_FILTER_READ",
+            "standard",
+            ConstantValue::Int(1),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "STREAM_FILTER_WRITE",
+            "standard",
+            ConstantValue::Int(2),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "STREAM_FILTER_ALL",
+            "standard",
+            ConstantValue::Int(3),
         ))
         .with_function(FunctionDescriptor::php("str_contains", "standard"))
         .with_function(FunctionDescriptor::php("str_ends_with", "standard"))
@@ -1939,8 +1961,11 @@ pub(super) fn standard_library_pgsql_extension() -> ExtensionDescriptor {
             .with_function(FunctionDescriptor::php("pg_last_error", "pgsql"))
             .with_function(FunctionDescriptor::php("pg_num_fields", "pgsql"))
             .with_function(FunctionDescriptor::php("pg_num_rows", "pgsql"))
+            .with_function(FunctionDescriptor::php("pg_pconnect", "pgsql"))
             .with_function(FunctionDescriptor::php("pg_prepare", "pgsql"))
             .with_function(FunctionDescriptor::php("pg_query", "pgsql"))
+            .with_function(FunctionDescriptor::php("pg_query_params", "pgsql"))
+            .with_function(FunctionDescriptor::php("pg_result_error", "pgsql"))
             .with_constant(ConstantDescriptor::with_value(
                 "PGSQL_ASSOC",
                 "pgsql",
@@ -2038,10 +2063,16 @@ pub(super) fn standard_library_mysqli_extension() -> ExtensionDescriptor {
             ConstantValue::Int(1),
         ))
         .with_function(FunctionDescriptor::php("mysqli_close", "mysqli"))
+        .with_function(FunctionDescriptor::php("mysqli_autocommit", "mysqli"))
+        .with_function(FunctionDescriptor::php(
+            "mysqli_begin_transaction",
+            "mysqli",
+        ))
         .with_function(FunctionDescriptor::php(
             "mysqli_character_set_name",
             "mysqli",
         ))
+        .with_function(FunctionDescriptor::php("mysqli_commit", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_connect", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_connect_errno", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_connect_error", "mysqli"))
@@ -2053,8 +2084,13 @@ pub(super) fn standard_library_mysqli_extension() -> ExtensionDescriptor {
         .with_function(FunctionDescriptor::php("mysqli_field_count", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_get_charset", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_get_client_info", "mysqli"))
+        .with_function(FunctionDescriptor::php("mysqli_get_client_stats", "mysqli"))
         .with_function(FunctionDescriptor::php(
             "mysqli_get_client_version",
+            "mysqli",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "mysqli_get_connection_stats",
             "mysqli",
         ))
         .with_function(FunctionDescriptor::php("mysqli_get_host_info", "mysqli"))
@@ -2065,10 +2101,14 @@ pub(super) fn standard_library_mysqli_extension() -> ExtensionDescriptor {
         .with_function(FunctionDescriptor::php("mysqli_fetch_row", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_free_result", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_init", "mysqli"))
+        .with_function(FunctionDescriptor::php("mysqli_insert_id", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_more_results", "mysqli"))
+        .with_function(FunctionDescriptor::php("mysqli_multi_query", "mysqli"))
+        .with_function(FunctionDescriptor::php("mysqli_next_result", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_num_fields", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_num_rows", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_options", "mysqli"))
+        .with_function(FunctionDescriptor::php("mysqli_ping", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_prepare", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_query", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_real_connect", "mysqli"))
@@ -2077,8 +2117,10 @@ pub(super) fn standard_library_mysqli_extension() -> ExtensionDescriptor {
             "mysqli",
         ))
         .with_function(FunctionDescriptor::php("mysqli_report", "mysqli"))
+        .with_function(FunctionDescriptor::php("mysqli_rollback", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_select_db", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_set_charset", "mysqli"))
+        .with_function(FunctionDescriptor::php("mysqli_store_result", "mysqli"))
         .with_function(FunctionDescriptor::php(
             "mysqli_stmt_affected_rows",
             "mysqli",
@@ -2096,7 +2138,12 @@ pub(super) fn standard_library_mysqli_extension() -> ExtensionDescriptor {
         .with_function(FunctionDescriptor::php("mysqli_stmt_insert_id", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_stmt_num_rows", "mysqli"))
         .with_function(FunctionDescriptor::php("mysqli_stmt_prepare", "mysqli"))
+        .with_function(FunctionDescriptor::php(
+            "mysqli_stmt_result_metadata",
+            "mysqli",
+        ))
         .with_function(FunctionDescriptor::php("mysqli_stmt_sqlstate", "mysqli"))
+        .with_function(FunctionDescriptor::php("mysqli_use_result", "mysqli"))
         .with_class(ClassDescriptor::new("mysqli", "mysqli", ClassKind::Class))
         .with_class(ClassDescriptor::new(
             "mysqli_driver",
@@ -2173,6 +2220,116 @@ pub(super) fn standard_library_curl_extension() -> ExtensionDescriptor {
             ConstantValue::Int(4),
         ))
         .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_IPV6",
+            "curl",
+            ConstantValue::Int(1),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_LIBZ",
+            "curl",
+            ConstantValue::Int(8),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_NTLM",
+            "curl",
+            ConstantValue::Int(16),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_ASYNCHDNS",
+            "curl",
+            ConstantValue::Int(128),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_SPNEGO",
+            "curl",
+            ConstantValue::Int(256),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_LARGEFILE",
+            "curl",
+            ConstantValue::Int(512),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_IDN",
+            "curl",
+            ConstantValue::Int(1024),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_SSPI",
+            "curl",
+            ConstantValue::Int(2048),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_CONV",
+            "curl",
+            ConstantValue::Int(4096),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_TLSAUTH_SRP",
+            "curl",
+            ConstantValue::Int(16384),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_NTLM_WB",
+            "curl",
+            ConstantValue::Int(32768),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_HTTP2",
+            "curl",
+            ConstantValue::Int(65536),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_UNIX_SOCKETS",
+            "curl",
+            ConstantValue::Int(524288),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_HTTPS_PROXY",
+            "curl",
+            ConstantValue::Int(2097152),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_BROTLI",
+            "curl",
+            ConstantValue::Int(8388608),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_ALTSVC",
+            "curl",
+            ConstantValue::Int(16777216),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_HTTP3",
+            "curl",
+            ConstantValue::Int(33554432),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_ZSTD",
+            "curl",
+            ConstantValue::Int(67108864),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_UNICODE",
+            "curl",
+            ConstantValue::Int(134217728),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_HSTS",
+            "curl",
+            ConstantValue::Int(268435456),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_VERSION_GSASL",
+            "curl",
+            ConstantValue::Int(536870912),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_HTTP_VERSION_NONE",
+            "curl",
+            ConstantValue::Int(0),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
             "CURL_HTTP_VERSION_1_0",
             "curl",
             ConstantValue::Int(1),
@@ -2183,14 +2340,59 @@ pub(super) fn standard_library_curl_extension() -> ExtensionDescriptor {
             ConstantValue::Int(2),
         ))
         .with_constant(ConstantDescriptor::with_value(
+            "CURL_HTTP_VERSION_2_0",
+            "curl",
+            ConstantValue::Int(3),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_HTTP_VERSION_2",
+            "curl",
+            ConstantValue::Int(3),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_HTTP_VERSION_2TLS",
+            "curl",
+            ConstantValue::Int(4),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE",
+            "curl",
+            ConstantValue::Int(5),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_HTTP_VERSION_3",
+            "curl",
+            ConstantValue::Int(30),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
             "CURLAUTH_BASIC",
             "curl",
             ConstantValue::Int(1),
         ))
         .with_constant(ConstantDescriptor::with_value(
+            "CURLAUTH_DIGEST",
+            "curl",
+            ConstantValue::Int(2),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLAUTH_NEGOTIATE",
+            "curl",
+            ConstantValue::Int(4),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLAUTH_NTLM",
+            "curl",
+            ConstantValue::Int(8),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
             "CURLAUTH_ANY",
             "curl",
             ConstantValue::Int(-17),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLAUTH_ANYSAFE",
+            "curl",
+            ConstantValue::Int(-18),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "CURLPROTO_HTTP",
@@ -2203,9 +2405,54 @@ pub(super) fn standard_library_curl_extension() -> ExtensionDescriptor {
             ConstantValue::Int(2),
         ))
         .with_constant(ConstantDescriptor::with_value(
+            "CURLPROTO_FTP",
+            "curl",
+            ConstantValue::Int(4),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLPROTO_FTPS",
+            "curl",
+            ConstantValue::Int(8),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLPROTO_FILE",
+            "curl",
+            ConstantValue::Int(1024),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLPROTO_ALL",
+            "curl",
+            ConstantValue::Int(-1),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
             "CURLPROXY_HTTP",
             "curl",
             ConstantValue::Int(0),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLPROXY_HTTP_1_0",
+            "curl",
+            ConstantValue::Int(1),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLPROXY_SOCKS4",
+            "curl",
+            ConstantValue::Int(4),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLPROXY_SOCKS5",
+            "curl",
+            ConstantValue::Int(5),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLPROXY_SOCKS4A",
+            "curl",
+            ConstantValue::Int(6),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLPROXY_SOCKS5_HOSTNAME",
+            "curl",
+            ConstantValue::Int(7),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "CURLOPT_URL",
@@ -2253,6 +2500,11 @@ pub(super) fn standard_library_curl_extension() -> ExtensionDescriptor {
             ConstantValue::Int(10016),
         ))
         .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_ACCEPT_ENCODING",
+            "curl",
+            ConstantValue::Int(10102),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
             "CURLOPT_ENCODING",
             "curl",
             ConstantValue::Int(10102),
@@ -2283,9 +2535,49 @@ pub(super) fn standard_library_curl_extension() -> ExtensionDescriptor {
             ConstantValue::Int(45),
         ))
         .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_AUTOREFERER",
+            "curl",
+            ConstantValue::Int(58),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_COOKIE",
+            "curl",
+            ConstantValue::Int(10022),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_COOKIEFILE",
+            "curl",
+            ConstantValue::Int(10031),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_COOKIEJAR",
+            "curl",
+            ConstantValue::Int(10082),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_COOKIESESSION",
+            "curl",
+            ConstantValue::Int(96),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_DNS_CACHE_TIMEOUT",
+            "curl",
+            ConstantValue::Int(92),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
             "CURLOPT_HTTPHEADER",
             "curl",
             ConstantValue::Int(10023),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_HTTPGET",
+            "curl",
+            ConstantValue::Int(80),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_HTTPPROXYTUNNEL",
+            "curl",
+            ConstantValue::Int(61),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "CURLOPT_HEADERFUNCTION",
@@ -2313,6 +2605,21 @@ pub(super) fn standard_library_curl_extension() -> ExtensionDescriptor {
             ConstantValue::Int(107),
         ))
         .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_IPRESOLVE",
+            "curl",
+            ConstantValue::Int(113),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_NOPROXY",
+            "curl",
+            ConstantValue::Int(10177),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_PORT",
+            "curl",
+            ConstantValue::Int(3),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
             "CURLOPT_PROTOCOLS",
             "curl",
             ConstantValue::Int(181),
@@ -2338,6 +2645,16 @@ pub(super) fn standard_library_curl_extension() -> ExtensionDescriptor {
             ConstantValue::Int(101),
         ))
         .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_PROXYUSERNAME",
+            "curl",
+            ConstantValue::Int(10175),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_PROXYPASSWORD",
+            "curl",
+            ConstantValue::Int(10176),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
             "CURLOPT_PROXYUSERPWD",
             "curl",
             ConstantValue::Int(10006),
@@ -2346,6 +2663,21 @@ pub(super) fn standard_library_curl_extension() -> ExtensionDescriptor {
             "CURLOPT_REDIR_PROTOCOLS",
             "curl",
             ConstantValue::Int(182),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_TCP_NODELAY",
+            "curl",
+            ConstantValue::Int(121),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_USERNAME",
+            "curl",
+            ConstantValue::Int(10173),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_PASSWORD",
+            "curl",
+            ConstantValue::Int(10174),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "CURLOPT_USERPWD",
@@ -2378,6 +2710,16 @@ pub(super) fn standard_library_curl_extension() -> ExtensionDescriptor {
             ConstantValue::Int(10100),
         ))
         .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_SSLCERT",
+            "curl",
+            ConstantValue::Int(10025),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_SSLKEY",
+            "curl",
+            ConstantValue::Int(10087),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
             "CURLOPT_SSL_VERIFYPEER",
             "curl",
             ConstantValue::Int(64),
@@ -2386,6 +2728,71 @@ pub(super) fn standard_library_curl_extension() -> ExtensionDescriptor {
             "CURLOPT_SSL_VERIFYHOST",
             "curl",
             ConstantValue::Int(81),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_SSLVERSION",
+            "curl",
+            ConstantValue::Int(32),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLOPT_VERBOSE",
+            "curl",
+            ConstantValue::Int(41),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_IPRESOLVE_WHATEVER",
+            "curl",
+            ConstantValue::Int(0),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_IPRESOLVE_V4",
+            "curl",
+            ConstantValue::Int(1),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_IPRESOLVE_V6",
+            "curl",
+            ConstantValue::Int(2),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_SSLVERSION_DEFAULT",
+            "curl",
+            ConstantValue::Int(0),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_SSLVERSION_TLSv1",
+            "curl",
+            ConstantValue::Int(1),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_SSLVERSION_SSLv2",
+            "curl",
+            ConstantValue::Int(2),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_SSLVERSION_SSLv3",
+            "curl",
+            ConstantValue::Int(3),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_SSLVERSION_TLSv1_0",
+            "curl",
+            ConstantValue::Int(4),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_SSLVERSION_TLSv1_1",
+            "curl",
+            ConstantValue::Int(5),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_SSLVERSION_TLSv1_2",
+            "curl",
+            ConstantValue::Int(6),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURL_SSLVERSION_TLSv1_3",
+            "curl",
+            ConstantValue::Int(7),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "CURLINFO_EFFECTIVE_URL",
@@ -2408,9 +2815,59 @@ pub(super) fn standard_library_curl_extension() -> ExtensionDescriptor {
             ConstantValue::Int(2097163),
         ))
         .with_constant(ConstantDescriptor::with_value(
+            "CURLINFO_HTTP_CONNECTCODE",
+            "curl",
+            ConstantValue::Int(2097174),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
             "CURLINFO_TOTAL_TIME",
             "curl",
             ConstantValue::Int(3145731),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLINFO_NAMELOOKUP_TIME",
+            "curl",
+            ConstantValue::Int(3145732),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLINFO_CONNECT_TIME",
+            "curl",
+            ConstantValue::Int(3145733),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLINFO_PRETRANSFER_TIME",
+            "curl",
+            ConstantValue::Int(3145734),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLINFO_SIZE_DOWNLOAD",
+            "curl",
+            ConstantValue::Int(3145736),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLINFO_CONTENT_TYPE",
+            "curl",
+            ConstantValue::Int(1048594),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLINFO_STARTTRANSFER_TIME",
+            "curl",
+            ConstantValue::Int(3145745),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLINFO_REDIRECT_COUNT",
+            "curl",
+            ConstantValue::Int(2097172),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLINFO_REDIRECT_TIME",
+            "curl",
+            ConstantValue::Int(3145747),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "CURLINFO_REQUEST_SIZE",
+            "curl",
+            ConstantValue::Int(2097164),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "CURLINFO_PRIVATE",
@@ -2448,7 +2905,10 @@ pub(super) fn standard_library_curl_extension() -> ExtensionDescriptor {
         .with_function(FunctionDescriptor::php("curl_multi_add_handle", "curl"))
         .with_function(FunctionDescriptor::php("curl_multi_close", "curl"))
         .with_function(FunctionDescriptor::php("curl_multi_exec", "curl"))
+        .with_function(FunctionDescriptor::php("curl_multi_info_read", "curl"))
         .with_function(FunctionDescriptor::php("curl_multi_init", "curl"))
+        .with_function(FunctionDescriptor::php("curl_multi_remove_handle", "curl"))
+        .with_function(FunctionDescriptor::php("curl_multi_select", "curl"))
         .with_function(FunctionDescriptor::php("curl_multi_strerror", "curl"))
         .with_function(FunctionDescriptor::php("curl_share_close", "curl"))
         .with_function(FunctionDescriptor::php("curl_share_errno", "curl"))
@@ -2521,6 +2981,26 @@ pub(super) fn standard_library_openssl_extension() -> ExtensionDescriptor {
             "openssl",
             ConstantValue::Int(4),
         ))
+        .with_constant(ConstantDescriptor::with_value(
+            "OPENSSL_KEYTYPE_RSA",
+            "openssl",
+            ConstantValue::Int(0),
+        ))
+        .with_class(ClassDescriptor::new(
+            "OpenSSLAsymmetricKey",
+            "openssl",
+            ClassKind::Class,
+        ))
+        .with_class(ClassDescriptor::new(
+            "OpenSSLCertificate",
+            "openssl",
+            ClassKind::Class,
+        ))
+        .with_class(ClassDescriptor::new(
+            "OpenSSLCertificateSigningRequest",
+            "openssl",
+            ClassKind::Class,
+        ))
         .with_function(FunctionDescriptor::php("openssl_decrypt", "openssl"))
         .with_function(FunctionDescriptor::php("openssl_digest", "openssl"))
         .with_function(FunctionDescriptor::php("openssl_encrypt", "openssl"))
@@ -2542,6 +3022,25 @@ pub(super) fn standard_library_openssl_extension() -> ExtensionDescriptor {
             "openssl",
         ))
         .with_function(FunctionDescriptor::php("openssl_get_publickey", "openssl"))
+        .with_function(FunctionDescriptor::php(
+            "openssl_pkey_get_private",
+            "openssl",
+        ))
+        .with_function(FunctionDescriptor::php("openssl_get_privatekey", "openssl"))
+        .with_function(FunctionDescriptor::php("openssl_pkey_new", "openssl"))
+        .with_function(FunctionDescriptor::php("openssl_pkey_export", "openssl"))
+        .with_function(FunctionDescriptor::php(
+            "openssl_pkey_get_details",
+            "openssl",
+        ))
+        .with_function(FunctionDescriptor::php("openssl_sign", "openssl"))
+        .with_function(FunctionDescriptor::php("openssl_x509_read", "openssl"))
+        .with_function(FunctionDescriptor::php("openssl_x509_parse", "openssl"))
+        .with_function(FunctionDescriptor::php(
+            "openssl_x509_check_private_key",
+            "openssl",
+        ))
+        .with_function(FunctionDescriptor::php("openssl_x509_verify", "openssl"))
         .with_function(FunctionDescriptor::php("openssl_error_string", "openssl"))
         .with_function(FunctionDescriptor::php(
             "openssl_random_pseudo_bytes",
@@ -2651,6 +3150,15 @@ pub(super) fn standard_library_mbstring_extension() -> ExtensionDescriptor {
         .with_function(FunctionDescriptor::php("mb_internal_encoding", "mbstring"))
         .with_function(FunctionDescriptor::php("mb_list_encodings", "mbstring"))
         .with_function(FunctionDescriptor::php("mb_strlen", "mbstring"))
+        .with_function(FunctionDescriptor::php("mb_strcut", "mbstring"))
+        .with_function(FunctionDescriptor::php("mb_strwidth", "mbstring"))
+        .with_function(FunctionDescriptor::php("mb_strimwidth", "mbstring"))
+        .with_function(FunctionDescriptor::php("mb_convert_case", "mbstring"))
+        .with_function(FunctionDescriptor::php("mb_ucfirst", "mbstring"))
+        .with_function(FunctionDescriptor::php("mb_lcfirst", "mbstring"))
+        .with_function(FunctionDescriptor::php("mb_ord", "mbstring"))
+        .with_function(FunctionDescriptor::php("mb_chr", "mbstring"))
+        .with_function(FunctionDescriptor::php("mb_parse_str", "mbstring"))
         .with_function(FunctionDescriptor::php("mb_strtolower", "mbstring"))
         .with_function(FunctionDescriptor::php("mb_strtoupper", "mbstring"))
         .with_function(FunctionDescriptor::php("mb_stripos", "mbstring"))
@@ -2661,6 +3169,46 @@ pub(super) fn standard_library_mbstring_extension() -> ExtensionDescriptor {
             "mbstring",
         ))
         .with_function(FunctionDescriptor::php("mb_substr", "mbstring"))
+        .with_constant(ConstantDescriptor::with_value(
+            "MB_CASE_UPPER",
+            "mbstring",
+            ConstantValue::Int(0),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "MB_CASE_LOWER",
+            "mbstring",
+            ConstantValue::Int(1),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "MB_CASE_TITLE",
+            "mbstring",
+            ConstantValue::Int(2),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "MB_CASE_FOLD",
+            "mbstring",
+            ConstantValue::Int(3),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "MB_CASE_UPPER_SIMPLE",
+            "mbstring",
+            ConstantValue::Int(4),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "MB_CASE_LOWER_SIMPLE",
+            "mbstring",
+            ConstantValue::Int(5),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "MB_CASE_TITLE_SIMPLE",
+            "mbstring",
+            ConstantValue::Int(6),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "MB_CASE_FOLD_SIMPLE",
+            "mbstring",
+            ConstantValue::Int(7),
+        ))
 }
 
 pub(super) fn standard_library_intl_extension() -> ExtensionDescriptor {
@@ -2679,6 +3227,8 @@ pub(super) fn standard_library_intl_extension() -> ExtensionDescriptor {
             ))
             .with_function(FunctionDescriptor::php("grapheme_substr", "intl"))
             .with_function(FunctionDescriptor::php("grapheme_strlen", "intl"))
+            .with_function(FunctionDescriptor::php("grapheme_strpos", "intl"))
+            .with_function(FunctionDescriptor::php("grapheme_stripos", "intl"))
             .with_function(FunctionDescriptor::php("intl_get_error_code", "intl"))
             .with_function(FunctionDescriptor::php("intl_get_error_message", "intl"))
             .with_function(FunctionDescriptor::php(
@@ -3597,32 +4147,133 @@ pub(super) fn standard_library_iconv_extension() -> ExtensionDescriptor {
         ))
 }
 
+#[allow(unsafe_code)] // libsodium exposes a few runtime constant accessors as FFI calls
 pub(super) fn standard_library_sodium_extension() -> ExtensionDescriptor {
     ExtensionDescriptor::new("sodium")
+        .with_class(ClassDescriptor::new(
+            "SodiumException",
+            "sodium",
+            ClassKind::Class,
+        ))
         .with_constant(ConstantDescriptor::with_value(
             "SODIUM_LIBRARY_VERSION",
             "sodium",
-            ConstantValue::String("1.0.20"),
+            ConstantValue::String(sodium_library_version_string()),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "SODIUM_LIBRARY_MAJOR_VERSION",
             "sodium",
-            ConstantValue::Int(10),
+            ConstantValue::Int(libsodium_sys::SODIUM_LIBRARY_VERSION_MAJOR as i64),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "SODIUM_LIBRARY_MINOR_VERSION",
             "sodium",
-            ConstantValue::Int(5),
+            ConstantValue::Int(libsodium_sys::SODIUM_LIBRARY_VERSION_MINOR as i64),
         ))
+        .with_function(FunctionDescriptor::php("sodium_add", "sodium"))
         .with_function(FunctionDescriptor::php("sodium_base642bin", "sodium"))
         .with_function(FunctionDescriptor::php("sodium_bin2base64", "sodium"))
         .with_function(FunctionDescriptor::php("sodium_bin2hex", "sodium"))
+        .with_function(FunctionDescriptor::php("sodium_compare", "sodium"))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_aead_xchacha20poly1305_ietf_keygen",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_aead_xchacha20poly1305_ietf_decrypt",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_aead_xchacha20poly1305_ietf_encrypt",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_auth_keygen",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php("sodium_crypto_box", "sodium"))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_box_keypair",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_box_keypair_from_secretkey_and_publickey",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php("sodium_crypto_box_open", "sodium"))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_box_publickey",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_box_publickey_from_secretkey",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php("sodium_crypto_box_seal", "sodium"))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_box_seal_open",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_box_secretkey",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_box_seed_keypair",
+            "sodium",
+        ))
         .with_function(FunctionDescriptor::php(
             "sodium_crypto_generichash",
             "sodium",
         ))
         .with_function(FunctionDescriptor::php(
             "sodium_crypto_generichash_keygen",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_kdf_keygen",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_kdf_derive_from_key",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php("sodium_crypto_pwhash", "sodium"))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_pwhash_str",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_pwhash_str_needs_rehash",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_pwhash_str_verify",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_pwhash_scryptsalsa208sha256",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_pwhash_scryptsalsa208sha256_str",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_pwhash_scryptsalsa208sha256_str_verify",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php("sodium_crypto_secretbox", "sodium"))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_secretbox_keygen",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_secretbox_open",
+            "sodium",
+        ))
+        .with_function(FunctionDescriptor::php(
+            "sodium_crypto_shorthash_keygen",
             "sodium",
         ))
         .with_function(FunctionDescriptor::php(
@@ -3634,6 +4285,11 @@ pub(super) fn standard_library_sodium_extension() -> ExtensionDescriptor {
             "sodium",
         ))
         .with_function(FunctionDescriptor::php("sodium_hex2bin", "sodium"))
+        .with_function(FunctionDescriptor::php("sodium_increment", "sodium"))
+        .with_function(FunctionDescriptor::php("sodium_memcmp", "sodium"))
+        .with_function(FunctionDescriptor::php("sodium_memzero", "sodium"))
+        .with_function(FunctionDescriptor::php("sodium_pad", "sodium"))
+        .with_function(FunctionDescriptor::php("sodium_unpad", "sodium"))
         .with_constant(ConstantDescriptor::with_value(
             "SODIUM_BASE64_VARIANT_ORIGINAL",
             "sodium",
@@ -3657,33 +4313,270 @@ pub(super) fn standard_library_sodium_extension() -> ExtensionDescriptor {
         .with_constant(ConstantDescriptor::with_value(
             "SODIUM_CRYPTO_GENERICHASH_BYTES",
             "sodium",
-            ConstantValue::Int(32),
+            ConstantValue::Int(libsodium_sys::crypto_generichash_BYTES as i64),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "SODIUM_CRYPTO_GENERICHASH_BYTES_MIN",
             "sodium",
-            ConstantValue::Int(16),
+            ConstantValue::Int(libsodium_sys::crypto_generichash_BYTES_MIN as i64),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "SODIUM_CRYPTO_GENERICHASH_BYTES_MAX",
             "sodium",
-            ConstantValue::Int(64),
+            ConstantValue::Int(libsodium_sys::crypto_generichash_BYTES_MAX as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_GENERICHASH_KEYBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_generichash_KEYBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_GENERICHASH_KEYBYTES_MIN",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_generichash_KEYBYTES_MIN as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_GENERICHASH_KEYBYTES_MAX",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_generichash_KEYBYTES_MAX as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_SECRETBOX_KEYBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_secretbox_KEYBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_SECRETBOX_MACBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_secretbox_MACBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_SECRETBOX_NONCEBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_secretbox_NONCEBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_AUTH_KEYBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_auth_KEYBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_SHORTHASH_KEYBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_shorthash_KEYBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_BOX_SEEDBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_box_SEEDBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_BOX_PUBLICKEYBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_box_PUBLICKEYBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_BOX_SECRETKEYBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_box_SECRETKEYBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_BOX_KEYPAIRBYTES",
+            "sodium",
+            ConstantValue::Int(
+                (libsodium_sys::crypto_box_SECRETKEYBYTES
+                    + libsodium_sys::crypto_box_PUBLICKEYBYTES) as i64,
+            ),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_BOX_NONCEBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_box_NONCEBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_BOX_MACBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_box_MACBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_BOX_SEALBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_box_SEALBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_KDF_KEYBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_kdf_KEYBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_KDF_BYTES_MIN",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_kdf_BYTES_MIN as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_KDF_BYTES_MAX",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_kdf_BYTES_MAX as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_KDF_CONTEXTBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_kdf_CONTEXTBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_KEYBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_aead_xchacha20poly1305_ietf_KEYBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_aead_xchacha20poly1305_ietf_NPUBBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NSECBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_aead_xchacha20poly1305_ietf_NSECBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_ABYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_aead_xchacha20poly1305_ietf_ABYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_ALG_ARGON2I13",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_pwhash_ALG_ARGON2I13 as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_ALG_ARGON2ID13",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_pwhash_ALG_ARGON2ID13 as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_ALG_DEFAULT",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_pwhash_ALG_DEFAULT as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_BYTES_MIN",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_pwhash_BYTES_MIN as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_BYTES_MAX",
+            "sodium",
+            ConstantValue::Int(unsafe { libsodium_sys::crypto_pwhash_bytes_max() as i64 }),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_SALTBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_pwhash_SALTBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_STRPREFIX",
+            "sodium",
+            ConstantValue::String(sodium_nul_terminated_bytes(
+                libsodium_sys::crypto_pwhash_STRPREFIX,
+            )),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_OPSLIMIT_INTERACTIVE",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_pwhash_OPSLIMIT_INTERACTIVE as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_MEMLIMIT_INTERACTIVE",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_pwhash_MEMLIMIT_INTERACTIVE as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_OPSLIMIT_MODERATE",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_pwhash_OPSLIMIT_MODERATE as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_MEMLIMIT_MODERATE",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_pwhash_MEMLIMIT_MODERATE as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_OPSLIMIT_SENSITIVE",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_pwhash_OPSLIMIT_SENSITIVE as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_MEMLIMIT_SENSITIVE",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_pwhash_MEMLIMIT_SENSITIVE as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_SCRYPTSALSA208SHA256_SALTBYTES",
+            "sodium",
+            ConstantValue::Int(libsodium_sys::crypto_pwhash_scryptsalsa208sha256_SALTBYTES as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_SCRYPTSALSA208SHA256_STRPREFIX",
+            "sodium",
+            ConstantValue::String(sodium_nul_terminated_bytes(
+                libsodium_sys::crypto_pwhash_scryptsalsa208sha256_STRPREFIX,
+            )),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_SCRYPTSALSA208SHA256_OPSLIMIT_INTERACTIVE",
+            "sodium",
+            ConstantValue::Int(unsafe {
+                libsodium_sys::crypto_pwhash_scryptsalsa208sha256_opslimit_interactive() as i64
+            }),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_SCRYPTSALSA208SHA256_MEMLIMIT_INTERACTIVE",
+            "sodium",
+            ConstantValue::Int(unsafe {
+                libsodium_sys::crypto_pwhash_scryptsalsa208sha256_memlimit_interactive() as i64
+            }),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_SCRYPTSALSA208SHA256_OPSLIMIT_SENSITIVE",
+            "sodium",
+            ConstantValue::Int(unsafe {
+                libsodium_sys::crypto_pwhash_scryptsalsa208sha256_opslimit_sensitive() as i64
+            }),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SODIUM_CRYPTO_PWHASH_SCRYPTSALSA208SHA256_MEMLIMIT_SENSITIVE",
+            "sodium",
+            ConstantValue::Int(unsafe {
+                libsodium_sys::crypto_pwhash_scryptsalsa208sha256_memlimit_sensitive() as i64
+            }),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "SODIUM_CRYPTO_SIGN_BYTES",
             "sodium",
-            ConstantValue::Int(64),
+            ConstantValue::Int(libsodium_sys::crypto_sign_BYTES as i64),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES",
             "sodium",
-            ConstantValue::Int(32),
+            ConstantValue::Int(libsodium_sys::crypto_sign_PUBLICKEYBYTES as i64),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "SODIUM_CRYPTO_SIGN_SECRETKEYBYTES",
             "sodium",
-            ConstantValue::Int(64),
+            ConstantValue::Int(libsodium_sys::crypto_sign_SECRETKEYBYTES as i64),
         ))
+}
+
+fn sodium_library_version_string() -> &'static str {
+    sodium_nul_terminated_bytes(libsodium_sys::SODIUM_VERSION_STRING)
+}
+
+fn sodium_nul_terminated_bytes(bytes: &'static [u8]) -> &'static str {
+    let bytes = match bytes.split_last() {
+        Some((last, bytes)) if *last == 0 => bytes,
+        _ => bytes,
+    };
+    std::str::from_utf8(bytes).unwrap_or("unknown")
 }
 
 pub(super) fn standard_library_bcmath_extension() -> ExtensionDescriptor {
@@ -4178,6 +5071,7 @@ pub(super) fn standard_library_apcu_extension() -> ExtensionDescriptor {
         .with_function(FunctionDescriptor::php("apcu_dec", "apcu"))
         .with_function(FunctionDescriptor::php("apcu_delete", "apcu"))
         .with_function(FunctionDescriptor::php("apcu_enabled", "apcu"))
+        .with_function(FunctionDescriptor::php("apcu_entry", "apcu"))
         .with_function(FunctionDescriptor::php("apcu_exists", "apcu"))
         .with_function(FunctionDescriptor::php("apcu_fetch", "apcu"))
         .with_function(FunctionDescriptor::php("apcu_inc", "apcu"))
@@ -5014,6 +5908,7 @@ pub(super) fn standard_library_sockets_extension() -> ExtensionDescriptor {
         .with_function(FunctionDescriptor::php("socket_close", "sockets"))
         .with_function(FunctionDescriptor::php("socket_connect", "sockets"))
         .with_function(FunctionDescriptor::php("socket_create", "sockets"))
+        .with_function(FunctionDescriptor::php("socket_get_option", "sockets"))
         .with_function(FunctionDescriptor::php("socket_getpeername", "sockets"))
         .with_function(FunctionDescriptor::php("socket_getsockname", "sockets"))
         .with_function(FunctionDescriptor::php("socket_last_error", "sockets"))
@@ -5021,6 +5916,7 @@ pub(super) fn standard_library_sockets_extension() -> ExtensionDescriptor {
         .with_function(FunctionDescriptor::php("socket_read", "sockets"))
         .with_function(FunctionDescriptor::php("socket_recv", "sockets"))
         .with_function(FunctionDescriptor::php("socket_send", "sockets"))
+        .with_function(FunctionDescriptor::php("socket_set_option", "sockets"))
         .with_function(FunctionDescriptor::php("socket_shutdown", "sockets"))
         .with_function(FunctionDescriptor::php("socket_strerror", "sockets"))
         .with_function(FunctionDescriptor::php("socket_write", "sockets"))
@@ -5034,6 +5930,11 @@ pub(super) fn standard_library_sockets_extension() -> ExtensionDescriptor {
             "AF_INET",
             "sockets",
             ConstantValue::Int(2),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "AF_UNIX",
+            "sockets",
+            ConstantValue::Int(libc::AF_UNIX as i64),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "SOCK_STREAM",
@@ -5063,12 +5964,27 @@ pub(super) fn standard_library_sockets_extension() -> ExtensionDescriptor {
         .with_constant(ConstantDescriptor::with_value(
             "SOL_SOCKET",
             "sockets",
-            ConstantValue::Int(0xffff),
+            ConstantValue::Int(libc::SOL_SOCKET as i64),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "SOL_TCP",
             "sockets",
-            ConstantValue::Int(6),
+            ConstantValue::Int(libc::IPPROTO_TCP as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SO_REUSEADDR",
+            "sockets",
+            ConstantValue::Int(libc::SO_REUSEADDR as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "SO_KEEPALIVE",
+            "sockets",
+            ConstantValue::Int(libc::SO_KEEPALIVE as i64),
+        ))
+        .with_constant(ConstantDescriptor::with_value(
+            "TCP_NODELAY",
+            "sockets",
+            ConstantValue::Int(libc::TCP_NODELAY as i64),
         ))
         .with_constant(ConstantDescriptor::with_value(
             "SHUT_RD",
@@ -5284,67 +6200,70 @@ pub(super) fn standard_library_zip_extension() -> ExtensionDescriptor {
 }
 
 pub(super) fn standard_library_fileinfo_extension() -> ExtensionDescriptor {
-    ExtensionDescriptor::new("fileinfo")
-        .with_function(FunctionDescriptor::php("finfo_buffer", "fileinfo"))
-        .with_function(FunctionDescriptor::php("finfo_close", "fileinfo"))
-        .with_function(FunctionDescriptor::php("finfo_file", "fileinfo"))
-        .with_function(FunctionDescriptor::php("finfo_open", "fileinfo"))
-        .with_function(FunctionDescriptor::php("finfo_set_flags", "fileinfo"))
-        .with_constant(ConstantDescriptor::with_value(
-            "FILEINFO_NONE",
-            "fileinfo",
-            ConstantValue::Int(0),
-        ))
-        .with_constant(ConstantDescriptor::with_value(
-            "FILEINFO_SYMLINK",
-            "fileinfo",
-            ConstantValue::Int(2),
-        ))
-        .with_constant(ConstantDescriptor::with_value(
-            "FILEINFO_DEVICES",
-            "fileinfo",
-            ConstantValue::Int(8),
-        ))
-        .with_constant(ConstantDescriptor::with_value(
-            "FILEINFO_MIME_TYPE",
-            "fileinfo",
-            ConstantValue::Int(16),
-        ))
-        .with_constant(ConstantDescriptor::with_value(
-            "FILEINFO_CONTINUE",
-            "fileinfo",
-            ConstantValue::Int(32),
-        ))
-        .with_constant(ConstantDescriptor::with_value(
-            "FILEINFO_PRESERVE_ATIME",
-            "fileinfo",
-            ConstantValue::Int(128),
-        ))
-        .with_constant(ConstantDescriptor::with_value(
-            "FILEINFO_RAW",
-            "fileinfo",
-            ConstantValue::Int(256),
-        ))
-        .with_constant(ConstantDescriptor::with_value(
-            "FILEINFO_MIME_ENCODING",
-            "fileinfo",
-            ConstantValue::Int(1024),
-        ))
-        .with_constant(ConstantDescriptor::with_value(
-            "FILEINFO_MIME",
-            "fileinfo",
-            ConstantValue::Int(1040),
-        ))
-        .with_constant(ConstantDescriptor::with_value(
-            "FILEINFO_APPLE",
-            "fileinfo",
-            ConstantValue::Int(2048),
-        ))
-        .with_constant(ConstantDescriptor::with_value(
-            "FILEINFO_EXTENSION",
-            "fileinfo",
-            ConstantValue::Int(16777216),
-        ))
+    with_generated_classes(
+        ExtensionDescriptor::new("fileinfo")
+            .with_function(FunctionDescriptor::php("finfo_buffer", "fileinfo"))
+            .with_function(FunctionDescriptor::php("finfo_close", "fileinfo"))
+            .with_function(FunctionDescriptor::php("finfo_file", "fileinfo"))
+            .with_function(FunctionDescriptor::php("finfo_open", "fileinfo"))
+            .with_function(FunctionDescriptor::php("finfo_set_flags", "fileinfo"))
+            .with_constant(ConstantDescriptor::with_value(
+                "FILEINFO_NONE",
+                "fileinfo",
+                ConstantValue::Int(0),
+            ))
+            .with_constant(ConstantDescriptor::with_value(
+                "FILEINFO_SYMLINK",
+                "fileinfo",
+                ConstantValue::Int(2),
+            ))
+            .with_constant(ConstantDescriptor::with_value(
+                "FILEINFO_DEVICES",
+                "fileinfo",
+                ConstantValue::Int(8),
+            ))
+            .with_constant(ConstantDescriptor::with_value(
+                "FILEINFO_MIME_TYPE",
+                "fileinfo",
+                ConstantValue::Int(16),
+            ))
+            .with_constant(ConstantDescriptor::with_value(
+                "FILEINFO_CONTINUE",
+                "fileinfo",
+                ConstantValue::Int(32),
+            ))
+            .with_constant(ConstantDescriptor::with_value(
+                "FILEINFO_PRESERVE_ATIME",
+                "fileinfo",
+                ConstantValue::Int(128),
+            ))
+            .with_constant(ConstantDescriptor::with_value(
+                "FILEINFO_RAW",
+                "fileinfo",
+                ConstantValue::Int(256),
+            ))
+            .with_constant(ConstantDescriptor::with_value(
+                "FILEINFO_MIME_ENCODING",
+                "fileinfo",
+                ConstantValue::Int(1024),
+            ))
+            .with_constant(ConstantDescriptor::with_value(
+                "FILEINFO_MIME",
+                "fileinfo",
+                ConstantValue::Int(1040),
+            ))
+            .with_constant(ConstantDescriptor::with_value(
+                "FILEINFO_APPLE",
+                "fileinfo",
+                ConstantValue::Int(2048),
+            ))
+            .with_constant(ConstantDescriptor::with_value(
+                "FILEINFO_EXTENSION",
+                "fileinfo",
+                ConstantValue::Int(16777216),
+            )),
+        "fileinfo",
+    )
 }
 
 pub(super) fn standard_library_ffi_extension() -> ExtensionDescriptor {
@@ -5373,6 +6292,7 @@ pub(super) fn standard_library_exif_extension() -> ExtensionDescriptor {
         ))
         .with_function(FunctionDescriptor::php("exif_imagetype", "exif"))
         .with_function(FunctionDescriptor::php("exif_read_data", "exif"))
+        .with_function(FunctionDescriptor::php("read_exif_data", "exif"))
         .with_function(FunctionDescriptor::php("exif_tagname", "exif"))
         .with_function(FunctionDescriptor::php("exif_thumbnail", "exif"))
 }
@@ -5410,15 +6330,30 @@ pub(super) fn standard_library_gd_extension() -> ExtensionDescriptor {
             ConstantValue::Int(constants::IMG_AVIF),
         ))
         .with_function(FunctionDescriptor::php("gd_info", "gd"))
+        .with_function(FunctionDescriptor::php("imagealphablending", "gd"))
+        .with_function(FunctionDescriptor::php("imagecolorallocate", "gd"))
+        .with_function(FunctionDescriptor::php("imagecolorallocatealpha", "gd"))
+        .with_function(FunctionDescriptor::php("imagecolortransparent", "gd"))
+        .with_function(FunctionDescriptor::php("imagecopy", "gd"))
+        .with_function(FunctionDescriptor::php("imagecopymerge", "gd"))
         .with_function(FunctionDescriptor::php("imagecopyresampled", "gd"))
+        .with_function(FunctionDescriptor::php("imagecopyresized", "gd"))
         .with_function(FunctionDescriptor::php("imagecreatefromjpeg", "gd"))
         .with_function(FunctionDescriptor::php("imagecreatefrompng", "gd"))
         .with_function(FunctionDescriptor::php("imagecreatefromstring", "gd"))
         .with_function(FunctionDescriptor::php("imagecreatetruecolor", "gd"))
         .with_function(FunctionDescriptor::php("imagetypes", "gd"))
         .with_function(FunctionDescriptor::php("imagedestroy", "gd"))
+        .with_function(FunctionDescriptor::php("imagefill", "gd"))
+        .with_function(FunctionDescriptor::php("imagefilledrectangle", "gd"))
+        .with_function(FunctionDescriptor::php("imageflip", "gd"))
         .with_function(FunctionDescriptor::php("imagejpeg", "gd"))
+        .with_function(FunctionDescriptor::php("imageline", "gd"))
         .with_function(FunctionDescriptor::php("imagepng", "gd"))
+        .with_function(FunctionDescriptor::php("imagerectangle", "gd"))
+        .with_function(FunctionDescriptor::php("imagerotate", "gd"))
+        .with_function(FunctionDescriptor::php("imagesavealpha", "gd"))
+        .with_function(FunctionDescriptor::php("imagescale", "gd"))
         .with_function(FunctionDescriptor::php("imagesx", "gd"))
         .with_function(FunctionDescriptor::php("imagesy", "gd"))
         .with_class(ClassDescriptor::new("GdImage", "gd", ClassKind::Class))

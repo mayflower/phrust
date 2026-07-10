@@ -371,10 +371,10 @@ impl Vm {
         let start_callback = context
             .parser
             .get_property(php_runtime::xml::XML_PARSER_START_ELEMENT_HANDLER);
-        if xml_callback_is_enabled(&start_callback) {
+        if let Some(start_callback) = xml_enabled_callback(start_callback) {
             let callback_result = self.call_callable_with_by_ref_value_warnings(
                 compiled,
-                start_callback.unwrap(),
+                start_callback,
                 vec![
                     CallArgument::positional(Value::Object(context.parser.clone())),
                     CallArgument::positional(Value::string(name.as_bytes().to_vec())),
@@ -451,10 +451,10 @@ impl Vm {
         let end_callback = context
             .parser
             .get_property(php_runtime::xml::XML_PARSER_END_ELEMENT_HANDLER);
-        if xml_callback_is_enabled(&end_callback) {
+        if let Some(end_callback) = xml_enabled_callback(end_callback) {
             let callback_result = self.call_callable_with_by_ref_value_warnings(
                 compiled,
-                end_callback.unwrap(),
+                end_callback,
                 vec![
                     CallArgument::positional(Value::Object(context.parser.clone())),
                     CallArgument::positional(Value::string(name.as_bytes().to_vec())),
@@ -495,10 +495,10 @@ impl Vm {
         let callback = context
             .parser
             .get_property(php_runtime::xml::XML_PARSER_CHARACTER_DATA_HANDLER);
-        if xml_callback_is_enabled(&callback) {
+        if let Some(callback) = xml_enabled_callback(callback) {
             let callback_result = self.call_callable_with_by_ref_value_warnings(
                 compiled,
-                callback.unwrap(),
+                callback,
                 vec![
                     CallArgument::positional(Value::Object(context.parser.clone())),
                     CallArgument::positional(Value::string(text.as_bytes().to_vec())),
@@ -534,12 +534,10 @@ impl Vm {
         let callback = context
             .parser
             .get_property(php_runtime::xml::XML_PARSER_DEFAULT_HANDLER);
-        if !xml_callback_is_enabled(&callback) {
-            return None;
-        }
+        let callback = xml_enabled_callback(callback)?;
         let callback_result = self.call_callable_with_by_ref_value_warnings(
             compiled,
-            callback.unwrap(),
+            callback,
             vec![
                 CallArgument::positional(Value::Object(context.parser.clone())),
                 CallArgument::positional(Value::string(data.as_bytes().to_vec())),
@@ -1232,8 +1230,8 @@ fn xml_parser_case_folding(parser: &ObjectRef) -> bool {
     }
 }
 
-fn xml_callback_is_enabled(callback: &Option<Value>) -> bool {
-    !matches!(callback, None | Some(Value::Null))
+fn xml_enabled_callback(callback: Option<Value>) -> Option<Value> {
+    callback.filter(|value| !matches!(value, Value::Null))
 }
 
 fn xml_sax_name(name: &str, case_folding: bool) -> String {

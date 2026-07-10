@@ -1370,7 +1370,9 @@ pub(super) const MEMCACHED_INSTANCE_METHODS: &[&str] = &[
 pub(super) const IMAGICK_INSTANCE_METHODS: &[&str] = &[
     "__construct",
     "readImage",
+    "readImageBlob",
     "writeImage",
+    "getImagesBlob",
     "resizeImage",
     "cropImage",
     "thumbnailImage",
@@ -1379,6 +1381,7 @@ pub(super) const IMAGICK_INSTANCE_METHODS: &[&str] = &[
     "getImageHeight",
     "getImageFormat",
     "setImageFormat",
+    "stripImage",
     "clear",
     "destroy",
 ];

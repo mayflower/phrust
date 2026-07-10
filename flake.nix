@@ -45,6 +45,7 @@
                 cargo-semver-checks
                 sonar-scanner-cli
                 file
+                libxml2
                 pkg-config
                 python3
               ];

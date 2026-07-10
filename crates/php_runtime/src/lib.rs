@@ -45,6 +45,7 @@ pub mod tokenizer;
 pub mod types;
 pub mod value;
 pub mod xml;
+pub mod xml_backend;
 
 /// Stable runtime surface for VM, executor, server, and standard-library code.
 ///
@@ -65,9 +66,9 @@ pub mod api {
         BuiltinErrorContext, BuiltinRegistry, BuiltinResult, FilesystemRuntimeState,
         FtpOptionValue, FtpState, GettextState, IconvEncodingState, ImapState, InternalFunction,
         LdapState, MbSubstituteCharacter, OpcacheState, OpenSslErrorState, PcntlState,
-        ReadlineState, RuntimeSourceSpan, SYSVMSG_EAGAIN, SYSVMSG_EINVAL, ShmopState, SoapState,
-        SocketState, Ssh2State, StreamContextState, StrtokState, SysvMessageQueueState,
-        SysvSemaphoreState, SysvSharedMemoryState,
+        ReadlineState, RuntimeSourceSpan, SYSVMSG_EAGAIN, SYSVMSG_EINVAL, SYSVMSG_IPC_NOWAIT,
+        ShmopState, SoapState, SocketState, Ssh2State, StreamContextState, StrtokState,
+        SysvMessageQueueState, SysvSemaphoreState, SysvSharedMemoryState,
     };
     pub use crate::callable::{
         CallableMethodTarget, CallableValue, ClosureCaptureValue, ClosureContext, ClosureDebugInfo,
@@ -90,8 +91,9 @@ pub mod api {
     pub use crate::db::mysql::{
         MYSQL_TEST_DSN_ENV, MYSQLI_ASSOC, MYSQLI_BOTH, MYSQLI_NUM, MYSQLI_REPORT_ERROR,
         MYSQLI_REPORT_INDEX, MYSQLI_REPORT_OFF, MYSQLI_REPORT_STRICT, MYSQLI_SQLITE_COMPAT_ENV,
-        MYSQLND_CLIENT_INFO, MYSQLND_CLIENT_VERSION, MysqlCell, MysqlConnectOptions,
-        MysqlConnection, MysqlError, MysqlErrorKind, MysqlQueryResult, MysqlRow, MysqlState,
+        MYSQLI_STORE_RESULT, MYSQLI_USE_RESULT, MYSQLND_CLIENT_INFO, MYSQLND_CLIENT_VERSION,
+        MysqlCell, MysqlConnectOptions, MysqlConnection, MysqlError, MysqlErrorKind,
+        MysqlQueryResult, MysqlRow, MysqlState,
     };
     pub use crate::db::postgres::{
         PGSQL_ASSOC, PGSQL_BOTH, PGSQL_NUM, POSTGRES_TEST_DSN_ENV, PostgresConnectOptions,
@@ -138,8 +140,8 @@ pub mod api {
     };
     pub use crate::resource::{
         FilesystemCapabilities, ResourceId, ResourceKind, ResourceRef, ResourceTable, Stream,
-        StreamFlags, StreamMetadata, StreamOpenError, StreamOpenMode, StreamSeekWhence,
-        StreamWrapperRegistry,
+        StreamFilterMode, StreamFlags, StreamMetadata, StreamOpenError, StreamOpenMode,
+        StreamSeekWhence, StreamWrapperRegistry,
     };
     pub use crate::serialization::{
         SerializationError, UnserializeOptions, serialize, unserialize, unserialize_prefix,
@@ -239,8 +241,9 @@ pub use convert::{
 pub use db::mysql::{
     MYSQL_TEST_DSN_ENV, MYSQLI_ASSOC, MYSQLI_BOTH, MYSQLI_NUM, MYSQLI_REPORT_ERROR,
     MYSQLI_REPORT_INDEX, MYSQLI_REPORT_OFF, MYSQLI_REPORT_STRICT, MYSQLI_SQLITE_COMPAT_ENV,
-    MYSQLND_CLIENT_INFO, MYSQLND_CLIENT_VERSION, MysqlCell, MysqlConnectOptions, MysqlConnection,
-    MysqlError, MysqlErrorKind, MysqlQueryResult, MysqlRow, MysqlState,
+    MYSQLI_STORE_RESULT, MYSQLI_USE_RESULT, MYSQLND_CLIENT_INFO, MYSQLND_CLIENT_VERSION, MysqlCell,
+    MysqlConnectOptions, MysqlConnection, MysqlError, MysqlErrorKind, MysqlQueryResult, MysqlRow,
+    MysqlState,
 };
 pub use db::postgres::{
     PGSQL_ASSOC, PGSQL_BOTH, PGSQL_NUM, POSTGRES_TEST_DSN_ENV, PostgresConnectOptions,
@@ -296,8 +299,8 @@ pub use reference::{
 };
 pub use resource::{
     FilesystemCapabilities, ResourceId, ResourceKind, ResourceRef, ResourceTable, Stream,
-    StreamFlags, StreamMetadata, StreamOpenError, StreamOpenMode, StreamSeekWhence,
-    StreamWrapperRegistry,
+    StreamFilterMode, StreamFlags, StreamMetadata, StreamOpenError, StreamOpenMode,
+    StreamSeekWhence, StreamWrapperRegistry,
 };
 pub use serialization::{
     SerializationError, UnserializeOptions, serialize, serialize_object_properties,

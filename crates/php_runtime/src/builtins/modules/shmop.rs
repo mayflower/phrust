@@ -51,7 +51,7 @@ fn builtin_shmop_open(
         ));
     }
     let size = size.max(0) as usize;
-    let Some(segment_id) = context.shmop_state().open(key, mode, size) else {
+    let Some(segment_id) = context.shmop_state().open(key, mode, permissions, size) else {
         context.php_warning(
             "E_PHP_RUNTIME_SHMOP_OPEN",
             format!(
@@ -259,7 +259,7 @@ mod tests {
     use crate::OutputBuffer;
 
     #[test]
-    fn in_memory_segments_share_by_key_and_private_key_zero_is_isolated() {
+    fn sysv_segments_share_by_key_and_private_key_zero_is_isolated() {
         let mut output = OutputBuffer::new();
         let mut context = BuiltinContext::new(&mut output);
         let created = builtin_shmop_open(

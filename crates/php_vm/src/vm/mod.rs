@@ -168,6 +168,7 @@ const ZIP_FL_UNCHANGED: i64 = 8;
 const ZIP_FL_OVERWRITE: i64 = 8192;
 const ZIP_FL_OPEN_FILE_NOW: i64 = 1 << 30;
 const ZIP_LENGTH_TO_END: i64 = 0;
+const ZIP_CM_DEFAULT: i64 = -1;
 const ZIP_CM_STORE: i64 = 0;
 const ZIP_CM_DEFLATE: i64 = 8;
 const ZIP_CM_BZIP2: i64 = 12;
@@ -178,6 +179,7 @@ const ZIP_EM_AES_128: i64 = 257;
 const ZIP_EM_AES_192: i64 = 258;
 const ZIP_EM_AES_256: i64 = 259;
 const ZIP_ER_EXISTS: i64 = 10;
+const ZIP_ER_COMPNOTSUPP: i64 = 16;
 const ZIP_ER_RDONLY: i64 = 25;
 const ZIP_AFL_RDONLY: i64 = 2;
 const ZIP_AFL_CREATE_OR_KEEP_FILE_FOR_EMPTY_ARCHIVE: i64 = 16;
@@ -195,7 +197,7 @@ const SPL_RII_CATCH_GET_CHILD: i64 = 16;
 const SPL_RTI_BYPASS_CURRENT: i64 = 4;
 const SPL_RTI_BYPASS_KEY: i64 = 8;
 const SORT_FLAG_CASE: i64 = 8;
-const NORMALIZER_FORM_C: i64 = 4;
+const NORMALIZER_FORM_C: i64 = php_runtime::builtins::NORMALIZER_FORM_C;
 #[cfg(feature = "jit-cranelift")]
 const JIT_BLACKLIST_SIDE_EXIT_THRESHOLD: u64 = 2;
 #[cfg(feature = "jit-cranelift")]
@@ -1272,6 +1274,8 @@ struct ExecutionState {
     sqlite: php_runtime::SqliteState,
     mysql: php_runtime::MysqlState,
     postgres: php_runtime::PostgresState,
+    redis_clients: RedisClientState,
+    memcached_clients: MemcachedClientState,
     error_handlers: Vec<ErrorHandlerEntry>,
     exception_handlers: Vec<CallableValue>,
     diagnostics: Vec<RuntimeDiagnostic>,
@@ -28460,7 +28464,12 @@ impl Vm {
                             continue;
                         }
                         if is_redis_runtime_class(&object.class_name()) {
-                            let value = match call_redis_method(&object, method, values) {
+                            let value = match call_redis_method(
+                                &object,
+                                method,
+                                values,
+                                &mut state.redis_clients,
+                            ) {
                                 Ok(value) => value,
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
@@ -28477,7 +28486,12 @@ impl Vm {
                             continue;
                         }
                         if is_memcached_runtime_class(&object.class_name()) {
-                            let value = match call_memcached_method(&object, method, values) {
+                            let value = match call_memcached_method(
+                                &object,
+                                method,
+                                values,
+                                &mut state.memcached_clients,
+                            ) {
                                 Ok(value) => value,
                                 Err(message) => {
                                     return self.runtime_error(output, compiled, stack, message);
@@ -34997,6 +35011,11 @@ impl Vm {
             ) {
                 return result;
             }
+            if let Some(result) =
+                try_execute_simple_literal_pcre_builtin(&normalized, &values, state)
+            {
+                return result;
+            }
             return self.execute_internal_registry_builtin(
                 &normalized,
                 values,
@@ -35161,6 +35180,11 @@ impl Vm {
                         if let Some(result) = self.try_execute_serialization_builtin(
                             compiled, &name, &values, call_span, output, stack, state,
                         ) {
+                            return result;
+                        }
+                        if let Some(result) =
+                            try_execute_simple_literal_pcre_builtin(&name, &values, state)
+                        {
                             return result;
                         }
                         self.execute_internal_registry_builtin(
@@ -37077,13 +37101,14 @@ impl Vm {
             };
         }
         if is_redis_runtime_class(&object.class_name()) {
-            return match call_redis_method(&object, method, args) {
+            return match call_redis_method(&object, method, args, &mut state.redis_clients) {
                 Ok(value) => VmResult::success_no_output(Some(value)),
                 Err(message) => self.runtime_error(output, compiled, stack, message),
             };
         }
         if is_memcached_runtime_class(&object.class_name()) {
-            return match call_memcached_method(&object, method, args) {
+            return match call_memcached_method(&object, method, args, &mut state.memcached_clients)
+            {
                 Ok(value) => VmResult::success_no_output(Some(value)),
                 Err(message) => self.runtime_error(output, compiled, stack, message),
             };
@@ -42787,6 +42812,8 @@ impl Vm {
         } else if let Some(value) = redis_class_constant_value(&class.name, constant) {
             value
         } else if let Some(value) = memcached_class_constant_value(&class.name, constant) {
+            value
+        } else if let Some(value) = intl_class_constant_value(&class.name, constant) {
             value
         } else if let Some(value) = xml_class_constant_value(&class.name, constant) {
             value
@@ -48847,6 +48874,7 @@ fn internal_throwable_parent(class_name: &str) -> Option<&'static str> {
         }
         "argumentcounterror" => Some("TypeError"),
         "jsonexception"
+        | "sodiumexception"
         | "pdoexception"
         | "reflectionexception"
         | "logicexception"
@@ -48880,6 +48908,7 @@ fn internal_throwable_instanceof(object_class: &str, target_class: &str) -> Opti
             | "argumentcounterror"
             | "fibererror"
             | "jsonexception"
+            | "sodiumexception"
             | "pdoexception"
             | "reflectionexception"
             | "logicexception"
@@ -56517,9 +56546,19 @@ fn internal_enum_class_entry(normalized: &str) -> Option<php_ir::module::ClassEn
             "imagickexception",
             "ImagickException",
         )),
-        "phar" => Some(internal_empty_class_entry("phar", "Phar")),
+        "phar" => {
+            let mut entry = internal_empty_class_entry("phar", "Phar");
+            entry.interfaces.push(normalize_class_name("ArrayAccess"));
+            entry.interfaces.push(normalize_class_name("Countable"));
+            Some(entry)
+        }
         "phardata" => Some(internal_empty_class_entry("phardata", "PharData")),
-        "pharfileinfo" => Some(internal_empty_class_entry("pharfileinfo", "PharFileInfo")),
+        "pharfileinfo" => {
+            let mut entry = internal_empty_class_entry("pharfileinfo", "PharFileInfo");
+            entry.parent = Some(normalize_class_name("SplFileInfo"));
+            entry.parent_display_name = Some("SplFileInfo".to_owned());
+            Some(entry)
+        }
         "ziparchive" => Some(internal_empty_class_entry("ziparchive", "ZipArchive")),
         "gdimage" => Some(internal_empty_class_entry("gdimage", "GdImage")),
         "domdocument" => Some(internal_empty_class_entry("domdocument", "DOMDocument")),
@@ -56533,6 +56572,11 @@ fn internal_enum_class_entry(normalized: &str) -> Option<php_ir::module::ClassEn
         )),
         "domelement" => Some(internal_empty_class_entry("domelement", "DOMElement")),
         "domnodelist" => Some(internal_empty_class_entry("domnodelist", "DOMNodeList")),
+        "domnamednodemap" => Some(internal_empty_class_entry(
+            "domnamednodemap",
+            "DOMNamedNodeMap",
+        )),
+        "domxpath" => Some(internal_empty_class_entry("domxpath", "DOMXPath")),
         "simplexmlelement" => Some(internal_empty_class_entry(
             "simplexmlelement",
             "SimpleXMLElement",
@@ -57106,6 +57150,9 @@ fn class_constant_value_by_name(
         return Ok(Some(value));
     }
     if let Some(value) = memcached_class_constant_value(class_name, constant_name) {
+        return Ok(Some(value));
+    }
+    if let Some(value) = intl_class_constant_value(class_name, constant_name) {
         return Ok(Some(value));
     }
     if let Some(value) = xml_class_constant_value(class_name, constant_name) {
@@ -61350,6 +61397,215 @@ fn byte_slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
+fn try_execute_simple_literal_pcre_builtin(
+    name: &str,
+    values: &[Value],
+    state: &mut ExecutionState,
+) -> Option<VmResult> {
+    let result = match name {
+        "preg_match" => try_execute_simple_literal_preg_match(values)?,
+        "preg_replace" => try_execute_simple_literal_preg_replace(values)?,
+        "preg_split" => try_execute_simple_literal_preg_split(values)?,
+        "preg_grep" => try_execute_simple_literal_preg_grep(values)?,
+        _ => return None,
+    };
+    state.preg_last_error.clear();
+    Some(VmResult::success_no_output(Some(result)))
+}
+
+fn simple_literal_pcre_pattern_value(
+    value: &Value,
+) -> Option<php_runtime::pcre::SimpleLiteralPattern> {
+    let Value::String(pattern) = value else {
+        return None;
+    };
+    php_runtime::pcre::simple_literal_pattern(pattern)
+        .ok()
+        .flatten()
+}
+
+fn simple_literal_string_value(value: &Value) -> Option<&PhpString> {
+    match value {
+        Value::String(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn simple_literal_int_value(value: Option<&Value>, default: i64) -> Option<i64> {
+    match value {
+        Some(Value::Int(value)) => Some(*value),
+        Some(_) => None,
+        None => Some(default),
+    }
+}
+
+fn simple_literal_find(haystack: &[u8], needle: &[u8], start: usize) -> Option<(usize, usize)> {
+    if needle.is_empty() || start > haystack.len() {
+        return None;
+    }
+    let last_start = haystack.len().checked_sub(needle.len())?;
+    let first = needle[0];
+    let mut index = start;
+    while index <= last_start {
+        if haystack[index] == first && &haystack[index..index + needle.len()] == needle {
+            return Some((index, index + needle.len()));
+        }
+        index += 1;
+    }
+    None
+}
+
+fn try_execute_simple_literal_preg_match(values: &[Value]) -> Option<Value> {
+    if values.len() != 2 {
+        return None;
+    }
+    let literal = simple_literal_pcre_pattern_value(&values[0])?;
+    let subject = simple_literal_string_value(&values[1])?;
+    Some(Value::Int(
+        simple_literal_find(subject.as_bytes(), literal.as_bytes(), 0)
+            .is_some()
+            .into(),
+    ))
+}
+
+fn try_execute_simple_literal_preg_replace(values: &[Value]) -> Option<Value> {
+    if values.len() < 3 || values.len() > 5 {
+        return None;
+    }
+    let literal = simple_literal_pcre_pattern_value(&values[0])?;
+    let replacement = simple_literal_string_value(&values[1])?;
+    if replacement
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(*byte, b'$' | b'\\'))
+    {
+        return None;
+    }
+    let subject = simple_literal_string_value(&values[2])?;
+    let limit = simple_literal_int_value(values.get(3), -1)?;
+    let mut count = 0i64;
+    let replaced = simple_literal_replace(
+        subject.as_bytes(),
+        literal.as_bytes(),
+        replacement.as_bytes(),
+        limit,
+        &mut count,
+    );
+    if let Some(Value::Reference(cell)) = values.get(4) {
+        cell.set(Value::Int(count));
+    }
+    Some(Value::string(replaced))
+}
+
+fn simple_literal_replace(
+    subject: &[u8],
+    needle: &[u8],
+    replacement: &[u8],
+    limit: i64,
+    count: &mut i64,
+) -> Vec<u8> {
+    let mut output = Vec::with_capacity(subject.len());
+    let mut cursor = 0usize;
+    loop {
+        if limit >= 0 && *count >= limit {
+            break;
+        }
+        let Some((start, end)) = simple_literal_find(subject, needle, cursor) else {
+            break;
+        };
+        output.extend_from_slice(&subject[cursor..start]);
+        output.extend_from_slice(replacement);
+        cursor = end;
+        *count += 1;
+    }
+    output.extend_from_slice(&subject[cursor..]);
+    output
+}
+
+fn try_execute_simple_literal_preg_split(values: &[Value]) -> Option<Value> {
+    if values.len() < 2 || values.len() > 4 {
+        return None;
+    }
+    let literal = simple_literal_pcre_pattern_value(&values[0])?;
+    let subject = simple_literal_string_value(&values[1])?;
+    let limit = simple_literal_int_value(values.get(2), -1)?;
+    let flags = simple_literal_int_value(values.get(3), 0)?;
+    if flags & php_runtime::pcre::PREG_SPLIT_DELIM_CAPTURE != 0 {
+        return None;
+    }
+    let mut pieces = PhpArray::new();
+    let mut last_end = 0usize;
+    let mut emitted = 0i64;
+    while last_end <= subject.as_bytes().len() {
+        if limit > 0 && emitted >= limit - 1 {
+            break;
+        }
+        let Some((start, end)) =
+            simple_literal_find(subject.as_bytes(), literal.as_bytes(), last_end)
+        else {
+            break;
+        };
+        simple_literal_append_split_piece(
+            &mut pieces,
+            &subject.as_bytes()[last_end..start],
+            last_end,
+            flags,
+        );
+        last_end = end;
+        emitted += 1;
+    }
+    simple_literal_append_split_piece(
+        &mut pieces,
+        &subject.as_bytes()[last_end..],
+        last_end,
+        flags,
+    );
+    Some(Value::Array(pieces))
+}
+
+fn simple_literal_append_split_piece(
+    pieces: &mut PhpArray,
+    bytes: &[u8],
+    offset: usize,
+    flags: i64,
+) {
+    if flags & php_runtime::pcre::PREG_SPLIT_NO_EMPTY != 0 && bytes.is_empty() {
+        return;
+    }
+    let value = if flags & php_runtime::pcre::PREG_SPLIT_OFFSET_CAPTURE != 0 {
+        Value::packed_array(vec![
+            Value::string(bytes.to_vec()),
+            Value::Int(offset as i64),
+        ])
+    } else {
+        Value::string(bytes.to_vec())
+    };
+    pieces.insert(ArrayKey::Int(pieces.len() as i64), value);
+}
+
+fn try_execute_simple_literal_preg_grep(values: &[Value]) -> Option<Value> {
+    if values.len() < 2 || values.len() > 3 {
+        return None;
+    }
+    let literal = simple_literal_pcre_pattern_value(&values[0])?;
+    let Value::Array(input) = &values[1] else {
+        return None;
+    };
+    let flags = simple_literal_int_value(values.get(2), 0)?;
+    let invert = flags & php_runtime::pcre::PREG_GREP_INVERT != 0;
+    let mut output = PhpArray::new();
+    for (key, value) in input.iter() {
+        let Value::String(text) = value else {
+            return None;
+        };
+        let is_match = simple_literal_find(text.as_bytes(), literal.as_bytes(), 0).is_some();
+        if is_match != invert {
+            output.insert(key.clone(), value.clone());
+        }
+    }
+    Some(Value::Array(output))
+}
+
 fn execute_builtin_entry(
     entry: BuiltinEntry,
     args: Vec<Value>,
@@ -61589,6 +61845,16 @@ fn call_fileinfo_method_values(
                 Err(message) => return vm.runtime_error(output, compiled, stack, message),
             },
         };
+        if let Err(message) =
+            php_runtime::builtins::validate_fileinfo_options(flags, magic_file.as_deref())
+        {
+            return vm.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!("E_PHP_VM_FILEINFO_MAGIC: {message}"),
+            );
+        }
         object.set_property("__fileinfo_flags", Value::Int(flags));
         object.set_property(
             "__fileinfo_magic_file",
@@ -61739,6 +62005,7 @@ fn runtime_diagnostic_throwable(diagnostic: &RuntimeDiagnostic) -> Option<Value>
         "E_PHP_RUNTIME_TOKENIZER_PARSE" => "ParseError",
         "E_PHP_VM_EXCEPTION" => "Exception",
         "E_PHP_RUNTIME_JSON_EXCEPTION" => "JsonException",
+        "E_PHP_RUNTIME_SODIUM_EXCEPTION" => "SodiumException",
         "E_PHP_VM_PDO_EXCEPTION" => "PDOException",
         "E_PHP_VM_SPL_RUNTIME_EXCEPTION" => "RuntimeException",
         "E_PHP_VM_SPL_BAD_METHOD_CALL" => "BadMethodCallException",
@@ -63913,6 +64180,7 @@ fn internal_builtin_param_requires_reference(function: &str, index: usize) -> bo
         || (function == "mysqli_stmt_bind_param" && index >= 2)
         || (function == "mysqli_stmt_bind_result" && index >= 1)
         || (function == "curl_multi_exec" && index == 1)
+        || (function == "openssl_random_pseudo_bytes" && index == 1)
         || (matches!(function, "preg_match" | "preg_match_all") && index == 2)
         || (function == "preg_replace" && index == 4)
         || (function == "preg_replace_callback" && index == 4)
@@ -64038,8 +64306,10 @@ fn try_execute_dense_pcre_ascii_offset_block_fast_path(
     if !(5..=8).contains(&active_len) {
         return Ok(None);
     }
-    let Some((pattern_reg, pattern_const)) = dense_load_const_register(active[0].expect("active"))
-    else {
+    let Some(first_active) = active[0] else {
+        return Ok(None);
+    };
+    let Some((pattern_reg, pattern_const)) = dense_load_const_register(first_active) else {
         return Ok(None);
     };
     if !dense_constant_string_bytes_eq(compiled, pattern_const, br"/\G\w/u") {
@@ -64047,8 +64317,11 @@ fn try_execute_dense_pcre_ascii_offset_block_fast_path(
     }
 
     let mut cursor = 1;
+    let Some(subject_active) = active[cursor] else {
+        return Ok(None);
+    };
     let Some((subject_reg, subject_local, fused_flags)) =
-        dense_load_local_register_with_optional_const(active[cursor].expect("active"))
+        dense_load_local_register_with_optional_const(subject_active)
     else {
         return Ok(None);
     };
@@ -64578,12 +64851,47 @@ fn is_quiet_by_ref_internal_builtin_arg(function: &str, index: usize, arg: &IrCa
         return false;
     }
 
-    match normalize_function_name(function).as_str() {
+    let function = normalize_function_name(function);
+    if generated_internal_builtin_param_is_by_ref(&function, index, arg.name.as_deref()) {
+        return true;
+    }
+
+    match function.as_str() {
+        "apcu_fetch" => index == 1 || arg.name.as_deref() == Some("success"),
         "apcu_dec" | "apcu_inc" => index == 2 || arg.name.as_deref() == Some("success"),
+        "exif_thumbnail" => {
+            (1..=3).contains(&index)
+                || matches!(arg.name.as_deref(), Some("width" | "height" | "image_type"))
+        }
+        "getimagesize" => index == 1 || arg.name.as_deref() == Some("image_info"),
         "is_callable" => index == 2 || arg.name.as_deref() == Some("callable_name"),
+        "msg_send" => index == 5 || arg.name.as_deref() == Some("error_code"),
+        "msg_receive" => {
+            index == 2
+                || index == 4
+                || index == 7
+                || matches!(
+                    arg.name.as_deref(),
+                    Some("received_message_type" | "message" | "error_code")
+                )
+        }
+        "openssl_random_pseudo_bytes" => index == 1 || arg.name.as_deref() == Some("strong_result"),
+        "pcntl_wait" => index == 0 || arg.name.as_deref() == Some("status"),
+        "pcntl_waitpid" => {
+            index == 1
+                || arg.name.as_deref() == Some("status")
+                || index == 3
+                || arg.name.as_deref() == Some("resource_usage")
+        }
         "preg_match" | "preg_match_all" => index == 2 || arg.name.as_deref() == Some("matches"),
-        "preg_replace_callback" => index == 4 || arg.name.as_deref() == Some("count"),
+        "preg_filter" | "preg_replace" | "preg_replace_callback" => {
+            index == 4 || arg.name.as_deref() == Some("count")
+        }
         "preg_replace_callback_array" => index == 3 || arg.name.as_deref() == Some("count"),
+        "socket_getpeername" | "socket_getsockname" => {
+            index == 1 || index == 2 || matches!(arg.name.as_deref(), Some("address" | "port"))
+        }
+        "socket_recv" => index == 1 || arg.name.as_deref() == Some("data"),
         _ => false,
     }
 }
@@ -64601,14 +64909,63 @@ fn is_quiet_dense_by_ref_internal_builtin_arg(
         .name
         .and_then(|name| dense.names.get(name as usize).map(String::as_str));
 
-    match normalize_function_name(function).as_str() {
+    let function = normalize_function_name(function);
+    if generated_internal_builtin_param_is_by_ref(&function, index, arg_name) {
+        return true;
+    }
+
+    match function.as_str() {
         "apcu_dec" | "apcu_inc" => index == 2 || arg_name == Some("success"),
+        "exif_thumbnail" => {
+            (1..=3).contains(&index) || matches!(arg_name, Some("width" | "height" | "image_type"))
+        }
+        "getimagesize" => index == 1 || arg_name == Some("image_info"),
         "is_callable" => index == 2 || arg_name == Some("callable_name"),
+        "msg_send" => index == 5 || arg_name == Some("error_code"),
+        "msg_receive" => {
+            index == 2
+                || index == 4
+                || index == 7
+                || matches!(
+                    arg_name,
+                    Some("received_message_type" | "message" | "error_code")
+                )
+        }
+        "openssl_random_pseudo_bytes" => index == 1 || arg_name == Some("strong_result"),
+        "pcntl_wait" => index == 0 || arg_name == Some("status"),
+        "pcntl_waitpid" => {
+            index == 1
+                || arg_name == Some("status")
+                || index == 3
+                || arg_name == Some("resource_usage")
+        }
         "preg_match" | "preg_match_all" => index == 2 || arg_name == Some("matches"),
-        "preg_replace_callback" => index == 4 || arg_name == Some("count"),
+        "preg_filter" | "preg_replace" | "preg_replace_callback" => {
+            index == 4 || arg_name == Some("count")
+        }
         "preg_replace_callback_array" => index == 3 || arg_name == Some("count"),
+        "socket_getpeername" | "socket_getsockname" => {
+            index == 1 || index == 2 || matches!(arg_name, Some("address" | "port"))
+        }
+        "socket_recv" => index == 1 || arg_name == Some("data"),
         _ => false,
     }
+}
+
+fn generated_internal_builtin_param_is_by_ref(
+    function: &str,
+    index: usize,
+    arg_name: Option<&str>,
+) -> bool {
+    let Some(metadata) = php_std::arginfo::function_metadata_indexed(function) else {
+        return false;
+    };
+    let param = if let Some(name) = arg_name {
+        metadata.params.iter().find(|param| param.name == name)
+    } else {
+        metadata.params.get(index)
+    };
+    param.is_some_and(|param| param.by_ref)
 }
 
 fn iterator_function_temporary_arg_value(
@@ -65861,6 +66218,10 @@ fn call_builtin_args_to_positional(
                 values.push(Value::Reference(ReferenceCell::new(arg.value)));
                 continue;
             }
+            if internal_builtin_by_ref_temporary_falls_through(function, index) {
+                values.push(arg.value);
+                continue;
+            }
             return Err(InternalBuiltinArgError::Fatal(Box::new(
                 internal_builtin_by_ref_temporary_fatal_result(
                     output,
@@ -66057,6 +66418,7 @@ fn internal_builtin_by_ref_param_name(function: &str, index: usize) -> &'static 
     match (function, index) {
         ("str_replace", 3) => "count",
         ("parse_str", 1) => "result",
+        ("openssl_random_pseudo_bytes", 1) => "strong_result",
         ("preg_match" | "preg_match_all", 2) => "matches",
         ("preg_replace" | "preg_replace_callback", 4) => "count",
         ("preg_replace_callback_array", 3) => "count",
@@ -66065,6 +66427,13 @@ fn internal_builtin_by_ref_param_name(function: &str, index: usize) -> &'static 
         (_, 0) => "array",
         _ => "arg",
     }
+}
+
+fn internal_builtin_by_ref_temporary_falls_through(function: &str, index: usize) -> bool {
+    matches!(
+        (function, index),
+        ("sodium_memzero" | "sodium_increment" | "sodium_add", 0)
+    )
 }
 
 fn emit_internal_by_ref_indirect_temporary_notice(

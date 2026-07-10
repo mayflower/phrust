@@ -716,8 +716,7 @@ fn builtin_posix_getgrgid(
     if gid < 0 {
         #[cfg(target_os = "macos")]
         if gid == -1 {
-            let name = CString::new("nogroup").expect("static group name has no nul bytes");
-            let group = unsafe { libc::getgrnam(name.as_ptr()) };
+            let group = unsafe { libc::getgrnam(c"nogroup".as_ptr()) };
             if !group.is_null() {
                 context.set_posix_last_error(0);
                 return Ok(group_value_without_members(unsafe { &*group }));

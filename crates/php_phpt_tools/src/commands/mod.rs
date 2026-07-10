@@ -1974,6 +1974,7 @@ fn phpt_result_cache_key(
     phpt_source: &str,
     document: &PhptDocument,
     phpt_path: &Path,
+    timeout: Duration,
 ) -> Result<String, String> {
     let mut hasher = Sha256::new();
     hasher.update(b"phpt-run-cache-v1\0");
@@ -1981,7 +1982,7 @@ fn phpt_result_cache_key(
     hasher.update(b"\0target-mode=");
     hasher.update(context.options.target_mode.as_str().as_bytes());
     hasher.update(b"\0timeout=");
-    hasher.update(context.options.timeout.as_secs().to_string().as_bytes());
+    hasher.update(timeout.as_secs().to_string().as_bytes());
     hasher.update(b"\0target=");
     hasher.update(context.target_fingerprint.as_bytes());
     hasher.update(b"\0runner=");
@@ -2008,6 +2009,7 @@ fn phpt_result_input_cache_key(
     phpt_source: &str,
     document: &PhptDocument,
     phpt_path: &Path,
+    timeout: Duration,
 ) -> Result<String, String> {
     let mut hasher = Sha256::new();
     hasher.update(b"phpt-run-input-cache-v1\0");
@@ -2015,7 +2017,7 @@ fn phpt_result_input_cache_key(
     hasher.update(b"\0target-mode=");
     hasher.update(context.options.target_mode.as_str().as_bytes());
     hasher.update(b"\0timeout=");
-    hasher.update(context.options.timeout.as_secs().to_string().as_bytes());
+    hasher.update(timeout.as_secs().to_string().as_bytes());
     hasher.update(b"\0phpt=");
     hasher.update(phpt_source.as_bytes());
     if let Some(file_body) = file_body(&document.sections, phpt_path)? {

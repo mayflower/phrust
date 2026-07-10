@@ -1637,12 +1637,65 @@ fn is_quiet_by_ref_internal_builtin_arg(function: &str, index: usize, arg: &HirC
         return false;
     }
 
-    match normalize_function_name(function).as_str() {
+    let function = normalize_function_name(function);
+    if generated_internal_builtin_param_is_by_ref(&function, index, arg.name.as_deref()) {
+        return true;
+    }
+
+    match function.as_str() {
+        "apcu_fetch" => index == 1 || arg.name.as_deref() == Some("success"),
         "apcu_dec" | "apcu_inc" => index == 2 || arg.name.as_deref() == Some("success"),
+        "exif_thumbnail" => {
+            (1..=3).contains(&index)
+                || matches!(arg.name.as_deref(), Some("width" | "height" | "image_type"))
+        }
+        "getimagesize" => index == 1 || arg.name.as_deref() == Some("image_info"),
         "is_callable" => index == 2 || arg.name.as_deref() == Some("callable_name"),
+        "msg_send" => index == 5 || arg.name.as_deref() == Some("error_code"),
+        "msg_receive" => {
+            index == 2
+                || index == 4
+                || index == 7
+                || matches!(
+                    arg.name.as_deref(),
+                    Some("received_message_type" | "message" | "error_code")
+                )
+        }
+        "openssl_random_pseudo_bytes" => index == 1 || arg.name.as_deref() == Some("strong_result"),
+        "pcntl_wait" => index == 0 || arg.name.as_deref() == Some("status"),
+        "pcntl_waitpid" => {
+            index == 1
+                || arg.name.as_deref() == Some("status")
+                || index == 3
+                || arg.name.as_deref() == Some("resource_usage")
+        }
+        "preg_filter" | "preg_replace" | "preg_replace_callback" => {
+            index == 4 || arg.name.as_deref() == Some("count")
+        }
+        "preg_replace_callback_array" => index == 3 || arg.name.as_deref() == Some("count"),
         "preg_match" | "preg_match_all" => index == 2 || arg.name.as_deref() == Some("matches"),
+        "socket_getpeername" | "socket_getsockname" => {
+            index == 1 || index == 2 || matches!(arg.name.as_deref(), Some("address" | "port"))
+        }
+        "socket_recv" => index == 1 || arg.name.as_deref() == Some("data"),
         _ => false,
     }
+}
+
+fn generated_internal_builtin_param_is_by_ref(
+    function: &str,
+    index: usize,
+    arg_name: Option<&str>,
+) -> bool {
+    let Some(metadata) = php_std::arginfo::function_metadata_indexed(function) else {
+        return false;
+    };
+    let param = if let Some(name) = arg_name {
+        metadata.params.iter().find(|param| param.name == name)
+    } else {
+        metadata.params.get(index)
+    };
+    param.is_some_and(|param| param.by_ref)
 }
 
 /// Predefined stdlib constant initializers, built once per process.

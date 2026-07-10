@@ -1164,7 +1164,7 @@ mod tests {
     use super::*;
     use crate::{FilesystemCapabilities, OutputBuffer, RuntimeUploadedFile, UploadRegistry};
 
-    #[allow(unsafe_code)] // direct libc call, result checked
+    #[allow(unsafe_code)] // test compares against the same host libc oracle
     #[cfg(unix)]
     #[test]
     fn ftok_matches_host_key_for_allowed_path() {

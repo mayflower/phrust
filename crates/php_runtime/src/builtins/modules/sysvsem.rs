@@ -123,6 +123,7 @@ fn emit_sysvsem_warning(
     );
 }
 
+#[allow(unsafe_code)] // direct libc write loop, return value checked
 fn flush_root_output_to_stdout(output: &mut crate::OutputBuffer) {
     if output.as_bytes().is_empty() {
         return;

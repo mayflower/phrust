@@ -7,16 +7,37 @@ mod registry;
 mod signatures;
 
 pub use context::{
-    ApcuState, BuiltinContext, FilesystemRuntimeState, FtpOptionValue, FtpState, GettextState,
-    IconvEncodingState, ImapState, JSON_ERROR_RECURSION, JSON_PARTIAL_OUTPUT_ON_ERROR,
-    JSON_THROW_ON_ERROR, LdapState, MbSubstituteCharacter, OpcacheState, OpenSslErrorState,
-    PcntlState, ReadlineState, RuntimeSourceSpan, SYSVMSG_EAGAIN, SYSVMSG_EINVAL, ShmopState,
-    SoapState, SocketState, Ssh2State, StreamContextState, StrtokState, SysvMessageQueueState,
-    SysvSemaphoreError, SysvSemaphoreState, SysvSharedMemoryState,
+    ApcuState, BuiltinContext, CurlState, FilesystemRuntimeState, FtpOptionValue, FtpState,
+    GettextState, IconvEncodingState, ImapConnectionConfig, ImapMailboxSnapshot, ImapState,
+    JSON_ERROR_RECURSION, JSON_PARTIAL_OUTPUT_ON_ERROR, JSON_THROW_ON_ERROR, LdapSearchScope,
+    LdapState, MbSubstituteCharacter, OpcacheState, OpenSslErrorState, PcntlState, ReadlineState,
+    RuntimeSourceSpan, SYSVMSG_EAGAIN, SYSVMSG_EINVAL, SYSVMSG_IPC_NOWAIT, ShmopState, SoapState,
+    SocketState, Ssh2FingerprintHash, Ssh2State, StreamContextState, StrtokState,
+    SysvMessageQueueState, SysvSemaphoreError, SysvSemaphoreState, SysvSharedMemoryState,
+};
+pub(in crate::builtins) use context::{
+    CurlEasyCollector, CurlMultiDone, CurlMultiRuntimeState, CurlMultiTransferState,
 };
 pub use error::{BuiltinError, BuiltinErrorContext};
 #[doc(hidden)]
 pub use modules::curl::{CurlNetworkTestOverride, set_curl_network_tests_override_for_tests};
+pub use modules::fileinfo::validate_fileinfo_options;
+#[doc(hidden)]
+pub use modules::igbinary::{
+    serialize_value as igbinary_serialize_value, unserialize_value as igbinary_unserialize_value,
+};
+pub use modules::intl::{
+    NORMALIZER_FORM_C, NORMALIZER_FORM_D, NORMALIZER_FORM_KC, NORMALIZER_FORM_KD,
+    is_normalized_string, normalize_string,
+};
+#[doc(hidden)]
+pub use modules::msgpack::{
+    pack_value as msgpack_pack_value, unpack_value as msgpack_unpack_value,
+};
+#[doc(hidden)]
+pub use modules::soap::{
+    SoapParsedBody, build_soap_envelope, load_wsdl, parse_soap_response, parse_wsdl, soap_http_post,
+};
 pub use modules::{array_intrinsics, json_fast, string_intrinsics};
 pub use registry::{BuiltinCompatibility, BuiltinEntry, BuiltinRegistry};
 pub use signatures::{BuiltinResult, InternalFunction};

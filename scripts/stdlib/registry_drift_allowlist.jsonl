@@ -4,6 +4,7 @@
 {"kind":"runtime_without_std_metadata","name":"apcu_dec","reason":"APCu is a PECL-style compatibility surface not yet backed by committed php-src arginfo metadata."}
 {"kind":"runtime_without_std_metadata","name":"apcu_delete","reason":"APCu is a PECL-style compatibility surface not yet backed by committed php-src arginfo metadata."}
 {"kind":"runtime_without_std_metadata","name":"apcu_enabled","reason":"APCu is a PECL-style compatibility surface not yet backed by committed php-src arginfo metadata."}
+{"kind":"runtime_without_std_metadata","name":"apcu_entry","reason":"APCu is a PECL-style compatibility surface not yet backed by committed php-src arginfo metadata."}
 {"kind":"runtime_without_std_metadata","name":"apcu_exists","reason":"APCu is a PECL-style compatibility surface not yet backed by committed php-src arginfo metadata."}
 {"kind":"runtime_without_std_metadata","name":"apcu_fetch","reason":"APCu is a PECL-style compatibility surface not yet backed by committed php-src arginfo metadata."}
 {"kind":"runtime_without_std_metadata","name":"apcu_inc","reason":"APCu is a PECL-style compatibility surface not yet backed by committed php-src arginfo metadata."}

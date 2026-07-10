@@ -1,4 +1,4 @@
-//! Deterministic System V message queue compatibility slice.
+//! System V message queue compatibility slice.
 
 use super::core::{
     argument_type_error, argument_value_error, arity_error, assign_reference_arg, int_arg,
@@ -12,12 +12,8 @@ use crate::{
 };
 
 const QUEUE_CLASS: &str = "SysvMessageQueue";
-const MSG_EAGAIN: i64 = libc::EAGAIN as i64;
 const MSG_ENOMSG: i64 = libc::ENOMSG as i64;
 const MSG_EINVAL: i64 = libc::EINVAL as i64;
-const MSG_NOERROR: i64 = 0o10000;
-const MSG_EXCEPT: i64 = 0o20000;
-const E2BIG: i64 = libc::E2BIG as i64;
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new(
@@ -93,7 +89,7 @@ fn builtin_msg_send(
         message_scalar_bytes("msg_send", &args[2])?
     };
 
-    let Some(queue) = context.sysvmsg_state().queue(queue_id) else {
+    if context.sysvmsg_state().queue(queue_id).is_none() {
         context.php_warning(
             "E_PHP_RUNTIME_SYSVMSG_SEND",
             "msg_send(): msgsnd failed: Invalid argument",
@@ -103,20 +99,21 @@ fn builtin_msg_send(
         return Ok(Value::Bool(false));
     };
 
-    if !blocking && queue.byte_count() + payload.len() > queue.max_bytes() as usize {
-        assign_reference_arg(args.get(5), Value::Int(MSG_EAGAIN));
-        return Ok(Value::Bool(false));
+    let send_flags = if blocking { 0 } else { libc::IPC_NOWAIT as i64 };
+    match context.sysvmsg_state().send(
+        queue_id,
+        SysvMessage::new(message_type, payload, serialize),
+        send_flags,
+    ) {
+        Ok(()) => {
+            assign_reference_arg(args.get(5), Value::Int(0));
+            Ok(Value::Bool(true))
+        }
+        Err(errno) => {
+            assign_reference_arg(args.get(5), Value::Int(errno as i64));
+            Ok(Value::Bool(false))
+        }
     }
-
-    let sent = context
-        .sysvmsg_state()
-        .send(queue_id, SysvMessage::new(message_type, payload, serialize));
-    if sent {
-        assign_reference_arg(args.get(5), Value::Int(0));
-    } else {
-        assign_reference_arg(args.get(5), Value::Int(MSG_EAGAIN));
-    }
-    Ok(Value::Bool(sent))
 }
 
 fn builtin_msg_receive(
@@ -137,38 +134,30 @@ fn builtin_msg_receive(
     }
     let unserialize = optional_bool("msg_receive", &args, 5, true)?;
     let flags = optional_int("msg_receive", &args, 6, 0)?;
-    let except = flags & MSG_EXCEPT != 0 && desired_type > 0;
     if context.sysvmsg_state().queue(queue_id).is_none() {
         assign_reference_arg(args.get(2), Value::Int(0));
         assign_reference_arg(args.get(4), Value::Bool(false));
         assign_reference_arg(args.get(7), Value::Int(MSG_EINVAL));
         return Ok(Value::Bool(false));
     }
-    let Some(message) = context
+    match context
         .sysvmsg_state()
-        .receive(queue_id, desired_type, except)
-    else {
-        assign_reference_arg(args.get(2), Value::Int(0));
-        assign_reference_arg(args.get(4), Value::Bool(false));
-        assign_reference_arg(args.get(7), Value::Int(MSG_ENOMSG));
-        return Ok(Value::Bool(false));
-    };
-
-    if max_size >= 0 && message.payload().len() > max_size as usize {
-        if flags & MSG_NOERROR == 0 {
-            context.sysvmsg_state().send(queue_id, message);
-            assign_reference_arg(args.get(7), Value::Int(E2BIG));
-            return Ok(Value::Bool(false));
+        .receive(queue_id, desired_type, flags, max_size as usize)
+    {
+        Ok(Some(message)) => receive_message(context, args, message, unserialize, _span),
+        Ok(None) => {
+            assign_reference_arg(args.get(2), Value::Int(0));
+            assign_reference_arg(args.get(4), Value::Bool(false));
+            assign_reference_arg(args.get(7), Value::Int(MSG_ENOMSG));
+            Ok(Value::Bool(false))
         }
-        let truncated = SysvMessage::new(
-            message.message_type(),
-            message.payload()[..max_size as usize].to_vec(),
-            message.is_serialized(),
-        );
-        return receive_message(context, args, truncated, unserialize, _span);
+        Err(errno) => {
+            assign_reference_arg(args.get(2), Value::Int(0));
+            assign_reference_arg(args.get(4), Value::Bool(false));
+            assign_reference_arg(args.get(7), Value::Int(errno as i64));
+            Ok(Value::Bool(false))
+        }
     }
-
-    receive_message(context, args, message, unserialize, _span)
 }
 
 fn receive_message(
@@ -259,19 +248,28 @@ fn builtin_msg_set_queue(
     let Some(queue) = context.sysvmsg_state().queue_mut(queue_id) else {
         return Ok(Value::Bool(false));
     };
-    if let Some(value) = data.get(&string_key("msg_perm.mode")) {
-        queue.set_permissions(int_arg("msg_set_queue", value)?);
-    }
-    if let Some(value) = data.get(&string_key("msg_perm.uid")) {
-        queue.set_owner_uid(int_arg("msg_set_queue", value)?);
-    }
-    if let Some(value) = data.get(&string_key("msg_perm.gid")) {
-        queue.set_owner_gid(int_arg("msg_set_queue", value)?);
-    }
-    if let Some(value) = data.get(&string_key("msg_qbytes")) {
-        queue.set_max_bytes(int_arg("msg_set_queue", value)?);
-    }
-    Ok(Value::Bool(true))
+    let permissions = data
+        .get(&string_key("msg_perm.mode"))
+        .map(|value| int_arg("msg_set_queue", value))
+        .transpose()?;
+    let owner_uid = data
+        .get(&string_key("msg_perm.uid"))
+        .map(|value| int_arg("msg_set_queue", value))
+        .transpose()?;
+    let owner_gid = data
+        .get(&string_key("msg_perm.gid"))
+        .map(|value| int_arg("msg_set_queue", value))
+        .transpose()?;
+    let max_bytes = data
+        .get(&string_key("msg_qbytes"))
+        .map(|value| int_arg("msg_set_queue", value))
+        .transpose()?;
+    Ok(Value::Bool(queue.apply_settings(
+        permissions,
+        owner_uid,
+        owner_gid,
+        max_bytes,
+    )))
 }
 
 fn builtin_msg_queue_exists(
@@ -413,13 +411,17 @@ mod tests {
 
     const MSG_IPC_NOWAIT: i64 = libc::IPC_NOWAIT as i64;
 
+    fn unique_sysvmsg_key(offset: i64) -> i64 {
+        0x5300_0000_i64 | (((std::process::id() as i64) & 0xffff) << 4) | (offset & 0x0f)
+    }
+
     #[test]
     fn queue_send_receive_serialized_payload_and_metadata() {
         let mut output = OutputBuffer::new();
         let mut context = BuiltinContext::new(&mut output);
         let queue = builtin_msg_get_queue(
             &mut context,
-            vec![Value::Int(123), Value::Int(0o600)],
+            vec![Value::Int(unique_sysvmsg_key(1)), Value::Int(0o600)],
             RuntimeSourceSpan::default(),
         )
         .expect("queue");
@@ -453,12 +455,17 @@ mod tests {
         assert_eq!(received_type.get(), Value::Int(7));
         assert_eq!(received_message.get(), Value::string("payload"));
 
-        let stats = builtin_msg_stat_queue(&mut context, vec![queue], RuntimeSourceSpan::default())
-            .expect("stats");
+        let stats = builtin_msg_stat_queue(
+            &mut context,
+            vec![queue.clone()],
+            RuntimeSourceSpan::default(),
+        )
+        .expect("stats");
         let Value::Array(stats) = stats else {
             panic!("expected stats array");
         };
         assert_eq!(stats.get(&string_key("msg_qnum")), Some(&Value::Int(0)));
+        let _ = builtin_msg_remove_queue(&mut context, vec![queue], RuntimeSourceSpan::default());
     }
 
     #[test]
@@ -467,7 +474,7 @@ mod tests {
         let mut context = BuiltinContext::new(&mut output);
         let queue = builtin_msg_get_queue(
             &mut context,
-            vec![Value::Int(456)],
+            vec![Value::Int(unique_sysvmsg_key(2))],
             RuntimeSourceSpan::default(),
         )
         .expect("queue");
@@ -484,7 +491,7 @@ mod tests {
         let mut context = BuiltinContext::new(&mut output);
         let queue = builtin_msg_get_queue(
             &mut context,
-            vec![Value::Int(789)],
+            vec![Value::Int(unique_sysvmsg_key(3))],
             RuntimeSourceSpan::default(),
         )
         .expect("queue");
@@ -510,7 +517,7 @@ mod tests {
             builtin_msg_receive(
                 &mut context,
                 vec![
-                    queue,
+                    queue.clone(),
                     Value::Int(0),
                     Value::Reference(received_type.clone()),
                     Value::Int(1024),
@@ -527,6 +534,7 @@ mod tests {
         assert_eq!(received_type.get(), Value::Int(1));
         assert_eq!(received_message.get(), Value::Bool(false));
         assert_eq!(error.get(), Value::Int(MSG_EINVAL));
+        let _ = builtin_msg_remove_queue(&mut context, vec![queue], RuntimeSourceSpan::default());
     }
 
     #[test]
@@ -556,7 +564,7 @@ mod tests {
         let mut context = BuiltinContext::new(&mut output);
         let queue = builtin_msg_get_queue(
             &mut context,
-            vec![Value::Int(2468)],
+            vec![Value::Int(unique_sysvmsg_key(4))],
             RuntimeSourceSpan::default(),
         )
         .expect("queue");
@@ -568,7 +576,7 @@ mod tests {
             builtin_msg_receive(
                 &mut context,
                 vec![
-                    queue,
+                    queue.clone(),
                     Value::Int(1),
                     Value::Reference(received_type.clone()),
                     Value::Int(1024),
@@ -585,6 +593,7 @@ mod tests {
         assert_eq!(received_type.get(), Value::Int(0));
         assert_eq!(received_message.get(), Value::Bool(false));
         assert_eq!(error.get(), Value::Int(MSG_ENOMSG));
+        let _ = builtin_msg_remove_queue(&mut context, vec![queue], RuntimeSourceSpan::default());
     }
 
     #[test]
@@ -593,7 +602,7 @@ mod tests {
         let mut context = BuiltinContext::new(&mut output);
         let queue = builtin_msg_get_queue(
             &mut context,
-            vec![Value::Int(9753)],
+            vec![Value::Int(unique_sysvmsg_key(5))],
             RuntimeSourceSpan::default(),
         )
         .expect("queue");
@@ -675,18 +684,17 @@ mod tests {
     }
 
     #[test]
-    fn set_queue_updates_uid_gid_metadata() {
+    fn set_queue_updates_mode_metadata() {
         let mut output = OutputBuffer::new();
         let mut context = BuiltinContext::new(&mut output);
         let queue = builtin_msg_get_queue(
             &mut context,
-            vec![Value::Int(987)],
+            vec![Value::Int(unique_sysvmsg_key(6))],
             RuntimeSourceSpan::default(),
         )
         .expect("queue");
         let mut settings = PhpArray::new();
-        settings.insert(string_key("msg_perm.uid"), Value::Int(101));
-        settings.insert(string_key("msg_perm.gid"), Value::Int(202));
+        settings.insert(string_key("msg_perm.mode"), Value::Int(0o600));
         assert_eq!(
             builtin_msg_set_queue(
                 &mut context,
@@ -697,18 +705,21 @@ mod tests {
             Value::Bool(true)
         );
 
-        let stats = builtin_msg_stat_queue(&mut context, vec![queue], RuntimeSourceSpan::default())
-            .expect("stats");
+        let stats = builtin_msg_stat_queue(
+            &mut context,
+            vec![queue.clone()],
+            RuntimeSourceSpan::default(),
+        )
+        .expect("stats");
         let Value::Array(stats) = stats else {
             panic!("expected stats array");
         };
         assert_eq!(
-            stats.get(&string_key("msg_perm.uid")),
-            Some(&Value::Int(101))
+            stats
+                .get(&string_key("msg_perm.mode"))
+                .map(|value| int_arg("test", value).expect("mode") & 0o777),
+            Some(0o600)
         );
-        assert_eq!(
-            stats.get(&string_key("msg_perm.gid")),
-            Some(&Value::Int(202))
-        );
+        let _ = builtin_msg_remove_queue(&mut context, vec![queue], RuntimeSourceSpan::default());
     }
 }

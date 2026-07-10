@@ -34,6 +34,109 @@ fn fileinfo_object_facade_routes_to_runtime_state() {
 }
 
 #[test]
+fn fileinfo_constructor_rejects_invalid_magic_database_path() {
+    let result =
+        execute_source("<?php new finfo(FILEINFO_MIME_TYPE, '/path/to/missing/magic.mgc');");
+
+    assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
+    assert!(
+        result
+            .status
+            .message()
+            .is_some_and(|message| message.contains("E_PHP_VM_FILEINFO_MAGIC")),
+        "{:?}",
+        result.status
+    );
+}
+
+#[test]
+fn opcache_compile_file_records_only_successful_compiles() {
+    let root = std::env::temp_dir().join(format!("phrust-opcache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("temp root should be created");
+    let source_path = root.join("index.php");
+    std::fs::write(root.join("valid.php"), "<?php return 42;\n")
+        .expect("valid fixture should be written");
+    std::fs::write(root.join("invalid.php"), "<?php function {\n")
+        .expect("invalid fixture should be written");
+    let source = r#"<?php
+$valid = __DIR__ . "/valid.php";
+$invalid = __DIR__ . "/invalid.php";
+var_dump(opcache_compile_file($valid));
+var_dump(opcache_is_script_cached($valid));
+error_reporting(0);
+var_dump(opcache_compile_file($invalid));
+var_dump(opcache_is_script_cached($invalid));
+"#;
+
+    let result = execute_source_with_options_and_path(
+        source,
+        VmOptions {
+            include_loader: Some(IncludeLoader::for_root(&root).expect("loader")),
+            include_cache: Some(Arc::new(IncludeCache::new(1))),
+            runtime_context: RuntimeContext::default().with_cwd(root.clone()),
+            ..VmOptions::default()
+        },
+        source_path.display().to_string(),
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(
+        result.output.to_string_lossy(),
+        "bool(true)\nbool(true)\nbool(false)\nbool(false)\n"
+    );
+}
+
+#[test]
+fn getimagesize_initializes_undefined_image_info_reference() {
+    let root =
+        std::env::temp_dir().join(format!("phrust-getimagesize-by-ref-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("temp root should be created");
+    let image_path = root.join("pixel.png");
+    std::fs::write(
+        &image_path,
+        [
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0x00, 0x00, 0x00, 0x0d, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde,
+        ],
+    )
+    .expect("fixture should be written");
+
+    let source = format!(
+        "<?php $size = getimagesize({:?}, $info); var_dump($size[0], $size[1], is_array($info), array_keys($info));",
+        image_path.display().to_string()
+    );
+    let result = execute_source_with_options_and_path(
+        &source,
+        VmOptions {
+            runtime_context: RuntimeContext::default().with_filesystem_capabilities(
+                php_runtime::FilesystemCapabilities::none().with_allowed_roots(vec![root.clone()]),
+            ),
+            ..VmOptions::default()
+        },
+        root.join("index.php").display().to_string(),
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(
+        result.output.to_string_lossy(),
+        "int(1)\nint(1)\nbool(true)\narray(0) {\n}\n"
+    );
+    assert!(
+        !result
+            .output
+            .to_string_lossy()
+            .contains("Undefined variable $info"),
+        "{}",
+        result.output.to_string_lossy()
+    );
+}
+
+#[test]
 fn trace_argument_string_preview_truncates_on_char_boundary() {
     let value = Value::string("12345678901234éXYZ");
 
@@ -41,17 +144,26 @@ fn trace_argument_string_preview_truncates_on_char_boundary() {
 }
 
 #[test]
-fn pdo_mysql_dsn_parser_rejects_invalid_port_and_socket_gap() {
+fn pdo_mysql_dsn_parser_rejects_invalid_port_and_accepts_socket() {
     assert!(
         pdo_mysql_connect_options_from_dsn("mysql:host=db;port=abc", "", "")
             .expect_err("invalid ports should be rejected")
             .contains("invalid MySQL port")
     );
+
+    let (options, charset) = pdo_mysql_connect_options_from_dsn(
+        "mysql:unix_socket=/tmp/mysql.sock;dbname=app;charset=utf8mb4",
+        "socket_user",
+        "socket_pass",
+    )
+    .expect("unix socket PDO MySQL DSN should parse");
+    let rendered = format!("{options:?}");
     assert!(
-        pdo_mysql_connect_options_from_dsn("mysql:unix_socket=/tmp/mysql.sock", "", "")
-            .expect_err("unix socket support is not implemented")
-            .contains("unix_socket DSNs are not implemented")
+        rendered.contains("socket=%2Ftmp%2Fmysql.sock"),
+        "{rendered}"
     );
+    assert!(rendered.contains("/app"), "{rendered}");
+    assert_eq!(charset.as_deref(), Some("utf8mb4"));
 }
 
 #[test]
@@ -101,6 +213,24 @@ fn pdo_pgsql_rewrites_positional_placeholders_outside_strings() {
             .expect("placeholders should rewrite"),
         "SELECT '?' AS literal, $1 AS value, $2 AS second"
     );
+}
+
+#[test]
+fn pdo_pgsql_constructor_failure_raises_pdo_exception() {
+    let result = execute_source(
+        r#"<?php
+try {
+    $pdo = new PDO("sqlite::memory:");
+    $pdo->__construct("pgsql:host=127.0.0.1;port=abc");
+    echo "not-thrown";
+} catch (PDOException $e) {
+    echo "caught:", strlen($e->getMessage()) > 0 ? "message" : "empty";
+}
+"#,
+    );
+
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(result.output.as_bytes(), b"caught:message");
 }
 
 #[test]
@@ -6067,6 +6197,58 @@ var_dump(str_contains($archive->getStub(), '__HALT_COMPILER'));
     assert_eq!(
         result.output.to_string_lossy(),
         "int(2)\nbool(true)\nbool(true)\nbool(false)\nstring(20) \"fixture-methods.phar\"\nbool(true)\nbool(true)\n"
+    );
+}
+
+#[test]
+fn phar_arrayaccess_returns_fileinfo_with_metadata() {
+    let root = std::env::temp_dir().join(format!(
+        "phrust-phar-arrayaccess-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("temp phar root should be created");
+    let archive = root.join("metadata-fixture.phar");
+    let archive_path = archive.to_string_lossy().replace('\\', "\\\\");
+    let source = format!(
+        r#"<?php
+$hex = '3c3f706870205f5f48414c545f434f4d50494c455228293b203f3e0d0abc00000002000000110000000100150000006d657461646174612d666978747572652e706861722b000000613a323a7b733a373a2261726368697665223b733a343a226d657461223b733a313a226e223b693a333b7d08000000646174612e74787407000000f93c506a07000000156a2c42a40100001d000000613a313a7b733a353a22656e747279223b733a343a226d657461223b7d0d0000006c69622f68656c6c6f2e7068702e000000f93c506a2e000000924eee49a4010000000000007061796c6f61643c3f706870206563686f202266726f6d2d706861727c223b2072657475726e2022696e636c7564652d6f6b223b0a84e76fd65c15ed5859574cf7d652aafa41b0259dc96873783289da7164e0dd0c0300000047424d42';
+file_put_contents('{archive_path}', hex2bin($hex));
+$archive = new Phar('{archive_path}');
+$entry = $archive['data.txt'];
+var_dump($archive instanceof ArrayAccess);
+var_dump($archive instanceof Countable);
+var_dump($entry instanceof PharFileInfo);
+var_dump($entry instanceof SplFileInfo);
+var_dump($archive->getMetadata());
+var_dump($entry->getMetadata());
+var_dump($entry->getContent());
+var_dump($entry->getFilename());
+echo str_replace('phar://{archive_path}/', '', $entry->getPathname()), "\n";
+"#
+    );
+    let result = execute_source_with_options(
+        &source,
+        VmOptions {
+            execution_format: ExecutionFormat::Auto,
+            runtime_context: RuntimeContext::default()
+                .with_cwd(root.clone())
+                .with_filesystem_capabilities(
+                    php_runtime::FilesystemCapabilities::none()
+                        .with_allowed_roots(vec![root.clone()]),
+                ),
+            ..VmOptions::default()
+        },
+    );
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(
+        result.output.to_string_lossy(),
+        "bool(true)\nbool(true)\nbool(true)\nbool(true)\narray(2) {\n  [\"archive\"]=>\n  string(4) \"meta\"\n  [\"n\"]=>\n  int(3)\n}\narray(1) {\n  [\"entry\"]=>\n  string(4) \"meta\"\n}\nstring(7) \"payload\"\nstring(8) \"data.txt\"\ndata.txt\n"
     );
 }
 
@@ -13335,10 +13517,40 @@ fn internal_builtin_by_ref_metadata_uses_generated_arginfo() {
         internal_builtin_by_ref_param_name("pcntl_waitpid", 3),
         "resource_usage"
     );
+    assert!(internal_builtin_param_requires_reference(
+        "openssl_random_pseudo_bytes",
+        1
+    ));
+    assert_eq!(
+        internal_builtin_by_ref_param_name("openssl_random_pseudo_bytes", 1),
+        "strong_result"
+    );
+    assert!(internal_builtin_param_requires_reference(
+        "openssl_encrypt",
+        5
+    ));
+    assert_eq!(
+        internal_builtin_by_ref_param_name("openssl_encrypt", 5),
+        "tag"
+    );
     assert!(!internal_builtin_param_requires_reference(
         "pcntl_waitpid",
         2
     ));
+}
+
+#[test]
+fn internal_builtin_generated_by_ref_out_param_suppresses_undefined_warning() {
+    let result = execute_source(
+        r#"<?php
+$iv = str_repeat("0", openssl_cipher_iv_length("aes-128-cbc"));
+openssl_encrypt("payload", "aes-128-cbc", "secret", 0, $iv, $tag);
+var_dump($tag);
+"#,
+    );
+
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(result.output.as_bytes(), b"NULL\n");
 }
 
 #[test]
@@ -18623,63 +18835,57 @@ fn spl_multiple_iterator_callbacks_survive_self_detach() {
 }
 
 #[test]
-fn redis_fake_backend_covers_core_cache_probe_surface() {
+fn redis_endpoint_client_fails_closed_without_daemon() {
     let result = execute_source(
         r#"<?php
             $redis = new Redis();
             echo class_exists("Redis", false) ? "class|" : "missing|";
             echo $redis instanceof Redis ? "instance|" : "not-instance|";
             echo method_exists($redis, "getMultiple") ? "method|" : "no-method|";
-            echo $redis->connect("127.0.0.1") ? "connected|" : "offline|";
-            $redis->set("a", "1");
-            echo $redis->get("a"), "|";
-            echo $redis->incr("n"), ":", $redis->incrBy("n", 4), "|";
-            $redis->mset(["b" => "2", "c" => "3"]);
-            $many = $redis->mget(["a", "b", "missing"]);
-            echo $many[0], ":", $many[1], ":", ($many[2] === false ? "false" : "bad"), "|";
-            echo $redis->hSet("h", "f", "v"), ":", $redis->hGet("h", "f"), "|";
-            echo $redis->lPush("l", "x", "y"), ":", $redis->rPop("l"), "|";
-            echo $redis->sAdd("s", "u", "u", "v"), ":", ($redis->sIsMember("s", "v") ? "yes" : "no"), "|";
-            echo $redis->zAdd("z", 1, "m"), ":", $redis->zRange("z", 0, -1)[0], "|";
-            echo $redis->del("a", "missing"), ":", $redis->exists("a", "b");
+            echo $redis->connect("127.0.0.1", 1, 0.001) ? "connected|" : "offline|";
+            echo $redis->isConnected() ? "still-on|" : "closed|";
+            echo $redis->set("a", "1") ? "set|" : "no-set|";
+            echo $redis->get("a") === false ? "miss|" : "fake-hit|";
+            echo $redis->mset(["b" => "2"]) ? "mset|" : "no-mset|";
+            echo $redis->mget(["a", "b"]) === false ? "no-mget|" : "fake-mget|";
+            echo $redis->hSet("h", "f", "v") === false ? "no-hset|" : "fake-hset|";
+            echo $redis->lPush("l", "x") === false ? "no-lpush|" : "fake-lpush|";
+            echo $redis->lRange("l", 0, -1) === false ? "no-lrange|" : "fake-lrange|";
+            echo $redis->ttl("a") === false ? "no-ttl" : "fake-ttl";
             "#,
     );
 
     assert!(result.status.is_success(), "{:?}", result.status);
     assert_eq!(
         result.output.as_bytes(),
-        b"class|instance|method|connected|1|1:5|1:2:false|1:v|2:x|2:yes|1:m|1:1"
+        b"class|instance|method|offline|closed|no-set|miss|no-mset|no-mget|no-hset|no-lpush|no-lrange|no-ttl"
     );
 }
 
 #[test]
-fn memcached_fake_backend_tracks_core_cache_result_surface() {
+fn memcached_endpoint_client_fails_closed_without_daemon() {
     let result = execute_source(
         r#"<?php
             $memcached = new Memcached();
             echo class_exists("Memcached", false) ? "class|" : "missing|";
             echo $memcached instanceof Memcached ? "instance|" : "not-instance|";
             echo method_exists($memcached, "getMulti") ? "method|" : "no-method|";
-            echo Memcached::RES_SUCCESS, ":", Memcached::RES_NOTFOUND, "|";
-            echo $memcached->addServer("127.0.0.1", 11211) ? "server|" : "no-server|";
-            $memcached->set("a", "1");
-            echo $memcached->get("a"), ":", $memcached->getResultCode(), "|";
-            echo ($memcached->add("a", "2") ? "add" : "no-add"), ":", $memcached->getResultCode(), "|";
-            echo $memcached->replace("a", "3") ? $memcached->get("a") : "bad", "|";
-            $memcached->setMulti(["b" => "2", "c" => "3"]);
-            $many = $memcached->getMulti(["a", "b", "missing"]);
-            echo $many["a"], ":", $many["b"], ":", (isset($many["missing"]) ? "bad" : "missing"), "|";
-            echo $memcached->increment("n", 2, 10), ":", $memcached->decrement("n", 3), "|";
-            echo $memcached->append("a", "x") ? $memcached->get("a") : "bad", "|";
-            echo $memcached->delete("a") ? "deleted|" : "not-deleted|";
-            echo ($memcached->get("a") === false ? "miss" : "bad"), ":", $memcached->getResultCode();
+            echo Memcached::RES_SUCCESS, ":", Memcached::RES_NOTFOUND, ":", Memcached::RES_FAILURE, "|";
+            echo $memcached->addServer("127.0.0.1", 1) ? "server|" : "no-server|";
+            echo $memcached->getResultCode(), ":", $memcached->getResultMessage(), "|";
+            echo $memcached->set("a", "1") ? "set|" : "no-set|";
+            echo $memcached->get("a") === false ? "miss|" : "fake-hit|";
+            echo $memcached->setMulti(["b" => "2"]) ? "mset|" : "no-mset|";
+            echo $memcached->getMulti(["a", "b"]) === false ? "no-mget|" : "fake-mget|";
+            echo $memcached->increment("n", 2, 10) === false ? "no-incr|" : "fake-incr|";
+            echo $memcached->delete("a") ? "deleted" : "not-deleted";
             "#,
     );
 
     assert!(result.status.is_success(), "{:?}", result.status);
     assert_eq!(
         result.output.as_bytes(),
-        b"class|instance|method|0:16|server|1:0|no-add:16|3|3:2:missing|10:7|3x|deleted|miss:16"
+        b"class|instance|method|0:16:1|no-server|1:FAILURE|no-set|miss|no-mset|no-mget|no-incr|not-deleted"
     );
 }
 
@@ -18691,6 +18897,9 @@ fn imagick_surface_fails_closed_without_imagemagick_backend() {
             echo class_exists("Imagick", false) ? "class|" : "no-class|";
             echo class_exists("ImagickDraw", false) ? "draw|" : "no-draw|";
             echo method_exists("Imagick", "readImage") ? "method|" : "no-method|";
+            echo method_exists("Imagick", "readImageBlob") ? "blob|" : "no-blob|";
+            echo method_exists("Imagick", "getImageWidth") ? "width|" : "no-width|";
+            echo method_exists("Imagick", "stripImage") ? "strip|" : "no-strip|";
             $reflection = new ReflectionClass("Imagick");
             echo $reflection->getName(), ":", $reflection->getExtensionName(), "|";
             new Imagick();
@@ -18700,7 +18909,7 @@ fn imagick_surface_fails_closed_without_imagemagick_backend() {
     assert_eq!(result.status.exit_status(), ExitStatus::RuntimeError);
     assert_eq!(
         result.output.as_bytes(),
-        b"loaded|class|draw|method|Imagick:imagick|"
+        b"loaded|class|draw|method|blob|width|strip|Imagick:imagick|"
     );
     assert_eq!(result.diagnostics[0].id(), "E_PHP_VM_UNSUPPORTED_IMAGICK");
 }
@@ -20017,6 +20226,34 @@ fn by_ref_builtin_indirect_temporary_warns_and_uses_temp_cell() {
 }
 
 #[test]
+fn openssl_random_pseudo_bytes_initializes_strong_result_output_arg() {
+    let result = execute_source(
+        "<?php
+            $bytes = openssl_random_pseudo_bytes(8, $strong);
+            echo strlen($bytes), '|', $strong ? 'strong' : 'weak';
+            ",
+    );
+
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(result.output.as_bytes(), b"8|strong");
+}
+
+#[test]
+fn pcre_replace_builtins_initialize_count_output_args_quietly() {
+    let result = execute_source(
+        "<?php
+            echo preg_replace('/a/', 'b', 'aa', -1, $replace_count), ':', $replace_count, \"\\n\";
+            echo preg_filter('/a/', 'b', 'aa', -1, $filter_count), ':', $filter_count, \"\\n\";
+            echo preg_replace_callback('/a/', fn($m) => 'b', 'aa', -1, $callback_count), ':', $callback_count, \"\\n\";
+            echo preg_replace_callback_array(['/a/' => fn($m) => 'b'], 'aa', -1, $array_count), ':', $array_count;
+            ",
+    );
+
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(result.output.as_bytes(), b"bb:2\nbb:2\nbb:2\nbb:2");
+}
+
+#[test]
 fn array_sort_builtins_mutate_private_properties() {
     let result = execute_source(
         "<?php
@@ -20364,9 +20601,9 @@ fn call_by_ref_argument_mismatch_is_catchable_error() {
 
 #[test]
 fn sysvshm_destroyed_handle_is_catchable_error() {
-    let result = execute_source(
-        "<?php
-            $shm = shm_attach(42, 1024);
+    let key = unique_sysvshm_vm_key(1);
+    let source = r"<?php
+            $shm = shm_attach(__KEY__, 1024);
             shm_remove($shm);
             shm_detach($shm);
             try {
@@ -20374,8 +20611,9 @@ fn sysvshm_destroyed_handle_is_catchable_error() {
             } catch (Error $e) {
                 echo $e->getMessage();
             }
-            ",
-    );
+            "
+    .replace("__KEY__", &key.to_string());
+    let result = execute_source(&source);
 
     assert!(result.status.is_success(), "{:?}", result.status);
     assert_eq!(
@@ -20386,9 +20624,9 @@ fn sysvshm_destroyed_handle_is_catchable_error() {
 
 #[test]
 fn sysvshm_put_var_propagates_serialize_exception() {
-    let result = execute_source(
-        "<?php
-            $shm = shm_attach(43, 1024);
+    let key = unique_sysvshm_vm_key(2);
+    let source = r"<?php
+            $shm = shm_attach(__KEY__, 1024);
             class SysvshmSerializeThrows {
                 public function __serialize(): array {
                     throw new Error('no');
@@ -20399,8 +20637,10 @@ fn sysvshm_put_var_propagates_serialize_exception() {
             } catch (Error $e) {
                 echo $e->getMessage();
             }
-            ",
-    );
+            shm_remove($shm);
+            "
+    .replace("__KEY__", &key.to_string());
+    let result = execute_source(&source);
 
     assert!(result.status.is_success(), "{:?}", result.status);
     assert_eq!(result.output.as_bytes(), b"no");
@@ -20408,29 +20648,35 @@ fn sysvshm_put_var_propagates_serialize_exception() {
 
 #[test]
 fn sysvshm_put_var_detects_detach_during_serialize() {
-    let result = execute_source(
-        "<?php
+    let key = unique_sysvshm_vm_key(3);
+    let source = r"<?php
             class SysvshmSerializeDetaches {
                 public function __serialize(): array {
                     global $shm;
+                    shm_remove($shm);
                     shm_detach($shm);
                     return ['a' => 'b'];
                 }
             }
-            $shm = shm_attach(44, 1024);
+            $shm = shm_attach(__KEY__, 1024);
             try {
                 shm_put_var($shm, 1, new SysvshmSerializeDetaches);
             } catch (Error $e) {
                 echo $e->getMessage();
             }
-            ",
-    );
+            "
+    .replace("__KEY__", &key.to_string());
+    let result = execute_source(&source);
 
     assert!(result.status.is_success(), "{:?}", result.status);
     assert_eq!(
         result.output.as_bytes(),
         b"Shared memory block has been destroyed by the serialization function"
     );
+}
+
+fn unique_sysvshm_vm_key(offset: i64) -> i64 {
+    0x5500_0000_i64 | (((std::process::id() as i64) & 0xffff) << 4) | (offset & 0x0f)
 }
 
 #[test]
