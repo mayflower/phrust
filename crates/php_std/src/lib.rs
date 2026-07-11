@@ -480,7 +480,23 @@ impl ExtensionRegistry {
     }
 
     fn build_standard_library() -> Self {
-        Self::from_extensions(generated::extensions::descriptors())
+        let mut extensions = generated::extensions::descriptors();
+        if let Some(sysvmsg) = extensions
+            .iter_mut()
+            .find(|extension| extension.name() == "sysvmsg")
+        {
+            for constant in &mut sysvmsg.constants {
+                let value = match constant.name() {
+                    "MSG_EAGAIN" => Some(libc::EAGAIN),
+                    "MSG_ENOMSG" => Some(libc::ENOMSG),
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    constant.value = Some(ConstantValue::Int(i64::from(value)));
+                }
+            }
+        }
+        Self::from_extensions(extensions)
     }
 
     /// Returns extension descriptors in stable name order.
@@ -1249,6 +1265,12 @@ mod tests {
                 .enabled_constant("MSG_ENOMSG")
                 .and_then(ConstantDescriptor::value),
             Some(ConstantValue::Int(libc::ENOMSG as i64))
+        );
+        assert_eq!(
+            registry
+                .enabled_constant("MSG_EAGAIN")
+                .and_then(ConstantDescriptor::value),
+            Some(ConstantValue::Int(libc::EAGAIN as i64))
         );
     }
 
