@@ -432,6 +432,25 @@ pub(super) fn php_visible_non_register_root_object_ids(
     collect_root_object_ids(stack, state, false)
 }
 
+/// Runs `f` with the thread-local scan scratch (seen set + work list),
+/// cleared but with capacity retained across scans. The scans run on every
+/// object-overwriting store, so re-growing fresh tables per scan is pure
+/// allocator/rehash overhead. Traversal never re-enters PHP, so the
+/// scratch borrow never nests.
+fn with_gc_scan_scratch<R>(f: impl FnOnce(&mut GcSeenSet, &mut Vec<GcPendingEntity>) -> R) -> R {
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<(GcSeenSet, Vec<GcPendingEntity>)> =
+            std::cell::RefCell::new((GcSeenSet::default(), Vec::new()));
+    }
+    SCRATCH.with(|scratch| {
+        let mut guard = scratch.borrow_mut();
+        let (seen, pending) = &mut *guard;
+        seen.clear();
+        pending.clear();
+        f(seen, pending)
+    })
+}
+
 fn collect_root_object_ids(
     stack: &CallStack,
     state: &ExecutionState,
@@ -442,67 +461,85 @@ fn collect_root_object_ids(
     // into the work list; per-value deep clones are scan overhead.
     let _source = layout_source::enter(layout_source::GC_ROOT_SCAN);
     let mut object_ids = GcObjectIdSet::default();
-    let mut seen = GcSeenSet::default();
-    let mut pending = Vec::new();
+    with_gc_scan_scratch(|seen, pending| {
+        collect_root_object_ids_into(
+            stack,
+            state,
+            include_current_registers,
+            seen,
+            &mut object_ids,
+            pending,
+        );
+    });
+    object_ids
+}
+
+fn collect_root_object_ids_into(
+    stack: &CallStack,
+    state: &ExecutionState,
+    include_current_registers: bool,
+    seen: &mut GcSeenSet,
+    object_ids: &mut GcObjectIdSet,
+    pending: &mut Vec<GcPendingEntity>,
+) {
     for frame in stack.frames() {
         if include_current_registers {
             for (_, value) in frame.registers.iter() {
-                gc_note_value(value, &mut seen, &mut object_ids, &mut pending);
+                gc_note_value(value, seen, object_ids, pending);
             }
         }
         for (_, slot) in frame.locals.iter() {
-            gc_note_slot(slot, &mut seen, &mut object_ids, &mut pending);
+            gc_note_slot(slot, seen, object_ids, pending);
         }
     }
     for cell in state.static_locals.values() {
-        gc_note_reference(cell, &mut seen, &mut pending);
+        gc_note_reference(cell, seen, pending);
     }
     for value in state.static_properties.values() {
-        gc_note_value(value, &mut seen, &mut object_ids, &mut pending);
+        gc_note_value(value, seen, object_ids, pending);
     }
     for object in state.enum_cases.values() {
         object_ids.insert(object.id());
     }
     for entry in &state.shutdown_functions {
-        gc_note_value(&entry.callback, &mut seen, &mut object_ids, &mut pending);
+        gc_note_value(&entry.callback, seen, object_ids, pending);
         for arg in &entry.args {
-            gc_note_value(&arg.value, &mut seen, &mut object_ids, &mut pending);
+            gc_note_value(&arg.value, seen, object_ids, pending);
         }
     }
     for callback in state.autoload_registry.callbacks() {
-        gc_note_callable(callback, &mut seen, &mut object_ids, &mut pending);
+        gc_note_callable(callback, seen, object_ids, pending);
     }
-    gc_note_array(&state.globals.globals_array(), &mut seen, &mut pending);
+    gc_note_array(&state.globals.globals_array(), seen, pending);
     for continuation in state.generator_continuations.values() {
         for (_, value) in continuation.frame.registers.iter() {
-            gc_note_value(value, &mut seen, &mut object_ids, &mut pending);
+            gc_note_value(value, seen, object_ids, pending);
         }
         for (_, slot) in continuation.frame.locals.iter() {
-            gc_note_slot(slot, &mut seen, &mut object_ids, &mut pending);
+            gc_note_slot(slot, seen, object_ids, pending);
         }
     }
     for continuations in state.fiber_continuations.values() {
         for continuation in continuations {
             for (_, value) in continuation.frame.registers.iter() {
-                gc_note_value(value, &mut seen, &mut object_ids, &mut pending);
+                gc_note_value(value, seen, object_ids, pending);
             }
             for (_, slot) in continuation.frame.locals.iter() {
-                gc_note_slot(slot, &mut seen, &mut object_ids, &mut pending);
+                gc_note_slot(slot, seen, object_ids, pending);
             }
         }
     }
-    gc_drain_reachable(&mut seen, &mut object_ids, &mut pending);
-    object_ids
+    gc_drain_reachable(seen, object_ids, pending);
 }
 
 pub(super) fn preserved_destructor_object_ids(preserved: &[Value]) -> GcObjectIdSet {
-    let mut seen = GcSeenSet::default();
     let mut object_ids = GcObjectIdSet::default();
-    let mut pending = Vec::new();
-    for value in preserved {
-        gc_note_value(value, &mut seen, &mut object_ids, &mut pending);
-    }
-    gc_drain_reachable(&mut seen, &mut object_ids, &mut pending);
+    with_gc_scan_scratch(|seen, pending| {
+        for value in preserved {
+            gc_note_value(value, seen, &mut object_ids, pending);
+        }
+        gc_drain_reachable(seen, &mut object_ids, pending);
+    });
     object_ids
 }
 
