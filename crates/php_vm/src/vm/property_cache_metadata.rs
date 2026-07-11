@@ -1,5 +1,19 @@
 use super::prelude::*;
 
+pub(super) fn property_hook_is_active(
+    state: &ExecutionState,
+    object: &ObjectRef,
+    class: &php_ir::module::ClassEntry,
+    property: &php_ir::module::ClassPropertyEntry,
+) -> bool {
+    let class_name = normalize_class_name(&class.name);
+    state.property_hook_stack.iter().any(|active| {
+        active.object_id == object.id()
+            && active.class_name == class_name
+            && active.property == property.name
+    })
+}
+
 pub(super) fn property_storage_name(
     class: &php_ir::module::ClassEntry,
     property: &php_ir::module::ClassPropertyEntry,

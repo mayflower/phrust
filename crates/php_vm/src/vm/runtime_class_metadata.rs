@@ -1,5 +1,41 @@
 use super::prelude::*;
 
+pub(super) fn is_fiber_runtime_class(class_name: &str) -> bool {
+    normalize_class_name(class_name) == "fiber"
+}
+
+pub(super) fn is_closure_runtime_class(class_name: &str) -> bool {
+    normalize_class_name(class_name) == "closure"
+}
+
+/// Returns true when a statically named `new` expression can lower to the
+/// dense `NewObject` opcode. Builtin runtime classes keep their dedicated
+/// rich-interpreter construction paths; everything else resolves through
+/// the shared userland instantiation helpers at execution time (including
+/// autoload, abstract/interface/enum guards, and constructor dispatch).
+pub(crate) fn dense_new_object_lowering_supported(class_name: &str) -> bool {
+    !(is_special_static_class_name(class_name)
+        || is_closure_runtime_class(class_name)
+        || is_fiber_runtime_class(class_name)
+        || is_reflection_runtime_class(class_name)
+        || is_phar_runtime_class(class_name)
+        || is_zip_runtime_class(class_name)
+        || is_xml_runtime_class(class_name)
+        || is_pdo_runtime_class(class_name)
+        || is_sqlite_runtime_class(class_name)
+        || is_spl_iterator_runtime_class(class_name)
+        || is_spl_container_runtime_class(class_name)
+        || is_spl_heap_runtime_class(class_name)
+        || is_spl_file_runtime_class(class_name)
+        || is_std_class_runtime_class(class_name)
+        || is_php_token_runtime_class(class_name)
+        || is_fileinfo_runtime_class(class_name)
+        || is_imagick_runtime_class(class_name)
+        || is_xsl_runtime_class(class_name)
+        || is_soap_runtime_class(class_name)
+        || is_date_time_runtime_class(class_name))
+}
+
 pub(super) fn runtime_class_entry(
     compiled: &CompiledUnit,
     state: &ExecutionState,

@@ -1,5 +1,9 @@
 use super::prelude::*;
 
+pub(super) fn normalize_method_name(method: &str) -> String {
+    method.to_ascii_lowercase()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn method_call_profile_observation(
     callsite: &str,

@@ -112,6 +112,7 @@ use reflection::*;
 use request_lifecycle::RequestLifecycleState;
 pub use result::VmStepLimitDiagnostic;
 pub use result::{VmControlFlow, VmResult};
+pub(crate) use runtime_class_metadata::dense_new_object_lowering_supported;
 use runtime_class_metadata::*;
 use spl::*;
 use static_property_predicates::*;
@@ -28463,60 +28464,6 @@ fn spl_debug_view_value(value: Value, excluded_object_id: Option<u64>) -> Value 
         }
         value => value,
     }
-}
-
-fn property_hook_is_active(
-    state: &ExecutionState,
-    object: &ObjectRef,
-    class: &php_ir::module::ClassEntry,
-    property: &php_ir::module::ClassPropertyEntry,
-) -> bool {
-    let class_name = normalize_class_name(&class.name);
-    state.property_hook_stack.iter().any(|active| {
-        active.object_id == object.id()
-            && active.class_name == class_name
-            && active.property == property.name
-    })
-}
-
-fn normalize_method_name(method: &str) -> String {
-    method.to_ascii_lowercase()
-}
-
-fn is_fiber_runtime_class(class_name: &str) -> bool {
-    normalize_class_name(class_name) == "fiber"
-}
-
-fn is_closure_runtime_class(class_name: &str) -> bool {
-    normalize_class_name(class_name) == "closure"
-}
-
-/// Returns true when a statically named `new` expression can lower to the
-/// dense `NewObject` opcode. Builtin runtime classes keep their dedicated
-/// rich-interpreter construction paths; everything else resolves through
-/// the shared userland instantiation helpers at execution time (including
-/// autoload, abstract/interface/enum guards, and constructor dispatch).
-pub(crate) fn dense_new_object_lowering_supported(class_name: &str) -> bool {
-    !(is_special_static_class_name(class_name)
-        || is_closure_runtime_class(class_name)
-        || is_fiber_runtime_class(class_name)
-        || is_reflection_runtime_class(class_name)
-        || is_phar_runtime_class(class_name)
-        || is_zip_runtime_class(class_name)
-        || is_xml_runtime_class(class_name)
-        || is_pdo_runtime_class(class_name)
-        || is_sqlite_runtime_class(class_name)
-        || is_spl_iterator_runtime_class(class_name)
-        || is_spl_container_runtime_class(class_name)
-        || is_spl_heap_runtime_class(class_name)
-        || is_spl_file_runtime_class(class_name)
-        || is_std_class_runtime_class(class_name)
-        || is_php_token_runtime_class(class_name)
-        || is_fileinfo_runtime_class(class_name)
-        || is_imagick_runtime_class(class_name)
-        || is_xsl_runtime_class(class_name)
-        || is_soap_runtime_class(class_name)
-        || is_date_time_runtime_class(class_name))
 }
 
 fn emit_zip_open_empty_file_deprecation(
