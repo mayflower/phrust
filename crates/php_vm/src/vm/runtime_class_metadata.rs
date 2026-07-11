@@ -335,3 +335,328 @@ pub(super) fn runtime_attributes(
         })
         .collect()
 }
+
+pub(super) fn internal_runtime_class_entry(normalized: &str) -> Option<php_ir::module::ClassEntry> {
+    if is_std_class_runtime_class(normalized) {
+        return Some(empty_internal_class_entry("stdClass", None, None, false));
+    }
+    if is_hash_context_runtime_class(normalized) {
+        return Some(internal_hash_context_class_entry());
+    }
+    if is_php_token_runtime_class(normalized) {
+        return Some(internal_php_token_class_entry());
+    }
+    if is_redis_runtime_class(normalized) {
+        return Some(empty_internal_class_entry("Redis", None, None, false));
+    }
+    if is_memcached_runtime_class(normalized) {
+        return Some(empty_internal_class_entry("Memcached", None, None, false));
+    }
+    if is_soap_runtime_class(normalized) {
+        let display_name = soap_display_name(&normalize_class_name(normalized));
+        return Some(empty_internal_class_entry(display_name, None, None, false));
+    }
+    if is_supported_spl_runtime_class(normalized) {
+        return Some(internal_spl_class_entry(normalized));
+    }
+    if normalize_class_name(normalized) == "datetimeinterface"
+        || is_date_time_runtime_class(normalized)
+    {
+        return Some(internal_date_time_class_entry(normalized));
+    }
+    if normalize_class_name(normalized) == "throwable"
+        || internal_throwable_instanceof(normalized, "throwable").is_some()
+    {
+        return Some(internal_throwable_class_entry(normalized));
+    }
+    None
+}
+
+pub(super) fn internal_runtime_parent_is_known(
+    _class: &php_ir::module::ClassEntry,
+    parent_name: &str,
+) -> bool {
+    internal_runtime_class_entry(&normalize_class_name(parent_name)).is_some()
+}
+
+pub(super) fn internal_spl_class_entry(normalized: &str) -> php_ir::module::ClassEntry {
+    if is_spl_interface_runtime_class(normalized) {
+        let display_name = display_class_name(normalized);
+        let mut entry = empty_internal_class_entry(&display_name, None, None, true);
+        entry.interfaces = internal_class_interfaces(&display_name)
+            .into_iter()
+            .map(|interface| normalize_class_name(&interface))
+            .collect();
+        return entry;
+    }
+    let runtime_class = if is_spl_iterator_runtime_class(normalized) {
+        spl_iterator_class(normalized)
+    } else if is_spl_container_runtime_class(normalized) {
+        spl_container_class(normalized)
+    } else if is_spl_heap_runtime_class(normalized) {
+        spl_heap_class(normalized)
+    } else {
+        spl_file_class(normalized)
+    };
+    let display_name = if is_spl_iterator_runtime_class(normalized) {
+        spl_iterator_display_name(normalized)
+    } else if is_spl_container_runtime_class(normalized) {
+        spl_container_display_name(normalized)
+    } else if is_spl_heap_runtime_class(normalized) {
+        spl_heap_display_name(normalized)
+    } else {
+        spl_file_display_name(normalized)
+    };
+    let parent_display_name = runtime_class.parent.as_deref().map(display_class_name);
+    let mut entry = empty_internal_class_entry(
+        display_name,
+        runtime_class.parent.clone(),
+        parent_display_name,
+        false,
+    );
+    entry.interfaces = runtime_class.interfaces.clone();
+    entry
+}
+
+pub(super) fn internal_throwable_class_entry(normalized: &str) -> php_ir::module::ClassEntry {
+    let display_name = internal_throwable_display_name(normalized);
+    let parent = internal_throwable_parent(normalized).map(normalize_class_name);
+    let parent_display_name = internal_throwable_parent(normalized).map(display_class_name);
+    empty_internal_class_entry(
+        &display_name,
+        parent,
+        parent_display_name,
+        normalize_class_name(normalized) == "throwable",
+    )
+}
+
+pub(super) fn empty_internal_class_entry(
+    display_name: &str,
+    parent: Option<String>,
+    parent_display_name: Option<String>,
+    is_interface: bool,
+) -> php_ir::module::ClassEntry {
+    php_ir::module::ClassEntry {
+        id: ClassId::new(u32::MAX),
+        name: normalize_class_name(display_name),
+        display_name: display_name.to_owned(),
+        parent,
+        parent_display_name,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor: None,
+        flags: php_ir::module::ClassFlags {
+            is_interface,
+            ..php_ir::module::ClassFlags::default()
+        },
+        span: IrSpan::default(),
+    }
+}
+
+pub(super) fn internal_hash_context_class_entry() -> php_ir::module::ClassEntry {
+    let mut entry = empty_internal_class_entry("HashContext", None, None, false);
+    let constructor = FunctionId::new(u32::MAX);
+    entry.methods.push(php_ir::module::ClassMethodEntry {
+        name: "__construct".to_owned(),
+        origin_class: entry.name.clone(),
+        function: constructor,
+        flags: php_ir::module::ClassMethodFlags {
+            is_private: true,
+            ..php_ir::module::ClassMethodFlags::default()
+        },
+        attributes: Vec::new(),
+    });
+    entry.constructor = Some(constructor);
+    entry
+}
+
+pub(super) fn internal_php_token_class_entry() -> php_ir::module::ClassEntry {
+    let mut entry = empty_internal_class_entry("PhpToken", None, None, false);
+    entry.interfaces.push(normalize_class_name("Stringable"));
+    let constructor = FunctionId::new(u32::MAX);
+    entry.methods.push(php_ir::module::ClassMethodEntry {
+        name: "__construct".to_owned(),
+        origin_class: entry.name.clone(),
+        function: constructor,
+        flags: php_ir::module::ClassMethodFlags {
+            is_final: true,
+            ..php_ir::module::ClassMethodFlags::default()
+        },
+        attributes: Vec::new(),
+    });
+    entry.constructor = Some(constructor);
+    entry
+}
+
+pub(super) fn internal_enum_class_entry(normalized: &str) -> Option<php_ir::module::ClassEntry> {
+    match normalized {
+        "roundingmode" => Some(rounding_mode_class_entry()),
+        "pdo" => Some(internal_empty_class_entry("pdo", "PDO")),
+        "pdostatement" => Some(internal_empty_class_entry("pdostatement", "PDOStatement")),
+        "pdorow" => Some(internal_empty_class_entry("pdorow", "PDORow")),
+        "mysqli" => Some(internal_empty_class_entry("mysqli", "mysqli")),
+        "mysqli_driver" => Some(internal_empty_class_entry("mysqli_driver", "mysqli_driver")),
+        "mysqli_result" => Some(internal_empty_class_entry("mysqli_result", "mysqli_result")),
+        "mysqli_stmt" => Some(internal_empty_class_entry("mysqli_stmt", "mysqli_stmt")),
+        "mysqli_warning" => Some(internal_empty_class_entry(
+            "mysqli_warning",
+            "mysqli_warning",
+        )),
+        "redis" => Some(internal_empty_class_entry("redis", "Redis")),
+        "redisexception" => Some(internal_empty_class_entry(
+            "redisexception",
+            "RedisException",
+        )),
+        "memcached" => Some(internal_empty_class_entry("memcached", "Memcached")),
+        "memcachedexception" => Some(internal_empty_class_entry(
+            "memcachedexception",
+            "MemcachedException",
+        )),
+        "finfo" => Some(internal_empty_class_entry("finfo", "finfo")),
+        "messagepack" => Some(internal_empty_class_entry("messagepack", "MessagePack")),
+        "messagepackunpacker" => Some(internal_empty_class_entry(
+            "messagepackunpacker",
+            "MessagePackUnpacker",
+        )),
+        "imagick" => Some(internal_empty_class_entry("imagick", "Imagick")),
+        "imagickdraw" => Some(internal_empty_class_entry("imagickdraw", "ImagickDraw")),
+        "imagickpixel" => Some(internal_empty_class_entry("imagickpixel", "ImagickPixel")),
+        "imagickpixeliterator" => Some(internal_empty_class_entry(
+            "imagickpixeliterator",
+            "ImagickPixelIterator",
+        )),
+        "imagickexception" => Some(internal_empty_class_entry(
+            "imagickexception",
+            "ImagickException",
+        )),
+        "phar" => {
+            let mut entry = internal_empty_class_entry("phar", "Phar");
+            entry.interfaces.push(normalize_class_name("ArrayAccess"));
+            entry.interfaces.push(normalize_class_name("Countable"));
+            Some(entry)
+        }
+        "phardata" => Some(internal_empty_class_entry("phardata", "PharData")),
+        "pharfileinfo" => {
+            let mut entry = internal_empty_class_entry("pharfileinfo", "PharFileInfo");
+            entry.parent = Some(normalize_class_name("SplFileInfo"));
+            entry.parent_display_name = Some("SplFileInfo".to_owned());
+            Some(entry)
+        }
+        "ziparchive" => Some(internal_empty_class_entry("ziparchive", "ZipArchive")),
+        "gdimage" => Some(internal_empty_class_entry("gdimage", "GdImage")),
+        "domdocument" => Some(internal_empty_class_entry("domdocument", "DOMDocument")),
+        "domnode" => Some(internal_empty_class_entry("domnode", "DOMNode")),
+        "domattr" => Some(internal_empty_class_entry("domattr", "DOMAttr")),
+        "domtext" => Some(internal_empty_class_entry("domtext", "DOMText")),
+        "domcomment" => Some(internal_empty_class_entry("domcomment", "DOMComment")),
+        "domcdatasection" => Some(internal_empty_class_entry(
+            "domcdatasection",
+            "DOMCdataSection",
+        )),
+        "domelement" => Some(internal_empty_class_entry("domelement", "DOMElement")),
+        "domnodelist" => Some(internal_empty_class_entry("domnodelist", "DOMNodeList")),
+        "domnamednodemap" => Some(internal_empty_class_entry(
+            "domnamednodemap",
+            "DOMNamedNodeMap",
+        )),
+        "domxpath" => Some(internal_empty_class_entry("domxpath", "DOMXPath")),
+        "simplexmlelement" => Some(internal_empty_class_entry(
+            "simplexmlelement",
+            "SimpleXMLElement",
+        )),
+        "xmlparser" => Some(internal_empty_class_entry("xmlparser", "XMLParser")),
+        "xmlreader" => Some(internal_empty_class_entry("xmlreader", "XMLReader")),
+        "xmlwriter" => Some(internal_empty_class_entry("xmlwriter", "XMLWriter")),
+        "xsltprocessor" => Some(internal_empty_class_entry("xsltprocessor", "XSLTProcessor")),
+        "normalizer" => Some(internal_empty_class_entry("normalizer", "Normalizer")),
+        "ffi" => Some(internal_empty_class_entry("ffi", "FFI")),
+        "ffi\\cdata" => Some(internal_empty_class_entry("ffi\\cdata", "FFI\\CData")),
+        "ffi\\ctype" => Some(internal_empty_class_entry("ffi\\ctype", "FFI\\CType")),
+        "ffi\\exception" => Some(internal_empty_class_entry(
+            "ffi\\exception",
+            "FFI\\Exception",
+        )),
+        "ffi\\parserexception" => Some(internal_empty_class_entry(
+            "ffi\\parserexception",
+            "FFI\\ParserException",
+        )),
+        "shmop" => Some(internal_empty_class_entry("shmop", "Shmop")),
+        "sysvmessagequeue" => Some(internal_empty_class_entry(
+            "sysvmessagequeue",
+            "SysvMessageQueue",
+        )),
+        "sysvsemaphore" => Some(internal_empty_class_entry("sysvsemaphore", "SysvSemaphore")),
+        "sysvsharedmemory" => Some(internal_empty_class_entry(
+            "sysvsharedmemory",
+            "SysvSharedMemory",
+        )),
+        _ => None,
+    }
+}
+
+pub(super) fn internal_empty_class_entry(
+    name: &str,
+    display_name: &str,
+) -> php_ir::module::ClassEntry {
+    php_ir::module::ClassEntry {
+        id: ClassId::new(u32::MAX - 1),
+        name: name.to_owned(),
+        display_name: display_name.to_owned(),
+        parent: None,
+        parent_display_name: None,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor: None,
+        flags: php_ir::module::ClassFlags::default(),
+        span: IrSpan::default(),
+    }
+}
+
+pub(super) fn rounding_mode_class_entry() -> php_ir::module::ClassEntry {
+    php_ir::module::ClassEntry {
+        id: ClassId::new(u32::MAX),
+        name: "roundingmode".to_owned(),
+        display_name: "RoundingMode".to_owned(),
+        parent: None,
+        parent_display_name: None,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: [
+            "HalfAwayFromZero",
+            "HalfTowardsZero",
+            "HalfEven",
+            "HalfOdd",
+            "TowardsZero",
+            "AwayFromZero",
+            "NegativeInfinity",
+            "PositiveInfinity",
+        ]
+        .into_iter()
+        .map(|name| php_ir::module::ClassEnumCaseEntry {
+            name: name.to_owned(),
+            value: None,
+            attributes: Vec::new(),
+        })
+        .collect(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor: None,
+        flags: php_ir::module::ClassFlags {
+            is_enum: true,
+            ..php_ir::module::ClassFlags::default()
+        },
+        span: IrSpan::default(),
+    }
+}
