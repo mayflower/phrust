@@ -543,22 +543,35 @@ pub(super) fn preserved_destructor_object_ids(preserved: &[Value]) -> GcObjectId
     object_ids
 }
 
-pub(super) fn destructor_candidates_for_value(value: &Value) -> Vec<ObjectRef> {
-    // The scan runs on every object-overwriting store; reusing one scratch
-    // set keeps its capacity across calls instead of re-growing a fresh
-    // table each time. The walk is a pure value-graph traversal (no PHP
-    // re-entry), so the borrow never nests.
-    thread_local! {
-        static SEEN_SCRATCH: std::cell::RefCell<GcSeenSet> =
-            std::cell::RefCell::new(GcSeenSet::default());
-    }
+/// Collects destructor candidates plus the shared-container flag from the
+/// scratch-backed walk (see [`collect_destructor_candidates_with_share_flag`]).
+fn destructor_candidates_with_share_flag(value: &Value) -> (Vec<ObjectRef>, bool) {
     let mut candidates = Vec::new();
-    SEEN_SCRATCH.with(|scratch| {
+    let mut saw_shared_container = false;
+    DESTRUCTOR_SEEN_SCRATCH.with(|scratch| {
         let mut seen = scratch.borrow_mut();
         seen.clear();
-        collect_destructor_candidate_objects(value, &mut seen, &mut candidates);
+        collect_destructor_candidates_with_share_flag(
+            value,
+            &mut seen,
+            &mut candidates,
+            &mut saw_shared_container,
+        );
     });
-    candidates
+    (candidates, saw_shared_container)
+}
+
+// The candidate scan runs on every object-overwriting store; reusing one
+// scratch set keeps its capacity across calls instead of re-growing a fresh
+// table each time. The walk is a pure value-graph traversal (no PHP
+// re-entry), so the borrow never nests.
+thread_local! {
+    static DESTRUCTOR_SEEN_SCRATCH: std::cell::RefCell<GcSeenSet> =
+        std::cell::RefCell::new(GcSeenSet::default());
+}
+
+pub(super) fn destructor_candidates_for_value(value: &Value) -> Vec<ObjectRef> {
+    destructor_candidates_with_share_flag(value).0
 }
 
 /// Multiply-shift hasher for the GC scan's process-local entity ids. The
@@ -731,10 +744,17 @@ fn gc_drain_reachable(
     }
 }
 
-fn collect_destructor_candidate_objects(
+/// Walks `value` collecting every reachable object, and reports whether any
+/// traversed container (array storage, reference cell, callable payload)
+/// might also be held outside this graph. When the flag stays false, the
+/// only strong paths into the graph run through `value` itself, so a
+/// candidate whose handle count is exactly graph + candidate list is
+/// provably unreachable from the roots without scanning them.
+fn collect_destructor_candidates_with_share_flag(
     value: &Value,
     seen: &mut GcSeenSet,
     candidates: &mut Vec<ObjectRef>,
+    saw_shared_container: &mut bool,
 ) {
     match value {
         Value::Array(array) => {
@@ -742,8 +762,16 @@ fn collect_destructor_candidate_objects(
             if !seen.insert(id) {
                 return;
             }
+            if array.is_shared() {
+                *saw_shared_container = true;
+            }
             for (_, value) in array.iter() {
-                collect_destructor_candidate_objects(value, seen, candidates);
+                collect_destructor_candidates_with_share_flag(
+                    value,
+                    seen,
+                    candidates,
+                    saw_shared_container,
+                );
             }
         }
         Value::Object(object) => {
@@ -753,7 +781,12 @@ fn collect_destructor_candidate_objects(
             }
             candidates.push(object.clone());
             object.visit_property_values(|value| {
-                collect_destructor_candidate_objects(value, seen, candidates);
+                collect_destructor_candidates_with_share_flag(
+                    value,
+                    seen,
+                    candidates,
+                    saw_shared_container,
+                );
             });
         }
         Value::Reference(cell) => {
@@ -761,28 +794,47 @@ fn collect_destructor_candidate_objects(
             if !seen.insert(id) {
                 return;
             }
+            if cell.gc_refcount_estimate() > 1 {
+                *saw_shared_container = true;
+            }
             let value = cell.borrow();
-            collect_destructor_candidate_objects(&value, seen, candidates);
+            collect_destructor_candidates_with_share_flag(
+                &value,
+                seen,
+                candidates,
+                saw_shared_container,
+            );
         }
         Value::Callable(callable) => match callable.as_ref() {
             CallableValue::Closure(payload) => {
+                // Callable payload sharing is not directly observable here;
+                // stay conservative so captured objects never release
+                // scan-free while another closure handle can reach them.
+                *saw_shared_container = true;
                 for capture in &payload.captures {
                     if let Some(value) = capture.value() {
-                        collect_destructor_candidate_objects(value, seen, candidates);
+                        collect_destructor_candidates_with_share_flag(
+                            value,
+                            seen,
+                            candidates,
+                            saw_shared_container,
+                        );
                     }
                     if let Some(cell) = capture.reference() {
-                        collect_destructor_candidate_objects(
+                        collect_destructor_candidates_with_share_flag(
                             &Value::Reference(cell),
                             seen,
                             candidates,
+                            saw_shared_container,
                         );
                     }
                 }
                 if let Some(bound_this) = &payload.bound_this {
-                    collect_destructor_candidate_objects(
+                    collect_destructor_candidates_with_share_flag(
                         &Value::Object(bound_this.clone()),
                         seen,
                         candidates,
+                        saw_shared_container,
                     );
                 }
             }
@@ -790,10 +842,12 @@ fn collect_destructor_candidate_objects(
                 target: CallableMethodTarget::Object(object),
                 ..
             } => {
-                collect_destructor_candidate_objects(
+                *saw_shared_container = true;
+                collect_destructor_candidates_with_share_flag(
                     &Value::Object(object.clone()),
                     seen,
                     candidates,
+                    saw_shared_container,
                 );
             }
             CallableValue::UserFunction { .. }
@@ -859,7 +913,7 @@ pub(super) fn release_unrooted_object_handles(
         }
         return;
     }
-    let candidates = destructor_candidates_for_value(value);
+    let (candidates, saw_shared_container) = destructor_candidates_with_share_flag(value);
     if candidates.is_empty() {
         return;
     }
@@ -867,6 +921,23 @@ pub(super) fn release_unrooted_object_handles(
         .iter()
         .all(|object| object.gc_refcount_estimate() > 2)
     {
+        return;
+    }
+    // Scan-free fast path: with no shared container anywhere in the graph,
+    // the only strong paths into it run through the dropped value, so a
+    // candidate held exactly by the graph plus the candidate list cannot be
+    // reachable from any root — the scan below would release precisely this
+    // set. Any external holder either bumps the candidate's own count
+    // (objects) or marks a traversed container as shared (arrays, reference
+    // cells, callable payloads).
+    if !saw_shared_container
+        && candidates
+            .iter()
+            .all(|object| object.gc_refcount_estimate() <= 2)
+    {
+        for object in candidates {
+            object.release_php_handle();
+        }
         return;
     }
     let rooted_object_ids = php_visible_root_object_ids(stack, state);
