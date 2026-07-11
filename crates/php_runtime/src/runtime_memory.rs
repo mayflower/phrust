@@ -3,11 +3,9 @@
 //! This is the only module in `php_runtime` allowed to use `unsafe`; every
 //! unsafe surface here is recorded with its invariants in
 //! `docs/performance/runtime-memory-safety-audit.md`. Public APIs are safe.
-#![allow(unsafe_code)]
 // Consumed by the PhpString migration (ADR 0020 stage 2); the primitives
 // land first so the audit, tests, and Miri coverage exist before any
 // caller depends on them.
-#![allow(dead_code)]
 
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::cell::Cell;
@@ -38,25 +36,32 @@ const NO_SYMBOL: u64 = u64::MAX;
 ///
 /// Semantically `Rc<[u8]>` plus two lazily-cached header cells. `!Send`
 /// and `!Sync` like `Rc`.
+#[allow(dead_code)]
 pub struct CompactBytes {
     ptr: NonNull<Header>,
     /// Pins `!Send`/`!Sync`: the refcount is a plain `Cell`.
     _not_send: PhantomData<Rc<()>>,
 }
 
+#[allow(dead_code)]
 impl CompactBytes {
     fn layout(len: usize) -> Layout {
         // SAFETY-ADJACENT: the identical layout must be recomputed in
         // `drop`; both sides derive it from the header type and `len`.
-        Layout::new::<Header>()
-            .extend(Layout::array::<u8>(len).expect("byte layout"))
-            .expect("compact bytes layout")
-            .0
-            .pad_to_align()
+        let header = Layout::new::<Header>();
+        let bytes = match Layout::array::<u8>(len) {
+            Ok(layout) => layout,
+            Err(_) => handle_alloc_error(header),
+        };
+        match header.extend(bytes) {
+            Ok((layout, _)) => layout.pad_to_align(),
+            Err(_) => handle_alloc_error(header),
+        }
     }
 
     /// Allocates one block holding the header and a copy of `bytes`.
     #[must_use]
+    #[allow(unsafe_code)]
     pub fn from_slice(bytes: &[u8]) -> Self {
         let len = bytes.len();
         let layout = Self::layout(len);
@@ -85,6 +90,7 @@ impl CompactBytes {
         }
     }
 
+    #[allow(unsafe_code)]
     fn header(&self) -> &Header {
         // SAFETY: `ptr` always points at the live header of an allocation
         // this handle keeps alive through its refcount.
@@ -93,6 +99,7 @@ impl CompactBytes {
 
     /// The stored bytes.
     #[must_use]
+    #[allow(unsafe_code)]
     pub fn as_bytes(&self) -> &[u8] {
         let len = self.header().len;
         // SAFETY: the tail of the allocation holds exactly `len`
@@ -160,6 +167,7 @@ impl Clone for CompactBytes {
     }
 }
 
+#[allow(unsafe_code)]
 impl Drop for CompactBytes {
     fn drop(&mut self) {
         let header = self.header();

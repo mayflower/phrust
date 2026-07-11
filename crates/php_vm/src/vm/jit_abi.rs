@@ -1,7 +1,6 @@
 // Audited native-tier ABI surface (docs/performance/cranelift/
 // safety-audit.md); compiled only under the JIT features, which the
 // pre-ADR-0020 CLI gate never covered.
-#![allow(unsafe_code)]
 #[cfg(feature = "jit-cranelift")]
 use crate::deopt::GuardKind;
 #[cfg(any(
@@ -54,6 +53,7 @@ pub(super) fn jit_guard_kind_for_side_exit(reason: php_jit::SideExitReason) -> O
 }
 
 #[cfg(feature = "jit-cranelift")]
+#[allow(unsafe_code)]
 pub(super) extern "C" fn jit_array_len_abi(value_ptr: usize, out: *mut i64) -> i32 {
     if value_ptr == 0 || out.is_null() {
         return php_runtime::PHP_JIT_ARRAY_STATUS_LAYOUT_EXIT;
@@ -78,6 +78,7 @@ pub(super) extern "C" fn jit_array_len_abi(value_ptr: usize, out: *mut i64) -> i
 }
 
 #[cfg(feature = "jit-cranelift")]
+#[allow(unsafe_code)]
 pub(super) extern "C" fn jit_array_fetch_int_slow_abi(
     value_ptr: usize,
     index: i64,
@@ -99,6 +100,7 @@ pub(super) extern "C" fn jit_array_fetch_int_slow_abi(
 }
 
 #[cfg(feature = "jit-cranelift")]
+#[allow(unsafe_code)]
 pub(super) extern "C" fn jit_strlen_known_abi(value_ptr: usize, out: *mut i64) -> i32 {
     if value_ptr == 0 || out.is_null() {
         return php_jit::JIT_HELPER_STATUS_FALLBACK;
@@ -125,6 +127,7 @@ pub(super) extern "C" fn jit_strlen_known_abi(value_ptr: usize, out: *mut i64) -
 }
 
 #[cfg(feature = "jit-cranelift")]
+#[allow(unsafe_code)]
 pub(super) extern "C" fn jit_count_known_abi(value_ptr: usize, out: *mut i64) -> i32 {
     if value_ptr == 0 || out.is_null() {
         return php_jit::JIT_HELPER_STATUS_FALLBACK;
@@ -151,6 +154,7 @@ pub(super) extern "C" fn jit_count_known_abi(value_ptr: usize, out: *mut i64) ->
 }
 
 #[cfg(feature = "jit-cranelift")]
+#[allow(unsafe_code)]
 pub(super) extern "C" fn jit_record_array_lookup_abi(
     array_ptr: usize,
     key_ptr: usize,
@@ -180,6 +184,7 @@ pub(super) extern "C" fn jit_record_array_lookup_abi(
 }
 
 #[cfg(feature = "jit-cranelift")]
+#[allow(unsafe_code)]
 pub(super) extern "C" fn jit_concat_string_string_fast(
     lhs_ptr: usize,
     rhs_ptr: usize,
@@ -318,6 +323,7 @@ pub(crate) fn jit_property_store_commit(
 }
 
 #[cfg(feature = "jit-cranelift")]
+#[allow(unsafe_code)]
 pub(super) extern "C" fn jit_property_load_monomorphic_fast(
     value_ptr: usize,
     metadata_ptr: usize,
