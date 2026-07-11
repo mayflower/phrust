@@ -1057,6 +1057,7 @@ runtime-miri-smoke:
     fi; \
     cargo miri test -p php_runtime reference::tests::slot_alias_and_copy_semantics_are_distinct
     cargo miri test -p php_runtime runtime_memory::tests
+    cargo miri test -p php_vm frame_memory::tests
 
 runtime-sanitizer-smoke:
     @if [[ "${PHRUST_RUN_SANITIZER:-0}" != "1" ]]; then \

@@ -72,6 +72,12 @@ impl LocalFile {
         self.locals.get(id.index())
     }
 
+    /// Raw slot table for the audited unchecked accessors (ADR 0021).
+    #[must_use]
+    pub(crate) fn slot_table(&self) -> &[Slot] {
+        &self.locals
+    }
+
     /// Writes a local without panicking.
     pub fn set(&mut self, id: LocalId, value: Value) -> Result<(), VmError> {
         let Some(slot) = self.locals.get_mut(id.index()) else {
@@ -203,6 +209,17 @@ impl RegisterFile {
     #[must_use]
     pub fn get(&self, id: RegId) -> Option<&Value> {
         self.registers.get(id.index()).map(TempValue::value)
+    }
+
+    /// Raw slot table for the audited unchecked accessors (ADR 0021).
+    #[must_use]
+    pub(crate) fn temp_slots(&self) -> &[TempValue] {
+        &self.registers
+    }
+
+    /// Mutable raw slot table for the audited unchecked accessors (ADR 0021).
+    pub(crate) fn temp_slots_mut(&mut self) -> &mut [TempValue] {
+        &mut self.registers
     }
 
     /// Iterates over registers in stable register order.

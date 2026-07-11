@@ -38,6 +38,9 @@ pub mod exit_policy;
 pub mod fallback;
 #[doc(hidden)]
 pub mod frame;
+/// Audited unchecked frame-slot access (ADR 0021); the only interpreter
+/// module exempt from the crate's `unsafe` denial.
+pub(crate) mod frame_memory;
 #[doc(hidden)]
 pub mod include;
 #[doc(hidden)]

@@ -2,7 +2,7 @@ use super::{Vm, constant_value, layout_source};
 use crate::bytecode::{DenseOperand, DenseOperandKind};
 use crate::compiled_unit::CompiledUnit;
 use crate::frame::CallStack;
-use php_ir::ids::{ConstId, LocalId, RegId};
+use php_ir::ids::{ConstId, RegId};
 use php_ir::module::IrUnit;
 use php_ir::operand::Operand;
 use php_runtime::{Slot, Value, to_bool};
@@ -57,7 +57,9 @@ impl Vm {
             return self.read_dense_operand(compiled, stack, operand);
         }
         let frame = stack.current_mut().ok_or("no active frame")?;
-        let value = frame.registers.take(RegId::new(operand.index))?;
+        // Verified dense operand: the bounds check is discharged by the
+        // dense verifier + frame sizing (ADR 0021, crate::frame_memory).
+        let value = crate::frame_memory::take_register(&mut frame.registers, operand.index);
         if value.is_uninitialized() {
             return Err(format!("read uninitialized register r{}", operand.index));
         }
@@ -74,9 +76,9 @@ impl Vm {
         match operand.kind {
             DenseOperandKind::Register => {
                 let frame = stack.current().ok_or("no active frame")?;
-                let Some(value) = frame.registers.get(RegId::new(operand.index)) else {
-                    return Err(format!("invalid register r{}", operand.index));
-                };
+                // Verified dense operand (ADR 0021, crate::frame_memory).
+                let value = crate::frame_memory::register_slot(&frame.registers, operand.index)
+                    .value();
                 if value.is_uninitialized() {
                     return Err(format!("read uninitialized register r{}", operand.index));
                 }
@@ -86,9 +88,9 @@ impl Vm {
             DenseOperandKind::Local => {
                 let frame = stack.current().ok_or("no active frame")?;
                 let _source = layout_source::enter(source_family);
-                let Some(value) = frame.locals.get(LocalId::new(operand.index)) else {
-                    return Err(format!("invalid local local:{}", operand.index));
-                };
+                // Verified dense operand (ADR 0021, crate::frame_memory).
+                let value =
+                    crate::frame_memory::local_slot(&frame.locals, operand.index).read();
                 Ok(if value.is_uninitialized() {
                     Value::Null
                 } else {
@@ -114,9 +116,9 @@ impl Vm {
         match operand.kind {
             DenseOperandKind::Register => {
                 let frame = stack.current().ok_or("no active frame")?;
-                let Some(value) = frame.registers.get(RegId::new(operand.index)) else {
-                    return Err(format!("invalid register r{}", operand.index));
-                };
+                // Verified dense operand (ADR 0021, crate::frame_memory).
+                let value = crate::frame_memory::register_slot(&frame.registers, operand.index)
+                    .value();
                 if value.is_uninitialized() {
                     return Err(format!("read uninitialized register r{}", operand.index));
                 }
@@ -124,9 +126,8 @@ impl Vm {
             }
             DenseOperandKind::Local => {
                 let frame = stack.current().ok_or("no active frame")?;
-                let Some(slot) = frame.locals.get_slot(LocalId::new(operand.index)) else {
-                    return Err(format!("invalid local local:{}", operand.index));
-                };
+                // Verified dense operand (ADR 0021, crate::frame_memory).
+                let slot = crate::frame_memory::local_slot(&frame.locals, operand.index);
                 match slot {
                     Slot::Value(value) if value.is_uninitialized() => {
                         Ok(DenseOperandRead::Owned(Value::Null))
