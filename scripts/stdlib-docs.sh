@@ -26,9 +26,13 @@ test -f docs/stdlib/stabilization-06-54.md
 test -f docs/stdlib/arginfo-coercion.md
 test -f docs/stdlib/platform-constants.md
 test -f docs/stdlib/validation-summary.md
+test -f docs/stdlib/canonical-extension-surfaces.md
 test -f scripts/stdlib/diff_builtin_function.php
 test -x scripts/stdlib/function_coverage.py
 test -x scripts/stdlib/generate_arginfo.py
+test -x scripts/stdlib/generate_extension_surfaces.py
+test -x scripts/stdlib/verify_generated_extension_surfaces.sh
+test -f fixtures/stdlib/extensions/index.json
 test -f scripts/stdlib/list_reference_functions.php
 test -f scripts/stdlib/list_reference_classes.php
 test -f scripts/stdlib/list_reference_constants.php
@@ -56,6 +60,8 @@ grep -q 'PDO' docs/stdlib/standard-library.md
 grep -q 'curl' docs/stdlib/standard-library.md
 grep -q 'FPM' docs/stdlib/standard-library.md
 grep -q 'nix develop -c just verify-stdlib' docs/stdlib/standard-library.md
+grep -q 'generate-extension-surfaces' docs/stdlib/canonical-extension-surfaces.md
+grep -q 'verify-generated-extension-surfaces' docs/stdlib/canonical-extension-surfaces.md
 grep -q 'composer-smoke-source' docs/stdlib/composer-compatibility.md
 grep -q 'PHRUST_STDLIB_COMPOSER_SOURCE_DIR' docs/stdlib/composer-compatibility.md
 grep -q 'Standard Library Function Coverage' docs/stdlib/function-coverage.md

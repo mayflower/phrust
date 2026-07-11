@@ -18,7 +18,8 @@ REGISTRY_INPUTS = [
     "crates/php_runtime/src/builtins/registry.rs",
     "crates/php_runtime/src/builtins/modules",
     "crates/php_vm/src/vm/builtin_classes.rs",
-    "crates/php_std/src/extensions.rs",
+    "fixtures/stdlib/extensions",
+    "crates/php_std/src/generated/extensions",
     "tests/phpt/manifests/modules",
     "tests/phpt/generated",
 ]

@@ -67,14 +67,14 @@ pub(crate) const ENTRIES: &[BuiltinEntry] = &[
 pub(crate) struct CtypeExtension;
 
 static DESCRIPTOR: ExtensionDescriptor = ExtensionDescriptor {
-    name: "ctype",
-    version: "8.5.7",
-    dependencies: &[],
+    name: crate::generated::CTYPE.name,
+    version: crate::generated::CTYPE.version,
+    dependencies: crate::generated::CTYPE.dependencies,
     functions: ENTRIES,
     classes: &[],
     constants: &[],
     request_state: None,
-    capabilities: &[],
+    capabilities: crate::generated::CTYPE.capabilities,
     initialize: None,
     shutdown: None,
 };

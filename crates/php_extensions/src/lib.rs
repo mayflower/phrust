@@ -2,6 +2,7 @@
 
 mod apcu;
 mod ctype;
+mod generated;
 
 use php_runtime::api::{BuiltinEntry, BuiltinRegistry as RuntimeBuiltinRegistry};
 use php_runtime::api::{

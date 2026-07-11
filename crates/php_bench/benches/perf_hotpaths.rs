@@ -589,9 +589,16 @@ fn mixed_key(index: i64) -> ArrayKey {
 }
 
 fn bench_runtime(c: &mut Criterion) {
-    let json_last_error = BuiltinRegistry::new()
+    let registry = BuiltinRegistry::new();
+    let json_last_error = registry
         .get("json_last_error")
         .expect("JSON builtin is registered");
+    c.bench_function("performance/builtin_registry_lookup_hit", |b| {
+        b.iter(|| black_box(registry.get(black_box("json_last_error"))));
+    });
+    c.bench_function("performance/builtin_registry_lookup_miss", |b| {
+        b.iter(|| black_box(registry.get(black_box("not_a_php_builtin"))));
+    });
     let mut output = OutputBuffer::new();
     let mut context = BuiltinContext::new(&mut output);
     c.bench_function("performance/request_state_json_dispatch", |b| {

@@ -30,6 +30,7 @@ help:
       '  just panic-unwrap-policy   Check production panic/unwrap policy' \
       '  just stdlib-registry-drift Check stdlib/runtime registry drift' \
       '  just verify-generated-arginfo Strict php-src arginfo drift check' \
+      '  just verify-generated-extension-surfaces Strict canonical descriptor drift check' \
       '  just oracle-api-index    Generate php-src/reference API oracle JSONL' \
       '  just oracle-api-summary  Print the latest API oracle summary' \
       '  just oracle-probe-generate Generate bounded oracle runtime probes' \
@@ -114,6 +115,8 @@ help:
       'Standard library and compatibility:' \
       '  just generate-arginfo     Regenerate stdlib arginfo from php-src stubs' \
       '  just verify-generated-arginfo Regenerate and diff committed arginfo' \
+      '  just generate-extension-surfaces Regenerate canonical extension Rust surfaces' \
+      '  just verify-generated-extension-surfaces Regenerate and diff extension surfaces' \
       '  just oracle-api-index    Generate php-src/reference API oracle JSONL' \
       '  just oracle-api-summary  Print the latest API oracle summary' \
       '  just oracle-probe-generate Generate bounded oracle runtime probes' \
@@ -460,6 +463,7 @@ verify-runtime:
 verify-stdlib:
     @just stdlib-docs
     @just stdlib-coverage
+    @just verify-generated-extension-surfaces
     @just stdlib-registry-drift
     @just diff-stdlib
     @just diff-streams
@@ -702,6 +706,14 @@ generate-arginfo php_src="third_party/php-src" out="crates/php_std/src/generated
 
 verify-generated-arginfo:
     scripts/stdlib/verify_generated_arginfo.sh
+
+generate-extension-surfaces:
+    scripts/stdlib/generate_extension_surfaces.py --schema-dir fixtures/stdlib/extensions --arginfo crates/php_std/src/generated/arginfo.rs --out-root .
+    cargo fmt --all
+
+verify-generated-extension-surfaces:
+    scripts/stdlib/test_generate_extension_surfaces.py
+    scripts/stdlib/verify_generated_extension_surfaces.sh
 
 oracle-api-index:
     cargo build -q -p php_std --bin dump_stdlib_registry

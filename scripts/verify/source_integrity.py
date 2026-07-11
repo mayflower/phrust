@@ -34,9 +34,14 @@ REQUIRED_FILES = [
     "crates/php_std/src/arginfo.rs",
     "crates/php_std/src/generated/mod.rs",
     "crates/php_std/src/generated/arginfo.rs",
+    "crates/php_std/src/generated/extensions/mod.rs",
+    "crates/php_runtime/src/builtins/generated/mod.rs",
+    "crates/php_extensions/src/generated.rs",
     "scripts/stdlib/generate_arginfo.py",
+    "scripts/stdlib/generate_extension_surfaces.py",
     "scripts/stdlib/registry_drift.py",
-    "scripts/stdlib/registry_drift_allowlist.jsonl",
+    "scripts/stdlib/verify_generated_extension_surfaces.sh",
+    "fixtures/stdlib/extensions/index.json",
     "scripts/verify/api_facade_allowlist.txt",
     "scripts/performance/architecture_baseline.py",
     "scripts/verify/architecture_inventory.py",
@@ -284,6 +289,8 @@ def check_generated_arginfo() -> None:
     generated_mod = read_required("crates/php_std/src/generated/mod.rs")
     if "pub mod arginfo;" not in generated_mod:
         raise IntegrityError("php_std::generated does not expose generated::arginfo")
+    if "pub(crate) mod extensions;" not in generated_mod:
+        raise IntegrityError("php_std::generated does not expose canonical extensions")
 
     arginfo = read_required("crates/php_std/src/generated/arginfo.rs")
     require_snippets("generated arginfo", arginfo, ARGINFO_REQUIRED_SNIPPETS)

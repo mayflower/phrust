@@ -1,8 +1,8 @@
 //! Process-local APCu compatibility helpers.
 
 use php_runtime::api::{
-    ApcuState, ArrayKey, ExtensionCapability, ExtensionDescriptor, ExtensionModule,
-    ExtensionStateFactory, PhpArray, PhpString, Value, to_bool, to_int, to_string,
+    ApcuState, ArrayKey, ExtensionDescriptor, ExtensionModule, ExtensionStateFactory, PhpArray,
+    PhpString, Value, to_bool, to_int, to_string,
 };
 use php_runtime::api::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError, BuiltinResult,
@@ -55,21 +55,23 @@ fn create_state() -> Box<dyn Any> {
     Box::new(ApcuState::default())
 }
 
+const APCU_STATE_SLOT: &str = match crate::generated::APCU.state_slot {
+    Some(name) => name,
+    None => "",
+};
+
 static DESCRIPTOR: ExtensionDescriptor = ExtensionDescriptor {
-    name: "apcu",
-    version: "5.1",
-    dependencies: &[],
+    name: crate::generated::APCU.name,
+    version: crate::generated::APCU.version,
+    dependencies: crate::generated::APCU.dependencies,
     functions: ENTRIES,
     classes: &[],
     constants: &[],
     request_state: Some(ExtensionStateFactory::of::<ApcuState>(
-        "ApcuState",
+        APCU_STATE_SLOT,
         create_state,
     )),
-    capabilities: &[
-        ExtensionCapability::Clock,
-        ExtensionCapability::ProcessSharedState,
-    ],
+    capabilities: crate::generated::APCU.capabilities,
     initialize: None,
     shutdown: None,
 };

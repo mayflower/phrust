@@ -2,6 +2,7 @@
 
 mod context;
 mod error;
+mod generated;
 pub(in crate::builtins) mod modules;
 mod registry;
 mod request_state;

@@ -72,7 +72,11 @@ def run(*command: str) -> str:
 
 def tracked_rust_files() -> list[Path]:
     output = run("git", "ls-files", "*.rs")
-    return [Path(line) for line in output.splitlines() if line]
+    return [
+        Path(line)
+        for line in output.splitlines()
+        if line and (ROOT / line).is_file()
+    ]
 
 
 def classify_rust_file(path: Path, content: bytes) -> str:
