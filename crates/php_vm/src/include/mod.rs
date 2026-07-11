@@ -1,11 +1,10 @@
 //! Local include/require resolution, caching, compilation port, and metadata.
-//!
-//! Source ownership is intentionally one-way:
-//! `source/diagnostics -> resolver/compiler -> resolution/compiled caches -> cache facade`.
-//! The concrete frontend/lowering/optimizer implementation lives in
-//! `php_executor`; no include module may import those crates.
+//! Ownership flows from source/diagnostics through resolver/compiler and caches to the facade.
+//! Frontend, lowering, and optimizer integration stays in `php_executor`.
 
 mod cache;
+mod cache_freshness;
+mod compile_coordinator;
 mod compiled_cache;
 mod compiler;
 mod diagnostics;

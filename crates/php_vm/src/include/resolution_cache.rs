@@ -3,6 +3,7 @@
 //! This component knows paths, loader policy, directory guards, and metrics.
 //! It deliberately has no compiler or compiled-artifact imports.
 
+use super::cache_freshness::{RevalidationClock, ValidationStamp};
 use super::diagnostics::include_cache_lock_error;
 use super::metadata::IncludeMetadataState;
 use super::metrics::IncludeCacheCounters;
@@ -15,9 +16,9 @@ use crate::error::VmError;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Per-shard capacity bound for negative include-path entries. Autoloader
 /// probing can generate unbounded distinct missing paths (class names can be
@@ -55,26 +56,15 @@ impl IncludeResolutionKey {
 #[derive(Debug)]
 pub(super) struct CachedIncludeResolution {
     resolved: ResolvedIncludePath,
-    validated_at_nanos: AtomicU64,
+    validated_at: ValidationStamp,
 }
 
 impl CachedIncludeResolution {
-    fn new(resolved: ResolvedIncludePath, epoch: Instant) -> Self {
+    fn new(resolved: ResolvedIncludePath, revalidation: &RevalidationClock) -> Self {
         Self {
             resolved,
-            validated_at_nanos: AtomicU64::new(epoch.elapsed().as_nanos() as u64),
+            validated_at: revalidation.stamp(),
         }
-    }
-
-    fn freshly_validated(&self, epoch: Instant, interval: Duration) -> bool {
-        let now = epoch.elapsed().as_nanos() as u64;
-        let stamped = self.validated_at_nanos.load(Ordering::Relaxed);
-        now.saturating_sub(stamped) < interval.as_nanos() as u64
-    }
-
-    fn touch(&self, epoch: Instant) {
-        self.validated_at_nanos
-            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 }
 
@@ -84,8 +74,7 @@ pub(super) struct ResolutionCache {
     negative_shards: Vec<RwLock<HashMap<IncludeResolutionKey, NegativeIncludeEntry>>>,
     stats: Arc<IncludeCacheCounters>,
     metadata: Arc<IncludeMetadataState>,
-    revalidation_interval: Duration,
-    revalidation_epoch: Instant,
+    revalidation: RevalidationClock,
 }
 
 impl ResolutionCache {
@@ -104,8 +93,7 @@ impl ResolutionCache {
                 .collect(),
             stats,
             metadata,
-            revalidation_interval,
-            revalidation_epoch: Instant::now(),
+            revalidation: RevalidationClock::new(revalidation_interval),
         }
     }
 
@@ -126,9 +114,7 @@ impl ResolutionCache {
                 .map_err(|_| include_cache_lock_error("resolution", "lookup"))?;
             shard.get(&key).cloned()
         } {
-            if self.revalidation_interval > Duration::ZERO
-                && cached.freshly_validated(self.revalidation_epoch, self.revalidation_interval)
-            {
+            if self.revalidation.enabled() && self.revalidation.is_fresh(&cached.validated_at) {
                 self.stats.resolution_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(cached.resolved.clone());
             }
@@ -152,14 +138,14 @@ impl ResolutionCache {
                 // resolution path — one fs op per include per request. With
                 // it, the symlink/root-swap probe keeps its per-window
                 // cadence instead of running per hit.
-                cached.touch(self.revalidation_epoch);
+                self.revalidation.touch(&cached.validated_at);
                 return Ok(resolved.clone());
             }
             match include_path_file_fingerprint(&resolved.canonical_path) {
                 Ok(current) if target_is_current && current == resolved.fingerprint => {
                     self.stats.resolution_hits.fetch_add(1, Ordering::Relaxed);
                     self.stats.observe_directory_version(resolved);
-                    cached.touch(self.revalidation_epoch);
+                    self.revalidation.touch(&cached.validated_at);
                     return Ok(resolved.clone());
                 }
                 Ok(_) | Err(_) => {
@@ -195,7 +181,7 @@ impl ResolutionCache {
         shard.entry(key).or_insert_with(|| {
             Arc::new(CachedIncludeResolution::new(
                 resolved.clone(),
-                self.revalidation_epoch,
+                &self.revalidation,
             ))
         });
         Ok(resolved)

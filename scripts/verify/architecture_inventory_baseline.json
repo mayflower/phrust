@@ -182,8 +182,8 @@
       "max_lines": 135
     },
     "crates/php_vm/src/include/compiled_cache.rs": {
-      "max_bytes": 20827,
-      "max_lines": 575
+      "max_bytes": 20480,
+      "max_lines": 552
     },
     "crates/php_vm/src/include/compiler.rs": {
       "max_bytes": 1802,
@@ -206,8 +206,8 @@
       "max_lines": 35
     },
     "crates/php_vm/src/include/resolution_cache.rs": {
-      "max_bytes": 11033,
-      "max_lines": 296
+      "max_bytes": 11006,
+      "max_lines": 289
     },
     "crates/php_vm/src/include/resolver.rs": {
       "max_bytes": 24737,

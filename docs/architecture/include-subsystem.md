@@ -13,16 +13,18 @@ forbidden.
 | `source` | stable opened-file reads, content identity, portable metadata | resolution, compilation, cache policy |
 | `resolver` | allowed roots, include path and cwd order, canonicalization, Phar adapters | compiled artifacts, frontend work |
 | `resolution_cache` | positive paths, guarded negative entries, directory validation | compiler settings or compiled units |
+| `cache_freshness` | monotonic revalidation windows and entry stamps | paths, compiler settings, or cache policy |
 | `compiler` | VM-facing `IncludeCompiler` port and opaque fingerprint | concrete frontend, lowering, optimizer |
 | `compiled_cache` | artifact identity, dependency validation, stampede coordination | path candidate policy, server configuration |
+| `compile_coordinator` | per-path compile locks and stampede wakeups | source validation or compiled artifacts |
 | `metadata` | Composer-map and deployment-root observations | hidden source scanning during compilation |
 | `metrics` | atomic counters and typed immutable snapshots | cache decisions |
 | `cache` | stable public facade and cross-component delegation | component implementation details |
 
 The source dependency order is:
 
-`diagnostics/source -> resolver -> compiler/metrics -> metadata ->
-resolution_cache/compiled_cache -> cache`.
+`diagnostics/source -> resolver -> compiler/metrics -> metadata/cache_freshness ->
+resolution_cache/compiled_cache/compile_coordinator -> cache`.
 
 `include::tests::include_module_ownership_is_one_way` enforces the declared
 edges, rejects frontend and optimizer imports in every production include

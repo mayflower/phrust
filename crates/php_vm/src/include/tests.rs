@@ -15,6 +15,8 @@ fn include_module_ownership_is_one_way() {
     let include_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/include");
     let modules = [
         ("diagnostics", &[][..]),
+        ("cache_freshness", &[][..]),
+        ("compile_coordinator", &["diagnostics"][..]),
         ("source", &["diagnostics"][..]),
         ("resolver", &["diagnostics", "source"][..]),
         ("compiler", &["resolver", "source"][..]),
@@ -22,11 +24,20 @@ fn include_module_ownership_is_one_way() {
         ("metadata", &["metrics", "source"][..]),
         (
             "resolution_cache",
-            &["diagnostics", "metadata", "metrics", "resolver", "source"][..],
+            &[
+                "cache_freshness",
+                "diagnostics",
+                "metadata",
+                "metrics",
+                "resolver",
+                "source",
+            ][..],
         ),
         (
             "compiled_cache",
             &[
+                "cache_freshness",
+                "compile_coordinator",
                 "compiler",
                 "diagnostics",
                 "metadata",
@@ -1624,7 +1635,7 @@ fn poisoned_compile_lock_returns_typed_error() {
     let resolved = loader
         .resolve_with_include_path(None, "lib.php", &[], Some(&fixture.root))
         .expect("resolve include");
-    poison_mutex(&cache.compiled.locks[0].in_progress);
+    poison_mutex(&cache.compiled.compile_coordinator.shards[0].in_progress);
 
     let error = cache
         .get_or_compile_include(

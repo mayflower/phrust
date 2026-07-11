@@ -1,5 +1,7 @@
 //! Compiled include artifact cache and stampede coordination.
 
+use super::cache_freshness::{RevalidationClock, ValidationStamp};
+use super::compile_coordinator::IncludeCompileCoordinator;
 use super::compiler::{IncludeCompiler, IncludeCompilerFingerprint};
 use super::diagnostics::include_cache_lock_error;
 use super::metadata::{DeploymentRootMode, IncludeMetadataState};
@@ -11,32 +13,12 @@ use super::source::{
 };
 use crate::compiled_unit::CompiledUnit;
 use crate::error::VmError;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::{Duration, Instant};
-
-#[derive(Debug, Default)]
-pub(super) struct IncludeCompileLockShard {
-    pub(super) in_progress: Mutex<HashSet<PathBuf>>,
-    condvar: Condvar,
-}
-
-struct IncludeCompilePermit<'a> {
-    shard: &'a IncludeCompileLockShard,
-    path: PathBuf,
-}
-
-impl Drop for IncludeCompilePermit<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut in_progress) = self.shard.in_progress.lock() {
-            in_progress.remove(&self.path);
-        }
-        self.shard.condvar.notify_all();
-    }
-}
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct CompiledIncludeKey {
@@ -99,26 +81,15 @@ impl CompiledIncludeLookupKey {
 #[derive(Debug)]
 pub(super) struct CachedCompiledInclude {
     compiled: Arc<CompiledUnit>,
-    validated_at_nanos: AtomicU64,
+    validated_at: ValidationStamp,
 }
 
 impl CachedCompiledInclude {
-    fn new(compiled: Arc<CompiledUnit>, epoch: Instant) -> Self {
+    fn new(compiled: Arc<CompiledUnit>, revalidation: &RevalidationClock) -> Self {
         Self {
             compiled,
-            validated_at_nanos: AtomicU64::new(epoch.elapsed().as_nanos() as u64),
+            validated_at: revalidation.stamp(),
         }
-    }
-
-    fn freshly_validated(&self, epoch: Instant, interval: Duration) -> bool {
-        let now = epoch.elapsed().as_nanos() as u64;
-        let stamped = self.validated_at_nanos.load(Ordering::Relaxed);
-        now.saturating_sub(stamped) < interval.as_nanos() as u64
-    }
-
-    fn touch(&self, epoch: Instant) {
-        self.validated_at_nanos
-            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 }
 
@@ -126,11 +97,10 @@ impl CachedCompiledInclude {
 pub(super) struct CompiledIncludeCache {
     pub(super) shards: Vec<RwLock<HashMap<CompiledIncludeKey, Arc<CachedCompiledInclude>>>>,
     lookup_shards: Vec<RwLock<HashMap<CompiledIncludeLookupKey, CompiledIncludeKey>>>,
-    pub(super) locks: Vec<IncludeCompileLockShard>,
+    pub(super) compile_coordinator: IncludeCompileCoordinator,
     stats: Arc<IncludeCacheCounters>,
     metadata: Arc<IncludeMetadataState>,
-    revalidation_interval: Duration,
-    revalidation_epoch: Instant,
+    revalidation: RevalidationClock,
 }
 
 impl CompiledIncludeCache {
@@ -147,13 +117,10 @@ impl CompiledIncludeCache {
             lookup_shards: (0..shard_count)
                 .map(|_| RwLock::new(HashMap::new()))
                 .collect(),
-            locks: (0..shard_count)
-                .map(|_| IncludeCompileLockShard::default())
-                .collect(),
+            compile_coordinator: IncludeCompileCoordinator::new(shard_count),
             stats,
             metadata,
-            revalidation_interval,
-            revalidation_epoch: Instant::now(),
+            revalidation: RevalidationClock::new(revalidation_interval),
         }
     }
 
@@ -195,8 +162,11 @@ impl CompiledIncludeCache {
                 return Ok(compiled);
             }
 
-            let Some(_permit) = self.try_begin_compile(&resolved.canonical_path)? else {
-                self.wait_for_compile(&resolved.canonical_path)?;
+            let Some(_permit) = self
+                .compile_coordinator
+                .try_begin(&resolved.canonical_path)?
+            else {
+                self.compile_coordinator.wait(&resolved.canonical_path)?;
                 continue;
             };
 
@@ -238,7 +208,7 @@ impl CompiledIncludeCache {
                                 .or_insert_with(|| {
                                     Arc::new(CachedCompiledInclude::new(
                                         compiled,
-                                        self.revalidation_epoch,
+                                        &self.revalidation,
                                     ))
                                 })
                                 .compiled,
@@ -266,7 +236,7 @@ impl CompiledIncludeCache {
         resolved: &ResolvedIncludePath,
         compiler: &IncludeCompilerFingerprint,
     ) -> Result<Option<Arc<CompiledUnit>>, VmError> {
-        if self.revalidation_interval == Duration::ZERO {
+        if !self.revalidation.enabled() {
             return Ok(None);
         }
         let lookup_key =
@@ -289,7 +259,7 @@ impl CompiledIncludeCache {
         let Some(slot) = slot else {
             return Ok(None);
         };
-        if slot.freshly_validated(self.revalidation_epoch, self.revalidation_interval) {
+        if self.revalidation.is_fresh(&slot.validated_at) {
             self.stats.compile_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(Arc::clone(&slot.compiled)));
         }
@@ -325,9 +295,7 @@ impl CompiledIncludeCache {
         let Some((key, slot)) = hit else {
             return Ok(None);
         };
-        if self.revalidation_interval > Duration::ZERO
-            && slot.freshly_validated(self.revalidation_epoch, self.revalidation_interval)
-        {
+        if self.revalidation.enabled() && self.revalidation.is_fresh(&slot.validated_at) {
             self.stats.compile_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(Arc::clone(&slot.compiled)));
         }
@@ -343,7 +311,7 @@ impl CompiledIncludeCache {
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 self.stats.compile_hits.fetch_add(1, Ordering::Relaxed);
-                slot.touch(self.revalidation_epoch);
+                self.revalidation.touch(&slot.validated_at);
                 Ok(Some(Arc::clone(&slot.compiled)))
             }
             Ok(false) | Err(_) => {
@@ -564,42 +532,6 @@ impl CompiledIncludeCache {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         path.hash(&mut hasher);
         (hasher.finish() as usize) % self.shards.len()
-    }
-
-    fn compile_lock_shard_index(&self, path: &Path) -> usize {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        path.hash(&mut hasher);
-        (hasher.finish() as usize) % self.locks.len()
-    }
-
-    fn try_begin_compile(&self, path: &Path) -> Result<Option<IncludeCompilePermit<'_>>, VmError> {
-        let shard = &self.locks[self.compile_lock_shard_index(path)];
-        let mut in_progress = shard
-            .in_progress
-            .lock()
-            .map_err(|_| include_cache_lock_error("compile-lock", "begin"))?;
-        if !in_progress.insert(path.to_path_buf()) {
-            return Ok(None);
-        }
-        Ok(Some(IncludeCompilePermit {
-            shard,
-            path: path.to_path_buf(),
-        }))
-    }
-
-    fn wait_for_compile(&self, path: &Path) -> Result<(), VmError> {
-        let shard = &self.locks[self.compile_lock_shard_index(path)];
-        let mut in_progress = shard
-            .in_progress
-            .lock()
-            .map_err(|_| include_cache_lock_error("compile-lock", "wait"))?;
-        while in_progress.contains(path) {
-            in_progress = shard
-                .condvar
-                .wait(in_progress)
-                .map_err(|_| include_cache_lock_error("compile-lock", "wait"))?;
-        }
-        Ok(())
     }
 
     pub(super) fn clear(&self) -> Result<(), VmError> {
