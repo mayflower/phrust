@@ -601,6 +601,170 @@ fn read_call_args_with_value_policy_at_frame(
     Ok(out)
 }
 
+fn is_quiet_by_ref_internal_builtin_arg(function: &str, index: usize, arg: &IrCallArg) -> bool {
+    if arg.by_ref_local.is_none() || arg.unpack {
+        return false;
+    }
+
+    let function = normalize_function_name(function);
+    if generated_internal_builtin_param_is_by_ref(&function, index, arg.name.as_deref()) {
+        return true;
+    }
+
+    match function.as_str() {
+        "apcu_fetch" => index == 1 || arg.name.as_deref() == Some("success"),
+        "apcu_dec" | "apcu_inc" => index == 2 || arg.name.as_deref() == Some("success"),
+        "exif_thumbnail" => {
+            (1..=3).contains(&index)
+                || matches!(arg.name.as_deref(), Some("width" | "height" | "image_type"))
+        }
+        "getimagesize" => index == 1 || arg.name.as_deref() == Some("image_info"),
+        "is_callable" => index == 2 || arg.name.as_deref() == Some("callable_name"),
+        "msg_send" => index == 5 || arg.name.as_deref() == Some("error_code"),
+        "msg_receive" => {
+            index == 2
+                || index == 4
+                || index == 7
+                || matches!(
+                    arg.name.as_deref(),
+                    Some("received_message_type" | "message" | "error_code")
+                )
+        }
+        "openssl_random_pseudo_bytes" => index == 1 || arg.name.as_deref() == Some("strong_result"),
+        "pcntl_wait" => index == 0 || arg.name.as_deref() == Some("status"),
+        "pcntl_waitpid" => {
+            index == 1
+                || arg.name.as_deref() == Some("status")
+                || index == 3
+                || arg.name.as_deref() == Some("resource_usage")
+        }
+        "preg_match" | "preg_match_all" => index == 2 || arg.name.as_deref() == Some("matches"),
+        "preg_filter" | "preg_replace" | "preg_replace_callback" => {
+            index == 4 || arg.name.as_deref() == Some("count")
+        }
+        "preg_replace_callback_array" => index == 3 || arg.name.as_deref() == Some("count"),
+        "socket_getpeername" | "socket_getsockname" => {
+            index == 1 || index == 2 || matches!(arg.name.as_deref(), Some("address" | "port"))
+        }
+        "socket_recv" => index == 1 || arg.name.as_deref() == Some("data"),
+        _ => false,
+    }
+}
+
+pub(super) fn is_quiet_dense_by_ref_internal_builtin_arg(
+    dense: &DenseBytecodeUnit,
+    function: &str,
+    index: usize,
+    arg: &DenseCallArg,
+) -> bool {
+    if arg.by_ref_local.is_none() {
+        return false;
+    }
+    let arg_name = arg
+        .name
+        .and_then(|name| dense.names.get(name as usize).map(String::as_str));
+
+    let function = normalize_function_name(function);
+    if generated_internal_builtin_param_is_by_ref(&function, index, arg_name) {
+        return true;
+    }
+
+    match function.as_str() {
+        "apcu_dec" | "apcu_inc" => index == 2 || arg_name == Some("success"),
+        "exif_thumbnail" => {
+            (1..=3).contains(&index) || matches!(arg_name, Some("width" | "height" | "image_type"))
+        }
+        "getimagesize" => index == 1 || arg_name == Some("image_info"),
+        "is_callable" => index == 2 || arg_name == Some("callable_name"),
+        "msg_send" => index == 5 || arg_name == Some("error_code"),
+        "msg_receive" => {
+            index == 2
+                || index == 4
+                || index == 7
+                || matches!(
+                    arg_name,
+                    Some("received_message_type" | "message" | "error_code")
+                )
+        }
+        "openssl_random_pseudo_bytes" => index == 1 || arg_name == Some("strong_result"),
+        "pcntl_wait" => index == 0 || arg_name == Some("status"),
+        "pcntl_waitpid" => {
+            index == 1
+                || arg_name == Some("status")
+                || index == 3
+                || arg_name == Some("resource_usage")
+        }
+        "preg_match" | "preg_match_all" => index == 2 || arg_name == Some("matches"),
+        "preg_filter" | "preg_replace" | "preg_replace_callback" => {
+            index == 4 || arg_name == Some("count")
+        }
+        "preg_replace_callback_array" => index == 3 || arg_name == Some("count"),
+        "socket_getpeername" | "socket_getsockname" => {
+            index == 1 || index == 2 || matches!(arg_name, Some("address" | "port"))
+        }
+        "socket_recv" => index == 1 || arg_name == Some("data"),
+        _ => false,
+    }
+}
+
+fn generated_internal_builtin_param_is_by_ref(
+    function: &str,
+    index: usize,
+    arg_name: Option<&str>,
+) -> bool {
+    let Some(metadata) = php_std::arginfo::function_metadata_indexed(function) else {
+        return false;
+    };
+    let param = if let Some(name) = arg_name {
+        metadata.params.iter().find(|param| param.name == name)
+    } else {
+        metadata.params.get(index)
+    };
+    param.is_some_and(|param| param.by_ref)
+}
+
+pub(super) fn iterator_function_temporary_arg_value(
+    function: &str,
+    ir_args: &[IrCallArg],
+    args: &[CallArgument],
+) -> Option<(Operand, Value)> {
+    if !iterator_function_releases_temporary_arg(function) {
+        return None;
+    }
+    let ir_arg = ir_args.first()?;
+    let arg = args.first()?;
+    (arg.value_kind == IrCallArgValueKind::IndirectTemporary)
+        .then(|| (ir_arg.value, arg.value.clone()))
+}
+
+pub(super) fn callable_iterator_function_temporary_arg_value(
+    callee: &Value,
+    ir_args: &[IrCallArg],
+    args: &[CallArgument],
+) -> Option<(Operand, Value)> {
+    let function = match effective_value(callee) {
+        Value::String(name) => String::from_utf8_lossy(name.as_bytes()).into_owned(),
+        Value::Callable(callable) => match callable.as_ref() {
+            CallableValue::UserFunction { name } | CallableValue::InternalBuiltin { name } => {
+                name.clone()
+            }
+            CallableValue::Closure(_)
+            | CallableValue::BoundMethod { .. }
+            | CallableValue::MethodPlaceholder { .. }
+            | CallableValue::UnresolvedDynamic { .. } => return None,
+        },
+        _ => return None,
+    };
+    iterator_function_temporary_arg_value(&function, ir_args, args)
+}
+
+fn iterator_function_releases_temporary_arg(function: &str) -> bool {
+    matches!(
+        normalize_function_name(function).as_str(),
+        "iterator_apply" | "iterator_count" | "iterator_to_array"
+    )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PreparedArg {
     pub(super) value: Value,
