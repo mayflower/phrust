@@ -276,6 +276,9 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         max_in_flight: config.max_in_flight,
         cpu_execution: Arc::new(Semaphore::new(config.cpu_execution_limit)),
         cpu_execution_limit: config.cpu_execution_limit,
+        php_workers: Arc::new(crate::worker_pool::PhpWorkerPool::new(
+            config.cpu_execution_limit,
+        )),
         metrics: Arc::new(ServerMetrics::default()),
         engine,
         metrics_token: config.metrics_token,
@@ -1121,6 +1124,7 @@ mod tests {
             max_in_flight: 1,
             cpu_execution: Arc::new(Semaphore::new(1)),
             cpu_execution_limit: 1,
+            php_workers: Arc::new(crate::worker_pool::PhpWorkerPool::new(1)),
             metrics: Arc::new(ServerMetrics::default()),
             engine: Arc::new(ServerEngineState::new(
                 EngineProfileName::Default,

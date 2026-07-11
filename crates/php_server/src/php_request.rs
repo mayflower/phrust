@@ -38,7 +38,6 @@ use std::{
 };
 use tokio::{
     sync::{OwnedSemaphorePermit, TryAcquireError},
-    task,
     time::timeout,
 };
 use tracing::{debug, warn};
@@ -347,19 +346,24 @@ pub(crate) async fn execute_php_request(
         );
         return finish_php_request(&state, trace, response, script_cache_hit, Some("cpu_queue"));
     };
-    run_php_request_on_worker(
-        state,
-        parts,
-        body,
-        script_path,
-        path_info,
-        peer,
-        request_id,
-        trace,
-        lookup,
-        script_cache_hit,
-        cpu_permit,
-    )
+    let workers = Arc::clone(&state.php_workers);
+    workers
+        .execute(move || {
+            run_php_request_on_worker(
+                state,
+                parts,
+                body,
+                script_path,
+                path_info,
+                peer,
+                request_id,
+                trace,
+                lookup,
+                script_cache_hit,
+                cpu_permit,
+            )
+        })
+        .await
 }
 
 /// Synchronous request core: builds the PHP runtime context, parses
@@ -1040,6 +1044,10 @@ async fn acquire_cpu_execution_permit(state: &AppState) -> Option<OwnedSemaphore
     }
 }
 
+/// Executes a compiled script on the current thread. Callers are pinned
+/// PHP worker threads (or the pool's degraded inline path, which already
+/// wraps the whole request core in `block_in_place`), so no additional
+/// scheduling boundary is needed here.
 pub(crate) fn execute_compiled_php_in_blocking_region(
     state: Arc<AppState>,
     lookup: CompiledScriptCacheLookup,
@@ -1047,23 +1055,20 @@ pub(crate) fn execute_compiled_php_in_blocking_region(
     runtime_context: RuntimeContext,
     profile_requested: bool,
 ) -> Result<PhpExecutionOutput, PhpExecutionError> {
-    task::block_in_place(move || {
-        let mode = if profile_requested {
-            request_counter_mode(&state)
-        } else {
-            perf_trace_counter_mode(&state)
-        };
-        let collect_profile_spans =
-            profile_requested && collect_vm_profile_spans_for_request(&state);
-        execute_compiled_php_with_state(
-            &state,
-            lookup,
-            script_path,
-            runtime_context,
-            mode,
-            collect_profile_spans,
-        )
-    })
+    let mode = if profile_requested {
+        request_counter_mode(&state)
+    } else {
+        perf_trace_counter_mode(&state)
+    };
+    let collect_profile_spans = profile_requested && collect_vm_profile_spans_for_request(&state);
+    execute_compiled_php_with_state(
+        &state,
+        lookup,
+        script_path,
+        runtime_context,
+        mode,
+        collect_profile_spans,
+    )
 }
 
 /// Counter mode for requests that did not ask for a profile (only relevant

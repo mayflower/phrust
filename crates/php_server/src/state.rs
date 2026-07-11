@@ -41,6 +41,9 @@ pub(crate) struct AppState {
     pub(crate) max_in_flight: usize,
     pub(crate) cpu_execution: Arc<Semaphore>,
     pub(crate) cpu_execution_limit: usize,
+    /// Pinned PHP execution threads; sized to `cpu_execution_limit` so the
+    /// pool and the CPU semaphore describe the same concurrency budget.
+    pub(crate) php_workers: Arc<crate::worker_pool::PhpWorkerPool>,
     pub(crate) metrics: Arc<ServerMetrics>,
     pub(crate) engine: Arc<ServerEngineState>,
     pub(crate) metrics_token: Option<String>,
