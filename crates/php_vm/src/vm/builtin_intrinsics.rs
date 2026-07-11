@@ -712,3 +712,844 @@ fn with_dense_string_operand<T>(
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuiltinIntrinsicKind {
+    ArrayKeyExists,
+    CountArray,
+    ExplodeSingleByte,
+    HtmlSpecialCharsDefault,
+    IsArray,
+    IsBool,
+    IsFloat,
+    IsInt,
+    IsNull,
+    IsNumeric,
+    IsObject,
+    IsScalar,
+    IsString,
+    PointerCurrent,
+    PointerKey,
+    ArrayKeysAll,
+    ImplodeStringParts,
+    StrContains,
+    StrEndsWith,
+    StrLen,
+    StrReplaceScalar,
+    StrStartsWith,
+    StrToLower,
+    StrToUpper,
+    SubstrBytes,
+    TrimDefault,
+    InArrayStrict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BuiltinIntrinsicParam {
+    name: &'static str,
+    type_decl: &'static str,
+    optional: bool,
+    by_ref: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BuiltinIntrinsicSpec {
+    name: &'static str,
+    /// Counter label under `intrinsic_hits`/`intrinsic_misses`; carries the
+    /// specialized-case suffix where the fast path covers only one shape.
+    counter_name: &'static str,
+    return_type: &'static str,
+    params: &'static [BuiltinIntrinsicParam],
+    /// Lowest supplied-argument count the fast path accepts.
+    min_arity: usize,
+    /// Highest supplied-argument count the fast path accepts.
+    exact_arity: usize,
+    kind: BuiltinIntrinsicKind,
+}
+
+const INTRINSIC_VALUE_PARAM: &[BuiltinIntrinsicParam] = &[BuiltinIntrinsicParam {
+    name: "value",
+    type_decl: "mixed",
+    optional: false,
+    by_ref: false,
+}];
+const INTRINSIC_STRING_PARAM: &[BuiltinIntrinsicParam] = &[BuiltinIntrinsicParam {
+    name: "string",
+    type_decl: "string",
+    optional: false,
+    by_ref: false,
+}];
+const INTRINSIC_COUNT_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "value",
+        type_decl: "Countable|array",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "mode",
+        type_decl: "int",
+        optional: true,
+        by_ref: false,
+    },
+];
+const INTRINSIC_STRING_PAIR_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "haystack",
+        type_decl: "string",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "needle",
+        type_decl: "string",
+        optional: false,
+        by_ref: false,
+    },
+];
+const INTRINSIC_ARRAY_KEY_EXISTS_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "key",
+        type_decl: "mixed",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "array",
+        type_decl: "array",
+        optional: false,
+        by_ref: false,
+    },
+];
+const INTRINSIC_EXPLODE_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "separator",
+        type_decl: "string",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "string",
+        type_decl: "string",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "limit",
+        type_decl: "int",
+        optional: true,
+        by_ref: false,
+    },
+];
+const INTRINSIC_HTMLSPECIALCHARS_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "string",
+        type_decl: "string",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "flags",
+        type_decl: "int",
+        optional: true,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "encoding",
+        type_decl: "?string",
+        optional: true,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "double_encode",
+        type_decl: "bool",
+        optional: true,
+        by_ref: false,
+    },
+];
+const INTRINSIC_STR_REPLACE_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "search",
+        type_decl: "array|string",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "replace",
+        type_decl: "array|string",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "subject",
+        type_decl: "string|array",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "count",
+        type_decl: "mixed",
+        optional: true,
+        by_ref: true,
+    },
+];
+const INTRINSIC_SUBSTR_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "string",
+        type_decl: "string",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "offset",
+        type_decl: "int",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "length",
+        type_decl: "?int",
+        optional: true,
+        by_ref: false,
+    },
+];
+const INTRINSIC_TRIM_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "string",
+        type_decl: "string",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "characters",
+        type_decl: "string",
+        optional: true,
+        by_ref: false,
+    },
+];
+const INTRINSIC_IN_ARRAY_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "needle",
+        type_decl: "mixed",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "haystack",
+        type_decl: "array",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "strict",
+        type_decl: "bool",
+        optional: true,
+        by_ref: false,
+    },
+];
+const INTRINSIC_POINTER_ARRAY_PARAM: &[BuiltinIntrinsicParam] = &[BuiltinIntrinsicParam {
+    name: "array",
+    type_decl: "array|object",
+    optional: false,
+    by_ref: false,
+}];
+
+const INTRINSIC_ARRAY_KEYS_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "array",
+        type_decl: "array",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "filter_value",
+        type_decl: "mixed",
+        optional: true,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "strict",
+        type_decl: "bool",
+        optional: true,
+        by_ref: false,
+    },
+];
+const INTRINSIC_IMPLODE_PARAMS: &[BuiltinIntrinsicParam] = &[
+    BuiltinIntrinsicParam {
+        name: "separator",
+        type_decl: "string|array",
+        optional: false,
+        by_ref: false,
+    },
+    BuiltinIntrinsicParam {
+        name: "array",
+        type_decl: "?array",
+        optional: true,
+        by_ref: false,
+    },
+];
+
+const BUILTIN_INTRINSICS: &[BuiltinIntrinsicSpec] = &[
+    BuiltinIntrinsicSpec {
+        name: "substr",
+        counter_name: "substr_bytes",
+        return_type: "string",
+        params: INTRINSIC_SUBSTR_PARAMS,
+        min_arity: 2,
+        exact_arity: 3,
+        kind: BuiltinIntrinsicKind::SubstrBytes,
+    },
+    BuiltinIntrinsicSpec {
+        name: "trim",
+        counter_name: "trim_default",
+        return_type: "string",
+        params: INTRINSIC_TRIM_PARAMS,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::TrimDefault,
+    },
+    BuiltinIntrinsicSpec {
+        name: "in_array",
+        counter_name: "in_array_strict",
+        return_type: "bool",
+        params: INTRINSIC_IN_ARRAY_PARAMS,
+        min_arity: 3,
+        exact_arity: 3,
+        kind: BuiltinIntrinsicKind::InArrayStrict,
+    },
+    BuiltinIntrinsicSpec {
+        name: "array_key_exists",
+        counter_name: "array_key_exists",
+        return_type: "bool",
+        params: INTRINSIC_ARRAY_KEY_EXISTS_PARAMS,
+        min_arity: 2,
+        exact_arity: 2,
+        kind: BuiltinIntrinsicKind::ArrayKeyExists,
+    },
+    BuiltinIntrinsicSpec {
+        name: "count",
+        counter_name: "count",
+        return_type: "int",
+        params: INTRINSIC_COUNT_PARAMS,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::CountArray,
+    },
+    BuiltinIntrinsicSpec {
+        name: "explode",
+        counter_name: "explode_single_byte",
+        return_type: "array",
+        params: INTRINSIC_EXPLODE_PARAMS,
+        min_arity: 2,
+        exact_arity: 2,
+        kind: BuiltinIntrinsicKind::ExplodeSingleByte,
+    },
+    BuiltinIntrinsicSpec {
+        name: "htmlspecialchars",
+        counter_name: "htmlspecialchars_default",
+        return_type: "string",
+        params: INTRINSIC_HTMLSPECIALCHARS_PARAMS,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::HtmlSpecialCharsDefault,
+    },
+    BuiltinIntrinsicSpec {
+        name: "is_array",
+        counter_name: "is_array",
+        return_type: "bool",
+        params: INTRINSIC_VALUE_PARAM,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::IsArray,
+    },
+    BuiltinIntrinsicSpec {
+        name: "is_int",
+        counter_name: "is_int",
+        return_type: "bool",
+        params: INTRINSIC_VALUE_PARAM,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::IsInt,
+    },
+    BuiltinIntrinsicSpec {
+        name: "is_string",
+        counter_name: "is_string",
+        return_type: "bool",
+        params: INTRINSIC_VALUE_PARAM,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::IsString,
+    },
+    BuiltinIntrinsicSpec {
+        name: "strlen",
+        counter_name: "strlen",
+        return_type: "int",
+        params: INTRINSIC_STRING_PARAM,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::StrLen,
+    },
+    BuiltinIntrinsicSpec {
+        name: "str_contains",
+        counter_name: "str_contains",
+        return_type: "bool",
+        params: INTRINSIC_STRING_PAIR_PARAMS,
+        min_arity: 2,
+        exact_arity: 2,
+        kind: BuiltinIntrinsicKind::StrContains,
+    },
+    BuiltinIntrinsicSpec {
+        name: "str_ends_with",
+        counter_name: "str_ends_with",
+        return_type: "bool",
+        params: INTRINSIC_STRING_PAIR_PARAMS,
+        min_arity: 2,
+        exact_arity: 2,
+        kind: BuiltinIntrinsicKind::StrEndsWith,
+    },
+    BuiltinIntrinsicSpec {
+        name: "str_replace",
+        counter_name: "str_replace_scalar",
+        return_type: "string|array",
+        params: INTRINSIC_STR_REPLACE_PARAMS,
+        min_arity: 3,
+        exact_arity: 3,
+        kind: BuiltinIntrinsicKind::StrReplaceScalar,
+    },
+    BuiltinIntrinsicSpec {
+        name: "str_starts_with",
+        counter_name: "str_starts_with",
+        return_type: "bool",
+        params: INTRINSIC_STRING_PAIR_PARAMS,
+        min_arity: 2,
+        exact_arity: 2,
+        kind: BuiltinIntrinsicKind::StrStartsWith,
+    },
+    BuiltinIntrinsicSpec {
+        name: "strtolower",
+        counter_name: "strtolower",
+        return_type: "string",
+        params: INTRINSIC_STRING_PARAM,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::StrToLower,
+    },
+    BuiltinIntrinsicSpec {
+        name: "strtoupper",
+        counter_name: "strtoupper_ascii",
+        return_type: "string",
+        params: INTRINSIC_STRING_PARAM,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::StrToUpper,
+    },
+    BuiltinIntrinsicSpec {
+        name: "is_bool",
+        counter_name: "is_bool",
+        return_type: "bool",
+        params: INTRINSIC_VALUE_PARAM,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::IsBool,
+    },
+    BuiltinIntrinsicSpec {
+        name: "is_float",
+        counter_name: "is_float",
+        return_type: "bool",
+        params: INTRINSIC_VALUE_PARAM,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::IsFloat,
+    },
+    BuiltinIntrinsicSpec {
+        name: "is_null",
+        counter_name: "is_null",
+        return_type: "bool",
+        params: INTRINSIC_VALUE_PARAM,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::IsNull,
+    },
+    BuiltinIntrinsicSpec {
+        name: "is_numeric",
+        counter_name: "is_numeric",
+        return_type: "bool",
+        params: INTRINSIC_VALUE_PARAM,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::IsNumeric,
+    },
+    BuiltinIntrinsicSpec {
+        name: "is_object",
+        counter_name: "is_object",
+        return_type: "bool",
+        params: INTRINSIC_VALUE_PARAM,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::IsObject,
+    },
+    BuiltinIntrinsicSpec {
+        name: "is_scalar",
+        counter_name: "is_scalar",
+        return_type: "bool",
+        params: INTRINSIC_VALUE_PARAM,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::IsScalar,
+    },
+    BuiltinIntrinsicSpec {
+        name: "current",
+        counter_name: "current_array_pointer",
+        return_type: "mixed",
+        params: INTRINSIC_POINTER_ARRAY_PARAM,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::PointerCurrent,
+    },
+    BuiltinIntrinsicSpec {
+        name: "key",
+        counter_name: "key_array_pointer",
+        return_type: "int|string|null",
+        params: INTRINSIC_POINTER_ARRAY_PARAM,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::PointerKey,
+    },
+    BuiltinIntrinsicSpec {
+        name: "array_keys",
+        counter_name: "array_keys_all",
+        return_type: "array",
+        params: INTRINSIC_ARRAY_KEYS_PARAMS,
+        min_arity: 1,
+        exact_arity: 1,
+        kind: BuiltinIntrinsicKind::ArrayKeysAll,
+    },
+    BuiltinIntrinsicSpec {
+        name: "implode",
+        counter_name: "implode_string_parts",
+        return_type: "string",
+        params: INTRINSIC_IMPLODE_PARAMS,
+        min_arity: 2,
+        exact_arity: 2,
+        kind: BuiltinIntrinsicKind::ImplodeStringParts,
+    },
+];
+
+fn fast_builtin_stub_result_for_spec(
+    spec_index: usize,
+    spec: &'static BuiltinIntrinsicSpec,
+    values: &[Value],
+) -> Option<Value> {
+    if fast_builtin_stub_fallback_reason_for_spec(spec_index, spec, values).is_some() {
+        return None;
+    }
+    match (spec.kind, values) {
+        (BuiltinIntrinsicKind::ArrayKeyExists, [key, Value::Array(array)]) => {
+            let key = ArrayKey::from_value(key)?;
+            Some(Value::Bool(array.get(&key).is_some()))
+        }
+        (BuiltinIntrinsicKind::CountArray, [Value::Array(array)]) => {
+            Some(Value::Int(array.len() as i64))
+        }
+        (BuiltinIntrinsicKind::IsArray, [value]) => {
+            Some(Value::Bool(matches!(value, Value::Array(_))))
+        }
+        (BuiltinIntrinsicKind::IsInt, [value]) => Some(Value::Bool(matches!(value, Value::Int(_)))),
+        (BuiltinIntrinsicKind::IsBool, [value]) => {
+            Some(Value::Bool(matches!(value, Value::Bool(_))))
+        }
+        (BuiltinIntrinsicKind::IsFloat, [value]) => {
+            Some(Value::Bool(matches!(value, Value::Float(_))))
+        }
+        (BuiltinIntrinsicKind::IsNull, [value]) => Some(Value::Bool(matches!(value, Value::Null))),
+        (BuiltinIntrinsicKind::IsNumeric, [value]) => Some(Value::Bool(match value {
+            Value::Int(_) | Value::Float(_) => true,
+            // Matches the numeric-string classifier: only a whole trimmed
+            // int/float string is numeric; leading-numeric ("12abc") and
+            // non-numeric strings are not. References are rejected as by_ref
+            // before reaching here, so this sees the effective value.
+            Value::String(bytes) => matches!(
+                classify_php_string(bytes).kind,
+                NumericStringKind::IntString | NumericStringKind::FloatString
+            ),
+            _ => false,
+        })),
+        (BuiltinIntrinsicKind::IsObject, [value]) => Some(Value::Bool(matches!(
+            value,
+            Value::Object(_) | Value::Fiber(_) | Value::Generator(_) | Value::Callable(_)
+        ))),
+        (BuiltinIntrinsicKind::IsScalar, [value]) => Some(Value::Bool(matches!(
+            value,
+            Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::String(_)
+        ))),
+        (BuiltinIntrinsicKind::PointerCurrent, [Value::Array(array)]) => {
+            Some(array.pointer_value().unwrap_or(Value::Bool(false)))
+        }
+        (BuiltinIntrinsicKind::PointerKey, [Value::Array(array)]) => {
+            Some(array.pointer_key().map_or(Value::Null, array_key_to_value))
+        }
+        (BuiltinIntrinsicKind::ArrayKeysAll, [Value::Array(array)]) => {
+            let keys = array
+                .iter()
+                .map(|(key, _)| array_key_to_value(key))
+                .collect::<Vec<_>>();
+            Some(Value::Array(PhpArray::from_packed(keys)))
+        }
+        (
+            BuiltinIntrinsicKind::ImplodeStringParts,
+            [Value::String(separator), Value::Array(parts)],
+        ) => php_runtime::builtins::string_intrinsics::implode_string_parts(separator, parts)
+            .map(Value::String),
+        (BuiltinIntrinsicKind::IsString, [value]) => {
+            Some(Value::Bool(matches!(value, Value::String(_))))
+        }
+        (BuiltinIntrinsicKind::StrLen, [Value::String(string)]) => {
+            Some(Value::Int(string.len() as i64))
+        }
+        (BuiltinIntrinsicKind::StrContains, [Value::String(haystack), Value::String(needle)]) => {
+            Some(Value::Bool(byte_slice_contains(
+                haystack.as_bytes(),
+                needle.as_bytes(),
+            )))
+        }
+        (BuiltinIntrinsicKind::StrStartsWith, [Value::String(haystack), Value::String(needle)]) => {
+            Some(Value::Bool(
+                haystack.as_bytes().starts_with(needle.as_bytes()),
+            ))
+        }
+        (BuiltinIntrinsicKind::StrEndsWith, [Value::String(haystack), Value::String(needle)]) => {
+            Some(Value::Bool(
+                haystack.as_bytes().ends_with(needle.as_bytes()),
+            ))
+        }
+        (BuiltinIntrinsicKind::StrToLower, [Value::String(string)]) => Some(Value::String(
+            php_runtime::builtins::string_intrinsics::strtolower_ascii(string),
+        )),
+        (BuiltinIntrinsicKind::StrToUpper, [Value::String(string)]) => Some(Value::String(
+            php_runtime::builtins::string_intrinsics::strtoupper_ascii(string),
+        )),
+        (
+            BuiltinIntrinsicKind::StrReplaceScalar,
+            [
+                Value::String(search),
+                Value::String(replace),
+                Value::String(subject),
+            ],
+        ) => Some(Value::String(
+            php_runtime::builtins::string_intrinsics::str_replace_scalar(search, replace, subject),
+        )),
+        (BuiltinIntrinsicKind::HtmlSpecialCharsDefault, [Value::String(string)]) => {
+            Some(Value::String(
+                php_runtime::builtins::string_intrinsics::htmlspecialchars_default(string),
+            ))
+        }
+        (
+            BuiltinIntrinsicKind::ExplodeSingleByte,
+            [Value::String(separator), Value::String(subject)],
+        ) if separator.len() == 1 => Some(Value::Array(
+            php_runtime::builtins::string_intrinsics::explode_single_byte(
+                separator.as_bytes()[0],
+                subject,
+            ),
+        )),
+        (
+            BuiltinIntrinsicKind::SubstrBytes,
+            [Value::String(string), Value::Int(offset), rest @ ..],
+        ) => {
+            let length = match rest {
+                [] | [Value::Null] => None,
+                [Value::Int(length)] => Some(*length),
+                _ => return None,
+            };
+            Some(Value::String(
+                php_runtime::builtins::string_intrinsics::substr_bytes(string, *offset, length),
+            ))
+        }
+        (BuiltinIntrinsicKind::TrimDefault, [Value::String(string)]) => Some(Value::String(
+            php_runtime::builtins::string_intrinsics::trim_ascii_default(string),
+        )),
+        (
+            BuiltinIntrinsicKind::InArrayStrict,
+            [
+                needle @ (Value::Int(_) | Value::String(_)),
+                Value::Array(haystack),
+                Value::Bool(true),
+            ],
+        ) => {
+            Some(Value::Bool(haystack.iter().any(|(_, value)| {
+                php_runtime::convert::identical(needle, value)
+            })))
+        }
+        _ => None,
+    }
+}
+
+fn builtin_intrinsic_spec(name: &str) -> Option<(usize, &'static BuiltinIntrinsicSpec)> {
+    BUILTIN_INTRINSICS
+        .iter()
+        .enumerate()
+        .find(|(_, spec)| spec.name == name)
+}
+
+/// Memoized per-spec result of `builtin_intrinsic_metadata_matches`.
+///
+/// The check compares the static intrinsic spec against the static generated
+/// arginfo table (a linear scan over ~2.3k entries), so recomputing it on
+/// every intrinsic builtin call dominated the fast-stub dispatch cost.
+fn builtin_intrinsic_metadata_matches_cached(spec_index: usize) -> bool {
+    static RESULTS: std::sync::LazyLock<Vec<bool>> = std::sync::LazyLock::new(|| {
+        BUILTIN_INTRINSICS
+            .iter()
+            .map(builtin_intrinsic_metadata_matches)
+            .collect()
+    });
+    RESULTS[spec_index]
+}
+
+fn fast_builtin_stub_fallback_reason_for_spec(
+    spec_index: usize,
+    spec: &'static BuiltinIntrinsicSpec,
+    values: &[Value],
+) -> Option<&'static str> {
+    if !builtin_intrinsic_metadata_matches_cached(spec_index) {
+        return Some("metadata");
+    }
+    if values.len() < spec.min_arity || values.len() > spec.exact_arity {
+        return Some("arity");
+    }
+    if values
+        .iter()
+        .any(|value| matches!(value, Value::Reference(_)))
+    {
+        return Some("by_ref");
+    }
+    builtin_intrinsic_type_fallback(spec.kind, values)
+}
+
+fn builtin_intrinsic_metadata_matches(spec: &BuiltinIntrinsicSpec) -> bool {
+    let Some(metadata) = php_std::arginfo::function_metadata_indexed(spec.name) else {
+        return false;
+    };
+    if metadata.return_type != spec.return_type || metadata.params.len() != spec.params.len() {
+        return false;
+    }
+    metadata
+        .params
+        .iter()
+        .zip(spec.params.iter())
+        .all(|(actual, expected)| {
+            actual.name == expected.name
+                && actual.type_decl == expected.type_decl
+                && actual.optional == expected.optional
+                && actual.by_ref == expected.by_ref
+                && !actual.variadic
+        })
+}
+
+/// `None` when the argument shape fits the intrinsic fast path; otherwise the
+/// per-builtin fallback reason recorded in the counters.
+fn builtin_intrinsic_type_fallback(
+    kind: BuiltinIntrinsicKind,
+    values: &[Value],
+) -> Option<&'static str> {
+    match (kind, values) {
+        (BuiltinIntrinsicKind::ArrayKeyExists, [key, Value::Array(_)]) => {
+            if ArrayKey::from_value(key).is_some() {
+                None
+            } else {
+                Some("type")
+            }
+        }
+        (BuiltinIntrinsicKind::CountArray, [Value::Array(_)])
+        | (
+            BuiltinIntrinsicKind::StrLen
+            | BuiltinIntrinsicKind::StrToLower
+            | BuiltinIntrinsicKind::StrToUpper
+            | BuiltinIntrinsicKind::HtmlSpecialCharsDefault,
+            [Value::String(_)],
+        )
+        | (
+            BuiltinIntrinsicKind::StrContains
+            | BuiltinIntrinsicKind::StrStartsWith
+            | BuiltinIntrinsicKind::StrEndsWith,
+            [Value::String(_), Value::String(_)],
+        )
+        | (
+            BuiltinIntrinsicKind::IsArray
+            | BuiltinIntrinsicKind::IsBool
+            | BuiltinIntrinsicKind::IsFloat
+            | BuiltinIntrinsicKind::IsInt
+            | BuiltinIntrinsicKind::IsNull
+            | BuiltinIntrinsicKind::IsNumeric
+            | BuiltinIntrinsicKind::IsObject
+            | BuiltinIntrinsicKind::IsScalar
+            | BuiltinIntrinsicKind::IsString,
+            [_],
+        )
+        | (
+            BuiltinIntrinsicKind::PointerCurrent
+            | BuiltinIntrinsicKind::PointerKey
+            | BuiltinIntrinsicKind::ArrayKeysAll,
+            [Value::Array(_)],
+        ) => None,
+        (BuiltinIntrinsicKind::ImplodeStringParts, [Value::String(_), Value::Array(parts)]) => {
+            if parts
+                .iter()
+                .all(|(_, value)| matches!(value, Value::String(_)))
+            {
+                None
+            } else {
+                Some("non_string_parts")
+            }
+        }
+        (BuiltinIntrinsicKind::ExplodeSingleByte, [Value::String(separator), Value::String(_)]) => {
+            match separator.len() {
+                0 => Some("empty_separator"),
+                1 => None,
+                _ => Some("multi_byte_separator"),
+            }
+        }
+        (
+            BuiltinIntrinsicKind::StrReplaceScalar,
+            [Value::String(_), Value::String(_), Value::String(_)],
+        ) => None,
+        (
+            BuiltinIntrinsicKind::SubstrBytes,
+            [Value::String(_), Value::Int(_)]
+            | [Value::String(_), Value::Int(_), Value::Int(_) | Value::Null],
+        ) => None,
+        (BuiltinIntrinsicKind::TrimDefault, [Value::String(_)]) => None,
+        (
+            BuiltinIntrinsicKind::InArrayStrict,
+            [
+                Value::Int(_) | Value::String(_),
+                Value::Array(_),
+                Value::Bool(strict),
+            ],
+        ) => {
+            if *strict {
+                None
+            } else {
+                Some("loose_comparison")
+            }
+        }
+        (BuiltinIntrinsicKind::StrReplaceScalar, [search, replace, subject]) => {
+            if [search, replace, subject]
+                .iter()
+                .any(|value| matches!(value, Value::Array(_)))
+            {
+                Some("array_args")
+            } else {
+                Some("type")
+            }
+        }
+        _ => Some("type"),
+    }
+}
+
+fn byte_slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty()
+        || haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
