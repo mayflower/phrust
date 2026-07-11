@@ -166,6 +166,11 @@ impl CompiledIncludeCache {
     ) -> Result<Arc<CompiledUnit>, VmError> {
         let compiler_fingerprint = compiler.fingerprint(loader);
         loop {
+            if let Some(compiled) =
+                self.lookup_fresh_compiled_include(resolved, &compiler_fingerprint)?
+            {
+                return Ok(compiled);
+            }
             let validation_mode = if self.immutable_identity_only_allowed(resolved) {
                 IncludeValidationMode::IdentityOnly
             } else {
@@ -249,6 +254,46 @@ impl CompiledIncludeCache {
             }?;
             return Ok(compiled);
         }
+    }
+
+    /// Serves a hit whose revalidation window is still open, without touching
+    /// the filesystem. This runs before any validation input is prepared:
+    /// preparing those inputs is what costs per-call fs work (a full source
+    /// read in content mode, a resolution-path canonicalize in immutable
+    /// identity mode), and a freshly-validated slot never consults them.
+    fn lookup_fresh_compiled_include(
+        &self,
+        resolved: &ResolvedIncludePath,
+        compiler: &IncludeCompilerFingerprint,
+    ) -> Result<Option<Arc<CompiledUnit>>, VmError> {
+        if self.revalidation_interval == Duration::ZERO {
+            return Ok(None);
+        }
+        let lookup_key =
+            CompiledIncludeLookupKey::new(resolved.canonical_path.clone(), compiler.clone());
+        let shard_index = self.compile_shard_index_for_path(&lookup_key.canonical_path);
+        let Some(full_key) = ({
+            let lookup_shard = self.lookup_shards[shard_index]
+                .read()
+                .map_err(|_| include_cache_lock_error("compiled-index", "lookup"))?;
+            lookup_shard.get(&lookup_key).cloned()
+        }) else {
+            return Ok(None);
+        };
+        let slot = {
+            let shard = self.shards[shard_index]
+                .read()
+                .map_err(|_| include_cache_lock_error("compiled", "lookup"))?;
+            shard.get(&full_key).map(Arc::clone)
+        };
+        let Some(slot) = slot else {
+            return Ok(None);
+        };
+        if slot.freshly_validated(self.revalidation_epoch, self.revalidation_interval) {
+            self.stats.compile_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(Arc::clone(&slot.compiled)));
+        }
+        Ok(None)
     }
 
     fn lookup_compiled_include(

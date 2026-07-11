@@ -146,6 +146,13 @@ impl ResolutionCache {
                 self.stats
                     .immutable_release_hits
                     .fetch_add(1, Ordering::Relaxed);
+                // Re-arm the freshness window: without this stamp an
+                // immutable-trusted entry never counts as freshly validated,
+                // so every hit after the window re-canonicalizes its
+                // resolution path — one fs op per include per request. With
+                // it, the symlink/root-swap probe keeps its per-window
+                // cadence instead of running per hit.
+                cached.touch(self.revalidation_epoch);
                 return Ok(resolved.clone());
             }
             match include_path_file_fingerprint(&resolved.canonical_path) {
