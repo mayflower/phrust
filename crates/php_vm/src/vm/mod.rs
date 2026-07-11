@@ -64,6 +64,7 @@ mod rich_call_dispatch;
 mod rich_dispatch;
 mod rich_exception_dispatch;
 mod rich_foreach_dispatch;
+mod rich_object_dispatch;
 mod rich_property_dispatch;
 mod runtime_class_metadata;
 mod runtime_class_support;
@@ -569,7 +570,6 @@ pub struct Vm {
     last_use_move_plans: RefCell<HashMap<(u64, u32), Rc<crate::last_use::LastUseMovePlan>>>,
     /// Per-request receiver-class lookup by shared class-name identity.
     object_class_resolution: RefCell<ObjectClassResolution>,
-    /// Per-unit constant values, resolved once and indexed on later reads.
     resolved_constants: RefCell<ResolvedConstantTables>,
 }
 
