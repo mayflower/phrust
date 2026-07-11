@@ -8136,6 +8136,16 @@ fn methods_execute_static_calls() {
 }
 
 #[test]
+fn scoped_missing_static_calls_use_inherited_instance_magic_call() {
+    let result = execute_source(
+        "<?php class Base { public function __call($name, $args) { echo $name, '|'; } } class Child extends Base { public function run() { static::first(); parent::second(); } } (new Child())->run();",
+    );
+
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(result.output.as_bytes(), b"first|second|");
+}
+
+#[test]
 fn methods_execute_inheritance_visibility_and_static_scope() {
     let inherited = execute_source(
         "<?php class Base { public $value; function set($value) { $this->value = $value; } function get() { return $this->value; } } class Child extends Base { function label() { return 'child'; } } $child = new Child(); $child->set(9); echo $child->get(), '|', $child->label();",

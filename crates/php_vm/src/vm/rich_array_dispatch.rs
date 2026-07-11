@@ -17,6 +17,7 @@ pub(super) fn execute_rich_array_instruction(
         function_id,
         block_id,
         instruction,
+        instruction_index: _,
         frame_index,
     } = site;
 

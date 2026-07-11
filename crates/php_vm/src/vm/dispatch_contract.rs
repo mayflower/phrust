@@ -6,6 +6,7 @@ pub(super) struct RichInstructionSite<'a> {
     pub(super) function_id: FunctionId,
     pub(super) block_id: BlockId,
     pub(super) instruction: &'a Instruction,
+    pub(super) instruction_index: usize,
     pub(super) frame_index: usize,
 }
 

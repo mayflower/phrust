@@ -1151,8 +1151,8 @@ fn typecheck_fast_path_match(value: &Value, runtime_type: &RuntimeType) -> bool 
         RuntimeType::Object => {
             matches!(
                 value,
-                Value::Object(_) | Value::Fiber(_) | Value::Generator(_)
-            ) || matches!(value.as_callable(), Some(CallableValue::Closure(_)))
+                Value::Object(_) | Value::Callable(_) | Value::Fiber(_) | Value::Generator(_)
+            )
         }
         RuntimeType::Class { name, .. } => {
             matches!(
@@ -1164,8 +1164,7 @@ fn typecheck_fast_path_match(value: &Value, runtime_type: &RuntimeType) -> bool 
             ) || matches!(
                 value,
                 Value::Generator(_) if name.eq_ignore_ascii_case("Generator")
-            ) || (matches!(value.as_callable(), Some(CallableValue::Closure(_)))
-                && name.eq_ignore_ascii_case("Closure"))
+            ) || (matches!(value, Value::Callable(_)) && name.eq_ignore_ascii_case("Closure"))
         }
         RuntimeType::Nullable { inner } => {
             matches!(value, Value::Null) || typecheck_fast_path_match(value, inner)

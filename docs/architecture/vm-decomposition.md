@@ -53,11 +53,11 @@ queries and property resolution live in `class_relations` and
 
 `rich_dispatch` now owns the complete rich execution cursor instead of leaving
 it embedded in the facade. Its initial 15,212-line move is a migration boundary,
-not an accepted final file size: direct foreach, exception-control, and
-array/dimension handlers have since moved to focused owners. Opcode-family
-extraction must ratchet the cursor below the repository's 5,000-line default
-while `vm/mod.rs` remains below the 2,500-line facade limit. Neither large-file
-baseline may increase during that migration.
+not an accepted final file size: direct foreach, exception-control,
+array/dimension, and call handlers have since moved to focused owners.
+Opcode-family extraction must ratchet the cursor below the repository's
+5,000-line default while `vm/mod.rs` remains below the 2,500-line facade limit.
+Neither large-file baseline may increase during that migration.
 
 | Owner | Owns | Must not own |
 | --- | --- | --- |
@@ -65,6 +65,7 @@ baseline may increase during that migration.
 | `execution_state` | frames, exception/control state, request-local declaration tables, deadline state, GC roots | builtin dispatch or server state |
 | `rich_dispatch` | IR cursor and direct opcode selection | extension implementations or backend-specific JIT details |
 | `rich_array_dispatch` | array literals and dimension read/write/probe/unset handlers | local-variable lifecycle or generic property rules |
+| `rich_call_dispatch` | function, method, static, closure, callable, and pipe opcode handlers | argument binding or method-resolution implementation |
 | `dense_dispatch` | dense cursor and direct opcode selection | a second semantic implementation |
 | `arguments` | argument binding, reference acquisition, type enforcement, and parameter diagnostics | call routing or opcode dispatch |
 | `closure_operations` | closure values, captures, binding context, and `$this` initialization | generic function dispatch or argument binding |

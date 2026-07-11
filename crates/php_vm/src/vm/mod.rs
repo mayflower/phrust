@@ -60,6 +60,7 @@ mod request_lifecycle;
 mod request_profile;
 mod result;
 mod rich_array_dispatch;
+mod rich_call_dispatch;
 mod rich_dispatch;
 mod rich_exception_dispatch;
 mod rich_foreach_dispatch;
@@ -392,10 +393,8 @@ struct DenseExecutionPlanThreadCacheKey {
     artifact: DenseExecutionArtifactKey,
 }
 
-/// Per-worker symbol-replay ledger: units whose declarations this thread
-/// has already observed, plus the worker-monotonic lookup epoch. Identical
-/// include replay keeps the epoch constant so slot-indexed inline caches
-/// with request-stable targets survive the request boundary.
+/// Tracks declarations observed by this worker and its lookup invalidation epoch.
+/// Stable include replay preserves slot-indexed inline caches across requests.
 struct WorkerSymbolLedger {
     epoch: Cell<u64>,
     seen_units: RefCell<HashSet<u64>>,

@@ -656,6 +656,23 @@ impl Vm {
             Ok(Some(method)) => method,
             Ok(None) => {
                 self.record_counter_dense_call_fallback("magic_static_call");
+                if let Some(object) = current_this_object(compiled, stack) {
+                    match self.call_magic_instance_method(
+                        compiled,
+                        object,
+                        "__call",
+                        method,
+                        args.clone(),
+                        call_span,
+                        output,
+                        stack,
+                        state,
+                    ) {
+                        Ok(Some(result)) => return result,
+                        Ok(None) => {}
+                        Err(result) => return result,
+                    }
+                }
                 return match self.call_magic_static_method(
                     compiled,
                     &class,

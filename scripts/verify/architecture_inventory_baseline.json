@@ -230,12 +230,12 @@
       "max_lines": 5993
     },
     "crates/php_vm/src/vm/mod.rs": {
-      "max_bytes": 67176,
-      "max_lines": 1602
+      "max_bytes": 67077,
+      "max_lines": 1601
     },
     "crates/php_vm/src/vm/rich_dispatch.rs": {
-      "max_bytes": 691501,
-      "max_lines": 13269
+      "max_bytes": 498149,
+      "max_lines": 9674
     },
     "crates/php_vm/src/vm/spl.rs": {
       "max_bytes": 257771,
