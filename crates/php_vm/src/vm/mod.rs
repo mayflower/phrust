@@ -2922,7 +2922,7 @@ impl Vm {
                     diagnostics: vec![diagnostic],
                     http_response: RuntimeHttpResponseState::default(),
                     upload_registry: UploadRegistry::default(),
-                    session: php_runtime::SessionState::default(),
+                    session: None,
                     return_value: None,
                     returned_explicitly: false,
                     process_exit_code: None,
@@ -3010,7 +3010,7 @@ impl Vm {
                             tiering_stats: None,
                             http_response: RuntimeHttpResponseState::default(),
                             upload_registry: UploadRegistry::default(),
-                            session: php_runtime::SessionState::default(),
+                            session: None,
                         }
                     } else {
                         self.record_counter_bytecode_unsupported_fallback();
@@ -3108,7 +3108,7 @@ impl Vm {
         result.diagnostics.extend(state.diagnostics);
         result.http_response = state.http_response;
         result.upload_registry = state.upload_registry;
-        result.session = state.session;
+        result.session = Some(Box::new(state.session));
         if self.options.trace || self.options.trace_runtime || self.options.trace_includes {
             result.trace = self.trace.borrow().clone();
         }
@@ -27166,7 +27166,7 @@ impl Vm {
                                 tiering_stats: None,
                                 http_response: RuntimeHttpResponseState::default(),
                                 upload_registry: UploadRegistry::default(),
-                                session: php_runtime::SessionState::default(),
+                                session: None,
                             };
                         };
                         foreach_iterators.insert(
@@ -31269,7 +31269,7 @@ impl Vm {
                             tiering_stats: None,
                             http_response: RuntimeHttpResponseState::default(),
                             upload_registry: UploadRegistry::default(),
-                            session: php_runtime::SessionState::default(),
+                            session: None,
                         };
                     }
                     InstructionKind::RuntimeError {
@@ -40222,7 +40222,7 @@ impl Vm {
                     tiering_stats: None,
                     http_response: RuntimeHttpResponseState::default(),
                     upload_registry: UploadRegistry::default(),
-                    session: php_runtime::SessionState::default(),
+                    session: None,
                 })
             }
         }

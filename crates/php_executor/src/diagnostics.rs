@@ -153,7 +153,7 @@ pub(crate) fn execution_output_from_vm(
         runtime_diagnostics: result.diagnostics,
         http_response: result.http_response,
         upload_registry: result.upload_registry,
-        session: result.session,
+        session: result.session.map(|session| *session).unwrap_or_default(),
         return_value: result.return_value,
         trace: result.trace,
         counters: result.counters.map(|counters| *counters),

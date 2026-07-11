@@ -22,8 +22,10 @@ pub struct VmResult {
     pub http_response: RuntimeHttpResponseState,
     /// Request-local upload registry state after PHP code has executed.
     pub upload_registry: UploadRegistry,
-    /// Request-local session state after PHP code has executed.
-    pub session: SessionState,
+    /// Request-local session state after PHP code has executed. Boxed and
+    /// optional: only the outermost `execute` boundary attaches it, while
+    /// every nested function return moves a `VmResult` by value.
+    pub session: Option<Box<SessionState>>,
     /// Return value when execution returned successfully.
     pub return_value: Option<Value>,
     /// True when the return value came from an explicit PHP `return`.
@@ -117,10 +119,7 @@ impl VmResult {
             diagnostics: Vec::new(),
             http_response: RuntimeHttpResponseState::default(),
             upload_registry: UploadRegistry::default(),
-            // Never observed: overwritten at the request boundary from
-            // `state.session`, discarded for inner-call returns. Cheap default
-            // avoids three heap Strings on every function return.
-            session: SessionState::placeholder(),
+            session: None,
             return_value,
             returned_explicitly: false,
             process_exit_code: None,
@@ -149,8 +148,7 @@ impl VmResult {
             diagnostics,
             http_response: RuntimeHttpResponseState::default(),
             upload_registry: UploadRegistry::default(),
-            // See `success`: never-observed placeholder, allocation-free.
-            session: SessionState::placeholder(),
+            session: None,
             return_value,
             returned_explicitly: false,
             process_exit_code: None,
@@ -189,7 +187,7 @@ impl VmResult {
             diagnostics: vec![diagnostic],
             http_response: RuntimeHttpResponseState::default(),
             upload_registry: UploadRegistry::default(),
-            session: SessionState::default(),
+            session: None,
             return_value: None,
             returned_explicitly: false,
             process_exit_code: None,
@@ -210,7 +208,7 @@ impl VmResult {
             diagnostics: Vec::new(),
             http_response: RuntimeHttpResponseState::default(),
             upload_registry: UploadRegistry::default(),
-            session: SessionState::default(),
+            session: None,
             return_value: None,
             returned_explicitly: false,
             process_exit_code: None,
@@ -231,7 +229,7 @@ impl VmResult {
             diagnostics: Vec::new(),
             http_response: RuntimeHttpResponseState::default(),
             upload_registry: UploadRegistry::default(),
-            session: SessionState::default(),
+            session: None,
             return_value: None,
             returned_explicitly: false,
             process_exit_code: None,
@@ -258,7 +256,7 @@ impl VmResult {
             diagnostics: Vec::new(),
             http_response: RuntimeHttpResponseState::default(),
             upload_registry: UploadRegistry::default(),
-            session: SessionState::default(),
+            session: None,
             return_value: None,
             returned_explicitly: false,
             process_exit_code: None,
@@ -304,6 +302,7 @@ mod tests {
 
 #[cfg(test)]
 mod size_tests {
+
     /// `VmResult` is returned by value from every nested function call, so
     /// inline payload growth multiplies across the whole interpreter. The
     /// unboxed counters struct alone once pushed this to ~5.7 KB per return.
@@ -311,7 +310,7 @@ mod size_tests {
     fn vm_result_stays_call_sized() {
         let size = std::mem::size_of::<super::VmResult>();
         assert!(
-            size <= 768,
+            size <= 512,
             "VmResult grew to {size} bytes; it is moved by value on every function return — box new large fields"
         );
     }
