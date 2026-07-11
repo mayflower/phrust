@@ -1,5 +1,6 @@
 //! Callable dispatch and dynamic call execution.
 
+use super::builtin_intrinsics::try_execute_simple_literal_pcre_builtin;
 use super::prelude::*;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

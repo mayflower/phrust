@@ -1553,3 +1553,212 @@ fn byte_slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
             .windows(needle.len())
             .any(|window| window == needle)
 }
+
+pub(super) fn try_execute_simple_literal_pcre_builtin(
+    name: &str,
+    values: &[Value],
+    state: &mut ExecutionState,
+) -> Option<VmResult> {
+    let result = match name {
+        "preg_match" => try_execute_simple_literal_preg_match(values)?,
+        "preg_replace" => try_execute_simple_literal_preg_replace(values)?,
+        "preg_split" => try_execute_simple_literal_preg_split(values)?,
+        "preg_grep" => try_execute_simple_literal_preg_grep(values)?,
+        _ => return None,
+    };
+    state.builtins.pcre_state_mut().last_error_mut().clear();
+    Some(VmResult::success_no_output(Some(result)))
+}
+
+fn simple_literal_pcre_pattern_value(
+    value: &Value,
+) -> Option<php_runtime::pcre::SimpleLiteralPattern> {
+    let Value::String(pattern) = value else {
+        return None;
+    };
+    php_runtime::pcre::simple_literal_pattern(pattern)
+        .ok()
+        .flatten()
+}
+
+fn simple_literal_string_value(value: &Value) -> Option<&PhpString> {
+    match value {
+        Value::String(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn simple_literal_int_value(value: Option<&Value>, default: i64) -> Option<i64> {
+    match value {
+        Some(Value::Int(value)) => Some(*value),
+        Some(_) => None,
+        None => Some(default),
+    }
+}
+
+fn simple_literal_find(haystack: &[u8], needle: &[u8], start: usize) -> Option<(usize, usize)> {
+    if needle.is_empty() || start > haystack.len() {
+        return None;
+    }
+    let last_start = haystack.len().checked_sub(needle.len())?;
+    let first = needle[0];
+    let mut index = start;
+    while index <= last_start {
+        if haystack[index] == first && &haystack[index..index + needle.len()] == needle {
+            return Some((index, index + needle.len()));
+        }
+        index += 1;
+    }
+    None
+}
+
+fn try_execute_simple_literal_preg_match(values: &[Value]) -> Option<Value> {
+    if values.len() != 2 {
+        return None;
+    }
+    let literal = simple_literal_pcre_pattern_value(&values[0])?;
+    let subject = simple_literal_string_value(&values[1])?;
+    Some(Value::Int(
+        simple_literal_find(subject.as_bytes(), literal.as_bytes(), 0)
+            .is_some()
+            .into(),
+    ))
+}
+
+fn try_execute_simple_literal_preg_replace(values: &[Value]) -> Option<Value> {
+    if values.len() < 3 || values.len() > 5 {
+        return None;
+    }
+    let literal = simple_literal_pcre_pattern_value(&values[0])?;
+    let replacement = simple_literal_string_value(&values[1])?;
+    if replacement
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(*byte, b'$' | b'\\'))
+    {
+        return None;
+    }
+    let subject = simple_literal_string_value(&values[2])?;
+    let limit = simple_literal_int_value(values.get(3), -1)?;
+    let mut count = 0i64;
+    let replaced = simple_literal_replace(
+        subject.as_bytes(),
+        literal.as_bytes(),
+        replacement.as_bytes(),
+        limit,
+        &mut count,
+    );
+    if let Some(Value::Reference(cell)) = values.get(4) {
+        cell.set(Value::Int(count));
+    }
+    Some(Value::string(replaced))
+}
+
+fn simple_literal_replace(
+    subject: &[u8],
+    needle: &[u8],
+    replacement: &[u8],
+    limit: i64,
+    count: &mut i64,
+) -> Vec<u8> {
+    let mut output = Vec::with_capacity(subject.len());
+    let mut cursor = 0usize;
+    loop {
+        if limit >= 0 && *count >= limit {
+            break;
+        }
+        let Some((start, end)) = simple_literal_find(subject, needle, cursor) else {
+            break;
+        };
+        output.extend_from_slice(&subject[cursor..start]);
+        output.extend_from_slice(replacement);
+        cursor = end;
+        *count += 1;
+    }
+    output.extend_from_slice(&subject[cursor..]);
+    output
+}
+
+fn try_execute_simple_literal_preg_split(values: &[Value]) -> Option<Value> {
+    if values.len() < 2 || values.len() > 4 {
+        return None;
+    }
+    let literal = simple_literal_pcre_pattern_value(&values[0])?;
+    let subject = simple_literal_string_value(&values[1])?;
+    let limit = simple_literal_int_value(values.get(2), -1)?;
+    let flags = simple_literal_int_value(values.get(3), 0)?;
+    if flags & php_runtime::pcre::PREG_SPLIT_DELIM_CAPTURE != 0 {
+        return None;
+    }
+    let mut pieces = PhpArray::new();
+    let mut last_end = 0usize;
+    let mut emitted = 0i64;
+    while last_end <= subject.as_bytes().len() {
+        if limit > 0 && emitted >= limit - 1 {
+            break;
+        }
+        let Some((start, end)) =
+            simple_literal_find(subject.as_bytes(), literal.as_bytes(), last_end)
+        else {
+            break;
+        };
+        simple_literal_append_split_piece(
+            &mut pieces,
+            &subject.as_bytes()[last_end..start],
+            last_end,
+            flags,
+        );
+        last_end = end;
+        emitted += 1;
+    }
+    simple_literal_append_split_piece(
+        &mut pieces,
+        &subject.as_bytes()[last_end..],
+        last_end,
+        flags,
+    );
+    Some(Value::Array(pieces))
+}
+
+fn simple_literal_append_split_piece(
+    pieces: &mut PhpArray,
+    bytes: &[u8],
+    offset: usize,
+    flags: i64,
+) {
+    if flags & php_runtime::pcre::PREG_SPLIT_NO_EMPTY != 0 && bytes.is_empty() {
+        return;
+    }
+    let value = if flags & php_runtime::pcre::PREG_SPLIT_OFFSET_CAPTURE != 0 {
+        Value::packed_array(vec![
+            Value::string(bytes.to_vec()),
+            Value::Int(offset as i64),
+        ])
+    } else {
+        Value::string(bytes.to_vec())
+    };
+    pieces.insert(ArrayKey::Int(pieces.len() as i64), value);
+}
+
+fn try_execute_simple_literal_preg_grep(values: &[Value]) -> Option<Value> {
+    if values.len() < 2 || values.len() > 3 {
+        return None;
+    }
+    let literal = simple_literal_pcre_pattern_value(&values[0])?;
+    let Value::Array(input) = &values[1] else {
+        return None;
+    };
+    let flags = simple_literal_int_value(values.get(2), 0)?;
+    let invert = flags & php_runtime::pcre::PREG_GREP_INVERT != 0;
+    let mut output = PhpArray::new();
+    for (key, value) in input.iter() {
+        let Value::String(text) = value else {
+            return None;
+        };
+        let is_match = simple_literal_find(text.as_bytes(), literal.as_bytes(), 0).is_some();
+        if is_match != invert {
+            output.insert(key.clone(), value.clone());
+        }
+    }
+    Some(Value::Array(output))
+}
