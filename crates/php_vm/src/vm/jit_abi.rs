@@ -1,3 +1,7 @@
+// Audited native-tier ABI surface (docs/performance/cranelift/
+// safety-audit.md); compiled only under the JIT features, which the
+// pre-ADR-0020 CLI gate never covered.
+#![allow(unsafe_code)]
 #[cfg(feature = "jit-cranelift")]
 use crate::deopt::GuardKind;
 #[cfg(any(

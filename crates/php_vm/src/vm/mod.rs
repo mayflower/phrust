@@ -3316,6 +3316,10 @@ impl Vm {
     }
 
     #[cfg(feature = "jit-cranelift")]
+    // Audited native-tier helper boundary (docs/performance/cranelift/
+    // safety-audit.md): reconstitutes Box<Value> pointers produced by JIT
+    // helpers for this synchronous call.
+    #[allow(unsafe_code)]
     fn try_execute_jit_leaf(
         &self,
         compiled: &CompiledUnit,
