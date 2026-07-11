@@ -32,8 +32,15 @@ mod spl;
 use builtin_classes::*;
 use calls::*;
 use diagnostics::*;
-use execution_control::{ExecutionLimitExceeded, execution_limit_exceeded};
+use execution_control::{
+    ExceptionHandler, ExecutionLimitExceeded, PendingControl, RaiseOutcome,
+    execution_limit_exceeded,
+};
 use ext_redis::*;
+use generator_fiber::{
+    FiberContinuation, FiberResumeInput, FiberSuspension, GeneratorContinuation,
+    GeneratorResumeInput, GeneratorYield, YieldFromDelegation, YieldFromKey, YieldFromStep,
+};
 use jit_state::*;
 pub use options::{
     BytecodeLayoutMode, DenseIncludeMode, DenseJumpThreadingMode, ExecutionFormat,
@@ -298,104 +305,10 @@ enum ForeachInvalidSourceBehavior {
     WarnAndEmpty { span: Option<php_ir::IrSpan> },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ExceptionHandler {
-    catch: Option<BlockId>,
-    catch_types: Vec<String>,
-    finally: Option<BlockId>,
-    after: BlockId,
-    exception_local: Option<LocalId>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum PendingControl {
-    Return(Option<Value>),
-    Throw(Value),
-}
-
-/// Outcome of routing a runtime error through the active exception handlers.
-enum RaiseOutcome {
-    /// A handler in the current frame caught the throwable; resume at this block.
-    Caught(BlockId),
-    /// Nothing caught it in this frame; return this result to the caller.
-    Done(Box<VmResult>),
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AutoloadTraceOrigin {
     function_name: &'static str,
     span: php_ir::IrSpan,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GeneratorYield {
-    key: Option<Value>,
-    value: Value,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GeneratorContinuation {
-    frame: Frame,
-    block_id: BlockId,
-    instruction_index: usize,
-    yield_result: php_ir::ids::RegId,
-    foreach_iterators: HashMap<php_ir::ids::RegId, ForeachIterator>,
-    exception_handlers: Vec<ExceptionHandler>,
-    pending_control: Option<PendingControl>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FiberContinuation {
-    frame: Frame,
-    block_id: BlockId,
-    instruction_index: usize,
-    resume_result: php_ir::ids::RegId,
-    foreach_iterators: HashMap<php_ir::ids::RegId, ForeachIterator>,
-    exception_handlers: Vec<ExceptionHandler>,
-    pending_control: Option<PendingControl>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum FiberResumeInput {
-    Value(Value),
-    Throw(Value),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FiberSuspension {
-    value: Value,
-    continuations: Vec<FiberContinuation>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum GeneratorResumeInput {
-    Value(Value),
-    Throw(Value),
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct YieldFromKey {
-    generator_id: u64,
-    block_id: BlockId,
-    instruction_index: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum YieldFromDelegation {
-    Array {
-        entries: Vec<(ArrayKey, Value)>,
-        position: usize,
-    },
-    Generator {
-        generator: GeneratorRef,
-        started: bool,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum YieldFromStep {
-    Yield { key: Option<Value>, value: Value },
-    Complete(Value),
 }
 
 enum PropertyFetchCacheRead {

@@ -1,5 +1,28 @@
 use super::*;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ExceptionHandler {
+    pub(super) catch: Option<BlockId>,
+    pub(super) catch_types: Vec<String>,
+    pub(super) finally: Option<BlockId>,
+    pub(super) after: BlockId,
+    pub(super) exception_local: Option<LocalId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum PendingControl {
+    Return(Option<Value>),
+    Throw(Value),
+}
+
+/// Outcome of routing a runtime error through the active exception handlers.
+pub(super) enum RaiseOutcome {
+    /// A handler in the current frame caught the throwable; resume at this block.
+    Caught(BlockId),
+    /// Nothing caught it in this frame; return this result to the caller.
+    Done(Box<VmResult>),
+}
+
 const EXECUTION_DEADLINE_CHECK_INTERVAL: usize = 64;
 const EXECUTION_TIMEOUT_DIAGNOSTIC_ID: &str = "E_PHP_VM_EXECUTION_TIMEOUT";
 

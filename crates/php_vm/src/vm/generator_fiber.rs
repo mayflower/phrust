@@ -2,6 +2,77 @@
 
 use super::prelude::*;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GeneratorYield {
+    pub(super) key: Option<Value>,
+    pub(super) value: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GeneratorContinuation {
+    pub(super) frame: Frame,
+    pub(super) block_id: BlockId,
+    pub(super) instruction_index: usize,
+    pub(super) yield_result: php_ir::ids::RegId,
+    pub(super) foreach_iterators: HashMap<php_ir::ids::RegId, ForeachIterator>,
+    pub(super) exception_handlers: Vec<ExceptionHandler>,
+    pub(super) pending_control: Option<PendingControl>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct FiberContinuation {
+    pub(super) frame: Frame,
+    pub(super) block_id: BlockId,
+    pub(super) instruction_index: usize,
+    pub(super) resume_result: php_ir::ids::RegId,
+    pub(super) foreach_iterators: HashMap<php_ir::ids::RegId, ForeachIterator>,
+    pub(super) exception_handlers: Vec<ExceptionHandler>,
+    pub(super) pending_control: Option<PendingControl>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum FiberResumeInput {
+    Value(Value),
+    Throw(Value),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct FiberSuspension {
+    pub(super) value: Value,
+    pub(super) continuations: Vec<FiberContinuation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum GeneratorResumeInput {
+    Value(Value),
+    Throw(Value),
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct YieldFromKey {
+    pub(super) generator_id: u64,
+    pub(super) block_id: BlockId,
+    pub(super) instruction_index: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum YieldFromDelegation {
+    Array {
+        entries: Vec<(ArrayKey, Value)>,
+        position: usize,
+    },
+    Generator {
+        generator: GeneratorRef,
+        started: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum YieldFromStep {
+    Yield { key: Option<Value>, value: Value },
+    Complete(Value),
+}
+
 impl Vm {
     pub(super) fn resume_fiber_continuations(
         &self,
