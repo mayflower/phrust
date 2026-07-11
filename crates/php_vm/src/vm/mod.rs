@@ -139,7 +139,7 @@ use runtime_class_metadata::*;
 use runtime_operations::object_has_public_to_string_in_state;
 use scalar_handlers::{
     checked_int_binary, execute_arithmetic, execute_bitwise, execute_power, execute_rich_binary_op,
-    execute_rich_compare_op, execute_rich_unary_op,
+    execute_rich_compare_op, execute_rich_unary_op, int_int_specialization_for_binary_op,
 };
 use spl::*;
 use static_property_predicates::*;
@@ -28712,23 +28712,6 @@ fn next_block_id(function: &IrFunction, current: BlockId) -> Result<BlockId, Str
         ));
     }
     Ok(BlockId::new(next))
-}
-
-fn int_int_specialization_for_binary_op(op: BinaryOp) -> Option<QuickeningSpecialization> {
-    match op {
-        BinaryOp::Add => Some(QuickeningSpecialization::AddIntInt),
-        BinaryOp::Sub => Some(QuickeningSpecialization::SubIntInt),
-        BinaryOp::Mul => Some(QuickeningSpecialization::MulIntInt),
-        BinaryOp::Div
-        | BinaryOp::Mod
-        | BinaryOp::Concat
-        | BinaryOp::Pow
-        | BinaryOp::BitAnd
-        | BinaryOp::BitOr
-        | BinaryOp::BitXor
-        | BinaryOp::ShiftLeft
-        | BinaryOp::ShiftRight => None,
-    }
 }
 
 fn string_offset_negative_index(message: &str) -> Option<i64> {

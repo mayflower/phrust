@@ -1,6 +1,25 @@
 use super::dispatch_contract::DenseBinaryRequest;
 use super::prelude::*;
 
+pub(super) fn int_int_specialization_for_binary_op(
+    op: BinaryOp,
+) -> Option<QuickeningSpecialization> {
+    match op {
+        BinaryOp::Add => Some(QuickeningSpecialization::AddIntInt),
+        BinaryOp::Sub => Some(QuickeningSpecialization::SubIntInt),
+        BinaryOp::Mul => Some(QuickeningSpecialization::MulIntInt),
+        BinaryOp::Div
+        | BinaryOp::Mod
+        | BinaryOp::Concat
+        | BinaryOp::Pow
+        | BinaryOp::BitAnd
+        | BinaryOp::BitOr
+        | BinaryOp::BitXor
+        | BinaryOp::ShiftLeft
+        | BinaryOp::ShiftRight => None,
+    }
+}
+
 fn dense_binary_op(opcode: DenseOpcode) -> Option<BinaryOp> {
     match opcode {
         DenseOpcode::BinaryAdd => Some(BinaryOp::Add),
