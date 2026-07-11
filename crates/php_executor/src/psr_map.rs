@@ -189,12 +189,19 @@ fn infer_psr_root_and_prefix(
 }
 
 fn case_insensitive_existing_path(path: &Path) -> Option<PathBuf> {
+    let path = case_insensitive_existing_entry(path)?;
+    path.is_file()
+        .then(|| fs::canonicalize(path).ok())
+        .flatten()
+}
+
+fn case_insensitive_existing_entry(path: &Path) -> Option<PathBuf> {
     let parent = path.parent()?;
     let file_name = path.file_name()?.to_string_lossy();
     let parent = if parent.is_dir() {
         parent.to_path_buf()
     } else {
-        case_insensitive_existing_path(parent)?
+        case_insensitive_existing_entry(parent)?
     };
     for entry in fs::read_dir(parent).ok()? {
         let entry = entry.ok()?;
@@ -203,11 +210,7 @@ fn case_insensitive_existing_path(path: &Path) -> Option<PathBuf> {
             .to_string_lossy()
             .eq_ignore_ascii_case(&file_name)
         {
-            let path = entry.path();
-            return path
-                .is_file()
-                .then(|| fs::canonicalize(path).ok())
-                .flatten();
+            return Some(entry.path());
         }
     }
     None
