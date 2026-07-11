@@ -1595,12 +1595,19 @@ pub fn cached_leaf(
             .or_insert_with(|| {
                 let leaf = NativeLeaf::compile(unit, function, constants, function_id).map(Rc::new);
                 if std::env::var_os("PHRUST_JIT_COPY_PATCH_DEBUG").is_some() {
-                    eprintln!(
-                        "[copy-patch] fn={} (id={}) recognized={}",
-                        function.name,
-                        function_id,
-                        leaf.is_some()
-                    );
+                    if leaf.is_some() {
+                        eprintln!(
+                            "[copy-patch] fn={} (id={}) recognized=true",
+                            function.name, function_id,
+                        );
+                    } else {
+                        eprintln!(
+                            "[copy-patch] fn={} (id={}) recognized=false shape={}",
+                            function.name,
+                            function_id,
+                            rejection_shape(function),
+                        );
+                    }
                 }
                 leaf
             })
@@ -1654,6 +1661,33 @@ fn inline_scalar_leaf_calls(
         InlineOutcome::Inlined(inlined) => Some(*inlined),
         InlineOutcome::NoCalls | InlineOutcome::Rejected => None,
     }
+}
+
+/// Coarse shape label for `recognized=false` debug lines: which structural
+/// bucket kept a candidate out of every leaf recognizer. Debug-only output
+/// for ranking coverage work; never used for recognition decisions.
+#[cfg(all(unix, target_arch = "aarch64"))]
+fn rejection_shape(function: &IrFunction) -> String {
+    let blocks = function.blocks.len();
+    let instrs: usize = function
+        .blocks
+        .iter()
+        .map(|block| block.instructions.len())
+        .sum();
+    let mut kinds = std::collections::BTreeSet::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            let debug = format!("{:?}", instruction.kind);
+            let name = debug
+                .split([' ', '(', '{'])
+                .next()
+                .unwrap_or("?")
+                .to_owned();
+            kinds.insert(name);
+        }
+    }
+    let kinds = kinds.into_iter().collect::<Vec<_>>().join(",");
+    format!("blocks={blocks} instrs={instrs} kinds=[{kinds}]")
 }
 
 /// True when any block of `function` contains a `CallFunction`.
