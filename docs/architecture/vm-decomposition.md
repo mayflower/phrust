@@ -30,7 +30,9 @@ extension adapter state from the facade. `ExecutionState` now contains one
 stream-wrapper state, and the typed `BuiltinRequestState`. HTTP response,
 upload, session, and SAPI state similarly live behind one
 `RequestLifecycleState` subsystem. The remaining execution state has a dedicated
-`execution_state` owner rather than being declared in the facade.
+`execution_state` owner rather than being declared in the facade. Request-local
+declaration models, error/shutdown state, destructor ownership, and GC root
+scanning have moved with it.
 
 ## Target Ownership
 
