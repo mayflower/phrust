@@ -813,18 +813,23 @@ impl Vm {
                 None => {}
             }
         }
-        if normalize_class_name(&object.class_name()) != target.receiver_class {
+        // Allocation-free receiver guard: the target stores the normalized
+        // name, so a trimmed case-insensitive compare over the shared handle
+        // is equivalent to normalizing a fresh copy of the name.
+        let receiver_name = object.class_name_handle();
+        if !target
+            .receiver_class
+            .eq_ignore_ascii_case(receiver_name.trim_start_matches('\\'))
+        {
             self.record_counter_property_ic_fallback("receiver_class_mismatch");
             return Ok(PropertyFetchCacheRead::Fallback);
         }
-        let object_class_name = object.class_name();
-        let Some(receiver_class_entry) =
-            lookup_class_in_state_ref(compiled, state, &object_class_name)
+        let Some(receiver_class_entry) = self.lookup_class_for_object(compiled, state, object)
         else {
             self.record_counter_property_ic_fallback("receiver_class_missing");
             return Ok(PropertyFetchCacheRead::Fallback);
         };
-        if receiver_class_entry.as_ref().id.raw() != layout.class_id {
+        if receiver_class_entry.id.raw() != layout.class_id {
             self.record_counter_property_ic_fallback("class_id_mismatch");
             return Ok(PropertyFetchCacheRead::Fallback);
         }
@@ -931,18 +936,21 @@ impl Vm {
                 return Ok(PropertyAssignCacheWrite::Written(value));
             }
         }
-        if normalize_class_name(&object.class_name()) != target.receiver_class {
+        // Allocation-free receiver guard; see the fetch-side twin above.
+        let receiver_name = object.class_name_handle();
+        if !target
+            .receiver_class
+            .eq_ignore_ascii_case(receiver_name.trim_start_matches('\\'))
+        {
             self.record_counter_property_assign_ic_fallback("receiver_class_mismatch");
             return Ok(PropertyAssignCacheWrite::Fallback);
         }
-        let object_class_name = object.class_name();
-        let Some(receiver_class_entry) =
-            lookup_class_in_state_ref(compiled, state, &object_class_name)
+        let Some(receiver_class_entry) = self.lookup_class_for_object(compiled, state, object)
         else {
             self.record_counter_property_assign_ic_fallback("receiver_class_missing");
             return Ok(PropertyAssignCacheWrite::Fallback);
         };
-        if receiver_class_entry.as_ref().id.raw() != layout.class_id {
+        if receiver_class_entry.id.raw() != layout.class_id {
             self.record_counter_property_assign_ic_fallback("class_id_mismatch");
             return Ok(PropertyAssignCacheWrite::Fallback);
         }
