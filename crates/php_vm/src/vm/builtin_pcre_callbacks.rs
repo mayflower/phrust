@@ -1,4 +1,5 @@
 use super::builtin_adapter::{BuiltinTypeError, builtin_source_span};
+use super::builtin_callback_validation::{array_callback_type_error, validate_array_callback_arg};
 use super::prelude::*;
 
 impl Vm {
