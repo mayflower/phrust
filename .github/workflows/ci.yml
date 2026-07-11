@@ -44,7 +44,7 @@ jobs:
     runs-on: mayflower-k8s-runners
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
@@ -66,7 +66,7 @@ jobs:
     runs-on: mayflower-k8s-runners
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
@@ -88,7 +88,7 @@ jobs:
           - verify-performance
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
@@ -109,7 +109,7 @@ jobs:
 
       - name: Upload gate reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.gate }}-reports
           if-no-files-found: ignore
@@ -125,7 +125,7 @@ jobs:
     runs-on: mayflower-k8s-runners
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
@@ -135,7 +135,7 @@ jobs:
 
       - name: Upload PHPT smoke reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: phpt-smoke-reports
           if-no-files-found: ignore
@@ -160,7 +160,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.run_quality == 'true'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
@@ -174,7 +174,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.run_full_phpt == 'true'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
@@ -190,7 +190,7 @@ jobs:
 
       - name: Upload full PHPT reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: full-phpt-reports
           if-no-files-found: ignore
@@ -209,7 +209,7 @@ jobs:
       PHRUST_WORDPRESS_ROOT_BASELINE_JSON: ${{ vars.PHRUST_WORDPRESS_ROOT_BASELINE_JSON }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
@@ -222,7 +222,7 @@ jobs:
 
       - name: Upload WordPress performance report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wordpress-performance
           if-no-files-found: error
