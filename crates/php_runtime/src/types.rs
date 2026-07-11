@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn type_matcher_checks_object_class_names_case_insensitively() {
         let class = ClassEntry {
-            name: "Box".to_owned(),
+            name: "Box".to_owned().into(),
             parent: None,
             interfaces: Vec::new(),
             methods: Vec::new(),

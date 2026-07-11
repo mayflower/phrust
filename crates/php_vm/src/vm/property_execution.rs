@@ -17,7 +17,7 @@ impl Vm {
         let Value::Object(object) = object else {
             return Ok(Value::Bool(false));
         };
-        let value = property_state_value(compiled, state, stack, object, property);
+        let value = self.property_state_value(compiled, state, stack, object, property);
         let result = if let Some(value) = value {
             !matches!(value, Value::Uninitialized | Value::Null)
         } else {
@@ -61,7 +61,7 @@ impl Vm {
         let Value::Object(object) = object else {
             return Ok(Value::Bool(true));
         };
-        let result = match property_state_value(compiled, state, stack, object, property) {
+        let result = match self.property_state_value(compiled, state, stack, object, property) {
             Some(value) => match php_empty_access_value(&value) {
                 Ok(value) => value,
                 Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
@@ -545,7 +545,7 @@ impl Vm {
             object.set_property(property, current);
             return Ok(value);
         }
-        let class = match lookup_class_in_state(compiled, state, &object.class_name()) {
+        let class = match self.lookup_class_for_object(compiled, state, &object) {
             Some(class) => class,
             None => {
                 return Err(PropertyDimAssign::Fatal(format!(
@@ -730,7 +730,7 @@ impl Vm {
             self.record_counter_property_dim_assign_generic("typed_readonly_or_readonly_class");
         }
         let mut current =
-            property_state_value(compiled, state, stack, &object, property).unwrap_or(Value::Null);
+            self.property_state_value(compiled, state, stack, &object, property).unwrap_or(Value::Null);
         match self.try_userland_arrayaccess_offset_set_value(
             compiled,
             output,

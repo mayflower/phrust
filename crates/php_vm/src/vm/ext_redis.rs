@@ -106,7 +106,7 @@ pub(super) fn new_redis_object(
 
 pub(super) fn redis_runtime_class() -> RuntimeClassEntry {
     RuntimeClassEntry {
-        name: "redis".to_owned(),
+        name: "redis".to_owned().into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),

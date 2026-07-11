@@ -55,7 +55,7 @@ pub(super) fn runtime_class_entry(
         push_runtime_constants(&owner, state, lineage_class, &mut constants)?;
     }
     Ok(RuntimeClassEntry {
-        name: class.name.clone(),
+        name: class.name.clone().into(),
         parent: class.parent.clone(),
         interfaces: class.interfaces.clone(),
         methods: class

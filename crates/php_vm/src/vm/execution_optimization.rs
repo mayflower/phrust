@@ -1604,6 +1604,39 @@ impl Vm {
     /// Sharing one value across reads is sound for the same reason the
     /// literal pool is: strings and arrays copy-on-write, so a mutation
     /// through any handle separates from the cached storage first.
+    /// Resolves the receiver's class through the handle-address cache: all
+    /// instances of one runtime class share one name-handle allocation, so
+    /// a hit costs one pointer-keyed probe instead of normalizing and
+    /// hashing the class-name string. Misses take the full state lookup and
+    /// pin the handle in the cache; a class-table epoch change drops every
+    /// entry.
+    pub(super) fn lookup_class_for_object(
+        &self,
+        compiled: &CompiledUnit,
+        state: &ExecutionState,
+        object: &php_runtime::ObjectRef,
+    ) -> Option<Arc<php_ir::module::ClassEntry>> {
+        let handle = object.class_name_handle();
+        let key = std::sync::Arc::as_ptr(&handle) as *const () as usize;
+        let epoch = state.class_table_epoch;
+        {
+            let cache = self.object_class_resolution.borrow();
+            if cache.epoch == epoch
+                && let Some((_, class)) = cache.entries.get(&key)
+            {
+                return Some(Arc::clone(class));
+            }
+        }
+        let class = lookup_class_in_state(compiled, state, &handle)?;
+        let mut cache = self.object_class_resolution.borrow_mut();
+        if cache.epoch != epoch {
+            cache.entries.clear();
+            cache.epoch = epoch;
+        }
+        cache.entries.insert(key, (handle, Arc::clone(&class)));
+        Some(class)
+    }
+
     pub(super) fn resolved_constant_value(
         &self,
         compiled: &CompiledUnit,

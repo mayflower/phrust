@@ -618,7 +618,7 @@ fn socket_object(id: i64) -> ObjectRef {
 
 fn socket_runtime_class() -> ClassEntry {
     ClassEntry {
-        name: "socket".to_owned(),
+        name: "socket".to_owned().into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),

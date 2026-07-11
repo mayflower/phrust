@@ -7991,7 +7991,7 @@ fn destructor_throw_becomes_shutdown_runtime_error() {
 #[test]
 fn gc_snapshot_tracks_vm_roots_and_cycle_candidates() {
     let class = RuntimeClassEntry {
-        name: "GcBox".to_owned(),
+        name: "GcBox".to_owned().into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),

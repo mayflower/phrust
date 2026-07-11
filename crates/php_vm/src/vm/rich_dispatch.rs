@@ -6515,8 +6515,7 @@ impl Vm {
                                 }
                             }
                         }
-                        let value = match property_state_value(
-                            compiled, state, stack, &object, &property,
+                        let value = match self.property_state_value(compiled, state, stack, &object, &property,
                         ) {
                             Some(value) => value,
                             None => match self.call_magic_property_method(
@@ -6609,7 +6608,7 @@ impl Vm {
                             Err(result) => return result,
                         };
                         let value =
-                            property_state_value(compiled, state, stack, &object, &property);
+                            self.property_state_value(compiled, state, stack, &object, &property);
                         let result = if let Some(value) = value {
                             !matches!(value, Value::Uninitialized | Value::Null)
                         } else {
@@ -6708,8 +6707,7 @@ impl Vm {
                             Ok(property) => property,
                             Err(result) => return result,
                         };
-                        let result = match property_state_value(
-                            compiled, state, stack, &object, &property,
+                        let result = match self.property_state_value(compiled, state, stack, &object, &property,
                         ) {
                             Some(value) => match php_empty_access_value(&value) {
                                 Ok(value) => value,
@@ -6806,7 +6804,7 @@ impl Vm {
                             }
                         };
                         let value = object.as_ref().and_then(|object| {
-                            property_state_value(compiled, state, stack, object, &property)
+                            self.property_state_value(compiled, state, stack, object, &property)
                                 .and_then(|value| {
                                     fetch_dim_path_value(&value, &dims).ok().flatten()
                                 })
@@ -6853,7 +6851,7 @@ impl Vm {
                         let value = object
                             .as_ref()
                             .and_then(|object| {
-                                property_state_value(compiled, state, stack, object, &property)
+                                self.property_state_value(compiled, state, stack, object, &property)
                                     .and_then(|value| {
                                         fetch_dim_path_value(&value, &dims).ok().flatten()
                                     })
@@ -6910,7 +6908,7 @@ impl Vm {
                         // container (the clone shares the array handle and
                         // forces a full copy-on-write separation on the next
                         // write to the same registry-style array).
-                        let borrowed = with_property_state_value(
+                        let borrowed = self.with_property_state_value(
                             compiled,
                             state,
                             stack,
@@ -6931,7 +6929,7 @@ impl Vm {
                             }
                             None => {
                                 let value =
-                                    property_state_value(compiled, state, stack, &object, property)
+                                    self.property_state_value(compiled, state, stack, &object, property)
                                         .and_then(|value| {
                                             fetch_dim_path_value(&value, &dims).ok().flatten()
                                         });
@@ -6981,7 +6979,7 @@ impl Vm {
                         };
                         // Borrowed probe mirroring the isset arm: empty()
                         // only needs a borrowed view of the leaf value.
-                        let borrowed = with_property_state_value(
+                        let borrowed = self.with_property_state_value(
                             compiled,
                             state,
                             stack,
@@ -7002,7 +7000,7 @@ impl Vm {
                             }
                             None => {
                                 let value =
-                                    property_state_value(compiled, state, stack, &object, property)
+                                    self.property_state_value(compiled, state, stack, &object, property)
                                         .and_then(|value| {
                                             fetch_dim_path_value(&value, &dims).ok().flatten()
                                         })

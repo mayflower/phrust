@@ -850,7 +850,7 @@ fn imap_connection_object(id: i64) -> ObjectRef {
 
 fn runtime_class(name: &str) -> ClassEntry {
     ClassEntry {
-        name: normalize_class_name(name),
+        name: normalize_class_name(name).into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),

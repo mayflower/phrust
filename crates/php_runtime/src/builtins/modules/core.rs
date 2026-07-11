@@ -3276,7 +3276,7 @@ pub(in crate::builtins::modules) fn json_failure(
 
 pub(in crate::builtins::modules) fn json_std_class() -> ClassEntry {
     ClassEntry {
-        name: normalize_class_name("stdClass"),
+        name: normalize_class_name("stdClass").into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),
@@ -10188,7 +10188,7 @@ mod tests {
 
     fn empty_class(name: &str) -> ClassEntry {
         ClassEntry {
-            name: normalize_class_name(name),
+            name: normalize_class_name(name).into(),
             parent: None,
             interfaces: Vec::new(),
             methods: Vec::new(),
@@ -10230,7 +10230,7 @@ mod tests {
             });
         }
         ClassEntry {
-            name: normalize_class_name(name),
+            name: normalize_class_name(name).into(),
             parent: None,
             interfaces: Vec::new(),
             methods: Vec::new(),

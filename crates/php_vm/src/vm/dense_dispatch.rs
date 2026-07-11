@@ -5368,7 +5368,7 @@ impl Vm {
                                     // Mirror the rich arms: borrowed probe
                                     // first, clone path only when the walk
                                     // meets unsupported shapes.
-                                    let borrowed = with_property_state_value(
+                                    let borrowed = self.with_property_state_value(
                                         compiled,
                                         state,
                                         stack,
@@ -5403,8 +5403,7 @@ impl Vm {
                                             result
                                         }
                                         None => {
-                                            let value = property_state_value(
-                                                compiled, state, stack, object, property,
+                                            let value = self.property_state_value(compiled, state, stack, object, property,
                                             )
                                             .and_then(|value| {
                                                 fetch_dim_path_value(&value, &dims).ok().flatten()

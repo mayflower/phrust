@@ -389,7 +389,7 @@ fn fileinfo_object_with_options(flags: i64, magic_file: Option<String>) -> Objec
 
 fn fileinfo_runtime_class() -> ClassEntry {
     ClassEntry {
-        name: "finfo".to_owned(),
+        name: "finfo".to_owned().into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),

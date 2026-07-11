@@ -577,7 +577,7 @@ mod tests {
 
     fn empty_class(name: &str) -> ClassEntry {
         ClassEntry {
-            name: name.to_owned(),
+            name: name.to_owned().into(),
             parent: None,
             interfaces: Vec::new(),
             methods: Vec::new(),

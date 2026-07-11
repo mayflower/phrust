@@ -6,84 +6,88 @@ use super::prelude::*;
 /// path) only when object storage is already mutably borrowed. `f` receives
 /// `None` when the property is missing or visibility validation fails,
 /// mirroring `property_state_value`'s `None` results.
-pub(super) fn with_property_state_value<R>(
-    compiled: &CompiledUnit,
-    state: &ExecutionState,
-    stack: &CallStack,
-    object: &ObjectRef,
-    property: &str,
-    f: &mut dyn FnMut(Option<&Value>) -> R,
-) -> Option<R> {
-    let Some(class) = lookup_class_in_state(compiled, state, &object.class_name()) else {
-        return object
-            .try_with_property_lookup(property, property, &mut *f)
-            .ok();
-    };
-    let scope = current_scope_class(compiled, stack);
-    let resolved = match lookup_resolved_property_in_state(
-        compiled,
-        state,
-        &class,
-        property,
-        scope.as_deref(),
-    ) {
-        Ok(Some(resolved)) => resolved,
-        Ok(None) => {
+impl Vm {
+    pub(super) fn with_property_state_value<R>(
+        &self,
+        compiled: &CompiledUnit,
+        state: &ExecutionState,
+        stack: &CallStack,
+        object: &ObjectRef,
+        property: &str,
+        f: &mut dyn FnMut(Option<&Value>) -> R,
+    ) -> Option<R> {
+        let Some(class) = self.lookup_class_for_object(compiled, state, object) else {
             return object
                 .try_with_property_lookup(property, property, &mut *f)
                 .ok();
+        };
+        let scope = current_scope_class(compiled, stack);
+        let resolved = match lookup_resolved_property_in_state(
+            compiled,
+            state,
+            &class,
+            property,
+            scope.as_deref(),
+        ) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => {
+                return object
+                    .try_with_property_lookup(property, property, &mut *f)
+                    .ok();
+            }
+            Err(_) => return Some(f(None)),
+        };
+        if validate_property_access_in_state(
+            compiled,
+            state,
+            stack,
+            &resolved.class,
+            &resolved.property,
+        )
+        .is_err()
+        {
+            return Some(f(None));
         }
-        Err(_) => return Some(f(None)),
-    };
-    if validate_property_access_in_state(
-        compiled,
-        state,
-        stack,
-        &resolved.class,
-        &resolved.property,
-    )
-    .is_err()
-    {
-        return Some(f(None));
+        let storage_name = property_storage_name(&resolved.class, &resolved.property);
+        object
+            .try_with_property_lookup(&storage_name, property, &mut *f)
+            .ok()
     }
-    let storage_name = property_storage_name(&resolved.class, &resolved.property);
-    object
-        .try_with_property_lookup(&storage_name, property, &mut *f)
-        .ok()
-}
 
-pub(super) fn property_state_value(
-    compiled: &CompiledUnit,
-    state: &ExecutionState,
-    stack: &CallStack,
-    object: &ObjectRef,
-    property: &str,
-) -> Option<Value> {
-    let Some(class) = lookup_class_in_state(compiled, state, &object.class_name()) else {
-        return object.get_property(property);
-    };
-    let scope = current_scope_class(compiled, stack);
-    let Some(resolved) =
-        lookup_resolved_property_in_state(compiled, state, &class, property, scope.as_deref())
-            .ok()?
-    else {
-        return object.get_property(property);
-    };
-    if validate_property_access_in_state(
-        compiled,
-        state,
-        stack,
-        &resolved.class,
-        &resolved.property,
-    )
-    .is_err()
-    {
-        return None;
+    pub(super) fn property_state_value(
+        &self,
+        compiled: &CompiledUnit,
+        state: &ExecutionState,
+        stack: &CallStack,
+        object: &ObjectRef,
+        property: &str,
+    ) -> Option<Value> {
+        let Some(class) = self.lookup_class_for_object(compiled, state, object) else {
+            return object.get_property(property);
+        };
+        let scope = current_scope_class(compiled, stack);
+        let Some(resolved) =
+            lookup_resolved_property_in_state(compiled, state, &class, property, scope.as_deref())
+                .ok()?
+        else {
+            return object.get_property(property);
+        };
+        if validate_property_access_in_state(
+            compiled,
+            state,
+            stack,
+            &resolved.class,
+            &resolved.property,
+        )
+        .is_err()
+        {
+            return None;
+        }
+        let storage_name = property_storage_name(&resolved.class, &resolved.property);
+        object
+            .get_property(&storage_name)
+            .or_else(|| object.get_property(property))
     }
-    let storage_name = property_storage_name(&resolved.class, &resolved.property);
-    object
-        .get_property(&storage_name)
-        .or_else(|| object.get_property(property))
 }
 
 pub(super) fn property_dimension_storage_name(

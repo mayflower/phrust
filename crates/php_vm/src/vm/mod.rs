@@ -566,6 +566,12 @@ pub struct Vm {
     /// Built only when `options.last_use_moves` is on; empty and never consulted
     /// otherwise, keeping the default dense read path byte-identical.
     last_use_move_plans: RefCell<HashMap<(u64, u32), Rc<crate::last_use::LastUseMovePlan>>>,
+    /// Receiver-class resolution keyed by the shared class-name handle's
+    /// address (all instances of one runtime class alias one allocation).
+    /// The map pins each key handle, so an address can never be reused while
+    /// its entry lives; guarded by the class-table epoch and cleared per
+    /// request with the other per-request memo caches.
+    object_class_resolution: RefCell<ObjectClassResolution>,
     /// Per-unit resolved constant tables (zend literal-table parity): each
     /// materializable `IrConstant` resolves once into an interned value and
     /// every later operand read is an indexed refcount bump instead of a
@@ -573,6 +579,14 @@ pub struct Vm {
     /// Keyed by the compiled unit's cache identity; unit constant tables
     /// are immutable per identity, so entries never invalidate.
     resolved_constants: RefCell<ResolvedConstantTables>,
+}
+
+/// Receiver-class resolutions pinned by their shared name handles (the
+/// handle address is the key, the stored handle keeps that address alive).
+#[derive(Clone, Debug, Default)]
+struct ObjectClassResolution {
+    epoch: u64,
+    entries: HashMap<usize, (std::sync::Arc<str>, Arc<php_ir::module::ClassEntry>)>,
 }
 
 /// Per-unit lazily-resolved constant values, with a one-entry hot-unit
@@ -618,6 +632,7 @@ impl Vm {
             request_profile_stack: RefCell::new(Vec::new()),
             last_use_move_plans: RefCell::new(HashMap::new()),
             resolved_constants: RefCell::new(ResolvedConstantTables::default()),
+            object_class_resolution: RefCell::new(ObjectClassResolution::default()),
         }
     }
 
@@ -632,6 +647,7 @@ impl Vm {
         self.trace.borrow_mut().clear();
         *self.literal_pool.borrow_mut() = LiteralPool::default();
         *self.resolved_constants.borrow_mut() = ResolvedConstantTables::default();
+        *self.object_class_resolution.borrow_mut() = ObjectClassResolution::default();
         self.trivial_method_plans.borrow_mut().clear();
         self.last_use_move_plans.borrow_mut().clear();
         *self.runtime_class_entry_cache.borrow_mut() = RuntimeClassEntryCache::default();

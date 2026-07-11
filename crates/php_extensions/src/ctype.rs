@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn ctype_object_deprecation_names_class() {
         let class = ClassEntry {
-            name: "classa".to_owned(),
+            name: "classa".to_owned().into(),
             parent: None,
             interfaces: Vec::new(),
             methods: Vec::new(),

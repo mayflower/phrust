@@ -1755,7 +1755,7 @@ mod tests {
 
     fn object(display_name: &str) -> Value {
         let class = ClassEntry {
-            name: display_name.to_ascii_lowercase(),
+            name: display_name.to_ascii_lowercase().into(),
             parent: None,
             interfaces: Vec::new(),
             methods: Vec::new(),

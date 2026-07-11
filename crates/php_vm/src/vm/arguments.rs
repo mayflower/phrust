@@ -761,7 +761,7 @@ pub(super) fn trace_value_for_param(value: &Value, sensitive: bool) -> Value {
 pub(super) fn sensitive_parameter_value() -> Value {
     Value::Object(ObjectRef::new_with_display_name(
         &RuntimeClassEntry {
-            name: normalize_class_name("SensitiveParameterValue"),
+            name: normalize_class_name("SensitiveParameterValue").into(),
             parent: None,
             interfaces: Vec::new(),
             methods: Vec::new(),

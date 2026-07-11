@@ -849,7 +849,7 @@ fn write_or_output_image(
 
 fn gd_runtime_class() -> ClassEntry {
     ClassEntry {
-        name: "gdimage".to_owned(),
+        name: "gdimage".to_owned().into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),

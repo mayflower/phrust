@@ -2038,7 +2038,7 @@ pub(super) fn spl_iterator_class(class_name: &str) -> RuntimeClassEntry {
         interfaces.push("OuterIterator".to_owned());
     }
     RuntimeClassEntry {
-        name: normalize_class_name(class_name),
+        name: normalize_class_name(class_name).into(),
         parent: match normalized.as_str() {
             "directoryiterator" => Some(normalize_class_name("SplFileInfo")),
             "filesystemiterator" => Some(normalize_class_name("DirectoryIterator")),
@@ -5059,7 +5059,7 @@ pub(super) fn spl_container_class(class_name: &str) -> RuntimeClassEntry {
         interfaces.push("ArrayAccess".to_owned());
     }
     RuntimeClassEntry {
-        name: normalize_class_name(class_name),
+        name: normalize_class_name(class_name).into(),
         parent: match normalized.as_str() {
             "splstack" | "splqueue" => Some(normalize_class_name("SplDoublyLinkedList")),
             _ => None,
@@ -5729,7 +5729,7 @@ pub(super) fn call_spl_heap_method(
 pub(super) fn spl_heap_class(class_name: &str) -> RuntimeClassEntry {
     let normalized = normalize_class_name(class_name);
     RuntimeClassEntry {
-        name: normalized.clone(),
+        name: normalized.clone().into(),
         parent: match normalized.as_str() {
             "splmaxheap" | "splminheap" => Some(normalize_class_name("SplHeap")),
             _ => None,
@@ -6743,7 +6743,7 @@ pub(super) fn spl_file_info_result_class(
             let display_name = class.display_name.clone();
             (
                 RuntimeClassEntry {
-                    name: normalize_class_name(&class.name),
+                    name: normalize_class_name(&class.name).into(),
                     parent: class.parent.clone(),
                     interfaces: class.interfaces.clone(),
                     methods: Vec::new(),
@@ -6770,7 +6770,7 @@ pub(super) fn spl_file_info_result_base_class(class_name: &str) -> (RuntimeClass
     } else {
         (
             RuntimeClassEntry {
-                name: normalize_class_name(class_name),
+                name: normalize_class_name(class_name).into(),
                 parent: Some(normalize_class_name("SplFileInfo")),
                 interfaces: Vec::new(),
                 methods: Vec::new(),
@@ -6790,7 +6790,7 @@ pub(super) fn spl_file_info_result_base_class(class_name: &str) -> (RuntimeClass
 pub(super) fn spl_file_class(class_name: &str) -> RuntimeClassEntry {
     let normalized = normalize_class_name(class_name);
     RuntimeClassEntry {
-        name: normalize_class_name(class_name),
+        name: normalize_class_name(class_name).into(),
         parent: match normalized.as_str() {
             "splfileobject" | "spltempfileobject" => Some(normalize_class_name("SplFileInfo")),
             _ => None,

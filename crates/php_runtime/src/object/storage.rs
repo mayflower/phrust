@@ -89,7 +89,7 @@ fn class_layout(class: &ClassEntry, display_name: &str) -> Rc<PropertyLayout> {
         .collect();
     LAYOUT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let candidates = cache.entry(class.name.clone()).or_default();
+        let candidates = cache.entry(class.name.to_string()).or_default();
         if let Some(existing) = candidates
             .iter()
             .find(|layout| layout.slot_names == slot_names && layout.debug_labels == debug_labels)
@@ -258,7 +258,7 @@ impl ObjectRef {
     /// Creates an object with properties initialized from the class entry.
     #[must_use]
     pub fn new(class: &ClassEntry) -> Self {
-        Self::new_with_display_name(class, class.name.clone())
+        Self::new_with_display_name(class, class.name.to_string())
     }
 
     /// Creates an object with an explicit source-spelled display class name.
@@ -325,7 +325,10 @@ impl ObjectRef {
             cell: Rc::new(ObjectCell {
                 id,
                 storage: RefCell::new(ObjectStorage {
-                    class_name: Arc::from(class.name.as_str()),
+                    // Shared handle: every instance of one runtime class aliases the
+                    // class entry's allocation (no per-instantiation copy, and
+                    // the address doubles as a per-class identity).
+                    class_name: Arc::clone(&class.name),
                     display_name: Arc::from(display_name),
                     is_enum: class.flags.is_enum,
                     enum_backing_type: class.enum_backing_type,

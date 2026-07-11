@@ -342,7 +342,7 @@ pub(super) fn php_token_properties() -> Vec<RuntimeClassPropertyEntry> {
 
 pub(super) fn php_token_class() -> RuntimeClassEntry {
     RuntimeClassEntry {
-        name: normalize_class_name("PhpToken"),
+        name: normalize_class_name("PhpToken").into(),
         parent: None,
         interfaces: vec![normalize_class_name("Stringable")],
         methods: Vec::new(),
@@ -807,7 +807,7 @@ pub(super) fn new_soap_object(
 
 pub(super) fn soap_runtime_class(name: &str) -> RuntimeClassEntry {
     RuntimeClassEntry {
-        name: normalize_class_name(name),
+        name: normalize_class_name(name).into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),
@@ -1694,7 +1694,7 @@ pub(super) fn new_memcached_object(
 
 pub(super) fn memcached_runtime_class() -> RuntimeClassEntry {
     RuntimeClassEntry {
-        name: "memcached".to_owned(),
+        name: "memcached".to_owned().into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),
@@ -2430,7 +2430,7 @@ pub(super) fn phar_runtime_class(name: &str) -> RuntimeClassEntry {
         _ => None,
     };
     RuntimeClassEntry {
-        name: normalized,
+        name: normalized.into(),
         parent,
         interfaces,
         methods: Vec::new(),
@@ -2746,7 +2746,7 @@ pub(super) fn new_fileinfo_object(
 
 pub(super) fn fileinfo_runtime_class() -> RuntimeClassEntry {
     RuntimeClassEntry {
-        name: "finfo".to_owned(),
+        name: "finfo".to_owned().into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),
@@ -2762,7 +2762,7 @@ pub(super) fn fileinfo_runtime_class() -> RuntimeClassEntry {
 
 pub(super) fn zip_runtime_class() -> RuntimeClassEntry {
     RuntimeClassEntry {
-        name: "ziparchive".to_owned(),
+        name: "ziparchive".to_owned().into(),
         parent: None,
         interfaces: vec!["Countable".to_owned()],
         methods: Vec::new(),
@@ -3448,7 +3448,7 @@ pub(super) fn mysqli_stmt_object(statement_id: Option<i64>) -> ObjectRef {
 
 pub(super) fn mysqli_runtime_class(name: &str) -> RuntimeClassEntry {
     RuntimeClassEntry {
-        name: normalize_class_name(name),
+        name: normalize_class_name(name).into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),
@@ -6178,7 +6178,7 @@ pub(super) fn pdo_statement_object(
 
 pub(super) fn pdo_runtime_class(name: &str) -> RuntimeClassEntry {
     RuntimeClassEntry {
-        name: normalize_class_name(name),
+        name: normalize_class_name(name).into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),
@@ -8335,7 +8335,7 @@ pub(super) fn sqlite_stmt_object(connection_id: i64, query: &str) -> Value {
 
 pub(super) fn sqlite_class(name: &str) -> RuntimeClassEntry {
     RuntimeClassEntry {
-        name: normalize_class_name(name),
+        name: normalize_class_name(name).into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),

@@ -6,7 +6,7 @@ use super::prelude::*;
 
 pub(super) fn reflection_runtime_class(name: &str) -> RuntimeClassEntry {
     RuntimeClassEntry {
-        name: normalize_class_name(name),
+        name: normalize_class_name(name).into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),

@@ -757,7 +757,7 @@ pub(super) fn make_exception_object(
             attributes: Vec::new(),
         };
     let class = RuntimeClassEntry {
-        name: normalize_class_name(&class_name),
+        name: normalize_class_name(&class_name).into(),
         parent,
         interfaces: vec!["throwable".to_owned()],
         methods: Vec::new(),
@@ -926,7 +926,7 @@ pub(super) fn initialize_internal_throwable_object(
 
 pub(super) fn std_class_entry() -> RuntimeClassEntry {
     RuntimeClassEntry {
-        name: normalize_class_name("stdClass"),
+        name: normalize_class_name("stdClass").into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),
@@ -942,7 +942,7 @@ pub(super) fn std_class_entry() -> RuntimeClassEntry {
 
 pub(super) fn incomplete_class_object(class_name: String, source: ObjectRef) -> ObjectRef {
     let class = RuntimeClassEntry {
-        name: normalize_class_name("__PHP_Incomplete_Class"),
+        name: normalize_class_name("__PHP_Incomplete_Class").into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),
@@ -967,7 +967,7 @@ pub(super) fn incomplete_class_object(class_name: String, source: ObjectRef) -> 
 
 pub(super) fn empty_runtime_class(name: &str) -> RuntimeClassEntry {
     RuntimeClassEntry {
-        name: normalize_class_name(name),
+        name: normalize_class_name(name).into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),

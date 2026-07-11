@@ -239,7 +239,7 @@ fn shmop_object(segment_id: i64, read_only: bool) -> ObjectRef {
 
 fn shmop_runtime_class() -> ClassEntry {
     ClassEntry {
-        name: "shmop".to_owned(),
+        name: "shmop".to_owned().into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),

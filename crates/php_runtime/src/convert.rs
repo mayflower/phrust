@@ -703,7 +703,7 @@ mod tests {
     #[test]
     fn objects_compare_by_properties_for_same_class() {
         let class = ClassEntry {
-            name: "sample".to_string(),
+            name: "sample".to_string().into(),
             parent: None,
             interfaces: Vec::new(),
             methods: Vec::new(),
@@ -980,7 +980,7 @@ mod tests {
         assert!(identical(&alias, &other_reference));
 
         let class = crate::ClassEntry {
-            name: "Box".to_owned(),
+            name: "Box".to_owned().into(),
             parent: None,
             interfaces: Vec::new(),
             methods: Vec::new(),

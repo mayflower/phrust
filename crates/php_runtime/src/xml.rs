@@ -324,7 +324,7 @@ fn struct_tag_name(name: &str, case_folding: bool) -> String {
 
 pub fn empty_internal_class(name: &str) -> ClassEntry {
     ClassEntry {
-        name: normalize_class_name(name),
+        name: normalize_class_name(name).into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),

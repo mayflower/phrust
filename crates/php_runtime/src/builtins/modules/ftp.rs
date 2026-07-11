@@ -838,7 +838,7 @@ fn ftp_object(id: i64) -> ObjectRef {
 
 fn ftp_runtime_class() -> ClassEntry {
     ClassEntry {
-        name: "ftp\\connection".to_owned(),
+        name: "ftp\\connection".to_owned().into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),

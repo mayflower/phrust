@@ -563,7 +563,7 @@ impl Parser<'_> {
 
 fn empty_class(name: &str) -> ClassEntry {
     ClassEntry {
-        name: normalize_class_name(name),
+        name: normalize_class_name(name).into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),
@@ -661,7 +661,7 @@ mod tests {
     #[test]
     fn serializes_object_visibility_property_names() {
         let class = ClassEntry {
-            name: "bar".to_owned(),
+            name: "bar".to_owned().into(),
             parent: Some("foo".to_owned()),
             interfaces: Vec::new(),
             methods: Vec::new(),

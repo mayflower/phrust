@@ -2075,7 +2075,7 @@ pub fn mysqli_stmt_object(statement_id: i64) -> ObjectRef {
 
 fn mysqli_runtime_class(name: &str) -> crate::ClassEntry {
     crate::ClassEntry {
-        name: crate::normalize_class_name(name),
+        name: crate::normalize_class_name(name).into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),

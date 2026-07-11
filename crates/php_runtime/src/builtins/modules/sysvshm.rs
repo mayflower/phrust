@@ -284,7 +284,7 @@ fn serialized_value(value: &Value) -> Result<Vec<u8>, BuiltinError> {
 
 fn runtime_class(name: &str) -> ClassEntry {
     ClassEntry {
-        name: normalize_class_name(name),
+        name: normalize_class_name(name).into(),
         parent: None,
         interfaces: Vec::new(),
         methods: Vec::new(),
