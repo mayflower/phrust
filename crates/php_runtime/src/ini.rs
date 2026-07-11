@@ -38,19 +38,27 @@ pub struct IniRegistry {
 
 impl Default for IniRegistry {
     fn default() -> Self {
+        // One shared pristine table for the whole process: a default
+        // registry is built per builtin invocation context, and
+        // materializing all 57 owned local values there put ~60 heap
+        // allocations on every builtin dispatch. Mutation already
+        // copies-on-write through `Arc::make_mut`.
+        static DEFAULT_TABLE: std::sync::OnceLock<Arc<Vec<IniEntry>>> = std::sync::OnceLock::new();
         Self {
-            entries: Arc::new(
-                default_entries()
-                    .into_iter()
-                    .map(|(extension, name, value, access)| IniEntry {
-                        extension,
-                        name,
-                        global_value: value,
-                        local_value: value.to_owned(),
-                        access,
-                    })
-                    .collect(),
-            ),
+            entries: Arc::clone(DEFAULT_TABLE.get_or_init(|| {
+                Arc::new(
+                    default_entries()
+                        .into_iter()
+                        .map(|(extension, name, value, access)| IniEntry {
+                            extension,
+                            name,
+                            global_value: value,
+                            local_value: value.to_owned(),
+                            access,
+                        })
+                        .collect(),
+                )
+            })),
         }
     }
 }
