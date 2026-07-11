@@ -19,10 +19,10 @@ http-body-util = "0.1"
 httpdate = "1"
 hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "http2", "server", "tokio"] }
-php_executor = { path = "../php_executor", version = "0.0.0" }
+php_executor = { path = "../php_executor", version = "0.0.0", default-features = false }
 php_diagnostics = { path = "../php_diagnostics", version = "0.0.0" }
-php_runtime = { path = "../php_runtime", version = "0.0.0" }
-php_vm = { path = "../php_vm", version = "0.0.0" }
+php_runtime = { path = "../php_runtime", version = "0.0.0", default-features = false, features = ["full-runtime"] }
+php_vm = { path = "../php_vm", version = "0.0.0", default-features = false }
 quinn = "0.11"
 rustls-pki-types = { version = "1", features = ["std"] }
 serde_json = "1"
@@ -33,5 +33,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [features]
-default = ["runtime-telemetry"]
-runtime-telemetry = ["php_executor/runtime-telemetry"]
+default = ["runtime-telemetry", "jit-copy-patch"]
+runtime-telemetry = [
+    "php_executor/runtime-telemetry",
+    "php_vm/runtime-telemetry",
+    "php_runtime/runtime-telemetry",
+]
+jit-copy-patch = ["php_executor/jit-copy-patch", "php_vm/jit-copy-patch"]
