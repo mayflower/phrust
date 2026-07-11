@@ -226,8 +226,8 @@
       "max_lines": 8770
     },
     "crates/php_vm/src/vm/mod.rs": {
-      "max_bytes": 1861686,
-      "max_lines": 42338
+      "max_bytes": 1853407,
+      "max_lines": 42076
     },
     "crates/php_vm/src/vm/spl.rs": {
       "max_bytes": 257771,
