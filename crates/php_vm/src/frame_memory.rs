@@ -16,13 +16,12 @@
 //! so `index < table.len()` holds for every call that passes an operand of
 //! the currently executing dense function. Debug builds restate the bound
 //! with `debug_assert!`.
-#![allow(unsafe_code)]
-
 use crate::frame::{LocalFile, RegisterFile};
 use php_runtime::{Slot, TempValue, Value};
 
 /// Borrows the register slot for a verified dense register operand.
 #[must_use]
+#[allow(unsafe_code)]
 pub(crate) fn register_slot(registers: &RegisterFile, index: u32) -> &TempValue {
     let slots = registers.temp_slots();
     debug_assert!(
@@ -38,6 +37,7 @@ pub(crate) fn register_slot(registers: &RegisterFile, index: u32) -> &TempValue 
 
 /// Moves a verified dense register operand out, leaving it uninitialized.
 #[must_use]
+#[allow(unsafe_code)]
 pub(crate) fn take_register(registers: &mut RegisterFile, index: u32) -> Value {
     let slots = registers.temp_slots_mut();
     debug_assert!(
@@ -53,6 +53,7 @@ pub(crate) fn take_register(registers: &mut RegisterFile, index: u32) -> Value {
 
 /// Borrows the local slot for a verified dense local operand.
 #[must_use]
+#[allow(unsafe_code)]
 pub(crate) fn local_slot(locals: &LocalFile, index: u32) -> &Slot {
     let slots = locals.slot_table();
     debug_assert!(
