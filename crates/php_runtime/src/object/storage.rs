@@ -148,6 +148,11 @@ impl ObjectStorage {
             crate::layout_stats::record_object_declared_slot_read();
             return self.declared_slots[*slot as usize].as_ref();
         }
+        // Most objects never grow dynamic properties; skip the second hash
+        // (and its telemetry) when the map is provably empty.
+        if self.dynamic_properties.is_empty() {
+            return None;
+        }
         crate::layout_stats::record_object_dynamic_property_map_read();
         self.dynamic_properties.get(name)
     }
@@ -155,6 +160,9 @@ impl ObjectStorage {
     fn get_mut(&mut self, name: &str) -> Option<&mut Value> {
         if let Some(slot) = self.layout.slot_by_name.get(name).copied() {
             return self.declared_slots[slot as usize].as_mut();
+        }
+        if self.dynamic_properties.is_empty() {
+            return None;
         }
         self.dynamic_properties.get_mut(name)
     }
