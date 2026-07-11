@@ -2,6 +2,7 @@
 
 use super::builtin_adapter::builtin_source_span;
 use super::prelude::*;
+use super::runtime_operations::write_object_numeric_cast_warning;
 
 pub(super) fn is_array_sort_builtin_name(name: &str) -> bool {
     matches!(
