@@ -14305,16 +14305,17 @@ impl Vm {
             }
         };
 
-        if internal_throwable_instanceof(&object.class_name_handle(), "throwable").is_some()
-            || is_php_token_runtime_class(&object.class_name())
-            || is_std_class_runtime_class(&object.class_name())
-            || is_date_time_runtime_class(&object.class_name())
-            || is_pdo_runtime_class(&object.class_name())
+        let class_handle = object.class_name_handle();
+        if internal_throwable_instanceof(&class_handle, "throwable").is_some()
+            || is_php_token_runtime_class(&class_handle)
+            || is_std_class_runtime_class(&class_handle)
+            || is_date_time_runtime_class(&class_handle)
+            || is_pdo_runtime_class(&class_handle)
         {
             self.record_counter_dense_property_fallback("internal_runtime_object");
             return Ok(object.get_property(property).unwrap_or(Value::Null));
         }
-        if normalize_class_name(&object.class_name()) == "simplexmlelement" {
+        if class_name_is(&class_handle, &["simplexmlelement"]) {
             self.record_counter_dense_property_fallback("simplexml_property");
             return Ok(php_runtime::xml::simplexml_property(&object, property));
         }
@@ -14331,26 +14332,9 @@ impl Vm {
             });
         }
 
-        let class = match lookup_class_in_state(compiled, state, &object.class_name()) {
-            Some(class) => class,
-            None => {
-                self.record_counter_dense_property_fallback("receiver_class_missing");
-                return Err(self.dense_runtime_error(
-                    compiled,
-                    output,
-                    stack,
-                    state,
-                    span,
-                    format!(
-                        "E_PHP_VM_UNKNOWN_CLASS: class {} is not defined",
-                        object.class_name()
-                    ),
-                ));
-            }
-        };
         let scope = current_scope_class(compiled, stack);
         let normalized_scope = scope.as_deref().map(normalize_class_name);
-        let receiver_class = normalize_class_name(&object.class_name());
+        let receiver_class = normalize_class_name(&class_handle);
         let lookup_epoch = state.lookup_epoch();
 
         let cached_target = if let Some(id) = cache_id {
@@ -14400,8 +14384,23 @@ impl Vm {
             }
         }
 
-        // Only the resolve/miss path consults the magic-get flag; keep the
-        // hierarchy walk off the cache-hit path.
+        // Only the resolve/miss path needs the class entry and the magic-get
+        // flag; keep the class-table lookup and hierarchy walk off the
+        // cache-hit path.
+        let class = match lookup_class_in_state(compiled, state, &class_handle) {
+            Some(class) => class,
+            None => {
+                self.record_counter_dense_property_fallback("receiver_class_missing");
+                return Err(self.dense_runtime_error(
+                    compiled,
+                    output,
+                    stack,
+                    state,
+                    span,
+                    format!("E_PHP_VM_UNKNOWN_CLASS: class {class_handle} is not defined"),
+                ));
+            }
+        };
         let receiver_has_magic_get = class_has_public_magic_get(compiled, &class);
         let resolved = match lookup_resolved_property_in_state(
             compiled,
@@ -14702,32 +14701,16 @@ impl Vm {
             }
             return Ok(value);
         }
-        if is_std_class_runtime_class(&object.class_name()) {
+        let class_handle = object.class_name_handle();
+        if is_std_class_runtime_class(&class_handle) {
             self.record_counter_dense_property_fallback("dynamic_property");
             object.set_property(property, value.clone());
             return Ok(value);
         }
 
-        let class = match lookup_class_in_state(compiled, state, &object.class_name()) {
-            Some(class) => class,
-            None => {
-                self.record_counter_dense_property_fallback("receiver_class_missing");
-                return Err(self.dense_runtime_error(
-                    compiled,
-                    output,
-                    stack,
-                    state,
-                    span,
-                    format!(
-                        "E_PHP_VM_UNKNOWN_CLASS: class {} is not defined",
-                        object.class_name()
-                    ),
-                ));
-            }
-        };
         let scope = current_scope_class(compiled, stack);
         let normalized_scope = scope.as_deref().map(normalize_class_name);
-        let receiver_class = normalize_class_name(&object.class_name());
+        let receiver_class = normalize_class_name(&class_handle);
         let lookup_epoch = state.lookup_epoch();
 
         let cached_target = if let Some(id) = cache_id {
@@ -14784,8 +14767,22 @@ impl Vm {
             }
         }
 
-        // Same as the fetch arm: the magic-set flag only matters on the
-        // resolve/miss path.
+        // Same as the fetch arm: the class entry and magic-set flag only
+        // matter on the resolve/miss path.
+        let class = match lookup_class_in_state(compiled, state, &class_handle) {
+            Some(class) => class,
+            None => {
+                self.record_counter_dense_property_fallback("receiver_class_missing");
+                return Err(self.dense_runtime_error(
+                    compiled,
+                    output,
+                    stack,
+                    state,
+                    span,
+                    format!("E_PHP_VM_UNKNOWN_CLASS: class {class_handle} is not defined"),
+                ));
+            }
+        };
         let receiver_has_magic_set = class_has_public_magic_set(compiled, &class);
         let resolved = match lookup_resolved_property_in_state(
             compiled,
