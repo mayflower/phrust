@@ -41,6 +41,7 @@ def main() -> int:
     views = read("crates/php_runtime/src/builtins/context/service_views.rs")
     vm = read("crates/php_vm/src/vm/mod.rs")
     vm_builtin_adapter = read("crates/php_vm/src/vm/builtin_adapter.rs")
+    vm_execution_state = read("crates/php_vm/src/vm/execution_state.rs")
     vm_request_lifecycle = read("crates/php_vm/src/vm/request_lifecycle.rs")
     migration = read("docs/runtime/request-state-slots.md")
 
@@ -98,7 +99,7 @@ def main() -> int:
         if symbol not in builtin_state:
             failures.append(f"builtin request owner is missing {symbol}")
 
-    execution_state = struct_body(vm, "ExecutionState")
+    execution_state = struct_body(vm_execution_state, "ExecutionState")
     vm_adapter_state = struct_body(vm_builtin_adapter, "BuiltinAdapterState")
     request_lifecycle_state = struct_body(
         vm_request_lifecycle, "RequestLifecycleState"
@@ -118,7 +119,9 @@ def main() -> int:
         "php_binary",
     )
     for field in lifecycle_fields:
-        if re.search(rf"^\s+{field}:", execution_state, re.MULTILINE):
+        if re.search(
+            rf"^\s+(?:pub\(super\)\s+)?{field}:", execution_state, re.MULTILINE
+        ):
             failures.append(f"ExecutionState directly owns request field: {field}")
         if not re.search(rf"^\s+pub\(super\) {field}:", request_lifecycle_state, re.MULTILINE):
             failures.append(f"RequestLifecycleState is missing request field: {field}")

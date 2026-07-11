@@ -13,6 +13,7 @@ mod calls;
 mod dense_method_dispatch;
 mod diagnostics;
 mod execution_control;
+mod execution_state;
 mod ext_redis;
 mod generator_fiber;
 mod include_execution;
@@ -42,6 +43,7 @@ use execution_control::{
     ExceptionHandler, ExecutionLimitExceeded, PendingControl, RaiseOutcome,
     execution_limit_exceeded,
 };
+use execution_state::ExecutionState;
 use ext_redis::*;
 use generator_fiber::{
     FiberContinuation, FiberResumeInput, FiberSuspension, GeneratorContinuation,
@@ -392,185 +394,6 @@ enum PropertyDimAssign {
     /// Return this result directly (a userland ArrayAccess::offsetSet threw or
     /// otherwise produced a final result); it is not routed through handlers.
     Return(Box<VmResult>),
-}
-
-#[derive(Debug, Default)]
-struct ExecutionState {
-    /// Worker-stable symbol epochs enabled (VmOptions::worker_symbol_epoch).
-    worker_symbol_epoch: bool,
-    globals: GlobalSymbolTable,
-    included_once: Vec<PathBuf>,
-    included_once_set: HashSet<PathBuf>,
-    include_stack: Vec<PathBuf>,
-    cwd: PathBuf,
-    /// Request-invariant: network builtins explicitly enabled via env.
-    /// Precomputed once so builtin dispatch does not rescan the env table.
-    network_requests_enabled: bool,
-    static_locals: HashMap<(u32, String), ReferenceCell>,
-    static_properties: HashMap<(String, String), Value>,
-    enum_cases: HashMap<(String, String), ObjectRef>,
-    destructor_queue: DestructorQueue,
-    magic_property_stack: Vec<MagicPropertyCall>,
-    magic_method_stack: Vec<MagicMethodCall>,
-    property_hook_stack: Vec<PropertyHookCall>,
-    generator_continuations: HashMap<u64, GeneratorContinuation>,
-    fiber_continuations: HashMap<u64, Vec<FiberContinuation>>,
-    yield_from_delegations: HashMap<YieldFromKey, YieldFromDelegation>,
-    eval_depth: usize,
-    eval_counter: usize,
-    eval_diagnostic_spans: Vec<RuntimeSourceSpan>,
-    function_table_epoch: u64,
-    autoload_stack_epoch: u64,
-    class_table_epoch: u64,
-    include_config_epoch: u64,
-    parsed_include_path: Arc<Vec<PathBuf>>,
-    class_relation_cache: ClassRelationCache,
-    autoload_registry: AutoloadRegistry,
-    autoload_stack: Vec<String>,
-    spl_autoload_extensions: String,
-    /// Composer autoload-map fingerprint observed once per request on first
-    /// autoload-cache use. Outer `None` = not yet computed; inner `None` = no
-    /// map detected (unknown, blocks persistent reuse keyed on it).
-    composer_map_fingerprint: Option<Option<Arc<str>>>,
-    dynamic_units: Vec<CompiledUnit>,
-    dynamic_unit_index: HashMap<u64, usize>,
-    dynamic_functions: Vec<DynamicFunctionEntry>,
-    dynamic_function_index: HashMap<String, usize>,
-    dynamic_classes: Vec<DynamicClassEntry>,
-    dynamic_class_index: HashMap<String, usize>,
-    dynamic_constants: Vec<DynamicConstantEntry>,
-    dynamic_constant_index: HashMap<String, usize>,
-    validated_class_dependencies: HashSet<String>,
-    failed_class_declarations: HashSet<String>,
-    user_constants: HashMap<String, Value>,
-    shutdown_functions: Vec<ShutdownFunctionEntry>,
-    ini: IniRegistry,
-    default_timezone: String,
-    env: Arc<Vec<(String, String)>>,
-    filter_input_arrays: Rc<BTreeMap<i64, PhpArray>>,
-    resources: ResourceTable,
-    stdin: Option<php_runtime::ResourceRef>,
-    stdout: Option<php_runtime::ResourceRef>,
-    stderr: Option<php_runtime::ResourceRef>,
-    builtins: BuiltinAdapterState,
-    last_error: Option<LastErrorEntry>,
-    request: RequestLifecycleState,
-    error_handlers: Vec<ErrorHandlerEntry>,
-    exception_handlers: Vec<CallableValue>,
-    diagnostics: Vec<RuntimeDiagnostic>,
-    suppress_array_to_string_warnings: usize,
-    execution_deadline_at: Option<Instant>,
-    execution_deadline_mutable: bool,
-    process_exit_code: Option<i32>,
-    /// Throwable propagating up the call stack toward an enclosing handler.
-    ///
-    /// Set when a frame cannot handle a throw locally; each caller frame gets a
-    /// chance to catch it before the entry point renders it as uncaught.
-    pending_throw: Option<Value>,
-    /// Stack trace captured at the throw origin (before unwinding), rendered as
-    /// PHP's `Stack trace:` body for the uncaught-error message.
-    pending_trace: Option<String>,
-}
-
-impl ExecutionState {
-    fn has_included(&self, path: &Path) -> bool {
-        self.included_once_set.contains(path)
-    }
-
-    fn record_included(&mut self, path: PathBuf) -> bool {
-        if !self.included_once_set.insert(path.clone()) {
-            return false;
-        }
-        self.included_once.push(path);
-        true
-    }
-}
-
-impl ExecutionState {
-    fn push_dynamic_unit(&mut self, unit: CompiledUnit) -> usize {
-        let index = self.dynamic_units.len();
-        let identity = unit.cache_identity();
-        self.dynamic_units.push(unit);
-        self.dynamic_unit_index.insert(identity, index);
-        index
-    }
-
-    fn push_dynamic_function(&mut self, entry: DynamicFunctionEntry) {
-        let index = self.dynamic_functions.len();
-        self.dynamic_function_index
-            .entry(entry.name.clone())
-            .or_insert(index);
-        self.dynamic_functions.push(entry);
-    }
-
-    fn push_dynamic_class(&mut self, entry: DynamicClassEntry) {
-        let index = self.dynamic_classes.len();
-        self.dynamic_class_index
-            .entry(entry.lookup_name.clone())
-            .or_insert(index);
-        self.dynamic_classes.push(entry);
-    }
-
-    fn push_dynamic_constant(&mut self, entry: DynamicConstantEntry) {
-        let index = self.dynamic_constants.len();
-        self.dynamic_constant_index
-            .entry(entry.name.clone())
-            .or_insert(index);
-        self.dynamic_constants.push(entry);
-    }
-
-    fn lookup_epoch(&self) -> InvalidationEpoch {
-        InvalidationEpoch::new(self.function_table_epoch)
-    }
-
-    fn bump_lookup_epoch(&mut self) {
-        if self.worker_symbol_epoch {
-            // Advance the worker ledger so the epoch stays monotonic across
-            // requests on this thread; per-request state re-seeds from it.
-            self.function_table_epoch = WORKER_SYMBOL_LEDGER.with(|ledger| {
-                let next = ledger.epoch.get().saturating_add(1);
-                ledger.epoch.set(next);
-                next
-            });
-        } else {
-            self.function_table_epoch = self.function_table_epoch.saturating_add(1);
-        }
-    }
-
-    fn autoload_class_lookup_epochs(&self) -> AutoloadClassLookupEpochs {
-        AutoloadClassLookupEpochs {
-            autoload_stack_epoch: self.autoload_stack_epoch,
-            class_table_epoch: self.class_table_epoch,
-            include_config_epoch: self.include_config_epoch,
-        }
-    }
-
-    fn class_relation_epochs(&self) -> ClassRelationEpochs {
-        ClassRelationEpochs {
-            class_table_epoch: self.class_table_epoch,
-            autoload_epoch: self.autoload_stack_epoch,
-            include_eval_epoch: self.include_config_epoch.wrapping_mul(1_000_003)
-                ^ self.eval_counter as u64,
-            trait_interface_map_version: self.class_table_epoch,
-            method_table_version: self.function_table_epoch,
-        }
-    }
-
-    fn bump_autoload_stack_epoch(&mut self) {
-        self.autoload_stack_epoch = self.autoload_stack_epoch.saturating_add(1);
-        self.bump_lookup_epoch();
-    }
-
-    fn bump_class_table_epoch(&mut self) {
-        self.class_table_epoch = self.class_table_epoch.saturating_add(1);
-        self.bump_lookup_epoch();
-    }
-
-    fn bump_include_config_epoch(&mut self) {
-        self.include_config_epoch = self.include_config_epoch.saturating_add(1);
-        self.parsed_include_path = parse_ini_include_path(&self.ini);
-        self.bump_lookup_epoch();
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
