@@ -9,6 +9,21 @@ use super::builtin_array_sort::{
 use super::builtin_callback_validation::{array_callback_type_error, validate_array_callback_arg};
 use super::prelude::*;
 
+pub(super) fn is_array_callback_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        "array_map"
+            | "array_filter"
+            | "array_reduce"
+            | "array_walk"
+            | "array_walk_recursive"
+            | "array_any"
+            | "array_all"
+            | "array_find"
+            | "array_find_key"
+    )
+}
+
 fn array_callback_entries(
     function: &str,
     value: &Value,

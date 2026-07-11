@@ -67,6 +67,7 @@ mod static_property_predicates;
 mod stream_wrappers;
 mod symbol_resolution;
 
+use arguments::call_args_to_positional;
 #[cfg(test)]
 use builtin_adapter::internal_builtin_by_ref_param_name;
 use builtin_adapter::{
@@ -74,9 +75,12 @@ use builtin_adapter::{
     call_builtin_args_to_positional, internal_builtin_by_ref_temporary_fatal_result,
     request_filter_input_arrays, sorted_request_env,
 };
+use builtin_array_callbacks::is_array_callback_builtin_name;
+use builtin_array_sort::is_array_sort_builtin_name;
 use builtin_classes::*;
 use builtin_fileinfo::FileinfoMethodCall;
 use builtin_filter_callbacks::is_filter_callback_builtin_name;
+use builtin_pcre_callbacks::is_pcre_callback_builtin_name;
 use calls::*;
 use class_context::*;
 use class_operations::*;
@@ -28505,59 +28509,6 @@ fn iterator_function_releases_temporary_arg(function: &str) -> bool {
     matches!(
         normalize_function_name(function).as_str(),
         "iterator_apply" | "iterator_count" | "iterator_to_array"
-    )
-}
-
-fn call_args_to_positional(function: &str, args: Vec<CallArgument>) -> Result<Vec<Value>, String> {
-    let mut values = Vec::with_capacity(args.len());
-    for arg in args {
-        if let Some(name) = arg.name {
-            return Err(format!(
-                "E_PHP_VM_UNKNOWN_NAMED_ARG: function {function} has no builtin parameter ${name}"
-            ));
-        }
-        values.push(arg.value);
-    }
-    Ok(values)
-}
-
-fn is_array_callback_builtin_name(name: &str) -> bool {
-    matches!(
-        name,
-        "array_map"
-            | "array_filter"
-            | "array_reduce"
-            | "array_walk"
-            | "array_walk_recursive"
-            | "array_any"
-            | "array_all"
-            | "array_find"
-            | "array_find_key"
-    )
-}
-
-fn is_pcre_callback_builtin_name(name: &str) -> bool {
-    matches!(
-        name,
-        "preg_replace_callback" | "preg_replace_callback_array"
-    )
-}
-
-fn is_array_sort_builtin_name(name: &str) -> bool {
-    matches!(
-        name,
-        "array_multisort"
-            | "sort"
-            | "rsort"
-            | "asort"
-            | "arsort"
-            | "ksort"
-            | "krsort"
-            | "usort"
-            | "uasort"
-            | "uksort"
-            | "natsort"
-            | "natcasesort"
     )
 }
 

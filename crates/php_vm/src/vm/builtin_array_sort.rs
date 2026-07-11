@@ -3,6 +3,24 @@
 use super::builtin_adapter::builtin_source_span;
 use super::prelude::*;
 
+pub(super) fn is_array_sort_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        "array_multisort"
+            | "sort"
+            | "rsort"
+            | "asort"
+            | "arsort"
+            | "ksort"
+            | "krsort"
+            | "usort"
+            | "uasort"
+            | "uksort"
+            | "natsort"
+            | "natcasesort"
+    )
+}
+
 pub(super) fn array_callback_key_value(key: &ArrayKey) -> Value {
     match key {
         ArrayKey::Int(index) => Value::Int(*index),

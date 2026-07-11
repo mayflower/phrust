@@ -2,6 +2,13 @@ use super::builtin_adapter::{BuiltinTypeError, builtin_source_span};
 use super::builtin_callback_validation::{array_callback_type_error, validate_array_callback_arg};
 use super::prelude::*;
 
+pub(super) fn is_pcre_callback_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        "preg_replace_callback" | "preg_replace_callback_array"
+    )
+}
+
 impl Vm {
     pub(super) fn call_pcre_callback_builtin(
         &self,

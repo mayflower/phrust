@@ -1,6 +1,22 @@
 use super::prelude::*;
 use crate::error::VmError;
 
+pub(super) fn call_args_to_positional(
+    function: &str,
+    args: Vec<CallArgument>,
+) -> Result<Vec<Value>, String> {
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        if let Some(name) = arg.name {
+            return Err(format!(
+                "E_PHP_VM_UNKNOWN_NAMED_ARG: function {function} has no builtin parameter ${name}"
+            ));
+        }
+        values.push(arg.value);
+    }
+    Ok(values)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ArgumentBindingPolicy {
     pub(super) call_site_strict_types: bool,
