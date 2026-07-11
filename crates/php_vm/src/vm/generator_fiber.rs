@@ -625,4 +625,429 @@ impl Vm {
             )),
         }
     }
+
+    pub(super) fn advance_generator_to_first_yield(
+        &self,
+        compiled: &CompiledUnit,
+        generator: GeneratorRef,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Option<(Option<Value>, Value)>, VmResult> {
+        match generator.state() {
+            GeneratorState::Created => {}
+            GeneratorState::Suspended => return Ok(generator.current()),
+            GeneratorState::Closed => return Ok(None),
+            GeneratorState::Running => {
+                return Err(self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    "E_PHP_VM_GENERATOR_REENTRANCY: generator is already running",
+                ));
+            }
+            GeneratorState::Errored => {
+                return Err(self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    "E_PHP_VM_GENERATOR_ERRORED: generator already errored",
+                ));
+            }
+        }
+        generator.set_state(GeneratorState::Running);
+        self.record_runtime_trace_event(|| {
+            format!(
+                "generator state function={} transition=created->running",
+                generator.function()
+            )
+        });
+        let args = generator
+            .args()
+            .into_iter()
+            .map(CallArgument::positional)
+            .collect();
+        let context = generator.call_context();
+        let mut call = FunctionCall::new(args, Vec::new())
+            .with_call_site_strict_types(
+                context
+                    .call_site_strict_types
+                    .unwrap_or(compiled.unit().strict_types),
+            )
+            .running_generator(generator.clone());
+        if let Some(this_value) = context.this_value {
+            call = call.with_this(this_value);
+        }
+        if let (Some(scope_class), Some(called_class), Some(declaring_class)) = (
+            context.scope_class,
+            context.called_class,
+            context.declaring_class,
+        ) {
+            // Captured from a call that already went through
+            // `with_class_context`, so the handles keep their exact form.
+            call = call.with_class_context_handles(scope_class, called_class, declaring_class);
+        }
+        let result = self.execute_function(
+            compiled,
+            FunctionId::new(generator.function()),
+            call,
+            output,
+            stack,
+            state,
+        );
+        if !result.status.is_success() {
+            generator.set_state(GeneratorState::Errored);
+            self.record_runtime_trace_event(|| {
+                format!(
+                    "generator state function={} transition=running->errored",
+                    generator.function()
+                )
+            });
+            return Err(result);
+        }
+        if let Some(yielded) = result.yielded {
+            generator.suspend(yielded.key.clone(), yielded.value.clone());
+            self.record_runtime_trace_event(|| {
+                format!(
+                    "generator suspend function={} key={} value={}",
+                    generator.function(),
+                    yielded
+                        .key
+                        .as_ref()
+                        .map(trace_value)
+                        .unwrap_or_else(|| "None".to_owned()),
+                    trace_value(&yielded.value)
+                )
+            });
+            Ok(Some((yielded.key, yielded.value)))
+        } else {
+            generator.close(result.return_value);
+            self.record_runtime_trace_event(|| {
+                format!(
+                    "generator state function={} transition=running->closed",
+                    generator.function()
+                )
+            });
+            Ok(None)
+        }
+    }
+
+    pub(super) fn resume_generator_to_next_yield(
+        &self,
+        compiled: &CompiledUnit,
+        generator: GeneratorRef,
+        input: GeneratorResumeInput,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Option<(Option<Value>, Value)>, VmResult> {
+        match generator.state() {
+            GeneratorState::Suspended => {}
+            GeneratorState::Closed => return Ok(None),
+            GeneratorState::Running => {
+                return Err(self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    "E_PHP_VM_GENERATOR_REENTRANCY: generator is already running",
+                ));
+            }
+            GeneratorState::Errored => {
+                return Err(self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    "E_PHP_VM_GENERATOR_ERRORED: generator already errored",
+                ));
+            }
+            GeneratorState::Created => {
+                return Err(self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    "E_PHP_VM_GENERATOR_NOT_STARTED: generator has not reached a yield",
+                ));
+            }
+        }
+
+        let Some(continuation) = state.generator_continuations.remove(&generator.id()) else {
+            return Err(self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_GENERATOR_CONTINUATION_MISSING: suspended generator has no VM continuation",
+            ));
+        };
+        generator.set_state(GeneratorState::Running);
+        self.record_runtime_trace_event(|| {
+            format!(
+                "generator state function={} transition=suspended->running input={}",
+                generator.function(),
+                match &input {
+                    GeneratorResumeInput::Value(value) => format!("value({})", trace_value(value)),
+                    GeneratorResumeInput::Throw(value) => format!("throw({})", trace_value(value)),
+                }
+            )
+        });
+        let result = self.execute_function(
+            compiled,
+            FunctionId::new(generator.function()),
+            FunctionCall::new(Vec::new(), Vec::new())
+                .running_generator(generator.clone())
+                .resume_generator(continuation, input),
+            output,
+            stack,
+            state,
+        );
+        if !result.status.is_success() {
+            generator.set_state(GeneratorState::Errored);
+            state.generator_continuations.remove(&generator.id());
+            self.record_runtime_trace_event(|| {
+                format!(
+                    "generator state function={} transition=running->errored",
+                    generator.function()
+                )
+            });
+            return Err(result);
+        }
+        if let Some(yielded) = result.yielded {
+            generator.suspend(yielded.key.clone(), yielded.value.clone());
+            self.record_runtime_trace_event(|| {
+                format!(
+                    "generator suspend function={} key={} value={}",
+                    generator.function(),
+                    yielded
+                        .key
+                        .as_ref()
+                        .map(trace_value)
+                        .unwrap_or_else(|| "None".to_owned()),
+                    trace_value(&yielded.value)
+                )
+            });
+            Ok(Some((yielded.key, yielded.value)))
+        } else {
+            state.generator_continuations.remove(&generator.id());
+            generator.close(result.return_value);
+            self.record_runtime_trace_event(|| {
+                format!(
+                    "generator state function={} transition=running->closed",
+                    generator.function()
+                )
+            });
+            Ok(None)
+        }
+    }
+
+    pub(super) fn advance_yield_from_delegation(
+        &self,
+        compiled: &CompiledUnit,
+        key: YieldFromKey,
+        source: Operand,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<YieldFromStep, VmResult> {
+        if !state.yield_from_delegations.contains_key(&key) {
+            let source = match read_operand(compiled.unit(), stack, source) {
+                Ok(source) => source,
+                Err(message) => {
+                    return Err(self.runtime_error(output, compiled, stack, message));
+                }
+            };
+            let delegation = match source {
+                Value::Array(array) => YieldFromDelegation::Array {
+                    entries: array
+                        .iter()
+                        .map(|(key, value)| (key.clone(), effective_value(value)))
+                        .collect(),
+                    position: 0,
+                },
+                Value::Generator(generator) => YieldFromDelegation::Generator {
+                    generator,
+                    started: false,
+                },
+                other => {
+                    return Err(self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        format!(
+                            "E_PHP_VM_UNSUPPORTED_YIELD_FROM_SOURCE: yield from over {} is not implemented; runtime-semantics supports arrays and generator MVP objects",
+                            value_type_name(&other)
+                        ),
+                    ));
+                }
+            };
+            state.yield_from_delegations.insert(key.clone(), delegation);
+        }
+
+        let Some(mut delegation) = state.yield_from_delegations.remove(&key) else {
+            return Err(self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_YIELD_FROM_DELEGATION_MISSING: yield from delegation state is missing",
+            ));
+        };
+        let step = match &mut delegation {
+            YieldFromDelegation::Array { entries, position } => {
+                if let Some((entry_key, value)) = entries.get(*position).cloned() {
+                    *position += 1;
+                    YieldFromStep::Yield {
+                        key: Some(array_key_to_value(entry_key)),
+                        value,
+                    }
+                } else {
+                    YieldFromStep::Complete(Value::Null)
+                }
+            }
+            YieldFromDelegation::Generator { generator, started } => {
+                let next = if *started {
+                    self.resume_generator_to_next_yield(
+                        compiled,
+                        generator.clone(),
+                        GeneratorResumeInput::Value(Value::Null),
+                        output,
+                        stack,
+                        state,
+                    )?
+                } else {
+                    *started = true;
+                    self.advance_generator_to_first_yield(
+                        compiled,
+                        generator.clone(),
+                        output,
+                        stack,
+                        state,
+                    )?
+                };
+                if let Some((key, value)) = next {
+                    YieldFromStep::Yield { key, value }
+                } else {
+                    YieldFromStep::Complete(generator.return_value().unwrap_or(Value::Null))
+                }
+            }
+        };
+        if matches!(step, YieldFromStep::Yield { .. }) {
+            state.yield_from_delegations.insert(key, delegation);
+        }
+        Ok(step)
+    }
+
+    pub(super) fn suspend_current_fiber(
+        &self,
+        compiled: &CompiledUnit,
+        running_fiber: &Option<FiberRef>,
+        args: Vec<CallArgument>,
+        resume_result: php_ir::ids::RegId,
+        block_id: BlockId,
+        instruction_index: usize,
+        foreach_iterators: &HashMap<php_ir::ids::RegId, ForeachIterator>,
+        exception_handlers: &[ExceptionHandler],
+        pending_control: &Option<PendingControl>,
+        output: &OutputBuffer,
+        stack: &mut CallStack,
+    ) -> Result<VmResult, VmResult> {
+        let Some(fiber) = running_fiber.as_ref() else {
+            return Err(self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_FIBER_SUSPEND_OUTSIDE_FIBER: Fiber::suspend called outside a running fiber",
+            ));
+        };
+        if let Some(name) = args.iter().find_map(|arg| arg.name.as_deref()) {
+            return Err(self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_UNKNOWN_NAMED_ARG: Fiber::suspend has no builtin parameter ${name}"
+                ),
+            ));
+        }
+        if args.len() > 1 {
+            return Err(self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_TOO_MANY_ARGS: Fiber::suspend expects at most 1 argument(s), {} given",
+                    args.len()
+                ),
+            ));
+        }
+        let value = args
+            .into_iter()
+            .next()
+            .map(|arg| arg.value)
+            .unwrap_or(Value::Null);
+        self.record_runtime_trace_event(|| {
+            format!(
+                "fiber suspend transition=running->suspended state={:?} value={}",
+                fiber.state(),
+                trace_value(&value)
+            )
+        });
+        let Some(frame) = stack.pop() else {
+            return Err(self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_FIBER_FRAME_MISSING: fiber frame missing at suspend",
+            ));
+        };
+        let mut result = VmResult::success_no_output(None);
+        result.fiber_suspension = Some(Box::new(FiberSuspension {
+            value,
+            continuations: vec![FiberContinuation {
+                frame,
+                block_id,
+                instruction_index,
+                resume_result,
+                foreach_iterators: foreach_iterators.clone(),
+                exception_handlers: exception_handlers.to_vec(),
+                pending_control: pending_control.clone(),
+            }],
+        }));
+        Ok(result)
+    }
+
+    pub(super) fn propagate_fiber_suspension(
+        &self,
+        mut result: VmResult,
+        compiled: &CompiledUnit,
+        resume_result: php_ir::ids::RegId,
+        block_id: BlockId,
+        instruction_index: usize,
+        foreach_iterators: &HashMap<php_ir::ids::RegId, ForeachIterator>,
+        exception_handlers: &[ExceptionHandler],
+        pending_control: &Option<PendingControl>,
+        output: &OutputBuffer,
+        stack: &mut CallStack,
+    ) -> VmResult {
+        if let Some(suspension) = result.fiber_suspension.as_mut() {
+            let Some(frame) = stack.pop() else {
+                return self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    "E_PHP_VM_FIBER_FRAME_MISSING: caller frame missing while propagating fiber suspension",
+                );
+            };
+            suspension.continuations.insert(
+                0,
+                FiberContinuation {
+                    frame,
+                    block_id,
+                    instruction_index,
+                    resume_result,
+                    foreach_iterators: foreach_iterators.clone(),
+                    exception_handlers: exception_handlers.to_vec(),
+                    pending_control: pending_control.clone(),
+                },
+            );
+        }
+        result
+    }
 }

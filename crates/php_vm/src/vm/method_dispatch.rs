@@ -1282,4 +1282,153 @@ impl Vm {
         }
         Ok(result.return_value.unwrap_or(Value::Null))
     }
+
+    pub(super) fn call_magic_instance_method(
+        &self,
+        compiled: &CompiledUnit,
+        object: ObjectRef,
+        magic_method: &str,
+        called_method: &str,
+        args: Vec<CallArgument>,
+        call_span: Option<php_ir::IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Option<VmResult>, VmResult> {
+        let Some(_class) = lookup_class_in_state(compiled, state, &object.class_name()) else {
+            return Ok(None);
+        };
+        let resolved = match lookup_resolved_method_in_state(
+            compiled,
+            state,
+            &object.class_name(),
+            magic_method,
+            None,
+        ) {
+            Ok(Some(method)) => method,
+            Ok(None) => return Ok(None),
+            Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+        };
+        if resolved.method.flags.is_static
+            || resolved.method.flags.is_private
+            || resolved.method.flags.is_protected
+        {
+            return Ok(None);
+        }
+        let guard = MagicMethodCall {
+            receiver: format!("object:{}", object.id()),
+            magic_method: normalize_method_name(magic_method),
+            called_method: normalize_method_name(called_method),
+        };
+        if state
+            .magic_method_stack
+            .iter()
+            .any(|active| active == &guard)
+        {
+            return Err(self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_MAGIC_METHOD_RECURSION: recursive {magic_method} for {}::{called_method}",
+                    object.class_name()
+                ),
+            ));
+        }
+        let magic_args = vec![
+            CallArgument::positional(Value::String(PhpString::from_test_str(called_method))),
+            CallArgument::positional(magic_args_array(args)),
+        ];
+        state.magic_method_stack.push(guard);
+        let class_owner = class_owner_in_state(compiled, state, &resolved.class.name);
+        let result = self.execute_function(
+            &class_owner,
+            resolved.method.function,
+            FunctionCall::new(magic_args, Vec::new())
+                .with_call_site_strict_types(call_site_strictness(compiled, call_span))
+                .with_optional_call_span(call_span)
+                .with_this(object.clone())
+                .with_class_context_handles(
+                    self.class_name_handles(&resolved.class.name).normalized,
+                    object_called_class_handle(&object),
+                    self.class_name_handles(&resolved.class.name).normalized,
+                ),
+            output,
+            stack,
+            state,
+        );
+        let _ = state.magic_method_stack.pop();
+        Ok(Some(result))
+    }
+
+    pub(super) fn call_magic_static_method(
+        &self,
+        compiled: &CompiledUnit,
+        class: &php_ir::module::ClassEntry,
+        magic_method: &str,
+        called_method: &str,
+        args: Vec<CallArgument>,
+        called_class: String,
+        call_span: Option<php_ir::IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<Option<VmResult>, VmResult> {
+        let resolved =
+            match lookup_resolved_method_in_state(compiled, state, &class.name, magic_method, None)
+            {
+                Ok(Some(method)) => method,
+                Ok(None) => return Ok(None),
+                Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+            };
+        if !resolved.method.flags.is_static
+            || resolved.method.flags.is_private
+            || resolved.method.flags.is_protected
+        {
+            return Ok(None);
+        }
+        let guard = MagicMethodCall {
+            receiver: format!("class:{}", normalize_class_name(&class.name)),
+            magic_method: normalize_method_name(magic_method),
+            called_method: normalize_method_name(called_method),
+        };
+        if state
+            .magic_method_stack
+            .iter()
+            .any(|active| active == &guard)
+        {
+            return Err(self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_MAGIC_METHOD_RECURSION: recursive {magic_method} for {}::{called_method}",
+                    class.name
+                ),
+            ));
+        }
+        let magic_args = vec![
+            CallArgument::positional(Value::String(PhpString::from_test_str(called_method))),
+            CallArgument::positional(magic_args_array(args)),
+        ];
+        state.magic_method_stack.push(guard);
+        let class_owner = class_owner_in_state(compiled, state, &resolved.class.name);
+        let result = self.execute_function(
+            &class_owner,
+            resolved.method.function,
+            FunctionCall::new(magic_args, Vec::new())
+                .with_call_site_strict_types(call_site_strictness(compiled, call_span))
+                .with_optional_call_span(call_span)
+                .with_class_context_handles(
+                    self.class_name_handles(&resolved.class.name).normalized,
+                    self.class_name_handles(&called_class).display,
+                    self.class_name_handles(&resolved.class.name).normalized,
+                ),
+            output,
+            stack,
+            state,
+        );
+        let _ = state.magic_method_stack.pop();
+        Ok(Some(result))
+    }
 }
