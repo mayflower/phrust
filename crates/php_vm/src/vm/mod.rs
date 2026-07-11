@@ -28642,37 +28642,5 @@ fn packed_array_get(array: &Value, index: &Value) -> Result<Value, String> {
         .unwrap_or(Value::Null))
 }
 
-fn string_offset_negative_index(message: &str) -> Option<i64> {
-    message
-        .strip_prefix("E_PHP_VM_STRING_OFFSET_NEGATIVE: Illegal string offset ")
-        .and_then(|index| index.parse().ok())
-}
-
-fn emit_string_offset_negative_warning(
-    compiled: &CompiledUnit,
-    output: &mut OutputBuffer,
-    stack: &CallStack,
-    state: &mut ExecutionState,
-    span: php_ir::IrSpan,
-    index: i64,
-) {
-    let diagnostic = RuntimeDiagnostic::new(
-        "E_PHP_RUNTIME_ILLEGAL_STRING_OFFSET",
-        RuntimeSeverity::Warning,
-        format!("Illegal string offset {index}"),
-        runtime_source_span(compiled, span),
-        stack_trace(compiled, stack),
-        Some(php_runtime::PhpReferenceClassification::Warning),
-    );
-    emit_vm_diagnostic(
-        output,
-        state,
-        &diagnostic,
-        php_runtime::PhpDiagnosticChannel::Warning,
-        php_runtime::PHP_E_WARNING,
-    );
-    state.diagnostics.push(diagnostic);
-}
-
 #[cfg(test)]
 mod tests;

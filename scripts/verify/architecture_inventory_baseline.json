@@ -17,7 +17,7 @@
       "reason": "builtin type-error rendering strips a legacy runtime prefix; replace at the runtime boundary in Prompt 07"
     },
     {
-      "id": "crates/php_vm/src/vm/mod.rs:diagnostic_code_prefix_parse:99236549912f:1",
+      "id": "crates/php_vm/src/vm/diagnostics.rs:diagnostic_code_prefix_parse:99236549912f:1",
       "reason": "negative string-offset rendering recovers a typed index from legacy text; move to typed VM diagnostics in Prompt 10"
     },
     {
@@ -230,8 +230,8 @@
       "max_lines": 5993
     },
     "crates/php_vm/src/vm/mod.rs": {
-      "max_bytes": 1293231,
-      "max_lines": 28678
+      "max_bytes": 1292280,
+      "max_lines": 28646
     },
     "crates/php_vm/src/vm/spl.rs": {
       "max_bytes": 257771,
