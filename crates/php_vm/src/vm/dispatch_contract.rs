@@ -21,3 +21,20 @@ pub(super) struct DenseBinaryRequest<'unit> {
     pub(super) rhs: DenseOperand,
     pub(super) span: IrSpan,
 }
+
+pub(super) struct RichCompareRequest<'unit> {
+    pub(super) unit: &'unit IrUnit,
+    pub(super) frame_index: usize,
+    pub(super) dst: RegId,
+    pub(super) op: CompareOp,
+    pub(super) lhs: Operand,
+    pub(super) rhs: Operand,
+}
+
+pub(super) struct RichUnaryRequest<'unit> {
+    pub(super) unit: &'unit IrUnit,
+    pub(super) frame_index: usize,
+    pub(super) dst: RegId,
+    pub(super) op: UnaryOp,
+    pub(super) src: Operand,
+}

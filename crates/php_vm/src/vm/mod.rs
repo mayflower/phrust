@@ -23,7 +23,6 @@ mod class_validation;
 mod closure_operations;
 mod dense_dispatch;
 mod dense_method_dispatch;
-mod dense_scalar_handlers;
 mod diagnostics;
 mod dispatch_contract;
 mod exception_dispatch;
@@ -54,6 +53,7 @@ mod request_profile;
 mod result;
 mod runtime_class_metadata;
 mod runtime_operations;
+mod scalar_handlers;
 mod serialization;
 mod shutdown_execution;
 mod spl;
@@ -75,7 +75,7 @@ use class_relations::*;
 use class_validation::*;
 use closure_operations::*;
 use diagnostics::*;
-use dispatch_contract::DenseExecutionRequest;
+use dispatch_contract::{DenseExecutionRequest, RichCompareRequest, RichUnaryRequest};
 use exception_dispatch::*;
 use execution_control::{
     ExceptionHandler, ExecutionLimitExceeded, PendingControl, RaiseOutcome,
@@ -119,6 +119,7 @@ pub use result::VmStepLimitDiagnostic;
 pub use result::{VmControlFlow, VmResult};
 pub(crate) use runtime_class_metadata::dense_new_object_lowering_supported;
 use runtime_class_metadata::*;
+use scalar_handlers::{execute_rich_compare_op, execute_rich_unary_op};
 use spl::*;
 use static_property_predicates::*;
 use symbol_resolution::*;
@@ -6747,30 +6748,17 @@ impl Vm {
                         }
                     }
                     InstructionKind::Compare { dst, op, lhs, rhs } => {
-                        let lhs = match read_operand_at_frame(unit, stack, frame_index, *lhs) {
-                            Ok(value) => value,
-                            Err(message) => {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                        };
-                        let rhs = match read_operand_at_frame(unit, stack, frame_index, *rhs) {
-                            Ok(value) => value,
-                            Err(message) => {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                        };
-                        let value = match execute_compare(*op, &lhs, &rhs) {
-                            Ok(value) => value,
-                            Err(message) => {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                        };
-                        if let Err(message) = stack
-                            .frame_mut(frame_index)
-                            .expect("frame was pushed")
-                            .registers
-                            .set(*dst, value)
-                        {
+                        if let Err(message) = execute_rich_compare_op(
+                            RichCompareRequest {
+                                unit,
+                                frame_index,
+                                dst: *dst,
+                                op: *op,
+                                lhs: *lhs,
+                                rhs: *rhs,
+                            },
+                            stack,
+                        ) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
                     }
@@ -6861,24 +6849,16 @@ impl Vm {
                         }
                     }
                     InstructionKind::Unary { dst, op, src } => {
-                        let src = match read_operand_at_frame(unit, stack, frame_index, *src) {
-                            Ok(value) => value,
-                            Err(message) => {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                        };
-                        let value = match execute_unary(*op, &src) {
-                            Ok(value) => value,
-                            Err(message) => {
-                                return self.runtime_error(output, compiled, stack, message);
-                            }
-                        };
-                        if let Err(message) = stack
-                            .frame_mut(frame_index)
-                            .expect("frame was pushed")
-                            .registers
-                            .set(*dst, value)
-                        {
+                        if let Err(message) = execute_rich_unary_op(
+                            RichUnaryRequest {
+                                unit,
+                                frame_index,
+                                dst: *dst,
+                                op: *op,
+                                src: *src,
+                            },
+                            stack,
+                        ) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
                     }

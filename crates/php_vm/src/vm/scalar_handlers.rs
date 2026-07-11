@@ -1,6 +1,50 @@
 use super::dispatch_contract::DenseBinaryRequest;
 use super::prelude::*;
 
+pub(super) fn execute_rich_compare_op(
+    request: RichCompareRequest<'_>,
+    stack: &mut CallStack,
+) -> Result<(), String> {
+    let RichCompareRequest {
+        unit,
+        frame_index,
+        dst,
+        op,
+        lhs,
+        rhs,
+    } = request;
+    let lhs = read_operand_at_frame(unit, stack, frame_index, lhs)?;
+    let rhs = read_operand_at_frame(unit, stack, frame_index, rhs)?;
+    let value = execute_compare(op, &lhs, &rhs)?;
+    stack
+        .frame_mut(frame_index)
+        .expect("frame was pushed")
+        .registers
+        .set(dst, value)?;
+    Ok(())
+}
+
+pub(super) fn execute_rich_unary_op(
+    request: RichUnaryRequest<'_>,
+    stack: &mut CallStack,
+) -> Result<(), String> {
+    let RichUnaryRequest {
+        unit,
+        frame_index,
+        dst,
+        op,
+        src,
+    } = request;
+    let src = read_operand_at_frame(unit, stack, frame_index, src)?;
+    let value = execute_unary(op, &src)?;
+    stack
+        .frame_mut(frame_index)
+        .expect("frame was pushed")
+        .registers
+        .set(dst, value)?;
+    Ok(())
+}
+
 impl Vm {
     pub(super) fn execute_dense_binary_op(
         &self,
