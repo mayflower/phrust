@@ -96,7 +96,7 @@ use dispatch_contract::{
 use exception_dispatch::*;
 use execution_control::{
     ExceptionHandler, ExecutionLimitExceeded, PendingControl, RaiseOutcome,
-    execution_limit_exceeded,
+    execution_limit_exceeded, next_block_id,
 };
 use execution_state::{
     DeclarationKind, DeclarationLoadKind, DeclarationOrigin, DestructorEntry, DestructorSweep,
@@ -28640,17 +28640,6 @@ fn packed_array_get(array: &Value, index: &Value) -> Result<Value, String> {
         .packed_element_fast(index as usize)
         .cloned()
         .unwrap_or(Value::Null))
-}
-
-fn next_block_id(function: &IrFunction, current: BlockId) -> Result<BlockId, String> {
-    let next = current.raw() + 1;
-    if next as usize >= function.blocks.len() {
-        return Err(format!(
-            "fallthrough block after block:{} is missing",
-            current.raw()
-        ));
-    }
-    Ok(BlockId::new(next))
 }
 
 fn string_offset_negative_index(message: &str) -> Option<i64> {

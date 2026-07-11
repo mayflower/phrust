@@ -32,6 +32,17 @@ pub(super) enum ExecutionLimitExceeded {
     StepLimit,
 }
 
+pub(super) fn next_block_id(function: &IrFunction, current: BlockId) -> Result<BlockId, String> {
+    let next = current.raw() + 1;
+    if next as usize >= function.blocks.len() {
+        return Err(format!(
+            "fallthrough block after block:{} is missing",
+            current.raw()
+        ));
+    }
+    Ok(BlockId::new(next))
+}
+
 pub(super) fn execution_limit_exceeded(
     state: &ExecutionState,
     steps: usize,
