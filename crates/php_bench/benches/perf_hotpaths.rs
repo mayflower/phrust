@@ -709,10 +709,13 @@ fn bench_runtime(c: &mut Criterion) {
 
     c.bench_function("performance/string_concat_builder", |b| {
         b.iter(|| {
-            let mut value = PhpString::from_bytes(Vec::with_capacity(384));
+            // Storage is fixed-length now; growth accumulates in a Vec and
+            // builds the string once, matching how the engine concatenates.
+            let mut builder = Vec::with_capacity(384);
             for _ in 0..64 {
-                value.bytes_mut().extend_from_slice(black_box(b"abc"));
+                builder.extend_from_slice(black_box(b"abc"));
             }
+            let value = PhpString::from_bytes(builder);
             black_box(value.len());
         });
     });

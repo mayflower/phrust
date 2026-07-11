@@ -148,6 +148,33 @@ impl CompactBytes {
     pub fn set_symbol(&self, symbol: Option<u64>) {
         self.header().symbol.set(symbol.unwrap_or(NO_SYMBOL));
     }
+
+    /// True when both handles share one allocation.
+    #[must_use]
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        a.ptr == b.ptr
+    }
+
+    /// Process-local allocation identity for request-scoped caches.
+    #[must_use]
+    pub fn addr(&self) -> usize {
+        self.ptr.as_ptr() as usize
+    }
+
+    /// Mutable access to the bytes of a uniquely-owned allocation.
+    ///
+    /// Callers must hold the only handle (`is_unique`); shared storage must
+    /// be separated first. The uniqueness requirement keeps the mutation
+    /// invisible to any other owner, mirroring `Rc::get_mut` semantics.
+    #[must_use]
+    pub fn unique_bytes_mut(&mut self) -> &mut [u8] {
+        assert!(self.is_unique(), "mutating shared compact bytes");
+        let len = self.header().len;
+        // SAFETY: the tail holds exactly `len` initialized bytes; `self` is
+        // the only owner (asserted above) and holds an exclusive borrow, so
+        // no aliasing reference can exist for the returned lifetime.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(1).cast::<u8>(), len) }
+    }
 }
 
 impl Clone for CompactBytes {
@@ -234,6 +261,19 @@ mod tests {
         assert_eq!(clone.symbol(), Some(7));
         clone.set_symbol(None);
         assert_eq!(bytes.symbol(), None);
+    }
+
+    #[test]
+    fn identity_and_unique_mutation_hold_their_contracts() {
+        let mut a = CompactBytes::from_slice(b"abc");
+        let b = a.clone();
+        assert!(CompactBytes::ptr_eq(&a, &b));
+        assert_eq!(a.addr(), b.addr());
+        drop(b);
+        a.unique_bytes_mut()[0] = b'x';
+        assert_eq!(a.as_bytes(), b"xbc");
+        let c = CompactBytes::from_slice(b"abc");
+        assert!(!CompactBytes::ptr_eq(&a, &c));
     }
 
     #[test]

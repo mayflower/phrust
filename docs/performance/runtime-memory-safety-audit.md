@@ -30,6 +30,11 @@ Invariants:
   caller). Only the header's hash/symbol cells mutate, and they are
   plain `Cell`s on a single thread.
 
+- `unique_bytes_mut` returns mutable bytes only for a uniquely-owned
+  allocation (asserted), through an exclusive borrow — no other handle or
+  outstanding byte reference can alias the returned slice.
+
 Tests: construction/round-trip (empty, small, large), clone/drop
 refcount behavior including interleavings, hash/symbol cell caching,
-uniqueness probe, and a Miri run via `safety-audit-smoke`.
+identity (`ptr_eq`/`addr`) and unique-mutation contracts, and a Miri run
+via `safety-audit-smoke`.
