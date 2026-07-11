@@ -14352,7 +14352,6 @@ impl Vm {
         let normalized_scope = scope.as_deref().map(normalize_class_name);
         let receiver_class = normalize_class_name(&object.class_name());
         let lookup_epoch = state.lookup_epoch();
-        let receiver_has_magic_get = class_has_public_magic_get(compiled, &class);
 
         let cached_target = if let Some(id) = cache_id {
             self.lookup_dense_property_fetch_inline_cache(
@@ -14401,6 +14400,9 @@ impl Vm {
             }
         }
 
+        // Only the resolve/miss path consults the magic-get flag; keep the
+        // hierarchy walk off the cache-hit path.
+        let receiver_has_magic_get = class_has_public_magic_get(compiled, &class);
         let resolved = match lookup_resolved_property_in_state(
             compiled,
             state,
@@ -14727,7 +14729,6 @@ impl Vm {
         let normalized_scope = scope.as_deref().map(normalize_class_name);
         let receiver_class = normalize_class_name(&object.class_name());
         let lookup_epoch = state.lookup_epoch();
-        let receiver_has_magic_set = class_has_public_magic_set(compiled, &class);
 
         let cached_target = if let Some(id) = cache_id {
             self.lookup_dense_property_assign_inline_cache(
@@ -14783,6 +14784,9 @@ impl Vm {
             }
         }
 
+        // Same as the fetch arm: the magic-set flag only matters on the
+        // resolve/miss path.
+        let receiver_has_magic_set = class_has_public_magic_set(compiled, &class);
         let resolved = match lookup_resolved_property_in_state(
             compiled,
             state,
