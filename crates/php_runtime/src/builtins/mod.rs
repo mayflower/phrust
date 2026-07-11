@@ -4,6 +4,7 @@ mod context;
 mod error;
 pub(in crate::builtins) mod modules;
 mod registry;
+mod request_state;
 mod signatures;
 
 pub use crate::source_span::RuntimeSourceSpan;
@@ -41,6 +42,7 @@ pub use modules::soap::{
 };
 pub use modules::{array_intrinsics, json_fast, string_intrinsics};
 pub use registry::{BuiltinCompatibility, BuiltinEntry, BuiltinRegistry};
+pub use request_state::{BuiltinRequestState, JsonRequestState, PcreRequestState};
 pub use signatures::{BuiltinResult, InternalFunction};
 
 pub fn hash_algorithm_exists(algorithm: &str) -> bool {

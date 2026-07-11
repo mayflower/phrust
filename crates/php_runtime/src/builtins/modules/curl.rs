@@ -2716,12 +2716,36 @@ struct CurlResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OutputBuffer, ReferenceCell};
+    use crate::{BuiltinRequestState, OutputBuffer, ReferenceCell};
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener};
     use std::thread;
 
     static NET_TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn curl_state_persists_in_one_request_owner_across_builtin_contexts() {
+        let mut request_state = BuiltinRequestState::new();
+        let handle = {
+            let mut output = OutputBuffer::default();
+            let mut context =
+                BuiltinContext::new_with_request_state(&mut output, &mut request_state);
+            builtin_curl_init(
+                &mut context,
+                vec![Value::string("http://example.com/")],
+                RuntimeSourceSpan::default(),
+            )
+            .expect("init")
+        };
+
+        let mut output = OutputBuffer::default();
+        let mut context = BuiltinContext::new_with_request_state(&mut output, &mut request_state);
+        assert_eq!(
+            builtin_curl_errno(&mut context, vec![handle], RuntimeSourceSpan::default())
+                .expect("errno"),
+            Value::Int(0)
+        );
+    }
 
     #[test]
     fn curl_version_advertises_ssl_transport_capability() {

@@ -41,6 +41,7 @@ pub mod pcre;
 #[cfg(feature = "full-runtime")]
 pub mod phar;
 pub mod reference;
+pub mod request_state;
 pub mod resource;
 pub mod serialization;
 pub mod session;
@@ -75,12 +76,12 @@ pub mod api {
     #[cfg(feature = "full-runtime")]
     pub use crate::builtins::{
         ApcuState, BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError,
-        BuiltinErrorContext, BuiltinRegistry, BuiltinResult, FilesystemRuntimeState,
-        FtpOptionValue, FtpState, GettextState, IconvEncodingState, ImapState, InternalFunction,
-        LdapState, MbSubstituteCharacter, OpcacheState, OpenSslErrorState, PcntlState,
-        ReadlineState, SYSVMSG_EAGAIN, SYSVMSG_EINVAL, SYSVMSG_IPC_NOWAIT, ShmopState, SoapState,
-        SocketState, Ssh2State, StreamContextState, StrtokState, SysvMessageQueueState,
-        SysvSemaphoreState, SysvSharedMemoryState,
+        BuiltinErrorContext, BuiltinRegistry, BuiltinRequestState, BuiltinResult,
+        FilesystemRuntimeState, FtpOptionValue, FtpState, GettextState, IconvEncodingState,
+        ImapState, InternalFunction, LdapState, MbSubstituteCharacter, OpcacheState,
+        OpenSslErrorState, PcntlState, ReadlineState, SYSVMSG_EAGAIN, SYSVMSG_EINVAL,
+        SYSVMSG_IPC_NOWAIT, ShmopState, SoapState, SocketState, Ssh2State, StreamContextState,
+        StrtokState, SysvMessageQueueState, SysvSemaphoreState, SysvSharedMemoryState,
     };
     pub use crate::callable::{
         CallableMethodTarget, CallableValue, ClosureCaptureValue, ClosureContext, ClosureDebugInfo,
@@ -158,6 +159,10 @@ pub mod api {
     pub use crate::reference::{
         Lvalue, LvalueError, LvalueKind, ReferenceCell, ReferencePlaceholder, Slot, TempValue,
         ValueSlot,
+    };
+    pub use crate::request_state::{
+        ExtensionStateLayout, ExtensionStateLayoutBuilder, ExtensionStateLayoutError,
+        ExtensionStateSlot, RequestState,
     };
     pub use crate::resource::{
         FilesystemCapabilities, ResourceId, ResourceKind, ResourceRef, ResourceTable, Stream,
@@ -241,11 +246,12 @@ pub use autoload::AutoloadRegistry;
 #[cfg(feature = "full-runtime")]
 pub use builtins::{
     ApcuState, BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError,
-    BuiltinErrorContext, BuiltinRegistry, BuiltinResult, FilesystemRuntimeState, FtpOptionValue,
-    FtpState, GettextState, IconvEncodingState, ImapState, InternalFunction, JSON_ERROR_RECURSION,
-    JSON_PARTIAL_OUTPUT_ON_ERROR, JSON_THROW_ON_ERROR, LdapState, MbSubstituteCharacter,
-    OpcacheState, OpenSslErrorState, PcntlState, ReadlineState, ShmopState, SoapState, SocketState,
-    Ssh2State, StreamContextState, StrtokState, SysvMessageQueueState, SysvSemaphoreState,
+    BuiltinErrorContext, BuiltinRegistry, BuiltinRequestState, BuiltinResult,
+    FilesystemRuntimeState, FtpOptionValue, FtpState, GettextState, IconvEncodingState, ImapState,
+    InternalFunction, JSON_ERROR_RECURSION, JSON_PARTIAL_OUTPUT_ON_ERROR, JSON_THROW_ON_ERROR,
+    JsonRequestState, LdapState, MbSubstituteCharacter, OpcacheState, OpenSslErrorState,
+    PcntlState, PcreRequestState, ReadlineState, ShmopState, SoapState, SocketState, Ssh2State,
+    StreamContextState, StrtokState, SysvMessageQueueState, SysvSemaphoreState,
     SysvSharedMemoryState,
 };
 pub use callable::{
@@ -332,6 +338,10 @@ pub use phar::{PharArchive, PharEntry, PharError, PharUri};
 pub use reference::{
     Lvalue, LvalueError, LvalueKind, ReferenceCell, ReferencePlaceholder, Slot, TempValue,
     ValueSlot, WeakReferenceHandle,
+};
+pub use request_state::{
+    ExtensionStateLayout, ExtensionStateLayoutBuilder, ExtensionStateLayoutError,
+    ExtensionStateSlot, RequestState,
 };
 pub use resource::{
     FilesystemCapabilities, ResourceId, ResourceKind, ResourceRef, ResourceTable, Stream,

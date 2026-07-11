@@ -1299,9 +1299,7 @@ struct ExecutionState {
     user_stream_wrappers: UserStreamWrapperRegistry,
     mb_internal_encoding: String,
     mb_substitute_character: php_runtime::MbSubstituteCharacter,
-    pcre_cache: php_runtime::pcre::PcreCache,
-    preg_last_error: php_runtime::pcre::PcreLastErrorState,
-    json_last_error: i64,
+    builtin_request_state: php_runtime::BuiltinRequestState,
     json_serializable_active_objects: Vec<u64>,
     posix_last_error: i32,
     last_error: Option<LastErrorEntry>,
@@ -1334,6 +1332,14 @@ struct ExecutionState {
 }
 
 impl ExecutionState {
+    fn pcre_state_mut(&mut self) -> &mut php_runtime::PcreRequestState {
+        self.builtin_request_state.pcre_mut()
+    }
+
+    fn set_json_last_error(&mut self, code: i64) {
+        self.builtin_request_state.json_mut().set(code);
+    }
+
     fn has_included(&self, path: &Path) -> bool {
         self.included_once_set.contains(path)
     }
@@ -33244,7 +33250,7 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> Result<(), ArrayCallbackError> {
-        state.preg_last_error.set(
+        state.pcre_state_mut().last_error_mut().set(
             error.code(),
             php_runtime::pcre::preg_error_message(error.code()),
         );
@@ -61251,7 +61257,7 @@ fn try_execute_simple_literal_pcre_builtin(
         "preg_grep" => try_execute_simple_literal_preg_grep(values)?,
         _ => return None,
     };
-    state.preg_last_error.clear();
+    state.pcre_state_mut().last_error_mut().clear();
     Some(VmResult::success_no_output(Some(result)))
 }
 
@@ -61464,11 +61470,12 @@ fn execute_builtin_entry(
     if state.mb_internal_encoding.is_empty() {
         state.mb_internal_encoding = "UTF-8".to_owned();
     }
-    let mut context = BuiltinContext::with_runtime(
+    let mut context = BuiltinContext::with_runtime_request_state(
         output,
         PathBuf::new(),
         runtime_context.filesystem.clone(),
         Some(&mut state.resources),
+        &mut state.builtin_request_state,
     );
     context.set_cwd_state(&mut state.cwd);
     context.set_include_path_shared(include_path);
@@ -61481,9 +61488,6 @@ fn execute_builtin_entry(
     context.set_default_timezone_state(&mut state.default_timezone);
     context.set_diagnostic_display(diagnostic_display);
     context.set_filter_input_arrays_shared(Rc::clone(&state.filter_input_arrays));
-    context.set_pcre_cache_state(&mut state.pcre_cache);
-    context.set_preg_last_error_state(&mut state.preg_last_error);
-    context.set_json_last_error(state.json_last_error);
     context.set_bcmath_scale(state.bcmath_scale);
     context.set_strtok_state(&mut state.strtok_state);
     context.set_iconv_state(&mut state.iconv_state);
@@ -61527,7 +61531,6 @@ fn execute_builtin_entry(
     let time_limit_arg = (entry.name() == "set_time_limit").then(|| args.first().cloned());
     let result = (entry.function())(&mut context, args, source_span.clone());
     context.sync_session_state_from_global();
-    state.json_last_error = context.json_last_error().0;
     state.posix_last_error = context.posix_last_error();
     state.bcmath_scale = context.bcmath_scale();
     let mut diagnostics = context.take_diagnostics();
@@ -64323,7 +64326,8 @@ fn try_execute_dense_pcre_ascii_offset_block_fast_path(
                 return Ok(None);
             }
             if !state
-                .pcre_cache
+                .pcre_state_mut()
+                .cache_mut()
                 .validate_utf8_ascii_subject_at_offset(subject, start)
                 .map_err(|error| error.message().to_owned())?
             {
@@ -64345,7 +64349,7 @@ fn try_execute_dense_pcre_ascii_offset_block_fast_path(
         .ok_or_else(|| "no active frame".to_owned())?
         .locals
         .ensure_reference_cell(LocalId::new(matches_local))?;
-    state.preg_last_error.clear();
+    state.pcre_state_mut().last_error_mut().clear();
     let truthy = match match_result {
         DensePcreAsciiOffsetBlockMatch::Matched(byte) => {
             builtin_intrinsics::set_preg_match_single_byte_match(&matches, &[byte]);
