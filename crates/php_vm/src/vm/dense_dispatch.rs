@@ -1,3 +1,4 @@
+use super::dispatch_contract::DenseBinaryRequest;
 use super::prelude::*;
 
 impl Vm {
@@ -2785,82 +2786,27 @@ impl Vm {
                             stack.pop_recycle();
                             return result;
                         };
-                        // Borrow both operands for the quickened fast paths;
-                        // only the generic `execute_binary` fallback (which
-                        // needs `&mut` VM state for warnings/`__toString`)
-                        // materializes owned values.
-                        let lhs = match self.read_dense_operand_ref(compiled, stack, lhs) {
-                            Ok(value) => value,
-                            Err(message) => {
-                                let result = self.runtime_error(output, compiled, stack, message);
-                                stack.pop_recycle();
-                                return result;
-                            }
-                        };
-                        let rhs = match self.read_dense_operand_ref(compiled, stack, rhs) {
-                            Ok(value) => value,
-                            Err(message) => {
-                                let result = self.runtime_error(output, compiled, stack, message);
-                                stack.pop_recycle();
-                                return result;
-                            }
-                        };
-                        let op = dense_binary_op(instruction.opcode)
-                            .expect("dense binary opcode matched");
                         let span = dense
                             .spans
                             .get(instruction.span.index())
                             .copied()
                             .unwrap_or_default();
-                        let value = match op {
-                            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => self
-                                .try_quickened_dense_int_int_binary(
-                                    unit_id,
-                                    function_id,
-                                    dense_instruction_index,
-                                    op,
-                                    lhs.as_value(),
-                                    rhs.as_value(),
-                                ),
-                            BinaryOp::Concat => self.try_quickened_dense_concat_string_string(
+                        if let Err(result) = self.execute_dense_binary_op(
+                            DenseBinaryRequest {
+                                compiled,
                                 unit_id,
                                 function_id,
-                                dense_instruction_index,
-                                lhs.as_value(),
-                                rhs.as_value(),
-                            ),
-                            _ => None,
-                        };
-                        let value = match value {
-                            Some(value) => value,
-                            None => {
-                                let lhs = lhs.into_owned();
-                                let rhs = rhs.into_owned();
-                                match self.execute_binary(
-                                    compiled,
-                                    op,
-                                    &lhs,
-                                    &rhs,
-                                    runtime_source_span(compiled, span),
-                                    output,
-                                    stack,
-                                    state,
-                                ) {
-                                    Ok(value) => value,
-                                    Err(result) => {
-                                        stack.pop_recycle();
-                                        return result;
-                                    }
-                                }
-                            }
-                        };
-                        if let Err(message) = stack
-                            .current_mut()
-                            .expect("bytecode frame was pushed")
-                            .registers
-                            .set(RegId::new(dst), value)
-                        {
-                            let result = self.runtime_error(output, compiled, stack, message);
+                                instruction_index: dense_instruction_index,
+                                opcode: instruction.opcode,
+                                dst,
+                                lhs,
+                                rhs,
+                                span,
+                            },
+                            output,
+                            stack,
+                            state,
+                        ) {
                             stack.pop_recycle();
                             return result;
                         }
