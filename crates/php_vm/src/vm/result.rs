@@ -176,6 +176,8 @@ impl VmResult {
         result
     }
 
+    #[cold]
+    #[inline(never)]
     pub(crate) fn runtime_error_with_diagnostic(
         output: OutputBuffer,
         message: impl Into<String>,
@@ -201,6 +203,8 @@ impl VmResult {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     pub(super) fn compile_error(output: OutputBuffer, message: impl Into<String>) -> Self {
         Self {
             status: ExecutionStatus::compile_error(message),

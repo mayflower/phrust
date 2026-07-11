@@ -14471,6 +14471,8 @@ impl Vm {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     fn dense_runtime_error(
         &self,
         compiled: &CompiledUnit,
@@ -14504,6 +14506,8 @@ impl Vm {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     fn runtime_error_at_optional_span(
         &self,
         compiled: &CompiledUnit,
@@ -16328,6 +16332,8 @@ impl Vm {
         Ok(next_value)
     }
 
+    #[cold]
+    #[inline(never)]
     fn invalid_bytecode_operand_shape(
         &self,
         output: &mut OutputBuffer,
@@ -48281,6 +48287,8 @@ impl Vm {
         result
     }
 
+    #[cold]
+    #[inline(never)]
     fn runtime_error(
         &self,
         output: &OutputBuffer,
@@ -55496,6 +55504,8 @@ fn load_phar_include(
     })
 }
 
+#[cold]
+#[inline(never)]
 fn include_vm_error(code: &'static str, message: impl Into<String>) -> VmError {
     VmError::fatal(code, "include", message)
 }
