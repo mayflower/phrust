@@ -34,7 +34,9 @@ upload, session, and SAPI state similarly live behind one
 declaration models, error/shutdown state, destructor ownership, and GC root
 scanning have moved with it. Class constants, cloning, autoload, class/object
 introspection, aliases, dependency validation, and construction now have a
-bounded `class_operations` owner.
+bounded `class_operations` owner. Function/fiber target resolution, dense-plan
+calls, array callables, and closure binding now complete the bounded `calls`
+owner rather than routing through facade methods.
 
 ## Target Ownership
 

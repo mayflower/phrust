@@ -930,4 +930,1002 @@ impl Vm {
             ),
         }
     }
+
+    pub(super) fn call_fiber_callable(
+        &self,
+        compiled: &CompiledUnit,
+        fiber: FiberRef,
+        callee: Value,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        match callee {
+            Value::Callable(callable) => match *callable {
+                CallableValue::UserFunction { name } => {
+                    if let Some(function) = compiled.lookup_function(&name) {
+                        self.execute_function(
+                            compiled,
+                            function,
+                            FunctionCall::new(args, Vec::new())
+                                .with_call_site_strict_types(compiled.unit().strict_types)
+                                .running_fiber(fiber),
+                            output,
+                            stack,
+                            state,
+                        )
+                    } else if let Some((owner, function)) = dynamic_function_in_state(state, &name)
+                    {
+                        self.execute_function(
+                            &owner,
+                            function,
+                            FunctionCall::new(args, Vec::new())
+                                .with_call_site_strict_types(compiled.unit().strict_types)
+                                .running_fiber(fiber),
+                            output,
+                            stack,
+                            state,
+                        )
+                    } else {
+                        self.runtime_error(
+                            output,
+                            compiled,
+                            stack,
+                            format!("E_PHP_VM_UNRESOLVED_CALLABLE: function {name} is not defined"),
+                        )
+                    }
+                }
+                CallableValue::Closure(payload) => {
+                    let mut call = FunctionCall::new(args, payload.captures)
+                        .with_call_site_strict_types(compiled.unit().strict_types)
+                        .running_fiber(fiber)
+                        .with_error_context(compiled.clone());
+                    let closure_owner = closure_owner_for_function(
+                        compiled,
+                        state,
+                        payload.function,
+                        payload.debug.as_deref(),
+                        payload.context.owner_unit,
+                    );
+                    if let Some(bound_this) = payload.bound_this
+                        && closure_function_has_this_local(&closure_owner, payload.function)
+                    {
+                        call = call.with_this(bound_this);
+                    }
+                    if let Some(scope_class) = payload.context.scope_class {
+                        call = call.with_class_context_handles(
+                            scope_class.clone(),
+                            payload
+                                .context
+                                .called_class
+                                .unwrap_or_else(|| scope_class.clone()),
+                            payload
+                                .context
+                                .declaring_class
+                                .unwrap_or_else(|| scope_class.clone()),
+                        );
+                    } else if let Some(this_value) = call.this_value.as_ref() {
+                        let scope_class = this_value.display_name();
+                        call = call.with_class_context(
+                            scope_class.clone(),
+                            scope_class.clone(),
+                            scope_class,
+                        );
+                    }
+                    self.execute_function(
+                        &closure_owner,
+                        FunctionId::new(payload.function),
+                        call,
+                        output,
+                        stack,
+                        state,
+                    )
+                }
+                other_callable => self.call_callable(
+                    compiled,
+                    Value::Callable(Box::new(other_callable)),
+                    args,
+                    output,
+                    stack,
+                    state,
+                ),
+            },
+            other => self.call_callable(compiled, other, args, output, stack, state),
+        }
+    }
+
+    pub(super) fn call_named_callable(
+        &self,
+        compiled: &CompiledUnit,
+        name: &str,
+        args: Vec<CallArgument>,
+        call_span: Option<php_ir::IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        allow_by_ref_value_warnings: bool,
+        by_ref_warning_callable_name: Option<String>,
+    ) -> VmResult {
+        if let Some((class_name, method)) = name.split_once("::") {
+            return self.call_static_method_callable(
+                compiled,
+                class_name,
+                method,
+                args,
+                call_span,
+                output,
+                stack,
+                state,
+                allow_by_ref_value_warnings,
+                by_ref_warning_callable_name,
+            );
+        }
+        let normalized = name.to_ascii_lowercase();
+        let make_call = |args| {
+            let call = FunctionCall::new(args, Vec::new())
+                .with_call_site_strict_types(call_site_strictness(compiled, call_span))
+                .with_optional_call_span(call_span);
+            if allow_by_ref_value_warnings {
+                call.with_by_ref_value_warnings()
+            } else {
+                call
+            }
+            .with_optional_by_ref_warning_callable_name(by_ref_warning_callable_name.clone())
+        };
+        if let Some(function) = compiled.lookup_function(&normalized) {
+            return self.execute_function(
+                compiled,
+                function,
+                make_call(args),
+                output,
+                stack,
+                state,
+            );
+        }
+        if let Some((owner, function)) = dynamic_function_in_state(state, &normalized) {
+            return self.execute_function(&owner, function, make_call(args), output, stack, state);
+        }
+        if is_autoload_builtin_name(&normalized)
+            || is_symbol_introspection_builtin_name(&normalized)
+        {
+            return self.call_autoload_builtin(
+                compiled,
+                &normalized,
+                args,
+                None,
+                call_span,
+                output,
+                stack,
+                state,
+            );
+        }
+        if is_config_builtin_name(&normalized) {
+            return self.call_config_builtin(
+                compiled,
+                &normalized,
+                args,
+                call_span,
+                output,
+                stack,
+                state,
+            );
+        }
+        if is_error_handling_builtin_name(&normalized) {
+            return self.call_error_handling_builtin(
+                compiled,
+                &normalized,
+                args,
+                output,
+                stack,
+                state,
+            );
+        }
+        if is_output_buffering_builtin_name(&normalized) {
+            return self.call_output_buffering_builtin(compiled, &normalized, args, output, stack);
+        }
+        if is_environment_builtin_name(&normalized) {
+            return self.call_environment_builtin(
+                compiled,
+                &normalized,
+                args,
+                output,
+                stack,
+                state,
+            );
+        }
+        if is_process_builtin_name(&normalized) {
+            return self.call_process_builtin(compiled, &normalized, args, output, stack);
+        }
+        if is_pcre_callback_builtin_name(&normalized) {
+            return self.call_pcre_callback_builtin(
+                compiled,
+                &normalized,
+                args,
+                call_span,
+                output,
+                stack,
+                state,
+            );
+        }
+        if is_filter_callback_builtin_name(&normalized) {
+            return self.call_filter_callback_builtin(
+                compiled,
+                &normalized,
+                args,
+                call_span,
+                output,
+                stack,
+                state,
+            );
+        }
+        if is_array_callback_builtin_name(&normalized) {
+            return self.call_array_callback_builtin(
+                compiled,
+                &normalized,
+                args,
+                call_span,
+                output,
+                stack,
+                state,
+            );
+        }
+        if is_array_sort_builtin_name(&normalized) {
+            return self.call_array_sort_builtin(compiled, &normalized, args, output, stack, state);
+        }
+        if let Some(result) = self.try_execute_preg_match_start_offset_ascii_call_fast(
+            &normalized,
+            &args,
+            compiled,
+            stack,
+            state,
+        ) {
+            return result;
+        }
+        if BuiltinRegistry::new().contains(&normalized) {
+            let values = match call_builtin_args_to_positional(
+                self,
+                compiled,
+                &normalized,
+                args,
+                None,
+                output,
+                stack,
+                state,
+            ) {
+                Ok(values) => values,
+                Err(InternalBuiltinArgError::Message(message)) => {
+                    return self.runtime_error(output, compiled, stack, message);
+                }
+                Err(InternalBuiltinArgError::Fatal(result)) => return *result,
+            };
+            if let Some(result) = self.try_execute_serialization_builtin(
+                compiled,
+                &normalized,
+                &values,
+                call_span,
+                output,
+                stack,
+                state,
+            ) {
+                return result;
+            }
+            if let Some(result) =
+                try_execute_simple_literal_pcre_builtin(&normalized, &values, state)
+            {
+                return result;
+            }
+            return self.execute_internal_registry_builtin(
+                &normalized,
+                values,
+                call_span,
+                output,
+                stack,
+                state,
+                compiled,
+            );
+        }
+        self.runtime_error(
+            output,
+            compiled,
+            stack,
+            format!("E_PHP_VM_UNRESOLVED_CALLABLE: function {name} is not defined"),
+        )
+    }
+
+    pub(super) fn resolve_function_call_target(
+        &self,
+        compiled: &CompiledUnit,
+        state: &ExecutionState,
+        name: &str,
+    ) -> Option<FunctionCallCacheTarget> {
+        if !name.contains('\\')
+            && let Some(target) = builtin_function_call_target(name)
+        {
+            return Some(target);
+        }
+        if let Some(function) = compiled.lookup_function(name) {
+            return Some(FunctionCallCacheTarget::CurrentUnit {
+                unit_identity: compiled.cache_identity(),
+                function,
+            });
+        }
+        if let Some((unit_index, function)) = dynamic_function_target_in_state(state, name) {
+            return Some(FunctionCallCacheTarget::DynamicUnit {
+                unit_index,
+                unit_identity: dynamic_unit_identity(state, unit_index),
+                function,
+            });
+        }
+
+        if let Some(fallback_name) = namespaced_function_global_fallback(name) {
+            if let Some(function) = compiled.lookup_function(fallback_name) {
+                return Some(FunctionCallCacheTarget::CurrentUnit {
+                    unit_identity: compiled.cache_identity(),
+                    function,
+                });
+            }
+            if let Some((unit_index, function)) =
+                dynamic_function_target_in_state(state, fallback_name)
+            {
+                return Some(FunctionCallCacheTarget::DynamicUnit {
+                    unit_index,
+                    unit_identity: dynamic_unit_identity(state, unit_index),
+                    function,
+                });
+            }
+            if let Some(target) = builtin_function_call_target(fallback_name) {
+                return Some(target);
+            }
+        }
+
+        if let Some(target) = builtin_function_call_target(name) {
+            return Some(target);
+        }
+        None
+    }
+
+    pub(super) fn execute_function_call_target(
+        &self,
+        compiled: &CompiledUnit,
+        target: FunctionCallCacheTarget,
+        args: Vec<CallArgument>,
+        call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
+        call_span: Option<php_ir::IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        running_fiber: &Option<FiberRef>,
+    ) -> VmResult {
+        match target {
+            FunctionCallCacheTarget::CurrentUnit {
+                unit_identity,
+                function,
+            } => {
+                if unit_identity != compiled.cache_identity() {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        "E_PHP_VM_INLINE_CACHE_STALE_CURRENT_UNIT: cached unit identity changed",
+                    );
+                }
+                self.execute_function(
+                    compiled,
+                    function,
+                    FunctionCall::new(args, Vec::new())
+                        .with_call_site_strict_types(call_site_strictness(compiled, call_span))
+                        .inherit_fiber_context(running_fiber)
+                        .with_optional_call_span(call_span),
+                    output,
+                    stack,
+                    state,
+                )
+            }
+            FunctionCallCacheTarget::DynamicUnit {
+                unit_index,
+                unit_identity,
+                function,
+            } => {
+                let Some(owner) =
+                    resolve_dynamic_unit_by_identity(state, unit_index, unit_identity)
+                else {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        format!(
+                            "E_PHP_VM_INLINE_CACHE_STALE_DYNAMIC_UNIT: dynamic unit {unit_index} is unavailable"
+                        ),
+                    );
+                };
+                self.execute_function(
+                    &owner,
+                    function,
+                    FunctionCall::new(args, Vec::new())
+                        .with_call_site_strict_types(call_site_strictness(compiled, call_span))
+                        .inherit_fiber_context(running_fiber)
+                        .with_optional_call_span(call_span),
+                    output,
+                    stack,
+                    state,
+                )
+            }
+            FunctionCallCacheTarget::Builtin { kind, name } => {
+                self.profile_builtin_call(&name, || match kind {
+                    FunctionCallBuiltinKind::AutoloadOrSymbolIntrospection => self
+                        .call_autoload_builtin(
+                            compiled, &name, args, call_site, call_span, output, stack, state,
+                        ),
+                    FunctionCallBuiltinKind::Config => self.call_config_builtin(
+                        compiled, &name, args, call_span, output, stack, state,
+                    ),
+                    FunctionCallBuiltinKind::ErrorHandling => self
+                        .call_error_handling_builtin(compiled, &name, args, output, stack, state),
+                    FunctionCallBuiltinKind::OutputBuffering => {
+                        self.call_output_buffering_builtin(compiled, &name, args, output, stack)
+                    }
+                    FunctionCallBuiltinKind::Environment => {
+                        self.call_environment_builtin(compiled, &name, args, output, stack, state)
+                    }
+                    FunctionCallBuiltinKind::Process => {
+                        self.call_process_builtin(compiled, &name, args, output, stack)
+                    }
+                    FunctionCallBuiltinKind::PcreCallback => self.call_pcre_callback_builtin(
+                        compiled, &name, args, call_span, output, stack, state,
+                    ),
+                    FunctionCallBuiltinKind::FilterCallback => self.call_filter_callback_builtin(
+                        compiled, &name, args, call_span, output, stack, state,
+                    ),
+                    FunctionCallBuiltinKind::ArrayCallback => self.call_array_callback_builtin(
+                        compiled, &name, args, call_span, output, stack, state,
+                    ),
+                    FunctionCallBuiltinKind::ArraySort => {
+                        self.call_array_sort_builtin(compiled, &name, args, output, stack, state)
+                    }
+                    FunctionCallBuiltinKind::InternalRegistry => {
+                        if let Some(result) = self
+                            .try_execute_preg_match_start_offset_ascii_call_fast(
+                                &name, &args, compiled, stack, state,
+                            )
+                        {
+                            return result;
+                        }
+                        let values = match call_builtin_args_to_positional(
+                            self, compiled, &name, args, call_span, output, stack, state,
+                        ) {
+                            Ok(values) => values,
+                            Err(InternalBuiltinArgError::Message(message)) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
+                            Err(InternalBuiltinArgError::Fatal(result)) => return *result,
+                        };
+                        if let Some(result) = self.try_execute_serialization_builtin(
+                            compiled, &name, &values, call_span, output, stack, state,
+                        ) {
+                            return result;
+                        }
+                        if let Some(result) =
+                            try_execute_simple_literal_pcre_builtin(&name, &values, state)
+                        {
+                            return result;
+                        }
+                        self.execute_internal_registry_builtin(
+                            &name, values, call_span, output, stack, state, compiled,
+                        )
+                    }
+                })
+            }
+        }
+    }
+
+    pub(super) fn execute_function_with_dense_plan(
+        &self,
+        compiled: &CompiledUnit,
+        owner: &CompiledUnit,
+        plan: Option<&DenseExecutionPlan>,
+        function: FunctionId,
+        call: FunctionCall<'_>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> VmResult {
+        // Copy-and-patch native leaf tier for method-path calls: dense method
+        // dispatch executes bodies directly (bypassing `execute_function`), so
+        // without this hook a recognized `$this` accessor leaf would never
+        // engage on the default engine. Same placement contract as the hook in
+        // `execute_function`: before dense dispatch, fall through on `None`.
+        // The leaf is compiled against `owner` — the unit whose IR owns the
+        // function — exactly like the dense body below.
+        #[cfg(feature = "jit-copy-patch")]
+        if let Some(ir_function) = owner.unit().functions.get(function.index())
+            && let Some(result) = self.try_execute_copy_patch_leaf(
+                owner,
+                function,
+                ir_function,
+                &call,
+                output,
+                stack,
+                state,
+            )
+        {
+            return result;
+        }
+        if let Some(plan) = plan {
+            self.record_counter_dense_method_dispatch_attempt();
+            // Bodies defined in another unit (an include) execute through
+            // that unit's memoized plan; every warmed include already has
+            // one in the thread cache, so cross-unit methods stop dropping
+            // whole bodies to the rich interpreter.
+            let owner_plan_arc;
+            let (unit, active_plan) = if owner.ptr_eq(compiled) {
+                (compiled, plan)
+            } else {
+                match self.get_or_build_dense_execution_plan(owner) {
+                    Ok(owner_plan) => {
+                        owner_plan_arc = owner_plan;
+                        (owner, owner_plan_arc.as_ref())
+                    }
+                    Err(_) => {
+                        self.record_counter_dense_method_dispatch_fallback(
+                            "owner_plan_unavailable",
+                        );
+                        return self.execute_function(owner, function, call, output, stack, state);
+                    }
+                }
+            };
+            let fallback_reason = if call.resume_continuation.is_some()
+                || call.resume_fiber_continuation.is_some()
+                || call.running_generator.is_some()
+                || call.running_fiber.is_some()
+            {
+                Some("generator_or_fiber_context")
+            } else {
+                match active_plan.function_plan(function.index()) {
+                    Some(DenseFunctionPlan::Dense) => {
+                        if let (Some(dense_function), Some(ir_function)) = (
+                            active_plan.unit.functions.get(function.index()),
+                            unit.unit().functions.get(function.index()),
+                        ) {
+                            self.record_counter_dense_method_dispatch_hit();
+                            // Record the request-profile boundary here too:
+                            // the dense path bypasses `execute_function`, so
+                            // without this a densely executed function/method
+                            // would silently vanish from the profiler's
+                            // per-name attribution.
+                            let profile_boundary = self.request_profile_boundary_start();
+                            let function_profile = profile_boundary
+                                .is_some()
+                                .then(|| (ir_function.name.clone(), ir_function.flags.is_method));
+                            let result = self.execute_bytecode_function(
+                                unit,
+                                &active_plan.unit,
+                                Some(active_plan),
+                                dense_function,
+                                ir_function,
+                                function,
+                                call,
+                                output,
+                                stack,
+                                state,
+                            );
+                            if let Some((name, is_method)) = function_profile {
+                                self.record_counter_function_profile(
+                                    &name,
+                                    is_method,
+                                    profile_boundary,
+                                );
+                            }
+                            return result;
+                        }
+                        Some("dense_body_missing")
+                    }
+                    Some(DenseFunctionPlan::RichFallback { reason }) => Some(reason.as_str()),
+                    None => Some("plan_missing"),
+                }
+            };
+            if let Some(reason) = fallback_reason {
+                self.record_counter_dense_method_dispatch_fallback(reason);
+            }
+        }
+        self.execute_function(owner, function, call, output, stack, state)
+    }
+
+    /// Builds the direct dispatch route a warmed method-call site reuses on
+    /// every hit: the owner unit, its execution plan (only when the method is
+    /// planned dense), the declaring class entry, and the normalized name
+    /// handle. Returns `None` when the body must run through the re-resolving
+    /// legacy path.
+
+    pub(super) fn call_array_callable(
+        &self,
+        compiled: &CompiledUnit,
+        array: &PhpArray,
+        args: Vec<CallArgument>,
+        call_span: Option<php_ir::IrSpan>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        allow_by_ref_value_warnings: bool,
+    ) -> VmResult {
+        if array.len() != 2 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_INVALID_CALLABLE_ARRAY: callable arrays must contain exactly target and method",
+            );
+        }
+        let (Some(target), Some(method)) =
+            (array.get(&ArrayKey::Int(0)), array.get(&ArrayKey::Int(1)))
+        else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_INVALID_CALLABLE_ARRAY: callable arrays must contain exactly target and method",
+            );
+        };
+        let Some(method) = callable_string_ref(method) else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_INVALID_CALLABLE_ARRAY: callable array method must be string",
+            );
+        };
+        match callable_resolve_reference(target.clone()) {
+            Value::Object(object) => {
+                self.call_object_method_callable(
+                    compiled, object, &method, args, call_span, output, stack, state,
+                )
+            }
+            Value::Callable(callable) if method.eq_ignore_ascii_case("__invoke") => {
+                self.call_callable_inner(
+                    compiled,
+                    Value::Callable(callable),
+                    args,
+                    call_span,
+                    output,
+                    stack,
+                    state,
+                    allow_by_ref_value_warnings,
+                    Some("Closure::__invoke".to_owned()),
+                )
+            }
+            Value::String(class_name) => self.call_static_method_callable(
+                compiled,
+                &class_name.to_string_lossy(),
+                &method,
+                args,
+                call_span,
+                output,
+                stack,
+                state,
+                allow_by_ref_value_warnings,
+                None,
+            ),
+            other => self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_INVALID_CALLABLE_ARRAY: callable array target must be object or class string, got {}",
+                    value_type_name(&other)
+                ),
+            ),
+        }
+    }
+
+    pub(super) fn call_closure_call_method(
+        &self,
+        compiled: &CompiledUnit,
+        callable: CallableValue,
+        mut args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        span: php_ir::IrSpan,
+    ) -> VmResult {
+        if args.is_empty() {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_TOO_FEW_ARGS: Closure::call expects at least 1 argument, 0 given",
+            );
+        }
+        let new_this = callable_resolve_reference(args.remove(0).value);
+        let Value::Object(new_this) = new_this else {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_PARAM_TYPE_MISMATCH: Closure::call(): Argument #1 ($newThis) must be of type object, {} given",
+                    value_type_name(&new_this)
+                ),
+            );
+        };
+        match callable {
+            CallableValue::BoundMethod {
+                target: CallableMethodTarget::Object(object),
+                method,
+                scope,
+            } => {
+                let compatible = class_is_a_in_state(
+                    compiled,
+                    state,
+                    &new_this.class_name(),
+                    &object.class_name(),
+                )
+                .unwrap_or(false);
+                if !compatible {
+                    if let Err(result) = self.emit_closure_call_bind_warning(
+                        compiled,
+                        output,
+                        stack,
+                        state,
+                        &object.class_name(),
+                        &method,
+                        &new_this.class_name(),
+                        span,
+                    ) {
+                        return result;
+                    }
+                    return VmResult::success_no_output(Some(Value::Null));
+                }
+                self.call_bound_object_method_callable(
+                    compiled,
+                    new_this,
+                    &method,
+                    scope,
+                    args,
+                    Some(span),
+                    output,
+                    stack,
+                    state,
+                )
+            }
+            callable @ CallableValue::Closure(_) => {
+                if is_std_class_object(&new_this) {
+                    if let Err(result) = self.emit_closure_internal_scope_bind_warning(
+                        compiled,
+                        output,
+                        stack,
+                        state,
+                        &new_this.class_name(),
+                        span,
+                    ) {
+                        return result;
+                    }
+                    return VmResult::success_no_output(Some(Value::Null));
+                }
+                self.call_callable_inner(
+                    compiled,
+                    bind_closure_callable_value(callable, Some(new_this)),
+                    args,
+                    Some(span),
+                    output,
+                    stack,
+                    state,
+                    false,
+                    Some("Closure::call".to_owned()),
+                )
+            }
+            other => self.call_callable_inner(
+                compiled,
+                Value::Callable(Box::new(other)),
+                args,
+                Some(span),
+                output,
+                stack,
+                state,
+                false,
+                Some("Closure::call".to_owned()),
+            ),
+        }
+    }
+
+    pub(super) fn call_closure_bind_to_method(
+        &self,
+        compiled: &CompiledUnit,
+        callable: CallableValue,
+        args: Vec<CallArgument>,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        span: php_ir::IrSpan,
+    ) -> VmResult {
+        let mut values = match call_args_to_positional("Closure::bindTo", args) {
+            Ok(values) => values,
+            Err(message) => return self.runtime_error(output, compiled, stack, message),
+        };
+        if values.is_empty() {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                "E_PHP_VM_TOO_FEW_ARGS: Closure::bindTo expects at least 1 argument, 0 given",
+            );
+        }
+        if values.len() > 2 {
+            return self.runtime_error(
+                output,
+                compiled,
+                stack,
+                format!(
+                    "E_PHP_VM_TOO_MANY_ARGS: Closure::bindTo expects at most 2 arguments, {} given",
+                    values.len()
+                ),
+            );
+        }
+        if let Some(scope) = values.get(1) {
+            match callable_resolve_reference(scope.clone()) {
+                Value::Null | Value::String(_) | Value::Object(_) => {}
+                other => {
+                    return self.runtime_error(
+                        output,
+                        compiled,
+                        stack,
+                        format!(
+                            "E_PHP_VM_PARAM_TYPE_MISMATCH: Closure::bindTo(): Argument #2 ($newScope) must be of type object|string|null, {} given",
+                            value_type_name(&other)
+                        ),
+                    );
+                }
+            }
+        }
+        let new_this = callable_resolve_reference(values.remove(0));
+        let bound_this = match new_this {
+            Value::Null => {
+                if callable_closure_should_warn_unbind_this(&callable) {
+                    if let Err(result) =
+                        self.emit_closure_unbind_this_warning(compiled, output, stack, state, span)
+                    {
+                        return result;
+                    }
+                    return VmResult::success_no_output(Some(Value::Null));
+                }
+                None
+            }
+            Value::Object(object) => Some(object),
+            other => {
+                return self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    format!(
+                        "E_PHP_VM_PARAM_TYPE_MISMATCH: Closure::bindTo(): Argument #1 ($newThis) must be of type ?object, {} given",
+                        value_type_name(&other)
+                    ),
+                );
+            }
+        };
+        let value = bind_closure_callable_value(callable, bound_this);
+        VmResult::success_no_output(Some(value))
+    }
+
+    pub(super) fn emit_closure_internal_scope_bind_warning(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        class_name: &str,
+        span: php_ir::IrSpan,
+    ) -> Result<(), VmResult> {
+        let diagnostic = RuntimeDiagnostic::new(
+            "E_PHP_VM_CLOSURE_INTERNAL_SCOPE_BIND_WARNING",
+            RuntimeSeverity::Warning,
+            format!(
+                "Cannot bind closure to scope of internal class {}, this will be an error in PHP 9",
+                callable_class_display_name(compiled, state, class_name)
+            ),
+            runtime_source_span(compiled, span),
+            stack_trace(compiled, stack),
+            Some(php_runtime::PhpReferenceClassification::Warning),
+        );
+        let handled = self.dispatch_error_handler(
+            compiled,
+            output,
+            stack,
+            state,
+            php_runtime::PHP_E_WARNING,
+            &diagnostic,
+        )?;
+        if !handled && error_reporting_allows(state, php_runtime::PHP_E_WARNING) {
+            emit_vm_diagnostic(
+                output,
+                state,
+                &diagnostic,
+                php_runtime::PhpDiagnosticChannel::Warning,
+                php_runtime::PHP_E_WARNING,
+            );
+            state.diagnostics.push(diagnostic);
+        }
+        Ok(())
+    }
+
+    pub(super) fn emit_closure_unbind_this_warning(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        span: php_ir::IrSpan,
+    ) -> Result<(), VmResult> {
+        let diagnostic = RuntimeDiagnostic::new(
+            "E_PHP_VM_CLOSURE_UNBIND_THIS_WARNING",
+            RuntimeSeverity::Warning,
+            "Cannot unbind $this of closure using $this, this will be an error in PHP 9",
+            runtime_source_span(compiled, span),
+            stack_trace(compiled, stack),
+            Some(php_runtime::PhpReferenceClassification::Warning),
+        );
+        let handled = self.dispatch_error_handler(
+            compiled,
+            output,
+            stack,
+            state,
+            php_runtime::PHP_E_WARNING,
+            &diagnostic,
+        )?;
+        if !handled && error_reporting_allows(state, php_runtime::PHP_E_WARNING) {
+            emit_vm_diagnostic(
+                output,
+                state,
+                &diagnostic,
+                php_runtime::PhpDiagnosticChannel::Warning,
+                php_runtime::PHP_E_WARNING,
+            );
+            state.diagnostics.push(diagnostic);
+        }
+        Ok(())
+    }
+
+    pub(super) fn emit_closure_call_bind_warning(
+        &self,
+        compiled: &CompiledUnit,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+        declaring_class: &str,
+        method: &str,
+        target_class: &str,
+        span: php_ir::IrSpan,
+    ) -> Result<(), VmResult> {
+        let diagnostic = RuntimeDiagnostic::new(
+            "E_PHP_VM_CLOSURE_CALL_BIND_WARNING",
+            RuntimeSeverity::Warning,
+            format!(
+                "Cannot bind method {}::{}() to object of class {}, this will be an error in PHP 9",
+                callable_class_display_name(compiled, state, declaring_class),
+                method,
+                callable_class_display_name(compiled, state, target_class)
+            ),
+            runtime_source_span(compiled, span),
+            stack_trace(compiled, stack),
+            Some(php_runtime::PhpReferenceClassification::Warning),
+        );
+        let handled = self.dispatch_error_handler(
+            compiled,
+            output,
+            stack,
+            state,
+            php_runtime::PHP_E_WARNING,
+            &diagnostic,
+        )?;
+        if !handled && error_reporting_allows(state, php_runtime::PHP_E_WARNING) {
+            emit_vm_diagnostic(
+                output,
+                state,
+                &diagnostic,
+                php_runtime::PhpDiagnosticChannel::Warning,
+                php_runtime::PHP_E_WARNING,
+            );
+            state.diagnostics.push(diagnostic);
+        }
+        Ok(())
+    }
 }
