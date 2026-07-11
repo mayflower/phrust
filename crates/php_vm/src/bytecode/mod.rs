@@ -868,7 +868,7 @@ pub enum DenseFunctionPlan {
 }
 
 /// Mixed dense/rich execution plan for one IR unit.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct DenseExecutionPlan {
     /// Dense unit with function indexes aligned to the original IR unit.
     pub unit: DenseBytecodeUnit,
@@ -880,6 +880,12 @@ pub struct DenseExecutionPlan {
     /// constructed outside the VM's plan builder; callers fall back to the
     /// per-(unit, function) memo caches.
     pub call_shape_meta: Vec<DenseCallShapeMeta>,
+    /// Lazily-built last-use move plans, index-aligned with `functions`.
+    /// Each plan is a pure function of the dense bytecode, so it lives and
+    /// dies with this (thread-cached) execution plan instead of being
+    /// re-analyzed per request. Empty when a plan is constructed outside
+    /// the VM's plan builder; callers fall back to the per-request memo.
+    pub last_use_plans: Vec<std::cell::OnceCell<std::rc::Rc<crate::last_use::LastUseMovePlan>>>,
 }
 
 /// Function-invariant facts the dense call path consults on every call.
@@ -1256,6 +1262,7 @@ fn lower_mixed_plan(unit: &IrUnit) -> DenseExecutionPlan {
         unit: dense,
         functions,
         call_shape_meta: Vec::new(),
+        last_use_plans: Vec::new(),
     }
 }
 

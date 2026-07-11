@@ -407,7 +407,7 @@ impl Vm {
         };
         // Runtime lever R3: `None` unless the flag is on, so the hot read path is
         // unchanged by default. Built once per (unit, function) and reused.
-        let move_plan = self.last_use_move_plan(compiled, function_id, dense_function);
+        let move_plan = self.last_use_move_plan(compiled, plan, function_id, dense_function);
         let move_plan = move_plan.as_deref();
         let mut foreach_iterators: HashMap<RegId, ForeachIterator> = HashMap::new();
         let mut block_index = 0_u32;

@@ -1083,6 +1083,9 @@ impl Vm {
         let plan = Arc::new({
             let mut plan = self.build_dense_execution_plan(compiled)?;
             plan.call_shape_meta = dense_call_shape_meta_for_unit(compiled.unit());
+            plan.last_use_plans = (0..plan.functions.len())
+                .map(|_| std::cell::OnceCell::new())
+                .collect();
             plan
         });
         DENSE_EXECUTION_PLAN_THREAD_CACHE.with(|cache| {
@@ -1199,6 +1202,7 @@ impl Vm {
             unit: dense,
             functions,
             call_shape_meta: Vec::new(),
+            last_use_plans: Vec::new(),
         })
     }
 

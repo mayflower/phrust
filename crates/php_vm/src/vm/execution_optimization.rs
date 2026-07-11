@@ -540,29 +540,46 @@ impl Vm {
     /// Returns the memoized last-use move plan for a dense function, building it
     /// on first use. Returns `None` when the R3 flag is off, so callers keep the
     /// unchanged clone path.
+    ///
+    /// The plan is a pure function of the dense bytecode, so it lives on the
+    /// (thread-cached) execution plan and survives across requests; only
+    /// plan-less calls fall back to the per-request memo map.
     pub(super) fn last_use_move_plan(
         &self,
         compiled: &CompiledUnit,
+        execution_plan: Option<&crate::bytecode::DenseExecutionPlan>,
         function_id: FunctionId,
         dense_function: &DenseFunction,
     ) -> Option<Rc<crate::last_use::LastUseMovePlan>> {
         if !self.options.last_use_moves {
             return None;
         }
-        let key = (compiled_unit_cache_key(compiled), function_id.raw());
-        if let Some(plan) = self.last_use_move_plans.borrow().get(&key) {
-            return (!plan.is_empty()
-                && (plan.move_checks_enabled() || plan.has_array_release_reads()))
-            .then(|| Rc::clone(plan));
-        }
-        let plan = Rc::new(crate::last_use::LastUseMovePlan::analyze(dense_function));
-        self.record_counter_last_use_move_ineligible(&plan);
-        if let Some(counters) = self.counters.borrow_mut().as_mut() {
-            counters.record_last_use_plan_built(plan.eligible_reads(), plan.array_release_reads());
-        }
-        self.last_use_move_plans
-            .borrow_mut()
-            .insert(key, Rc::clone(&plan));
+        let build = || {
+            let plan = Rc::new(crate::last_use::LastUseMovePlan::analyze(dense_function));
+            self.record_counter_last_use_move_ineligible(&plan);
+            if let Some(counters) = self.counters.borrow_mut().as_mut() {
+                counters
+                    .record_last_use_plan_built(plan.eligible_reads(), plan.array_release_reads());
+            }
+            plan
+        };
+        let plan = match execution_plan
+            .and_then(|plan| plan.last_use_plans.get(function_id.index()))
+        {
+            Some(cell) => Rc::clone(cell.get_or_init(build)),
+            None => {
+                let key = (compiled_unit_cache_key(compiled), function_id.raw());
+                if let Some(plan) = self.last_use_move_plans.borrow().get(&key) {
+                    Rc::clone(plan)
+                } else {
+                    let plan = build();
+                    self.last_use_move_plans
+                        .borrow_mut()
+                        .insert(key, Rc::clone(&plan));
+                    plan
+                }
+            }
+        };
         (!plan.is_empty() && (plan.move_checks_enabled() || plan.has_array_release_reads()))
             .then_some(plan)
     }
