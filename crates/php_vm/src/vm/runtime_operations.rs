@@ -33,6 +33,22 @@ pub(super) fn object_has_public_to_string_in_state(
         && !resolved.method.flags.is_protected
 }
 
+pub(super) fn packed_array_get(array: &Value, index: &Value) -> Result<Value, String> {
+    let Value::Array(array) = array else {
+        return Err("E_PHP_VM_ARRAY_FETCH_TYPE: value is not an array".to_owned());
+    };
+    let NumericValue::Int(index) = to_number(index)? else {
+        return Err("E_PHP_VM_ARRAY_FETCH_INDEX: array index must be int".to_owned());
+    };
+    if index < 0 {
+        return Ok(Value::Null);
+    }
+    Ok(array
+        .packed_element_fast(index as usize)
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
 fn has_array_operand(value: &Value) -> bool {
     match value {
         Value::Array(_) => true,

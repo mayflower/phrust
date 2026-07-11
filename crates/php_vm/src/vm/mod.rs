@@ -136,7 +136,7 @@ pub use result::VmStepLimitDiagnostic;
 pub use result::{VmControlFlow, VmResult};
 pub(crate) use runtime_class_metadata::dense_new_object_lowering_supported;
 use runtime_class_metadata::*;
-use runtime_operations::object_has_public_to_string_in_state;
+use runtime_operations::{object_has_public_to_string_in_state, packed_array_get};
 use scalar_handlers::{
     checked_int_binary, execute_arithmetic, execute_bitwise, execute_power, execute_rich_binary_op,
     execute_rich_compare_op, execute_rich_unary_op, int_int_specialization_for_binary_op,
@@ -28624,22 +28624,6 @@ fn array_offset_scalar_type_name(value: &Value) -> &'static str {
         Value::Resource(_) => "resource",
         other => value_type_name(other),
     }
-}
-
-fn packed_array_get(array: &Value, index: &Value) -> Result<Value, String> {
-    let Value::Array(array) = array else {
-        return Err("E_PHP_VM_ARRAY_FETCH_TYPE: value is not an array".to_owned());
-    };
-    let NumericValue::Int(index) = to_number(index)? else {
-        return Err("E_PHP_VM_ARRAY_FETCH_INDEX: array index must be int".to_owned());
-    };
-    if index < 0 {
-        return Ok(Value::Null);
-    }
-    Ok(array
-        .packed_element_fast(index as usize)
-        .cloned()
-        .unwrap_or(Value::Null))
 }
 
 #[cfg(test)]
