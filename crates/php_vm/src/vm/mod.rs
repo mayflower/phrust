@@ -562,6 +562,22 @@ pub struct Vm {
     /// Built only when `options.last_use_moves` is on; empty and never consulted
     /// otherwise, keeping the default dense read path byte-identical.
     last_use_move_plans: RefCell<HashMap<(u64, u32), Rc<crate::last_use::LastUseMovePlan>>>,
+    /// Per-unit resolved constant tables (zend literal-table parity): each
+    /// materializable `IrConstant` resolves once into an interned value and
+    /// every later operand read is an indexed refcount bump instead of a
+    /// fresh allocation (strings) or a full rebuild (constant arrays).
+    /// Keyed by the compiled unit's cache identity; unit constant tables
+    /// are immutable per identity, so entries never invalidate.
+    resolved_constants: RefCell<ResolvedConstantTables>,
+}
+
+/// Per-unit lazily-resolved constant values, with a one-entry hot-unit
+/// cache in front of the map because consecutive reads overwhelmingly
+/// come from the same unit.
+#[derive(Clone, Debug, Default)]
+struct ResolvedConstantTables {
+    last: Option<(u64, Rc<[std::cell::OnceCell<Value>]>)>,
+    tables: HashMap<u64, Rc<[std::cell::OnceCell<Value>]>>,
 }
 
 impl Vm {
@@ -597,6 +613,7 @@ impl Vm {
             include_execution_depth: Cell::new(0),
             request_profile_stack: RefCell::new(Vec::new()),
             last_use_move_plans: RefCell::new(HashMap::new()),
+            resolved_constants: RefCell::new(ResolvedConstantTables::default()),
         }
     }
 
@@ -610,6 +627,7 @@ impl Vm {
         let mut output = OutputBuffer::with_capacity(output_preallocation_hint(unit.unit()));
         self.trace.borrow_mut().clear();
         *self.literal_pool.borrow_mut() = LiteralPool::default();
+        *self.resolved_constants.borrow_mut() = ResolvedConstantTables::default();
         self.trivial_method_plans.borrow_mut().clear();
         self.last_use_move_plans.borrow_mut().clear();
         *self.runtime_class_entry_cache.borrow_mut() = RuntimeClassEntryCache::default();
@@ -2631,7 +2649,7 @@ impl Vm {
                 }
             }
             DenseOperandKind::Constant => {
-                let value = self.constant_value(compiled.unit(), ConstId::new(operand.index))?;
+                let value = self.cached_constant_value(compiled, ConstId::new(operand.index))?;
                 self.dense_branch_truthy_from_value(unit_id, function_id, instruction_index, &value)
             }
         }
@@ -2727,6 +2745,64 @@ impl Vm {
         if let Some(name) = &attribute.fallback_name {
             self.intern_str(name);
         }
+    }
+
+    /// Resolves a materializable unit constant through the per-unit
+    /// resolved-constant table: the first read interns/builds the value,
+    /// every later read is an indexed refcount bump. Returns `None` for
+    /// out-of-range ids and for constants that need per-read runtime
+    /// resolution (named/class constants), so callers keep their exact
+    /// existing error/fallback behavior for those.
+    ///
+    /// Sharing one value across reads is sound for the same reason the
+    /// literal pool is: strings and arrays copy-on-write, so a mutation
+    /// through any handle separates from the cached storage first.
+    fn resolved_constant_value(&self, compiled: &CompiledUnit, constant: ConstId) -> Option<Value> {
+        let key = compiled.cache_identity();
+        // Hit path: one borrow, an indexed cell read, one value clone —
+        // no IR-table touch and no `Rc` traffic.
+        let mut tables = self.resolved_constants.borrow_mut();
+        if !matches!(&tables.last, Some((last_key, _)) if *last_key == key) {
+            let table = Rc::clone(tables.tables.entry(key).or_insert_with(|| {
+                std::iter::repeat_with(std::cell::OnceCell::new)
+                    .take(compiled.unit().constants.len())
+                    .collect()
+            }));
+            tables.last = Some((key, table));
+        }
+        let (_, table) = tables.last.as_ref()?;
+        let cell = table.get(constant.index())?;
+        if let Some(value) = cell.get() {
+            return Some(value.clone());
+        }
+        let table = Rc::clone(table);
+        drop(tables);
+        // Miss path (first read of this id): named/class constants keep
+        // their per-read runtime resolution and never populate the cell.
+        let ir_constant = compiled.unit().constants.get(constant.index())?;
+        if matches!(
+            ir_constant,
+            IrConstant::NamedConstant(_) | IrConstant::ClassConstant { .. }
+        ) {
+            return None;
+        }
+        let value = self.inline_constant_value(ir_constant);
+        let _ = table.get(constant.index())?.set(value.clone());
+        Some(value)
+    }
+
+    /// Table-backed variant of [`Self::constant_value`] for hot dense
+    /// sites: falls through to the interning path (and its exact error
+    /// and null-mapping behavior) whenever the table declines the id.
+    pub(super) fn cached_constant_value(
+        &self,
+        compiled: &CompiledUnit,
+        constant: ConstId,
+    ) -> Result<Value, String> {
+        if let Some(value) = self.resolved_constant_value(compiled, constant) {
+            return Ok(value);
+        }
+        self.constant_value(compiled.unit(), constant)
     }
 
     fn constant_value(&self, unit: &IrUnit, constant: ConstId) -> Result<Value, String> {

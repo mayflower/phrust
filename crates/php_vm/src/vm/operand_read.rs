@@ -96,7 +96,11 @@ impl Vm {
                 })
             }
             DenseOperandKind::Constant => {
-                constant_value(compiled.unit(), ConstId::new(operand.index))
+                let id = ConstId::new(operand.index);
+                if let Some(value) = self.resolved_constant_value(compiled, id) {
+                    return Ok(value);
+                }
+                constant_value(compiled.unit(), id)
             }
         }
     }
@@ -136,8 +140,11 @@ impl Vm {
                 }
             }
             DenseOperandKind::Constant => {
-                constant_value(compiled.unit(), ConstId::new(operand.index))
-                    .map(DenseOperandRead::Owned)
+                let id = ConstId::new(operand.index);
+                if let Some(value) = self.resolved_constant_value(compiled, id) {
+                    return Ok(DenseOperandRead::Owned(value));
+                }
+                constant_value(compiled.unit(), id).map(DenseOperandRead::Owned)
             }
         }
     }

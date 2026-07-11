@@ -23401,3 +23401,30 @@ fn reuse_class_context_signal_reuses_frames_and_clears_blocker() {
         on.frames_allocated
     );
 }
+
+#[test]
+fn resolved_constant_reads_stay_cow_isolated() {
+    // Repeated reads of one string/array constant share the cached
+    // resolved value; a mutation through any handle must separate from
+    // the cached storage instead of corrupting later reads.
+    let result = execute_source(
+        "<?php
+for ($i = 0; $i < 3; $i++) {
+    $a = ['x' => 1, 'y' => 'base'];
+    $a['x'] = $a['x'] + $i;
+    $a['y'] .= '-mutated';
+    echo $a['x'], ':', $a['y'], \"\\n\";
+}
+for ($i = 0; $i < 2; $i++) {
+    $s = 'abc';
+    $s[0] = 'X';
+    echo $s, \"\\n\";
+}",
+    );
+
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(
+        result.output.to_string_lossy(),
+        "1:base-mutated\n2:base-mutated\n3:base-mutated\nXbc\nXbc\n"
+    );
+}

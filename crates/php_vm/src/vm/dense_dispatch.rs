@@ -1703,7 +1703,7 @@ impl Vm {
                             }
                         };
                         let value = match self
-                            .constant_value(compiled.unit(), ConstId::new(constant))
+                            .cached_constant_value(compiled, ConstId::new(constant))
                         {
                             Ok(value) => value,
                             Err(message) => {
@@ -1724,7 +1724,7 @@ impl Vm {
                         }
                         if let Some((second_dst, second_constant)) = fused_const {
                             let value = match self
-                                .constant_value(compiled.unit(), ConstId::new(second_constant))
+                                .cached_constant_value(compiled, ConstId::new(second_constant))
                             {
                                 Ok(value) => value,
                                 Err(message) => {
@@ -1762,7 +1762,7 @@ impl Vm {
                             return result;
                         };
                         let value = match self
-                            .constant_value(compiled.unit(), ConstId::new(constant))
+                            .cached_constant_value(compiled, ConstId::new(constant))
                         {
                             Ok(value) => value,
                             Err(message) => {
@@ -2092,7 +2092,7 @@ impl Vm {
                         }
                         if let Some((second_dst, constant)) = fused_const {
                             let value = match self
-                                .constant_value(compiled.unit(), ConstId::new(constant))
+                                .cached_constant_value(compiled, ConstId::new(constant))
                             {
                                 Ok(value) => value,
                                 Err(message) => {
@@ -4205,7 +4205,7 @@ impl Vm {
                                 key,
                             } => {
                                 let constant = match self
-                                    .constant_value(compiled.unit(), ConstId::new(value_constant))
+                                    .cached_constant_value(compiled, ConstId::new(value_constant))
                                 {
                                     Ok(value) => value,
                                     Err(message) => {
@@ -4349,7 +4349,7 @@ impl Vm {
                                 quiet,
                             } => {
                                 let value = match self
-                                    .constant_value(compiled.unit(), ConstId::new(key_constant))
+                                    .cached_constant_value(compiled, ConstId::new(key_constant))
                                 {
                                     Ok(value) => value,
                                     Err(message) => {
