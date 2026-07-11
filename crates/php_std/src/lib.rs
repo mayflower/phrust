@@ -45,6 +45,10 @@ impl ExtensionDescriptor {
         }
     }
 
+    // One parameter per descriptor field: the generated extension surfaces
+    // call this positionally, and collapsing fields into groups would only
+    // obscure the generator's output.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_generated(
         name: &'static str,
         version: &'static str,
