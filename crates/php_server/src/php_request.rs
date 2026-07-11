@@ -347,6 +347,42 @@ pub(crate) async fn execute_php_request(
         );
         return finish_php_request(&state, trace, response, script_cache_hit, Some("cpu_queue"));
     };
+    run_php_request_on_worker(
+        state,
+        parts,
+        body,
+        script_path,
+        path_info,
+        peer,
+        request_id,
+        trace,
+        lookup,
+        script_cache_hit,
+        cpu_permit,
+    )
+}
+
+/// Synchronous request core: builds the PHP runtime context, parses
+/// multipart bodies, seeds the session, executes the compiled script, and
+/// renders the HTTP response. Everything execution-side (`RuntimeContext`,
+/// `PhpExecutionOutput`) is created and consumed here, so this function can
+/// run unchanged on a dedicated worker thread — its inputs and its return
+/// value are the `Send` payload set pinned by `worker_payload_tests`.
+#[allow(clippy::too_many_arguments)]
+fn run_php_request_on_worker(
+    state: Arc<AppState>,
+    parts: Parts,
+    body: Arc<[u8]>,
+    script_path: PathBuf,
+    path_info: Option<String>,
+    peer: SocketAddr,
+    request_id: String,
+    mut trace: Option<PerfTraceEvent>,
+    lookup: CompiledScriptCacheLookup,
+    script_cache_hit: Option<bool>,
+    cpu_permit: OwnedSemaphorePermit,
+) -> (Response<ResponseBody>, Option<bool>) {
+    let collect_request_trace = state.perf_trace.is_some() || state.request_profile.is_some();
     let script_name = script_name_for(&state.route_config.docroot, &script_path);
     let request_context_started = Instant::now();
     let mut request_context = http_runtime_context(
