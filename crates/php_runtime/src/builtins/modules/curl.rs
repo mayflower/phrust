@@ -4,6 +4,7 @@ use super::core::{
     argument_type_error, argument_value_error, expect_arity, float_arg, int_arg, string_arg,
     string_array_key,
 };
+use crate::builtins::context::CurlBuiltinServices;
 use crate::builtins::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError, BuiltinResult,
     CurlEasyCollector, CurlMultiDone, CurlMultiRuntimeState, CurlMultiTransferState,
@@ -136,6 +137,37 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
 ];
+
+macro_rules! curl_builtin_adapter {
+    ($entry:ident => $implementation:ident) => {
+        pub(in crate::builtins::modules) fn $entry(
+            context: &mut BuiltinContext<'_>,
+            args: Vec<Value>,
+            span: RuntimeSourceSpan,
+        ) -> BuiltinResult {
+            let mut services = context.curl_services();
+            $implementation(&mut services, args, span)
+        }
+    };
+}
+
+curl_builtin_adapter!(builtin_curl_multi_init => curl_multi_init);
+curl_builtin_adapter!(builtin_curl_multi_add_handle => curl_multi_add_handle);
+curl_builtin_adapter!(builtin_curl_multi_exec => curl_multi_exec);
+curl_builtin_adapter!(builtin_curl_multi_select => curl_multi_select);
+curl_builtin_adapter!(builtin_curl_multi_info_read => curl_multi_info_read);
+curl_builtin_adapter!(builtin_curl_multi_remove_handle => curl_multi_remove_handle);
+curl_builtin_adapter!(builtin_curl_multi_close => curl_multi_close);
+curl_builtin_adapter!(builtin_curl_share_init => curl_share_init);
+curl_builtin_adapter!(builtin_curl_share_setopt => curl_share_setopt);
+curl_builtin_adapter!(builtin_curl_share_close => curl_share_close);
+curl_builtin_adapter!(builtin_curl_init => curl_init);
+curl_builtin_adapter!(builtin_curl_setopt => curl_setopt);
+curl_builtin_adapter!(builtin_curl_setopt_array => curl_setopt_array);
+curl_builtin_adapter!(builtin_curl_exec => curl_exec);
+curl_builtin_adapter!(builtin_curl_close => curl_close);
+curl_builtin_adapter!(builtin_curl_reset => curl_reset);
+curl_builtin_adapter!(builtin_curl_copy_handle => curl_copy_handle);
 
 pub const PHRUST_NET_TESTS_ENV: &str = "PHRUST_NET_TESTS";
 static NET_TESTS_OVERRIDE: Mutex<Option<bool>> = Mutex::new(None);
@@ -470,8 +502,8 @@ pub(in crate::builtins::modules) fn builtin_curl_strerror(
     Ok(Value::string(message))
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_multi_init(
-    context: &mut BuiltinContext<'_>,
+fn curl_multi_init(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -483,8 +515,8 @@ pub(in crate::builtins::modules) fn builtin_curl_multi_init(
     Ok(Value::Object(object))
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_multi_add_handle(
-    context: &mut BuiltinContext<'_>,
+fn curl_multi_add_handle(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -506,8 +538,8 @@ pub(in crate::builtins::modules) fn builtin_curl_multi_add_handle(
     Ok(Value::Int(CURLM_OK))
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_multi_exec(
-    context: &mut BuiltinContext<'_>,
+fn curl_multi_exec(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -619,8 +651,8 @@ pub(in crate::builtins::modules) fn builtin_curl_multi_exec(
     Ok(Value::Int(CURLM_OK))
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_multi_select(
-    context: &mut BuiltinContext<'_>,
+fn curl_multi_select(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -650,8 +682,8 @@ pub(in crate::builtins::modules) fn builtin_curl_multi_select(
     Ok(Value::Int(ready))
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_multi_info_read(
-    context: &mut BuiltinContext<'_>,
+fn curl_multi_info_read(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -688,8 +720,8 @@ pub(in crate::builtins::modules) fn builtin_curl_multi_info_read(
     Ok(curl_multi_done_value(&entry))
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_multi_remove_handle(
-    context: &mut BuiltinContext<'_>,
+fn curl_multi_remove_handle(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -705,8 +737,8 @@ pub(in crate::builtins::modules) fn builtin_curl_multi_remove_handle(
     Ok(Value::Int(CURLM_OK))
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_multi_close(
-    context: &mut BuiltinContext<'_>,
+fn curl_multi_close(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -717,8 +749,8 @@ pub(in crate::builtins::modules) fn builtin_curl_multi_close(
     Ok(Value::Null)
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_share_init(
-    context: &mut BuiltinContext<'_>,
+fn curl_share_init(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -730,8 +762,8 @@ pub(in crate::builtins::modules) fn builtin_curl_share_init(
     Ok(Value::Object(object))
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_share_setopt(
-    context: &mut BuiltinContext<'_>,
+fn curl_share_setopt(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -791,8 +823,8 @@ pub(in crate::builtins::modules) fn builtin_curl_share_strerror(
     Ok(Value::string(message))
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_share_close(
-    context: &mut BuiltinContext<'_>,
+fn curl_share_close(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -806,8 +838,8 @@ pub(in crate::builtins::modules) fn builtin_curl_share_close(
     Ok(Value::Null)
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_init(
-    context: &mut BuiltinContext<'_>,
+fn curl_init(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -829,8 +861,8 @@ pub(in crate::builtins::modules) fn builtin_curl_init(
     Ok(Value::Object(handle))
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_setopt(
-    context: &mut BuiltinContext<'_>,
+fn curl_setopt(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -926,8 +958,8 @@ pub(in crate::builtins::modules) fn builtin_curl_setopt(
     Ok(Value::Bool(true))
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_setopt_array(
-    context: &mut BuiltinContext<'_>,
+fn curl_setopt_array(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -967,8 +999,8 @@ pub(in crate::builtins::modules) fn builtin_curl_setopt_array(
     Ok(Value::Bool(true))
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_exec(
-    context: &mut BuiltinContext<'_>,
+fn curl_exec(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -1151,7 +1183,7 @@ pub(in crate::builtins::modules) fn builtin_curl_exec(
     }
 }
 
-fn curl_network_requests_enabled(context: &BuiltinContext<'_>) -> bool {
+fn curl_network_requests_enabled(context: &CurlBuiltinServices<'_, '_>) -> bool {
     if let Some(enabled) = *NET_TESTS_OVERRIDE
         .lock()
         .expect("network test override lock")
@@ -1261,8 +1293,8 @@ pub(in crate::builtins::modules) fn builtin_curl_error(
     Ok(curl_string_property(&handle, "__curl_error"))
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_close(
-    context: &mut BuiltinContext<'_>,
+fn curl_close(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -1273,8 +1305,8 @@ pub(in crate::builtins::modules) fn builtin_curl_close(
     Ok(Value::Null)
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_reset(
-    context: &mut BuiltinContext<'_>,
+fn curl_reset(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -1285,8 +1317,8 @@ pub(in crate::builtins::modules) fn builtin_curl_reset(
     Ok(Value::Null)
 }
 
-pub(in crate::builtins::modules) fn builtin_curl_copy_handle(
-    context: &mut BuiltinContext<'_>,
+fn curl_copy_handle(
+    context: &mut CurlBuiltinServices<'_, '_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -2468,7 +2500,7 @@ fn curl_share_handle_arg(name: &str, value: Option<&Value>) -> Result<ObjectRef,
 }
 
 fn set_curl_option(
-    context: &mut BuiltinContext<'_>,
+    context: &mut CurlBuiltinServices<'_, '_>,
     handle: &ObjectRef,
     option: i64,
     value: Value,
@@ -2586,7 +2618,7 @@ impl CurlDiagnostic {
 }
 
 fn record_curl_diagnostic(
-    context: &mut BuiltinContext<'_>,
+    context: &mut CurlBuiltinServices<'_, '_>,
     handle: &ObjectRef,
     diagnostic: CurlDiagnostic,
     span: RuntimeSourceSpan,

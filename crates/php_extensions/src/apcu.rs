@@ -62,10 +62,10 @@ static DESCRIPTOR: ExtensionDescriptor = ExtensionDescriptor {
     functions: ENTRIES,
     classes: &[],
     constants: &[],
-    request_state: Some(ExtensionStateFactory {
-        type_name: "ApcuState",
-        create: create_state,
-    }),
+    request_state: Some(ExtensionStateFactory::of::<ApcuState>(
+        "ApcuState",
+        create_state,
+    )),
     capabilities: &[
         ExtensionCapability::Clock,
         ExtensionCapability::ProcessSharedState,

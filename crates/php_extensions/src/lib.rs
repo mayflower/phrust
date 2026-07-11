@@ -4,8 +4,11 @@ mod apcu;
 mod ctype;
 
 use php_runtime::api::{BuiltinEntry, BuiltinRegistry as RuntimeBuiltinRegistry};
+use php_runtime::api::{
+    ErasedExtensionStateSlot, ExtensionStateLayout, ExtensionStateLayoutBuilder,
+    ExtensionStateSlot, RequestState,
+};
 use php_runtime::api::{ExtensionDescriptor, ExtensionModule};
-use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
@@ -18,6 +21,7 @@ static DEFAULT_MODULES: [&dyn ExtensionModule; 2] = [&APCU, &CTYPE];
 pub enum ExtensionRegistryError {
     DuplicateExtension(&'static str),
     DuplicateFunction(&'static str),
+    DuplicateStateType(&'static str),
     MissingDependency {
         extension: &'static str,
         dependency: &'static str,
@@ -30,6 +34,8 @@ pub enum ExtensionRegistryError {
 pub struct ExtensionRegistry {
     descriptors: Vec<&'static ExtensionDescriptor>,
     entries: Vec<BuiltinEntry>,
+    request_state_layout: ExtensionStateLayout,
+    request_state_slots: BTreeMap<&'static str, ErasedExtensionStateSlot>,
 }
 
 impl ExtensionRegistry {
@@ -62,9 +68,28 @@ impl ExtensionRegistry {
         {
             return Err(ExtensionRegistryError::DuplicateFunction(pair[0].name()));
         }
+
+        let mut layout = ExtensionStateLayoutBuilder::new();
+        let mut request_state_slots = BTreeMap::new();
+        for descriptor in &ordered {
+            let Some(factory) = descriptor.request_state else {
+                continue;
+            };
+            let slot = layout
+                .register_factory(
+                    factory.type_id(),
+                    factory.type_name(),
+                    factory.payload_bytes(),
+                    factory.create_fn(),
+                )
+                .map_err(|_| ExtensionRegistryError::DuplicateStateType(factory.type_name()))?;
+            request_state_slots.insert(descriptor.name, slot);
+        }
         Ok(Self {
             descriptors: ordered,
             entries,
+            request_state_layout: layout.build(),
+            request_state_slots,
         })
     }
 
@@ -87,15 +112,22 @@ impl ExtensionRegistry {
         self.get(name).is_some()
     }
 
-    pub fn create_request_states(&self) -> Vec<(&'static str, Box<dyn Any>)> {
-        self.descriptors
-            .iter()
-            .filter_map(|descriptor| {
-                descriptor
-                    .request_state
-                    .map(|factory| (descriptor.name, (factory.create)()))
-            })
-            .collect()
+    /// Allocates exactly the request-local states selected by this registry.
+    pub fn create_request_state(&self) -> RequestState {
+        self.request_state_layout.create_request_state()
+    }
+
+    /// Immutable layout assembled once with the selected extension set.
+    pub fn request_state_layout(&self) -> &ExtensionStateLayout {
+        &self.request_state_layout
+    }
+
+    /// Resolves a typed slot during engine setup, never during builtin dispatch.
+    pub fn request_state_slot<T: 'static>(&self, extension: &str) -> Option<ExtensionStateSlot<T>> {
+        self.request_state_slots
+            .get(extension)
+            .copied()
+            .and_then(ErasedExtensionStateSlot::typed::<T>)
     }
 }
 
@@ -162,7 +194,7 @@ impl BuiltinRegistry {
 mod tests {
     use super::*;
     use php_runtime::api::{
-        BuiltinCompatibility, BuiltinContext, BuiltinResult, RuntimeSourceSpan, Value,
+        ApcuState, BuiltinCompatibility, BuiltinContext, BuiltinResult, RuntimeSourceSpan, Value,
     };
 
     fn noop(
@@ -204,7 +236,73 @@ mod tests {
     #[test]
     fn disabled_extensions_allocate_no_state() {
         let registry = ExtensionRegistry::assemble(&[]).expect("empty set");
-        assert!(registry.create_request_states().is_empty());
+        assert_eq!(registry.request_state_layout().slot_count(), 0);
+        assert_eq!(registry.request_state_layout().payload_bytes(), 0);
+        assert_eq!(registry.create_request_state().slot_count(), 0);
+        assert!(registry.request_state_slot::<ApcuState>("apcu").is_none());
+    }
+
+    #[test]
+    fn selected_extensions_receive_stable_typed_slots() {
+        let registry = ExtensionRegistry::assemble(&DEFAULT_MODULES).expect("default registry");
+        let slot = registry
+            .request_state_slot::<ApcuState>("apcu")
+            .expect("APCu slot");
+        assert_eq!(slot.index(), 0);
+        assert_eq!(registry.request_state_layout().slot_count(), 1);
+        assert_eq!(
+            registry.request_state_layout().payload_bytes(),
+            std::mem::size_of::<ApcuState>()
+        );
+        assert!(registry.request_state_slot::<ApcuState>("ctype").is_none());
+
+        let mut request = registry.create_request_state();
+        request.get_mut(slot).expect("selected APCu state").store(
+            b"registry-layout".to_vec(),
+            Value::Int(1),
+            0,
+        );
+        assert_eq!(
+            request
+                .get_mut(slot)
+                .expect("same direct slot")
+                .fetch(b"registry-layout"),
+            Some(Value::Int(1))
+        );
+        request
+            .get_mut(slot)
+            .expect("same direct slot")
+            .delete(b"registry-layout");
+    }
+
+    #[test]
+    fn process_shared_extension_state_survives_request_owner_reset() {
+        let registry = ExtensionRegistry::assemble(&[&APCU]).expect("APCu registry");
+        let slot = registry
+            .request_state_slot::<ApcuState>("apcu")
+            .expect("APCu slot");
+        let key = b"registry-process-shared".to_vec();
+        let mut first = registry.create_request_state();
+        first.get_mut(slot).expect("first APCu handle").delete(&key);
+        first.get_mut(slot).expect("first APCu handle").store(
+            key.clone(),
+            Value::string("shared"),
+            0,
+        );
+        drop(first);
+
+        let mut second = registry.create_request_state();
+        assert_eq!(
+            second
+                .get_mut(slot)
+                .expect("second APCu handle")
+                .fetch(&key),
+            Some(Value::string("shared"))
+        );
+        second
+            .get_mut(slot)
+            .expect("second APCu handle")
+            .delete(&key);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use super::super::context::{
     JSON_INVALID_UTF8_SUBSTITUTE, JSON_NUMERIC_CHECK, JSON_PARTIAL_OUTPUT_ON_ERROR,
     JSON_PRESERVE_ZERO_FRACTION, JSON_PRETTY_PRINT, JSON_THROW_ON_ERROR,
     JSON_UNESCAPED_LINE_TERMINATORS, JSON_UNESCAPED_SLASHES, JSON_UNESCAPED_UNICODE,
-    json_error_message,
+    JsonBuiltinServices, PcreCallbackServiceAccess, PcreServiceAccess, json_error_message,
 };
 use super::super::{
     BuiltinCompatibility, BuiltinContext, BuiltinEntry, BuiltinError, BuiltinResult,
@@ -2834,8 +2834,8 @@ fn json_pretty_indent_for_php(encoded: &str) -> String {
     normalized
 }
 
-pub(in crate::builtins::modules) fn compile_preg_pattern(
-    context: &mut BuiltinContext<'_>,
+pub(in crate::builtins::modules) fn compile_preg_pattern<S: PcreServiceAccess>(
+    context: &mut S,
     function_name: &str,
     pattern: PhpString,
     span: RuntimeSourceSpan,
@@ -2857,7 +2857,7 @@ pub(in crate::builtins::modules) fn compile_preg_pattern(
     }
 }
 
-fn pcre_match_limits_from_ini(context: &BuiltinContext<'_>) -> pcre::PcreMatchLimits {
+fn pcre_match_limits_from_ini<S: PcreServiceAccess>(context: &S) -> pcre::PcreMatchLimits {
     pcre::PcreMatchLimits {
         backtrack_limit: pcre_ini_u32(context, "pcre.backtrack_limit"),
         recursion_limit: pcre_ini_u32(context, "pcre.recursion_limit"),
@@ -2867,14 +2867,14 @@ fn pcre_match_limits_from_ini(context: &BuiltinContext<'_>) -> pcre::PcreMatchLi
     }
 }
 
-fn pcre_ini_u32(context: &BuiltinContext<'_>, name: &str) -> Option<u32> {
+fn pcre_ini_u32<S: PcreServiceAccess>(context: &S, name: &str) -> Option<u32> {
     context
         .ini_get(name)
         .and_then(|value| value.trim().parse::<u32>().ok())
 }
 
-pub(in crate::builtins::modules) fn preg_failure(
-    context: &mut BuiltinContext<'_>,
+pub(in crate::builtins::modules) fn preg_failure<S: PcreServiceAccess>(
+    context: &mut S,
     error: pcre::PcreFailure,
 ) -> BuiltinResult {
     context.set_preg_last_error(error.code(), pcre::preg_error_message(error.code()));
@@ -3045,8 +3045,8 @@ pub(in crate::builtins::modules) fn preg_replace_bytes(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::builtins::modules) fn preg_replace_callback_subject(
-    context: &mut BuiltinContext<'_>,
+pub(in crate::builtins::modules) fn preg_replace_callback_subject<S: PcreCallbackServiceAccess>(
+    context: &mut S,
     compiled: &pcre::CompiledPattern,
     callback: BuiltinEntry,
     subject: &Value,
@@ -3105,8 +3105,8 @@ pub(in crate::builtins::modules) fn preg_replace_callback_subject(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::builtins::modules) fn preg_replace_callback_bytes(
-    context: &mut BuiltinContext<'_>,
+pub(in crate::builtins::modules) fn preg_replace_callback_bytes<S: PcreCallbackServiceAccess>(
+    context: &mut S,
     compiled: &pcre::CompiledPattern,
     callback: BuiltinEntry,
     subject: &[u8],
@@ -3129,8 +3129,8 @@ pub(in crate::builtins::modules) fn preg_replace_callback_bytes(
                 return Ok(false);
             }
             output.extend_from_slice(&subject[last_end..full.start()]);
-            let callback_result = (callback.function())(
-                context,
+            let callback_result = context.invoke_builtin(
+                callback,
                 vec![pcre::captures_to_array_with_names(
                     &captures,
                     compiled.capture_names(),
@@ -3259,7 +3259,7 @@ pub(in crate::builtins::modules) fn append_split_piece(
 }
 
 pub(in crate::builtins::modules) fn json_failure(
-    context: &mut BuiltinContext<'_>,
+    context: &mut JsonBuiltinServices<'_>,
     flags: i64,
     code: i64,
 ) -> BuiltinResult {

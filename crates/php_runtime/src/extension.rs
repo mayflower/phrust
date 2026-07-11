@@ -2,6 +2,8 @@
 
 use crate::builtins::BuiltinEntry;
 use std::any::Any;
+use std::any::TypeId;
+use std::mem::size_of;
 
 /// Host service requested by an extension implementation.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -28,8 +30,47 @@ pub struct ExtensionConstant {
 /// Factory for state allocated only when its extension is selected.
 #[derive(Clone, Copy)]
 pub struct ExtensionStateFactory {
-    pub type_name: &'static str,
-    pub create: fn() -> Box<dyn Any>,
+    type_name: &'static str,
+    create: fn() -> Box<dyn Any>,
+    type_id: fn() -> TypeId,
+    payload_bytes: usize,
+}
+
+fn extension_state_type_id<T: Any>() -> TypeId {
+    TypeId::of::<T>()
+}
+
+impl ExtensionStateFactory {
+    /// Declares one concrete request-state type for registration-time layout assembly.
+    #[must_use]
+    pub const fn of<T: Any>(type_name: &'static str, create: fn() -> Box<dyn Any>) -> Self {
+        Self {
+            type_name,
+            create,
+            type_id: extension_state_type_id::<T>,
+            payload_bytes: size_of::<T>(),
+        }
+    }
+
+    #[must_use]
+    pub const fn type_name(self) -> &'static str {
+        self.type_name
+    }
+
+    #[must_use]
+    pub fn type_id(self) -> TypeId {
+        (self.type_id)()
+    }
+
+    #[must_use]
+    pub const fn payload_bytes(self) -> usize {
+        self.payload_bytes
+    }
+
+    #[must_use]
+    pub const fn create_fn(self) -> fn() -> Box<dyn Any> {
+        self.create
+    }
 }
 
 impl std::fmt::Debug for ExtensionStateFactory {

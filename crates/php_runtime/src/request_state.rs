@@ -16,6 +16,32 @@ pub struct ExtensionStateSlot<T: 'static> {
     marker: PhantomData<fn() -> T>,
 }
 
+/// Registration-time slot metadata before an extension binds its concrete type.
+#[derive(Clone, Copy, Debug)]
+pub struct ErasedExtensionStateSlot {
+    layout_id: u64,
+    index: usize,
+    type_id: TypeId,
+}
+
+impl ErasedExtensionStateSlot {
+    /// Zero-based slot index fixed for the lifetime of the registry layout.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.index
+    }
+
+    /// Binds registration metadata to the expected concrete extension state.
+    #[must_use]
+    pub fn typed<T: Any>(self) -> Option<ExtensionStateSlot<T>> {
+        (self.type_id == TypeId::of::<T>()).then_some(ExtensionStateSlot {
+            layout_id: self.layout_id,
+            index: self.index,
+            marker: PhantomData,
+        })
+    }
+}
+
 impl<T: 'static> ExtensionStateSlot<T> {
     /// Zero-based slot index used by the request hot path.
     #[must_use]
@@ -114,6 +140,35 @@ impl ExtensionStateLayoutBuilder {
             layout_id: self.layout_id,
             index,
             marker: PhantomData,
+        })
+    }
+
+    /// Registers an extension descriptor's erased factory during registry assembly.
+    pub fn register_factory(
+        &mut self,
+        type_id: TypeId,
+        type_name: &'static str,
+        payload_bytes: usize,
+        create: fn() -> Box<dyn Any>,
+    ) -> Result<ErasedExtensionStateSlot, ExtensionStateLayoutError> {
+        if self
+            .registrations
+            .iter()
+            .any(|registration| registration.type_id == type_id)
+        {
+            return Err(ExtensionStateLayoutError::DuplicateType(type_name));
+        }
+        let index = self.registrations.len();
+        self.registrations.push(StateRegistration {
+            type_id,
+            type_name,
+            payload_bytes,
+            create: Arc::new(create),
+        });
+        Ok(ErasedExtensionStateSlot {
+            layout_id: self.layout_id,
+            index,
+            type_id,
         })
     }
 
@@ -254,6 +309,27 @@ mod tests {
         let second_request = second_builder.build().create_request_state();
         assert_eq!(first_request.get(second), None);
         assert_eq!(second_request.get(first), None);
+    }
+
+    #[test]
+    fn erased_registration_binds_only_the_declared_concrete_type() {
+        fn create_number() -> Box<dyn Any> {
+            Box::new(11_u64)
+        }
+
+        let mut builder = ExtensionStateLayoutBuilder::new();
+        let erased = builder
+            .register_factory(
+                TypeId::of::<u64>(),
+                type_name::<u64>(),
+                size_of::<u64>(),
+                create_number,
+            )
+            .expect("erased slot");
+        let number = erased.typed::<u64>().expect("matching type");
+        assert!(erased.typed::<String>().is_none());
+        let request = builder.build().create_request_state();
+        assert_eq!(request.get(number), Some(&11));
     }
 
     #[test]

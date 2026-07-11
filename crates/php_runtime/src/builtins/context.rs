@@ -28,7 +28,12 @@ use suppaftp::types::{FileType, FormatControl, Response};
 use suppaftp::{FtpStream, Mode, Status};
 
 mod legacy_extension_state;
+mod service_views;
 pub use legacy_extension_state::*;
+pub(in crate::builtins) use service_views::{
+    CurlBuiltinServices, JsonBuiltinServices, PcreBuiltinServices, PcreCallbackServiceAccess,
+    PcreCallbackServices, PcreServiceAccess,
+};
 
 pub(in crate::builtins) struct BuiltinIoContext<'a> {
     output: &'a mut OutputBuffer,
@@ -45,6 +50,30 @@ impl<'a> BuiltinIoContext<'a> {
             diagnostic_display: PhpDiagnosticDisplayOptions::default(),
             diagnostics: Vec::new(),
         }
+    }
+
+    fn php_warning(
+        &mut self,
+        id: impl Into<String>,
+        message: impl Into<String>,
+        source_span: RuntimeSourceSpan,
+    ) {
+        let diagnostic = RuntimeDiagnostic::new(
+            id,
+            RuntimeSeverity::Warning,
+            message.into(),
+            source_span,
+            Vec::new(),
+            Some(crate::PhpReferenceClassification::Warning),
+        );
+        emit_php_diagnostic(
+            self.output,
+            &diagnostic,
+            PhpDiagnosticChannel::Warning,
+            PHP_E_WARNING,
+            self.diagnostic_display,
+        );
+        self.diagnostics.push(diagnostic);
     }
 }
 
@@ -381,23 +410,7 @@ impl<'a> BuiltinContext<'a> {
         message: impl Into<String>,
         source_span: RuntimeSourceSpan,
     ) {
-        let message = message.into();
-        let diagnostic = RuntimeDiagnostic::new(
-            id,
-            RuntimeSeverity::Warning,
-            message,
-            source_span,
-            Vec::new(),
-            Some(crate::PhpReferenceClassification::Warning),
-        );
-        emit_php_diagnostic(
-            self.io.output,
-            &diagnostic,
-            PhpDiagnosticChannel::Warning,
-            PHP_E_WARNING,
-            self.io.diagnostic_display,
-        );
-        self.io.diagnostics.push(diagnostic);
+        self.io.php_warning(id, message, source_span);
     }
 
     /// Emits a PHP display_errors-style notice into stdout and records a
@@ -814,17 +827,6 @@ impl<'a> BuiltinContext<'a> {
         }
     }
 
-    /// Returns request-local cURL state.
-    pub fn curl_state(&mut self) -> &mut CurlState {
-        self.request_state.get_mut().curl_mut()
-    }
-
-    /// Returns immutable request-local cURL state.
-    #[must_use]
-    pub fn curl_state_ref(&self) -> &CurlState {
-        self.request_state.get().curl()
-    }
-
     /// Uses VM-owned PCNTL state for request-local PCNTL builtins.
     pub fn set_pcntl_state(&mut self, state: &'a mut PcntlState) {
         self.extensions.pcntl_state_slot = Some(state);
@@ -1083,47 +1085,6 @@ impl<'a> BuiltinContext<'a> {
             state.set_data(array);
         }
     }
-
-    /// Request-local PCRE pattern cache.
-    pub fn pcre_cache(&mut self) -> &mut PcreCache {
-        self.request_state.get_mut().pcre_mut().cache_mut()
-    }
-
-    /// Updates request-local PCRE last-error state.
-    pub fn set_preg_last_error(&mut self, code: i64, message: impl Into<String>) {
-        self.request_state
-            .get_mut()
-            .pcre_mut()
-            .last_error_mut()
-            .set(code, message);
-    }
-
-    /// Clears request-local PCRE last-error state.
-    pub fn clear_preg_last_error(&mut self) {
-        self.request_state
-            .get_mut()
-            .pcre_mut()
-            .last_error_mut()
-            .clear();
-    }
-
-    /// Returns request-local PCRE last-error code and message.
-    #[must_use]
-    pub fn preg_last_error(&self) -> (i64, &str) {
-        let state = self.request_state.get().pcre().last_error();
-        (state.code(), state.message())
-    }
-
-    /// Updates request-local JSON last-error state.
-    pub fn set_json_last_error(&mut self, code: i64) {
-        self.request_state.get_mut().json_mut().set(code);
-    }
-
-    /// Returns request-local JSON last-error code and message.
-    #[must_use]
-    pub fn json_last_error(&self) -> (i64, &str) {
-        self.request_state.get().json().value()
-    }
 }
 
 pub(in crate::builtins) const fn json_error_message(code: i64) -> &'static str {
@@ -1147,8 +1108,8 @@ pub(in crate::builtins) const fn json_error_message(code: i64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        BuiltinContext, JSON_ERROR_NONE, JSON_ERROR_SYNTAX, RuntimeSourceSpan, StrtokState,
-        json_error_message,
+        BuiltinContext, JSON_ERROR_NONE, JSON_ERROR_SYNTAX, PcreServiceAccess, RuntimeSourceSpan,
+        StrtokState, json_error_message,
     };
     use crate::{
         ArrayKey, BuiltinRequestState, OutputBuffer, PhpArray, PhpString, ReferenceCell,
@@ -1161,15 +1122,16 @@ mod tests {
         let mut output = OutputBuffer::new();
         let mut context = BuiltinContext::new(&mut output);
 
-        context.set_json_last_error(JSON_ERROR_SYNTAX);
+        let mut services = context.json_services();
+        services.set_json_last_error(JSON_ERROR_SYNTAX);
         assert_eq!(
-            context.json_last_error(),
+            services.json_last_error(),
             (JSON_ERROR_SYNTAX, json_error_message(JSON_ERROR_SYNTAX))
         );
 
-        context.set_json_last_error(JSON_ERROR_NONE);
+        services.set_json_last_error(JSON_ERROR_NONE);
         assert_eq!(
-            context.json_last_error(),
+            services.json_last_error(),
             (JSON_ERROR_NONE, json_error_message(JSON_ERROR_NONE))
         );
     }
@@ -1179,12 +1141,13 @@ mod tests {
         let mut output = OutputBuffer::new();
         let mut context = BuiltinContext::new(&mut output);
 
-        context.set_preg_last_error(2, "backtrack limit exhausted");
-        assert_eq!(context.preg_last_error(), (2, "backtrack limit exhausted"));
+        let mut services = context.pcre_services();
+        services.set_preg_last_error(2, "backtrack limit exhausted");
+        assert_eq!(services.preg_last_error(), (2, "backtrack limit exhausted"));
 
-        context.clear_preg_last_error();
+        services.clear_preg_last_error();
         assert_eq!(
-            context.preg_last_error(),
+            services.preg_last_error(),
             (
                 pcre::PREG_NO_ERROR,
                 pcre::preg_error_message(pcre::PREG_NO_ERROR)
@@ -1200,8 +1163,9 @@ mod tests {
         {
             let mut context =
                 BuiltinContext::new_with_request_state(&mut output, &mut request_state);
-            context.set_preg_last_error(3, "recursive limit exhausted");
-            assert_eq!(context.preg_last_error(), (3, "recursive limit exhausted"));
+            let mut services = context.pcre_services();
+            services.set_preg_last_error(3, "recursive limit exhausted");
+            assert_eq!(services.preg_last_error(), (3, "recursive limit exhausted"));
         }
 
         assert_eq!(request_state.pcre().last_error().code(), 3);

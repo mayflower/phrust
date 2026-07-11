@@ -161,8 +161,8 @@ pub mod api {
         ValueSlot,
     };
     pub use crate::request_state::{
-        ExtensionStateLayout, ExtensionStateLayoutBuilder, ExtensionStateLayoutError,
-        ExtensionStateSlot, RequestState,
+        ErasedExtensionStateSlot, ExtensionStateLayout, ExtensionStateLayoutBuilder,
+        ExtensionStateLayoutError, ExtensionStateSlot, RequestState,
     };
     pub use crate::resource::{
         FilesystemCapabilities, ResourceId, ResourceKind, ResourceRef, ResourceTable, Stream,
@@ -340,8 +340,8 @@ pub use reference::{
     ValueSlot, WeakReferenceHandle,
 };
 pub use request_state::{
-    ExtensionStateLayout, ExtensionStateLayoutBuilder, ExtensionStateLayoutError,
-    ExtensionStateSlot, RequestState,
+    ErasedExtensionStateSlot, ExtensionStateLayout, ExtensionStateLayoutBuilder,
+    ExtensionStateLayoutError, ExtensionStateSlot, RequestState,
 };
 pub use resource::{
     FilesystemCapabilities, ResourceId, ResourceKind, ResourceRef, ResourceTable, Stream,
