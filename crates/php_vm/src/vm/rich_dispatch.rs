@@ -1003,7 +1003,7 @@ impl Vm {
                                     RaiseOutcome::Done(result) => return *result,
                                 }
                             }
-                            release_unrooted_object_handles(&value, stack, state);
+                            release_unrooted_object_handles(&value);
                         }
                     }
                     InstructionKind::LoadLocal { dst, local } => {
@@ -1196,7 +1196,7 @@ impl Vm {
                                 RaiseOutcome::Done(result) => return *result,
                             }
                         }
-                        release_unrooted_object_handles(&previous, stack, state);
+                        release_unrooted_object_handles(&previous);
                     }
                     InstructionKind::BindReference { target, source } => {
                         self.record_counter_alias_state_transition(
@@ -8892,7 +8892,7 @@ impl Vm {
                                 RaiseOutcome::Done(result) => return *result,
                             }
                         }
-                        release_unrooted_object_handles(&previous, stack, state);
+                        release_unrooted_object_handles(&previous);
                     }
                     InstructionKind::UnsetStaticPropertyDim {
                         class_name,
@@ -10290,7 +10290,7 @@ impl Vm {
                                             }
                                         };
                                     for value in &cleanup_values {
-                                        release_unrooted_object_handles(value, stack, state);
+                                        release_unrooted_object_handles(value);
                                     }
                                     match self.route_throwable_result(
                                         compiled,
@@ -10332,7 +10332,7 @@ impl Vm {
                                         }
                                     };
                                 for value in &cleanup_values {
-                                    release_unrooted_object_handles(value, stack, state);
+                                    release_unrooted_object_handles(value);
                                 }
                                 continue;
                             }

@@ -2391,7 +2391,7 @@ impl Vm {
                                 }
                             }
                         }
-                        release_unrooted_object_handles(&previous, stack, state);
+                        release_unrooted_object_handles(&previous);
                     }
                     DenseOpcode::UnsetLocal => {
                         let DenseOperands::Local { local } = instruction.operands else {
@@ -2468,7 +2468,7 @@ impl Vm {
                                 }
                             }
                         }
-                        release_unrooted_object_handles(&previous, stack, state);
+                        release_unrooted_object_handles(&previous);
                     }
                     DenseOpcode::BindGlobal => {
                         let DenseOperands::LocalName { local, name } = instruction.operands else {

@@ -61,7 +61,7 @@ impl Vm {
                 .builtins
                 .set_json_last_error(php_runtime::JSON_ERROR_RECURSION);
         }
-        release_unrooted_direct_object_handle(&original_first, stack, state);
+        release_unrooted_direct_object_handle(&original_first);
         result
     }
 

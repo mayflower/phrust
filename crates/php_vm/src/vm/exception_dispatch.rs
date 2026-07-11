@@ -1083,7 +1083,7 @@ pub(super) fn handle_throw(
                 if let Some(frame) = stack.current_mut() {
                     let _ = frame.locals.set(local, value.clone());
                 }
-                release_unrooted_object_handles(&previous, stack, state);
+                release_unrooted_object_handles(&previous);
             }
             return Some(catch);
         }

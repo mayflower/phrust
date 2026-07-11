@@ -891,11 +891,7 @@ pub(super) struct DestructorSweep {
 /// is unaffected: it runs through the separate
 /// `run_destructors_for_unreferenced_value` path, which is gated on the
 /// destructor queue.
-pub(super) fn release_unrooted_object_handles(
-    value: &Value,
-    stack: &CallStack,
-    state: &ExecutionState,
-) {
+pub(super) fn release_unrooted_object_handles(value: &Value) {
     // Hot-path guard: the deep root traversal below walks every frame local/
     // register/reference plus globals per call, which turned every
     // object-overwriting store into a full-heap scan (measured 5x on the
@@ -926,8 +922,8 @@ pub(super) fn release_unrooted_object_handles(
     // Scan-free fast path: with no shared container anywhere in the graph,
     // the only strong paths into it run through the dropped value, so a
     // candidate held exactly by the graph plus the candidate list cannot be
-    // reachable from any root — the scan below would release precisely this
-    // set. Any external holder either bumps the candidate's own count
+    // reachable from any root — the eager release below covers precisely
+    // this set. Any external holder either bumps the candidate's own count
     // (objects) or marks a traversed container as shared (arrays, reference
     // cells, callable payloads).
     if !saw_shared_container
@@ -938,25 +934,29 @@ pub(super) fn release_unrooted_object_handles(
         for object in candidates {
             object.release_php_handle();
         }
-        return;
     }
-    let rooted_object_ids = php_visible_root_object_ids(stack, state);
-    for object in candidates {
-        if !rooted_object_ids.contains(&object.id()) {
-            object.release_php_handle();
-        }
-    }
+    // Mixed shapes (a shared container in the graph, or mixed handle counts)
+    // defer to the natural drop instead of walking the full root set. Per
+    // this function's contract the eager scan only tightens id-reuse timing:
+    // an acyclic unrooted candidate is freed by the overwrite's own drop
+    // before the next instruction runs, a rooted candidate must not release
+    // either way, and cycle members always carry more than two handles so
+    // the all-shared gate above already left them to the destructor queue.
+    // `object-id-release-on-overwrite.php` and
+    // `object-id-cycle-survives-overwrite.php` pin the observable timing
+    // against the reference oracle.
 }
 
-pub(super) fn release_unrooted_direct_object_handle(
-    value: &Value,
-    stack: &CallStack,
-    state: &ExecutionState,
-) {
-    let Value::Object(object) = effective_value(value) else {
+pub(super) fn release_unrooted_direct_object_handle(value: &Value) {
+    // Same contract as `release_unrooted_object_handles`: eager release only
+    // tightens id-reuse timing, so instead of walking the full root set the
+    // handle is released exactly when this value is provably its only
+    // holder. A reference-wrapped object defers unconditionally — the cell
+    // may be aliased from a root without bumping the object's own count.
+    let Value::Object(object) = value else {
         return;
     };
-    if !php_visible_root_object_ids(stack, state).contains(&object.id()) {
+    if object.gc_refcount_estimate() <= 1 {
         object.release_php_handle();
     }
 }
