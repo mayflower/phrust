@@ -1,5 +1,6 @@
 //! Deterministic standard-library INI/config registry.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 /// One supported INI entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,16 +114,38 @@ impl IniRegistry {
     }
 
     fn lookup(&self, name: &str) -> Option<&IniEntry> {
-        self.entries
-            .iter()
-            .find(|entry| entry.name.eq_ignore_ascii_case(name))
+        self.entries.get(entry_index(name)?)
     }
 
     fn lookup_mut(&mut self, name: &str) -> Option<&mut IniEntry> {
-        Arc::make_mut(&mut self.entries)
-            .iter_mut()
-            .find(|entry| entry.name.eq_ignore_ascii_case(name))
+        let index = entry_index(name)?;
+        Arc::make_mut(&mut self.entries).get_mut(index)
     }
+}
+
+/// Position of a supported option in the (fixed, shared) entry table.
+///
+/// Every registry is built from `default_entries` in the same order and
+/// `set` only mutates values in place, so one process-wide index replaces
+/// the per-lookup case-insensitive linear scan (which ran twice per
+/// builtin dispatch for the diagnostic display options alone).
+fn entry_index(name: &str) -> Option<usize> {
+    static NAME_INDEX: std::sync::OnceLock<HashMap<&'static str, usize>> =
+        std::sync::OnceLock::new();
+    let index = NAME_INDEX.get_or_init(|| {
+        default_entries()
+            .into_iter()
+            .enumerate()
+            .map(|(position, (_, name, _, _))| (name, position))
+            .collect()
+    });
+    if let Some(position) = index.get(name) {
+        return Some(*position);
+    }
+    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return index.get(name.to_ascii_lowercase().as_str()).copied();
+    }
+    None
 }
 
 fn normalize_ini_value(name: &str, value: String) -> String {
