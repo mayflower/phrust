@@ -1051,3 +1051,105 @@ impl Vm {
         result
     }
 }
+
+pub(super) fn new_fiber_object(args: Vec<CallArgument>) -> Result<FiberRef, String> {
+    if let Some(name) = args.iter().find_map(|arg| arg.name.as_deref()) {
+        return Err(format!(
+            "E_PHP_VM_UNKNOWN_NAMED_ARG: Fiber::__construct has no builtin parameter ${name}"
+        ));
+    }
+    if args.len() != 1 {
+        let id = if args.is_empty() {
+            "E_PHP_VM_TOO_FEW_ARGS"
+        } else {
+            "E_PHP_VM_TOO_MANY_ARGS"
+        };
+        return Err(format!(
+            "{id}: Fiber::__construct expects exactly 1 argument(s), {} given",
+            args.len()
+        ));
+    }
+    let callable = args
+        .into_iter()
+        .next()
+        .expect("checked exactly one argument")
+        .value;
+    if !fiber_constructor_accepts_callable(&callable) {
+        return Err(format!(
+            "E_PHP_VM_FIBER_CONSTRUCTOR_NOT_CALLABLE: Fiber::__construct expects callable, {} given",
+            value_type_name(&callable)
+        ));
+    }
+    Ok(FiberRef::new(callable))
+}
+
+pub(super) fn fiber_constructor_accepts_callable(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Callable(_) | Value::String(_) | Value::Array(_) | Value::Object(_)
+    )
+}
+
+pub(super) fn validate_fiber_arg_count(
+    method: &str,
+    args: &[CallArgument],
+    expected: usize,
+) -> Result<(), String> {
+    validate_fiber_arg_count_range(method, args, expected, expected)
+}
+
+pub(super) fn validate_fiber_arg_count_range(
+    method: &str,
+    args: &[CallArgument],
+    min: usize,
+    max: usize,
+) -> Result<(), String> {
+    if let Some(name) = args.iter().find_map(|arg| arg.name.as_deref()) {
+        return Err(format!(
+            "E_PHP_VM_UNKNOWN_NAMED_ARG: Fiber::{method} has no builtin parameter ${name}"
+        ));
+    }
+    if args.len() < min || args.len() > max {
+        let id = if args.len() < min {
+            "E_PHP_VM_TOO_FEW_ARGS"
+        } else {
+            "E_PHP_VM_TOO_MANY_ARGS"
+        };
+        let expected = if min == max {
+            format!("exactly {min}")
+        } else if min == 0 {
+            format!("at most {max}")
+        } else {
+            format!("between {min} and {max}")
+        };
+        return Err(format!(
+            "{id}: Fiber::{method} expects {expected} argument(s), {} given",
+            args.len()
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_generator_arg_count(
+    method: &str,
+    args: &[CallArgument],
+    expected: usize,
+) -> Result<(), String> {
+    if let Some(name) = args.iter().find_map(|arg| arg.name.as_deref()) {
+        return Err(format!(
+            "E_PHP_VM_UNKNOWN_NAMED_ARG: Generator::{method} has no builtin parameter ${name}"
+        ));
+    }
+    if args.len() != expected {
+        let id = if args.len() < expected {
+            "E_PHP_VM_TOO_FEW_ARGS"
+        } else {
+            "E_PHP_VM_TOO_MANY_ARGS"
+        };
+        return Err(format!(
+            "{id}: Generator::{method} expects exactly {expected} argument(s), {} given",
+            args.len()
+        ));
+    }
+    Ok(())
+}
