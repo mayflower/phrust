@@ -457,6 +457,7 @@ fn json_validate(
         }
     }
 }
+#[inline(always)]
 fn json_last_error(
     context: &mut JsonBuiltinServices<'_>,
     args: Vec<Value>,
@@ -465,6 +466,7 @@ fn json_last_error(
     expect_arity("json_last_error", &args, 0)?;
     Ok(Value::Int(context.json_last_error().0))
 }
+#[inline(always)]
 fn json_last_error_msg(
     context: &mut JsonBuiltinServices<'_>,
     args: Vec<Value>,

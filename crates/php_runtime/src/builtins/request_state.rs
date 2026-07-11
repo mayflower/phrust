@@ -191,7 +191,7 @@ mod tests {
     fn full_builtin_layout_reports_three_migrated_payloads() {
         let state = BuiltinRequestState::new();
         assert_eq!(state.slot_count(), 3);
-        assert!(BuiltinRequestState::payload_bytes() >= std::mem::size_of::<CurlState>());
+        assert_eq!(BuiltinRequestState::payload_bytes(), 200);
     }
 
     #[test]

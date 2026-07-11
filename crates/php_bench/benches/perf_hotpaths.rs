@@ -1,10 +1,13 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use php_executor::ExecutorIncludeCompiler;
-use php_ir::ids::{BlockId, FunctionId, InstrId};
+use php_ir::ids::{BlockId, ClassId, FunctionId, InstrId};
 use php_ir::{LoweringOptions, lower_frontend_result};
 use php_lexer::{LexerConfig, lex_all};
 use php_optimizer::OptimizationLevel;
-use php_runtime::api::{ArrayKey, PhpArray, PhpString, Value};
+use php_runtime::api::{
+    ArrayKey, BuiltinContext, BuiltinRegistry, OutputBuffer, PhpArray, PhpString,
+    RuntimeSourceSpan, Value,
+};
 use php_runtime::builtins::string_intrinsics;
 use php_semantics::analyze_source;
 use php_source::byte_kernel;
@@ -323,6 +326,7 @@ fn bench_inline_cache_lookup(c: &mut Criterion) {
         by_ref_arguments: CallReferenceMask::default(),
     };
     let target = FunctionCallCacheTarget::CurrentUnit {
+        unit_identity: 7,
         function: FunctionId::new(7),
     };
     let epoch = InvalidationEpoch::new(3);
@@ -408,15 +412,13 @@ fn bench_inline_cache_lookup(c: &mut Criterion) {
         epoch,
         MethodCallCacheTarget::CurrentUnit {
             target: Rc::new(MethodCallResolvedTarget {
-                receiver_class: "perfbox".to_owned(),
                 declaring_class: "PerfBox".to_owned(),
                 function: FunctionId::new(8),
                 guard: MethodCallGuardMetadata {
-                    receiver_class_id: 1,
+                    receiver_class_id: ClassId::new(1),
                     class_layout_epoch: epoch.raw(),
                     method_table_epoch: epoch.raw(),
                     method_slot_index: Some(0),
-                    visibility_context: None,
                     method_is_final: false,
                     method_is_private: false,
                     method_is_static: false,
@@ -587,6 +589,21 @@ fn mixed_key(index: i64) -> ArrayKey {
 }
 
 fn bench_runtime(c: &mut Criterion) {
+    let json_last_error = BuiltinRegistry::new()
+        .get("json_last_error")
+        .expect("JSON builtin is registered");
+    let mut output = OutputBuffer::new();
+    let mut context = BuiltinContext::new(&mut output);
+    c.bench_function("performance/request_state_json_dispatch", |b| {
+        b.iter(|| {
+            black_box((json_last_error.function())(
+                black_box(&mut context),
+                Vec::new(),
+                RuntimeSourceSpan::default(),
+            ))
+        });
+    });
+
     let packed = PhpArray::from_packed((0..128).map(Value::Int).collect());
     c.bench_function("performance/packed_array_access", |b| {
         b.iter(|| {

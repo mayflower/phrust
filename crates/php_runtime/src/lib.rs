@@ -41,7 +41,7 @@ pub mod pcre;
 #[cfg(feature = "full-runtime")]
 pub mod phar;
 pub mod reference;
-pub mod request_state;
+mod request_state;
 pub mod resource;
 pub mod serialization;
 pub mod session;
@@ -156,14 +156,6 @@ pub mod api {
     };
     #[cfg(feature = "full-runtime")]
     pub use crate::phar::{PharArchive, PharEntry, PharError, PharUri};
-    pub use crate::reference::{
-        Lvalue, LvalueError, LvalueKind, ReferenceCell, ReferencePlaceholder, Slot, TempValue,
-        ValueSlot,
-    };
-    pub use crate::request_state::{
-        ErasedExtensionStateSlot, ExtensionStateLayout, ExtensionStateLayoutBuilder,
-        ExtensionStateLayoutError, ExtensionStateSlot, RequestState,
-    };
     pub use crate::resource::{
         FilesystemCapabilities, ResourceId, ResourceKind, ResourceRef, ResourceTable, Stream,
         StreamFilterMode, StreamFlags, StreamMetadata, StreamOpenError, StreamOpenMode,
@@ -188,6 +180,16 @@ pub mod api {
     pub use crate::tokenizer;
     pub use crate::types::{runtime_type_name, value_matches_runtime_type, value_type_name};
     pub use crate::value::{FloatValue, Value};
+    pub use crate::{
+        reference::{
+            Lvalue, LvalueError, LvalueKind, ReferenceCell, ReferencePlaceholder, Slot, TempValue,
+            ValueSlot,
+        },
+        request_state::{
+            ErasedExtensionStateSlot, ExtensionStateLayout, ExtensionStateLayoutBuilder,
+            ExtensionStateLayoutError, ExtensionStateSlot, RequestState,
+        },
+    };
 }
 
 /// Debug and test runtime surface.
@@ -236,6 +238,16 @@ pub mod experimental {
     pub use crate::numeric_string;
 }
 
+pub use crate::{
+    reference::{
+        Lvalue, LvalueError, LvalueKind, ReferenceCell, ReferencePlaceholder, Slot, TempValue,
+        ValueSlot, WeakReferenceHandle,
+    },
+    request_state::{
+        ErasedExtensionStateSlot, ExtensionStateLayout, ExtensionStateLayoutBuilder,
+        ExtensionStateLayoutError, ExtensionStateSlot, RequestState,
+    },
+};
 pub use array::{
     ArrayEntry, ArrayKey, PackedArrayValues, PhpArray, PhpArrayElementSummary,
     PhpArrayKeyKindSummary, PhpArrayKind, PhpArrayPackedIntReductionError, PhpArrayPackedMetadata,
@@ -335,14 +347,6 @@ pub use pcre::{
 };
 #[cfg(feature = "full-runtime")]
 pub use phar::{PharArchive, PharEntry, PharError, PharUri};
-pub use reference::{
-    Lvalue, LvalueError, LvalueKind, ReferenceCell, ReferencePlaceholder, Slot, TempValue,
-    ValueSlot, WeakReferenceHandle,
-};
-pub use request_state::{
-    ErasedExtensionStateSlot, ExtensionStateLayout, ExtensionStateLayoutBuilder,
-    ExtensionStateLayoutError, ExtensionStateSlot, RequestState,
-};
 pub use resource::{
     FilesystemCapabilities, ResourceId, ResourceKind, ResourceRef, ResourceTable, Stream,
     StreamFilterMode, StreamFlags, StreamMetadata, StreamOpenError, StreamOpenMode,
