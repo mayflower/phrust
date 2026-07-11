@@ -5,7 +5,7 @@
       "reason": "legacy parameter type-check helper returns encoded text; replace with a typed runtime error in Prompt 07"
     },
     {
-      "id": "crates/php_vm/src/vm/mod.rs:diagnostic_code_prefix_parse:ecc50dc89547:1",
+      "id": "crates/php_vm/src/vm/exception_dispatch.rs:diagnostic_code_prefix_parse:ecc50dc89547:1",
       "reason": "function-redeclaration rendering strips a legacy code prefix; move to typed VM diagnostics in Prompt 10"
     },
     {
@@ -226,8 +226,8 @@
       "max_lines": 8770
     },
     "crates/php_vm/src/vm/mod.rs": {
-      "max_bytes": 2029253,
-      "max_lines": 47044
+      "max_bytes": 1982496,
+      "max_lines": 45724
     },
     "crates/php_vm/src/vm/spl.rs": {
       "max_bytes": 257771,

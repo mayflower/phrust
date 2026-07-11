@@ -801,3 +801,354 @@ impl Vm {
         Ok(())
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct LegacySerializablePayload {
+    class_name: String,
+    payload: PhpString,
+}
+
+pub(super) fn legacy_serializable_wire(class_name: &str, payload: &PhpString) -> PhpString {
+    let class_bytes = class_name.as_bytes();
+    let payload_bytes = payload.as_bytes();
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(format!("C:{}:\"", class_bytes.len()).as_bytes());
+    encoded.extend_from_slice(class_bytes);
+    encoded.extend_from_slice(format!("\":{}:{{", payload_bytes.len()).as_bytes());
+    encoded.extend_from_slice(payload_bytes);
+    encoded.extend_from_slice(b"}");
+    PhpString::from_bytes(encoded)
+}
+
+pub(super) fn parse_legacy_serializable_payload(
+    input: &PhpString,
+) -> Option<LegacySerializablePayload> {
+    let bytes = input.as_bytes();
+    let mut offset = 0usize;
+    expect_serialized_byte(bytes, &mut offset, b'C')?;
+    expect_serialized_byte(bytes, &mut offset, b':')?;
+    let class_len = take_serialized_usize(bytes, &mut offset, b':')?;
+    expect_serialized_byte(bytes, &mut offset, b'"')?;
+    let class = take_serialized_bytes(bytes, &mut offset, class_len)?;
+    expect_serialized_byte(bytes, &mut offset, b'"')?;
+    expect_serialized_byte(bytes, &mut offset, b':')?;
+    let payload_len = take_serialized_usize(bytes, &mut offset, b':')?;
+    expect_serialized_byte(bytes, &mut offset, b'{')?;
+    let payload = take_serialized_bytes(bytes, &mut offset, payload_len)?;
+    expect_serialized_byte(bytes, &mut offset, b'}')?;
+    if offset != bytes.len() {
+        return None;
+    }
+    Some(LegacySerializablePayload {
+        class_name: String::from_utf8_lossy(&class).into_owned(),
+        payload: PhpString::from_bytes(payload),
+    })
+}
+
+pub(super) fn parse_indexed_serialized_object_payload(
+    input: &PhpString,
+) -> Option<(String, PhpArray)> {
+    let bytes = trim_serialized_outer_ascii_whitespace(input.as_bytes());
+    let mut offset = 0usize;
+    expect_serialized_byte(bytes, &mut offset, b'O')?;
+    expect_serialized_byte(bytes, &mut offset, b':')?;
+    let class_len = take_serialized_usize(bytes, &mut offset, b':')?;
+    expect_serialized_byte(bytes, &mut offset, b'"')?;
+    let class = take_serialized_bytes(bytes, &mut offset, class_len)?;
+    expect_serialized_byte(bytes, &mut offset, b'"')?;
+    expect_serialized_byte(bytes, &mut offset, b':')?;
+    let payload_len = take_serialized_usize(bytes, &mut offset, b':')?;
+    expect_serialized_byte(bytes, &mut offset, b'{')?;
+    if bytes.last().copied() != Some(b'}') {
+        return None;
+    }
+    let payload = &bytes[offset..bytes.len().saturating_sub(1)];
+    let mut array_wire = Vec::new();
+    array_wire.extend_from_slice(format!("a:{payload_len}:{{").as_bytes());
+    array_wire.extend_from_slice(payload);
+    array_wire.extend_from_slice(b"}");
+    let Value::Array(array) = unserialize_value(
+        &PhpString::from_bytes(array_wire),
+        UnserializeOptions::default(),
+    )
+    .ok()?
+    else {
+        return None;
+    };
+    Some((String::from_utf8_lossy(&class).into_owned(), array))
+}
+
+pub(super) fn trim_serialized_outer_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &bytes[start..end]
+}
+
+pub(super) fn validate_hash_context_unserialize_payload(payload: &PhpArray) -> Option<String> {
+    if hash_context_payload_is_internal_property_shape(payload) {
+        return None;
+    }
+    if payload.len() != 5 {
+        return Some(hash_context_ill_formed_message());
+    }
+    let algorithm = match payload.get(&ArrayKey::Int(0)).map(effective_value) {
+        Some(Value::String(algorithm)) => algorithm.to_string_lossy(),
+        _ => return Some(hash_context_ill_formed_message()),
+    };
+    let flags = match payload.get(&ArrayKey::Int(1)).map(effective_value) {
+        Some(Value::Int(flags)) => flags,
+        _ => return Some(hash_context_ill_formed_message()),
+    };
+    if flags & HASH_HMAC_FLAG != 0 {
+        return Some("HashContext with HASH_HMAC option cannot be serialized".to_owned());
+    }
+    if !php_runtime::builtins::hash_algorithm_exists(&algorithm) {
+        return Some("Unknown hash algorithm".to_owned());
+    }
+    let internals = match payload.get(&ArrayKey::Int(2)).map(effective_value) {
+        Some(Value::Array(internals)) => internals,
+        _ => return Some(hash_context_ill_formed_code_message(&algorithm, -1)),
+    };
+    let magic = match payload.get(&ArrayKey::Int(3)).map(effective_value) {
+        Some(Value::Int(magic)) => magic,
+        _ => return Some(hash_context_ill_formed_code_message(&algorithm, -1)),
+    };
+    if !hash_context_serialization_magic_is_supported(magic) {
+        return Some(hash_context_ill_formed_code_message(&algorithm, -1));
+    }
+    if !matches!(
+        payload.get(&ArrayKey::Int(4)).map(effective_value),
+        Some(Value::Array(_))
+    ) {
+        return Some(hash_context_ill_formed_code_message(&algorithm, -1));
+    }
+    validate_hash_context_serialized_internals(&algorithm, &internals)
+}
+
+pub(super) fn hash_context_payload_is_internal_property_shape(payload: &PhpArray) -> bool {
+    !payload.is_empty()
+        && payload.get(&ArrayKey::Int(0)).is_none()
+        && payload
+            .iter()
+            .any(|(key, _)| matches!(key, ArrayKey::String(_)))
+}
+
+pub(super) fn validate_hash_context_serialized_internals(
+    algorithm: &str,
+    internals: &PhpArray,
+) -> Option<String> {
+    match normalize_hash_algorithm_name(algorithm).as_str() {
+        "sha1"
+            if !matches!(
+                internals.get(&ArrayKey::Int(6)).map(effective_value),
+                Some(Value::Int(_))
+            ) =>
+        {
+            return Some(hash_context_ill_formed_code_message(algorithm, -1024));
+        }
+        "xxh32" if hash_context_serialized_memsize(internals, 10).is_some_and(|size| size > 16) => {
+            return Some(hash_context_ill_formed_code_message(algorithm, -2000));
+        }
+        "xxh64" if hash_context_serialized_memsize(internals, 18).is_some_and(|size| size > 32) => {
+            return Some(hash_context_ill_formed_code_message(algorithm, -2000));
+        }
+        _ => {}
+    }
+    None
+}
+
+pub(super) fn hash_context_serialized_memsize(internals: &PhpArray, index: i64) -> Option<i64> {
+    match internals.get(&ArrayKey::Int(index)).map(effective_value) {
+        Some(Value::Int(value)) => Some(value),
+        _ => None,
+    }
+}
+
+pub(super) fn hash_context_serialization_magic_is_supported(magic: i64) -> bool {
+    matches!(magic, 2 | 100 | 101)
+}
+
+pub(super) fn hash_context_ill_formed_message() -> String {
+    "Incomplete or ill-formed serialization data".to_owned()
+}
+
+pub(super) fn hash_context_ill_formed_code_message(algorithm: &str, code: i64) -> String {
+    format!("Incomplete or ill-formed serialization data (\"{algorithm}\" code {code})")
+}
+
+pub(super) fn normalize_hash_algorithm_name(algorithm: &str) -> String {
+    algorithm.to_ascii_lowercase()
+}
+
+pub(super) fn validate_spl_array_container_unserialize_payload(
+    compiled: &CompiledUnit,
+    state: &ExecutionState,
+    class_name: &str,
+    payload: &PhpArray,
+) -> Option<String> {
+    let normalized = normalize_class_name(class_name);
+    let required_len = if normalized == "arrayobject" {
+        3..=4
+    } else {
+        3..=3
+    };
+    if !required_len.contains(&payload.len()) {
+        return Some("Incomplete or ill-typed serialization data".to_owned());
+    }
+    if !matches!(
+        payload.get(&ArrayKey::Int(0)).map(effective_value),
+        Some(Value::Int(_))
+    ) {
+        return Some("Incomplete or ill-typed serialization data".to_owned());
+    }
+    if normalized == "arrayobject"
+        && payload.len() == 4
+        && !matches!(
+            payload.get(&ArrayKey::Int(3)).map(effective_value),
+            Some(Value::String(_))
+        )
+    {
+        return Some("Incomplete or ill-typed serialization data".to_owned());
+    }
+    if !matches!(
+        payload.get(&ArrayKey::Int(1)).map(effective_value),
+        Some(Value::Array(_) | Value::Object(_))
+    ) {
+        return Some("Passed variable is not an array or object".to_owned());
+    }
+    if !matches!(
+        payload.get(&ArrayKey::Int(2)).map(effective_value),
+        Some(Value::Array(_))
+    ) {
+        return Some("Incomplete or ill-typed serialization data".to_owned());
+    }
+    if normalized == "arrayobject" && payload.len() == 4 {
+        let Some(Value::String(iterator_class)) =
+            payload.get(&ArrayKey::Int(3)).map(effective_value)
+        else {
+            return Some("Incomplete or ill-typed serialization data".to_owned());
+        };
+        let iterator_class = iterator_class.to_string_lossy();
+        if !class_like_exists_direct(
+            compiled,
+            state,
+            &iterator_class,
+            AutoloadClassLookupKind::Class,
+        ) {
+            return Some(format!(
+                "Cannot deserialize ArrayObject with iterator class '{iterator_class}'; no such class exists"
+            ));
+        }
+        if !class_implements_in_state(
+            compiled,
+            state,
+            &iterator_class,
+            "Iterator",
+            &mut Vec::new(),
+        )
+        .unwrap_or(false)
+        {
+            return Some(format!(
+                "Cannot deserialize ArrayObject with iterator class '{iterator_class}'; this class does not implement the Iterator interface"
+            ));
+        }
+    }
+    None
+}
+
+pub(super) fn validate_spl_doubly_linked_list_unserialize_payload(
+    payload: &PhpArray,
+) -> Option<String> {
+    if payload.len() != 3
+        || !matches!(
+            payload.get(&ArrayKey::Int(0)).map(effective_value),
+            Some(Value::Int(_))
+        )
+        || !matches!(
+            payload.get(&ArrayKey::Int(1)).map(effective_value),
+            Some(Value::Array(_))
+        )
+        || !matches!(
+            payload.get(&ArrayKey::Int(2)).map(effective_value),
+            Some(Value::Array(_))
+        )
+    {
+        return Some("Incomplete or ill-typed serialization data".to_owned());
+    }
+    None
+}
+
+pub(super) fn validate_spl_object_storage_unserialize_payload(
+    payload: &PhpArray,
+) -> Option<String> {
+    if payload.len() != 2 {
+        return Some("Incomplete or ill-typed serialization data".to_owned());
+    }
+    let Some(Value::Array(storage)) = payload.get(&ArrayKey::Int(0)).map(effective_value) else {
+        return Some("Incomplete or ill-typed serialization data".to_owned());
+    };
+    if !matches!(
+        payload.get(&ArrayKey::Int(1)).map(effective_value),
+        Some(Value::Array(_))
+    ) {
+        return Some("Incomplete or ill-typed serialization data".to_owned());
+    }
+    if storage.len() % 2 != 0 {
+        return Some("Odd number of elements".to_owned());
+    }
+    for (index, (_, value)) in storage.iter().enumerate() {
+        if index % 2 == 0 && !matches!(effective_value(value), Value::Object(_)) {
+            return Some("Non-object key".to_owned());
+        }
+    }
+    None
+}
+
+pub(super) fn take_serialized_usize(
+    bytes: &[u8],
+    offset: &mut usize,
+    delimiter: u8,
+) -> Option<usize> {
+    let start = *offset;
+    while *offset < bytes.len() && bytes[*offset] != delimiter {
+        *offset += 1;
+    }
+    if *offset >= bytes.len() {
+        return None;
+    }
+    let value = std::str::from_utf8(&bytes[start..*offset])
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+    *offset += 1;
+    Some(value)
+}
+
+pub(super) fn take_serialized_bytes(
+    bytes: &[u8],
+    offset: &mut usize,
+    length: usize,
+) -> Option<Vec<u8>> {
+    let end = offset.checked_add(length)?;
+    if end > bytes.len() {
+        return None;
+    }
+    let value = bytes[*offset..end].to_vec();
+    *offset = end;
+    Some(value)
+}
+
+pub(super) fn expect_serialized_byte(bytes: &[u8], offset: &mut usize, expected: u8) -> Option<()> {
+    let actual = bytes.get(*offset).copied()?;
+    if actual != expected {
+        return None;
+    }
+    *offset += 1;
+    Some(())
+}

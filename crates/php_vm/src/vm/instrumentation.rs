@@ -1698,3 +1698,107 @@ impl Vm {
         }
     }
 }
+
+pub(super) fn format_instruction_kind(kind: &InstructionKind) -> String {
+    format!("{kind:?}")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub(super) fn format_locals(function: &IrFunction, stack: &CallStack) -> String {
+    let Some(frame) = stack.current() else {
+        return String::new();
+    };
+    frame
+        .locals
+        .iter()
+        .filter_map(|(index, slot)| {
+            let value = slot.read();
+            if value.is_uninitialized() {
+                return None;
+            }
+            let name = function
+                .locals
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| format!("local:{index}"));
+            Some(format!("{name}={}", trace_value(&value)))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub(super) fn format_registers(stack: &CallStack) -> String {
+    let Some(frame) = stack.current() else {
+        return String::new();
+    };
+    frame
+        .registers
+        .iter()
+        .filter_map(|(index, value)| {
+            if value.is_uninitialized() {
+                None
+            } else {
+                Some(format!("r{index}={}", trace_value(value)))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub(super) fn trace_value(value: &Value) -> String {
+    match value {
+        Value::Null => "Null".to_owned(),
+        Value::Bool(value) => format!("Bool({value})"),
+        Value::Int(value) => format!("Int({value})"),
+        Value::Float(value) => format!("Float({value})"),
+        Value::String(value) => format!("String({:?})", value.to_string_lossy()),
+        Value::Uninitialized => "Uninitialized".to_owned(),
+        Value::Array(array) => format!("Array(len={}, shared={})", array.len(), array.is_shared()),
+        Value::Object(object) => format!("Object(class={})", object.class_name()),
+        Value::Resource(resource) => format!(
+            "Resource(id={}, type={})",
+            resource.id().get(),
+            resource.resource_type()
+        ),
+        Value::Fiber(fiber) => format!("Fiber(state={:?})", fiber.state()),
+        Value::Generator(generator) => format!("Generator(state={:?})", generator.state()),
+        Value::Callable(callable) => match callable.as_ref() {
+            CallableValue::UserFunction { name } => {
+                format!("Callable(user_function={name})")
+            }
+            CallableValue::Closure(payload) => {
+                format!(
+                    "Closure(function={}, captures={})",
+                    payload.function,
+                    payload.captures.len()
+                )
+            }
+            CallableValue::InternalBuiltin { name } => {
+                format!("Callable(internal_builtin={name})")
+            }
+            CallableValue::BoundMethod { target, method, .. } => {
+                let target = match target {
+                    CallableMethodTarget::Object(object) => object.class_name(),
+                    CallableMethodTarget::Class(class_name) => class_name.clone(),
+                };
+                format!("Callable(bound_method={target}::{method})")
+            }
+            CallableValue::MethodPlaceholder { target } => {
+                format!("Callable(method_placeholder={target})")
+            }
+            CallableValue::UnresolvedDynamic { target } => {
+                format!("Callable(unresolved_dynamic={target})")
+            }
+        },
+        Value::Reference(cell) => format!("Reference(value={})", trace_value(&cell.get())),
+    }
+}
+
+pub(super) fn format_array_key_for_trace(key: &ArrayKey) -> String {
+    match key {
+        ArrayKey::Int(value) => format!("int({value})"),
+        ArrayKey::String(value) => format!("string({:?})", value.to_string_lossy()),
+    }
+}
