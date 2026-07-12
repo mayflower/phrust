@@ -63,6 +63,32 @@ alone); attributes/property_hooks failures are dominated by the diagnostic-leak
 mode, i.e. missing runtime support surfacing as raw diagnostic text; and 34
 tests (panics + timeouts) are unconditional bugs.
 
+### Normalized first-diff-line shapes (pure output diffs)
+
+The same 1,466 diffs keyed by the normalized first differing line on both
+sides (paths → `%FILE%`, digits → `N`, quoted text → `"%S%"`); shapes with a
+same-shape pair are value divergences, shapes with an empty or path-prefixed
+actual side are missing diagnostics or diagnostic leaks:
+
+| Tests | Expected first diff line | Actual first diff line |
+| ---: | --- | --- |
+| 61 | `int(N)` | `int(N)` |
+| 25 | `string(N) "%S%"` | `string(N) "%S%"` |
+| 14 | `Fatal error: Uncaught Error: Undefined constant "%S%" …` | (empty) |
+| 13 | `array(N) {` | diagnostic leak (path prefix) |
+| 10 | `array(N) {` | `array(N) {` |
+| 10 | `bool(true)` | `bool(false)` |
+| 10 | `N` | `N` |
+| 10 | `Parse error: syntax error, unexpected identifier "%S%" …` | diagnostic leak |
+| 9 | `bool(false)` | `bool(true)` |
+| 9 | `C::__destruct` | `C::__destruct` |
+| 8 | `int(N)` | diagnostic leak |
+| 7 | `Parse error: … unexpected token "%S%", expecting "%S%" …` | (empty) |
+| 7 | `Parse error: Invalid indentation - tabs and spaces …` | wrong output |
+
+The long tail is flat (1,031 distinct shapes) — per-shape fixes below this
+table are not leveraged; the failure-mode classes above are the working axis.
+
 ## How this feeds the closure loop
 
 The catalog rows and module plans (`tests/phpt/manifests/…`) stay the source of
