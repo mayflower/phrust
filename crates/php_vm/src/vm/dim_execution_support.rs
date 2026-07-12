@@ -657,8 +657,8 @@ pub(super) fn php_empty(value: &Value) -> Result<bool, String> {
         Value::Bool(value) => Ok(!*value),
         Value::Int(value) => Ok(*value == 0),
         Value::Float(value) => {
-            let value = value.to_f64();
-            Ok(value == 0.0 || value.is_nan())
+            // NAN is truthy, so empty(NAN) is false: only exact zeros are empty.
+            Ok(value.to_f64() == 0.0)
         }
         Value::String(value) => Ok(value.is_empty() || value.as_bytes() == b"0"),
         Value::Array(array) => Ok(array.is_empty()),
@@ -782,6 +782,14 @@ pub(super) fn array_offset_scalar_type_name(value: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn php_empty_treats_nan_as_truthy() {
+        assert!(!php_empty(&Value::float(f64::NAN)).unwrap());
+        assert!(php_empty(&Value::float(0.0)).unwrap());
+        assert!(php_empty(&Value::float(-0.0)).unwrap());
+        assert!(!php_empty(&Value::float(0.5)).unwrap());
+    }
 
     #[test]
     fn negative_string_offset_remains_typed_until_rendering() {
