@@ -315,7 +315,9 @@ mod tests {
 
     #[test]
     fn unrendered_runtime_error_keeps_structured_stderr() {
-        let input = test_input("<?php missing_runtime_function();");
+        // Undefined function calls render as uncaught Errors now, so an
+        // unresolved callable is the unrendered runtime-error example.
+        let input = test_input("<?php call_user_func('missing_runtime_function');");
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 

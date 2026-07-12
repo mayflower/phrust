@@ -3167,6 +3167,15 @@ impl Vm {
                                     diagnostic.message().to_owned(),
                                     diagnostic,
                                 );
+                                if let Some(throwable) = runtime_error_throwable(&result) {
+                                    let span = dense_instruction_span(dense, instruction);
+                                    tag_throwable_location(&throwable, compiled, span);
+                                    state.pending_trace =
+                                        Some(capture_backtrace_string(compiled, stack));
+                                    state.pending_throw = Some(throwable);
+                                    stack.pop_recycle();
+                                    return VmResult::propagating_exception(output.clone());
+                                }
                                 stack.pop_recycle();
                                 return result;
                             };

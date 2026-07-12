@@ -7430,26 +7430,17 @@ fn bringup_diagnostics_classify_callable_and_builtin_failures() {
         Some("function")
     );
 
+    // Undefined functions are catchable Errors now, so the bring-up payload
+    // is replaced by the uncaught-exception surface when nothing catches.
     let builtin = execute_source("<?php missing_app_function();");
     assert_eq!(builtin.status.exit_status(), ExitStatus::RuntimeError);
-    let builtin_context = first_runtime_bringup_payload(&builtin).fields();
-    assert_eq!(
-        builtin_context
-            .get("bringup_error_class")
-            .map(String::as_str),
-        Some("stdlib_builtin")
-    );
-    assert_eq!(
-        builtin_context.get("requested_name").map(String::as_str),
-        Some("missing_app_function")
-    );
-    assert_eq!(
-        builtin_context.get("normalized_name").map(String::as_str),
-        Some("missing_app_function")
-    );
-    assert_eq!(
-        builtin_context.get("lookup_kind").map(String::as_str),
-        Some("function")
+    assert_eq!(builtin.diagnostics[0].id(), "E_PHP_VM_UNCAUGHT_EXCEPTION");
+    assert!(
+        builtin.diagnostics[0]
+            .message()
+            .contains("Uncaught Error: Call to undefined function missing_app_function()"),
+        "{}",
+        builtin.diagnostics[0].message()
     );
 }
 
@@ -21352,11 +21343,17 @@ fn runtime_errors_emit_structured_diagnostics_and_warning_continuation() {
     );
     assert_eq!(division.diagnostics[0].stack_trace()[0].function(), "main");
 
+    // Undefined functions throw a catchable Error; uncaught it surfaces as
+    // the uncaught-exception diagnostic with the reference wording.
     let undefined = execute_source("<?php missing_function();");
     assert_eq!(undefined.status.exit_status(), ExitStatus::RuntimeError);
-    assert_eq!(
-        undefined.diagnostics[0].id(),
-        "E_PHP_RUNTIME_UNDEFINED_FUNCTION"
+    assert_eq!(undefined.diagnostics[0].id(), "E_PHP_VM_UNCAUGHT_EXCEPTION");
+    assert!(
+        undefined.diagnostics[0]
+            .message()
+            .contains("Uncaught Error: Call to undefined function missing_function()"),
+        "{}",
+        undefined.diagnostics[0].message()
     );
 
     let stack = execute_source("<?php function boom() { echo 1 / 0; } boom();");

@@ -102,13 +102,29 @@ pub(super) fn execute_rich_call_instruction(
                     RuntimeSourceSpan::default(),
                     stack_trace(compiled, stack),
                 );
-                return RichDispatchOutcome::Return(Box::new(
-                    VmResult::runtime_error_with_diagnostic(
-                        output.clone(),
-                        diagnostic.message().to_owned(),
-                        diagnostic,
-                    ),
-                ));
+                let result = VmResult::runtime_error_with_diagnostic(
+                    output.clone(),
+                    diagnostic.message().to_owned(),
+                    diagnostic,
+                );
+                if let Some(throwable) = runtime_error_throwable(&result) {
+                    tag_throwable_location(&throwable, compiled, instruction.span);
+                    state.pending_trace = Some(capture_backtrace_string(compiled, stack));
+                    if let Some(target) = handle_throw(
+                        compiled,
+                        throwable.clone(),
+                        stack,
+                        state,
+                        exception_handlers,
+                        pending_control,
+                    ) {
+                        return RichDispatchOutcome::Jump(target);
+                    }
+                    return RichDispatchOutcome::Return(Box::new(
+                        vm.propagate_exception(output, stack, state, throwable),
+                    ));
+                }
+                return RichDispatchOutcome::Return(Box::new(result));
             };
             let temporary_iterator_arg =
                 iterator_function_temporary_arg_value(&lowered_name, args, &values);

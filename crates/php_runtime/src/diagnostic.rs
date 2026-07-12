@@ -1283,7 +1283,7 @@ pub fn undefined_function(
     RuntimeDiagnostic::new(
         "E_PHP_RUNTIME_UNDEFINED_FUNCTION",
         RuntimeSeverity::FatalError,
-        format!("undefined function {name}"),
+        format!("Call to undefined function {name}()"),
         source_span,
         stack_trace,
         Some(PhpReferenceClassification::Error),
@@ -1351,7 +1351,7 @@ mod tests {
         assert_eq!(diagnostic.severity(), RuntimeSeverity::FatalError);
         assert_eq!(
             diagnostic.to_json(),
-            "{\"id\":\"E_PHP_RUNTIME_UNDEFINED_FUNCTION\",\"severity\":\"fatal_error\",\"message\":\"undefined function missing\",\"span\":{\"file\":\"fixture.php\",\"start\":1,\"end\":8},\"stack\":[{\"function\":\"main\"}],\"php_reference\":\"error\",\"context\":{\"bringup_error_class\":\"stdlib_builtin\",\"lookup_kind\":\"function\",\"normalized_name\":\"missing\",\"payload\":\"runtime_bringup\",\"requested_name\":\"missing\"}}"
+            "{\"id\":\"E_PHP_RUNTIME_UNDEFINED_FUNCTION\",\"severity\":\"fatal_error\",\"message\":\"Call to undefined function missing()\",\"span\":{\"file\":\"fixture.php\",\"start\":1,\"end\":8},\"stack\":[{\"function\":\"main\"}],\"php_reference\":\"error\",\"context\":{\"bringup_error_class\":\"stdlib_builtin\",\"lookup_kind\":\"function\",\"normalized_name\":\"missing\",\"payload\":\"runtime_bringup\",\"requested_name\":\"missing\"}}"
         );
     }
 

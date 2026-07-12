@@ -6391,7 +6391,7 @@ mod tests {
         let code = run(
             [
                 "report".to_string(),
-                fixture("fixtures/runtime/invalid/errors/undefined-function.php"),
+                fixture("fixtures/runtime/invalid/errors/unresolved-callable.php"),
             ],
             &mut stdout,
             &mut stderr,
@@ -6401,7 +6401,7 @@ mod tests {
         assert!(stderr.is_empty());
         let stdout = String::from_utf8(stdout).unwrap();
         assert!(stdout.contains("## Runtime Diagnostics"));
-        assert!(stdout.contains("E_PHP_RUNTIME_UNDEFINED_FUNCTION"));
+        assert!(stdout.contains("E_PHP_VM_UNRESOLVED_CALLABLE"));
     }
 
     #[test]
@@ -6524,7 +6524,7 @@ mod tests {
                 "run".to_string(),
                 "--error-format".to_string(),
                 "text".to_string(),
-                fixture("fixtures/runtime/invalid/errors/undefined-function.php"),
+                fixture("fixtures/runtime/invalid/errors/unresolved-callable.php"),
             ],
             &mut stdout,
             &mut stderr,
@@ -6535,7 +6535,7 @@ mod tests {
         let stderr = String::from_utf8(stderr).unwrap();
         assert!(stderr.contains("runtime-diagnostic:"), "{stderr}");
         assert!(
-            stderr.contains("\"id\":\"E_PHP_RUNTIME_UNDEFINED_FUNCTION\""),
+            stderr.contains("\"id\":\"E_PHP_VM_UNRESOLVED_CALLABLE\""),
             "{stderr}"
         );
         assert!(

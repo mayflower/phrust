@@ -363,6 +363,7 @@ pub(super) fn runtime_diagnostic_throwable(diagnostic: &RuntimeDiagnostic) -> Op
         | "E_PHP_VM_PIPE_RHS_NOT_CALLABLE"
         | "E_PHP_VM_UNKNOWN_METHOD"
         | "E_PHP_VM_UNKNOWN_CLASS"
+        | "E_PHP_RUNTIME_UNDEFINED_FUNCTION"
         | "E_PHP_VM_UNDEFINED_CONSTANT"
         | "E_PHP_VM_UNKNOWN_CLASS_CONSTANT"
         | "E_PHP_VM_PRIVATE_CLASS_CONSTANT_ACCESS"
