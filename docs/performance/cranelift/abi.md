@@ -1,7 +1,5 @@
 # Performance Cranelift Array ABI
 
-Date: 2026-06-23.
-
 Reference target: PHP 8.5.7 (`php-8.5.7`).
 
 Work item.20 defines the read-only packed-array ABI surface used by later

@@ -1,7 +1,5 @@
 # Cranelift Big-Win Benchmark Methodology
 
-Date: 2026-06-23.
-
 Reference target: PHP 8.5.7 (`php-8.5.7`).
 
 This methodology extends `docs/performance/methodology.md` for the

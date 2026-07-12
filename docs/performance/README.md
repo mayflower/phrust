@@ -41,7 +41,6 @@ default-off unless a separate ADR changes that policy.
 
 ## Additional References
 
-- [ARM performance tranche v2](arm-performance-tranche-v2.md)
 - [Performance Autoload Lookup Cache](autoload-lookup-cache.md)
 - [Performance Benchmark Corpus](benchmark-corpus.md)
 - [Dense Bytecode Block Layout](bytecode-layout.md)

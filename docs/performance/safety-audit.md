@@ -1,6 +1,6 @@
 # Performance Safety Audit
 
-## Work item: Cache, Adaptive Runtime, And JIT Audit
+## Cache, Adaptive Runtime, And JIT Audit
 
 Work item reviewed the Performance bytecode cache, optimizer-adjacent
 adaptive runtime state, quickening, inline caches, tiering, and experimental
@@ -179,7 +179,7 @@ boundary and must stay covered by `docs/performance/cranelift/safety-audit.md`,
   handles; do not store raw references into VM frames, arrays, objects, or
   class/function tables.
 
-## Work item: VM Frame Reuse
+## VM Frame Reuse
 
 The VM now keeps a request-local frame pool inside `CallStack` for normal
 function activations. Completed normal calls recycle their frame after the VM
@@ -225,7 +225,7 @@ Coverage:
   non-pooled,
 - generator and fiber suspension smoke tests preserve existing output.
 
-## Work item: JIT ABI Boundary
+## JIT ABI Boundary
 
 `crates/php_jit/src/abi.rs` defines the VM/JIT boundary for future native
 experiments. The boundary is intentionally handle-based and by-value.
@@ -255,7 +255,7 @@ Coverage:
 - `jit-smoke` runs the default and `jit-cranelift` feature test sets while
   still recording native execution as skipped.
 
-## Work item: Cranelift IR Lowering Prototype
+## Cranelift IR Lowering Prototype
 
 `crates/php_jit/src/cranelift_lowering.rs` is compiled only when the
 `jit-cranelift` feature is enabled. It began as a CLIF-only lowering prototype
@@ -287,7 +287,7 @@ Coverage:
 - `jit-smoke` runs both feature-off and `jit-cranelift` feature test sets while
   still recording native execution as skipped.
 
-## Work item: Guarded Int-Leaf JIT Execution
+## Guarded Int-Leaf JIT Execution
 
 The VM now has an experimental JIT execution tier behind both Cargo feature
 `jit-cranelift` and CLI/runtime `--jit=on`. The tier is request-local and

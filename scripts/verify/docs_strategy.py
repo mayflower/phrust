@@ -50,10 +50,7 @@ CLASS_RULES: list[tuple[str, str]] = [
 ]
 
 # Explicit per-file overrides where the path rules misclassify.
-CLASS_OVERRIDES: dict[str, str] = {
-    "docs/architecture/refactor-signoff.md": "worklog",
-    "docs/performance/arm-performance-tranche-v2.md": "worklog",
-}
+CLASS_OVERRIDES: dict[str, str] = {}
 
 WORKLOG_MARKERS = (
     re.compile(r"^Date: 20\d\d-", re.M),
@@ -185,12 +182,12 @@ def self_test() -> None:
     assert classify("docs/research/foo.md") == "research"
     assert classify("docs/runtime/known-gaps.md") == "ledger"
     assert classify("docs/runtime/vm.md") == "reference"
-    assert classify("docs/architecture/refactor-signoff.md") == "worklog"
     assert classify("fixtures/runtime/README.md") == "colocated"
     assert classify("error_classes.md") == "reference"
     targets = link_targets("see [x](vm.md) and docs/adr/0001-a.md", "docs/runtime/contract.md")
     assert "docs/runtime/vm.md" in targets and "docs/adr/0001-a.md" in targets
-    assert RECIPE_PATTERN.search("`just verify-runtime`").group(1) == "verify-runtime"
+    recipe_match = RECIPE_PATTERN.search("`just verify-runtime`")
+    assert recipe_match is not None and recipe_match.group(1) == "verify-runtime"
     assert RECIPE_PATTERN.search("we just pushed the fix") is None
     print("[ok] docs strategy self-test passed")
 

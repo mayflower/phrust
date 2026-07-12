@@ -1,7 +1,5 @@
 # Cranelift Helper Symbol Registry
 
-Date: 2026-06-23.
-
 Work item.06 defines the stable helper-symbol registry used by later
 Cranelift lowering work items. Work item.13 makes the checked integer add/mul
 helpers executable from Cranelift-generated code. Work item.17 supersedes
@@ -47,7 +45,7 @@ The registry lives in `crates/php_jit/src/helpers.rs` and exports:
 - Any registry shape or meaning change updates `JIT_HELPER_REGISTRY_ABI_HASH`,
   tests, and this document in the same work item.
 
-## Work item.13 Checked Integer Helper ABI
+## Checked Integer Helper ABI
 
 The add/mul helpers receive two `i64` operands plus an output pointer encoded in
 the registry as `U64`, then return a `Status` code:
@@ -66,7 +64,7 @@ branches on Cranelift overflow flags and returns status `2` to the VM when the
 interpreter must resume. Helper-call rows and future helper-backed operations
 still use the registry ABI above.
 
-## Work item.20 Packed Array Helper ABI
+## Packed Array Helper ABI
 
 Work item.20 adds the read-only packed-array helper symbols used by later
 packed-array fast paths:
@@ -95,7 +93,7 @@ helper status through the normal native status ABI:
 
 Status `1` remains the generic fallback status for non-executable helper uses.
 
-## Work item.26 Property Load Helper ABI
+## Property Load Helper ABI
 
 Work item.26 adds `php_jit_property_load_monomorphic_fast`, a VM-owned
 helper for the narrow monomorphic property-load fast path. Native code passes

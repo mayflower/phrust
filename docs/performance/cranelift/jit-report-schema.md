@@ -1,7 +1,5 @@
 # Cranelift JIT Counter And Report Schema
 
-Date: 2026-06-23.
-
 Work item.04 defines the machine-readable counter and report surface used by
 later Cranelift addendum work items.
 

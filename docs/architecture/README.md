@@ -34,4 +34,3 @@ history, one-off benchmark captures, and local run evidence belong under
 ## Additional References
 
 - [Architecture Guardrails](guardrails.md)
-- [Architecture Remediation Sign-off](refactor-signoff.md)

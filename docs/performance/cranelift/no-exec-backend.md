@@ -1,7 +1,5 @@
 # Cranelift Constrained Native Backend
 
-Date: 2026-06-23.
-
 Work item.07 added `CraneliftNoExecBackend`, a feature-gated backend adapter
 behind `jit-cranelift`. Work item.12 keeps the type name for compatibility
 but extends the backend with the first executable subset: constant integer
