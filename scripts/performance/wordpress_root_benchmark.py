@@ -15,6 +15,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -119,6 +120,8 @@ def main() -> int:
         print(f"[ok] recorded baseline at {rel(baseline_path)}")
     if report["status"] == "fail":
         return 1
+    if report["status"] == "inconclusive":
+        return 2
     if report["status"] == "skip" and args.strict:
         return 2
     return 0
@@ -140,6 +143,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--server",
         default=os.environ.get("PHRUST_SERVER", "target/release/phrust-server"),
+    )
+    parser.add_argument(
+        "--server-source-commit",
+        default=os.environ.get("PHRUST_SERVER_SOURCE_COMMIT", ""),
+        help="source commit used to build the supplied Phrust server binary",
+    )
+    parser.add_argument(
+        "--server-source-patch-sha256",
+        default=os.environ.get("PHRUST_SERVER_SOURCE_PATCH_SHA256", ""),
+        help="optional SHA-256 identity of uncommitted source applied to that commit",
     )
     parser.add_argument("--php-version", default=os.environ.get("PHRUST_WORDPRESS_PHP_VERSION", ""))
     parser.add_argument("--php-fpm-image", default=os.environ.get("PHRUST_PHP_FPM_IMAGE", DEFAULT_PHP_FPM_IMAGE))
@@ -214,6 +227,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--baseline; use 3 for a normal performance tranche"
         ),
     )
+    parser.add_argument(
+        "--max-php-control-p50-delta-pct",
+        type=float,
+        default=None,
+        help=(
+            "reject a baseline comparison when the independently measured "
+            "PHP-FPM concurrency-1 p50 drifts by more than this percentage; "
+            "use 10 for adjacent performance tranches"
+        ),
+    )
+    parser.add_argument(
+        "--require-idle-host",
+        action="store_true",
+        help=(
+            "capture host-process evidence before and during clean timing and "
+            "mark the run inconclusive when competing build, test, benchmark, "
+            "or CPU-intensive processes are observed"
+        ),
+    )
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
     if args.compare:
@@ -232,6 +264,14 @@ def run(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     errors = validate_configuration(args)
     if errors:
         return failure_report(errors, args, out_dir)
+    preflight = capture_host_preflight() if args.require_idle_host else []
+    if preflight and host_check_failures(preflight):
+        return inconclusive_report(
+            [],
+            args,
+            out_dir,
+            preflight,
+        )
     docroot = repo_path(args.docroot) or repo_path(args.wordpress_dir)
     if not args.phrust_url:
         blockers = wordpress_shape_blockers(docroot)
@@ -447,6 +487,10 @@ def validate_configuration(args: argparse.Namespace) -> list[str]:
         errors.append("--cranelift-ab and --feedback-ab are mutually exclusive")
     if args.cranelift_ab and (args.baseline or args.compare or args.record_baseline):
         errors.append("--cranelift-ab cannot record or compare a regression baseline")
+    if args.require_idle_host and (args.feedback_ab or args.cranelift_ab):
+        errors.append("--require-idle-host is supported only by a single clean timing arm")
+    if args.require_idle_host and args.mode != "clean":
+        errors.append("--require-idle-host requires --mode clean")
     if args.cranelift_ab and platform.machine().lower() not in {"arm64", "aarch64"}:
         errors.append("--cranelift-ab is supported only on ARM/aarch64")
     levels = concurrency_levels(args.concurrency)
@@ -486,6 +530,13 @@ def validate_configuration(args: argparse.Namespace) -> list[str]:
             errors.append("--min-c1-p50-improvement-pct requires strict clean mode")
         if not args.baseline:
             errors.append("--min-c1-p50-improvement-pct requires --baseline")
+    if args.max_php_control_p50_delta_pct is not None:
+        if args.max_php_control_p50_delta_pct < 0:
+            errors.append("--max-php-control-p50-delta-pct must be non-negative")
+        if args.mode != "clean" or not args.strict:
+            errors.append("--max-php-control-p50-delta-pct requires strict clean mode")
+        if not args.baseline:
+            errors.append("--max-php-control-p50-delta-pct requires --baseline")
     try:
         parse_observables(args.observable)
     except ValueError as error:
@@ -509,6 +560,260 @@ def available_cpus() -> int:
     if hasattr(os, "sched_getaffinity"):
         return max(1, len(os.sched_getaffinity(0)))
     return max(1, os.cpu_count() or 1)
+
+
+HOST_BLOCKING_COMMANDS = re.compile(
+    r"(?:^|[/ ])(?:cargo|rustc|rustfmt|clippy|pytest|hyperfine|oha)(?:$|[ ])"
+    r"|\bjust\s+(?:ci|test|verify|perf)"
+    r"|scripts/performance/.+(?:benchmark|smoke)",
+    re.IGNORECASE,
+)
+HOST_CPU_BLOCKER_PCT = 20.0
+HOST_AMBIENT_CPU_COMMANDS = re.compile(r"^(?:/System/Library/|/usr/libexec/)")
+DOCKER_RUNTIME_MARKERS = (
+    "com.docker.virtualization",
+    "com.docker.backend",
+    "com.apple.Virtualization.VirtualMachine",
+)
+
+
+def capture_host_snapshot(
+    label: str,
+    excluded_pids: tuple[int, ...] = (),
+    *,
+    allow_docker_runtime: bool = False,
+) -> dict[str, Any]:
+    completed = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,%cpu=,%mem=,time=,etime=,command="],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    processes: list[dict[str, Any]] = []
+    for line in completed.stdout.splitlines():
+        fields = line.strip().split(None, 6)
+        if len(fields) != 7:
+            continue
+        try:
+            pid, ppid = int(fields[0]), int(fields[1])
+            cpu_pct, memory_pct = float(fields[2]), float(fields[3])
+            cpu_seconds = parse_cpu_time(fields[4])
+        except ValueError:
+            continue
+        processes.append(
+            {
+                "pid": pid,
+                "ppid": ppid,
+                "cpu_pct": cpu_pct,
+                "cpu_seconds": cpu_seconds,
+                "memory_pct": memory_pct,
+                "elapsed": fields[5],
+                "command": fields[6],
+            }
+        )
+    excluded = {os.getpid(), *excluded_pids}
+    process_by_pid = {process["pid"]: process for process in processes}
+    parent_pid = os.getppid()
+    while parent_pid > 1 and parent_pid not in excluded:
+        excluded.add(parent_pid)
+        parent = process_by_pid.get(parent_pid)
+        if parent is None:
+            break
+        parent_pid = parent["ppid"]
+    if allow_docker_runtime:
+        excluded.update(
+            process["pid"]
+            for process in processes
+            if any(marker in process["command"] for marker in DOCKER_RUNTIME_MARKERS)
+        )
+    changed = True
+    while changed:
+        changed = False
+        for process in processes:
+            if process["ppid"] in excluded and process["pid"] not in excluded:
+                excluded.add(process["pid"])
+                changed = True
+    blockers = []
+    for process in processes:
+        command = process["command"]
+        if process["pid"] in excluded:
+            continue
+        reasons = []
+        if HOST_BLOCKING_COMMANDS.search(command):
+            reasons.append("competing build/test/benchmark command")
+        if reasons:
+            blockers.append({**process, "reasons": reasons})
+    try:
+        load_average = list(os.getloadavg())
+    except OSError:
+        load_average = None
+    top_processes = sorted(processes, key=lambda process: process["cpu_pct"], reverse=True)[:12]
+    return {
+        "label": label,
+        "captured_unix_seconds": time.time(),
+        "captured_monotonic_seconds": time.monotonic(),
+        "load_average": load_average,
+        "logical_cpus": os.cpu_count(),
+        "cpu_blocker_threshold_pct": HOST_CPU_BLOCKER_PCT,
+        "blockers": blockers,
+        "cpu_excluded_pids": sorted(excluded),
+        "ambient_cpu_observations": [],
+        "interval_cpu_blockers": [],
+        "processes": processes,
+        "top_processes": top_processes,
+    }
+
+
+def parse_cpu_time(value: str) -> float:
+    days = 0.0
+    if "-" in value:
+        day_text, value = value.split("-", 1)
+        days = float(day_text)
+    fields = value.split(":")
+    if len(fields) == 2:
+        minutes, seconds = fields
+        return days * 86400.0 + float(minutes) * 60.0 + float(seconds)
+    if len(fields) == 3:
+        hours, minutes, seconds = fields
+        return (
+            days * 86400.0
+            + float(hours) * 3600.0
+            + float(minutes) * 60.0
+            + float(seconds)
+        )
+    raise ValueError(f"unsupported process CPU time: {value}")
+
+
+def capture_host_preflight() -> list[dict[str, Any]]:
+    snapshots = [capture_host_snapshot("preflight-before")]
+    time.sleep(1.0)
+    snapshots.append(capture_host_snapshot("preflight-after"))
+    return snapshots
+
+
+class HostIdleMonitor:
+    """Capture low-frequency host evidence without instrumenting either engine."""
+
+    def __init__(
+        self,
+        label: str,
+        excluded_pids: tuple[int, ...],
+        *,
+        allow_docker_runtime: bool,
+    ) -> None:
+        self.label = label
+        self.excluded_pids = excluded_pids
+        self.allow_docker_runtime = allow_docker_runtime
+        self.snapshots: list[dict[str, Any]] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._capture("before")
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def _capture(self, phase: str) -> None:
+        self.snapshots.append(
+            capture_host_snapshot(
+                f"{self.label}-{phase}",
+                self.excluded_pids,
+                allow_docker_runtime=self.allow_docker_runtime,
+            )
+        )
+
+    def _poll(self) -> None:
+        sample = 0
+        while not self._stop.wait(2.0):
+            sample += 1
+            self._capture(f"during-{sample}")
+
+    def stop(self) -> list[dict[str, Any]]:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3)
+        self._capture("after")
+        return self.snapshots
+
+
+def host_check_failures(snapshots: list[dict[str, Any]]) -> list[str]:
+    details = []
+    for snapshot in snapshots:
+        snapshot["ambient_cpu_observations"] = []
+        snapshot["interval_cpu_blockers"] = []
+        for blocker in snapshot["blockers"]:
+            details.append(
+                f"{snapshot['label']}: pid {blocker['pid']} "
+                f"({', '.join(blocker['reasons'])})"
+            )
+    for previous, current in zip(snapshots, snapshots[1:]):
+        if host_snapshot_group(previous["label"]) != host_snapshot_group(current["label"]):
+            continue
+        interval = current["captured_monotonic_seconds"] - previous["captured_monotonic_seconds"]
+        if interval < 0.5:
+            continue
+        prior_processes = {process["pid"]: process for process in previous["processes"]}
+        current_processes = {process["pid"]: process for process in current["processes"]}
+        excluded = set(previous["cpu_excluded_pids"]) | set(current["cpu_excluded_pids"])
+        for pid, process in current_processes.items():
+            prior = prior_processes.get(pid)
+            if prior is None or pid in excluded or prior["command"] != process["command"]:
+                continue
+            cpu_delta = max(0.0, process["cpu_seconds"] - prior["cpu_seconds"])
+            cpu_pct = cpu_delta / interval * 100.0
+            if cpu_pct < HOST_CPU_BLOCKER_PCT:
+                continue
+            blocker = {
+                **process,
+                "interval_seconds": interval,
+                "interval_cpu_pct": cpu_pct,
+                "reasons": [f"interval CPU usage >= {HOST_CPU_BLOCKER_PCT:.0f}%"],
+            }
+            if process["ppid"] == 1 and HOST_AMBIENT_CPU_COMMANDS.search(process["command"]):
+                blocker["reasons"] = ["recorded macOS platform CPU usage"]
+                current["ambient_cpu_observations"].append(blocker)
+                continue
+            current["interval_cpu_blockers"].append(blocker)
+            details.append(
+                f"{current['label']}: pid {pid} at {cpu_pct:.1f}% interval CPU"
+            )
+    if not details:
+        return []
+    return ["host idle control failed: " + "; ".join(details)]
+
+
+def host_snapshot_group(label: str) -> str:
+    if "-timing-" in label:
+        return label.split("-timing-", 1)[0]
+    if label.startswith("preflight-"):
+        return "preflight"
+    return label
+
+
+def build_performance_decision(
+    baseline: dict[str, Any] | None,
+    control_failures: list[str],
+    candidate_failures: list[str],
+) -> dict[str, Any]:
+    if baseline is None:
+        return {
+            "eligible": False,
+            "status": "baseline_only",
+            "reasons": ["no adjacent candidate comparison was requested"],
+        }
+    if control_failures:
+        return {
+            "eligible": False,
+            "status": "inconclusive",
+            "reasons": control_failures,
+        }
+    if candidate_failures:
+        return {
+            "eligible": True,
+            "status": "revert",
+            "reasons": candidate_failures,
+        }
+    return {"eligible": True, "status": "keep", "reasons": []}
 
 
 def parse_observables(values: list[str]) -> list[tuple[str, str]]:
@@ -589,6 +894,8 @@ def resolve_phrust(args: argparse.Namespace, out_dir: Path, docroot: Path | None
     )
     base_url = wait_for_server(process, log)
     identity = binary_identity(server)
+    identity["source_commit"] = args.server_source_commit or None
+    identity["source_patch_sha256"] = args.server_source_patch_sha256 or None
     identity["deployment_mode"] = "immutable"
     identity["engine_preset"] = args.engine_preset
     identity["persistent_feedback"] = args.persistent_feedback
@@ -838,17 +1145,29 @@ def collect_clean(
             "artifacts": artifact_paths(out_dir, phrust, php),
         }
     engines: dict[str, Any] = {}
+    host_checks: list[dict[str, Any]] = []
     for managed in (phrust, php):
-        curves = [
-            sample_curve(
-                managed.target,
-                args.path,
-                concurrency,
-                args.samples,
-                args.timeout_seconds,
-            )
-            for concurrency in concurrency_levels(args.concurrency)
-        ]
+        monitor = HostIdleMonitor(
+            f"{managed.target.name}-timing",
+            managed.target.pids,
+            allow_docker_runtime=True,
+        ) if args.require_idle_host else None
+        if monitor is not None:
+            monitor.start()
+        try:
+            curves = [
+                sample_curve(
+                    managed.target,
+                    args.path,
+                    concurrency,
+                    args.samples,
+                    args.timeout_seconds,
+                )
+                for concurrency in concurrency_levels(args.concurrency)
+            ]
+        finally:
+            if monitor is not None:
+                host_checks.extend(monitor.stop())
         engines[managed.target.name] = {
             "command": managed.command,
             "identity": managed.identity,
@@ -883,13 +1202,11 @@ def collect_clean(
         "process_sampling_hz": 20,
     }
     environment = environment_identity(docroot, args.database_identity)
-    failures.extend(
-        compare_baseline_identity(
-            baseline,
-            measurement_model,
-            environment,
-            engines["php-fpm"]["identity"],
-        )
+    comparison_failures = compare_baseline_identity(
+        baseline,
+        measurement_model,
+        environment,
+        engines["php-fpm"]["identity"],
     )
     baseline_comparisons, baseline_failures = compare_baseline(
         engines["phrust"]["curves"],
@@ -898,21 +1215,38 @@ def collect_clean(
         args.min_c1_p50_improvement_pct,
     )
     failures.extend(baseline_failures)
+    php_control_comparisons, php_control_failures = compare_php_control(
+        engines["php-fpm"]["curves"],
+        baseline,
+        args.max_php_control_p50_delta_pct,
+    )
+    host_control_failures = host_check_failures(host_checks)
+    control_failures = comparison_failures + php_control_failures + host_control_failures
+    decision = build_performance_decision(
+        baseline,
+        control_failures,
+        failures,
+    )
+    status = "inconclusive" if control_failures else "fail" if failures else "pass"
     return {
         "schema_version": 2,
-        "status": "fail" if failures else "pass",
+        "status": status,
         "mode": "clean",
-        "timing_eligible": True,
+        "timing_eligible": not control_failures,
         "measurement_model": measurement_model,
         "environment": environment,
         "engines": engines,
         "baseline_comparisons": baseline_comparisons,
+        "php_control_comparisons": php_control_comparisons,
+        "host_checks": host_checks,
+        "performance_decision": decision,
         "correctness": {
             "before": before,
             "benchmark_before": benchmark_before,
             "after": after,
             "failures": failures,
         },
+        "control_failures": control_failures,
         "ratios": ratios,
         "baseline": baseline_summary(baseline),
         "artifacts": artifact_paths(out_dir, phrust, php),
@@ -1106,6 +1440,56 @@ def compare_baseline(
         int(curve.get("concurrency", 0)) == 1 for curve in curves
     ):
         failures.append("current benchmark is missing concurrency-1 Phrust results")
+    return comparisons, failures
+
+
+def compare_php_control(
+    curves: list[dict[str, Any]],
+    baseline: dict[str, Any] | None,
+    max_c1_p50_delta_pct: float | None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    if baseline is None:
+        return [], []
+    previous_curves = (((baseline.get("engines") or {}).get("php-fpm") or {}).get("curves") or [])
+    previous = {curve.get("concurrency"): curve for curve in previous_curves}
+    comparisons: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for curve in curves:
+        old = previous.get(curve.get("concurrency"))
+        if not old:
+            continue
+        concurrency = int(curve["concurrency"])
+        current_p50 = (curve.get("latency_ms") or {}).get("p50")
+        old_p50 = (old.get("latency_ms") or {}).get("p50")
+        delta_pct = None
+        if (
+            isinstance(current_p50, (int, float))
+            and isinstance(old_p50, (int, float))
+            and old_p50 > 0
+        ):
+            delta_pct = (current_p50 - old_p50) / old_p50 * 100.0
+        comparisons.append(
+            {
+                "concurrency": concurrency,
+                "baseline_p50_ms": old_p50,
+                "current_p50_ms": current_p50,
+                "php_p50_delta_pct": delta_pct,
+            }
+        )
+        if concurrency == 1 and max_c1_p50_delta_pct is not None:
+            if delta_pct is None:
+                failures.append("PHP-FPM concurrency-1 p50 control comparison is unavailable")
+            elif abs(delta_pct) > max_c1_p50_delta_pct:
+                failures.append(
+                    "PHP-FPM p50 control at concurrency 1 drifted by "
+                    f"{delta_pct:+.1f}%; allowed +/-{max_c1_p50_delta_pct:.1f}%"
+                )
+    if max_c1_p50_delta_pct is not None and 1 not in previous:
+        failures.append("performance baseline is missing concurrency-1 PHP-FPM control results")
+    elif max_c1_p50_delta_pct is not None and not any(
+        int(curve.get("concurrency", 0)) == 1 for curve in curves
+    ):
+        failures.append("current benchmark is missing concurrency-1 PHP-FPM control results")
     return comparisons, failures
 
 
@@ -1320,6 +1704,29 @@ def failure_report(failures: list[str], args: argparse.Namespace, out_dir: Path)
     }
 
 
+def inconclusive_report(
+    failures: list[str],
+    args: argparse.Namespace,
+    out_dir: Path,
+    host_checks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    reasons = failures + host_check_failures(host_checks)
+    return {
+        "schema_version": 2,
+        "status": "inconclusive",
+        "mode": args.mode,
+        "timing_eligible": False,
+        "control_failures": reasons,
+        "host_checks": host_checks,
+        "performance_decision": {
+            "eligible": False,
+            "status": "inconclusive",
+            "reasons": reasons,
+        },
+        "artifacts": artifact_paths(out_dir),
+    }
+
+
 def artifact_paths(out_dir: Path, *targets: ManagedTarget) -> dict[str, str]:
     artifacts = {
         "summary_json": rel(out_dir / "summary.json"),
@@ -1340,6 +1747,22 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
         lines.extend(["Instrumented diagnostic data; not eligible for latency comparison.", ""])
     for failure in report.get("failures", []) or (report.get("correctness") or {}).get("failures", []):
         lines.append(f"- {failure}")
+    for failure in report.get("control_failures", []):
+        lines.append(f"- {failure}")
+    decision = report.get("performance_decision")
+    if decision:
+        lines.extend(
+            [
+                "",
+                "## Performance decision",
+                "",
+                f"- eligible: `{str(decision['eligible']).lower()}`",
+                f"- status: `{decision['status']}`",
+            ]
+        )
+        for reason in decision.get("reasons", []):
+            lines.append(f"- reason: {reason}")
+        lines.append("")
     if "engines" in report:
         lines.extend(["## Clean timing", ""])
         for name, engine in report["engines"].items():
@@ -1376,6 +1799,26 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
                     f"{format_interval(comparison['baseline_to_current_p50_latency_ci95'])})"
                 )
             lines.append("")
+        if report.get("php_control_comparisons"):
+            lines.extend(["## PHP-FPM load control", ""])
+            for comparison in report["php_control_comparisons"]:
+                delta = comparison["php_p50_delta_pct"]
+                delta_text = "unavailable" if delta is None else f"{delta:+.2f}%"
+                lines.append(
+                    f"- concurrency {comparison['concurrency']}: p50 "
+                    f"{format_milliseconds(comparison['baseline_p50_ms'])} -> "
+                    f"{format_milliseconds(comparison['current_p50_ms'])} ({delta_text})"
+                )
+            lines.append("")
+    if report.get("host_checks"):
+        lines.extend(["## Host idle evidence", ""])
+        for snapshot in report["host_checks"]:
+            lines.append(
+                f"- `{snapshot['label']}`: load {snapshot['load_average']}; "
+                f"blockers {len(snapshot['blockers']) + len(snapshot.get('interval_cpu_blockers', []))}; "
+                f"ambient observations {len(snapshot.get('ambient_cpu_observations', []))}"
+            )
+        lines.append("")
     lines.extend(["## Artifacts", ""])
     for name, value in report.get("artifacts", {}).items():
         lines.append(f"- `{name}`: `{value}`")
@@ -1451,6 +1894,10 @@ def format_ratio(value: float | None) -> str:
     return "unsupported" if value is None else f"{value:.3f}x"
 
 
+def format_milliseconds(value: float | None) -> str:
+    return "unavailable" if value is None else f"{value:.3f} ms"
+
+
 def format_interval(value: list[float] | None) -> str:
     if value is None:
         return "unsupported"
@@ -1465,6 +1912,51 @@ def rel(path: Path) -> str:
 
 
 def self_test() -> int:
+    assert parse_cpu_time("1326:47.79") == 79607.79
+    assert parse_cpu_time("1-02:03:04.50") == 93784.5
+    idle_process = {
+        "pid": 7,
+        "ppid": 1,
+        "cpu_pct": 90.0,
+        "cpu_seconds": 10.0,
+        "memory_pct": 1.0,
+        "elapsed": "00:10",
+        "command": "background-worker",
+    }
+    host_before = {
+        "label": "preflight-before",
+        "captured_monotonic_seconds": 1.0,
+        "blockers": [],
+        "cpu_excluded_pids": [],
+        "interval_cpu_blockers": [],
+        "processes": [idle_process],
+        "top_processes": [idle_process],
+    }
+    host_after = copy.deepcopy(host_before)
+    host_after.update(label="preflight-after", captured_monotonic_seconds=2.0)
+    assert not host_check_failures([host_before, host_after])
+    host_after["processes"][0]["cpu_seconds"] = 10.3
+    assert "pid 7 at 30.0% interval CPU" in " ".join(
+        host_check_failures([host_before, host_after])
+    )
+    next_arm = copy.deepcopy(host_after)
+    host_after["label"] = "phrust-timing-after"
+    next_arm.update(label="php-fpm-timing-before", captured_monotonic_seconds=3.0)
+    next_arm["processes"][0]["cpu_seconds"] = 11.0
+    assert not host_check_failures([host_after, next_arm])
+    ambient_after = copy.deepcopy(host_after)
+    ambient_after["captured_monotonic_seconds"] = 3.0
+    ambient_after["processes"][0].update(
+        command=(
+            "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/"
+            "WindowServer -daemon"
+        ),
+        ppid=1,
+        cpu_seconds=11.0,
+    )
+    host_after["processes"][0]["command"] = ambient_after["processes"][0]["command"]
+    assert not host_check_failures([host_after, ambient_after])
+    assert len(ambient_after["ambient_cpu_observations"]) == 1
     assert percentile([1.0, 2.0, 3.0, 4.0], 50) == 2.0
     assert percentile(list(map(float, range(1, 101))), 95) == 95.0
     interval = bootstrap_percentile_ci([1.0, 2.0, 3.0, 4.0], 50, seed=7, iterations=100)
@@ -1569,10 +2061,40 @@ def self_test() -> int:
     assert tranche_failures == [
         "Phrust p50 at concurrency 1 improved by 2.0%; required 3.0%"
     ]
+    tranche_baseline["engines"]["php-fpm"] = {
+        "curves": [{"concurrency": 1, "latency_ms": {"p50": 40.0}}]
+    }
+    php_control, php_failures = compare_php_control(
+        [{"concurrency": 1, "latency_ms": {"p50": 43.0}}],
+        tranche_baseline,
+        10.0,
+    )
+    assert not php_failures
+    assert php_control[0]["php_p50_delta_pct"] == 7.5
+    _, php_failures = compare_php_control(
+        [{"concurrency": 1, "latency_ms": {"p50": 48.0}}],
+        tranche_baseline,
+        10.0,
+    )
+    assert php_failures == [
+        "PHP-FPM p50 control at concurrency 1 drifted by +20.0%; allowed +/-10.0%"
+    ]
+    assert build_performance_decision(tranche_baseline, php_failures, ["too slow"]) == {
+        "eligible": False,
+        "status": "inconclusive",
+        "reasons": php_failures,
+    }
+    assert build_performance_decision(tranche_baseline, [], ["too slow"])["status"] == "revert"
+    assert build_performance_decision(tranche_baseline, [], [])["status"] == "keep"
+    assert build_performance_decision(None, [], [])["status"] == "baseline_only"
     invalid_tranche_gate = validate_configuration(
         parse_args(["--min-c1-p50-improvement-pct", "3"])
     )
     assert "requires --baseline" in " ".join(invalid_tranche_gate)
+    invalid_php_control = validate_configuration(
+        parse_args(["--max-php-control-p50-delta-pct", "10"])
+    )
+    assert "requires --baseline" in " ".join(invalid_php_control)
     previous_trace = os.environ.get("PHRUST_PERF_TRACE")
     os.environ["PHRUST_PERF_TRACE"] = "target/forbidden-clean-trace.jsonl"
     try:
