@@ -1,6 +1,6 @@
 # Performance Include Path Cache
 
-Work item adds two include-cache layers:
+The performance layer provides two include-cache layers:
 
 - a request-local include-/require-path inline cache behind the existing
   inline-cache mode, and

@@ -2,21 +2,5 @@
   "dead_recipes": [],
   "orphans": [],
   "unclassified": [],
-  "worklogs": [
-    "docs/frontend/ast-view-model.md",
-    "docs/frontend/compile-time-diagnostics.md",
-    "docs/frontend/declaration-model.md",
-    "docs/frontend/hir-model.md",
-    "docs/frontend/php-name-resolution.md",
-    "docs/performance/array-shapes.md",
-    "docs/performance/builtin-intrinsics.md",
-    "docs/performance/deopt-live-state-osr-metadata.md",
-    "docs/performance/hot-cold-splitting.md",
-    "docs/performance/reference-aliasing-deopt.md",
-    "docs/performance/selective-cranelift-regions.md",
-    "docs/performance/simd-byte-kernels.md",
-    "docs/performance/specialized-call-frames.md",
-    "docs/runtime/semantics-object-semantics.md",
-    "docs/stdlib/composer-compatibility.md"
-  ]
+  "worklogs": []
 }

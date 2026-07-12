@@ -2,7 +2,7 @@
 
 ## Cache, Adaptive Runtime, And JIT Audit
 
-Work item reviewed the Performance bytecode cache, optimizer-adjacent
+This audit covers the Performance bytecode cache, optimizer-adjacent
 adaptive runtime state, quickening, inline caches, tiering, and experimental
 JIT. The audited implementation surface contains no Rust `unsafe` blocks in:
 
@@ -66,7 +66,7 @@ Audit result:
   properties, arrays, references, or VM frames.
 - Function/class/include/autoload config changes use monotonic epochs. Stale
   epochs invalidate or refresh IC entries before reusing cached metadata.
-- Work item tiering counters are saturating request-local integers. They do
+- the tiering counters are saturating request-local integers. They do
   not create control-flow edges and cannot introduce tiering loops.
 - `--tiering=off` disables adaptive quickening observations and JIT attempts,
   keeping execution on the interpreter even when other adaptive flags are set.
@@ -243,7 +243,7 @@ Safety constraints:
   copied by value.
 - Bailout/deopt, runtime-callout, region-result, and exception propagation use
   owned enums and strings. They do not extend lifetimes across the boundary.
-- The implementation uses safe Rust only. Work item adds no `unsafe`, no
+- The implementation uses safe Rust only. The performance layer provides no `unsafe`, no
   executable memory, and no native execution path.
 
 Coverage:
@@ -267,7 +267,7 @@ Safety constraints:
 - The module emits Cranelift IR text only. It does not allocate executable
   memory, does not expose a callable function pointer, and does not install a
   VM execution path.
-- Lowering starts with the conservative Work item eligibility analyzer, then
+- Lowering starts with the conservative the eligibility analyzer, then
   narrows the accepted subset further to integer constants, integer
   add/sub/mul, register moves, and an integer return.
 - Unsupported instructions, operands, constants, control flow, missing
@@ -298,8 +298,8 @@ Safety constraints:
 - The interpreter remains the source of truth. Functions run on the interpreter
   until they pass a warmup threshold, and any compile rejection or guard failure
   falls back to interpreter execution.
-- Compilation first calls the Work item eligibility analyzer through the
-  Work item Cranelift lowerer. Only successfully verified tiny integer leaf
+- Compilation first calls the eligibility analyzer through the
+  the Cranelift lowerer. Only successfully verified tiny integer leaf
   functions can enter the JIT execution path.
 - Native entries use a fixed `extern "C"` ABI, ABI-hash checks, opaque pointer
   arguments, and status/side-exit returns. They do not resume at arbitrary

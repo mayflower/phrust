@@ -29,7 +29,7 @@ deopt, and they must be removable without rewriting the compiled unit.
 
 ## Tiering Policy
 
-Work item adds a request-local tiering controller above quickening, inline
+The performance layer provides a request-local tiering controller above quickening, inline
 caches, and the experimental JIT. The controller is intentionally small and
 does not own PHP semantics. It records:
 
@@ -94,7 +94,7 @@ An inline-cache entry should contain:
 
 ## Shared Guard/Fallback Protocol
 
-Work item unifies quickening and inline-cache miss handling through the
+The engine unifies quickening and inline-cache miss handling through the
 `FallbackProtocolStats` structure. Every installed fast path follows the same
 order:
 
@@ -193,7 +193,7 @@ and argument binding logic. It must fall back for autoload/eval/include changes,
 disabled functions, dynamic callables, changed defaults, by-reference errors,
 or any exception-producing binding path.
 
-The implemented Work item function-call IC caches guarded `CallFunction`
+The implemented the function-call IC caches guarded `CallFunction`
 resolution for current-unit user functions, include-defined dynamic functions,
 VM-managed builtins, and registered internal builtins. Each slot is keyed by
 compiled unit, function, block, instruction, and IC kind. The guard checks the
@@ -304,7 +304,7 @@ tracked in counters but not yet reachable from an executable PHP fixture.
 
 ### `FETCH_CLASS_CONST` And Static Property Metadata
 
-The implemented Work item class/static IC is monomorphic and
+The implemented the class/static IC is monomorphic and
 resolution-only. It covers class constants, enum cases, and static-property
 metadata under the shared `ClassConstantStaticProperty` IC family. Each slot is
 guarded by resolved class name, member name, cache sub-kind, request-local
