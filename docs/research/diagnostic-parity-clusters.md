@@ -35,6 +35,34 @@ before acting on the numbers.
 | 63 | `E_PHP_VM_DATETIME_PARSE` | Date-format parser gaps. |
 | 44 | `PHPT_TIMEOUT` | Hangs; each is a bug worth an issue regardless of policy. |
 
+## zend.basic drill-down (Phase 0 of the module campaign)
+
+The 2,432 zend.basic FAILs split into 966 with a phrust diagnostic ID (feature
+missing/aborted) and 1,466 pure output diffs. Pairwise (expected, actual)
+line-shape clustering is too flat there (1,031 shapes); classifying by *failure
+mode* is not:
+
+| Tests | Mode | Concentrated in |
+| ---: | --- | --- |
+| 330 | other output divergence | type_declarations 53, inheritance 19, gc 17 |
+| 300 | missing `Fatal error` | type_declarations 92, attributes 37, errmsg 21 — compile-/runtime-time validations the reference enforces and phrust does not |
+| 258 | value divergence, same output shape | generators 33, type_declarations 24, gc 20 — semantic bugs, not diagnostics |
+| 176 | phrust diagnostic leak (non-`E_PHP_*` text aborts output) | attributes 56, property_hooks 56 |
+| 128 | spurious `Fatal error` (phrust rejects valid code) | type_declarations 39, led by asymmetric_visibility |
+| 64 | diagnostic wording differs | mechanical message-format parity |
+| 43 | missing `Parse error` | heredoc/nowdoc indentation rules 16, group_use trailing comma 8 |
+| 39 | truncated/empty actual output | needs per-test minimization |
+| 36+23 | missing `Warning`/`Deprecated` | `#[NoDiscard]` and `#[Deprecated]` attribute semantics |
+| 32+2 | spurious `Warning`/`Deprecated` | over-eager emission |
+| 17 | internal panic or stack overflow | hard bugs regardless of parity |
+| 17 | timeout | hangs; each warrants a fixture |
+
+Reading: the type-system block (Phase 1.1) carries three modes at once
+(missing-fatal 92 + spurious-fatal 39 + divergence 77 in type_declarations
+alone); attributes/property_hooks failures are dominated by the diagnostic-leak
+mode, i.e. missing runtime support surfacing as raw diagnostic text; and 34
+tests (panics + timeouts) are unconditional bugs.
+
 ## How this feeds the closure loop
 
 The catalog rows and module plans (`tests/phpt/manifests/…`) stay the source of
