@@ -1,6 +1,8 @@
 //! php-vm command implementation.
+mod optimizer_report;
 mod phase_timing;
 
+use optimizer_report::OptimizerReportJson;
 use phase_timing::PhaseTimingCollector;
 use php_bytecode_cache::{
     CacheArtifact, CacheFingerprint, CacheFingerprintInput, CacheHeader, CachedIrArtifact,
@@ -1308,44 +1310,6 @@ struct IrJson {
     functions: usize,
     constants: usize,
     verified: bool,
-}
-
-#[derive(Serialize)]
-struct OptimizerReportJson<'a> {
-    level: &'a str,
-    enabled_pass_count: usize,
-    passes: Vec<OptimizerPassJson<'a>>,
-}
-
-impl<'a> From<&'a OptimizationReport> for OptimizerReportJson<'a> {
-    fn from(report: &'a OptimizationReport) -> Self {
-        Self {
-            level: report.level.as_str(),
-            enabled_pass_count: report.enabled_pass_count(),
-            passes: report
-                .passes
-                .iter()
-                .map(|pass| OptimizerPassJson {
-                    name: pass.name,
-                    phase: pass.phase.as_str(),
-                    enabled: pass.enabled,
-                    changed: pass.changed,
-                    source_spans_preserved: pass.source_spans_preserved,
-                    stats: &pass.stats,
-                })
-                .collect(),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct OptimizerPassJson<'a> {
-    name: &'a str,
-    phase: &'a str,
-    enabled: bool,
-    changed: bool,
-    source_spans_preserved: bool,
-    stats: &'a BTreeMap<&'static str, u64>,
 }
 
 fn compile_pipeline_with_optimization(

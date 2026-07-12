@@ -186,8 +186,8 @@
       "max_lines": 6930
     },
     "crates/php_vm_cli/src/commands.rs": {
-      "max_bytes": 250410,
-      "max_lines": 6751
+      "max_bytes": 249404,
+      "max_lines": 6715
     }
   },
   "module_wide_allowlist": [
