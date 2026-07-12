@@ -205,6 +205,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--compare", default="", help="legacy baseline comparison; implies --strict")
     parser.add_argument("--record-baseline", default="")
     parser.add_argument("--max-latency-regression-pct", type=float, default=20.0)
+    parser.add_argument(
+        "--min-c1-p50-improvement-pct",
+        type=float,
+        default=None,
+        help=(
+            "require this minimum Phrust concurrency-1 p50 improvement over "
+            "--baseline; use 3 for a normal performance tranche"
+        ),
+    )
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
     if args.compare:
@@ -466,10 +475,17 @@ def validate_configuration(args: argparse.Namespace) -> list[str]:
                 "clean timing rejects Phrust instrumentation environment: "
                 + ", ".join(active_instrumentation)
             )
-    if args.compare:
-        baseline_path = repo_path(args.compare)
+    if args.baseline:
+        baseline_path = repo_path(args.baseline)
         if baseline_path is None or not baseline_path.is_file():
-            errors.append(f"strict regression baseline is missing: {args.compare}")
+            errors.append(f"strict regression baseline is missing: {args.baseline}")
+    if args.min_c1_p50_improvement_pct is not None:
+        if args.min_c1_p50_improvement_pct < 0:
+            errors.append("--min-c1-p50-improvement-pct must be non-negative")
+        if args.mode != "clean" or not args.strict:
+            errors.append("--min-c1-p50-improvement-pct requires strict clean mode")
+        if not args.baseline:
+            errors.append("--min-c1-p50-improvement-pct requires --baseline")
     try:
         parse_observables(args.observable)
     except ValueError as error:
@@ -875,7 +891,13 @@ def collect_clean(
             engines["php-fpm"]["identity"],
         )
     )
-    failures.extend(compare_baseline(engines["phrust"]["curves"], baseline, args.max_latency_regression_pct))
+    baseline_comparisons, baseline_failures = compare_baseline(
+        engines["phrust"]["curves"],
+        baseline,
+        args.max_latency_regression_pct,
+        args.min_c1_p50_improvement_pct,
+    )
+    failures.extend(baseline_failures)
     return {
         "schema_version": 2,
         "status": "fail" if failures else "pass",
@@ -884,6 +906,7 @@ def collect_clean(
         "measurement_model": measurement_model,
         "environment": environment,
         "engines": engines,
+        "baseline_comparisons": baseline_comparisons,
         "correctness": {
             "before": before,
             "benchmark_before": benchmark_before,
@@ -944,9 +967,11 @@ def compare_observables(left: dict[str, Any], right: dict[str, Any]) -> list[str
         if name not in left or name not in right:
             failures.append(f"observable {name!r} is missing from one engine")
             continue
-        for field in ("status", "headers", "body_sha256"):
-            if left[name].get(field) != right[name].get(field):
-                failures.append(f"observable {name!r} {field} differs between Phrust and PHP-FPM")
+        for observable_field in ("status", "headers", "body_sha256"):
+            if left[name].get(observable_field) != right[name].get(observable_field):
+                failures.append(
+                    f"observable {name!r} {observable_field} differs between Phrust and PHP-FPM"
+                )
     return failures
 
 
@@ -980,10 +1005,10 @@ def validate_curves(
         for index, sample in enumerate(curve["samples"]):
             if sample["status"] >= 500:
                 failures.append(f"{name} concurrency {concurrency} sample {index} returned HTTP {sample['status']}")
-            for field in ("status", "headers", "body_sha256"):
-                if sample.get(field) != expected.get(field):
+            for sample_field in ("status", "headers", "body_sha256"):
+                if sample.get(sample_field) != expected.get(sample_field):
                     failures.append(
-                        f"{name} concurrency {concurrency} sample {index} {field} "
+                        f"{name} concurrency {concurrency} sample {index} {sample_field} "
                         "differs from the warmed correctness sample"
                     )
     return failures
@@ -1022,25 +1047,66 @@ def safe_ratio(left: Any, right: Any) -> float | None:
     return left / right
 
 
-def compare_baseline(curves: list[dict[str, Any]], baseline: dict[str, Any] | None, threshold: float) -> list[str]:
+def compare_baseline(
+    curves: list[dict[str, Any]],
+    baseline: dict[str, Any] | None,
+    p95_regression_threshold: float,
+    min_c1_p50_improvement_pct: float | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
     if baseline is None:
-        return []
+        return [], []
     previous_curves = (((baseline.get("engines") or {}).get("phrust") or {}).get("curves") or [])
     previous = {curve.get("concurrency"): curve for curve in previous_curves}
+    comparisons = []
     failures = []
     for curve in curves:
         old = previous.get(curve["concurrency"])
         if not old:
             continue
+        concurrency = int(curve["concurrency"])
+        current_p50 = curve["latency_ms"]["p50"]
+        old_p50 = (old.get("latency_ms") or {}).get("p50")
         current_p95 = curve["latency_ms"]["p95"]
         old_p95 = (old.get("latency_ms") or {}).get("p95")
+        p50_improvement = None
+        if isinstance(current_p50, (int, float)) and isinstance(old_p50, (int, float)) and old_p50 > 0:
+            p50_improvement = (old_p50 - current_p50) / old_p50 * 100.0
+        current_walls = [float(sample["wall_ms"]) for sample in curve.get("samples", [])]
+        old_walls = [float(sample["wall_ms"]) for sample in old.get("samples", [])]
+        comparisons.append(
+            {
+                "concurrency": concurrency,
+                "phrust_p50_improvement_pct": p50_improvement,
+                "baseline_to_current_p50_latency": safe_ratio(old_p50, current_p50),
+                "baseline_to_current_p50_latency_ci95": bootstrap_percentile_ratio_ci(
+                    old_walls,
+                    current_walls,
+                    50,
+                    seed=concurrency * 137 + len(current_walls),
+                ) if old_walls and current_walls else None,
+            }
+        )
+        if concurrency == 1 and min_c1_p50_improvement_pct is not None:
+            if p50_improvement is None:
+                failures.append("Phrust concurrency-1 p50 improvement is unavailable")
+            elif p50_improvement < min_c1_p50_improvement_pct:
+                failures.append(
+                    "Phrust p50 at concurrency 1 improved by "
+                    f"{p50_improvement:.1f}%; required {min_c1_p50_improvement_pct:.1f}%"
+                )
         if isinstance(current_p95, (int, float)) and isinstance(old_p95, (int, float)) and old_p95 > 0:
             regression = (current_p95 - old_p95) / old_p95 * 100.0
-            if regression > threshold:
+            if regression > p95_regression_threshold:
                 failures.append(
                     f"Phrust p95 at concurrency {curve['concurrency']} regressed by {regression:.1f}%"
                 )
-    return failures
+    if min_c1_p50_improvement_pct is not None and 1 not in previous:
+        failures.append("performance baseline is missing concurrency-1 Phrust results")
+    elif min_c1_p50_improvement_pct is not None and not any(
+        int(curve.get("concurrency", 0)) == 1 for curve in curves
+    ):
+        failures.append("current benchmark is missing concurrency-1 Phrust results")
+    return comparisons, failures
 
 
 def compare_baseline_identity(
@@ -1055,28 +1121,28 @@ def compare_baseline_identity(
     if baseline.get("schema_version") != 2 or baseline.get("mode") != "clean":
         failures.append("baseline is not a schema-version-2 clean benchmark")
     previous_model = baseline.get("measurement_model") or {}
-    for field in (
+    for model_field in (
         "warmups_per_engine",
         "samples_per_concurrency",
         "concurrency",
         "latency_percentile",
         "process_sampling_hz",
     ):
-        if previous_model.get(field) != measurement_model.get(field):
-            failures.append(f"baseline measurement model differs for {field}")
+        if previous_model.get(model_field) != measurement_model.get(model_field):
+            failures.append(f"baseline measurement model differs for {model_field}")
     previous_environment = baseline.get("environment") or {}
-    for field in ("platform", "available_cpus", "database_identity"):
-        if previous_environment.get(field) != environment.get(field):
-            failures.append(f"baseline environment differs for {field}")
+    for environment_field in ("platform", "available_cpus", "database_identity"):
+        if previous_environment.get(environment_field) != environment.get(environment_field):
+            failures.append(f"baseline environment differs for {environment_field}")
     previous_wordpress = previous_environment.get("wordpress") or {}
     current_wordpress = environment.get("wordpress") or {}
-    for field in ("version", "git_commit", "tree_sha256", "file_count"):
-        if previous_wordpress.get(field) != current_wordpress.get(field):
-            failures.append(f"baseline WordPress identity differs for {field}")
+    for wordpress_field in ("version", "git_commit", "tree_sha256", "file_count"):
+        if previous_wordpress.get(wordpress_field) != current_wordpress.get(wordpress_field):
+            failures.append(f"baseline WordPress identity differs for {wordpress_field}")
     previous_php = (((baseline.get("engines") or {}).get("php-fpm") or {}).get("identity") or {})
-    for field in ("php_version", "php_fpm_image_id", "opcache"):
-        if previous_php.get(field) != php_identity.get(field):
-            failures.append(f"baseline PHP-FPM identity differs for {field}")
+    for php_field in ("php_version", "php_fpm_image_id", "opcache"):
+        if previous_php.get(php_field) != php_identity.get(php_field):
+            failures.append(f"baseline PHP-FPM identity differs for {php_field}")
     return failures
 
 
@@ -1289,12 +1355,27 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
         lines.extend(["## Phrust / PHP ratios", ""])
         for ratio in report["ratios"]:
             lines.append(
-                f"- concurrency {ratio['concurrency']}: p95 latency "
+                f"- concurrency {ratio['concurrency']}: p50 latency "
+                f"{format_ratio(ratio['phrust_to_php_p50_latency'])} "
+                f"(95% bootstrap {format_interval(ratio['phrust_to_php_p50_latency_ci95'])}), p95 latency "
                 f"{format_ratio(ratio['phrust_to_php_p95_latency'])} "
                 f"(95% bootstrap {format_interval(ratio['phrust_to_php_p95_latency_ci95'])}), throughput "
                 f"{format_ratio(ratio['phrust_to_php_requests_per_second'])}"
             )
         lines.append("")
+        if report.get("baseline_comparisons"):
+            lines.extend(["## Phrust baseline comparison", ""])
+            for comparison in report["baseline_comparisons"]:
+                improvement = comparison["phrust_p50_improvement_pct"]
+                improvement_text = "unavailable" if improvement is None else f"{improvement:.2f}%"
+                lines.append(
+                    f"- concurrency {comparison['concurrency']}: p50 improvement "
+                    f"{improvement_text}, baseline/current latency "
+                    f"{format_ratio(comparison['baseline_to_current_p50_latency'])} "
+                    f"(95% bootstrap "
+                    f"{format_interval(comparison['baseline_to_current_p50_latency_ci95'])})"
+                )
+            lines.append("")
     lines.extend(["## Artifacts", ""])
     for name, value in report.get("artifacts", {}).items():
         lines.append(f"- `{name}`: `{value}`")
@@ -1460,6 +1541,38 @@ def self_test() -> int:
     ab_comparison = build_feedback_ab_ratios(ab_off, ab_on)
     assert ab_comparison[0]["off_to_on_p95_latency"] == 2.0
     assert ab_comparison[0]["on_to_off_requests_per_second"] == 2.0
+    tranche_baseline = {
+        "engines": {
+            "phrust": {
+                "curves": [{
+                    "concurrency": 1,
+                    "latency_ms": {"p50": 100.0, "p95": 120.0},
+                    "samples": [{"wall_ms": 100.0}, {"wall_ms": 120.0}],
+                }]
+            }
+        }
+    }
+    tranche_current = [{
+        "concurrency": 1,
+        "latency_ms": {"p50": 96.0, "p95": 121.0},
+        "samples": [{"wall_ms": 96.0}, {"wall_ms": 121.0}],
+    }]
+    tranche_comparisons, tranche_failures = compare_baseline(
+        tranche_current, tranche_baseline, 20.0, 3.0
+    )
+    assert not tranche_failures
+    assert tranche_comparisons[0]["phrust_p50_improvement_pct"] == 4.0
+    tranche_current[0]["latency_ms"]["p50"] = 98.0
+    _, tranche_failures = compare_baseline(
+        tranche_current, tranche_baseline, 20.0, 3.0
+    )
+    assert tranche_failures == [
+        "Phrust p50 at concurrency 1 improved by 2.0%; required 3.0%"
+    ]
+    invalid_tranche_gate = validate_configuration(
+        parse_args(["--min-c1-p50-improvement-pct", "3"])
+    )
+    assert "requires --baseline" in " ".join(invalid_tranche_gate)
     previous_trace = os.environ.get("PHRUST_PERF_TRACE")
     os.environ["PHRUST_PERF_TRACE"] = "target/forbidden-clean-trace.jsonl"
     try:

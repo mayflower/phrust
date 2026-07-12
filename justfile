@@ -95,6 +95,7 @@ help:
       '  just wordpress-root-profile Run optional local real WordPress request profile' \
       '  just wordpress-reference-image Build pinned PHP-FPM/OPcache benchmark image' \
       '  just wordpress-root-benchmark Run clean Phrust vs PHP-FPM WordPress gate' \
+      '  just wordpress-root-tranche-gate Run strict c1-p50 performance acceptance gate' \
       '  just wordpress-root-benchmark-feedback-ab Run persistent-feedback A/B' \
       '  just wordpress-root-benchmark-cranelift Run experimental Cranelift arm' \
       '  just worker-adaptive-state-smoke Verify worker-local adaptive reuse and isolation' \
@@ -1189,6 +1190,13 @@ wordpress-root-diagnostics *args:
 wordpress-root-regression-gate *args:
     if [ -z "${PHRUST_WORDPRESS_PHRUST_URL:-${PHRUST_WORDPRESS_URL:-}}" ]; then cargo build --release -p php_server --bin phrust-server --no-default-features --features jit-copy-patch; fi
     PHRUST_SERVER="${PHRUST_SERVER:-${CARGO_TARGET_DIR:-target}/release/phrust-server}" scripts/performance/wordpress_root_benchmark.py --mode clean --strict --compare "${PHRUST_WORDPRESS_ROOT_BASELINE_JSON:-target/performance/wordpress-root/baseline.json}" {{args}}
+
+# Prompt-pack tranche acceptance: the leading result is the warm,
+# instrumentation-free WordPress concurrency-1 p50. The ordinary regression
+# recipe remains a no-regression CI guard and does not require a speedup.
+wordpress-root-tranche-gate baseline *args:
+    if [ -z "${PHRUST_WORDPRESS_PHRUST_URL:-${PHRUST_WORDPRESS_URL:-}}" ]; then cargo build --release -p php_server --bin phrust-server --no-default-features --features jit-copy-patch; fi
+    PHRUST_SERVER="${PHRUST_SERVER:-${CARGO_TARGET_DIR:-target}/release/phrust-server}" scripts/performance/wordpress_root_benchmark.py --mode clean --strict --baseline "{{baseline}}" --min-c1-p50-improvement-pct 3 {{args}}
 
 # Anti-theater guard: fail performance branches that only add docs, reports,
 # counters, or metric renames without production Rust changes or gates.
