@@ -1089,6 +1089,10 @@ fn non_session_request_with_session_cookie_does_not_load_session_store() {
         "{metrics}"
     );
     assert!(
+        metrics.contains("phrust_server_session_id_generations_total 0\n"),
+        "{metrics}"
+    );
+    assert!(
         metrics.contains("phrust_server_session_finalize_skipped_inactive_total 1\n"),
         "{metrics}"
     );
@@ -1170,6 +1174,7 @@ fn server_persists_web_sessions_across_requests() {
         &[("Cookie", &cookie_pair)],
         "",
     );
+    let metrics = http_request(&address, "GET", "/__phrust/metrics");
 
     stop_child(child);
     fs::remove_dir_all(session_dir).expect("remove session temp dir");
@@ -1181,6 +1186,10 @@ fn server_persists_web_sessions_across_requests() {
     assert_eq!(
         response_body(&after_destroy),
         format!("id={session_id}\nn=1\nstatus=2\n")
+    );
+    assert!(
+        metrics.contains("phrust_server_session_id_generations_total 1\n"),
+        "{metrics}"
     );
 }
 

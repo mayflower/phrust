@@ -40,3 +40,4 @@ runtime-telemetry = [
     "php_runtime/runtime-telemetry",
 ]
 jit-copy-patch = ["php_executor/jit-copy-patch", "php_vm/jit-copy-patch"]
+jit-cranelift = ["php_executor/jit-cranelift", "php_vm/jit-cranelift"]

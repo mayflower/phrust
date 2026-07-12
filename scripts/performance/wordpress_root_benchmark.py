@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -44,7 +45,16 @@ CLEAN_TIMING_FORBIDDEN_ENV = (
     "PHRUST_REQUEST_PROFILE",
     "PHRUST_REQUEST_PROFILE_VM_COUNTERS",
     "PHRUST_REQUEST_PROFILE_SOURCE_ATTRIBUTION",
+    "PHRUST_PERF_ABLATION",
 )
+# Clean runs override and report these values instead of inheriting ambient
+# state. Ablations and instrumentation remain hard failures above.
+MANAGED_CLEAN_ENV = {
+    "PHRUST_JIT_COPY_PATCH": "1",
+    "PHRUST_INCLUDE_REVALIDATE_MS": "2000",
+    "PHRUST_WORKER_SYMBOL_EPOCH": "1",
+    "PHRUST_PERSISTENT_FEEDBACK": "1",
+}
 
 
 @dataclass
@@ -77,6 +87,16 @@ def main() -> int:
         return self_test()
     out_dir = output_dir(args)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.feedback_ab:
+        report = run_feedback_ab(args, out_dir)
+        write_json(report, out_dir / "summary.json")
+        write_feedback_ab_markdown(report, out_dir / "summary.md")
+        print(f"[{report['status']}] feedback A/B wrote {rel(out_dir / 'summary.md')}")
+        if report["status"] == "fail":
+            return 1
+        if report["status"] == "skip" and args.strict:
+            return 2
+        return 0
     report = run(args, out_dir)
     write_json(report, out_dir / "summary.json")
     write_markdown(report, out_dir / "summary.md")
@@ -141,6 +161,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--database-identity", default=os.environ.get("PHRUST_WORDPRESS_DB_IDENTITY", ""))
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
     parser.add_argument("--metrics-token", default=os.environ.get("PHRUST_METRICS_TOKEN", ""))
+    parser.add_argument(
+        "--engine-preset",
+        choices=("default", "experimental-jit"),
+        default="default",
+        help="Phrust execution preset; experimental-jit requires a jit-cranelift build",
+    )
+    parser.add_argument(
+        "--persistent-feedback",
+        choices=("on", "off"),
+        default="on",
+        help="A/B switch for request-persistent quickening and callsite feedback",
+    )
+    parser.add_argument(
+        "--feedback-ab",
+        action="store_true",
+        help="run isolated persistent-feedback off/on arms and write one comparison report",
+    )
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--baseline", default="")
     parser.add_argument("--compare", default="", help="legacy baseline comparison; implies --strict")
@@ -187,8 +224,101 @@ def run(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
             target.stop()
 
 
+def run_feedback_ab(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
+    """Run feedback-off and feedback-on arms with an explicit joint report."""
+    errors = validate_configuration(args)
+    if errors:
+        return {
+            "schema_version": 1,
+            "status": "fail",
+            "mode": "feedback-ab",
+            "timing_eligible": False,
+            "comparison": [],
+            "arms": {},
+            "failures": errors,
+        }
+    arms: dict[str, dict[str, Any]] = {}
+    for arm in ("off", "on"):
+        arm_args = copy.copy(args)
+        arm_args.feedback_ab = False
+        arm_args.persistent_feedback = arm
+        arm_args.out_dir = str(out_dir / arm)
+        arm_args.baseline = ""
+        arm_args.compare = ""
+        arm_args.record_baseline = ""
+        arm_dir = out_dir / arm
+        arm_dir.mkdir(parents=True, exist_ok=True)
+        arm_report = run(arm_args, arm_dir)
+        write_json(arm_report, arm_dir / "summary.json")
+        write_markdown(arm_report, arm_dir / "summary.md")
+        arms[arm] = arm_report
+
+    statuses = {report.get("status") for report in arms.values()}
+    status = "fail" if "fail" in statuses else "skip" if "skip" in statuses else "pass"
+    return {
+        "schema_version": 1,
+        "status": status,
+        "mode": "feedback-ab",
+        "timing_eligible": all(report.get("timing_eligible") is True for report in arms.values()),
+        "comparison": build_feedback_ab_ratios(arms["off"], arms["on"]),
+        "arms": {
+            arm: {
+                "status": report.get("status"),
+                "summary_json": rel(out_dir / arm / "summary.json"),
+                "summary_markdown": rel(out_dir / arm / "summary.md"),
+                "phrust_identity": ((report.get("engines") or {}).get("phrust") or {}).get("identity"),
+                "correctness_failures": (report.get("correctness") or {}).get("failures", []),
+            }
+            for arm, report in arms.items()
+        },
+    }
+
+
+def build_feedback_ab_ratios(
+    off_report: dict[str, Any], on_report: dict[str, Any]
+) -> list[dict[str, Any]]:
+    off_curves = (((off_report.get("engines") or {}).get("phrust") or {}).get("curves") or [])
+    on_curves = (((on_report.get("engines") or {}).get("phrust") or {}).get("curves") or [])
+    on_by_concurrency = {curve.get("concurrency"): curve for curve in on_curves}
+    comparisons: list[dict[str, Any]] = []
+    for off in off_curves:
+        concurrency = off.get("concurrency")
+        on = on_by_concurrency.get(concurrency)
+        if on is None:
+            continue
+        off_walls = [float(sample["wall_ms"]) for sample in off.get("samples", [])]
+        on_walls = [float(sample["wall_ms"]) for sample in on.get("samples", [])]
+        comparisons.append(
+            {
+                "concurrency": concurrency,
+                "off_to_on_p50_latency": safe_ratio(
+                    (off.get("latency_ms") or {}).get("p50"),
+                    (on.get("latency_ms") or {}).get("p50"),
+                ),
+                "off_to_on_p95_latency": safe_ratio(
+                    (off.get("latency_ms") or {}).get("p95"),
+                    (on.get("latency_ms") or {}).get("p95"),
+                ),
+                "off_to_on_p95_latency_ci95": bootstrap_percentile_ratio_ci(
+                    off_walls,
+                    on_walls,
+                    95,
+                    seed=int(concurrency or 0) * 131 + len(off_walls),
+                ) if off_walls and on_walls else None,
+                "on_to_off_requests_per_second": safe_ratio(
+                    on.get("requests_per_second"), off.get("requests_per_second")
+                ),
+            }
+        )
+    return comparisons
+
+
 def validate_configuration(args: argparse.Namespace) -> list[str]:
     errors: list[str] = []
+    if args.feedback_ab and args.mode != "clean":
+        errors.append("--feedback-ab requires --mode clean")
+    if args.feedback_ab and (args.baseline or args.compare or args.record_baseline):
+        errors.append("--feedback-ab cannot record or compare a regression baseline")
     levels = concurrency_levels(args.concurrency)
     if args.samples < 1:
         errors.append("samples must be positive")
@@ -280,6 +410,10 @@ def resolve_phrust(args: argparse.Namespace, out_dir: Path, docroot: Path | None
         str(docroot),
         "--front-controller",
         "index.php",
+        "--deployment-mode",
+        "immutable",
+        "--engine-preset",
+        args.engine_preset,
     ]
     artifacts = {"server_log": rel(log_path)}
     if args.mode == "diagnostic":
@@ -299,9 +433,30 @@ def resolve_phrust(args: argparse.Namespace, out_dir: Path, docroot: Path | None
         )
         artifacts.update({"request_profiles": rel(profile_dir), "trace": rel(trace_path)})
     startup_started_ns = time.perf_counter_ns()
-    process = subprocess.Popen(command, cwd=REPO_ROOT, text=True, stdout=log, stderr=subprocess.STDOUT)
+    process_env = os.environ.copy()
+    performance_environment = dict(MANAGED_CLEAN_ENV)
+    performance_environment["PHRUST_PERSISTENT_FEEDBACK"] = (
+        "1" if args.persistent_feedback == "on" else "0"
+    )
+    if args.mode == "clean":
+        process_env.update(performance_environment)
+        process_env.pop("PHRUST_PERF_ABLATION", None)
+    process = subprocess.Popen(
+        command,
+        cwd=REPO_ROOT,
+        env=process_env,
+        text=True,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+    )
     base_url = wait_for_server(process, log)
     identity = binary_identity(server)
+    identity["deployment_mode"] = "immutable"
+    identity["engine_preset"] = args.engine_preset
+    identity["persistent_feedback"] = args.persistent_feedback
+    identity["performance_environment"] = (
+        performance_environment if args.mode == "clean" else "diagnostic"
+    )
     identity["startup_ms"] = (time.perf_counter_ns() - startup_started_ns) / 1_000_000.0
     return ManagedTarget(
         HttpTarget("phrust", base_url, args.host_header, (process.pid,)),
@@ -1017,6 +1172,36 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
+def write_feedback_ab_markdown(report: dict[str, Any], path: Path) -> None:
+    lines = [
+        "# WordPress persistent-feedback A/B",
+        "",
+        f"Status: `{report['status']}`",
+        "",
+        "Ratios above 1.0 favor persistent feedback: off/on latency and on/off throughput.",
+        "",
+    ]
+    for failure in report.get("failures", []):
+        lines.append(f"- {failure}")
+    for comparison in report.get("comparison", []):
+        lines.append(
+            f"- concurrency {comparison['concurrency']}: p50 latency "
+            f"{format_ratio(comparison['off_to_on_p50_latency'])}, p95 latency "
+            f"{format_ratio(comparison['off_to_on_p95_latency'])} "
+            f"(95% bootstrap {format_interval(comparison['off_to_on_p95_latency_ci95'])}), "
+            f"throughput {format_ratio(comparison['on_to_off_requests_per_second'])}"
+        )
+    if not report.get("comparison") and not report.get("failures"):
+        lines.append("- No comparable clean timing curves were produced.")
+    lines.extend(["", "## Arms", ""])
+    for arm, details in report.get("arms", {}).items():
+        lines.append(
+            f"- feedback {arm}: {details['status']} "
+            f"(`{details['summary_markdown']}`)"
+        )
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
 def format_ratio(value: float | None) -> str:
     return "unsupported" if value is None else f"{value:.3f}x"
 
@@ -1080,6 +1265,31 @@ def self_test() -> int:
     assert is_release_binary(REPO_ROOT / "target/release/phrust-server")
     diagnostic = parse_args(["--mode", "diagnostic", "--samples", "1", "--concurrency", "1"])
     assert not validate_configuration(diagnostic)
+    invalid_ab = parse_args(["--mode", "diagnostic", "--feedback-ab"])
+    assert "requires --mode clean" in " ".join(validate_configuration(invalid_ab))
+    ab_off = {
+        "engines": {
+            "phrust": {
+                "curves": [{
+                    "concurrency": 1,
+                    "latency_ms": {"p50": 10.0, "p95": 20.0},
+                    "requests_per_second": 100.0,
+                    "samples": [{"wall_ms": 10.0}, {"wall_ms": 20.0}],
+                }]
+            }
+        }
+    }
+    ab_on = copy.deepcopy(ab_off)
+    ab_on["engines"]["phrust"]["curves"][0].update(
+        latency_ms={"p50": 5.0, "p95": 10.0}, requests_per_second=200.0
+    )
+    ab_on["engines"]["phrust"]["curves"][0]["samples"] = [
+        {"wall_ms": 5.0},
+        {"wall_ms": 10.0},
+    ]
+    ab_comparison = build_feedback_ab_ratios(ab_off, ab_on)
+    assert ab_comparison[0]["off_to_on_p95_latency"] == 2.0
+    assert ab_comparison[0]["on_to_off_requests_per_second"] == 2.0
     previous_trace = os.environ.get("PHRUST_PERF_TRACE")
     os.environ["PHRUST_PERF_TRACE"] = "target/forbidden-clean-trace.jsonl"
     try:

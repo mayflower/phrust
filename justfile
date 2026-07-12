@@ -94,6 +94,8 @@ help:
       '  just wordpress-root-profile Run optional local real WordPress request profile' \
       '  just wordpress-reference-image Build pinned PHP-FPM/OPcache benchmark image' \
       '  just wordpress-root-benchmark Run clean Phrust vs PHP-FPM WordPress gate' \
+      '  just wordpress-root-benchmark-feedback-ab Run persistent-feedback A/B' \
+      '  just wordpress-root-benchmark-cranelift Run experimental Cranelift arm' \
       '  just wordpress-root-diagnostics Run timing-ineligible Phrust diagnostics' \
       '  just wordpress-dense-fallback-report Summarize dense fallback attribution from latest request profile' \
       '  just wordpress-clone-churn-report Summarize clone/COW attribution from latest request profile' \
@@ -1157,8 +1159,20 @@ wordpress-reference-image:
 # Clean timing: release Phrust and stock PHP-FPM/OPcache. This never enables
 # request profiles, VM counters, or trace collection.
 wordpress-root-benchmark *args:
-    if [ -z "${PHRUST_WORDPRESS_PHRUST_URL:-${PHRUST_WORDPRESS_URL:-}}" ]; then cargo build --release -p php_server --bin phrust-server; fi
+    if [ -z "${PHRUST_WORDPRESS_PHRUST_URL:-${PHRUST_WORDPRESS_URL:-}}" ]; then cargo build --release -p php_server --bin phrust-server --no-default-features --features jit-copy-patch; fi
     PHRUST_SERVER="${PHRUST_SERVER:-${CARGO_TARGET_DIR:-target}/release/phrust-server}" scripts/performance/wordpress_root_benchmark.py --mode clean {{args}}
+
+# Explicit experimental-JIT arm for the clean WordPress A/B matrix. The
+# default benchmark remains copy-patch-only and is the control arm.
+wordpress-root-benchmark-cranelift *args:
+    if [ -z "${PHRUST_WORDPRESS_PHRUST_URL:-${PHRUST_WORDPRESS_URL:-}}" ]; then cargo build --release -p php_server --bin phrust-server --no-default-features --features jit-copy-patch,jit-cranelift; fi
+    PHRUST_SERVER="${PHRUST_SERVER:-${CARGO_TARGET_DIR:-target}/release/phrust-server}" scripts/performance/wordpress_root_benchmark.py --mode clean --engine-preset experimental-jit {{args}}
+
+# Isolated persistent-feedback A/B using the same lean binary and benchmark
+# contract. Both arms and their joint ratio report share one result directory.
+wordpress-root-benchmark-feedback-ab *args:
+    if [ -z "${PHRUST_WORDPRESS_PHRUST_URL:-${PHRUST_WORDPRESS_URL:-}}" ]; then cargo build --release -p php_server --bin phrust-server --no-default-features --features jit-copy-patch; fi
+    PHRUST_SERVER="${PHRUST_SERVER:-${CARGO_TARGET_DIR:-target}/release/phrust-server}" scripts/performance/wordpress_root_benchmark.py --mode clean --feedback-ab {{args}}
 
 # Instrumented Phrust-only attribution. Its samples are marked timing-ineligible.
 wordpress-root-diagnostics *args:
@@ -1168,7 +1182,7 @@ wordpress-root-diagnostics *args:
 # Strict regression gate: compare both engines and a recorded Phrust baseline;
 # missing WordPress or reference PHP is a failure.
 wordpress-root-regression-gate *args:
-    if [ -z "${PHRUST_WORDPRESS_PHRUST_URL:-${PHRUST_WORDPRESS_URL:-}}" ]; then cargo build --release -p php_server --bin phrust-server; fi
+    if [ -z "${PHRUST_WORDPRESS_PHRUST_URL:-${PHRUST_WORDPRESS_URL:-}}" ]; then cargo build --release -p php_server --bin phrust-server --no-default-features --features jit-copy-patch; fi
     PHRUST_SERVER="${PHRUST_SERVER:-${CARGO_TARGET_DIR:-target}/release/phrust-server}" scripts/performance/wordpress_root_benchmark.py --mode clean --strict --compare "${PHRUST_WORDPRESS_ROOT_BASELINE_JSON:-target/performance/wordpress-root/baseline.json}" {{args}}
 
 # Anti-theater guard: fail performance branches that only add docs, reports,

@@ -10111,6 +10111,10 @@ fn managed_native_platform_unavailable_keeps_interpreter_fast_paths() {
             quickening: QuickeningMode::On,
             inline_caches: InlineCacheMode::On,
             jit: JitMode::Cranelift,
+            // This test isolates the unavailable Cranelift tier. On aarch64,
+            // copy-patch is independently available and must not satisfy the
+            // generic native execution counter here.
+            copy_patch_leaf_override: Some(false),
             tiering: TieringOptions {
                 function_entry_threshold: 1,
                 ..TieringOptions::default()
@@ -23482,6 +23486,82 @@ for ($i = 0; $i < 3; $i++) {
         result.output.to_string_lossy(),
         expected_round.repeat(3),
         "cast getters must agree across interpreted and native iterations"
+    );
+}
+
+#[test]
+fn property_leaves_roundtrip_string_array_object_and_null() {
+    let result = execute_source_with_options(
+        "<?php
+class Payload {
+    public $value = null;
+    public function get() { return $this->value; }
+    public function put($value) { $this->value = $value; }
+}
+$payload = new Payload();
+$object = new stdClass();
+for ($i = 0; $i < 3; $i++) {
+    $payload->put('wordpress'); echo $payload->get(), '|';
+    $payload->put([10, 20]); echo $payload->get()[1], '|';
+    $payload->put($object); echo $payload->get() === $object ? 'object' : 'bad', '|';
+    $payload->put(null); echo is_null($payload->get()) ? 'null' : 'bad', PHP_EOL;
+}",
+        VmOptions {
+            collect_counters: true,
+            ..VmOptions::default()
+        },
+    );
+
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(
+        result.output.to_string_lossy(),
+        "wordpress|20|object|null\n".repeat(3),
+        "heap/null property values must agree across native and interpreter paths"
+    );
+    #[cfg(all(feature = "jit-copy-patch", unix, target_arch = "aarch64"))]
+    assert!(
+        result
+            .counters
+            .as_ref()
+            .is_some_and(|counters| counters.copy_patch_executed >= 4),
+        "mixed property values must actually execute through copy-patch: {:?}",
+        result.counters
+    );
+}
+
+#[test]
+fn value_tailcall_wrappers_roundtrip_mixed_wordpress_shapes() {
+    let result = execute_source_with_options(
+        "<?php
+function sink($value) { return $value; }
+function wrapper($value) { return sink($value); }
+$object = new stdClass();
+for ($i = 0; $i < 3; $i++) {
+    echo wrapper('filter'), '|';
+    echo wrapper([3, 7])[1], '|';
+    echo wrapper($object) === $object ? 'object' : 'bad', '|';
+    echo is_null(wrapper(null)) ? 'null' : 'bad', PHP_EOL;
+}",
+        VmOptions {
+            collect_counters: true,
+            ..VmOptions::default()
+        },
+    );
+
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(
+        result.output.to_string_lossy(),
+        "filter|7|object|null\n".repeat(3),
+        "plain call wrappers must preserve mixed values across native glue"
+    );
+    #[cfg(all(feature = "jit-copy-patch", unix, target_arch = "aarch64"))]
+    assert!(
+        result
+            .counters
+            .as_ref()
+            .is_some_and(|counters| counters.copy_patch_executed >= 4),
+        "mixed wrappers must actually execute through copy-patch: {:?}",
+        result.counters
     );
 }
 

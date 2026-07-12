@@ -28,6 +28,15 @@ pub(super) struct RequestProfileOperation<'vm> {
     start: Option<Instant>,
 }
 
+impl RequestProfileOperation<'_> {
+    /// Prevents a speculative operation sample from being recorded when the
+    /// fast path side-exits and the interpreter performs the real operation.
+    #[cfg(all(feature = "jit-copy-patch", unix, target_arch = "aarch64"))]
+    pub(super) fn cancel(&mut self) {
+        self.start = None;
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RequestProfileSample {
     inclusive_nanos: u64,
@@ -50,6 +59,19 @@ impl Vm {
             rich_instructions,
             dense_instructions,
         })
+    }
+
+    /// Abandons a speculative boundary when a fast path declines the call.
+    pub(super) fn request_profile_boundary_discard(
+        &self,
+        boundary: Option<RequestProfileBoundary>,
+    ) {
+        if boundary.is_some() {
+            self.request_profile_stack
+                .borrow_mut()
+                .pop()
+                .expect("active request-profile boundary");
+        }
     }
 
     pub(super) fn record_counter_function_profile(

@@ -75,9 +75,9 @@ Failed PHP requests include the last failure phase that was reached.
 
 `/__phrust/metrics` exposes aggregate phase counts/timing plus source-read and
 cache-effectiveness counters for the entry script and include cache. It also
-reports session seed/lazy-load/finalize/store counters: requests that never
-activate a PHP session should increment seed/finalize counters without
-incrementing session-store load/write counters. Header materialization counters
+reports session seed/lazy-load/ID-generation/finalize/store counters: requests
+that never activate a PHP session should increment seed/finalize counters
+without incrementing ID-generation or session-store load/write counters. Header materialization counters
 show how many incoming headers were seen, carried into the runtime context, or
 skipped because an equivalent direct PHP server value already exists. The server
 snapshots process environment variables at startup for normal request contexts;
@@ -126,11 +126,15 @@ PHRUST_WORDPRESS_DIR=/path/to/wordpress \
   nix develop -c just wordpress-root-benchmark
 ```
 
-The helper starts release Phrust and stock PHP-FPM with OPcache behind nginx.
-Reports land under `target/performance/wordpress-root/` and include p50/p95,
-throughput, CPU/RSS where supported, response equivalence, identities, and
-Phrust/PHP ratios. Use `just wordpress-root-diagnostics` for a separate
-instrumented Phrust pass; diagnostic samples are never mixed into clean timing.
+The helper starts telemetry-free `release-lean` Phrust with an immutable
+deployment root and stock PHP-FPM with OPcache behind nginx. Reports land under
+`target/performance/wordpress-root/` and include p50/p95, throughput, CPU/RSS
+where supported, response equivalence, identities, and Phrust/PHP ratios. Use
+`just wordpress-root-benchmark-feedback-ab` for persistent-feedback A/B with a
+joint off/on ratio report and
+`just wordpress-root-benchmark-cranelift` for the explicit experimental-JIT
+arm. Use `just wordpress-root-diagnostics` for a separate instrumented Phrust
+pass; diagnostic samples are never mixed into clean timing.
 
 See [WordPress smoke workflow](contributor/wordpress-smoke.md) for the profile
 schema and how to interpret clone, fallback, dense/rich, array, object, builtin,

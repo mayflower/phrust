@@ -15,8 +15,8 @@ use php_executor::{
     PhpExecutorOptions, PhpScriptCacheInput,
 };
 use php_vm::api::{
-    CacheInstanceId, DenseIncludeMode, DenseJumpThreadingMode, InlineCacheMode, JitMode,
-    QuickeningMode, QuickeningSiteSnapshot, VmError,
+    CacheInstanceId, DenseIncludeMode, DenseJumpThreadingMode, FunctionCallSiteSnapshot,
+    InlineCacheMode, JitMode, QuickeningMode, QuickeningSiteSnapshot, VmError,
 };
 use std::{
     net::SocketAddr,
@@ -176,15 +176,12 @@ impl ServerEngineState {
             options.vm_options.max_steps = self.max_vm_steps;
             options
         };
+        options.collect_quickening_feedback = persistent_feedback_enabled();
         self.apply_engine_overrides(&mut options);
         options
     }
 
     fn apply_engine_overrides(&self, options: &mut PhpExecutorOptions) {
-        let quickening_seed = self.persistent_metadata.quickening_templates();
-        if !quickening_seed.is_empty() {
-            options.vm_options.quickening_seed = quickening_seed;
-        }
         if let Some(mode) = self.dense_includes {
             options.vm_options.dense_include_execution = mode;
         }
@@ -230,10 +227,21 @@ impl ServerEngineState {
 
     pub(crate) fn executor_options_for_request(
         &self,
+        script: &str,
         metrics: &ServerMetrics,
     ) -> PhpExecutorOptions {
-        let options = self.executor_options_with_include_cache();
-        let instantiated = options.vm_options.quickening_seed.len() as u64;
+        let mut options = self.executor_options_with_include_cache();
+        if !options.collect_quickening_feedback {
+            return options;
+        }
+        options.vm_options.quickening_seed = self.persistent_metadata.quickening_templates(script);
+        options.vm_options.callsite_seed = self.persistent_metadata.callsite_templates(script);
+        let instantiated = options
+            .vm_options
+            .quickening_seed
+            .len()
+            .saturating_add(options.vm_options.callsite_seed.len())
+            as u64;
         if instantiated > 0 {
             metrics
                 .persistent_engine_feedback_template_instantiations
@@ -255,10 +263,20 @@ impl ServerEngineState {
 
     pub(crate) fn absorb_quickening_feedback(
         &self,
+        script: &str,
         feedback: Vec<QuickeningSiteSnapshot>,
     ) -> usize {
         self.persistent_metadata
-            .absorb_quickening_feedback(feedback)
+            .absorb_quickening_feedback(script, feedback)
+    }
+
+    pub(crate) fn absorb_callsite_feedback(
+        &self,
+        script: &str,
+        feedback: Vec<FunctionCallSiteSnapshot>,
+    ) -> usize {
+        self.persistent_metadata
+            .absorb_callsite_feedback(script, feedback)
     }
 
     pub(crate) fn persistent_metadata_stats(&self) -> PersistentMetadataStats {
@@ -279,6 +297,17 @@ impl ServerEngineState {
             },
         )
     }
+}
+
+fn persistent_feedback_enabled() -> bool {
+    std::env::var("PHRUST_PERSISTENT_FEEDBACK")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no" | ""
+            )
+        })
+        .unwrap_or(true)
 }
 
 impl AppState {

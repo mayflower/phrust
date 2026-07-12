@@ -8,6 +8,7 @@ pub(super) struct RequestLifecycleState {
     pub(super) upload_registry: UploadRegistry,
     pub(super) session: php_runtime::api::SessionState,
     pub(super) session_loader: Option<php_runtime::api::SessionLoadCallback>,
+    pub(super) session_id_generator: Option<php_runtime::api::SessionIdGenerateCallback>,
     pub(super) sapi_name: String,
     pub(super) php_binary: String,
 }
@@ -18,6 +19,7 @@ impl RequestLifecycleState {
             upload_registry: context.upload_registry(),
             session: context.session.clone(),
             session_loader: context.session_loader.clone(),
+            session_id_generator: context.session_id_generator.clone(),
             sapi_name: context.sapi_name.clone(),
             php_binary: context.php_binary.clone(),
             ..Self::default()

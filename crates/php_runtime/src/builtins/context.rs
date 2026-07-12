@@ -5,8 +5,9 @@ use crate::{
     FilesystemCapabilities, IniRegistry, MysqlState, ObjectRef, OutputBuffer, PHP_E_DEPRECATED,
     PHP_E_NOTICE, PHP_E_WARNING, PcreCache, PhpArray, PhpDiagnosticChannel,
     PhpDiagnosticDisplayOptions, PostgresState, ReferenceCell, ResourceTable, RuntimeDiagnostic,
-    RuntimeHttpResponseState, RuntimeSeverity, SessionLoadCallback, SessionState, UploadRegistry,
-    Value, datetime, emit_php_diagnostic, source_span::RuntimeSourceSpan,
+    RuntimeHttpResponseState, RuntimeSeverity, SessionIdGenerateCallback, SessionLoadCallback,
+    SessionState, UploadRegistry, Value, datetime, emit_php_diagnostic,
+    source_span::RuntimeSourceSpan,
 };
 use curl::easy::{Handler, WriteError};
 use curl::multi::{Easy2Handle, Multi};
@@ -230,6 +231,7 @@ pub(in crate::builtins) struct BuiltinSessionContext<'a> {
     session_state: Option<&'a mut SessionState>,
     session_global: Option<ReferenceCell>,
     session_loader: Option<&'a SessionLoadCallback>,
+    session_id_generator: Option<&'a SessionIdGenerateCallback>,
 }
 
 enum BuiltinRequestStateAccess<'a> {
@@ -1014,6 +1016,30 @@ impl<'a> BuiltinContext<'a> {
     /// Sets the request-local transport callback for lazy session data loading.
     pub fn set_session_loader(&mut self, loader: Option<&'a SessionLoadCallback>) {
         self.sessions.session_loader = loader;
+    }
+
+    /// Sets the request-local transport callback for lazy session-id generation.
+    pub fn set_session_id_generator(&mut self, generator: Option<&'a SessionIdGenerateCallback>) {
+        self.sessions.session_id_generator = generator;
+    }
+
+    /// Generates and stages a transport session id when the active operation
+    /// needs to create one. CLI contexts retain their deterministic fallback.
+    pub fn prepare_new_session_id(&mut self) -> Result<(), String> {
+        if self.sessions.session_state.is_none() {
+            return Ok(());
+        }
+        let Some(generator) = self.sessions.session_id_generator else {
+            return Ok(());
+        };
+        let id = generator.generate()?;
+        let state = self
+            .sessions
+            .session_state
+            .as_deref_mut()
+            .expect("session state checked above");
+        state.set_pending_generated_id(id);
+        Ok(())
     }
 
     /// Request-local session state.

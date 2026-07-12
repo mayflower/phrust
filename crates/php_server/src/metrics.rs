@@ -42,6 +42,7 @@ pub(crate) struct ServerMetrics {
     pub(crate) session_seed_attempts: AtomicU64,
     pub(crate) session_store_loads: AtomicU64,
     pub(crate) session_lazy_loads: AtomicU64,
+    pub(crate) session_id_generations: AtomicU64,
     pub(crate) session_finalizations: AtomicU64,
     pub(crate) session_store_writes: AtomicU64,
     pub(crate) session_store_deletes: AtomicU64,
@@ -211,6 +212,7 @@ phrust_server_runtime_diagnostics_total {}\n\
 phrust_server_session_seed_attempts_total {}\n\
 phrust_server_session_store_loads_total {}\n\
 phrust_server_session_lazy_loads_total {}\n\
+phrust_server_session_id_generations_total {}\n\
 phrust_server_session_finalizations_total {}\n\
 phrust_server_session_store_writes_total {}\n\
 phrust_server_session_store_deletes_total {}\n\
@@ -317,6 +319,7 @@ phrust_server_persistent_engine_feedback_template_absorptions_total {}\n",
             self.session_seed_attempts.load(Ordering::Relaxed),
             self.session_store_loads.load(Ordering::Relaxed),
             self.session_lazy_loads.load(Ordering::Relaxed),
+            self.session_id_generations.load(Ordering::Relaxed),
             self.session_finalizations.load(Ordering::Relaxed),
             self.session_store_writes.load(Ordering::Relaxed),
             self.session_store_deletes.load(Ordering::Relaxed),

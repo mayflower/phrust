@@ -54,10 +54,6 @@ pub(super) struct InternalFunctionDispatchCache {
 }
 
 impl InternalFunctionDispatchCache {
-    pub(super) fn clear(&mut self) {
-        self.entries.clear();
-    }
-
     pub(super) fn lookup(
         &mut self,
         name: &str,
@@ -287,6 +283,7 @@ pub(super) fn execute_builtin_entry(
         .ensure_slot("_SESSION", initial_session_global);
     context.set_session_state(&mut state.request.session, session_global);
     context.set_session_loader(state.request.session_loader.as_ref());
+    context.set_session_id_generator(state.request.session_id_generator.as_ref());
     context.sync_session_state_from_global();
     let time_limit_arg = (entry.name() == "set_time_limit").then(|| args.first().cloned());
     let result = (entry.function())(&mut context, args, source_span.clone());

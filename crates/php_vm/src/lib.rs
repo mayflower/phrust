@@ -113,7 +113,7 @@ pub mod api {
     pub use crate::tiering::{TieringOptions, TieringStats};
     pub use crate::vm::{
         BytecodeLayoutMode, DenseIncludeMode, DenseJumpThreadingMode, ExecutionFormat,
-        JitBlacklistMode, JitMode, SuperinstructionMode, Vm, VmOptions, VmResult,
+        JitBlacklistMode, JitMode, SuperinstructionMode, Vm, VmOptions, VmResult, VmWorkerState,
     };
 }
 

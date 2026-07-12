@@ -88,10 +88,39 @@ impl Vm {
         } else {
             params.extend(call.positional_values.iter().cloned());
         }
+        // The native hook runs before the interpreter's normal binding loop.
+        // Apply the identical parameter coercion/type check here so a native
+        // leaf cannot erase weak scalar coercions, strict `TypeError`s, or the
+        // typecheck fast-path counters. A mismatch falls through before any
+        // native code has run; the ordinary call path then constructs the
+        // canonical error and trace.
+        let param_offset = usize::from(call.this_value.is_some());
+        let call_site_strict_types = call
+            .argument_binding_policy(compiled)
+            .call_site_strict_types;
+        for (arg_index, param) in function.params.iter().enumerate() {
+            let value = params.get_mut(param_offset + arg_index)?;
+            if coerce_or_check_param_type(
+                compiled,
+                state,
+                function,
+                param,
+                arg_index,
+                value,
+                false,
+                self.typecheck_fast_path_context(),
+                call_site_strict_types,
+                call.call_span,
+            )
+            .is_err()
+            {
+                return None;
+            }
+        }
         // Return-and-resume call compositions need the VM to drive the
         // suspend/perform-call/re-enter loop rather than a single region run.
         if leaf.resume_plan().is_some() {
-            return self.execute_copy_patch_resume_leaf(
+            let result = self.execute_copy_patch_resume_leaf(
                 compiled,
                 function_id,
                 function,
@@ -102,17 +131,44 @@ impl Vm {
                 stack,
                 state,
             );
-        }
-        match leaf.run_outcome(&params) {
-            crate::copy_patch_bridge::LeafOutcome::Value(value) => {
-                Some(VmResult::success_no_output(Some(value)))
+            if result.is_some() {
+                self.record_counter_copy_patch_executed();
             }
+            return result;
+        }
+        let mut operation_profile = leaf.property_operation_family().map(|family| {
+            self.request_profile_operation_start(RequestProfileOperationCategory::Object, family)
+        });
+        let outcome = leaf.run_outcome(&params);
+        if matches!(&outcome, crate::copy_patch_bridge::LeafOutcome::Fallback)
+            && let Some(operation_profile) = operation_profile.as_mut()
+        {
+            operation_profile.cancel();
+        }
+        drop(operation_profile);
+        match outcome {
+            crate::copy_patch_bridge::LeafOutcome::Value(value) => match coerce_return_value(
+                compiled,
+                state,
+                function,
+                Some(value),
+                self.typecheck_fast_path_context(),
+            ) {
+                Ok(value) => {
+                    self.record_counter_copy_patch_executed();
+                    Some(VmResult::success_no_output(value))
+                }
+                // Recognized value-returning leaves are pure until commit. A
+                // defensive return mismatch can therefore use the canonical
+                // interpreter path without duplicating observable effects.
+                Err(_) => None,
+            },
             crate::copy_patch_bridge::LeafOutcome::Fallback => None,
             // The native prefix computed the arguments and requested the userland
             // call. The bridge never re-enters the VM; the call runs here, on the
             // identical normal path, so behavior matches the interpreter exactly.
-            crate::copy_patch_bridge::LeafOutcome::TailCall { callee_name, args } => self
-                .execute_copy_patch_tailcall(
+            crate::copy_patch_bridge::LeafOutcome::TailCall { callee_name, args } => {
+                let result = self.execute_copy_patch_tailcall(
                     compiled,
                     function_id,
                     function,
@@ -124,7 +180,12 @@ impl Vm {
                     output,
                     stack,
                     state,
-                ),
+                );
+                if result.is_some() {
+                    self.record_counter_copy_patch_executed();
+                }
+                result
+            }
         }
     }
 

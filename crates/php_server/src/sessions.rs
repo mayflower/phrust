@@ -1,5 +1,5 @@
 use super::state::AppState;
-use crate::session_store::{generate_session_id, valid_session_id};
+use crate::session_store::valid_session_id;
 use php_executor::PhpExecutionOutput;
 use php_runtime::api::{PHP_SESSION_ACTIVE, RuntimeHttpRequestContext, SessionState};
 use std::sync::atomic::Ordering;
@@ -24,13 +24,10 @@ pub(crate) fn seed_session_state(
         .map(|(_, value)| value.as_str())
         .filter(|value| valid_session_id(value))
         .unwrap_or("");
-    let generated_id = generate_session_id().map_err(|error| {
-        format!("E_PHP_SESSION_STORE_UNAVAILABLE: failed to generate session id: {error}")
-    })?;
     Ok(SessionState::seeded_lazy(
         state.sessions.config.cookie_name.clone(),
         incoming_id.to_string(),
-        Some(generated_id),
+        None,
     ))
 }
 

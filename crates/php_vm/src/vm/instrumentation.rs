@@ -899,6 +899,16 @@ impl Vm {
         }
     }
 
+    #[cfg(all(feature = "jit-copy-patch", unix, target_arch = "aarch64"))]
+    pub(super) fn record_counter_copy_patch_executed(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_copy_patch_executed();
+        }
+    }
+
     #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
     pub(super) fn record_counter_jit_bailout(&self) {
         if !self.options.collect_counters {

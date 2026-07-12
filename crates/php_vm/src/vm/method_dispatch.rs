@@ -13,6 +13,38 @@ impl Vm {
         object: &ObjectRef,
         args: &[CallArgument],
     ) -> Option<VmResult> {
+        let profile_boundary = self.request_profile_boundary_start();
+        let function_profile = profile_boundary.is_some().then(|| {
+            owner
+                .unit()
+                .functions
+                .get(method_function.index())
+                .map(|function| (function.name.clone(), function.flags.is_method))
+        });
+        let result = self.try_inline_trivial_method_inner(
+            owner,
+            method_function,
+            declaring_class,
+            object,
+            args,
+        );
+        match (result.as_ref(), function_profile.flatten()) {
+            (Some(_), Some((name, is_method))) => {
+                self.record_counter_function_profile(&name, is_method, profile_boundary);
+            }
+            _ => self.request_profile_boundary_discard(profile_boundary),
+        }
+        result
+    }
+
+    fn try_inline_trivial_method_inner(
+        &self,
+        owner: &CompiledUnit,
+        method_function: FunctionId,
+        declaring_class: &php_ir::module::ClassEntry,
+        object: &ObjectRef,
+        args: &[CallArgument],
+    ) -> Option<VmResult> {
         let key = (compiled_unit_cache_key(owner), method_function.raw());
         let plan = {
             let plans = self.trivial_method_plans.borrow();
@@ -193,8 +225,9 @@ impl Vm {
         let owner = &route.owner;
         let plan = route.plan.as_ref();
         #[cfg(feature = "jit-copy-patch")]
-        if let Some(ir_function) = owner.unit().functions.get(function.index())
-            && let Some(result) = self.try_execute_copy_patch_leaf(
+        if let Some(ir_function) = owner.unit().functions.get(function.index()) {
+            let profile_boundary = self.request_profile_boundary_start();
+            if let Some(result) = self.try_execute_copy_patch_leaf(
                 owner,
                 function,
                 ir_function,
@@ -202,9 +235,15 @@ impl Vm {
                 output,
                 stack,
                 state,
-            )
-        {
-            return result;
+            ) {
+                self.record_counter_function_profile(
+                    &ir_function.name,
+                    ir_function.flags.is_method,
+                    profile_boundary,
+                );
+                return result;
+            }
+            self.request_profile_boundary_discard(profile_boundary);
         }
         self.record_counter_dense_method_dispatch_attempt();
         if call.resume_continuation.is_some()

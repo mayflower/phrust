@@ -147,9 +147,9 @@ pub mod api {
     pub use crate::context::{
         ErrorReporting, ProcessCapability, RuntimeContext, RuntimeHttpHeader,
         RuntimeHttpRequestContext, RuntimeHttpResponseState, RuntimeIniOptions, RuntimeInputFilter,
-        RuntimeRequestMode, RuntimeUploadedFile, SessionLoadCallback, StrictTypesInfo,
-        UploadRegistry, UploadRegistryEntry, parse_cookie_header, parse_form_urlencoded_body,
-        parse_query_string, parse_query_string_with_separators,
+        RuntimeRequestMode, RuntimeUploadedFile, SessionIdGenerateCallback, SessionLoadCallback,
+        StrictTypesInfo, UploadRegistry, UploadRegistryEntry, parse_cookie_header,
+        parse_form_urlencoded_body, parse_query_string, parse_query_string_with_separators,
     };
     pub use crate::convert::{
         ArithmeticNumber, NumericValue, compare, compare_php, equal, equal_php, identical,
@@ -330,8 +330,8 @@ pub(crate) use callable::{
     CallableMethodTarget, CallableValue, ClosureCaptureValue, ClosureDebugParameter, ClosurePayload,
 };
 pub(crate) use context::{
-    RuntimeHttpResponseState, RuntimeIniOptions, RuntimeInputFilter, SessionLoadCallback,
-    UploadRegistry, parse_query_string_with_separators,
+    RuntimeHttpResponseState, RuntimeIniOptions, RuntimeInputFilter, SessionIdGenerateCallback,
+    SessionLoadCallback, UploadRegistry, parse_query_string_with_separators,
 };
 pub(crate) use convert::{
     NumericValue, compare, equal, identical, to_bool, to_float, to_int, to_number, to_string,

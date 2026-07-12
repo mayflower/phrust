@@ -12,12 +12,13 @@ use crate::pipeline::{
 use crate::request::include_loader_for_request;
 use php_runtime::api::{FilesystemCapabilities, RuntimeHttpResponseState};
 use php_source::SourceText;
-use php_vm::api::{CompiledUnit, Vm, VmOptions};
+use php_vm::api::{CompiledUnit, Vm, VmOptions, VmWorkerState};
 
 /// Transport-independent PHP executor.
 #[derive(Clone, Debug, Default)]
 pub struct PhpExecutor {
     options: PhpExecutorOptions,
+    worker_state: VmWorkerState,
 }
 
 impl PhpExecutor {
@@ -30,7 +31,19 @@ impl PhpExecutor {
     /// Creates an executor with explicit defaults.
     #[must_use]
     pub fn with_options(options: PhpExecutorOptions) -> Self {
-        Self { options }
+        let worker_state = VmWorkerState::new(options.vm_options.tiering.clone());
+        Self {
+            options,
+            worker_state,
+        }
+    }
+
+    /// Replaces request policy while retaining engine-owned worker caches.
+    ///
+    /// Persistent feedback seeds vary by compiled script and request, but must
+    /// not evict JIT handles, tiering hotness, or other worker-stable caches.
+    pub fn reconfigure(&mut self, options: PhpExecutorOptions) {
+        self.options = options;
     }
 
     /// Compiles source into a reusable artifact.
@@ -115,17 +128,20 @@ impl PhpExecutor {
             capabilities = capabilities.with_allowed_roots(loader.allowed_roots().to_vec());
         }
         runtime_context = runtime_context.with_filesystem_capabilities(capabilities);
-        let vm = Vm::with_options(VmOptions {
-            include_loader,
-            include_compiler: Some(std::sync::Arc::new(ExecutorIncludeCompiler::new(
-                self.options.include_optimization_level,
-            ))),
-            runtime_context,
-            collect_counters: input.collect_counters,
-            collect_profile_spans: input.collect_profile_spans,
-            collect_layout_source_attribution: input.collect_layout_source_attribution,
-            ..self.options.vm_options.clone()
-        });
+        let vm = Vm::with_options_and_worker_state(
+            VmOptions {
+                include_loader,
+                include_compiler: Some(std::sync::Arc::new(ExecutorIncludeCompiler::new(
+                    self.options.include_optimization_level,
+                ))),
+                runtime_context,
+                collect_counters: input.collect_counters,
+                collect_profile_spans: input.collect_profile_spans,
+                collect_layout_source_attribution: input.collect_layout_source_attribution,
+                ..self.options.vm_options.clone()
+            },
+            self.worker_state.clone(),
+        );
         let result = vm.execute(compiled.executable_unit());
         let (quickening_feedback, callsite_feedback, persistent_feedback_epochs) =
             if self.options.collect_quickening_feedback {
@@ -200,6 +216,12 @@ impl CompiledPhpScript {
             source,
             executable: CompiledUnit::with_ordered_sources(lowering.unit, [retained_source]),
         }
+    }
+
+    /// Stable source path used to scope request-persistent engine feedback.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
     /// Rehydrates a compiled script from an externally cached IR unit.
@@ -443,6 +465,77 @@ mod tests {
         assert_eq!(first.stdout, b"3");
         assert_eq!(second.stdout, b"3");
         assert!(before.ptr_eq(&after));
+    }
+
+    #[test]
+    fn execute_compiled_reuses_worker_builtin_dispatch_cache() {
+        let executor = PhpExecutor::new();
+        let compiled = executor
+            .compile_source(PhpCompileInput {
+                source: "<?php echo strlen('abc');".to_string(),
+                source_path: "worker-cache.php".to_string(),
+                optimization_level: Some(OptimizationLevel::O0),
+            })
+            .expect("compile reusable script");
+        let input = || PhpRequestExecutionInput {
+            real_path: None,
+            cwd: std::env::current_dir().expect("current directory"),
+            include_roots: Vec::new(),
+            runtime_context: RuntimeContext::controlled_cli("worker-cache.php", Vec::new()),
+            collect_counters: true,
+            collect_profile_spans: false,
+            collect_layout_source_attribution: false,
+        };
+
+        let first = executor.execute_compiled(&compiled, input());
+        let second = executor.execute_compiled(&compiled, input());
+        assert_eq!(first.stdout, b"3");
+        assert_eq!(second.stdout, b"3");
+        let first = first.counters.expect("first counters");
+        let second = second.counters.expect("second counters");
+        assert!(first.internal_function_dispatch_cache_misses > 0);
+        assert!(second.internal_function_dispatch_cache_hits > 0);
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn execute_compiled_reuses_worker_cranelift_compile_cache() {
+        let mut options = PhpExecutorOptions::managed_fast_runtime();
+        // Dense direct dispatch completes before the rich tiering hook. Force
+        // this cache-ownership test through the IR dispatcher so Cranelift is
+        // actually selected on the first call.
+        options.vm_options.execution_format = ExecutionFormat::Ir;
+        options.vm_options.jit = JitMode::Cranelift;
+        options.vm_options.tiering.jit_eager = true;
+        options.vm_options.copy_patch_leaf_override = Some(false);
+        let executor = PhpExecutor::with_options(options);
+        let compiled = executor
+            .compile_source(PhpCompileInput {
+                source:
+                    "<?php function add(int $a, int $b): int { return $a + $b; } echo add(1, 2);"
+                        .to_owned(),
+                source_path: "worker-jit-cache.php".to_owned(),
+                optimization_level: Some(OptimizationLevel::O0),
+            })
+            .expect("compile reusable JIT script");
+        let input = || PhpRequestExecutionInput {
+            real_path: None,
+            cwd: std::env::current_dir().expect("current directory"),
+            include_roots: Vec::new(),
+            runtime_context: RuntimeContext::controlled_cli("worker-jit-cache.php", Vec::new()),
+            collect_counters: true,
+            collect_profile_spans: false,
+            collect_layout_source_attribution: false,
+        };
+
+        let first = executor.execute_compiled(&compiled, input());
+        let second = executor.execute_compiled(&compiled, input());
+        assert_eq!(first.stdout, b"3");
+        assert_eq!(second.stdout, b"3");
+        let first = first.counters.expect("first counters");
+        let second = second.counters.expect("second counters");
+        assert!(first.jit_compile_cache_misses > 0, "{first:?}");
+        assert!(second.jit_compile_cache_hits > 0, "{second:?}");
     }
 
     fn managed_fast_counter_source() -> &'static str {

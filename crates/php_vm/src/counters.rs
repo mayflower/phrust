@@ -451,6 +451,7 @@ pub struct VmCounters {
     pub native_candidates: u64,
     pub native_compiled_regions: u64,
     pub native_executions: u64,
+    pub copy_patch_executed: u64,
     pub native_compile_budget_rejections: u64,
     pub native_eligibility_rejections_by_reason: BTreeMap<String, u64>,
     pub native_side_exits_by_reason: BTreeMap<String, u64>,
@@ -2060,6 +2061,15 @@ impl VmCounters {
     #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
     pub(crate) fn record_jit_executed(&mut self) {
         self.jit_executed += 1;
+        self.native_executions += 1;
+    }
+
+    #[cfg_attr(
+        not(all(feature = "jit-copy-patch", unix, target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn record_copy_patch_executed(&mut self) {
+        self.copy_patch_executed += 1;
         self.native_executions += 1;
     }
 
@@ -4202,6 +4212,12 @@ impl VmCounters {
             true,
         );
         push_field(&mut json, "native_executions", self.native_executions, true);
+        push_field(
+            &mut json,
+            "copy_patch_executed",
+            self.copy_patch_executed,
+            true,
+        );
         push_field(
             &mut json,
             "native_compile_budget_rejections",
@@ -6731,6 +6747,7 @@ mod tests {
         assert!(json.contains("\"native_candidates\": 0"));
         assert!(json.contains("\"native_compiled_regions\": 0"));
         assert!(json.contains("\"native_executions\": 0"));
+        assert!(json.contains("\"copy_patch_executed\": 0"));
         assert!(json.contains("\"native_compile_budget_rejections\": 0"));
         assert!(json.contains("\"native_eligibility_rejections_by_reason\": {}"));
         assert!(json.contains("\"native_side_exits_by_reason\": {}"));

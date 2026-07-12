@@ -24,8 +24,8 @@ use php_executor::{
     PhpExecutionStatus, PhpExecutor, PhpRequestExecutionInput,
 };
 use php_runtime::api::{
-    RuntimeContext, RuntimeHttpRequestContext, RuntimeHttpResponseState, SessionLoadCallback,
-    SessionState, Value, parse_cookie_header, parse_form_urlencoded_body,
+    RuntimeContext, RuntimeHttpRequestContext, RuntimeHttpResponseState, SessionIdGenerateCallback,
+    SessionLoadCallback, SessionState, Value, parse_cookie_header, parse_form_urlencoded_body,
 };
 use std::{
     cell::RefCell,
@@ -1196,14 +1196,15 @@ pub(crate) fn execute_compiled_php_with_state(
     mode: RequestCounterMode,
     collect_profile_spans: bool,
 ) -> Result<PhpExecutionOutput, PhpExecutionError> {
+    let feedback_key = lookup.compiled.path().to_owned();
     state
         .services
         .metrics
         .persistent_engine_request_local_resets
         .fetch_add(1, Ordering::Relaxed);
-    // Honest accounting: every request rebuilds its request-local engine
-    // state; nothing beyond compiled artifacts and feedback templates is
-    // persisted, and that rejection stays visible as a metric.
+    // PHP-visible state is always rebuilt. The worker retains only explicitly
+    // engine-owned plans, constants, builtin/JIT handles, tiering hotness, and
+    // feedback templates; rejecting frames/globals/resources remains visible.
     state
         .services
         .metrics
@@ -1231,7 +1232,14 @@ pub(crate) fn execute_compiled_php_with_state(
     let absorbed = state
         .services
         .engine
-        .absorb_quickening_feedback(std::mem::take(&mut output.quickening_feedback));
+        .absorb_quickening_feedback(
+            &feedback_key,
+            std::mem::take(&mut output.quickening_feedback),
+        )
+        .saturating_add(state.services.engine.absorb_callsite_feedback(
+            &feedback_key,
+            std::mem::take(&mut output.callsite_feedback),
+        ));
     if absorbed > 0 {
         state
             .services
@@ -1250,11 +1258,7 @@ fn execute_compiled_with_request_executor(
     let options = state
         .services
         .engine
-        .executor_options_for_request(&state.services.metrics);
-    if !options.vm_options.quickening_seed.is_empty() {
-        return PhpExecutor::with_options(options).execute_compiled(compiled, input);
-    }
-
+        .executor_options_for_request(compiled.path(), &state.services.metrics);
     let key = state.services.engine.request_executor_cache_key();
     REQUEST_EXECUTOR_CACHE.with(|cache| {
         let mut cached = cache.borrow_mut();
@@ -1269,7 +1273,10 @@ fn execute_compiled_with_request_executor(
             });
         }
         match cached.as_mut() {
-            Some(cached) => cached.executor.execute_compiled(compiled, input),
+            Some(cached) => {
+                cached.executor.reconfigure(options);
+                cached.executor.execute_compiled(compiled, input)
+            }
             None => PhpExecutor::with_options(options).execute_compiled(compiled, input),
         }
     })
@@ -1926,6 +1933,7 @@ pub(crate) fn php_runtime_context_for_http(
         .with_include_path(vec![state.route_config.docroot.clone()])
         .with_session_state(session_state)
         .with_session_loader(session_load_callback(state))
+        .with_session_id_generator(session_id_generate_callback(state))
         .with_execution_time_limit(state.request.execution_time_limit)
         .with_sorted_env_arc(env)
         .with_stdin(body)
@@ -1939,6 +1947,18 @@ fn session_load_callback(state: &AppState) -> SessionLoadCallback {
         metrics.session_store_loads.fetch_add(1, Ordering::Relaxed);
         store.load(id).map_err(|error| {
             format!("E_PHP_SESSION_STORE_UNAVAILABLE: failed to load session: {error}")
+        })
+    })
+}
+
+fn session_id_generate_callback(state: &AppState) -> SessionIdGenerateCallback {
+    let metrics = Arc::clone(&state.services.metrics);
+    SessionIdGenerateCallback::new(move || {
+        metrics
+            .session_id_generations
+            .fetch_add(1, Ordering::Relaxed);
+        crate::session_store::generate_session_id().map_err(|error| {
+            format!("E_PHP_SESSION_STORE_UNAVAILABLE: failed to generate session id: {error}")
         })
     })
 }

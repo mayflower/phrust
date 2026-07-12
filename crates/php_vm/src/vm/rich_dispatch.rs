@@ -91,6 +91,7 @@ impl Vm {
             CachedDenseFunctionDispatch::Continue(call) => call,
         };
         let function_tier = self.tiering.borrow_mut().record_function_entry(
+            compiled_unit_cache_key(compiled),
             function_id,
             self.options.quickening,
             self.options.jit,
@@ -3390,7 +3391,7 @@ impl Vm {
                     return result;
                 }
                 TerminatorKind::Jump { target } => {
-                    self.record_tiering_backedge(function_id, block_id, *target);
+                    self.record_tiering_backedge(compiled, function_id, block_id, *target);
                     block_id = *target;
                 }
                 TerminatorKind::JumpIfFalse { condition, target } => {
@@ -3408,10 +3409,10 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        self.record_tiering_backedge(function_id, block_id, next);
+                        self.record_tiering_backedge(compiled, function_id, block_id, next);
                         block_id = next;
                     } else {
-                        self.record_tiering_backedge(function_id, block_id, *target);
+                        self.record_tiering_backedge(compiled, function_id, block_id, *target);
                         block_id = *target;
                     }
                 }
@@ -3424,7 +3425,7 @@ impl Vm {
                         }
                     };
                     if truthy {
-                        self.record_tiering_backedge(function_id, block_id, *target);
+                        self.record_tiering_backedge(compiled, function_id, block_id, *target);
                         block_id = *target;
                     } else {
                         let next = match next_block_id(function, block_id) {
@@ -3433,7 +3434,7 @@ impl Vm {
                                 return self.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        self.record_tiering_backedge(function_id, block_id, next);
+                        self.record_tiering_backedge(compiled, function_id, block_id, next);
                         block_id = next;
                     }
                 }
@@ -3450,7 +3451,7 @@ impl Vm {
                         }
                     };
                     let next = if truthy { *if_true } else { *if_false };
-                    self.record_tiering_backedge(function_id, block_id, next);
+                    self.record_tiering_backedge(compiled, function_id, block_id, next);
                     block_id = next;
                 }
             }

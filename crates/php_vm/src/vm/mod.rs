@@ -531,16 +531,17 @@ pub struct Vm {
     /// (entry-unit) IC sites.
     persistent_feedback_entry_unit_key: Cell<Option<u64>>,
     inline_caches: RefCell<InlineCacheTable>,
-    jit: RefCell<JitRuntimeState>,
-    tiering: RefCell<TieringState>,
-    internal_function_dispatch_cache: RefCell<InternalFunctionDispatchCache>,
+    #[allow(dead_code)]
+    jit: Rc<RefCell<JitRuntimeState>>,
+    tiering: Rc<RefCell<TieringState>>,
+    internal_function_dispatch_cache: Rc<RefCell<InternalFunctionDispatchCache>>,
     /// Memoized per-(unit, function) trivial-method inline plans.
-    trivial_method_plans: RefCell<HashMap<(u64, u32), Option<TrivialMethodPlan>>>,
+    trivial_method_plans: Rc<RefCell<HashMap<(u64, u32), Option<TrivialMethodPlan>>>>,
     /// Memoized activation-context class-name handles keyed by the exact name
     /// spelling dispatch sees. The normalized/display forms of a spelling never
     /// change, so hot method-call sites attach shared handles with refcount
     /// bumps instead of re-normalizing three fresh `String`s per call.
-    class_name_handles: RefCell<HashMap<String, ClassNameHandles>>,
+    class_name_handles: Rc<RefCell<HashMap<String, ClassNameHandles>>>,
     /// Memoized resolved runtime class entries so repeated instantiations of a
     /// class do not rebuild the whole entry (lineage walk, property/constant
     /// evaluation, method mapping) on every `new`. Invalidated whenever the
@@ -568,12 +569,54 @@ pub struct Vm {
     /// Memoized per-(unit, function) last-use move plans (Runtime lever R3).
     /// Built only when `options.last_use_moves` is on; empty and never consulted
     /// otherwise, keeping the default dense read path byte-identical.
-    last_use_move_plans: RefCell<HashMap<(u64, u32), Rc<crate::last_use::LastUseMovePlan>>>,
+    last_use_move_plans: Rc<RefCell<HashMap<(u64, u32), Rc<crate::last_use::LastUseMovePlan>>>>,
     /// Per-request receiver-class lookup by shared class-name identity.
     object_class_resolution: RefCell<ObjectClassResolution>,
-    resolved_constants: RefCell<ResolvedConstantTables>,
+    /// Per-unit resolved constant tables (zend literal-table parity): each
+    /// materializable `IrConstant` resolves once into an interned value and
+    /// every later operand read is an indexed refcount bump instead of a
+    /// fresh allocation (strings) or a full rebuild (constant arrays).
+    /// Keyed by the compiled unit's cache identity; unit constant tables
+    /// are immutable per identity, so entries never invalidate.
+    resolved_constants: Rc<RefCell<ResolvedConstantTables>>,
 }
 
+/// Engine-owned caches retained by one worker across isolated requests.
+/// PHP-visible request state, frames, globals, resources and live IC values
+/// are intentionally absent.
+#[derive(Clone, Debug)]
+pub struct VmWorkerState {
+    trivial_method_plans: Rc<RefCell<HashMap<(u64, u32), Option<TrivialMethodPlan>>>>,
+    class_name_handles: Rc<RefCell<HashMap<String, ClassNameHandles>>>,
+    last_use_move_plans: Rc<RefCell<HashMap<(u64, u32), Rc<crate::last_use::LastUseMovePlan>>>>,
+    resolved_constants: Rc<RefCell<ResolvedConstantTables>>,
+    internal_function_dispatch_cache: Rc<RefCell<InternalFunctionDispatchCache>>,
+    jit: Rc<RefCell<JitRuntimeState>>,
+    tiering: Rc<RefCell<TieringState>>,
+}
+
+impl VmWorkerState {
+    #[must_use]
+    pub fn new(tiering: crate::tiering::TieringOptions) -> Self {
+        Self {
+            trivial_method_plans: Rc::new(RefCell::new(HashMap::new())),
+            class_name_handles: Rc::new(RefCell::new(HashMap::new())),
+            last_use_move_plans: Rc::new(RefCell::new(HashMap::new())),
+            resolved_constants: Rc::new(RefCell::new(ResolvedConstantTables::default())),
+            internal_function_dispatch_cache: Rc::new(RefCell::new(
+                InternalFunctionDispatchCache::default(),
+            )),
+            jit: Rc::new(RefCell::new(JitRuntimeState::default())),
+            tiering: Rc::new(RefCell::new(TieringState::new(tiering))),
+        }
+    }
+}
+
+impl Default for VmWorkerState {
+    fn default() -> Self {
+        Self::new(crate::tiering::TieringOptions::default())
+    }
+}
 impl Vm {
     /// Creates a VM with default options.
     #[must_use]
@@ -584,14 +627,20 @@ impl Vm {
     /// Creates a VM with explicit options.
     #[must_use]
     pub fn with_options(options: VmOptions) -> Self {
-        let tiering = TieringState::new(options.tiering.clone());
+        let worker_state = VmWorkerState::new(options.tiering.clone());
+        Self::with_options_and_worker_state(options, worker_state)
+    }
+
+    /// Creates an isolated request VM backed by engine-only worker caches.
+    #[must_use]
+    pub fn with_options_and_worker_state(options: VmOptions, worker_state: VmWorkerState) -> Self {
         Self {
             options,
             trace: RefCell::new(Vec::new()),
             counters: RefCell::new(None),
             literal_pool: RefCell::new(LiteralPool::default()),
-            trivial_method_plans: RefCell::new(HashMap::new()),
-            class_name_handles: RefCell::new(HashMap::new()),
+            trivial_method_plans: worker_state.trivial_method_plans,
+            class_name_handles: worker_state.class_name_handles,
             runtime_class_entry_cache: RefCell::new(RuntimeClassEntryCache::default()),
             ir_class_entry_cache: RefCell::new(IrClassEntryCache::default()),
             default_slot_template_cache: RefCell::new(DefaultSlotTemplateCache::default()),
@@ -600,14 +649,14 @@ impl Vm {
             persistent_feedback_epochs: Cell::new(None),
             persistent_feedback_entry_unit_key: Cell::new(None),
             inline_caches: RefCell::new(InlineCacheTable::default()),
-            jit: RefCell::new(JitRuntimeState::default()),
-            tiering: RefCell::new(tiering),
-            internal_function_dispatch_cache: RefCell::new(InternalFunctionDispatchCache::default()),
+            jit: worker_state.jit,
+            tiering: worker_state.tiering,
+            internal_function_dispatch_cache: worker_state.internal_function_dispatch_cache,
             adaptive_tiny_unit_setup_skipped: Cell::new(false),
             include_execution_depth: Cell::new(0),
             request_profile_stack: RefCell::new(Vec::new()),
-            last_use_move_plans: RefCell::new(HashMap::new()),
-            resolved_constants: RefCell::new(ResolvedConstantTables::default()),
+            last_use_move_plans: worker_state.last_use_move_plans,
+            resolved_constants: worker_state.resolved_constants,
             object_class_resolution: RefCell::new(ObjectClassResolution::default()),
         }
     }
@@ -616,16 +665,16 @@ impl Vm {
     #[must_use]
     pub fn execute(&self, unit: impl Into<CompiledUnit>) -> VmResult {
         let unit = unit.into();
+        self.tiering
+            .borrow_mut()
+            .begin_request(self.options.tiering.clone());
         let skip_adaptive_tiny_unit_setup = self.should_skip_adaptive_tiny_unit_setup(unit.unit());
         self.adaptive_tiny_unit_setup_skipped
             .set(skip_adaptive_tiny_unit_setup);
         let mut output = OutputBuffer::with_capacity(output_preallocation_hint(unit.unit()));
         self.trace.borrow_mut().clear();
         *self.literal_pool.borrow_mut() = LiteralPool::default();
-        *self.resolved_constants.borrow_mut() = ResolvedConstantTables::default();
         *self.object_class_resolution.borrow_mut() = ObjectClassResolution::default();
-        self.trivial_method_plans.borrow_mut().clear();
-        self.last_use_move_plans.borrow_mut().clear();
         *self.runtime_class_entry_cache.borrow_mut() = RuntimeClassEntryCache::default();
         *self.ir_class_entry_cache.borrow_mut() = IrClassEntryCache::default();
         *self.default_slot_template_cache.borrow_mut() = DefaultSlotTemplateCache::default();
@@ -669,9 +718,6 @@ impl Vm {
                     },
                 );
         }
-        *self.jit.borrow_mut() = JitRuntimeState::default();
-        *self.tiering.borrow_mut() = TieringState::new(self.options.tiering.clone());
-        self.internal_function_dispatch_cache.borrow_mut().clear();
         self.include_execution_depth.set(0);
         *self.counters.borrow_mut() = self.options.collect_counters.then(|| {
             let mut counters = VmCounters::default();
@@ -1180,10 +1226,19 @@ impl Vm {
             .or_else(|| Some(state.cwd.clone()))
     }
 
-    fn record_tiering_backedge(&self, function_id: FunctionId, current: BlockId, target: BlockId) {
-        self.tiering
-            .borrow_mut()
-            .record_loop_backedge(function_id, current, target);
+    fn record_tiering_backedge(
+        &self,
+        compiled: &CompiledUnit,
+        function_id: FunctionId,
+        current: BlockId,
+        target: BlockId,
+    ) {
+        self.tiering.borrow_mut().record_loop_backedge(
+            compiled_unit_cache_key(compiled),
+            function_id,
+            current,
+            target,
+        );
     }
 
     fn object_instanceof_cached(

@@ -45,6 +45,7 @@ const FLOAT_TAG: u16 = JitCValueTag::FloatBits as u16;
 const STRING_TAG: u16 = JitCValueTag::OpaqueString as u16;
 const ARRAY_TAG: u16 = JitCValueTag::OpaqueArray as u16;
 const OBJECT_TAG: u16 = JitCValueTag::OpaqueObject as u16;
+const NULL_TAG: u16 = JitCValueTag::Null as u16;
 
 /// A single guarded PHP integer-add step: `slot[dst] = slot[lhs] + slot[rhs]`.
 ///
@@ -401,6 +402,10 @@ pub struct NativeCallPermits {
     /// True when the callee name `is_bool` is confirmed to resolve to the real
     /// builtin `is_bool`.
     pub builtin_is_bool: bool,
+    /// True when `is_null` resolves to the real builtin.
+    pub builtin_is_null: bool,
+    /// True when `is_object` resolves to the real builtin.
+    pub builtin_is_object: bool,
 }
 
 /// Runtime-owned helper addresses the copy-and-patch tier `blr`s from emitted
@@ -1424,6 +1429,7 @@ mod x86_emit {
                     guard_tag(&mut asm, deopt, *src, INT_TAG);
                     emit_value_copy(&mut asm, slot, *src);
                 }
+                TailArgSource::ValueCopy { src } => emit_value_copy(&mut asm, slot, *src),
                 TailArgSource::Const { value } => {
                     asm.mov_imm64(x::R10, *value as u64);
                     store_int(&mut asm, slot, x::R10);
@@ -2221,6 +2227,9 @@ pub fn compile_scalar_int_function_with_permits_and_helpers(
     permits: NativeCallPermits,
     helpers: CopyPatchRuntimeHelpers,
 ) -> Option<CompiledScalarRegion> {
+    if let Some(compiled) = compile_value_passthrough_leaf(function) {
+        return Some(compiled);
+    }
     if let Some(compiled) = compile_scalar_int_count_leaf(function, permits, helpers) {
         return Some(compiled);
     }
@@ -2228,6 +2237,9 @@ pub fn compile_scalar_int_function_with_permits_and_helpers(
         return Some(compiled);
     }
     if let Some(compiled) = compile_scalar_int_is_type_leaf(function, permits) {
+        return Some(compiled);
+    }
+    if let Some(compiled) = compile_value_tailcall_leaf(function, permits) {
         return Some(compiled);
     }
     if let Some((graph, result)) = build_scalar_int_region(function, constants, region_id)
@@ -2261,6 +2273,167 @@ struct SingleArgBuiltinLeaf<'a> {
     result_slot: u32,
     /// `JitCValue` slots the caller's buffer must provide.
     buffer_slots: u32,
+}
+
+/// Lower the common one-argument identity wrapper (`return $value`) by copying
+/// the complete 24-byte ABI value. Heap handles remain borrowed for the
+/// synchronous call and the VM clones them while unmarshaling the result.
+fn compile_value_passthrough_leaf(function: &IrFunction) -> Option<CompiledScalarRegion> {
+    let flags = function.flags;
+    if flags.is_top_level || flags.is_closure || flags.is_method || flags.is_generator {
+        return None;
+    }
+    if function.returns_by_ref || !function.captures.is_empty() {
+        return None;
+    }
+    let [param] = function.params.as_slice() else {
+        return None;
+    };
+    if param.by_ref || param.variadic || param.default.is_some() {
+        return None;
+    }
+    // The native leaf does not run the VM's parameter/return type machinery.
+    // Only unrestricted signatures can therefore preserve PHP coercion and
+    // TypeError behavior by copying the value verbatim.
+    if !matches!(param.type_.as_ref(), None | Some(IrReturnType::Mixed))
+        || !matches!(
+            function.return_type.as_ref(),
+            None | Some(IrReturnType::Mixed)
+        )
+    {
+        return None;
+    }
+    let [block] = function.blocks.as_slice() else {
+        return None;
+    };
+    let kinds = meaningful_kinds(block);
+    let [InstructionKind::LoadLocal { dst, local }] = kinds.as_slice() else {
+        return None;
+    };
+    if *local != param.local {
+        return None;
+    }
+    let TerminatorKind::Return {
+        value: Some(Operand::Register(returned)),
+        by_ref_local: None,
+    } = &block.terminator.as_ref()?.kind
+    else {
+        return None;
+    };
+    if returned != dst {
+        return None;
+    }
+    let result_slot = function.local_count.checked_add(function.register_count)?;
+    let buffer_slots = result_slot.checked_add(1)?;
+    if result_slot > MAX_SLOT || param.local.raw() > MAX_SLOT {
+        return None;
+    }
+    let code = emit_scalar_int_ops(&[ScalarIntOp::Copy {
+        dst: result_slot,
+        src: param.local.raw(),
+    }])
+    .ok()?;
+    Some(CompiledScalarRegion {
+        code,
+        result_slot,
+        buffer_slots,
+        tail_call: None,
+    })
+}
+
+/// Lower `return callee($a, ...)` wrappers whose arguments are direct parameter
+/// loads. The native prefix transports complete ABI values; the VM still
+/// resolves/calls the callee and applies the wrapper's return coercion.
+fn compile_value_tailcall_leaf(
+    function: &IrFunction,
+    permits: NativeCallPermits,
+) -> Option<CompiledScalarRegion> {
+    if !permits.allow_userland_tailcall {
+        return None;
+    }
+    let flags = function.flags;
+    if flags.is_top_level || flags.is_closure || flags.is_method || flags.is_generator {
+        return None;
+    }
+    if function.returns_by_ref || !function.captures.is_empty() {
+        return None;
+    }
+    if function.params.iter().any(|param| {
+        param.by_ref
+            || param.variadic
+            || param.default.is_some()
+            || !matches!(param.type_.as_ref(), None | Some(IrReturnType::Mixed))
+    }) || !matches!(
+        function.return_type.as_ref(),
+        None | Some(IrReturnType::Mixed)
+    ) {
+        return None;
+    }
+    let parameter_locals = function
+        .params
+        .iter()
+        .map(|param| param.local)
+        .collect::<HashSet<_>>();
+    let [block] = function.blocks.as_slice() else {
+        return None;
+    };
+    let kinds = meaningful_kinds(block);
+    let (call, loads) = kinds.split_last()?;
+    let InstructionKind::CallFunction {
+        dst: call_dst,
+        name,
+        args,
+    } = call
+    else {
+        return None;
+    };
+    let TerminatorKind::Return {
+        value: Some(Operand::Register(returned)),
+        by_ref_local: None,
+    } = &block.terminator.as_ref()?.kind
+    else {
+        return None;
+    };
+    if returned != call_dst {
+        return None;
+    }
+    let mut loaded = HashMap::new();
+    for kind in loads {
+        let InstructionKind::LoadLocal { dst, local } = kind else {
+            return None;
+        };
+        if !parameter_locals.contains(local) {
+            return None;
+        }
+        loaded.insert(*dst, *local);
+    }
+    let mut sources = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg.name.is_some()
+            || arg.unpack
+            || arg.value_kind == IrCallArgValueKind::ByRefLocationPlaceholder
+        {
+            return None;
+        }
+        let local = match arg.value {
+            Operand::Register(reg) => *loaded.get(&reg)?,
+            Operand::Local(local) if parameter_locals.contains(&local) => local,
+            _ => return None,
+        };
+        sources.push(TailArgSource::ValueCopy { src: local.raw() });
+    }
+    let first_arg_slot = function.local_count.checked_add(function.register_count)?;
+    let buffer_slots = first_arg_slot.checked_add(u32::try_from(args.len()).ok()?)?;
+    let (code, arg_slots) = emit_tailcall_region(&[], &sources, &[], first_arg_slot).ok()?;
+    Some(CompiledScalarRegion {
+        code,
+        result_slot: 0,
+        buffer_slots,
+        tail_call: Some(TailCallPlan {
+            callee_name: name.clone(),
+            arg_slots,
+        }),
+    })
 }
 
 /// Match the `return builtin($x)` leaf shape common to the `count`/`strlen`/
@@ -2466,6 +2639,8 @@ fn is_type_predicate_tag(name: &str, permits: NativeCallPermits) -> Option<u16> 
         "is_array" if permits.builtin_is_array => Some(ARRAY_TAG),
         "is_float" if permits.builtin_is_float => Some(FLOAT_TAG),
         "is_bool" if permits.builtin_is_bool => Some(BOOL_TAG),
+        "is_null" if permits.builtin_is_null => Some(NULL_TAG),
+        "is_object" if permits.builtin_is_object => Some(OBJECT_TAG),
         _ => None,
     }
 }
@@ -3142,6 +3317,8 @@ fn compile_scalar_int_cfg(
 enum TailArgSource {
     /// Guard `src` is `Int` (side exit otherwise), then copy it to the arg slot.
     GuardedCopy { src: u32 },
+    /// Copy a complete already-bound PHP ABI value without narrowing its tag.
+    ValueCopy { src: u32 },
     /// Materialize a statically-known `Int` into the arg slot.
     Const { value: i64 },
 }
@@ -3180,7 +3357,7 @@ fn emit_tailcall_region(
             )
             .ok_or(SlotSequenceError::SlotIndexOutOfRange(first_arg_slot))?;
         check_slot(slot)?;
-        if let TailArgSource::GuardedCopy { src } = arg {
+        if let TailArgSource::GuardedCopy { src } | TailArgSource::ValueCopy { src } = arg {
             check_slot(*src)?;
         }
         arg_slots.push(slot);
@@ -3211,6 +3388,7 @@ fn emit_tailcall_region(
                     emit_int_guard(&mut asm, deopt, *src);
                     emit_value_copy(&mut asm, slot, *src);
                 }
+                TailArgSource::ValueCopy { src } => emit_value_copy(&mut asm, slot, *src),
                 TailArgSource::Const { value } => {
                     asm.mov_imm64(X6, *value as u64);
                     emit_store_int(&mut asm, slot, X6);
@@ -3719,6 +3897,7 @@ pub fn compile_scalar_int_resume_leaf(
                     // call).
                     emit_value_copy(&mut asm, slot, *src);
                 }
+                TailArgSource::ValueCopy { src } => emit_value_copy(&mut asm, slot, *src),
                 TailArgSource::Const { value } => {
                     asm.mov_imm64(X6, *value as u64);
                     emit_store_int(&mut asm, slot, X6);

@@ -33,17 +33,29 @@ reports land under `target/wordpress-real/` or
 nix develop -c just wordpress-root-profile
 nix develop -c just wordpress-reference-image
 nix develop -c just wordpress-root-benchmark
+nix develop -c just wordpress-root-benchmark-feedback-ab
+nix develop -c just wordpress-root-benchmark-cranelift
 nix develop -c just wordpress-root-diagnostics
 nix develop -c just wordpress-clone-churn-report
 ```
 
 `wordpress-root-benchmark` is a clean timing and compatibility comparison. It
-builds release Phrust, launches stock PHP-FPM 8.5.7 with OPcache behind nginx,
-warms both engines, and takes 30 requests at concurrency 1, the available CPU
-count, and twice that count. Build the pinned reference image once first. Both
-engines use the same WordPress docroot and database configuration. Strict mode
-requires `PHRUST_WORDPRESS_DB_IDENTITY` (for example the SHA-256 of the restored
-SQL dump) so the database snapshot is recorded rather than assumed.
+builds the telemetry-free `release-lean` Phrust server, launches it with an
+immutable deployment root, launches stock PHP-FPM 8.5.7 with OPcache behind
+nginx, warms both engines, and takes 30 requests at concurrency 1, the available
+CPU count, and twice that count. Build the pinned reference image once first.
+Both engines use the same WordPress docroot and database configuration. Strict
+mode requires `PHRUST_WORDPRESS_DB_IDENTITY` (for example the SHA-256 of the
+restored SQL dump) so the database snapshot is recorded rather than assumed.
+
+The clean launcher owns and records the performance-sensitive Phrust
+environment (`PHRUST_JIT_COPY_PATCH`, `PHRUST_INCLUDE_REVALIDATE_MS`,
+`PHRUST_WORKER_SYMBOL_EPOCH`, and `PHRUST_PERSISTENT_FEEDBACK`) and rejects an
+inherited `PHRUST_PERF_ABLATION`. Use `wordpress-root-benchmark-feedback-ab` for
+the isolated persistent-feedback arms plus their joint p50/p95/throughput ratio
+report, and
+`wordpress-root-benchmark-cranelift` for the explicitly featured
+`experimental-jit` arm.
 
 The clean report compares HTTP status, normalized headers, and body hashes. Add
 application-specific observable endpoints without changing the sampler:
