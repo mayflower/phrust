@@ -1,6 +1,7 @@
 use crate::PhpExecutorOptions;
 use crate::diagnostics::{
-    write_frontend_diagnostics, write_runtime_diagnostics, write_vm_compile_fatal_line,
+    write_frontend_diagnostics, write_php_compile_error_stdout, write_runtime_diagnostics,
+    write_vm_compile_fatal_line,
 };
 use crate::include_compiler::ExecutorIncludeCompiler;
 use crate::pipeline::{CompileTimingCollector, compile_source};
@@ -69,6 +70,7 @@ where
         &mut CompileTimingCollector::disabled(),
     )?;
     if !pipeline.ok() {
+        write_php_compile_error_stdout(stdout, &pipeline)?;
         write_frontend_diagnostics(stderr, &pipeline)?;
         return Ok(EXIT_PHP_ERROR);
     }
@@ -311,6 +313,23 @@ mod tests {
             "{stdout}"
         );
         assert_eq!(stderr, b"");
+    }
+
+    #[test]
+    fn compile_error_renders_php_parse_error_on_stdout() {
+        let input = test_input("<?php $x = ;");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = execute_php(input, &mut stdout, &mut stderr).expect("execute");
+
+        assert_eq!(status, EXIT_PHP_ERROR);
+        let stdout = String::from_utf8(stdout).expect("stdout utf8");
+        assert!(
+            stdout.starts_with("\nParse error: syntax error, unexpected token \";\" in"),
+            "{stdout}"
+        );
+        assert!(stdout.trim_end().ends_with("on line 1"), "{stdout}");
     }
 
     #[test]

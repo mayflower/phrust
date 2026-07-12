@@ -170,6 +170,112 @@ pub(crate) fn execution_output_from_vm(
     }
 }
 
+const PHP_RESERVED_WORDS: &[&str] = &[
+    "abstract", "and", "array", "as", "break", "callable", "case", "catch", "class", "clone",
+    "const", "continue", "declare", "default", "do", "echo", "else", "elseif", "empty",
+    "enddeclare", "endfor", "endforeach", "endif", "endswitch", "endwhile", "enum", "exit",
+    "extends", "final", "finally", "fn", "for", "foreach", "function", "global", "goto", "if",
+    "implements", "include", "include_once", "instanceof", "insteadof", "interface", "isset",
+    "list", "match", "namespace", "new", "or", "print", "private", "protected", "public",
+    "readonly", "require", "require_once", "return", "static", "switch", "throw", "trait", "try",
+    "unset", "use", "var", "while", "xor", "yield",
+];
+
+/// Synthesizes the reference parser error wording for an unexpected token at
+/// `span`: variables and identifiers get their own noun, reserved words and
+/// punctuation render as tokens, and an empty span reads as end of input.
+fn zend_parse_error_message(source: &SourceText, span: TextRange) -> String {
+    let text = source
+        .as_str()
+        .get(span.start().to_usize()..span.end().to_usize())
+        .unwrap_or("")
+        .trim();
+    if text.is_empty() {
+        return "syntax error, unexpected end of file".to_owned();
+    }
+    if let Some(name) = text.strip_prefix('$')
+        && !name.is_empty()
+    {
+        return format!("syntax error, unexpected variable \"{text}\"");
+    }
+    let identifier_like = text
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        && text.chars().next().is_some_and(|ch| !ch.is_ascii_digit());
+    if identifier_like && !PHP_RESERVED_WORDS.contains(&text.to_ascii_lowercase().as_str()) {
+        return format!("syntax error, unexpected identifier \"{text}\"");
+    }
+    format!("syntax error, unexpected token \"{text}\"")
+}
+
+/// Renders the reference-format compile error to stdout (the channel PHP uses
+/// with display_errors) and reports whether anything was rendered. Structured
+/// diagnostics still go to stderr for tooling.
+pub(crate) fn write_php_compile_error_stdout<W: Write>(
+    stdout: &mut W,
+    pipeline: &Pipeline,
+) -> Result<bool, String> {
+    if let Some(diagnostic) = pipeline.frontend.parser_diagnostics().first() {
+        let message = if diagnostic.message.starts_with("syntax error,") {
+            diagnostic.message.clone()
+        } else {
+            zend_parse_error_message(&pipeline.source, diagnostic.span)
+        };
+        let line = line_number_for_span(&pipeline.source, diagnostic.span);
+        writeln!(
+            stdout,
+            "\nParse error: {message} in {} on line {line}",
+            pipeline.path
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(true);
+    }
+    for diagnostic in pipeline.frontend.semantic_diagnostics() {
+        if diagnostic.severity() != Severity::Error {
+            continue;
+        }
+        let Some(span) = diagnostic.span() else {
+            continue;
+        };
+        let line = line_number_for_span(&pipeline.source, span);
+        if let Some(message) = semantic_diagnostic_php_fatal_message(
+            diagnostic.id(),
+            diagnostic.message(),
+            span,
+            &pipeline.lowering.unit,
+        ) {
+            writeln!(
+                stdout,
+                "\nFatal error: {message} in {} on line {line}",
+                pipeline.path
+            )
+            .map_err(|error| error.to_string())?;
+            return Ok(true);
+        }
+        if semantic_diagnostic_uses_php_parse_error_line(diagnostic.id()) {
+            writeln!(
+                stdout,
+                "\nParse error: {} in {} on line {line}",
+                diagnostic.message(),
+                pipeline.path
+            )
+            .map_err(|error| error.to_string())?;
+            return Ok(true);
+        }
+        if semantic_diagnostic_uses_php_fatal_line(diagnostic.id()) {
+            writeln!(
+                stdout,
+                "\nFatal error: {} in {} on line {line}",
+                diagnostic.message(),
+                pipeline.path
+            )
+            .map_err(|error| error.to_string())?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn write_frontend_diagnostics<W: Write>(
     stderr: &mut W,
     pipeline: &Pipeline,
