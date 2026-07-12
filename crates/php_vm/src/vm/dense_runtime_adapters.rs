@@ -13,7 +13,7 @@ impl Vm {
         local: LocalId,
         span: IrSpan,
         pre_call_by_ref_out_param: bool,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
         if is_globals_local(function, local) {
             self.record_counter_local_slot_fast_path(false);
             return Ok(Value::Array(state.globals.globals_array()));
@@ -33,9 +33,9 @@ impl Vm {
                     tag_throwable_location(&throwable, compiled, span);
                     state.pending_trace = Some(capture_backtrace_string(compiled, stack));
                     state.pending_throw = Some(throwable);
-                    Err(VmResult::propagating_exception(output.clone()))
+                    Err(Box::new(VmResult::propagating_exception(output.clone())))
                 } else {
-                    Err(result)
+                    Err(Box::new(result))
                 }
             }
             Some(Value::Uninitialized) if pre_call_by_ref_out_param => Ok(Value::Null),
@@ -79,12 +79,12 @@ impl Vm {
                 Ok(Value::Null)
             }
             Some(value) => Ok(value),
-            None => Err(self.runtime_error(
+            None => Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
                 format!("invalid local local:{}", local.raw()),
-            )),
+            ))),
         }
     }
 
@@ -102,10 +102,7 @@ impl Vm {
         // Match the rich raise path: the emitted diagnostic carries the
         // source span, not just the throwable location tag.
         let result = self.runtime_error_with_bringup_context(
-            output,
-            compiled,
-            stack,
-            state,
+            ExecutionView::new(compiled, output, stack, state),
             runtime_source_span(compiled, span),
             message,
             BringupDiagnosticInput {
@@ -156,14 +153,14 @@ impl Vm {
         property: &str,
         object_value: Value,
         span: IrSpan,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
         let object = match object_value {
             Value::Object(object) => object,
             Value::Reference(cell) => match cell.get() {
                 Value::Object(object) => object,
                 other => {
                     self.record_counter_dense_property_fallback("non_object");
-                    return Err(self.dense_runtime_error(
+                    return Err(Box::new(self.dense_runtime_error(
                         compiled,
                         output,
                         stack,
@@ -173,12 +170,12 @@ impl Vm {
                             "E_PHP_VM_PROPERTY_FETCH_NON_OBJECT: cannot fetch property {property} from {}",
                             value_type_name(&other)
                         ),
-                    ));
+                    )));
                 }
             },
             other => {
                 self.record_counter_dense_property_fallback("non_object");
-                return Err(self.dense_runtime_error(
+                return Err(Box::new(self.dense_runtime_error(
                     compiled,
                     output,
                     stack,
@@ -188,7 +185,7 @@ impl Vm {
                         "E_PHP_VM_PROPERTY_FETCH_NON_OBJECT: cannot fetch property {property} from {}",
                         value_type_name(&other)
                     ),
-                ));
+                )));
             }
         };
 
@@ -210,13 +207,13 @@ impl Vm {
             // ARRAY_AS_PROPS routes property reads through the container's
             // array storage; the rich arm takes the same branch.
             self.record_counter_dense_property_fallback("spl_array_as_props");
-            return spl_container_offset_get(
+            return Ok(spl_container_offset_get(
                 &object,
                 &Value::String(PhpString::from_test_str(property)),
             )
             .map_err(|message| {
                 self.dense_runtime_error(compiled, output, stack, state, span, message)
-            });
+            })?);
         }
 
         let scope = current_scope_class(compiled, stack);
@@ -226,9 +223,7 @@ impl Vm {
 
         let cached_target = if let Some(id) = cache_id {
             self.lookup_dense_property_fetch_inline_cache(
-                id,
-                function_id,
-                instruction_id,
+                DenseInlineCacheSite::new(id, function_id, instruction_id),
                 property,
                 &receiver_class,
                 normalized_scope.as_deref(),
@@ -243,10 +238,7 @@ impl Vm {
                 InlineCacheKind::PropertyFetch,
             );
             self.lookup_property_fetch_inline_cache(
-                compiled,
-                function_id,
-                block_id,
-                instruction_id,
+                IrInlineCacheSite::classic(compiled, function_id, block_id, instruction_id),
                 property,
                 &receiver_class,
                 normalized_scope.as_deref(),
@@ -264,9 +256,9 @@ impl Vm {
                     self.record_counter_dense_property_fallback("inline_cache_guard");
                 }
                 Err(message) => {
-                    return Err(
-                        self.dense_runtime_error(compiled, output, stack, state, span, message)
-                    );
+                    return Err(Box::new(self.dense_runtime_error(
+                        compiled, output, stack, state, span, message,
+                    )));
                 }
             }
         }
@@ -278,14 +270,14 @@ impl Vm {
             Some(class) => class,
             None => {
                 self.record_counter_dense_property_fallback("receiver_class_missing");
-                return Err(self.dense_runtime_error(
+                return Err(Box::new(self.dense_runtime_error(
                     compiled,
                     output,
                     stack,
                     state,
                     span,
                     format!("E_PHP_VM_UNKNOWN_CLASS: class {class_handle} is not defined"),
-                ));
+                )));
             }
         };
         let receiver_has_magic_get = class_has_public_magic_get(compiled, &class);
@@ -335,16 +327,13 @@ impl Vm {
                     Vec::new(),
                 ));
                 match self.call_magic_property_method(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object.clone(),
                     "__get",
                     property,
                     vec![CallArgument::positional(Value::String(
                         PhpString::from_test_str(property),
                     ))],
-                    output,
-                    stack,
-                    state,
                 ) {
                     Ok(Some(value)) => {
                         self.record_counter_dense_property_fallback("magic_get");
@@ -354,10 +343,7 @@ impl Vm {
                     Err(result) => return Err(result),
                 }
                 self.emit_undefined_property_warning(
-                    compiled,
-                    output,
-                    stack,
-                    state,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     diagnostics,
                     &object.display_name(),
                     property,
@@ -366,7 +352,9 @@ impl Vm {
                 return Ok(Value::Null);
             }
             Err(message) => {
-                return Err(self.dense_runtime_error(compiled, output, stack, state, span, message));
+                return Err(Box::new(self.dense_runtime_error(
+                    compiled, output, stack, state, span, message,
+                )));
             }
         };
         let resolved_class = &resolved.class;
@@ -381,30 +369,27 @@ impl Vm {
         ) {
             self.record_counter_dense_property_fallback("visibility_mismatch");
             match self.call_magic_property_method(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object.clone(),
                 "__get",
                 property,
                 vec![CallArgument::positional(Value::String(
                     PhpString::from_test_str(property),
                 ))],
-                output,
-                stack,
-                state,
             ) {
                 Ok(Some(value)) => {
                     self.record_counter_dense_property_fallback("magic_get");
                     return Ok(value);
                 }
                 Ok(None) => {
-                    return Err(self.dense_runtime_error(
+                    return Err(Box::new(self.dense_runtime_error(
                         compiled,
                         output,
                         stack,
                         state,
                         span,
                         access_error,
-                    ));
+                    )));
                 }
                 Err(result) => return Err(result),
             }
@@ -428,15 +413,12 @@ impl Vm {
         {
             self.record_counter_dense_property_fallback("property_hook");
             return self.call_property_hook(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object,
                 resolved_class,
                 resolved_property,
                 function,
                 Vec::new(),
-                output,
-                stack,
-                state,
             );
         }
 
@@ -444,16 +426,13 @@ impl Vm {
         let Some(value) = object.get_property(&storage_name) else {
             self.record_counter_dense_property_fallback("storage_missing");
             match self.call_magic_property_method(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object.clone(),
                 "__get",
                 property,
                 vec![CallArgument::positional(Value::String(
                     PhpString::from_test_str(property),
                 ))],
-                output,
-                stack,
-                state,
             ) {
                 Ok(Some(value)) => {
                     self.record_counter_dense_property_fallback("magic_get");
@@ -463,10 +442,7 @@ impl Vm {
                 Err(result) => return Err(result),
             }
             self.emit_undefined_property_warning(
-                compiled,
-                output,
-                stack,
-                state,
+                ExecutionCursor::new(compiled, output, stack, state),
                 diagnostics,
                 &object.display_name(),
                 property,
@@ -476,7 +452,7 @@ impl Vm {
         };
         if matches!(value, Value::Uninitialized) {
             self.record_counter_dense_property_fallback("typed_property_uninitialized");
-            return Err(self.dense_runtime_error(
+            return Err(Box::new(self.dense_runtime_error(
                 compiled,
                 output,
                 stack,
@@ -486,7 +462,7 @@ impl Vm {
                     "E_PHP_VM_UNINITIALIZED_PROPERTY: Typed property {}::${property} must not be accessed before initialization",
                     resolved.class.display_name
                 ),
-            ));
+            )));
         }
         self.maybe_install_property_fetch_inline_cache_target(
             compiled,
@@ -525,14 +501,14 @@ impl Vm {
         object_value: Value,
         value: Value,
         span: IrSpan,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
         let object = match object_value {
             Value::Object(object) => object,
             Value::Reference(cell) => match cell.get() {
                 Value::Object(object) => object,
                 other => {
                     self.record_counter_dense_property_fallback("non_object");
-                    return Err(self.dense_runtime_error(
+                    return Err(Box::new(self.dense_runtime_error(
                         compiled,
                         output,
                         stack,
@@ -542,12 +518,12 @@ impl Vm {
                             "E_PHP_VM_PROPERTY_ASSIGN_NON_OBJECT: cannot assign property {property} on {}",
                             value_type_name(&other)
                         ),
-                    ));
+                    )));
                 }
             },
             Value::Callable(_) => {
                 self.record_counter_dense_property_fallback("dynamic_property");
-                return Err(self.dense_runtime_error(
+                return Err(Box::new(self.dense_runtime_error(
                     compiled,
                     output,
                     stack,
@@ -556,11 +532,11 @@ impl Vm {
                     format!(
                         "E_PHP_VM_DYNAMIC_PROPERTY_ERROR: Cannot create dynamic property Closure::${property}"
                     ),
-                ));
+                )));
             }
             other => {
                 self.record_counter_dense_property_fallback("non_object");
-                return Err(self.dense_runtime_error(
+                return Err(Box::new(self.dense_runtime_error(
                     compiled,
                     output,
                     stack,
@@ -570,7 +546,7 @@ impl Vm {
                         "E_PHP_VM_PROPERTY_ASSIGN_NON_OBJECT: cannot assign property {property} on {}",
                         value_type_name(&other)
                     ),
-                ));
+                )));
             }
         };
 
@@ -584,7 +560,9 @@ impl Vm {
                 Value::String(PhpString::from_test_str(property)),
                 value.clone(),
             ) {
-                return Err(self.dense_runtime_error(compiled, output, stack, state, span, message));
+                return Err(Box::new(self.dense_runtime_error(
+                    compiled, output, stack, state, span, message,
+                )));
             }
             return Ok(value);
         }
@@ -602,9 +580,7 @@ impl Vm {
 
         let cached_target = if let Some(id) = cache_id {
             self.lookup_dense_property_assign_inline_cache(
-                id,
-                function_id,
-                instruction_id,
+                DenseInlineCacheSite::new(id, function_id, instruction_id),
                 property,
                 &receiver_class,
                 normalized_scope.as_deref(),
@@ -619,10 +595,7 @@ impl Vm {
                 InlineCacheKind::PropertyAssign,
             );
             self.lookup_property_assign_inline_cache(
-                compiled,
-                function_id,
-                block_id,
-                instruction_id,
+                IrInlineCacheSite::classic(compiled, function_id, block_id, instruction_id),
                 property,
                 &receiver_class,
                 normalized_scope.as_deref(),
@@ -647,9 +620,9 @@ impl Vm {
                     self.record_counter_dense_property_fallback("inline_cache_guard");
                 }
                 Err(message) => {
-                    return Err(
-                        self.dense_runtime_error(compiled, output, stack, state, span, message)
-                    );
+                    return Err(Box::new(self.dense_runtime_error(
+                        compiled, output, stack, state, span, message,
+                    )));
                 }
             }
         }
@@ -660,14 +633,14 @@ impl Vm {
             Some(class) => class,
             None => {
                 self.record_counter_dense_property_fallback("receiver_class_missing");
-                return Err(self.dense_runtime_error(
+                return Err(Box::new(self.dense_runtime_error(
                     compiled,
                     output,
                     stack,
                     state,
                     span,
                     format!("E_PHP_VM_UNKNOWN_CLASS: class {class_handle} is not defined"),
-                ));
+                )));
             }
         };
         let receiver_has_magic_set = class_has_public_magic_set(compiled, &class);
@@ -682,7 +655,7 @@ impl Vm {
             Ok(None) => {
                 self.record_counter_dense_property_fallback("dynamic_property");
                 match self.call_magic_property_method(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object.clone(),
                     "__set",
                     property,
@@ -690,9 +663,6 @@ impl Vm {
                         CallArgument::positional(Value::String(PhpString::from_test_str(property))),
                         CallArgument::positional(value.clone()),
                     ],
-                    output,
-                    stack,
-                    state,
                 ) {
                     Ok(Some(_)) => {
                         self.record_counter_dense_property_fallback("magic_set");
@@ -710,7 +680,9 @@ impl Vm {
                 return Ok(value);
             }
             Err(message) => {
-                return Err(self.dense_runtime_error(compiled, output, stack, state, span, message));
+                return Err(Box::new(self.dense_runtime_error(
+                    compiled, output, stack, state, span, message,
+                )));
             }
         };
         let resolved_class = &resolved.class;
@@ -747,7 +719,7 @@ impl Vm {
         }) {
             self.record_counter_dense_property_fallback("visibility_mismatch");
             match self.call_magic_property_method(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object.clone(),
                 "__set",
                 property,
@@ -755,18 +727,15 @@ impl Vm {
                     CallArgument::positional(Value::String(PhpString::from_test_str(property))),
                     CallArgument::positional(value.clone()),
                 ],
-                output,
-                stack,
-                state,
             ) {
                 Ok(Some(_)) => {
                     self.record_counter_dense_property_fallback("magic_set");
                     return Ok(value);
                 }
                 Ok(None) => {
-                    return Err(
-                        self.dense_runtime_error(compiled, output, stack, state, span, message)
-                    );
+                    return Err(Box::new(self.dense_runtime_error(
+                        compiled, output, stack, state, span, message,
+                    )));
                 }
                 Err(result) => return Err(result),
             }
@@ -783,28 +752,29 @@ impl Vm {
             self.typecheck_fast_path_context(),
         ) {
             self.record_counter_dense_property_fallback("typed_property_validation");
-            return Err(self.dense_runtime_error(compiled, output, stack, state, span, message));
+            return Err(Box::new(self.dense_runtime_error(
+                compiled, output, stack, state, span, message,
+            )));
         }
         if let Err(message) =
             validate_property_write(resolved_class, resolved_property, &object, stack, compiled)
         {
             self.record_counter_dense_property_fallback("readonly_or_init_only");
-            return Err(self.dense_runtime_error(compiled, output, stack, state, span, message));
+            return Err(Box::new(self.dense_runtime_error(
+                compiled, output, stack, state, span, message,
+            )));
         }
         if !property_hook_is_active(state, &object, resolved_class, resolved_property)
             && let Some(function) = resolved.property.hooks.set
         {
             self.record_counter_dense_property_fallback("property_hook");
             self.call_property_hook(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object.clone(),
                 resolved_class,
                 resolved_property,
                 function,
                 vec![CallArgument::positional(value.clone())],
-                output,
-                stack,
-                state,
             )?;
             return Ok(value);
         }
@@ -812,7 +782,7 @@ impl Vm {
             && (resolved.property.hooks.get.is_some() || resolved.property.hooks.set.is_some())
         {
             self.record_counter_dense_property_fallback("property_hook");
-            return Err(self.dense_runtime_error(
+            return Err(Box::new(self.dense_runtime_error(
                 compiled,
                 output,
                 stack,
@@ -822,7 +792,7 @@ impl Vm {
                     "E_PHP_VM_VIRTUAL_PROPERTY_WRITE: property {}::${} has no backing storage",
                     resolved_class.name, resolved_property.name
                 ),
-            ));
+            )));
         }
 
         let storage_name = property_storage_name(resolved_class, resolved_property);
@@ -1094,7 +1064,7 @@ impl Vm {
         diagnostics: &mut Vec<RuntimeDiagnostic>,
         base: &Value,
         span: IrSpan,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         let diagnostic = array_offset_on_scalar_warning(
             base,
             runtime_source_span(compiled, span),
@@ -1136,34 +1106,30 @@ impl Vm {
         key_value: &Value,
         quiet: bool,
         span: IrSpan,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
         let base = effective_value(array);
         if let Value::Object(object) = &base
             && spl_runtime_marker(object)
                 .is_some_and(|class| is_spl_array_access_runtime_class(&class))
         {
             return self.call_array_access_dim_method(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object.clone(),
                 "offsetGet",
                 key_value.clone(),
                 Some(span),
-                output,
-                stack,
-                state,
             );
         }
         if let Some(object) = match userland_arrayaccess_object(compiled, state, &base) {
             Ok(object) => object,
             Err(message) => {
-                return Err(self.runtime_error(output, compiled, stack, message));
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
             }
         } {
             return self.call_userland_arrayaccess_method(
-                compiled,
-                output,
-                stack,
-                state,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object,
                 "offsetGet",
                 vec![CallArgument::positional(key_value.clone())],
@@ -1256,14 +1222,14 @@ impl Vm {
                     if quiet {
                         Ok(Value::Null)
                     } else {
-                        Err(self.runtime_error_with_source_span(
+                        Err(Box::new(self.runtime_error_with_source_span(
                             output,
                             compiled,
                             stack,
                             runtime_source_span(compiled, span),
                             "E_PHP_VM_STRING_OFFSET_TYPE: Cannot access offset of type string on string"
                                 .to_owned(),
-                        ))
+                        )))
                     }
                 }
             };
@@ -1295,63 +1261,63 @@ impl Vm {
                 ));
                 Ok(Value::Null)
             }
-            Err(message) => Err(self.runtime_error_with_source_span(
+            Err(message) => Err(Box::new(self.runtime_error_with_source_span(
                 output,
                 compiled,
                 stack,
                 runtime_source_span(compiled, span),
                 message,
-            )),
+            ))),
         }
     }
 
     pub(super) fn call_userland_arrayaccess_method(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
         object: ObjectRef,
         method: &str,
         args: Vec<CallArgument>,
         span: IrSpan,
-    ) -> Result<Value, VmResult> {
-        let result = self.call_object_method_callable(
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
             compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
+        let result = self.call_object_method_callable(
+            ExecutionCursor::new(compiled, output, stack, state),
             object,
             method,
             args,
             Some(span),
-            output,
-            stack,
-            state,
         );
         if !result.status.is_success()
             || result.yielded.is_some()
             || result.fiber_suspension.is_some()
         {
-            return Err(result);
+            return Err(Box::new(result));
         }
         Ok(result.return_value.unwrap_or(Value::Null))
     }
 
     pub(super) fn call_array_access_dim_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: ObjectRef,
         method: &str,
         key: Value,
         call_span: Option<IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
-        let span = call_span.unwrap_or_default();
-        self.call_userland_arrayaccess_method(
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
             compiled,
             output,
             stack,
             state,
+        } = cursor;
+        let span = call_span.unwrap_or_default();
+        self.call_userland_arrayaccess_method(
+            ExecutionCursor::new(compiled, output, stack, state),
             object,
             method,
             vec![CallArgument::positional(key)],
@@ -1361,10 +1327,7 @@ impl Vm {
 
     pub(super) fn try_userland_arrayaccess_offset_set_local(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
         local: LocalId,
         dim_values: &[Value],
         append: bool,
@@ -1373,7 +1336,13 @@ impl Vm {
         // actual `offsetSet` dispatch below.
         value: &Value,
         span: IrSpan,
-    ) -> Result<bool, VmResult> {
+    ) -> Result<bool, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let Some(object) = local_effective_object(stack, local) else {
             return Ok(false);
         };
@@ -1381,35 +1350,34 @@ impl Vm {
             Ok(Some(object)) => object,
             Ok(None) => return Ok(false),
             Err(message) => {
-                return Err(self.runtime_error(output, compiled, stack, message));
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
             }
         };
         let key = if append {
             if !dim_values.is_empty() {
-                return Err(self.runtime_error(
+                return Err(Box::new(self.runtime_error(
                     output,
                     compiled,
                     stack,
                     "E_PHP_VM_ARRAYACCESS_NESTED_DIM: nested ArrayAccess writes are not implemented",
-                ));
+                )));
             }
             Value::Null
         } else {
             let [key] = dim_values else {
-                return Err(self.runtime_error(
+                return Err(Box::new(self.runtime_error(
                     output,
                     compiled,
                     stack,
                     "E_PHP_VM_ARRAYACCESS_DIM: ArrayAccess writes require exactly one dimension",
-                ));
+                )));
             };
             key.clone()
         };
         self.call_userland_arrayaccess_method(
-            compiled,
-            output,
-            stack,
-            state,
+            ExecutionCursor::new(compiled, output, stack, state),
             object,
             "offsetSet",
             vec![
@@ -1423,49 +1391,51 @@ impl Vm {
 
     pub(super) fn try_userland_arrayaccess_offset_set_value(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
         base: &Value,
         dims: &[ArrayKey],
         append: bool,
         value: Value,
         span: IrSpan,
-    ) -> Result<bool, VmResult> {
-        let object = match userland_arrayaccess_object(compiled, state, base) {
-            Ok(Some(object)) => object,
-            Ok(None) => return Ok(false),
-            Err(message) => {
-                return Err(self.runtime_error(output, compiled, stack, message));
-            }
-        };
-        let key = if append {
-            if !dims.is_empty() {
-                return Err(self.runtime_error(
-                    output,
-                    compiled,
-                    stack,
-                    "E_PHP_VM_ARRAYACCESS_NESTED_DIM: nested ArrayAccess writes are not implemented",
-                ));
-            }
-            Value::Null
-        } else {
-            let [key] = dims else {
-                return Err(self.runtime_error(
-                    output,
-                    compiled,
-                    stack,
-                    "E_PHP_VM_ARRAYACCESS_DIM: ArrayAccess writes require exactly one dimension",
-                ));
-            };
-            array_key_to_value(key.clone())
-        };
-        self.call_userland_arrayaccess_method(
+    ) -> Result<bool, Box<VmResult>> {
+        let ExecutionCursor {
             compiled,
             output,
             stack,
             state,
+        } = cursor;
+        let object = match userland_arrayaccess_object(compiled, state, base) {
+            Ok(Some(object)) => object,
+            Ok(None) => return Ok(false),
+            Err(message) => {
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
+            }
+        };
+        let key = if append {
+            if !dims.is_empty() {
+                return Err(Box::new(self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    "E_PHP_VM_ARRAYACCESS_NESTED_DIM: nested ArrayAccess writes are not implemented",
+                )));
+            }
+            Value::Null
+        } else {
+            let [key] = dims else {
+                return Err(Box::new(self.runtime_error(
+                    output,
+                    compiled,
+                    stack,
+                    "E_PHP_VM_ARRAYACCESS_DIM: ArrayAccess writes require exactly one dimension",
+                )));
+            };
+            array_key_to_value(key.clone())
+        };
+        self.call_userland_arrayaccess_method(
+            ExecutionCursor::new(compiled, output, stack, state),
             object,
             "offsetSet",
             vec![
@@ -1479,14 +1449,17 @@ impl Vm {
 
     pub(super) fn try_userland_arrayaccess_offset_exists_local(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
         local: LocalId,
         dims: &[ArrayKey],
         span: IrSpan,
-    ) -> Result<Option<bool>, VmResult> {
+    ) -> Result<Option<bool>, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let Some(local_value) = read_local_value(stack, local) else {
             return Ok(None);
         };
@@ -1494,7 +1467,9 @@ impl Vm {
             Ok(Some(object)) => object,
             Ok(None) => return Ok(None),
             Err(message) => {
-                return Err(self.runtime_error(output, compiled, stack, message));
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
             }
         };
         self.arrayaccess_dim_isset_value(
@@ -1511,14 +1486,17 @@ impl Vm {
 
     pub(super) fn try_userland_arrayaccess_offset_empty_local(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
         local: LocalId,
         dims: &[ArrayKey],
         span: IrSpan,
-    ) -> Result<Option<bool>, VmResult> {
+    ) -> Result<Option<bool>, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let Some(local_value) = read_local_value(stack, local) else {
             return Ok(None);
         };
@@ -1526,7 +1504,9 @@ impl Vm {
             Ok(Some(object)) => object,
             Ok(None) => return Ok(None),
             Err(message) => {
-                return Err(self.runtime_error(output, compiled, stack, message));
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
             }
         };
         self.arrayaccess_dim_empty_value(
@@ -1551,7 +1531,7 @@ impl Vm {
         value: Value,
         dims: &[ArrayKey],
         span: IrSpan,
-    ) -> Result<bool, VmResult> {
+    ) -> Result<bool, Box<VmResult>> {
         let Some((first, rest)) = dims.split_first() else {
             return Ok(!matches!(
                 effective_value(&value),
@@ -1561,18 +1541,19 @@ impl Vm {
         let base = effective_value(&value);
         if let Some(object) = match arrayaccess_object(compiled, state, &base) {
             Ok(object) => object,
-            Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+            Err(message) => {
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
+            }
         } {
             let key_value = array_key_to_value(first.clone());
             let exists = self.call_array_access_dim_method(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object.clone(),
                 "offsetExists",
                 key_value.clone(),
                 Some(span),
-                output,
-                stack,
-                state,
             )?;
             if !to_bool(&exists)
                 .map_err(|message| self.runtime_error(output, compiled, stack, message))?
@@ -1583,14 +1564,11 @@ impl Vm {
                 return Ok(true);
             }
             let child = self.call_array_access_dim_method(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object,
                 "offsetGet",
                 key_value,
                 Some(span),
-                output,
-                stack,
-                state,
             )?;
             return self
                 .arrayaccess_dim_isset_value(compiled, output, stack, state, child, rest, span);
@@ -1609,26 +1587,27 @@ impl Vm {
         value: Value,
         dims: &[ArrayKey],
         span: IrSpan,
-    ) -> Result<bool, VmResult> {
+    ) -> Result<bool, Box<VmResult>> {
         let Some((first, rest)) = dims.split_first() else {
-            return php_empty(&value)
-                .map_err(|message| self.runtime_error(output, compiled, stack, message));
+            return Ok(php_empty(&value)
+                .map_err(|message| self.runtime_error(output, compiled, stack, message))?);
         };
         let base = effective_value(&value);
         if let Some(object) = match arrayaccess_object(compiled, state, &base) {
             Ok(object) => object,
-            Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+            Err(message) => {
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
+            }
         } {
             let key_value = array_key_to_value(first.clone());
             let exists = self.call_array_access_dim_method(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object.clone(),
                 "offsetExists",
                 key_value.clone(),
                 Some(span),
-                output,
-                stack,
-                state,
             )?;
             if !to_bool(&exists)
                 .map_err(|message| self.runtime_error(output, compiled, stack, message))?
@@ -1636,18 +1615,15 @@ impl Vm {
                 return Ok(true);
             }
             let child = self.call_array_access_dim_method(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object,
                 "offsetGet",
                 key_value,
                 Some(span),
-                output,
-                stack,
-                state,
             )?;
             if rest.is_empty() {
-                return php_empty_access_value(&child)
-                    .map_err(|message| self.runtime_error(output, compiled, stack, message));
+                return Ok(php_empty_access_value(&child)
+                    .map_err(|message| self.runtime_error(output, compiled, stack, message))?);
             }
             return self
                 .arrayaccess_dim_empty_value(compiled, output, stack, state, child, rest, span);
@@ -1656,20 +1632,23 @@ impl Vm {
             .ok()
             .flatten()
             .unwrap_or(Value::Uninitialized);
-        php_empty_access_value(&value)
-            .map_err(|message| self.runtime_error(output, compiled, stack, message))
+        Ok(php_empty_access_value(&value)
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))?)
     }
 
     pub(super) fn try_userland_arrayaccess_offset_unset_local(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
         local: LocalId,
         dims: &[ArrayKey],
         span: IrSpan,
-    ) -> Result<bool, VmResult> {
+    ) -> Result<bool, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let Some(local_value) = read_local_value(stack, local) else {
             return Ok(false);
         };
@@ -1677,22 +1656,21 @@ impl Vm {
             Ok(Some(object)) => object,
             Ok(None) => return Ok(false),
             Err(message) => {
-                return Err(self.runtime_error(output, compiled, stack, message));
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
             }
         };
         let [key] = dims else {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
                 "E_PHP_VM_ARRAYACCESS_NESTED_DIM: nested ArrayAccess unset is not implemented",
-            ));
+            )));
         };
         self.call_userland_arrayaccess_method(
-            compiled,
-            output,
-            stack,
-            state,
+            ExecutionCursor::new(compiled, output, stack, state),
             object,
             "offsetUnset",
             vec![CallArgument::positional(array_key_to_value(key.clone()))],

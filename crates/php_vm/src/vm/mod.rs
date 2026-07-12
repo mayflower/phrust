@@ -1,8 +1,5 @@
 //! First minimal VM dispatch loop.
 
-#![allow(clippy::result_large_err)]
-#![allow(clippy::too_many_arguments)]
-
 mod arguments;
 mod builtin_adapter;
 mod builtin_array_callbacks;
@@ -33,6 +30,7 @@ mod dim_execution_support;
 mod dispatch_contract;
 mod exception_dispatch;
 mod execution_control;
+mod execution_cursor;
 mod execution_optimization;
 mod execution_state;
 mod execution_tiering;
@@ -83,10 +81,10 @@ mod symbol_resolution;
 mod value_support;
 
 use arguments::{
-    TypecheckFastPathContext, call_args_from_owned_php_array, call_args_from_php_array,
-    call_args_to_positional, call_argument_reference_cell, check_property_type,
-    coerce_or_check_param_type, coerce_return_value, ir_runtime_type, param_is_sensitive,
-    sensitive_parameter_value, trace_value_for_param, type_error_value_name,
+    ParamTypecheckRequest, TypecheckFastPathContext, call_args_from_owned_php_array,
+    call_args_from_php_array, call_args_to_positional, call_argument_reference_cell,
+    check_property_type, coerce_or_check_param_type, coerce_return_value, ir_runtime_type,
+    param_is_sensitive, sensitive_parameter_value, trace_value_for_param, type_error_value_name,
 };
 #[cfg(test)]
 use builtin_adapter::internal_builtin_by_ref_param_name;
@@ -120,6 +118,7 @@ use execution_control::{
     ExceptionHandler, ExecutionLimitExceeded, PendingControl, RaiseOutcome,
     execution_limit_exceeded, next_block_id,
 };
+use execution_cursor::{ExecutionCursor, ExecutionView};
 use execution_state::{
     DeclarationKind, DeclarationLoadKind, DeclarationOrigin, DestructorEntry, DestructorSweep,
     DestructorVisibility, DynamicClassEntry, DynamicConstantEntry, DynamicFunctionEntry,
@@ -130,13 +129,17 @@ use execution_state::{
     preserved_destructor_object_ids, release_unrooted_direct_object_handle,
     release_unrooted_object_handles,
 };
+use execution_tiering::JitLeafRequest;
 use ext_redis::*;
 use generator_fiber::{
-    FiberContinuation, FiberResumeInput, FiberSuspension, GeneratorContinuation,
-    GeneratorResumeInput, GeneratorYield, YieldFromDelegation, YieldFromKey, YieldFromStep,
-    new_fiber_object,
+    FiberContinuation, FiberContinuationState, FiberResumeInput, FiberSuspension,
+    GeneratorContinuation, GeneratorResumeInput, GeneratorYield, YieldFromDelegation, YieldFromKey,
+    YieldFromStep, new_fiber_object,
 };
-use include_execution::{include_failure_allows_continuation, include_vm_error};
+use include_execution::{
+    IncludeExecutionRequest, include_failure_allows_continuation, include_vm_error,
+};
+use inline_cache_access::{DenseInlineCacheSite, IrInlineCacheSite, UnitInlineCacheSite};
 use instrumentation::*;
 use iteration::{
     ForeachInvalidSourceBehavior, ForeachIterator, foreach_array_keys_from_local_at_frame,
@@ -145,11 +148,13 @@ use iteration::{
 };
 use jit_state::*;
 use method_cache_metadata::*;
+use method_dispatch::MagicStaticCallRequest;
 pub use options::{
     BytecodeLayoutMode, DenseIncludeMode, DenseJumpThreadingMode, ExecutionFormat,
     JitBlacklistMode, JitMode, SuperinstructionMode, VmOptions,
 };
 use property_cache_metadata::*;
+use property_execution::PropertyDimProbe;
 use property_resolution::*;
 use property_state::*;
 use reflection::*;
@@ -172,7 +177,9 @@ use static_property_predicates::*;
 use symbol_resolution::*;
 use value_support::*;
 
-use self::execution_optimization::{ObjectClassResolution, ResolvedConstantTables};
+use self::execution_optimization::{
+    ClassStaticCacheLookup, ObjectClassResolution, ResolvedConstantTables,
+};
 use crate::aliasing::{AliasState, slot_alias_state};
 use crate::bytecode::{
     DenseBytecodeUnit, DenseCallArg, DenseCallShapeMeta, DenseCallableKind, DenseClosureCapture,
@@ -959,7 +966,7 @@ impl Vm {
                     result.diagnostics.extend(diagnostics);
                 }
                 Err(error) => {
-                    result = error;
+                    result = *error;
                 }
             }
         }
@@ -969,7 +976,7 @@ impl Vm {
                     result.diagnostics.extend(diagnostics);
                 }
                 Err(error) => {
-                    result = error;
+                    result = *error;
                 }
             }
         }
@@ -979,7 +986,7 @@ impl Vm {
                     result.diagnostics.extend(diagnostics);
                 }
                 Err(error) => {
-                    result = error;
+                    result = *error;
                 }
             }
         }
@@ -1314,7 +1321,7 @@ impl Vm {
         state: &mut ExecutionState,
         diagnostics: Vec<RuntimeDiagnostic>,
         trace_context: Option<&TokenizerStaticCallTraceContext>,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         for diagnostic in diagnostics {
             let (level, channel) = match diagnostic.severity() {
                 RuntimeSeverity::Warning => (
@@ -1397,17 +1404,23 @@ impl Vm {
 
     fn call_static_method_callable(
         &self,
-        compiled: &CompiledUnit,
-        class_name: &str,
-        method: &str,
-        args: Vec<CallArgument>,
-        call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-        allow_by_ref_value_warnings: bool,
-        by_ref_warning_callable_name: Option<String>,
+        cursor: ExecutionCursor<'_>,
+        request: StaticMethodCallableRequest<'_>,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
+        let StaticMethodCallableRequest {
+            class_name,
+            method,
+            args,
+            call_span,
+            allow_by_ref_value_warnings,
+            by_ref_warning_callable_name,
+        } = request;
         if is_closure_runtime_class(class_name) {
             let value = match closure_static_method_value(
                 compiled,
@@ -1443,7 +1456,7 @@ impl Vm {
                 result.diagnostics,
                 trace_context.as_ref(),
             ) {
-                return result;
+                return *result;
             }
             return VmResult::success_no_output(Some(result.value));
         }
@@ -1456,15 +1469,12 @@ impl Vm {
             return VmResult::success_no_output(Some(value));
         }
         if let Err(result) = self.autoload_static_class_if_missing(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             class_name,
             call_span.unwrap_or_default(),
             None,
-            output,
-            stack,
-            state,
         ) {
-            return result;
+            return *result;
         }
         let class = match resolve_static_class_name(compiled, state, stack, class_name) {
             Ok(class) => class,
@@ -1473,7 +1483,7 @@ impl Vm {
         if let Err(result) =
             self.autoload_class_parents_if_missing(compiled, &class, output, stack, state)
         {
-            return result;
+            return *result;
         }
         let normalized_method = normalize_method_name(method);
         if class.flags.is_enum && matches!(normalized_method.as_str(), "cases" | "from" | "tryfrom")
@@ -1509,7 +1519,7 @@ impl Vm {
                 result.diagnostics,
                 trace_context.as_ref(),
             ) {
-                return result;
+                return *result;
             }
             return VmResult::success_no_output(Some(result.value));
         }
@@ -1526,16 +1536,15 @@ impl Vm {
                 let called_class =
                     called_class_for_static_call(compiled, stack, class_name, &class);
                 return match self.call_magic_static_method(
-                    compiled,
-                    &class,
-                    "__callStatic",
-                    method,
-                    args,
-                    called_class,
-                    call_span,
-                    output,
-                    stack,
-                    state,
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    MagicStaticCallRequest {
+                        class: &class,
+                        magic_method: "__callStatic",
+                        called_method: method,
+                        args,
+                        called_class,
+                        call_span,
+                    },
                 ) {
                     Ok(Some(result)) => result,
                     Ok(None) => self.runtime_error(
@@ -1547,7 +1556,7 @@ impl Vm {
                             class.name, method
                         ),
                     ),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             Err(message) => return self.runtime_error(output, compiled, stack, message),
@@ -1580,20 +1589,19 @@ impl Vm {
         {
             let called_class = called_class_for_static_call(compiled, stack, class_name, &class);
             return match self.call_magic_static_method(
-                compiled,
-                &class,
-                "__callStatic",
-                method,
-                args,
-                called_class,
-                call_span,
-                output,
-                stack,
-                state,
+                ExecutionCursor::new(compiled, output, stack, state),
+                MagicStaticCallRequest {
+                    class: &class,
+                    magic_method: "__callStatic",
+                    called_method: method,
+                    args,
+                    called_class,
+                    call_span,
+                },
             ) {
                 Ok(Some(result)) => result,
                 Ok(None) => self.runtime_error(output, compiled, stack, inaccessible),
-                Err(result) => result,
+                Err(result) => *result,
             };
         }
         let visibility = if is_constructor_call {

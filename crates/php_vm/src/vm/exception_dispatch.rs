@@ -101,14 +101,17 @@ impl Vm {
 
     pub(super) fn runtime_error_with_bringup_context(
         &self,
-        output: &OutputBuffer,
-        compiled: &CompiledUnit,
-        stack: &CallStack,
-        state: &ExecutionState,
+        view: ExecutionView<'_>,
         source_span: RuntimeSourceSpan,
         message: impl Into<String>,
         context: BringupDiagnosticInput,
     ) -> VmResult {
+        let ExecutionView {
+            compiled,
+            output,
+            stack,
+            state,
+        } = view;
         let mut message = message.into();
         let diagnostic_message = message.clone();
         if stack.len() > 1 {
@@ -162,20 +165,20 @@ impl Vm {
     /// the current frame's handlers.
     pub(super) fn raise_runtime_error(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
         handlers: &mut Vec<ExceptionHandler>,
         pending_control: &mut Option<PendingControl>,
         span: php_ir::IrSpan,
         message: String,
     ) -> RaiseOutcome {
-        let result = self.runtime_error_with_bringup_context(
-            output,
+        let ExecutionCursor {
             compiled,
+            output,
             stack,
             state,
+        } = cursor;
+        let result = self.runtime_error_with_bringup_context(
+            ExecutionView::new(compiled, output, stack, state),
             runtime_source_span(compiled, span),
             message,
             BringupDiagnosticInput {
@@ -205,15 +208,18 @@ impl Vm {
 
     pub(super) fn raise_runtime_class_entry_error(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
         handlers: &mut Vec<ExceptionHandler>,
         pending_control: &mut Option<PendingControl>,
         operation_span: IrSpan,
         error: RuntimeClassEntryError,
     ) -> RaiseOutcome {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let location_span = error.constant_initializer_span.unwrap_or(operation_span);
         let trace = error
             .constant_initializer_span
@@ -244,14 +250,17 @@ impl Vm {
 
     pub(super) fn route_throwable_result(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
         handlers: &mut Vec<ExceptionHandler>,
         pending_control: &mut Option<PendingControl>,
         result: VmResult,
     ) -> RaiseOutcome {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if vm_result_has_php_fatal_output(&result) {
             return RaiseOutcome::Done(Box::new(result));
         }

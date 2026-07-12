@@ -4,6 +4,15 @@ use super::builtin_adapter::builtin_source_span;
 use super::builtin_fileinfo::FileinfoMethodCall;
 use super::prelude::*;
 
+pub(super) struct MagicStaticCallRequest<'a> {
+    pub(super) class: &'a php_ir::module::ClassEntry,
+    pub(super) magic_method: &'a str,
+    pub(super) called_method: &'a str,
+    pub(super) args: Vec<CallArgument>,
+    pub(super) called_class: String,
+    pub(super) call_span: Option<php_ir::IrSpan>,
+}
+
 impl Vm {
     pub(super) fn try_inline_trivial_method(
         &self,
@@ -227,13 +236,10 @@ impl Vm {
         #[cfg(feature = "jit-copy-patch")]
         if let Some(ir_function) = owner.unit().functions.get(function.index())
             && let Some(result) = self.try_execute_profiled_copy_patch_leaf(
-                owner,
+                ExecutionCursor::new(owner, output, stack, state),
                 function,
                 ir_function,
                 &call,
-                output,
-                stack,
-                state,
             )
         {
             return result;
@@ -388,7 +394,7 @@ impl Vm {
         }
         let declaring_class_name = declaring_class.name.clone();
         self.execute_function_with_dense_plan(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             &owner,
             dense_plan,
             method_function,
@@ -402,54 +408,59 @@ impl Vm {
                     self.class_name_handles(&declaring_class_name).normalized,
                 )
                 .inherit_fiber_context(running_fiber),
-            output,
-            stack,
-            state,
         )
     }
 
     pub(super) fn call_bound_method_callable(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         target: CallableMethodTarget,
         method: &str,
         scope: Option<String>,
         args: Vec<CallArgument>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         match target {
             CallableMethodTarget::Object(object) => self.call_bound_object_method_callable(
-                compiled, object, method, scope, args, call_span, output, stack, state,
+                ExecutionCursor::new(compiled, output, stack, state),
+                object,
+                method,
+                scope,
+                args,
+                call_span,
             ),
             CallableMethodTarget::Class(class_name) => self.call_bound_static_method_callable(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 &class_name,
                 method,
                 scope,
                 args,
                 call_span,
-                output,
-                stack,
-                state,
             ),
         }
     }
 
     pub(super) fn call_bound_object_method_callable(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: ObjectRef,
         method: &str,
         scope: Option<String>,
         args: Vec<CallArgument>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let Some(_class) = lookup_class_in_state(compiled, state, &object.class_name()) else {
             return self.runtime_error(
                 output,
@@ -485,17 +496,25 @@ impl Vm {
                         | "endchildren"
                 ) {
                     return match self.call_spl_recursive_iterator_iterator_method(
-                        compiled, object, method, args, call_span, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        object,
+                        method,
+                        args,
+                        call_span,
                     ) {
                         Ok(value) => VmResult::success_no_output(Some(value)),
-                        Err(result) => result,
+                        Err(result) => *result,
                     };
                 }
                 if let Some(inner) = spl_inner_iterator_delegation_target(&object)
                     && spl_delegation_target_supports_method(compiled, state, &inner, method)
                 {
                     return self.call_object_method_callable(
-                        compiled, inner, method, args, call_span, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        inner,
+                        method,
+                        args,
+                        call_span,
                     );
                 }
                 if class_is_or_extends_internal_throwable_in_state(
@@ -515,15 +534,12 @@ impl Vm {
                     };
                 }
                 return match self.call_magic_instance_method(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object.clone(),
                     "__call",
                     method,
                     args,
                     call_span,
-                    output,
-                    stack,
-                    state,
                 ) {
                     Ok(Some(result)) => result,
                     Ok(None) => self.runtime_error(
@@ -536,7 +552,7 @@ impl Vm {
                             method
                         ),
                     ),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             Err(message) => return self.runtime_error(output, compiled, stack, message),
@@ -571,16 +587,19 @@ impl Vm {
 
     pub(super) fn call_bound_static_method_callable(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         class_name: &str,
         method: &str,
         scope: Option<String>,
         args: Vec<CallArgument>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let Some(class) = lookup_class_in_state(compiled, state, class_name) else {
             return self.runtime_error(
                 output,
@@ -600,16 +619,15 @@ impl Vm {
             Ok(None) => {
                 let called_class = class.display_name.clone();
                 return match self.call_magic_static_method(
-                    compiled,
-                    &class,
-                    "__callStatic",
-                    method,
-                    args,
-                    called_class,
-                    call_span,
-                    output,
-                    stack,
-                    state,
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    MagicStaticCallRequest {
+                        class: &class,
+                        magic_method: "__callStatic",
+                        called_method: method,
+                        args,
+                        called_class,
+                        call_span,
+                    },
                 ) {
                     Ok(Some(result)) => result,
                     Ok(None) => self.runtime_error(
@@ -621,7 +639,7 @@ impl Vm {
                             class.display_name, method
                         ),
                     ),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             Err(message) => return self.runtime_error(output, compiled, stack, message),
@@ -666,30 +684,40 @@ impl Vm {
 
     pub(super) fn call_object_callable(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: ObjectRef,
         args: Vec<CallArgument>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         self.call_object_method_callable(
-            compiled, object, "__invoke", args, call_span, output, stack, state,
+            ExecutionCursor::new(compiled, output, stack, state),
+            object,
+            "__invoke",
+            args,
+            call_span,
         )
     }
 
     pub(super) fn call_object_method_callable(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: ObjectRef,
         method: &str,
         args: Vec<CallArgument>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if is_hash_context_runtime_class(&object.class_name())
             && hash_context_method_is_supported(method)
         {
@@ -718,9 +746,12 @@ impl Vm {
         {
             match self.spl_object_has_userland_method(compiled, state, &object, method) {
                 Ok(false) => {
-                    return match self
-                        .call_spl_heap_method(compiled, object, method, args, output, stack, state)
-                    {
+                    return match self.call_spl_heap_method(
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        object,
+                        method,
+                        args,
+                    ) {
                         Ok(value) => VmResult::success_no_output(Some(value)),
                         Err(SplHeapMethodError::Message(message)) => {
                             self.runtime_error(output, compiled, stack, message)
@@ -820,10 +851,14 @@ impl Vm {
                 )
             {
                 return match self.call_spl_append_iterator_method(
-                    compiled, &object, method, args, output, stack, state, call_span,
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    &object,
+                    method,
+                    args,
+                    call_span,
                 ) {
                     Ok(value) => VmResult::success_no_output(Some(value)),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             if spl_runtime_marker(&object).as_deref() == Some("multipleiterator")
@@ -836,7 +871,7 @@ impl Vm {
                     compiled, &object, method, args, output, stack,
                 ) {
                     Ok(value) => VmResult::success_no_output(Some(value)),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             if spl_runtime_marker(&object).as_deref() == Some("multipleiterator")
@@ -846,10 +881,13 @@ impl Vm {
                 )
             {
                 return match self.call_spl_multiple_iterator_method(
-                    compiled, &object, method, args, output, stack, state,
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    &object,
+                    method,
+                    args,
                 ) {
                     Ok(value) => VmResult::success_no_output(Some(value)),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             if spl_runtime_marker(&object).as_deref() == Some("limititerator")
@@ -860,10 +898,13 @@ impl Vm {
                 )
             {
                 return match self.call_spl_limit_iterator_method(
-                    compiled, &object, method, args, output, stack, state,
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    &object,
+                    method,
+                    args,
                 ) {
                     Ok(value) => VmResult::success_no_output(Some(value)),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             if spl_runtime_marker(&object)
@@ -875,10 +916,13 @@ impl Vm {
                 )
             {
                 return match self.call_spl_caching_iterator_method(
-                    compiled, &object, method, args, output, stack, state,
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    &object,
+                    method,
+                    args,
                 ) {
                     Ok(value) => VmResult::success_no_output(Some(value)),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             if spl_runtime_marker(&object).as_deref() == Some("norewinditerator")
@@ -888,10 +932,13 @@ impl Vm {
                 )
             {
                 return match self.call_spl_no_rewind_iterator_method(
-                    compiled, &object, method, args, output, stack, state,
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    &object,
+                    method,
+                    args,
                 ) {
                     Ok(value) => VmResult::success_no_output(Some(value)),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             if spl_runtime_marker(&object).as_deref() == Some("infiniteiterator")
@@ -901,10 +948,13 @@ impl Vm {
                 )
             {
                 return match self.call_spl_infinite_iterator_method(
-                    compiled, &object, method, args, output, stack, state,
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    &object,
+                    method,
+                    args,
                 ) {
                     Ok(value) => VmResult::success_no_output(Some(value)),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             if spl_runtime_marker(&object)
@@ -925,7 +975,7 @@ impl Vm {
                     state,
                 ) {
                     Ok(value) => VmResult::success_no_output(Some(Value::String(value))),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             if spl_runtime_marker(&object)
@@ -936,7 +986,11 @@ impl Vm {
                 )
             {
                 return self.call_spl_caching_iterator_offset_access_method(
-                    compiled, &object, method, args, call_span, output, stack, state,
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    &object,
+                    method,
+                    args,
+                    call_span,
                 );
             }
             if normalize_method_name(method) == "valid"
@@ -949,7 +1003,7 @@ impl Vm {
                     .call_spl_userland_filter_valid(compiled, object, output, stack, state)
                 {
                     Ok(value) => VmResult::success_no_output(Some(Value::Bool(value))),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             if matches!(
@@ -967,10 +1021,14 @@ impl Vm {
                     | "endchildren"
             ) {
                 return match self.call_spl_recursive_iterator_iterator_method(
-                    compiled, object, method, args, call_span, output, stack, state,
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    object,
+                    method,
+                    args,
+                    call_span,
                 ) {
                     Ok(value) => VmResult::success_no_output(Some(value)),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             return match call_spl_iterator_method(
@@ -987,18 +1045,25 @@ impl Vm {
             is_spl_container_runtime_class(&class) && spl_container_method_is_supported(method)
         }) {
             return match self.call_spl_container_method_with_magic(
-                compiled, object, method, args, None, output, stack, state,
+                ExecutionCursor::new(compiled, output, stack, state),
+                object,
+                method,
+                args,
+                None,
             ) {
                 Ok(value) => VmResult::success_no_output(Some(value)),
-                Err(result) => result,
+                Err(result) => *result,
             };
         }
         if spl_runtime_marker(&object).is_some_and(|class| {
             is_spl_heap_runtime_class(&class) && spl_heap_method_is_supported(method)
         }) {
-            return match self
-                .call_spl_heap_method(compiled, object, method, args, output, stack, state)
-            {
+            return match self.call_spl_heap_method(
+                ExecutionCursor::new(compiled, output, stack, state),
+                object,
+                method,
+                args,
+            ) {
                 Ok(value) => VmResult::success_no_output(Some(value)),
                 Err(SplHeapMethodError::Message(message)) => {
                     self.runtime_error(output, compiled, stack, message)
@@ -1160,7 +1225,11 @@ impl Vm {
                         })
                 {
                     return self.call_object_method_callable(
-                        compiled, inner, method, args, call_span, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        inner,
+                        method,
+                        args,
+                        call_span,
                     );
                 }
                 if class_is_or_extends_internal_throwable_in_state(
@@ -1180,15 +1249,12 @@ impl Vm {
                     };
                 }
                 return match self.call_magic_instance_method(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object.clone(),
                     "__call",
                     method,
                     args,
                     call_span,
-                    output,
-                    stack,
-                    state,
                 ) {
                     Ok(Some(result)) => result,
                     Ok(None) => self.runtime_error(
@@ -1201,7 +1267,7 @@ impl Vm {
                             method
                         ),
                     ),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             Err(message) => return self.runtime_error(output, compiled, stack, message),
@@ -1219,19 +1285,16 @@ impl Vm {
             )
         {
             return match self.call_magic_instance_method(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object.clone(),
                 "__call",
                 method,
                 args,
                 call_span,
-                output,
-                stack,
-                state,
             ) {
                 Ok(Some(result)) => result,
                 Ok(None) => self.runtime_error(output, compiled, stack, message),
-                Err(result) => result,
+                Err(result) => *result,
             };
         }
         if let Err(message) = validate_method_callable_in_state_scope(
@@ -1278,67 +1341,67 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
         let result = self.call_object_method_callable(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             object,
             method,
             Vec::new(),
             None,
-            output,
-            stack,
-            state,
         );
         if !result.status.is_success()
             || result.yielded.is_some()
             || result.fiber_suspension.is_some()
         {
-            return Err(result);
+            return Err(Box::new(result));
         }
         Ok(result.return_value.unwrap_or(Value::Null))
     }
 
     pub(super) fn call_object_method_value_with_positional_args(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: ObjectRef,
         method: &str,
         args: Vec<Value>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
-        let result = self.call_object_method_callable(
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
             compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
+        let result = self.call_object_method_callable(
+            ExecutionCursor::new(compiled, output, stack, state),
             object,
             method,
             args.into_iter().map(CallArgument::positional).collect(),
             None,
-            output,
-            stack,
-            state,
         );
         if !result.status.is_success()
             || result.yielded.is_some()
             || result.fiber_suspension.is_some()
         {
-            return Err(result);
+            return Err(Box::new(result));
         }
         Ok(result.return_value.unwrap_or(Value::Null))
     }
 
     pub(super) fn call_magic_instance_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: ObjectRef,
         magic_method: &str,
         called_method: &str,
         args: Vec<CallArgument>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Option<VmResult>, VmResult> {
+    ) -> Result<Option<VmResult>, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let Some(_class) = lookup_class_in_state(compiled, state, &object.class_name()) else {
             return Ok(None);
         };
@@ -1351,7 +1414,11 @@ impl Vm {
         ) {
             Ok(Some(method)) => method,
             Ok(None) => return Ok(None),
-            Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+            Err(message) => {
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
+            }
         };
         if resolved.method.flags.is_static
             || resolved.method.flags.is_private
@@ -1369,7 +1436,7 @@ impl Vm {
             .iter()
             .any(|active| active == &guard)
         {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
@@ -1377,7 +1444,7 @@ impl Vm {
                     "E_PHP_VM_MAGIC_METHOD_RECURSION: recursive {magic_method} for {}::{called_method}",
                     object.class_name()
                 ),
-            ));
+            )));
         }
         let magic_args = vec![
             CallArgument::positional(Value::String(PhpString::from_test_str(called_method))),
@@ -1407,23 +1474,33 @@ impl Vm {
 
     pub(super) fn call_magic_static_method(
         &self,
-        compiled: &CompiledUnit,
-        class: &php_ir::module::ClassEntry,
-        magic_method: &str,
-        called_method: &str,
-        args: Vec<CallArgument>,
-        called_class: String,
-        call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Option<VmResult>, VmResult> {
+        cursor: ExecutionCursor<'_>,
+        request: MagicStaticCallRequest<'_>,
+    ) -> Result<Option<VmResult>, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
+        let MagicStaticCallRequest {
+            class,
+            magic_method,
+            called_method,
+            args,
+            called_class,
+            call_span,
+        } = request;
         let resolved =
             match lookup_resolved_method_in_state(compiled, state, &class.name, magic_method, None)
             {
                 Ok(Some(method)) => method,
                 Ok(None) => return Ok(None),
-                Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+                Err(message) => {
+                    return Err(Box::new(
+                        self.runtime_error(output, compiled, stack, message),
+                    ));
+                }
             };
         if !resolved.method.flags.is_static
             || resolved.method.flags.is_private
@@ -1441,7 +1518,7 @@ impl Vm {
             .iter()
             .any(|active| active == &guard)
         {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
@@ -1449,7 +1526,7 @@ impl Vm {
                     "E_PHP_VM_MAGIC_METHOD_RECURSION: recursive {magic_method} for {}::{called_method}",
                     class.name
                 ),
-            ));
+            )));
         }
         let magic_args = vec![
             CallArgument::positional(Value::String(PhpString::from_test_str(called_method))),

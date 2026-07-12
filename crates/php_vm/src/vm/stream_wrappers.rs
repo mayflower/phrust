@@ -117,7 +117,7 @@ impl Vm {
         let object = ObjectRef::new_with_display_name(&runtime_class, wrapper.display_class_name);
         let opened_path = ReferenceCell::new(Value::Null);
         let open_result = self.call_object_method_callable(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             object.clone(),
             "stream_open",
             vec![
@@ -127,9 +127,6 @@ impl Vm {
                 CallArgument::positional(Value::Reference(opened_path)),
             ],
             call_span,
-            output,
-            stack,
-            state,
         );
         if let Some(throwable) = state.pending_throw.take() {
             return Some(self.handle_uncaught_exception(compiled, output, stack, state, throwable));
@@ -196,14 +193,11 @@ impl Vm {
         .is_some()
         {
             let close_result = self.call_object_method_callable(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object,
                 "stream_close",
                 Vec::new(),
                 call_span,
-                output,
-                stack,
-                state,
             );
             if let Some(throwable) = state.pending_throw.take() {
                 return Some(
@@ -224,7 +218,7 @@ impl Vm {
         compiled: &CompiledUnit,
         output: &mut OutputBuffer,
         state: &mut ExecutionState,
-    ) -> Result<Vec<RuntimeDiagnostic>, VmResult> {
+    ) -> Result<Vec<RuntimeDiagnostic>, Box<VmResult>> {
         let mut diagnostics = Vec::new();
         for id in state.builtins.user_stream_wrappers.pending_close_ids() {
             let mut stack = CallStack::new();
@@ -234,7 +228,7 @@ impl Vm {
                 continue;
             };
             if !result.status.is_success() {
-                return Err(result);
+                return Err(Box::new(result));
             }
             diagnostics.extend(result.diagnostics);
         }

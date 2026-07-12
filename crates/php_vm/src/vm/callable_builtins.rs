@@ -77,7 +77,7 @@ impl Vm {
             && let Err(result) =
                 self.autoload_callable_class(compiled, &value, output, stack, state)
         {
-            return result;
+            return *result;
         }
         let callable = value_is_callable(compiled, state, &value, syntax_only);
         if let Some(name_arg) = bound[2].as_ref() {
@@ -237,10 +237,15 @@ impl Vm {
             stack,
             state,
         ) {
-            return result;
+            return *result;
         }
         self.call_callable_inner(
-            compiled, callback, args, call_span, output, stack, state, true, None,
+            ExecutionCursor::new(compiled, output, stack, state),
+            callback,
+            args,
+            call_span,
+            true,
+            None,
         )
     }
 
@@ -288,10 +293,15 @@ impl Vm {
             stack,
             state,
         ) {
-            return result;
+            return *result;
         }
         self.call_callable_inner(
-            compiled, callback, args, call_span, output, stack, state, true, None,
+            ExecutionCursor::new(compiled, output, stack, state),
+            callback,
+            args,
+            call_span,
+            true,
+            None,
         )
     }
 
@@ -303,7 +313,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         match callback {
             Value::Reference(cell) => {
                 let resolved = cell.get();
@@ -313,7 +323,10 @@ impl Vm {
                 let name = name.to_string_lossy();
                 if let Some((class_name, method)) = name.split_once("::") {
                     self.preflight_static_user_callback(
-                        compiled, class_name, method, builtin, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        class_name,
+                        method,
+                        builtin,
                     )?;
                 }
             }
@@ -328,16 +341,16 @@ impl Vm {
                 };
                 match callable_resolve_reference(target.clone()) {
                     Value::Object(object) => self.preflight_object_user_callback(
-                        compiled, &object, &method, builtin, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        &object,
+                        &method,
+                        builtin,
                     )?,
                     Value::String(class_name) => self.preflight_static_user_callback(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         &class_name.to_string_lossy(),
                         &method,
                         builtin,
-                        output,
-                        stack,
-                        state,
                     )?,
                     _ => {}
                 }
@@ -349,36 +362,33 @@ impl Vm {
 
     pub(super) fn preflight_static_user_callback(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         class_name: &str,
         method: &str,
         builtin: &str,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
-        let exists = self.class_like_exists_with_autoload_cache(
+    ) -> Result<(), Box<VmResult>> {
+        let ExecutionCursor {
             compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
+        let exists = self.class_like_exists_with_autoload_cache(
+            ExecutionCursor::new(compiled, output, stack, state),
             class_name,
             AutoloadClassLookupKind::Class,
             true,
             None,
-            output,
-            stack,
-            state,
         )?;
         if !exists {
-            return Err(self.callable_type_error(
-                compiled,
-                output,
-                stack,
-                state,
+            return Err(Box::new(self.callable_type_error(
+                ExecutionCursor::new(compiled, output, stack, state),
                 format!(
                     "{builtin}(): Argument #1 ($callback) must be a valid callback, class \"{class_name}\" not found"
                 ),
                 Some(class_name.to_owned()),
                 Some("class"),
-            ));
+            )));
         }
         let Some(resolved) =
             lookup_resolved_method_in_state(compiled, state, class_name, method, None)
@@ -387,26 +397,26 @@ impl Vm {
             return Ok(());
         };
         self.preflight_resolved_user_callback(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             &resolved.class,
             &resolved.method,
             builtin,
-            output,
-            stack,
-            state,
         )
     }
 
     pub(super) fn preflight_object_user_callback(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         method: &str,
         builtin: &str,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let Some(resolved) =
             lookup_resolved_method_in_state(compiled, state, &object.class_name(), method, None)
                 .map_err(|message| self.runtime_error(output, compiled, stack, message))?
@@ -414,26 +424,26 @@ impl Vm {
             return Ok(());
         };
         self.preflight_resolved_user_callback(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             &resolved.class,
             &resolved.method,
             builtin,
-            output,
-            stack,
-            state,
         )
     }
 
     pub(super) fn preflight_resolved_user_callback(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         class: &php_ir::module::ClassEntry,
         method: &php_ir::module::ClassMethodEntry,
         builtin: &str,
-        output: &mut OutputBuffer,
-        stack: &CallStack,
-        state: &ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let visibility = if method.flags.is_private {
             Some("private")
         } else if method.flags.is_protected {
@@ -456,35 +466,32 @@ impl Vm {
         if accessible {
             return Ok(());
         }
-        Err(self.callable_type_error(
-            compiled,
-            output,
-            stack,
-            state,
+        Err(Box::new(self.callable_type_error(
+            ExecutionCursor::new(compiled, output, stack, state),
             format!(
                 "{builtin}(): Argument #1 ($callback) must be a valid callback, cannot access {visibility} method {}::{}()",
                 class.display_name, method.name
             ),
             Some(format!("{}::{}", class.display_name, method.name)),
             Some("function"),
-        ))
+        )))
     }
 
     pub(super) fn callable_type_error(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &CallStack,
-        state: &ExecutionState,
+        cursor: ExecutionCursor<'_>,
         message: String,
         requested_name: Option<String>,
         lookup_kind: Option<&'static str>,
     ) -> VmResult {
-        self.runtime_error_with_bringup_context(
-            output,
+        let ExecutionCursor {
             compiled,
+            output,
             stack,
             state,
+        } = cursor;
+        self.runtime_error_with_bringup_context(
+            ExecutionView::new(compiled, output, stack, state),
             RuntimeSourceSpan::default(),
             format!("E_PHP_RUNTIME_BUILTIN_TYPE: {message}"),
             BringupDiagnosticInput {

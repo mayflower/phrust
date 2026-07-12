@@ -345,16 +345,13 @@ pub(super) fn execute_rich_binary_op(
         Some(value) => value,
         None => vm
             .execute_binary(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 op,
                 &lhs,
                 &rhs,
                 runtime_source_span(compiled, span),
-                output,
-                stack,
-                state,
             )
-            .map_err(|result| RichBinaryError::Route(Box::new(result)))?,
+            .map_err(|result| RichBinaryError::Route(Box::new(*result)))?,
     };
     stack
         .frame_mut(frame_index)
@@ -395,7 +392,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         let DenseBinaryRequest {
             compiled,
             unit_id,
@@ -439,14 +436,11 @@ impl Vm {
                 let lhs = lhs.into_owned();
                 let rhs = rhs.into_owned();
                 self.execute_binary(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     op,
                     &lhs,
                     &rhs,
                     runtime_source_span(compiled, span),
-                    output,
-                    stack,
-                    state,
                 )?
             }
         };

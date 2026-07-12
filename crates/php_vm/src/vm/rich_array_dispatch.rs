@@ -2,15 +2,18 @@ use super::*;
 
 pub(super) fn execute_rich_array_instruction(
     vm: &Vm,
-    compiled: &CompiledUnit,
+    cursor: ExecutionCursor<'_>,
     site: dispatch_contract::RichInstructionSite<'_>,
-    output: &mut OutputBuffer,
-    stack: &mut CallStack,
-    state: &mut ExecutionState,
     diagnostics: &mut Vec<RuntimeDiagnostic>,
     exception_handlers: &mut Vec<ExceptionHandler>,
     pending_control: &mut Option<PendingControl>,
 ) -> RichDispatchOutcome {
+    let ExecutionCursor {
+        compiled,
+        output,
+        stack,
+        state,
+    } = cursor;
     let dispatch_contract::RichInstructionSite {
         unit,
         function,
@@ -187,10 +190,7 @@ pub(super) fn execute_rich_array_instruction(
                                 Ok(object) => object,
                                 Err(message) => {
                                     match vm.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
+                                        ExecutionCursor::new(compiled, output, stack, state),
                                         exception_handlers,
                                         pending_control,
                                         instruction.span,
@@ -207,10 +207,7 @@ pub(super) fn execute_rich_array_instruction(
                             }
                         {
                             match vm.call_userland_arrayaccess_method(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 object,
                                 "offsetGet",
                                 vec![CallArgument::positional(key_value.clone())],
@@ -218,7 +215,7 @@ pub(super) fn execute_rich_array_instruction(
                             ) {
                                 Ok(value) => value,
                                 Err(result) => {
-                                    return RichDispatchOutcome::Return(Box::new(result));
+                                    return RichDispatchOutcome::Return(Box::new(*result));
                                 }
                             }
                         } else if let Value::Object(object) = &base
@@ -229,10 +226,7 @@ pub(super) fn execute_rich_array_instruction(
                                 Ok(value) => value,
                                 Err(message) => {
                                     match vm.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
+                                        ExecutionCursor::new(compiled, output, stack, state),
                                         exception_handlers,
                                         pending_control,
                                         instruction.span,
@@ -252,10 +246,7 @@ pub(super) fn execute_rich_array_instruction(
                                 Ok(key) => key,
                                 Err(message) => {
                                     match vm.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
+                                        ExecutionCursor::new(compiled, output, stack, state),
                                         exception_handlers,
                                         pending_control,
                                         instruction.span,
@@ -310,7 +301,7 @@ pub(super) fn execute_rich_array_instruction(
                                                 Ok(_) => {}
                                                 Err(result) => {
                                                     return RichDispatchOutcome::Return(Box::new(
-                                                        result,
+                                                        *result,
                                                     ));
                                                 }
                                             }
@@ -352,7 +343,7 @@ pub(super) fn execute_rich_array_instruction(
                                                 Ok(_) => {}
                                                 Err(result) => {
                                                     return RichDispatchOutcome::Return(Box::new(
-                                                        result,
+                                                        *result,
                                                     ));
                                                 }
                                             }
@@ -431,10 +422,9 @@ pub(super) fn execute_rich_array_instruction(
                                         }
                                         Err(message) => {
                                             match vm.raise_runtime_error(
-                                                compiled,
-                                                output,
-                                                stack,
-                                                state,
+                                                ExecutionCursor::new(
+                                                    compiled, output, stack, state,
+                                                ),
                                                 exception_handlers,
                                                 pending_control,
                                                 instruction.span,
@@ -464,7 +454,7 @@ pub(super) fn execute_rich_array_instruction(
                                 ) {
                                     Ok(()) => Value::Null,
                                     Err(result) => {
-                                        return RichDispatchOutcome::Return(Box::new(result));
+                                        return RichDispatchOutcome::Return(Box::new(*result));
                                     }
                                 }
                             } else {
@@ -481,10 +471,7 @@ pub(super) fn execute_rich_array_instruction(
                                     }
                                     Err(message) => {
                                         match vm.raise_runtime_error(
-                                            compiled,
-                                            output,
-                                            stack,
-                                            state,
+                                            ExecutionCursor::new(compiled, output, stack, state),
                                             exception_handlers,
                                             pending_control,
                                             instruction.span,
@@ -544,10 +531,7 @@ pub(super) fn execute_rich_array_instruction(
                 }
             };
             match vm.try_userland_arrayaccess_offset_set_local(
-                compiled,
-                output,
-                stack,
-                state,
+                ExecutionCursor::new(compiled, output, stack, state),
                 *local,
                 &dim_values,
                 false,
@@ -569,7 +553,7 @@ pub(super) fn execute_rich_array_instruction(
                     return RichDispatchOutcome::Continue;
                 }
                 Ok(false) => {}
-                Err(result) => return RichDispatchOutcome::Return(Box::new(result)),
+                Err(result) => return RichDispatchOutcome::Return(Box::new(*result)),
             }
             let dims = match dim_values_to_array_keys(&dim_values) {
                 Ok(dims) => dims,
@@ -603,13 +587,10 @@ pub(super) fn execute_rich_array_instruction(
                             }
                             Err(result) => {
                                 match vm.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     exception_handlers,
                                     pending_control,
-                                    result,
+                                    *result,
                                 ) {
                                     RaiseOutcome::Caught(target) => {
                                         return RichDispatchOutcome::Jump(target);
@@ -728,10 +709,7 @@ pub(super) fn execute_rich_array_instruction(
                 let message = message.render_message();
                 if message.starts_with("E_PHP_VM_STRING_OFFSET_TYPE:") {
                     match vm.raise_runtime_error(
-                        compiled,
-                        output,
-                        stack,
-                        state,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         exception_handlers,
                         pending_control,
                         instruction.span,
@@ -788,10 +766,7 @@ pub(super) fn execute_rich_array_instruction(
             };
             let dim_values: Vec<Value> = dims.iter().cloned().map(array_key_to_value).collect();
             match vm.try_userland_arrayaccess_offset_set_local(
-                compiled,
-                output,
-                stack,
-                state,
+                ExecutionCursor::new(compiled, output, stack, state),
                 *local,
                 &dim_values,
                 true,
@@ -813,7 +788,7 @@ pub(super) fn execute_rich_array_instruction(
                     return RichDispatchOutcome::Continue;
                 }
                 Ok(false) => {}
-                Err(result) => return RichDispatchOutcome::Return(Box::new(result)),
+                Err(result) => return RichDispatchOutcome::Return(Box::new(*result)),
             }
             if !is_globals_local(function, *local)
                 && let Some(Value::Object(object)) =
@@ -959,10 +934,7 @@ pub(super) fn execute_rich_array_instruction(
             };
             vm.record_counter_local_slot_fast_path(local_slot_is_in_bounds(stack, *local));
             match vm.try_userland_arrayaccess_offset_exists_local(
-                compiled,
-                output,
-                stack,
-                state,
+                ExecutionCursor::new(compiled, output, stack, state),
                 *local,
                 &dims,
                 instruction.span,
@@ -981,7 +953,7 @@ pub(super) fn execute_rich_array_instruction(
                     return RichDispatchOutcome::Continue;
                 }
                 Ok(None) => {}
-                Err(result) => return RichDispatchOutcome::Return(Box::new(result)),
+                Err(result) => return RichDispatchOutcome::Return(Box::new(*result)),
             }
             let local_value = if is_globals_local(function, *local) {
                 Some(Value::Array(state.globals.globals_array()))
@@ -993,25 +965,19 @@ pub(super) fn execute_rich_array_instruction(
                 .and_then(|value| spl_array_access_dim_target(value, &dims))
             {
                 let exists = match vm.call_array_access_dim_method(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object,
                     "offsetExists",
                     key_value,
                     Some(instruction.span),
-                    output,
-                    stack,
-                    state,
                 ) {
                     Ok(value) => value,
                     Err(result) => {
                         match vm.route_throwable_result(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
-                            result,
+                            *result,
                         ) {
                             RaiseOutcome::Caught(target) => {
                                 return RichDispatchOutcome::Jump(target);
@@ -1074,10 +1040,7 @@ pub(super) fn execute_rich_array_instruction(
             };
             vm.record_counter_local_slot_fast_path(local_slot_is_in_bounds(stack, *local));
             match vm.try_userland_arrayaccess_offset_empty_local(
-                compiled,
-                output,
-                stack,
-                state,
+                ExecutionCursor::new(compiled, output, stack, state),
                 *local,
                 &dims,
                 instruction.span,
@@ -1096,7 +1059,7 @@ pub(super) fn execute_rich_array_instruction(
                     return RichDispatchOutcome::Continue;
                 }
                 Ok(None) => {}
-                Err(result) => return RichDispatchOutcome::Return(Box::new(result)),
+                Err(result) => return RichDispatchOutcome::Return(Box::new(*result)),
             }
             let local_value = if is_globals_local(function, *local) {
                 Some(Value::Array(state.globals.globals_array()))
@@ -1108,25 +1071,19 @@ pub(super) fn execute_rich_array_instruction(
                 .and_then(|value| spl_array_access_dim_target(value, &dims))
             {
                 let exists = match vm.call_array_access_dim_method(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object.clone(),
                     "offsetExists",
                     key_value.clone(),
                     Some(instruction.span),
-                    output,
-                    stack,
-                    state,
                 ) {
                     Ok(value) => value,
                     Err(result) => {
                         match vm.route_throwable_result(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
-                            result,
+                            *result,
                         ) {
                             RaiseOutcome::Caught(target) => {
                                 return RichDispatchOutcome::Jump(target);
@@ -1147,25 +1104,19 @@ pub(super) fn execute_rich_array_instruction(
                 };
                 if exists {
                     match vm.call_array_access_dim_method(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         object,
                         "offsetGet",
                         key_value,
                         Some(instruction.span),
-                        output,
-                        stack,
-                        state,
                     ) {
                         Ok(value) => value,
                         Err(result) => {
                             match vm.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
-                                result,
+                                *result,
                             ) {
                                 RaiseOutcome::Caught(target) => {
                                     return RichDispatchOutcome::Jump(target);
@@ -1224,10 +1175,7 @@ pub(super) fn execute_rich_array_instruction(
                 local_array_is_packed_fast_at_frame(stack, frame_index, *local)
             };
             match vm.try_userland_arrayaccess_offset_unset_local(
-                compiled,
-                output,
-                stack,
-                state,
+                ExecutionCursor::new(compiled, output, stack, state),
                 *local,
                 &dims,
                 instruction.span,
@@ -1237,7 +1185,7 @@ pub(super) fn execute_rich_array_instruction(
                     return RichDispatchOutcome::Continue;
                 }
                 Ok(false) => {}
-                Err(result) => return RichDispatchOutcome::Return(Box::new(result)),
+                Err(result) => return RichDispatchOutcome::Return(Box::new(*result)),
             }
             let local_value = if is_globals_local(function, *local) {
                 Some(Value::Array(state.globals.globals_array()))
@@ -1249,14 +1197,11 @@ pub(super) fn execute_rich_array_instruction(
                 .and_then(|value| spl_array_access_dim_target(value, &dims))
             {
                 match vm.call_array_access_dim_method(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object,
                     "offsetUnset",
                     key_value,
                     Some(instruction.span),
-                    output,
-                    stack,
-                    state,
                 ) {
                     Ok(_) => {
                         vm.record_lvalue_trace_event("array-unset-dim", *local, &dims);
@@ -1264,13 +1209,10 @@ pub(super) fn execute_rich_array_instruction(
                     }
                     Err(result) => {
                         match vm.route_throwable_result(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
-                            result,
+                            *result,
                         ) {
                             RaiseOutcome::Caught(target) => {
                                 return RichDispatchOutcome::Jump(target);

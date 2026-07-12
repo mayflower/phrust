@@ -1,8 +1,6 @@
 //! Runtime implementations of built-in / optional-extension classes (std_class,
 //! hash_context, PhpToken, DateTime family, SQLite, PDO, mysqli, Memcached, Imagick,
 //! XSL, Phar, GD, ZipArchive, FFI, XML, Normalizer, Intl), extracted from the VM module.
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::result_large_err)]
 
 use super::prelude::*;
 use php_runtime::api::{
@@ -4543,40 +4541,42 @@ pub(super) fn zip_load_write_state(path: &Path) -> Result<(PhpArray, Vec<u8>), S
         let key = ArrayKey::String(PhpString::from_bytes(name.as_bytes().to_vec()));
         entries.insert(
             key,
-            Value::Array(zip_write_entry(
-                kind,
+            Value::Array(zip_write_entry(ZipEntry {
+                kind: kind.to_owned(),
                 name,
                 contents,
                 size,
-                compressed_size,
+                comp_size: compressed_size,
                 crc,
                 comment,
-                compression_method,
-            )),
+                method: compression_method,
+            })),
         );
     }
     Ok((entries, comment))
 }
 
-pub(super) fn zip_write_entry(
-    kind: &str,
+struct ZipEntry {
+    kind: String,
     name: String,
     contents: Vec<u8>,
     size: i64,
-    compressed_size: i64,
+    comp_size: i64,
     crc: i64,
     comment: Vec<u8>,
-    compression_method: i64,
-) -> PhpArray {
+    method: i64,
+}
+
+fn zip_write_entry(data: ZipEntry) -> PhpArray {
     let mut entry = PhpArray::new();
-    zip_array_insert(&mut entry, "kind", Value::string(kind));
-    zip_array_insert(&mut entry, "name", Value::string(name.into_bytes()));
-    zip_array_insert(&mut entry, "contents", Value::string(contents));
-    zip_array_insert(&mut entry, "size", Value::Int(size));
-    zip_array_insert(&mut entry, "comp_size", Value::Int(compressed_size));
-    zip_array_insert(&mut entry, "crc", Value::Int(crc));
-    zip_array_insert(&mut entry, "comment", Value::string(comment));
-    zip_array_insert(&mut entry, "comp_method", Value::Int(compression_method));
+    zip_array_insert(&mut entry, "kind", Value::string(data.kind));
+    zip_array_insert(&mut entry, "name", Value::string(data.name.into_bytes()));
+    zip_array_insert(&mut entry, "contents", Value::string(data.contents));
+    zip_array_insert(&mut entry, "size", Value::Int(data.size));
+    zip_array_insert(&mut entry, "comp_size", Value::Int(data.comp_size));
+    zip_array_insert(&mut entry, "crc", Value::Int(data.crc));
+    zip_array_insert(&mut entry, "comment", Value::string(data.comment));
+    zip_array_insert(&mut entry, "comp_method", Value::Int(data.method));
     entry
 }
 
@@ -4971,16 +4971,16 @@ pub(super) fn zip_append_write_entry(
         return Ok(false);
     }
     let size = contents.len() as i64;
-    let entry = zip_write_entry(
-        kind,
+    let entry = zip_write_entry(ZipEntry {
+        kind: kind.to_owned(),
         name,
         contents,
         size,
-        size,
-        0,
-        Vec::new(),
-        ZIP_CM_STORE,
-    );
+        comp_size: size,
+        crc: 0,
+        comment: Vec::new(),
+        method: ZIP_CM_STORE,
+    });
     entries.insert(key, Value::Array(entry));
     let last_id = existing_index.unwrap_or_else(|| entries.iter().len().saturating_sub(1));
     object.set_property("numFiles", Value::Int(entries.iter().len() as i64));

@@ -5,16 +5,19 @@ use super::prelude::*;
 impl Vm {
     pub(super) fn fetch_class_constant_value(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         class_name: &str,
         constant: &str,
         cache_site: Option<(FunctionId, BlockId, InstrId)>,
         cache_id: Option<InlineCacheId>,
         span: IrSpan,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Result<Value, ClassConstantFetch> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if constant.eq_ignore_ascii_case("class")
             && normalize_class_name(class_name) == "static"
             && let Some(called_class) = current_called_class_display(compiled, stack)
@@ -25,15 +28,12 @@ impl Vm {
             (compiled_unit_cache_key(compiled), function, block, instr)
         });
         if let Err(result) = self.autoload_static_class_if_missing(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             class_name,
             span,
             autoload_site,
-            output,
-            stack,
-            state,
         ) {
-            return Err(ClassConstantFetch::Throwable(Box::new(result)));
+            return Err(ClassConstantFetch::Throwable(Box::new(*result)));
         }
         let class = match resolve_static_class_name(compiled, state, stack, class_name) {
             Ok(class) => class,
@@ -76,16 +76,20 @@ impl Vm {
             };
             if let Some((function_id, block_id, instruction_id)) = cache_site
                 && let Some(target) = self.lookup_class_constant_static_property_inline_cache(
-                    compiled,
-                    cache_id,
-                    function_id,
-                    block_id,
-                    instruction_id,
-                    cache_kind,
-                    &resolved_class,
-                    constant,
-                    normalized_scope.as_deref(),
-                    lookup_epoch,
+                    IrInlineCacheSite::hybrid(
+                        compiled,
+                        cache_id,
+                        function_id,
+                        block_id,
+                        instruction_id,
+                    ),
+                    ClassStaticCacheLookup {
+                        kind: cache_kind,
+                        resolved_class: &resolved_class,
+                        member: constant,
+                        scope: normalized_scope.as_deref(),
+                        epoch: lookup_epoch,
+                    },
                 )
             {
                 match self
@@ -126,16 +130,20 @@ impl Vm {
                         },
                     };
                     self.install_class_constant_static_property_inline_cache(
-                        compiled,
-                        cache_id,
-                        function_id,
-                        block_id,
-                        instruction_id,
-                        ClassConstantStaticPropertyCacheKind::EnumCase,
-                        &resolved_class,
-                        constant,
-                        None,
-                        lookup_epoch,
+                        IrInlineCacheSite::hybrid(
+                            compiled,
+                            cache_id,
+                            function_id,
+                            block_id,
+                            instruction_id,
+                        ),
+                        ClassStaticCacheLookup {
+                            kind: ClassConstantStaticPropertyCacheKind::EnumCase,
+                            resolved_class: &resolved_class,
+                            member: constant,
+                            scope: None,
+                            epoch: lookup_epoch,
+                        },
                         target,
                     );
                 }
@@ -214,16 +222,20 @@ impl Vm {
                         },
                     };
                 self.install_class_constant_static_property_inline_cache(
-                    compiled,
-                    cache_id,
-                    function_id,
-                    block_id,
-                    instruction_id,
-                    ClassConstantStaticPropertyCacheKind::ClassConstant,
-                    &resolved_class,
-                    constant,
-                    cache_scope.as_deref(),
-                    lookup_epoch,
+                    IrInlineCacheSite::hybrid(
+                        compiled,
+                        cache_id,
+                        function_id,
+                        block_id,
+                        instruction_id,
+                    ),
+                    ClassStaticCacheLookup {
+                        kind: ClassConstantStaticPropertyCacheKind::ClassConstant,
+                        resolved_class: &resolved_class,
+                        member: constant,
+                        scope: cache_scope.as_deref(),
+                        epoch: lookup_epoch,
+                    },
                     target,
                 );
             }
@@ -293,7 +305,7 @@ impl Vm {
             state,
         ) {
             Ok(copy) => copy,
-            Err(result) => return Err(ClassConstantFetch::Throwable(Box::new(result))),
+            Err(result) => return Err(ClassConstantFetch::Throwable(Box::new(*result))),
         };
         self.register_destructor_if_needed(compiled, &class, copy.clone(), state);
         Ok(Value::Object(copy))
@@ -344,14 +356,17 @@ impl Vm {
 
     pub(super) fn execute_spl_autoload(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         values: Vec<Value>,
         call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
         call_span: Option<IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if values.is_empty() || values.len() > 2 {
             return self.runtime_error(
                 output,
@@ -392,18 +407,19 @@ impl Vm {
                 continue;
             }
             let result = self.execute_include(
-                compiled,
-                None,
-                unit_key,
-                function_id,
-                block_id,
-                instruction_id,
-                span,
-                IncludeKind::IncludeOnce,
-                &Value::string(path),
-                output,
-                stack,
-                state,
+                ExecutionCursor::new(compiled, output, stack, state),
+                IncludeExecutionRequest {
+                    site: UnitInlineCacheSite::new(
+                        None,
+                        unit_key,
+                        function_id,
+                        block_id,
+                        instruction_id,
+                    ),
+                    instruction_span: span,
+                    kind: IncludeKind::IncludeOnce,
+                    path: &Value::string(path),
+                },
             );
             if !result.status.is_success() {
                 return result;
@@ -417,15 +433,18 @@ impl Vm {
 
     pub(super) fn call_autoload_builtin(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         name: &str,
         args: Vec<CallArgument>,
         call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if name == "is_callable" {
             return self.call_is_callable_builtin(compiled, args, output, stack, state);
         }
@@ -470,7 +489,7 @@ impl Vm {
                         compiled, call_span, output, stack, state,
                     )
                 {
-                    return result;
+                    return *result;
                 }
                 let prepend = values
                     .get(2)
@@ -510,7 +529,7 @@ impl Vm {
                     if let Err(result) = self.emit_spl_autoload_call_unregister_deprecation(
                         compiled, call_span, output, stack, state,
                     ) {
-                        return result;
+                        return *result;
                     }
                     state.autoload_registry.clear();
                     state.bump_autoload_stack_epoch();
@@ -544,7 +563,7 @@ impl Vm {
                 };
                 match self.autoload_class(compiled, &class_name, output, stack, state, None) {
                     Ok(()) => VmResult::success_no_output(Some(Value::Null)),
-                    Err(result) => result,
+                    Err(result) => *result,
                 }
             }
             "spl_autoload_extensions" => {
@@ -569,8 +588,12 @@ impl Vm {
                     state.spl_autoload_extensions.clone(),
                 )))
             }
-            "spl_autoload" => self
-                .execute_spl_autoload(compiled, values, call_site, call_span, output, stack, state),
+            "spl_autoload" => self.execute_spl_autoload(
+                ExecutionCursor::new(compiled, output, stack, state),
+                values,
+                call_site,
+                call_span,
+            ),
             "defined" => {
                 let Some(constant_name) = values.first() else {
                     return self.runtime_error(
@@ -611,15 +634,12 @@ impl Vm {
                 ) {
                     let mut diagnostics = Vec::new();
                     if let Err(result) = self.emit_define_duplicate_warning(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         call_span,
-                        output,
-                        stack,
-                        state,
                         &mut diagnostics,
                         &constant_name,
                     ) {
-                        return result;
+                        return *result;
                     }
                     return VmResult::success_with_diagnostics_no_output(
                         Some(Value::Bool(false)),
@@ -663,16 +683,13 @@ impl Vm {
                 let mut diagnostics = Vec::new();
                 if let Some(constant) = resolved.predefined
                     && let Err(result) = self.emit_predefined_constant_deprecation(
-                        compiled,
-                        output,
-                        stack,
-                        state,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         &mut diagnostics,
                         call_span.unwrap_or_else(|| IrSpan::new(php_ir::FileId::new(0), 0, 0)),
                         constant,
                     )
                 {
-                    return result;
+                    return *result;
                 }
                 VmResult::success_with_diagnostics_no_output(Some(resolved.value), diagnostics)
             }
@@ -767,22 +784,22 @@ impl Vm {
                     _ => AutoloadClassLookupKind::Class,
                 };
                 let exists = match self.class_like_exists_with_autoload_cache(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &class_name,
                     lookup_kind,
                     autoload,
                     call_site,
-                    output,
-                    stack,
-                    state,
                 ) {
                     Ok(exists) => exists,
-                    Err(result) => return result,
+                    Err(result) => return *result,
                 };
                 VmResult::success_no_output(Some(Value::Bool(exists)))
             }
             "class_alias" => self.call_class_alias_builtin(
-                compiled, values, call_site, call_span, output, stack, state,
+                ExecutionCursor::new(compiled, output, stack, state),
+                values,
+                call_site,
+                call_span,
             ),
             "method_exists" => {
                 self.call_method_exists_builtin(compiled, values, output, stack, state)
@@ -927,7 +944,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         match effective_value(value) {
             Value::String(name) => {
                 let name = name.to_string_lossy();
@@ -987,7 +1004,7 @@ impl Vm {
             && let Err(result) =
                 self.autoload_class(compiled, &class_name, output, stack, state, None)
         {
-            return result;
+            return *result;
         }
         let exists = lookup_method_in_state(compiled, state, &class_name, &method)
             .map(|value| value.is_some())
@@ -1036,7 +1053,7 @@ impl Vm {
             && let Err(result) =
                 self.autoload_class(compiled, &class_name, output, stack, state, None)
         {
-            return result;
+            return *result;
         }
         let exists = lookup_property_in_state(compiled, state, &class_name, &property)
             .map(|value| value.is_some())
@@ -1124,7 +1141,7 @@ impl Vm {
             && let Err(result) =
                 self.autoload_class(compiled, &class_name, output, stack, state, None)
         {
-            return result;
+            return *result;
         }
         let Some(class) = lookup_class_in_state(compiled, state, &class_name) else {
             return VmResult::success_no_output(Some(Value::Bool(false)));
@@ -1160,7 +1177,7 @@ impl Vm {
             && let Err(result) =
                 self.autoload_class(compiled, &class_name, output, stack, state, None)
         {
-            return result;
+            return *result;
         }
         let Some(class) = lookup_class_in_state(compiled, state, &class_name) else {
             return VmResult::success_no_output(Some(Value::Bool(false)));
@@ -1236,7 +1253,7 @@ impl Vm {
                 && let Err(result) =
                     self.autoload_class(compiled, candidate, output, stack, state, None)
             {
-                return result;
+                return *result;
             }
         }
         let exists = class_is_subclass_of_in_state(compiled, state, &class_name, &target_name)
@@ -1277,7 +1294,7 @@ impl Vm {
                 && let Err(result) =
                     self.autoload_class(compiled, candidate, output, stack, state, None)
             {
-                return result;
+                return *result;
             }
         }
         let exists =
@@ -1340,7 +1357,7 @@ impl Vm {
             && let Err(result) =
                 self.autoload_class(compiled, &class_name, output, stack, state, None)
         {
-            return result;
+            return *result;
         }
         let parent = lookup_class_in_state(compiled, state, &class_name)
             .and_then(|class| class.parent.clone())
@@ -1384,20 +1401,17 @@ impl Vm {
             && let Err(result) =
                 self.autoload_class(compiled, &class_name, output, stack, state, None)
         {
-            return result;
+            return *result;
         }
         let Some(class) = lookup_class_in_state(compiled, state, &class_name) else {
             if let Err(result) = self.emit_class_introspection_missing_warning(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 "class_parents",
                 &class_name,
                 should_autoload,
                 call_span,
-                output,
-                stack,
-                state,
             ) {
-                return result;
+                return *result;
             }
             return VmResult::success_no_output(Some(Value::Bool(false)));
         };
@@ -1450,20 +1464,17 @@ impl Vm {
             && let Err(result) =
                 self.autoload_class(compiled, &class_name, output, stack, state, None)
         {
-            return result;
+            return *result;
         }
         let Some(class) = lookup_class_in_state(compiled, state, &class_name) else {
             if let Err(result) = self.emit_class_introspection_missing_warning(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 "class_implements",
                 &class_name,
                 should_autoload,
                 call_span,
-                output,
-                stack,
-                state,
             ) {
-                return result;
+                return *result;
             }
             return VmResult::success_no_output(Some(Value::Bool(false)));
         };
@@ -1478,15 +1489,18 @@ impl Vm {
 
     pub(super) fn emit_class_introspection_missing_warning(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         function_name: &str,
         class_name: &str,
         autoload_attempted: bool,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let suffix = if autoload_attempted {
             "does not exist and could not be loaded"
         } else {
@@ -1534,7 +1548,7 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
         message: String,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         let source_span = call_span
             .or_else(|| stack.current().and_then(|frame| frame.call_span))
             .map(|span| runtime_source_span(compiled, span))
@@ -1576,7 +1590,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         let source_span = call_span
             .or_else(|| stack.current().and_then(|frame| frame.call_span))
             .map(|span| runtime_source_span(compiled, span))
@@ -1614,14 +1628,17 @@ impl Vm {
 
     pub(super) fn emit_predefined_constant_deprecation(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
         diagnostics: &mut Vec<RuntimeDiagnostic>,
         instruction_span: php_ir::IrSpan,
         constant: &php_std::ConstantDescriptor,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let Some(deprecation) = constant.deprecation() else {
             return Ok(());
         };
@@ -1662,7 +1679,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         let source_span = call_span
             .or_else(|| stack.current().and_then(|frame| frame.call_span))
             .map(|span| runtime_source_span(compiled, span))
@@ -1700,24 +1717,24 @@ impl Vm {
 
     pub(super) fn emit_define_duplicate_warning(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         diagnostics: &mut Vec<RuntimeDiagnostic>,
         constant_name: &str,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let source_span = call_span
             .or_else(|| stack.current().and_then(|frame| frame.call_span))
             .map(|span| runtime_source_span(compiled, span))
             .unwrap_or_default();
         self.emit_constant_already_defined_warning(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             source_span,
-            output,
-            stack,
-            state,
             diagnostics,
             constant_name,
         )
@@ -1725,14 +1742,17 @@ impl Vm {
 
     pub(super) fn emit_constant_already_defined_warning(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         source_span: RuntimeSourceSpan,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         diagnostics: &mut Vec<RuntimeDiagnostic>,
         constant_name: &str,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let diagnostic = RuntimeDiagnostic::new(
             "E_PHP_VM_DEFINE_CONSTANT_ALREADY_DEFINED",
             RuntimeSeverity::Warning,
@@ -1765,15 +1785,18 @@ impl Vm {
 
     pub(super) fn emit_duplicate_dynamic_constant_warnings(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         dynamic_unit: &CompiledUnit,
         load_kind: DeclarationLoadKind,
         eval_span: Option<IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         diagnostics: &mut Vec<RuntimeDiagnostic>,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         for entry in &dynamic_unit.unit().constant_table {
             if !dynamic_constant_declared(compiled, state, &entry.name) {
                 continue;
@@ -1786,11 +1809,8 @@ impl Vm {
                 runtime_source_span(dynamic_unit, entry.span)
             };
             self.emit_constant_already_defined_warning(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 source_span,
-                output,
-                stack,
-                state,
                 diagnostics,
                 &entry.name,
             )?;
@@ -1900,14 +1920,17 @@ impl Vm {
 
     pub(super) fn call_class_alias_builtin(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         values: Vec<Value>,
         call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if values.len() < 2 || values.len() > 3 {
             return self.runtime_error(
                 output,
@@ -1928,17 +1951,14 @@ impl Vm {
             .get(2)
             .is_none_or(|value| to_bool(value).unwrap_or(true));
         let exists = match self.class_like_exists_with_autoload_cache(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             &source_name,
             AutoloadClassLookupKind::ClassLike,
             autoload,
             call_site,
-            output,
-            stack,
-            state,
         ) {
             Ok(exists) => exists,
-            Err(result) => return result,
+            Err(result) => return *result,
         };
         if !exists {
             if let Err(result) = self.emit_class_alias_warning(
@@ -1949,7 +1969,7 @@ impl Vm {
                 state,
                 format!("Class \"{source_name}\" not found"),
             ) {
-                return result;
+                return *result;
             }
             return VmResult::success_no_output(Some(Value::Bool(false)));
         }
@@ -1966,7 +1986,7 @@ impl Vm {
                 state,
                 format!("Cannot redeclare class {}", display_class_name(&alias_name)),
             ) {
-                return result;
+                return *result;
             }
             return VmResult::success_no_output(Some(Value::Bool(false)));
         }
@@ -1980,7 +2000,7 @@ impl Vm {
                 state,
                 format!("Class \"{source_name}\" not found"),
             ) {
-                return result;
+                return *result;
             }
             return VmResult::success_no_output(Some(Value::Bool(false)));
         };
@@ -2004,15 +2024,18 @@ impl Vm {
 
     pub(super) fn class_like_exists_with_autoload_cache(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         class_name: &str,
         kind: AutoloadClassLookupKind,
         autoload: bool,
         call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<bool, VmResult> {
+    ) -> Result<bool, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         self.class_like_exists_with_autoload_cache_at_slot(
             compiled, class_name, kind, autoload, call_site, None, output, stack, state,
         )
@@ -2030,7 +2053,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<bool, VmResult> {
+    ) -> Result<bool, Box<VmResult>> {
         let request = AutoloadClassLookupCacheKey {
             kind,
             normalized_name: normalize_class_name(class_name),
@@ -2049,11 +2072,7 @@ impl Vm {
                 instruction,
             );
             if let Some(target) = self.lookup_autoload_class_inline_cache(
-                cache_id,
-                unit_key,
-                function,
-                block,
-                instruction,
+                UnitInlineCacheSite::new(cache_id, unit_key, function, block, instruction),
                 &request,
                 epochs,
             ) {
@@ -2144,14 +2163,17 @@ impl Vm {
 
     pub(super) fn autoload_static_class_if_missing(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         class_name: &str,
         span: IrSpan,
         call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         self.autoload_static_class_if_missing_at_slot(
             compiled, class_name, span, call_site, None, output, stack, state,
         )
@@ -2168,7 +2190,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         if is_special_static_class_name(class_name)
             || class_like_exists_direct(
                 compiled,
@@ -2221,14 +2243,17 @@ impl Vm {
 
     pub(super) fn validate_runtime_class_dependencies_in_try(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         function: &php_ir::function::IrFunction,
         catch: BlockId,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         try_span: IrSpan,
     ) -> Option<ClassDependencyValidationFailure> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let catch_start = function
             .blocks
             .get(catch.index())
@@ -2276,14 +2301,11 @@ impl Vm {
             if let Some(parent) = class.parent.as_deref() {
                 let display = class_dependency_display_name(declared_unit, class, parent);
                 match self.class_like_exists_with_autoload_cache(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &display,
                     AutoloadClassLookupKind::Class,
                     true,
                     None,
-                    output,
-                    stack,
-                    state,
                 ) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -2299,13 +2321,13 @@ impl Vm {
                                     ClassDependencyValidationFailure::Throwable(throwable)
                                 }
                                 Err(result) => {
-                                    ClassDependencyValidationFailure::Result(Box::new(result))
+                                    ClassDependencyValidationFailure::Result(Box::new(*result))
                                 }
                             },
                         );
                     }
                     Err(result) => {
-                        return Some(ClassDependencyValidationFailure::Result(Box::new(result)));
+                        return Some(ClassDependencyValidationFailure::Result(Box::new(*result)));
                     }
                 }
             }
@@ -2325,14 +2347,11 @@ impl Vm {
                 }
                 let display = class_dependency_display_name(declared_unit, class, interface);
                 match self.class_like_exists_with_autoload_cache(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &display,
                     AutoloadClassLookupKind::Interface,
                     true,
                     None,
-                    output,
-                    stack,
-                    state,
                 ) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -2348,13 +2367,13 @@ impl Vm {
                                     ClassDependencyValidationFailure::Throwable(throwable)
                                 }
                                 Err(result) => {
-                                    ClassDependencyValidationFailure::Result(Box::new(result))
+                                    ClassDependencyValidationFailure::Result(Box::new(*result))
                                 }
                             },
                         );
                     }
                     Err(result) => {
-                        return Some(ClassDependencyValidationFailure::Result(Box::new(result)));
+                        return Some(ClassDependencyValidationFailure::Result(Box::new(*result)));
                     }
                 }
             }
@@ -2372,7 +2391,7 @@ impl Vm {
         dependency: &str,
         kind: &str,
         state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
         state
             .failed_class_declarations
             .insert(normalize_class_name(&class.name));
@@ -2381,7 +2400,7 @@ impl Vm {
         let throwable = match make_exception_object("Error", &message) {
             Ok(object) => Value::Object(object),
             Err(message) => {
-                return Err(VmResult::runtime_error_with_diagnostic(
+                return Err(Box::new(VmResult::runtime_error_with_diagnostic(
                     OutputBuffer::new(),
                     format!("E_PHP_VM_CLASS_DEPENDENCY_ERROR: {message}"),
                     RuntimeDiagnostic::new(
@@ -2392,7 +2411,7 @@ impl Vm {
                         Vec::new(),
                         None,
                     ),
-                ));
+                )));
             }
         };
         tag_throwable_location(&throwable, compiled, class.span);
@@ -2435,7 +2454,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         let reflection_class = normalize_class_name(reflection_class);
         if !matches!(
             reflection_class.as_str(),
@@ -2462,24 +2481,21 @@ impl Vm {
             _ => AutoloadClassLookupKind::Class,
         };
         let exists = self.class_like_exists_with_autoload_cache(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             &class_name,
             kind,
             true,
             None,
-            output,
-            stack,
-            state,
         )?;
         if exists {
             return Ok(());
         }
-        Err(self.runtime_error(
+        Err(Box::new(self.runtime_error(
             output,
             compiled,
             stack,
             format!("E_PHP_VM_REFLECTION_UNKNOWN_CLASS: Class \"{class_name}\" does not exist"),
-        ))
+        )))
     }
 
     pub(super) fn reflection_attribute_new_instance(
@@ -2588,15 +2604,18 @@ impl Vm {
 
     pub(super) fn reflection_class_new_instance(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         reflection_class: &ObjectRef,
         method: &str,
         values: Vec<Value>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         call_span: php_ir::IrSpan,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let class_name = match reflection_object_string_property(reflection_class, "class") {
             Ok(name) => name,
             Err(message) => return self.runtime_error(output, compiled, stack, message),
@@ -2621,26 +2640,26 @@ impl Vm {
             }
         };
         self.reflection_instantiate_class(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             &class_name,
             args,
-            output,
-            stack,
-            state,
             call_span,
         )
     }
 
     pub(super) fn reflection_instantiate_class(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         class_name: &str,
         args: Vec<CallArgument>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         call_span: php_ir::IrSpan,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let class = match lookup_class_in_state(compiled, state, class_name) {
             Some(class) => class,
             None => {
@@ -2732,14 +2751,17 @@ impl Vm {
 
     pub(super) fn preflight_reflection_class_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         method: &str,
         values: &[Value],
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if normalize_class_name(&object.class_name()) != "reflectionclass" {
             return Ok(());
         }
@@ -2753,26 +2775,23 @@ impl Vm {
                 };
                 let class_name = normalize_class_name(class_name);
                 let exists = self.class_like_exists_with_autoload_cache(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &class_name,
                     AutoloadClassLookupKind::Class,
                     true,
                     None,
-                    output,
-                    stack,
-                    state,
                 )?;
                 if exists {
                     Ok(())
                 } else {
-                    Err(self.runtime_error(
+                    Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         stack,
                         format!(
                             "E_PHP_VM_REFLECTION_UNKNOWN_CLASS: Class \"{class_name}\" does not exist"
                         ),
-                    ))
+                    )))
                 }
             }
             "implementsinterface" => {
@@ -2780,26 +2799,23 @@ impl Vm {
                     return Ok(());
                 };
                 let exists = self.class_like_exists_with_autoload_cache(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &interface_name,
                     AutoloadClassLookupKind::Interface,
                     true,
                     None,
-                    output,
-                    stack,
-                    state,
                 )?;
                 if exists {
                     Ok(())
                 } else {
-                    Err(self.runtime_error(
+                    Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         stack,
                         format!(
                             "E_PHP_VM_REFLECTION_UNKNOWN_CLASS: Interface \"{interface_name}\" does not exist"
                         ),
-                    ))
+                    )))
                 }
             }
             _ => Ok(()),
@@ -2814,7 +2830,7 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
         trace_origin: Option<AutoloadTraceOrigin>,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         let normalized = normalize_class_name(class_name);
         if lookup_class_in_state(compiled, state, class_name).is_some()
             || state.autoload_stack.iter().any(|name| name == &normalized)
@@ -2847,7 +2863,7 @@ impl Vm {
                     ));
                 }
                 let _ = state.autoload_stack.pop();
-                return Err(result);
+                return Err(Box::new(result));
             }
             if lookup_class_in_state(compiled, state, class_name).is_some() {
                 break;
@@ -2869,7 +2885,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         let normalized = normalize_class_name(class_name);
         if dynamic_class_entry_by_normalized_name(state, &normalized).is_some()
             || state.autoload_stack.iter().any(|name| name == &normalized)
@@ -2895,7 +2911,7 @@ impl Vm {
             );
             if !result.status.is_success() {
                 let _ = state.autoload_stack.pop();
-                return Err(result);
+                return Err(Box::new(result));
             }
             if dynamic_class_entry_by_normalized_name(state, &normalized).is_some() {
                 break;
@@ -2912,7 +2928,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         self.autoload_class_parents_if_missing_inner(
             compiled,
             class,
@@ -2931,7 +2947,7 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
         seen: &mut Vec<String>,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         let normalized = normalize_class_name(&class.name);
         if seen.iter().any(|name| name == &normalized) {
             return Ok(());

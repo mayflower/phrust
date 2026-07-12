@@ -3,14 +3,17 @@ use super::prelude::*;
 impl Vm {
     pub(super) fn call_spl_heap_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: ObjectRef,
         method: &str,
         args: Vec<CallArgument>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Result<Value, SplHeapMethodError> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let class_name = object.class_name();
         let normalized_class =
             spl_runtime_marker(&object).unwrap_or_else(|| normalize_class_name(&class_name));
@@ -55,13 +58,10 @@ impl Vm {
                 };
                 spl_heap_set_modifying(&object, true);
                 let inserted = self.spl_heap_insert_entry_with_userland_compare(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &object,
                     &normalized_class,
                     value,
-                    output,
-                    stack,
-                    state,
                 );
                 spl_heap_set_modifying(&object, false);
                 inserted?;
@@ -101,14 +101,17 @@ impl Vm {
 
     pub(super) fn spl_heap_insert_entry_with_userland_compare(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         class_name: &str,
         value: Value,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Result<(), SplHeapMethodError> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let normalized_class = normalize_class_name(class_name);
         let mut entries = spl_entries(object);
         entries.push((ArrayKey::Int(entries.len() as i64), value));
@@ -116,14 +119,11 @@ impl Vm {
         while child > 0 {
             let parent = (child - 1) / 2;
             let ordering = match self.spl_heap_compare_entries_with_userland_compare(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object,
                 &normalized_class,
                 &entries[parent].1,
                 &entries[child].1,
-                output,
-                stack,
-                state,
             ) {
                 Ok(ordering) => ordering,
                 Err(error) => {
@@ -161,14 +161,11 @@ impl Vm {
         if !entries.is_empty() {
             spl_heap_set_modifying(object, true);
             let sifted = self.spl_heap_sift_down_with_userland_compare(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object,
                 &mut entries,
                 class_name,
                 0,
-                output,
-                stack,
-                state,
             );
             spl_heap_set_modifying(object, false);
             if let Err(error) = sifted {
@@ -183,15 +180,18 @@ impl Vm {
 
     pub(super) fn spl_heap_sift_down_with_userland_compare(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         entries: &mut [(ArrayKey, Value)],
         class_name: &str,
         mut parent: usize,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Result<(), SplHeapMethodError> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let normalized_class = normalize_class_name(class_name);
         loop {
             let left = parent.saturating_mul(2).saturating_add(1);
@@ -199,28 +199,22 @@ impl Vm {
             let mut best = parent;
             if left < entries.len()
                 && self.spl_heap_compare_entries_with_userland_compare(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object,
                     &normalized_class,
                     &entries[best].1,
                     &entries[left].1,
-                    output,
-                    stack,
-                    state,
                 )? == std::cmp::Ordering::Greater
             {
                 best = left;
             }
             if right < entries.len()
                 && self.spl_heap_compare_entries_with_userland_compare(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object,
                     &normalized_class,
                     &entries[best].1,
                     &entries[right].1,
-                    output,
-                    stack,
-                    state,
                 )? == std::cmp::Ordering::Greater
             {
                 best = right;
@@ -236,15 +230,18 @@ impl Vm {
 
     pub(super) fn spl_heap_compare_entries_with_userland_compare(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         class_name: &str,
         left: &Value,
         right: &Value,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Result<std::cmp::Ordering, SplHeapMethodError> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let normalized_class = normalize_class_name(class_name);
         let (left_arg, right_arg) = if normalized_class == "splpriorityqueue" {
             (
@@ -260,15 +257,12 @@ impl Vm {
         };
         let result = self
             .call_object_method_value_with_positional_args(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object.clone(),
                 "compare",
                 vec![left_arg, right_arg],
-                output,
-                stack,
-                state,
             )
-            .map_err(|result| SplHeapMethodError::Runtime(Box::new(result)))?;
+            .map_err(|result| SplHeapMethodError::Runtime(Box::new(*result)))?;
         let int = to_int(&result).map_err(SplHeapMethodError::Message)?;
         let ordering = int.cmp(&0);
         Ok(if normalized_class == "splminheap" {

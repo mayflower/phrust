@@ -79,16 +79,7 @@ macro_rules! execute_rich_object_instruction {
                             ) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    match $vm.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        instruction.span,
-                                        message,
-                                    ) {
+                                    match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -134,16 +125,7 @@ macro_rules! execute_rich_object_instruction {
                             let object = match new_php_token_object(values) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    match $vm.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        instruction.span,
-                                        message,
-                                    ) {
+                                    match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -187,16 +169,7 @@ macro_rules! execute_rich_object_instruction {
                             ) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    match $vm.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        instruction.span,
-                                        message,
-                                    ) {
+                                    match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -224,16 +197,7 @@ macro_rules! execute_rich_object_instruction {
                             ) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    match $vm.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        instruction.span,
-                                        message,
-                                    ) {
+                                    match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -371,15 +335,7 @@ macro_rules! execute_rich_object_instruction {
                                 Err(message) => {
                                     let result =
                                         $vm.runtime_error(output, compiled, stack, message);
-                                    match $vm.route_throwable_result(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        result,
-                                    ) {
+                                    match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, result) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -408,15 +364,7 @@ macro_rules! execute_rich_object_instruction {
                                 Err(message) => {
                                     let result =
                                         $vm.runtime_error(output, compiled, stack, message);
-                                    match $vm.route_throwable_result(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        result,
-                                    ) {
+                                    match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, result) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -478,38 +426,20 @@ macro_rules! execute_rich_object_instruction {
                         {
                             class
                         } else {
-                            match $vm.class_like_exists_with_autoload_cache(
-                                compiled,
-                                &display_class_name,
-                                AutoloadClassLookupKind::Class,
-                                true,
-                                Some((
+                            match $vm.class_like_exists_with_autoload_cache(ExecutionCursor::new(compiled, output, stack, state), &display_class_name, AutoloadClassLookupKind::Class, true, Some((
                                     compiled_unit_cache_key(compiled),
                                     function_id,
                                     block_id,
                                     instruction.id,
-                                )),
-                                output,
-                                stack,
-                                state,
-                            ) {
+                                ))) {
                                 Ok(_) => {}
-                                Err(result) => return result,
+                                Err(result) => return *result,
                             }
                             let Some(class) = $vm.cached_class_entry(compiled, state, &class_name)
                             else {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    format!(
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, format!(
                                         "E_PHP_VM_UNKNOWN_CLASS: Class \"{display_class_name}\" not found"
-                                    ),
-                                ) {
+                                    )) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -522,23 +452,14 @@ macro_rules! execute_rich_object_instruction {
                         if let Err(result) = $vm.autoload_class_parents_if_missing(
                             compiled, &class, output, stack, state,
                         ) {
-                            return result;
+                            return *result;
                         }
                         let class_owner = class_owner_in_state(compiled, state, &class.name);
                         let runtime_class =
                             match $vm.cached_runtime_class_entry(&class_owner, state, &class) {
                                 Ok(class) => class,
                                 Err(error) => {
-                                    match $vm.raise_runtime_class_entry_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        instruction.span,
-                                        error,
-                                    ) {
+                                    match $vm.raise_runtime_class_entry_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, error) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -548,16 +469,7 @@ macro_rules! execute_rich_object_instruction {
                                 }
                             };
                         if let Err(message) = validate_object_mvp(&runtime_class) {
-                            match $vm.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut $exception_handlers,
-                                &mut $pending_control,
-                                instruction.span,
-                                message,
-                            ) {
+                            match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                 RaiseOutcome::Caught(target) => {
                                     $block_id = target;
                                     continue $dispatch;
@@ -603,16 +515,7 @@ macro_rules! execute_rich_object_instruction {
                                 &constructor.class,
                                 &constructor.method,
                             ) {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -644,15 +547,7 @@ macro_rules! execute_rich_object_instruction {
                                 state,
                             );
                             if !result.status.is_success() {
-                                match $vm.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    result,
-                                ) {
+                                match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, result) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -664,12 +559,14 @@ macro_rules! execute_rich_object_instruction {
                                 return $vm.propagate_fiber_suspension(
                                     result,
                                     compiled,
-                                    *dst,
-                                    block_id,
-                                    instruction_index + 1,
-                                    &$foreach_iterators,
-                                    &$exception_handlers,
-                                    &$pending_control,
+                                    FiberContinuationState::new(
+                                        *dst,
+                                        block_id,
+                                        instruction_index + 1,
+                                        &$foreach_iterators,
+                                        &$exception_handlers,
+                                        &$pending_control,
+                                    ),
                                     output,
                                     stack,
                                 );
@@ -682,15 +579,7 @@ macro_rules! execute_rich_object_instruction {
                                 ) {
                                     Ok(values) => values,
                                     Err(result) => {
-                                        match $vm.route_throwable_result(
-                                            compiled,
-                                            output,
-                                            stack,
-                                            state,
-                                            &mut $exception_handlers,
-                                            &mut $pending_control,
-                                            result,
-                                        ) {
+                                        match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                             RaiseOutcome::Caught(target) => {
                                                 $block_id = target;
                                                 continue $dispatch;
@@ -709,16 +598,7 @@ macro_rules! execute_rich_object_instruction {
                                 &$vm.options.runtime_context,
                                 Some(&mut state.resources),
                             ) {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -756,16 +636,7 @@ macro_rules! execute_rich_object_instruction {
                                 {
                                     Ok(class) => (class.name.clone(), class.display_name.clone()),
                                     Err(message) => {
-                                        match $vm.raise_runtime_error(
-                                            compiled,
-                                            output,
-                                            stack,
-                                            state,
-                                            &mut $exception_handlers,
-                                            &mut $pending_control,
-                                            instruction.span,
-                                            message,
-                                        ) {
+                                        match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                             RaiseOutcome::Caught(target) => {
                                                 $block_id = target;
                                                 continue $dispatch;
@@ -780,17 +651,8 @@ macro_rules! execute_rich_object_instruction {
                         let class_name = resolved_class_name.as_str();
                         let display_class_name = resolved_display_class_name.as_str();
                         if is_closure_runtime_class(class_name) {
-                            match $vm.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut $exception_handlers,
-                                &mut $pending_control,
-                                instruction.span,
-                                "E_PHP_VM_CLOSURE_INSTANTIATION: Instantiation of class Closure is not allowed"
-                                    .to_owned(),
-                            ) {
+                            match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, "E_PHP_VM_CLOSURE_INSTANTIATION: Instantiation of class Closure is not allowed"
+                                    .to_owned()) {
                                 RaiseOutcome::Caught(target) => {
                                     $block_id = target;
                                     continue $dispatch;
@@ -837,15 +699,7 @@ macro_rules! execute_rich_object_instruction {
                             if let Err(result) = $vm.preflight_reflection_constructor(
                                 compiled, class_name, &values, output, stack, state,
                             ) {
-                                match $vm.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    result,
-                                ) {
+                                match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -860,15 +714,7 @@ macro_rules! execute_rich_object_instruction {
                                 Err(message) => {
                                     let result =
                                         $vm.runtime_error(output, compiled, stack, message);
-                                    match $vm.route_throwable_result(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        result,
-                                    ) {
+                                    match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, result) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -901,15 +747,7 @@ macro_rules! execute_rich_object_instruction {
                             ) {
                                 Ok(values) => values,
                                 Err(result) => {
-                                    match $vm.route_throwable_result(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        result,
-                                    ) {
+                                    match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -926,16 +764,7 @@ macro_rules! execute_rich_object_instruction {
                             ) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    match $vm.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        instruction.span,
-                                        message,
-                                    ) {
+                                    match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -968,15 +797,7 @@ macro_rules! execute_rich_object_instruction {
                                 Err(message) => {
                                     let result =
                                         $vm.runtime_error(output, compiled, stack, message);
-                                    match $vm.route_throwable_result(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        result,
-                                    ) {
+                                    match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, result) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -1009,15 +830,7 @@ macro_rules! execute_rich_object_instruction {
                                 Err(message) => {
                                     let result =
                                         $vm.runtime_error(output, compiled, stack, message);
-                                    match $vm.route_throwable_result(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        result,
-                                    ) {
+                                    match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, result) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -1054,15 +867,7 @@ macro_rules! execute_rich_object_instruction {
                                 Err(message) => {
                                     let result =
                                         $vm.runtime_error(output, compiled, stack, message);
-                                    match $vm.route_throwable_result(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        result,
-                                    ) {
+                                    match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, result) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -1124,16 +929,7 @@ macro_rules! execute_rich_object_instruction {
                             let object = match new_php_token_object(values) {
                                 Ok(object) => object,
                                 Err(message) => {
-                                    match $vm.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        instruction.span,
-                                        message,
-                                    ) {
+                                    match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -1557,15 +1353,7 @@ macro_rules! execute_rich_object_instruction {
                                     ) {
                                         Ok(values) => values,
                                         Err(result) => {
-                                            match $vm.route_throwable_result(
-                                                compiled,
-                                                output,
-                                                stack,
-                                                state,
-                                                &mut $exception_handlers,
-                                                &mut $pending_control,
-                                                result,
-                                            ) {
+                                            match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                                 RaiseOutcome::Caught(target) => {
                                                     $block_id = target;
                                                     continue $dispatch;
@@ -1582,16 +1370,7 @@ macro_rules! execute_rich_object_instruction {
                                     ) {
                                         Ok(object) => object,
                                         Err(message) => {
-                                            match $vm.raise_runtime_error(
-                                                compiled,
-                                                output,
-                                                stack,
-                                                state,
-                                                &mut $exception_handlers,
-                                                &mut $pending_control,
-                                                instruction.span,
-                                                message,
-                                            ) {
+                                            match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                                 RaiseOutcome::Caught(target) => {
                                                     $block_id = target;
                                                     continue $dispatch;
@@ -1630,15 +1409,7 @@ macro_rules! execute_rich_object_instruction {
                                         Err(message) => {
                                             let result = $vm
                                                 .runtime_error(output, compiled, stack, message);
-                                            match $vm.route_throwable_result(
-                                                compiled,
-                                                output,
-                                                stack,
-                                                state,
-                                                &mut $exception_handlers,
-                                                &mut $pending_control,
-                                                result,
-                                            ) {
+                                            match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, result) {
                                                 RaiseOutcome::Caught(target) => {
                                                     $block_id = target;
                                                     continue $dispatch;
@@ -1676,15 +1447,7 @@ macro_rules! execute_rich_object_instruction {
                                         Err(message) => {
                                             let result = $vm
                                                 .runtime_error(output, compiled, stack, message);
-                                            match $vm.route_throwable_result(
-                                                compiled,
-                                                output,
-                                                stack,
-                                                state,
-                                                &mut $exception_handlers,
-                                                &mut $pending_control,
-                                                result,
-                                            ) {
+                                            match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, result) {
                                                 RaiseOutcome::Caught(target) => {
                                                     $block_id = target;
                                                     continue $dispatch;
@@ -1726,15 +1489,7 @@ macro_rules! execute_rich_object_instruction {
                                         Err(message) => {
                                             let result = $vm
                                                 .runtime_error(output, compiled, stack, message);
-                                            match $vm.route_throwable_result(
-                                                compiled,
-                                                output,
-                                                stack,
-                                                state,
-                                                &mut $exception_handlers,
-                                                &mut $pending_control,
-                                                result,
-                                            ) {
+                                            match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, result) {
                                                 RaiseOutcome::Caught(target) => {
                                                     $block_id = target;
                                                     continue $dispatch;
@@ -1850,15 +1605,7 @@ macro_rules! execute_rich_object_instruction {
                                     if let Err(result) = $vm.preflight_reflection_constructor(
                                         compiled, class_name, &values, output, stack, state,
                                     ) {
-                                        match $vm.route_throwable_result(
-                                            compiled,
-                                            output,
-                                            stack,
-                                            state,
-                                            &mut $exception_handlers,
-                                            &mut $pending_control,
-                                            result,
-                                        ) {
+                                        match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                             RaiseOutcome::Caught(target) => {
                                                 $block_id = target;
                                                 continue $dispatch;
@@ -1873,15 +1620,7 @@ macro_rules! execute_rich_object_instruction {
                                         Err(message) => {
                                             let result = $vm
                                                 .runtime_error(output, compiled, stack, message);
-                                            match $vm.route_throwable_result(
-                                                compiled,
-                                                output,
-                                                stack,
-                                                state,
-                                                &mut $exception_handlers,
-                                                &mut $pending_control,
-                                                result,
-                                            ) {
+                                            match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, result) {
                                                 RaiseOutcome::Caught(target) => {
                                                     $block_id = target;
                                                     continue $dispatch;
@@ -1901,32 +1640,15 @@ macro_rules! execute_rich_object_instruction {
                                     }
                                     continue;
                                 }
-                                match $vm.class_like_exists_with_autoload_cache(
-                                    compiled,
-                                    display_class_name,
-                                    AutoloadClassLookupKind::Class,
-                                    true,
-                                    Some((
+                                match $vm.class_like_exists_with_autoload_cache(ExecutionCursor::new(compiled, output, stack, state), display_class_name, AutoloadClassLookupKind::Class, true, Some((
                                         compiled_unit_cache_key(compiled),
                                         function_id,
                                         block_id,
                                         instruction.id,
-                                    )),
-                                    output,
-                                    stack,
-                                    state,
-                                ) {
+                                    ))) {
                                     Ok(_) => {}
                                     Err(result) => {
-                                        match $vm.route_throwable_result(
-                                            compiled,
-                                            output,
-                                            stack,
-                                            state,
-                                            &mut $exception_handlers,
-                                            &mut $pending_control,
-                                            result,
-                                        ) {
+                                        match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                             RaiseOutcome::Caught(target) => {
                                                 $block_id = target;
                                                 continue $dispatch;
@@ -1941,10 +1663,7 @@ macro_rules! execute_rich_object_instruction {
                                     class
                                 } else {
                                     return $vm.runtime_error_with_bringup_context(
-                                        output,
-                                        compiled,
-                                        stack,
-                                        state,
+                                        ExecutionView::new(compiled, output, stack, state),
                                         runtime_source_span(compiled, instruction.span),
                                         format!(
                                             "E_PHP_VM_UNKNOWN_CLASS: class {class_name} is not defined"
@@ -1963,15 +1682,7 @@ macro_rules! execute_rich_object_instruction {
                         if let Err(result) = $vm.autoload_class_parents_if_missing(
                             compiled, &class, output, stack, state,
                         ) {
-                            match $vm.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut $exception_handlers,
-                                &mut $pending_control,
-                                result,
-                            ) {
+                            match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                 RaiseOutcome::Caught(target) => {
                                     $block_id = target;
                                     continue $dispatch;
@@ -1984,16 +1695,7 @@ macro_rules! execute_rich_object_instruction {
                             match $vm.cached_runtime_class_entry(&class_owner, state, &class) {
                                 Ok(class) => class,
                                 Err(error) => {
-                                    match $vm.raise_runtime_class_entry_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        instruction.span,
-                                        error,
-                                    ) {
+                                    match $vm.raise_runtime_class_entry_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, error) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -2003,16 +1705,7 @@ macro_rules! execute_rich_object_instruction {
                                 }
                             };
                         if let Err(message) = validate_object_mvp(&runtime_class) {
-                            match $vm.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut $exception_handlers,
-                                &mut $pending_control,
-                                instruction.span,
-                                message,
-                            ) {
+                            match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                 RaiseOutcome::Caught(target) => {
                                     $block_id = target;
                                     continue $dispatch;
@@ -2064,16 +1757,7 @@ macro_rules! execute_rich_object_instruction {
                                 &constructor.class,
                                 &constructor.method,
                             ) {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -2105,15 +1789,7 @@ macro_rules! execute_rich_object_instruction {
                                 state,
                             );
                             if !result.status.is_success() {
-                                match $vm.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    result,
-                                ) {
+                                match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, result) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -2125,12 +1801,14 @@ macro_rules! execute_rich_object_instruction {
                                 return $vm.propagate_fiber_suspension(
                                     result,
                                     compiled,
-                                    *dst,
-                                    block_id,
-                                    instruction_index + 1,
-                                    &$foreach_iterators,
-                                    &$exception_handlers,
-                                    &$pending_control,
+                                    FiberContinuationState::new(
+                                        *dst,
+                                        block_id,
+                                        instruction_index + 1,
+                                        &$foreach_iterators,
+                                        &$exception_handlers,
+                                        &$pending_control,
+                                    ),
                                     output,
                                     stack,
                                 );
@@ -2143,15 +1821,7 @@ macro_rules! execute_rich_object_instruction {
                                 ) {
                                     Ok(values) => values,
                                     Err(result) => {
-                                        match $vm.route_throwable_result(
-                                            compiled,
-                                            output,
-                                            stack,
-                                            state,
-                                            &mut $exception_handlers,
-                                            &mut $pending_control,
-                                            result,
-                                        ) {
+                                        match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                             RaiseOutcome::Caught(target) => {
                                                 $block_id = target;
                                                 continue $dispatch;
@@ -2170,16 +1840,7 @@ macro_rules! execute_rich_object_instruction {
                                 &$vm.options.runtime_context,
                                 Some(&mut state.resources),
                             ) {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -2232,15 +1893,7 @@ macro_rules! execute_rich_object_instruction {
                                 }
                             }
                             Err(ClassConstantFetch::Throwable(result)) => {
-                                match $vm.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    *result,
-                                ) {
+                                match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -2249,16 +1902,7 @@ macro_rules! execute_rich_object_instruction {
                                 }
                             }
                             Err(ClassConstantFetch::Raise(span, message)) => {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -2362,15 +2006,7 @@ macro_rules! execute_rich_object_instruction {
                         ) {
                             Ok(copy) => copy,
                             Err(result) => {
-                                match $vm.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    result,
-                                ) {
+                                match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -2403,16 +2039,7 @@ macro_rules! execute_rich_object_instruction {
                             if let Err(message) =
                                 validate_property_access(compiled, stack, &class, ir_property)
                             {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -2423,16 +2050,7 @@ macro_rules! execute_rich_object_instruction {
                             if let Err(message) =
                                 validate_property_set_access(compiled, stack, &class, ir_property)
                             {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -2441,19 +2059,10 @@ macro_rules! execute_rich_object_instruction {
                                 }
                             }
                             if ir_property.flags.is_readonly || class.flags.is_readonly {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    format!(
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, format!(
                                         "E_PHP_VM_READONLY_PROPERTY_WRITE: Cannot modify protected(set) readonly property {}::${property} from global scope",
                                         class.display_name
-                                    ),
-                                ) {
+                                    )) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -2462,19 +2071,10 @@ macro_rules! execute_rich_object_instruction {
                                 }
                             }
                             if ir_property.flags.is_static {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    format!(
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, format!(
                                         "E_PHP_VM_UNSUPPORTED_PROPERTY_MODIFIER: property {}::${property} uses modifiers outside the reflection-clone clone-with MVP",
                                         class.display_name
-                                    ),
-                                ) {
+                                    )) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -2507,16 +2107,7 @@ macro_rules! execute_rich_object_instruction {
                                 value,
                                 $vm.typecheck_fast_path_context(),
                             ) {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -2525,19 +2116,9 @@ macro_rules! execute_rich_object_instruction {
                                 }
                             }
                             if let Some(function_id) = entry.hooks.set_function_id {
-                                match $vm.call_property_hook(
-                                    compiled,
-                                    copy.clone(),
-                                    &class,
-                                    ir_property,
-                                    FunctionId::new(function_id),
-                                    vec![CallArgument::positional(value.clone())],
-                                    output,
-                                    stack,
-                                    state,
-                                ) {
+                                match $vm.call_property_hook(ExecutionCursor::new(compiled, output, stack, state), copy.clone(), &class, ir_property, FunctionId::new(function_id), vec![CallArgument::positional(value.clone())]) {
                                     Ok(_) => continue,
-                                    Err(result) => return result,
+                                    Err(result) => return *result,
                                 }
                             }
                             if !entry.hooks.backed

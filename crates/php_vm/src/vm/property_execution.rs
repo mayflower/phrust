@@ -1,5 +1,12 @@
 use super::prelude::*;
 
+pub(super) struct PropertyDimProbe<'a> {
+    pub(super) object: &'a ObjectRef,
+    pub(super) property: &'a str,
+    pub(super) dims: &'a [ArrayKey],
+    pub(super) is_empty: bool,
+}
+
 impl Vm {
     /// `isset($object->property)` for a declared/dynamic property, shared by the
     /// rich and dense executors. Returns `Ok(Value::Bool(_))`; a `__isset` magic
@@ -13,7 +20,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
         let Value::Object(object) = object else {
             return Ok(Value::Bool(false));
         };
@@ -22,21 +29,20 @@ impl Vm {
             !matches!(value, Value::Uninitialized | Value::Null)
         } else {
             match self.call_magic_property_method(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object.clone(),
                 "__isset",
                 property,
                 vec![CallArgument::positional(Value::String(
                     PhpString::from_test_str(property),
                 ))],
-                output,
-                stack,
-                state,
             ) {
                 Ok(Some(value)) => match to_bool(&value) {
                     Ok(value) => value,
                     Err(message) => {
-                        return Err(self.runtime_error(output, compiled, stack, message));
+                        return Err(Box::new(
+                            self.runtime_error(output, compiled, stack, message),
+                        ));
                     }
                 },
                 Ok(None) => false,
@@ -57,32 +63,35 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
         let Value::Object(object) = object else {
             return Ok(Value::Bool(true));
         };
         let result = match self.property_state_value(compiled, state, stack, object, property) {
             Some(value) => match php_empty_access_value(&value) {
                 Ok(value) => value,
-                Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+                Err(message) => {
+                    return Err(Box::new(
+                        self.runtime_error(output, compiled, stack, message),
+                    ));
+                }
             },
             None => {
                 let isset = match self.call_magic_property_method(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object.clone(),
                     "__isset",
                     property,
                     vec![CallArgument::positional(Value::String(
                         PhpString::from_test_str(property),
                     ))],
-                    output,
-                    stack,
-                    state,
                 ) {
                     Ok(Some(value)) => match to_bool(&value) {
                         Ok(value) => value,
                         Err(message) => {
-                            return Err(self.runtime_error(output, compiled, stack, message));
+                            return Err(Box::new(
+                                self.runtime_error(output, compiled, stack, message),
+                            ));
                         }
                     },
                     Ok(None) => false,
@@ -92,21 +101,20 @@ impl Vm {
                     true
                 } else {
                     match self.call_magic_property_method(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         object.clone(),
                         "__get",
                         property,
                         vec![CallArgument::positional(Value::String(
                             PhpString::from_test_str(property),
                         ))],
-                        output,
-                        stack,
-                        state,
                     ) {
                         Ok(Some(value)) => match php_empty_access_value(&value) {
                             Ok(value) => value,
                             Err(message) => {
-                                return Err(self.runtime_error(output, compiled, stack, message));
+                                return Err(Box::new(
+                                    self.runtime_error(output, compiled, stack, message),
+                                ));
                             }
                         },
                         Ok(None) => true,
@@ -124,11 +132,14 @@ impl Vm {
         compiled: &CompiledUnit,
         state: &ExecutionState,
         stack: &CallStack,
-        object: &ObjectRef,
-        property: &str,
-        dims: &[ArrayKey],
-        is_empty: bool,
+        probe: PropertyDimProbe<'_>,
     ) -> Result<bool, String> {
+        let PropertyDimProbe {
+            object,
+            property,
+            dims,
+            is_empty,
+        } = probe;
         let borrowed = self
             .with_property_state_value(compiled, state, stack, object, property, &mut |value| {
                 match value {
@@ -201,20 +212,17 @@ impl Vm {
                 validate_property_access(compiled, stack, resolved.class, resolved.property)
             {
                 return match self.call_magic_property_method(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object.clone(),
                     "__unset",
                     property,
                     vec![CallArgument::positional(Value::String(
                         PhpString::from_test_str(property),
                     ))],
-                    output,
-                    stack,
-                    state,
                 ) {
                     Ok(Some(_)) => Ok(()),
                     Ok(None) => Err(StaticPropertyAssignError::Raise(span, message)),
-                    Err(result) => Err(StaticPropertyAssignError::Vm(Box::new(result))),
+                    Err(result) => Err(StaticPropertyAssignError::Vm(Box::new(*result))),
                 };
             }
             if resolved.property.flags.is_static {
@@ -239,22 +247,19 @@ impl Vm {
             return Ok(());
         }
         match self.call_magic_property_method(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             object.clone(),
             "__unset",
             property,
             vec![CallArgument::positional(Value::String(
                 PhpString::from_test_str(property),
             ))],
-            output,
-            stack,
-            state,
         ) {
             Ok(Some(_)) | Ok(None) => {
                 object.unset_property(property);
                 Ok(())
             }
-            Err(result) => Err(StaticPropertyAssignError::Vm(Box::new(result))),
+            Err(result) => Err(StaticPropertyAssignError::Vm(Box::new(*result))),
         }
     }
 
@@ -277,15 +282,12 @@ impl Vm {
         state: &mut ExecutionState,
     ) -> Result<(Value, Value), StaticPropertyAssignError> {
         if let Err(result) = self.autoload_static_class_if_missing(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             class_name,
             span,
             autoload_site,
-            output,
-            stack,
-            state,
         ) {
-            return Err(StaticPropertyAssignError::Vm(Box::new(result)));
+            return Err(StaticPropertyAssignError::Vm(Box::new(*result)));
         }
         let class = resolve_static_class_name(compiled, state, stack, class_name)
             .map_err(|message| StaticPropertyAssignError::Raise(span, message))?;
@@ -375,29 +377,29 @@ impl Vm {
     /// inline-cache key.
     pub(super) fn fetch_static_property_value(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         class_name: &str,
         property: &str,
         cache_site: Option<(FunctionId, BlockId, InstrId)>,
         cache_id: Option<InlineCacheId>,
         span: IrSpan,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Result<Value, ClassConstantFetch> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let autoload_site = cache_site.map(|(function, block, instr)| {
             (compiled_unit_cache_key(compiled), function, block, instr)
         });
         if let Err(result) = self.autoload_static_class_if_missing(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             class_name,
             span,
             autoload_site,
-            output,
-            stack,
-            state,
         ) {
-            return Err(ClassConstantFetch::Throwable(Box::new(result)));
+            return Err(ClassConstantFetch::Throwable(Box::new(*result)));
         }
         let class = match resolve_static_class_name(compiled, state, stack, class_name) {
             Ok(class) => class,
@@ -409,16 +411,20 @@ impl Vm {
         let lookup_epoch = state.lookup_epoch();
         if let Some((function_id, block_id, instruction_id)) = cache_site
             && let Some(target) = self.lookup_class_constant_static_property_inline_cache(
-                compiled,
-                cache_id,
-                function_id,
-                block_id,
-                instruction_id,
-                ClassConstantStaticPropertyCacheKind::StaticProperty,
-                &resolved_class,
-                property,
-                normalized_scope.as_deref(),
-                lookup_epoch,
+                IrInlineCacheSite::hybrid(
+                    compiled,
+                    cache_id,
+                    function_id,
+                    block_id,
+                    instruction_id,
+                ),
+                ClassStaticCacheLookup {
+                    kind: ClassConstantStaticPropertyCacheKind::StaticProperty,
+                    resolved_class: &resolved_class,
+                    member: property,
+                    scope: normalized_scope.as_deref(),
+                    epoch: lookup_epoch,
+                },
             )
         {
             match self.read_class_constant_static_property_target(compiled, target, stack, state) {
@@ -508,16 +514,20 @@ impl Vm {
                 },
             };
             self.install_class_constant_static_property_inline_cache(
-                compiled,
-                cache_id,
-                function_id,
-                block_id,
-                instruction_id,
-                ClassConstantStaticPropertyCacheKind::StaticProperty,
-                &resolved_class,
-                property,
-                cache_scope.as_deref(),
-                lookup_epoch,
+                IrInlineCacheSite::hybrid(
+                    compiled,
+                    cache_id,
+                    function_id,
+                    block_id,
+                    instruction_id,
+                ),
+                ClassStaticCacheLookup {
+                    kind: ClassConstantStaticPropertyCacheKind::StaticProperty,
+                    resolved_class: &resolved_class,
+                    member: property,
+                    scope: cache_scope.as_deref(),
+                    epoch: lookup_epoch,
+                },
                 target,
             );
         }
@@ -565,10 +575,7 @@ impl Vm {
             }
             let mut current = object.get_property(property).unwrap_or(Value::Null);
             match self.try_userland_arrayaccess_offset_set_value(
-                compiled,
-                output,
-                stack,
-                state,
+                ExecutionCursor::new(compiled, output, stack, state),
                 &current,
                 dims,
                 append,
@@ -577,7 +584,7 @@ impl Vm {
             ) {
                 Ok(true) => return Ok(value),
                 Ok(false) => {}
-                Err(result) => return Err(PropertyDimAssign::Return(Box::new(result))),
+                Err(result) => return Err(PropertyDimAssign::Return(Box::new(*result))),
             }
             if matches!(current, Value::Uninitialized | Value::Null) {
                 current = Value::Array(PhpArray::new());
@@ -640,10 +647,7 @@ impl Vm {
                 }
                 let mut current = object.get_property(property).unwrap_or(Value::Null);
                 match self.try_userland_arrayaccess_offset_set_value(
-                    compiled,
-                    output,
-                    stack,
-                    state,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &current,
                     dims,
                     append,
@@ -652,7 +656,7 @@ impl Vm {
                 ) {
                     Ok(true) => return Ok(value),
                     Ok(false) => {}
-                    Err(result) => return Err(PropertyDimAssign::Return(Box::new(result))),
+                    Err(result) => return Err(PropertyDimAssign::Return(Box::new(*result))),
                 }
                 if matches!(current, Value::Uninitialized | Value::Null) {
                     current = Value::Array(PhpArray::new());
@@ -700,10 +704,7 @@ impl Vm {
             );
             let mut current = object.get_property(property).unwrap_or(Value::Null);
             match self.try_userland_arrayaccess_offset_set_value(
-                compiled,
-                output,
-                stack,
-                state,
+                ExecutionCursor::new(compiled, output, stack, state),
                 &current,
                 dims,
                 append,
@@ -712,7 +713,7 @@ impl Vm {
             ) {
                 Ok(true) => return Ok(value),
                 Ok(false) => {}
-                Err(result) => return Err(PropertyDimAssign::Return(Box::new(result))),
+                Err(result) => return Err(PropertyDimAssign::Return(Box::new(*result))),
             }
             if matches!(current, Value::Uninitialized | Value::Null) {
                 current = Value::Array(PhpArray::new());
@@ -776,10 +777,7 @@ impl Vm {
             .property_state_value(compiled, state, stack, &object, property)
             .unwrap_or(Value::Null);
         match self.try_userland_arrayaccess_offset_set_value(
-            compiled,
-            output,
-            stack,
-            state,
+            ExecutionCursor::new(compiled, output, stack, state),
             &current,
             dims,
             append,
@@ -788,7 +786,7 @@ impl Vm {
         ) {
             Ok(true) => return Ok(value),
             Ok(false) => {}
-            Err(result) => return Err(PropertyDimAssign::Return(Box::new(result))),
+            Err(result) => return Err(PropertyDimAssign::Return(Box::new(*result))),
         }
         if matches!(current, Value::Uninitialized | Value::Null) {
             current = Value::Array(PhpArray::new());
@@ -1095,15 +1093,18 @@ impl Vm {
 
     pub(super) fn call_magic_property_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: ObjectRef,
         method: &str,
         property: &str,
         args: Vec<CallArgument>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Option<Value>, VmResult> {
+    ) -> Result<Option<Value>, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let resolved = match lookup_resolved_method_in_state(
             compiled,
             state,
@@ -1113,7 +1114,11 @@ impl Vm {
         ) {
             Ok(Some(method)) => method,
             Ok(None) => return Ok(None),
-            Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+            Err(message) => {
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
+            }
         };
         if resolved.method.flags.is_static {
             return Ok(None);
@@ -1130,7 +1135,7 @@ impl Vm {
             if method.eq_ignore_ascii_case("__isset") || method.eq_ignore_ascii_case("__set") {
                 return Ok(None);
             }
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
@@ -1138,7 +1143,7 @@ impl Vm {
                     "E_PHP_VM_MAGIC_PROPERTY_RECURSION: recursive {method} for {}::${property}",
                     object.class_name()
                 ),
-            ));
+            )));
         }
         state.magic_property_stack.push(guard);
         let owner = class_owner_in_state(compiled, state, &resolved.class.name);
@@ -1161,22 +1166,25 @@ impl Vm {
         if result.status.is_success() {
             Ok(Some(result.return_value.unwrap_or(Value::Null)))
         } else {
-            Err(result)
+            Err(Box::new(result))
         }
     }
 
     pub(super) fn call_property_hook(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: ObjectRef,
         class: &php_ir::module::ClassEntry,
         property: &php_ir::module::ClassPropertyEntry,
         function: FunctionId,
         args: Vec<CallArgument>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let guard = PropertyHookCall {
             object_id: object.id(),
             class_name: normalize_class_name(&class.name),
@@ -1187,7 +1195,7 @@ impl Vm {
             .iter()
             .any(|active| active == &guard)
         {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
@@ -1195,7 +1203,7 @@ impl Vm {
                     "E_PHP_VM_PROPERTY_HOOK_RECURSION: recursive hook for {}::${}",
                     class.name, property.name
                 ),
-            ));
+            )));
         }
         state.property_hook_stack.push(guard);
         let result = self.execute_function(
@@ -1217,7 +1225,7 @@ impl Vm {
         if result.status.is_success() {
             Ok(result.return_value.unwrap_or(Value::Null))
         } else {
-            Err(result)
+            Err(Box::new(result))
         }
     }
 }

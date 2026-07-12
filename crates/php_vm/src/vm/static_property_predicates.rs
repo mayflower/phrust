@@ -1,5 +1,14 @@
 use super::prelude::*;
 
+pub(super) struct StaticPropertyDimProbe<'a> {
+    pub(super) class_name: &'a str,
+    pub(super) property: &'a str,
+    pub(super) dims: &'a [ArrayKey],
+    pub(super) is_empty: bool,
+    pub(super) span: IrSpan,
+    pub(super) call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
+}
+
 pub(super) enum StaticPropertyIssetEmptyError {
     Runtime(String),
     Vm(Box<VmResult>),
@@ -13,20 +22,26 @@ impl From<String> for StaticPropertyIssetEmptyError {
 
 pub(super) fn static_property_isset_empty_result(
     vm: &Vm,
-    compiled: &CompiledUnit,
-    state: &mut ExecutionState,
-    stack: &mut CallStack,
+    cursor: ExecutionCursor<'_>,
     class_name: &str,
     property: &str,
     is_empty: bool,
     span: IrSpan,
     call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
-    output: &mut OutputBuffer,
 ) -> Result<bool, StaticPropertyIssetEmptyError> {
+    let ExecutionCursor {
+        compiled,
+        output,
+        stack,
+        state,
+    } = cursor;
     vm.autoload_static_class_if_missing(
-        compiled, class_name, span, call_site, output, stack, state,
+        ExecutionCursor::new(compiled, output, stack, state),
+        class_name,
+        span,
+        call_site,
     )
-    .map_err(|result| StaticPropertyIssetEmptyError::Vm(Box::new(result)))?;
+    .map_err(|result| StaticPropertyIssetEmptyError::Vm(Box::new(*result)))?;
     let class = resolve_static_class_name(compiled, state, stack, class_name)?;
     let scope = current_scope_class(compiled, stack);
     let Some(resolved) =
@@ -70,21 +85,30 @@ pub(super) fn static_property_isset_empty_result(
 
 pub(super) fn static_property_dim_isset_empty_result(
     vm: &Vm,
-    compiled: &CompiledUnit,
-    state: &mut ExecutionState,
-    stack: &mut CallStack,
-    class_name: &str,
-    property: &str,
-    dims: &[ArrayKey],
-    is_empty: bool,
-    span: IrSpan,
-    call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
-    output: &mut OutputBuffer,
+    cursor: ExecutionCursor<'_>,
+    probe: StaticPropertyDimProbe<'_>,
 ) -> Result<bool, StaticPropertyIssetEmptyError> {
+    let ExecutionCursor {
+        compiled,
+        output,
+        stack,
+        state,
+    } = cursor;
+    let StaticPropertyDimProbe {
+        class_name,
+        property,
+        dims,
+        is_empty,
+        span,
+        call_site,
+    } = probe;
     vm.autoload_static_class_if_missing(
-        compiled, class_name, span, call_site, output, stack, state,
+        ExecutionCursor::new(compiled, output, stack, state),
+        class_name,
+        span,
+        call_site,
     )
-    .map_err(|result| StaticPropertyIssetEmptyError::Vm(Box::new(result)))?;
+    .map_err(|result| StaticPropertyIssetEmptyError::Vm(Box::new(*result)))?;
     let class = resolve_static_class_name(compiled, state, stack, class_name)?;
     let scope = current_scope_class(compiled, stack);
     let Some(resolved) =
@@ -151,20 +175,26 @@ pub(super) fn static_property_dim_isset_empty_result(
 
 pub(super) fn static_property_dim_unset_result(
     vm: &Vm,
-    compiled: &CompiledUnit,
-    state: &mut ExecutionState,
-    stack: &mut CallStack,
+    cursor: ExecutionCursor<'_>,
     class_name: &str,
     property: &str,
     dims: &[ArrayKey],
     span: IrSpan,
     call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
-    output: &mut OutputBuffer,
 ) -> Result<(), StaticPropertyIssetEmptyError> {
+    let ExecutionCursor {
+        compiled,
+        output,
+        stack,
+        state,
+    } = cursor;
     vm.autoload_static_class_if_missing(
-        compiled, class_name, span, call_site, output, stack, state,
+        ExecutionCursor::new(compiled, output, stack, state),
+        class_name,
+        span,
+        call_site,
     )
-    .map_err(|result| StaticPropertyIssetEmptyError::Vm(Box::new(result)))?;
+    .map_err(|result| StaticPropertyIssetEmptyError::Vm(Box::new(*result)))?;
     let class = resolve_static_class_name(compiled, state, stack, class_name)?;
     let scope = current_scope_class(compiled, stack);
     let Some(resolved) =

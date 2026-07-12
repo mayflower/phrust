@@ -9,16 +9,20 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<ObjectRef, VmResult> {
+    ) -> Result<ObjectRef, Box<VmResult>> {
         let copy = object.clone_shallow();
         let resolved =
             match lookup_resolved_method_in_state(compiled, state, &class.name, "__clone", None) {
                 Ok(Some(method)) => method,
                 Ok(None) => return Ok(copy),
-                Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+                Err(message) => {
+                    return Err(Box::new(
+                        self.runtime_error(output, compiled, stack, message),
+                    ));
+                }
             };
         if resolved.method.flags.is_static {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
@@ -26,7 +30,7 @@ impl Vm {
                     "E_PHP_VM_CLONE_METHOD_INACCESSIBLE: method {}::__clone is not public instance",
                     resolved.class.name
                 ),
-            ));
+            )));
         }
         if let Err(message) = validate_method_callable_in_state_scope(
             compiled,
@@ -35,7 +39,9 @@ impl Vm {
             &resolved.class,
             &resolved.method,
         ) {
-            return Err(self.runtime_error(output, compiled, stack, message));
+            return Err(Box::new(
+                self.runtime_error(output, compiled, stack, message),
+            ));
         }
         let method_owner = class_owner_in_state(compiled, state, &resolved.class.name);
         let result = self.execute_function(
@@ -53,7 +59,7 @@ impl Vm {
             state,
         );
         if !result.status.is_success() {
-            return Err(result);
+            return Err(Box::new(result));
         }
         Ok(copy)
     }

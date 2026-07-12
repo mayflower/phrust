@@ -665,16 +665,17 @@ fn precheck_bound_argument_types(
             continue;
         };
         coerce_or_check_param_type(
-            compiled,
-            state,
-            function,
-            param,
-            index,
+            ParamTypecheckRequest {
+                compiled,
+                state,
+                function,
+                param,
+                arg_index: index,
+                fast_path: typecheck,
+                strict_types: call_site_strict_types,
+                call_span,
+            },
             &mut arg.value,
-            false,
-            typecheck,
-            call_site_strict_types,
-            call_span,
         )?;
     }
     Ok(())
@@ -767,6 +768,18 @@ impl<'a> TypecheckFastPathContext<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ParamTypecheckRequest<'a> {
+    pub(super) compiled: &'a CompiledUnit,
+    pub(super) state: &'a ExecutionState,
+    pub(super) function: &'a IrFunction,
+    pub(super) param: &'a IrParam,
+    pub(super) arg_index: usize,
+    pub(super) fast_path: TypecheckFastPathContext<'a>,
+    pub(super) strict_types: bool,
+    pub(super) call_span: Option<php_ir::IrSpan>,
+}
+
 pub(super) fn param_is_sensitive(param: &IrParam) -> bool {
     param.attributes.iter().any(|attribute| {
         attribute_name_matches_sensitive(attribute.resolved_name.as_deref())
@@ -820,15 +833,19 @@ pub(super) fn type_error_value_name(value: &Value) -> String {
 /// Builds PHP's argument `TypeError` message, e.g.
 /// `Foo::bar(): Argument #1 ($baz) must be of type int, string given`.
 fn param_type_mismatch_message(
-    compiled: &CompiledUnit,
-    function: &IrFunction,
-    param: &IrParam,
-    arg_index: usize,
+    request: ParamTypecheckRequest<'_>,
     value: &Value,
     runtime_type: &RuntimeType,
-    call_span: Option<php_ir::IrSpan>,
     include_parameter_name: bool,
 ) -> String {
+    let ParamTypecheckRequest {
+        compiled,
+        function,
+        param,
+        arg_index,
+        call_span,
+        ..
+    } = request;
     let parameter_name = if include_parameter_name {
         format!(" (${})", param.name)
     } else {
@@ -907,71 +924,54 @@ fn php_builtin_union_display_rank(name: &str) -> Option<u8> {
 }
 
 pub(super) fn coerce_or_check_param_type(
-    compiled: &CompiledUnit,
-    state: &ExecutionState,
-    function: &IrFunction,
-    param: &IrParam,
-    arg_index: usize,
+    request: ParamTypecheckRequest<'_>,
     value: &mut Value,
-    _by_ref_arg: bool,
-    typecheck: TypecheckFastPathContext<'_>,
-    call_site_strict_types: bool,
-    call_span: Option<php_ir::IrSpan>,
 ) -> Result<(), ParamTypecheckError> {
+    let ParamTypecheckRequest {
+        compiled,
+        state,
+        param,
+        fast_path,
+        strict_types,
+        ..
+    } = request;
     let Some(runtime_type) = ir_runtime_type(param.type_.as_ref()) else {
         return Ok(());
     };
     if param.variadic {
-        return coerce_or_check_variadic_param_type(
-            compiled,
-            state,
-            function,
-            param,
-            arg_index,
-            value,
-            &runtime_type,
-            typecheck,
-            call_site_strict_types,
-            call_span,
-        );
+        return coerce_or_check_variadic_param_type(request, value, &runtime_type);
     }
-    if !call_site_strict_types
-        && let Some(coerced) = coerce_value_to_runtime_type(value, &runtime_type)
-    {
+    if !strict_types && let Some(coerced) = coerce_value_to_runtime_type(value, &runtime_type) {
         *value = coerced;
         return Ok(());
     }
     materialize_int_to_float_runtime_type(value, &runtime_type);
-    if vm_value_matches_runtime_type(compiled, Some(state), value, &runtime_type, typecheck)
+    if vm_value_matches_runtime_type(compiled, Some(state), value, &runtime_type, fast_path)
         .map_err(ParamTypecheckError::Runtime)?
     {
         Ok(())
     } else {
         Err(ParamTypecheckError::Mismatch(param_type_mismatch_message(
-            compiled,
-            function,
-            param,
-            arg_index,
+            request,
             value,
             &runtime_type,
-            call_span,
             true,
         )))
     }
 }
 
 fn coerce_or_check_variadic_param_type(
-    compiled: &CompiledUnit,
-    state: &ExecutionState,
-    function: &IrFunction,
-    param: &IrParam,
-    arg_index: usize,
+    request: ParamTypecheckRequest<'_>,
     value: &mut Value,
     runtime_type: &RuntimeType,
-    typecheck: TypecheckFastPathContext<'_>,
-    call_site_strict_types: bool,
-    call_span: Option<php_ir::IrSpan>,
 ) -> Result<(), ParamTypecheckError> {
+    let ParamTypecheckRequest {
+        compiled,
+        state,
+        fast_path,
+        strict_types,
+        ..
+    } = request;
     let Value::Array(array) = value else {
         return Ok(());
     };
@@ -980,8 +980,7 @@ fn coerce_or_check_variadic_param_type(
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<Vec<_>>();
     for (offset, (key, mut element)) in entries.into_iter().enumerate() {
-        if !call_site_strict_types
-            && let Some(coerced) = coerce_value_to_runtime_type(&element, runtime_type)
+        if !strict_types && let Some(coerced) = coerce_value_to_runtime_type(&element, runtime_type)
         {
             element = coerced;
         } else if !vm_value_matches_runtime_type(
@@ -989,18 +988,17 @@ fn coerce_or_check_variadic_param_type(
             Some(state),
             &element,
             runtime_type,
-            typecheck,
+            fast_path,
         )
         .map_err(ParamTypecheckError::Runtime)?
         {
             return Err(ParamTypecheckError::Mismatch(param_type_mismatch_message(
-                compiled,
-                function,
-                param,
-                arg_index + offset,
+                ParamTypecheckRequest {
+                    arg_index: request.arg_index + offset,
+                    ..request
+                },
                 &element,
                 runtime_type,
-                call_span,
                 false,
             )));
         }

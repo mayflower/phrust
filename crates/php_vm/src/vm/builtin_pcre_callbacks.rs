@@ -2,6 +2,13 @@ use super::builtin_adapter::{BuiltinTypeError, builtin_source_span};
 use super::builtin_callback_validation::{array_callback_type_error, validate_array_callback_arg};
 use super::prelude::*;
 
+#[derive(Clone, Copy)]
+pub(super) struct PcreCallbackReplaceOptions {
+    call_span: Option<php_ir::IrSpan>,
+    limit: i64,
+    flags: i64,
+}
+
 pub(super) fn is_pcre_callback_builtin_name(name: &str) -> bool {
     matches!(
         name,
@@ -12,16 +19,23 @@ pub(super) fn is_pcre_callback_builtin_name(name: &str) -> bool {
 impl Vm {
     pub(super) fn call_pcre_callback_builtin(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         name: &str,
         args: Vec<CallArgument>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let values = match call_builtin_args_to_positional(
-            self, compiled, name, args, None, output, stack, state,
+            self,
+            ExecutionCursor::new(compiled, output, stack, state),
+            name,
+            args,
+            None,
         ) {
             Ok(values) => values,
             Err(InternalBuiltinArgError::Message(message)) => {
@@ -65,14 +79,17 @@ impl Vm {
 
     pub(super) fn emit_pcre_compile_warning(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         function_name: &str,
         call_span: Option<php_ir::IrSpan>,
         error: &php_runtime::experimental::pcre::PcreFailure,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Result<(), ArrayCallbackError> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         state.builtins.pcre_state_mut().last_error_mut().set(
             error.code(),
             php_runtime::experimental::pcre::preg_error_message(error.code()),
@@ -98,7 +115,7 @@ impl Vm {
                 php_runtime::api::PHP_E_WARNING,
                 &diagnostic,
             )
-            .map_err(|result| ArrayCallbackError::Runtime(Box::new(result)))?;
+            .map_err(|result| ArrayCallbackError::Runtime(Box::new(*result)))?;
         if !handled && error_reporting_allows(state, php_runtime::api::PHP_E_WARNING) {
             Self::record_last_error(state, php_runtime::api::PHP_E_WARNING, &diagnostic);
             emit_vm_diagnostic(
@@ -129,21 +146,24 @@ impl Vm {
             state,
             builtin_source_span(compiled, call_span),
         )
-        .map_err(|result| ArrayCallbackError::Runtime(Box::new(result)))
+        .map_err(|result| ArrayCallbackError::Runtime(Box::new(*result)))
     }
 
     pub(super) fn pcre_callback_subject_string_value(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         function: &str,
         position: usize,
         param_name: &str,
         value: &Value,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Result<PhpString, ArrayCallbackError> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         match effective_value(value) {
             Value::Object(object) => Err(ArrayCallbackError::BuiltinTypeMessage(format!(
                 "{function}(): Argument #{position} (${param_name}) must be of type array|string, {} given",
@@ -237,13 +257,10 @@ impl Vm {
                 Ok(compiled_pattern) => compiled_pattern,
                 Err(error) => {
                     self.emit_pcre_compile_warning(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         "preg_replace_callback",
                         call_span,
                         &error,
-                        output,
-                        stack,
-                        state,
                     )?;
                     return Ok(Value::Null);
                 }
@@ -263,16 +280,15 @@ impl Vm {
                         compiled, value, call_span, output, stack, state,
                     )?;
                     let bytes = match self.preg_replace_callback_array_bytes(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         &compiled_patterns,
                         text.as_bytes(),
-                        call_span,
-                        limit,
-                        flags,
+                        PcreCallbackReplaceOptions {
+                            call_span,
+                            limit,
+                            flags,
+                        },
                         &mut count,
-                        output,
-                        stack,
-                        state,
                     ) {
                         Ok(bytes) => bytes,
                         Err(error) => {
@@ -293,27 +309,23 @@ impl Vm {
             }
             subject => {
                 let text = self.pcre_callback_subject_string_value(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     "preg_replace_callback",
                     3,
                     "subject",
                     &subject,
                     call_span,
-                    output,
-                    stack,
-                    state,
                 )?;
                 let bytes = self.preg_replace_callback_array_bytes(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &compiled_patterns,
                     text.as_bytes(),
-                    call_span,
-                    limit,
-                    flags,
+                    PcreCallbackReplaceOptions {
+                        call_span,
+                        limit,
+                        flags,
+                    },
                     &mut count,
-                    output,
-                    stack,
-                    state,
                 )?;
                 Value::string(bytes)
             }
@@ -446,28 +458,24 @@ impl Vm {
                 Ok(compiled_pattern) => compiled_pattern,
                 Err(error) => {
                     self.emit_pcre_compile_warning(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         "preg_replace_callback_array",
                         call_span,
                         &error,
-                        output,
-                        stack,
-                        state,
                     )?;
                     return Ok(Value::Null);
                 }
             };
             value = self.preg_replace_callback_array_subject_value(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 &[(compiled_pattern, callback.clone())],
                 value,
-                call_span,
-                limit,
-                flags,
+                PcreCallbackReplaceOptions {
+                    call_span,
+                    limit,
+                    flags,
+                },
                 &mut count,
-                output,
-                stack,
-                state,
             )?;
         }
         if let Some(Value::Reference(cell)) = args.get(3) {
@@ -478,20 +486,21 @@ impl Vm {
 
     pub(super) fn preg_replace_callback_array_subject_bytes(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         patterns: &[(
             std::sync::Arc<php_runtime::experimental::pcre::CompiledPattern>,
             Value,
         )],
         subjects: PhpArray,
-        call_span: Option<php_ir::IrSpan>,
-        limit: i64,
-        flags: i64,
+        options: PcreCallbackReplaceOptions,
         count: &mut i64,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Result<PhpArray, ArrayCallbackError> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let mut replaced = subjects;
         for (pattern, callback) in patterns {
             let entries = replaced
@@ -500,19 +509,19 @@ impl Vm {
                 .collect::<Vec<_>>();
             for (key, subject) in entries {
                 let text = self.pcre_callback_string_value(
-                    compiled, &subject, call_span, output, stack, state,
-                )?;
-                let bytes = self.preg_replace_callback_array_bytes(
                     compiled,
-                    &[(pattern.clone(), callback.clone())],
-                    text.as_bytes(),
-                    call_span,
-                    limit,
-                    flags,
-                    count,
+                    &subject,
+                    options.call_span,
                     output,
                     stack,
                     state,
+                )?;
+                let bytes = self.preg_replace_callback_array_bytes(
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    &[(pattern.clone(), callback.clone())],
+                    text.as_bytes(),
+                    options,
+                    count,
                 )?;
                 replaced.insert(key, Value::string(bytes));
             }
@@ -522,50 +531,46 @@ impl Vm {
 
     pub(super) fn preg_replace_callback_array_subject_value(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         patterns: &[(
             std::sync::Arc<php_runtime::experimental::pcre::CompiledPattern>,
             Value,
         )],
         subject: Value,
-        call_span: Option<php_ir::IrSpan>,
-        limit: i64,
-        flags: i64,
+        options: PcreCallbackReplaceOptions,
         count: &mut i64,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Result<Value, ArrayCallbackError> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         match effective_value(&subject) {
             Value::Array(subjects) => Ok(Value::Array(
                 self.preg_replace_callback_array_subject_bytes(
-                    compiled, patterns, subjects, call_span, limit, flags, count, output, stack,
-                    state,
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    patterns,
+                    subjects,
+                    options,
+                    count,
                 )?,
             )),
             subject => {
                 let text = self.pcre_callback_subject_string_value(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     "preg_replace_callback_array",
                     2,
                     "subject",
                     &subject,
-                    call_span,
-                    output,
-                    stack,
-                    state,
+                    options.call_span,
                 )?;
                 let bytes = self.preg_replace_callback_array_bytes(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     patterns,
                     text.as_bytes(),
-                    call_span,
-                    limit,
-                    flags,
+                    options,
                     count,
-                    output,
-                    stack,
-                    state,
                 )?;
                 Ok(Value::string(bytes))
             }
@@ -574,34 +579,30 @@ impl Vm {
 
     pub(super) fn preg_replace_callback_array_bytes(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         patterns: &[(
             std::sync::Arc<php_runtime::experimental::pcre::CompiledPattern>,
             Value,
         )],
         subject: &[u8],
-        call_span: Option<php_ir::IrSpan>,
-        limit: i64,
-        flags: i64,
+        options: PcreCallbackReplaceOptions,
         count: &mut i64,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Result<Vec<u8>, ArrayCallbackError> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let mut current = subject.to_vec();
         for (pattern, callback) in patterns {
             current = self.preg_replace_callback_bytes(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 pattern,
                 callback.clone(),
                 &current,
-                call_span,
-                limit,
-                flags,
+                options,
                 count,
-                output,
-                stack,
-                state,
             )?;
         }
         Ok(current)
@@ -609,18 +610,19 @@ impl Vm {
 
     pub(super) fn preg_replace_callback_bytes(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         pattern: &php_runtime::experimental::pcre::CompiledPattern,
         callback: Value,
         subject: &[u8],
-        call_span: Option<php_ir::IrSpan>,
-        limit: i64,
-        flags: i64,
+        options: PcreCallbackReplaceOptions,
         count: &mut i64,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Result<Vec<u8>, ArrayCallbackError> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let mut replaced = Vec::new();
         let mut last_end = 0usize;
         for captures in pattern.captures_iter(subject) {
@@ -634,7 +636,7 @@ impl Vm {
             let Some(full) = captures.get(0) else {
                 continue;
             };
-            if limit >= 0 && *count >= limit {
+            if options.limit >= 0 && *count >= options.limit {
                 break;
             }
             replaced.extend_from_slice(&subject[last_end..full.start()]);
@@ -645,7 +647,7 @@ impl Vm {
                     php_runtime::experimental::pcre::captures_to_array_with_names(
                         &captures,
                         pattern.capture_names(),
-                        flags,
+                        options.flags,
                         0,
                     ),
                 ],
@@ -656,7 +658,7 @@ impl Vm {
             let callback_text = self.pcre_callback_string_value(
                 compiled,
                 &callback_result,
-                call_span,
+                options.call_span,
                 output,
                 stack,
                 state,

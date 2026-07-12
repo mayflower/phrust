@@ -2,18 +2,29 @@ use super::*;
 
 pub(super) fn execute_rich_foreach_instruction(
     vm: &Vm,
-    compiled: &CompiledUnit,
-    unit: &IrUnit,
-    frame_index: usize,
-    kind: &InstructionKind,
-    span: IrSpan,
-    output: &mut OutputBuffer,
-    stack: &mut CallStack,
-    state: &mut ExecutionState,
+    cursor: ExecutionCursor<'_>,
+    site: dispatch_contract::RichInstructionSite<'_>,
     foreach_iterators: &mut HashMap<RegId, ForeachIterator>,
-    exception_handlers: &mut Vec<ExceptionHandler>,
-    pending_control: &mut Option<PendingControl>,
+    control: dispatch_contract::RichControlState<'_>,
 ) -> RichDispatchOutcome {
+    let ExecutionCursor {
+        compiled,
+        output,
+        stack,
+        state,
+    } = cursor;
+    let dispatch_contract::RichInstructionSite {
+        unit,
+        instruction,
+        frame_index,
+        ..
+    } = site;
+    let kind = &instruction.kind;
+    let span = instruction.span;
+    let dispatch_contract::RichControlState {
+        exception_handlers,
+        pending_control,
+    } = control;
     match kind {
         InstructionKind::ForeachInit { iterator, source } => {
             let _profile = vm.request_profile_operation_start(
@@ -39,13 +50,10 @@ pub(super) fn execute_rich_foreach_instruction(
                 Ok(iterator) => iterator,
                 Err(result) => {
                     match vm.route_throwable_result(
-                        compiled,
-                        output,
-                        stack,
-                        state,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         exception_handlers,
                         pending_control,
-                        result,
+                        *result,
                     ) {
                         RaiseOutcome::Caught(target) => {
                             return RichDispatchOutcome::Jump(target);
@@ -142,13 +150,10 @@ pub(super) fn execute_rich_foreach_instruction(
                         )
                     {
                         match vm.route_throwable_result(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
-                            result,
+                            *result,
                         ) {
                             RaiseOutcome::Caught(target) => {
                                 return RichDispatchOutcome::Jump(target);
@@ -163,24 +168,18 @@ pub(super) fn execute_rich_foreach_instruction(
                         Some("recursiveiteratoriterator" | "recursivetreeiterator")
                     ) && spl_rii_should_call_valid_child_hook(&object)
                         && let Err(result) = vm.call_spl_rii_child_hook(
-                            compiled,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             &object,
                             "callHasChildren",
                             "RecursiveIteratorIterator->valid",
                             None,
-                            output,
-                            stack,
-                            state,
                         )
                     {
                         match vm.route_throwable_result(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
-                            result,
+                            *result,
                         ) {
                             RaiseOutcome::Caught(target) => {
                                 return RichDispatchOutcome::Jump(target);
@@ -208,13 +207,10 @@ pub(super) fn execute_rich_foreach_instruction(
                         },
                         Err(result) => {
                             match vm.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
-                                result,
+                                *result,
                             ) {
                                 RaiseOutcome::Caught(target) => {
                                     return RichDispatchOutcome::Jump(target);
@@ -239,13 +235,10 @@ pub(super) fn execute_rich_foreach_instruction(
                             Ok(value) => value,
                             Err(result) => {
                                 match vm.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     exception_handlers,
                                     pending_control,
-                                    result,
+                                    *result,
                                 ) {
                                     RaiseOutcome::Caught(target) => {
                                         return RichDispatchOutcome::Jump(target);
@@ -268,13 +261,10 @@ pub(super) fn execute_rich_foreach_instruction(
                                 Ok(value) => value,
                                 Err(result) => {
                                     match vm.route_throwable_result(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
+                                        ExecutionCursor::new(compiled, output, stack, state),
                                         exception_handlers,
                                         pending_control,
-                                        result,
+                                        *result,
                                     ) {
                                         RaiseOutcome::Caught(target) => {
                                             return RichDispatchOutcome::Jump(target);
@@ -314,14 +304,14 @@ pub(super) fn execute_rich_foreach_instruction(
                             state,
                         ) {
                             Ok(next) => next,
-                            Err(result) => return RichDispatchOutcome::Return(Box::new(result)),
+                            Err(result) => return RichDispatchOutcome::Return(Box::new(*result)),
                         }
                     } else {
                         match vm.advance_generator_to_first_yield(
                             compiled, generator, output, stack, state,
                         ) {
                             Ok(next) => next,
-                            Err(result) => return RichDispatchOutcome::Return(Box::new(result)),
+                            Err(result) => return RichDispatchOutcome::Return(Box::new(*result)),
                         }
                     }
                 }
@@ -390,10 +380,7 @@ pub(super) fn execute_rich_foreach_instruction(
                 .remove(iterator)
                 .and_then(foreach_iterator_candidate_value)
                 && let Some(outcome) = vm.run_destructors_for_unreferenced_value(
-                    compiled,
-                    output,
-                    stack,
-                    state,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     exception_handlers,
                     pending_control,
                     &value,
@@ -426,10 +413,7 @@ pub(super) fn execute_rich_foreach_instruction(
                 Value::Object(_) | Value::Generator(_) | Value::Resource(_)
             ) {
                 match vm.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
                                 span,

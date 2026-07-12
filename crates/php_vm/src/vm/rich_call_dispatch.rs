@@ -2,17 +2,19 @@ use super::*;
 
 pub(super) fn execute_rich_call_instruction(
     vm: &Vm,
-    compiled: &CompiledUnit,
+    cursor: ExecutionCursor<'_>,
     site: dispatch_contract::RichInstructionSite<'_>,
     running_fiber: &Option<FiberRef>,
-    output: &mut OutputBuffer,
-    stack: &mut CallStack,
-    state: &mut ExecutionState,
     diagnostics: &mut Vec<RuntimeDiagnostic>,
     foreach_iterators: &mut HashMap<RegId, ForeachIterator>,
-    exception_handlers: &mut Vec<ExceptionHandler>,
-    pending_control: &mut Option<PendingControl>,
+    control: dispatch_contract::RichControlState<'_>,
 ) -> RichDispatchOutcome {
+    let ExecutionCursor {
+        compiled,
+        output,
+        stack,
+        state,
+    } = cursor;
     let dispatch_contract::RichInstructionSite {
         unit,
         function: _,
@@ -22,6 +24,10 @@ pub(super) fn execute_rich_call_instruction(
         instruction_index,
         frame_index,
     } = site;
+    let dispatch_contract::RichControlState {
+        exception_handlers,
+        pending_control,
+    } = control;
 
     match &instruction.kind {
         InstructionKind::CallFunction { dst, name, args } => {
@@ -68,10 +74,7 @@ pub(super) fn execute_rich_call_instruction(
             let call_shape = function_call_shape(&values);
             let target = vm
                 .lookup_function_call_inline_cache(
-                    compiled,
-                    function_id,
-                    block_id,
-                    instruction.id,
+                    IrInlineCacheSite::classic(compiled, function_id, block_id, instruction.id),
                     &interned_name,
                     epoch,
                     &call_shape,
@@ -85,10 +88,7 @@ pub(super) fn execute_rich_call_instruction(
                         vm.record_counter_builtin_call_ic(false);
                     }
                     vm.install_function_call_inline_cache(
-                        compiled,
-                        function_id,
-                        block_id,
-                        instruction.id,
+                        IrInlineCacheSite::classic(compiled, function_id, block_id, instruction.id),
                         &interned_name,
                         epoch,
                         call_shape.clone(),
@@ -113,7 +113,7 @@ pub(super) fn execute_rich_call_instruction(
             let temporary_iterator_arg =
                 iterator_function_temporary_arg_value(&lowered_name, args, &values);
             let result = vm.execute_function_call_target(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 target,
                 values,
                 Some((
@@ -123,9 +123,6 @@ pub(super) fn execute_rich_call_instruction(
                     instruction.id,
                 )),
                 Some(instruction.span),
-                output,
-                stack,
-                state,
                 running_fiber,
             );
             if !result.status.is_success() {
@@ -144,10 +141,7 @@ pub(super) fn execute_rich_call_instruction(
                     let candidates = destructor_candidates_for_value(&arg_value);
                     let rooted_object_ids = php_visible_non_register_root_object_ids(stack, state);
                     let sweep = vm.run_destructors_for_unreferenced_candidates_with_roots(
-                        compiled,
-                        output,
-                        stack,
-                        state,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         exception_handlers,
                         pending_control,
                         candidates,
@@ -196,12 +190,14 @@ pub(super) fn execute_rich_call_instruction(
                 return RichDispatchOutcome::Return(Box::new(vm.propagate_fiber_suspension(
                     result,
                     compiled,
-                    *dst,
-                    block_id,
-                    instruction_index + 1,
-                    foreach_iterators,
-                    exception_handlers,
-                    pending_control,
+                    FiberContinuationState::new(
+                        *dst,
+                        block_id,
+                        instruction_index + 1,
+                        foreach_iterators,
+                        exception_handlers,
+                        pending_control,
+                    ),
                     output,
                     stack,
                 )));
@@ -222,10 +218,7 @@ pub(super) fn execute_rich_call_instruction(
                 )));
                 let candidates = destructor_candidates_for_value(&arg_value);
                 let sweep = vm.run_destructors_for_unreferenced_candidates_with_roots(
-                    compiled,
-                    output,
-                    stack,
-                    state,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     exception_handlers,
                     pending_control,
                     candidates,
@@ -284,11 +277,14 @@ pub(super) fn execute_rich_call_instruction(
             };
             let object = match receiver {
                 Value::Fiber(fiber) => {
-                    let value = match vm
-                        .call_fiber_method(compiled, fiber, method, values, output, stack, state)
-                    {
+                    let value = match vm.call_fiber_method(
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        fiber,
+                        method,
+                        values,
+                    ) {
                         Ok(value) => value,
-                        Err(result) => return RichDispatchOutcome::Return(Box::new(result)),
+                        Err(result) => return RichDispatchOutcome::Return(Box::new(*result)),
                     };
                     if let Err(message) = stack
                         .frame_mut(frame_index)
@@ -304,10 +300,13 @@ pub(super) fn execute_rich_call_instruction(
                 }
                 Value::Generator(generator) => {
                     let value = match vm.call_generator_method(
-                        compiled, generator, method, values, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        generator,
+                        method,
+                        values,
                     ) {
                         Ok(value) => value,
-                        Err(result) => return RichDispatchOutcome::Return(Box::new(result)),
+                        Err(result) => return RichDispatchOutcome::Return(Box::new(*result)),
                     };
                     if let Err(message) = stack
                         .frame_mut(frame_index)
@@ -324,13 +323,10 @@ pub(super) fn execute_rich_call_instruction(
                 Value::Callable(callable) if method.eq_ignore_ascii_case("__invoke") => {
                     let value = match vm
                         .call_callable_inner(
-                            compiled,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             Value::Callable(callable),
                             values,
                             Some(instruction.span),
-                            output,
-                            stack,
-                            state,
                             false,
                             None,
                         )
@@ -353,12 +349,9 @@ pub(super) fn execute_rich_call_instruction(
                 }
                 Value::Callable(callable) if method.eq_ignore_ascii_case("call") => {
                     let result = vm.call_closure_call_method(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         *callable,
                         values,
-                        output,
-                        stack,
-                        state,
                         instruction.span,
                     );
                     if !result.status.is_success()
@@ -399,12 +392,9 @@ pub(super) fn execute_rich_call_instruction(
                 }
                 Value::Callable(callable) if method.eq_ignore_ascii_case("bindto") => {
                     let result = vm.call_closure_bind_to_method(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         *callable,
                         values,
-                        output,
-                        stack,
-                        state,
                         instruction.span,
                     );
                     if !result.status.is_success()
@@ -450,10 +440,7 @@ pub(super) fn execute_rich_call_instruction(
                         value_type_name(&other)
                     );
                     match vm.raise_runtime_error(
-                        compiled,
-                        output,
-                        stack,
-                        state,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         exception_handlers,
                         pending_control,
                         instruction.span,
@@ -500,21 +487,15 @@ pub(super) fn execute_rich_call_instruction(
                     )
                 {
                     let result = vm.reflection_class_new_instance(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         &object,
                         method,
                         values,
-                        output,
-                        stack,
-                        state,
                         instruction.span,
                     );
                     if !result.status.is_success() {
                         match vm.route_throwable_result(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             result,
@@ -532,12 +513,14 @@ pub(super) fn execute_rich_call_instruction(
                             vm.propagate_fiber_suspension(
                                 result,
                                 compiled,
-                                *dst,
-                                block_id,
-                                instruction_index + 1,
-                                foreach_iterators,
-                                exception_handlers,
-                                pending_control,
+                                FiberContinuationState::new(
+                                    *dst,
+                                    block_id,
+                                    instruction_index + 1,
+                                    foreach_iterators,
+                                    exception_handlers,
+                                    pending_control,
+                                ),
                                 output,
                                 stack,
                             ),
@@ -570,10 +553,7 @@ pub(super) fn execute_rich_call_instruction(
                     );
                     if !result.status.is_success() {
                         match vm.route_throwable_result(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             result,
@@ -591,12 +571,14 @@ pub(super) fn execute_rich_call_instruction(
                             vm.propagate_fiber_suspension(
                                 result,
                                 compiled,
-                                *dst,
-                                block_id,
-                                instruction_index + 1,
-                                foreach_iterators,
-                                exception_handlers,
-                                pending_control,
+                                FiberContinuationState::new(
+                                    *dst,
+                                    block_id,
+                                    instruction_index + 1,
+                                    foreach_iterators,
+                                    exception_handlers,
+                                    pending_control,
+                                ),
                                 output,
                                 stack,
                             ),
@@ -617,16 +599,16 @@ pub(super) fn execute_rich_call_instruction(
                     return RichDispatchOutcome::Continue;
                 }
                 if let Err(result) = vm.preflight_reflection_class_method(
-                    compiled, &object, method, &values, output, stack, state,
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    &object,
+                    method,
+                    &values,
                 ) {
                     match vm.route_throwable_result(
-                        compiled,
-                        output,
-                        stack,
-                        state,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         exception_handlers,
                         pending_control,
-                        result,
+                        *result,
                     ) {
                         RaiseOutcome::Caught(target) => {
                             return RichDispatchOutcome::Jump(target);
@@ -635,23 +617,17 @@ pub(super) fn execute_rich_call_instruction(
                     }
                 }
                 let value = match reflection_method_value(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &object,
                     method,
                     values,
-                    output,
-                    stack,
-                    state,
                     runtime_source_span(compiled, instruction.span),
                 ) {
                     Ok(value) => value,
                     Err(message) => {
                         let result = vm.runtime_error(output, compiled, stack, message);
                         match vm.route_throwable_result(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             result,
@@ -684,10 +660,7 @@ pub(super) fn execute_rich_call_instruction(
                     Err(message) => {
                         let result = vm.runtime_error(output, compiled, stack, message);
                         match vm.route_throwable_result(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             result,
@@ -729,10 +702,7 @@ pub(super) fn execute_rich_call_instruction(
                     Ok(value) => value,
                     Err(message) => {
                         match vm.raise_runtime_error(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             instruction.span,
@@ -808,10 +778,7 @@ pub(super) fn execute_rich_call_instruction(
                             );
                             if !result.status.is_success() {
                                 match vm.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     exception_handlers,
                                     pending_control,
                                     result,
@@ -857,25 +824,19 @@ pub(super) fn execute_rich_call_instruction(
                     )
                 {
                     let value = match vm.call_spl_append_iterator_method(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         &object,
                         method,
                         values,
-                        output,
-                        stack,
-                        state,
                         Some(instruction.span),
                     ) {
                         Ok(value) => value,
                         Err(result) => {
                             match vm.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
-                                result,
+                                *result,
                             ) {
                                 RaiseOutcome::Caught(target) => {
                                     return RichDispatchOutcome::Jump(target);
@@ -906,18 +867,18 @@ pub(super) fn execute_rich_call_instruction(
                     )
                 {
                     let value = match vm.call_spl_limit_iterator_method(
-                        compiled, &object, method, values, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        &object,
+                        method,
+                        values,
                     ) {
                         Ok(value) => value,
                         Err(result) => {
                             match vm.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
-                                result,
+                                *result,
                             ) {
                                 RaiseOutcome::Caught(target) => {
                                     return RichDispatchOutcome::Jump(target);
@@ -949,18 +910,18 @@ pub(super) fn execute_rich_call_instruction(
                     )
                 {
                     let value = match vm.call_spl_caching_iterator_method(
-                        compiled, &object, method, values, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        &object,
+                        method,
+                        values,
                     ) {
                         Ok(value) => value,
                         Err(result) => {
                             match vm.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
-                                result,
+                                *result,
                             ) {
                                 RaiseOutcome::Caught(target) => {
                                     return RichDispatchOutcome::Jump(target);
@@ -990,18 +951,18 @@ pub(super) fn execute_rich_call_instruction(
                     )
                 {
                     let value = match vm.call_spl_no_rewind_iterator_method(
-                        compiled, &object, method, values, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        &object,
+                        method,
+                        values,
                     ) {
                         Ok(value) => value,
                         Err(result) => {
                             match vm.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
-                                result,
+                                *result,
                             ) {
                                 RaiseOutcome::Caught(target) => {
                                     return RichDispatchOutcome::Jump(target);
@@ -1032,10 +993,7 @@ pub(super) fn execute_rich_call_instruction(
                         validate_spl_iterator_arg_count(&object.class_name(), &values, 0, 0)
                     {
                         match vm.raise_runtime_error(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             instruction.span,
@@ -1060,13 +1018,10 @@ pub(super) fn execute_rich_call_instruction(
                         Ok(value) => Value::String(value),
                         Err(result) => {
                             match vm.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
-                                result,
+                                *result,
                             ) {
                                 RaiseOutcome::Caught(target) => {
                                     return RichDispatchOutcome::Jump(target);
@@ -1097,14 +1052,11 @@ pub(super) fn execute_rich_call_instruction(
                     )
                 {
                     let result = vm.call_spl_caching_iterator_offset_access_method(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         &object,
                         method,
                         values,
                         Some(instruction.span),
-                        output,
-                        stack,
-                        state,
                     );
                     if !result.status.is_success() || state.pending_throw.is_some() {
                         let cleanup_values = match take_method_call_temporary_registers_at_frame(
@@ -1124,10 +1076,7 @@ pub(super) fn execute_rich_call_instruction(
                             release_unrooted_object_handles(value);
                         }
                         match vm.route_throwable_result(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             result,
@@ -1176,18 +1125,18 @@ pub(super) fn execute_rich_call_instruction(
                         "rewind" | "valid" | "current" | "key" | "next"
                     ) {
                     match vm.call_spl_multiple_iterator_method(
-                        compiled, &object, method, values, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        &object,
+                        method,
+                        values,
                     ) {
                         Ok(value) => value,
                         Err(result) => {
                             match vm.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
-                                result,
+                                *result,
                             ) {
                                 RaiseOutcome::Caught(target) => {
                                     return RichDispatchOutcome::Jump(target);
@@ -1206,25 +1155,19 @@ pub(super) fn execute_rich_call_instruction(
                     "rewind" | "valid" | "current" | "next"
                 ) {
                     match vm.call_spl_recursive_iterator_iterator_method(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         object,
                         method,
                         values,
                         Some(instruction.span),
-                        output,
-                        stack,
-                        state,
                     ) {
                         Ok(value) => value,
                         Err(result) => {
                             match vm.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
-                                result,
+                                *result,
                             ) {
                                 RaiseOutcome::Caught(target) => {
                                     return RichDispatchOutcome::Jump(target);
@@ -1245,10 +1188,7 @@ pub(super) fn execute_rich_call_instruction(
                         Ok(value) => value,
                         Err(message) => {
                             match vm.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
                                 instruction.span,
@@ -1280,17 +1220,14 @@ pub(super) fn execute_rich_call_instruction(
                 is_spl_container_runtime_class(&class) && spl_container_method_is_supported(method)
             }) {
                 let value = match vm.call_spl_container_method_with_magic(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object,
                     method,
                     values,
                     Some(instruction.span),
-                    output,
-                    stack,
-                    state,
                 ) {
                     Ok(value) => value,
-                    Err(result) => return RichDispatchOutcome::Return(Box::new(result)),
+                    Err(result) => return RichDispatchOutcome::Return(Box::new(*result)),
                 };
                 if let Err(message) = stack
                     .frame_mut(frame_index)
@@ -1307,16 +1244,16 @@ pub(super) fn execute_rich_call_instruction(
             if spl_runtime_marker(&object).is_some_and(|class| {
                 is_spl_heap_runtime_class(&class) && spl_heap_method_is_supported(method)
             }) {
-                let value = match vm
-                    .call_spl_heap_method(compiled, object, method, values, output, stack, state)
-                {
+                let value = match vm.call_spl_heap_method(
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    object,
+                    method,
+                    values,
+                ) {
                     Ok(value) => value,
                     Err(SplHeapMethodError::Message(message)) => {
                         match vm.raise_runtime_error(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             instruction.span,
@@ -1332,10 +1269,7 @@ pub(super) fn execute_rich_call_instruction(
                     }
                     Err(SplHeapMethodError::Runtime(result)) => {
                         match vm.route_throwable_result(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             *result,
@@ -1368,10 +1302,7 @@ pub(super) fn execute_rich_call_instruction(
                     Ok(value) => value,
                     Err(message) => {
                         match vm.raise_runtime_error(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             instruction.span,
@@ -1412,10 +1343,7 @@ pub(super) fn execute_rich_call_instruction(
                     Ok(value) => value,
                     Err(message) => {
                         match vm.raise_runtime_error(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             instruction.span,
@@ -1503,10 +1431,7 @@ pub(super) fn execute_rich_call_instruction(
                     Ok(value) => value,
                     Err(message) => {
                         match vm.raise_runtime_error(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             instruction.span,
@@ -1570,10 +1495,7 @@ pub(super) fn execute_rich_call_instruction(
                         Ok(value) => value,
                         Err(message) => {
                             match vm.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
                                 instruction.span,
@@ -1820,10 +1742,7 @@ pub(super) fn execute_rich_call_instruction(
             let receiver_class_owner = class_owner_in_state(compiled, state, &class.name);
             let has_magic_call = class_has_public_magic_call(&receiver_class_owner, &class);
             let (cached_target, cache_observation) = vm.lookup_method_call_inline_cache(
-                compiled,
-                function_id,
-                block_id,
-                instruction.id,
+                IrInlineCacheSite::classic(compiled, function_id, block_id, instruction.id),
                 &lowered_method,
                 &receiver_class,
                 scope.as_deref(),
@@ -1831,16 +1750,16 @@ pub(super) fn execute_rich_call_instruction(
             );
             if let Some(target) = cached_target {
                 if !matches!(vm.options.jit, JitMode::Cranelift)
-                    || method_direct_call_target_is_eligible(
+                    || method_direct_call_target_is_eligible(MethodDirectCallEligibility {
                         compiled,
                         state,
-                        &target,
-                        &class,
+                        target: &target,
+                        class: &class,
                         args,
-                        &values,
+                        values: &values,
                         has_magic_call,
                         epoch,
-                    )
+                    })
                 {
                     vm.record_counter_method_direct_dispatch_hit();
                     if matches!(vm.options.jit, JitMode::Cranelift) {
@@ -1886,12 +1805,14 @@ pub(super) fn execute_rich_call_instruction(
                             vm.propagate_fiber_suspension(
                                 result,
                                 compiled,
-                                *dst,
-                                block_id,
-                                instruction_index + 1,
-                                foreach_iterators,
-                                exception_handlers,
-                                pending_control,
+                                FiberContinuationState::new(
+                                    *dst,
+                                    block_id,
+                                    instruction_index + 1,
+                                    foreach_iterators,
+                                    exception_handlers,
+                                    pending_control,
+                                ),
                                 output,
                                 stack,
                             ),
@@ -1962,14 +1883,11 @@ pub(super) fn execute_rich_call_instruction(
                             })
                     {
                         let result = vm.call_object_method_callable(
-                            compiled,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             inner,
                             method,
                             values,
                             Some(instruction.span),
-                            output,
-                            stack,
-                            state,
                         );
                         if !result.status.is_success() {
                             return RichDispatchOutcome::Return(Box::new(result));
@@ -2016,15 +1934,12 @@ pub(super) fn execute_rich_call_instruction(
                         return RichDispatchOutcome::Continue;
                     }
                     let result = match vm.call_magic_instance_method(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         object.clone(),
                         "__call",
                         method,
                         values,
                         Some(instruction.span),
-                        output,
-                        stack,
-                        state,
                     ) {
                         Ok(Some(result)) => result,
                         Ok(None) => {
@@ -2034,10 +1949,7 @@ pub(super) fn execute_rich_call_instruction(
                                 method
                             );
                             match vm.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
                                 instruction.span,
@@ -2051,7 +1963,7 @@ pub(super) fn execute_rich_call_instruction(
                                 }
                             }
                         }
-                        Err(result) => return RichDispatchOutcome::Return(Box::new(result)),
+                        Err(result) => return RichDispatchOutcome::Return(Box::new(*result)),
                     };
                     if !result.status.is_success() {
                         return RichDispatchOutcome::Return(Box::new(result));
@@ -2127,15 +2039,12 @@ pub(super) fn execute_rich_call_instruction(
             ) {
                 if method_entry.flags.is_private || method_entry.flags.is_protected {
                     let result = match vm.call_magic_instance_method(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         object.clone(),
                         "__call",
                         method,
                         values,
                         Some(instruction.span),
-                        output,
-                        stack,
-                        state,
                     ) {
                         Ok(Some(result)) => result,
                         Ok(None) => {
@@ -2160,7 +2069,7 @@ pub(super) fn execute_rich_call_instruction(
                             }
                             return RichDispatchOutcome::Return(Box::new(result));
                         }
-                        Err(result) => return RichDispatchOutcome::Return(Box::new(result)),
+                        Err(result) => return RichDispatchOutcome::Return(Box::new(*result)),
                     };
                     if !result.status.is_success() {
                         return RichDispatchOutcome::Return(Box::new(result));
@@ -2237,10 +2146,7 @@ pub(super) fn execute_rich_call_instruction(
                 || direct_call_cacheable
             {
                 vm.install_method_call_inline_cache(
-                    compiled,
-                    function_id,
-                    block_id,
-                    instruction.id,
+                    IrInlineCacheSite::classic(compiled, function_id, block_id, instruction.id),
                     &lowered_method,
                     &receiver_class,
                     scope.as_deref(),
@@ -2295,12 +2201,14 @@ pub(super) fn execute_rich_call_instruction(
                 return RichDispatchOutcome::Return(Box::new(vm.propagate_fiber_suspension(
                     result,
                     compiled,
-                    *dst,
-                    block_id,
-                    instruction_index + 1,
-                    foreach_iterators,
-                    exception_handlers,
-                    pending_control,
+                    FiberContinuationState::new(
+                        *dst,
+                        block_id,
+                        instruction_index + 1,
+                        foreach_iterators,
+                        exception_handlers,
+                        pending_control,
+                    ),
                     output,
                     stack,
                 )));
@@ -2345,10 +2253,7 @@ pub(super) fn execute_rich_call_instruction(
                     Ok(value) => value,
                     Err(message) => {
                         match vm.raise_runtime_error(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             instruction.span,
@@ -2389,17 +2294,19 @@ pub(super) fn execute_rich_call_instruction(
                         compiled,
                         running_fiber,
                         values,
-                        *dst,
-                        block_id,
-                        instruction_index + 1,
-                        foreach_iterators,
-                        exception_handlers,
-                        pending_control,
+                        FiberContinuationState::new(
+                            *dst,
+                            block_id,
+                            instruction_index + 1,
+                            foreach_iterators,
+                            exception_handlers,
+                            pending_control,
+                        ),
                         output,
                         stack,
                     ) {
                         Ok(result) => result,
-                        Err(result) => result,
+                        Err(result) => *result,
                     },
                 ));
             }
@@ -2422,10 +2329,7 @@ pub(super) fn execute_rich_call_instruction(
                     Ok(result) => result,
                     Err(message) => {
                         match vm.raise_runtime_error(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             instruction.span,
@@ -2453,7 +2357,7 @@ pub(super) fn execute_rich_call_instruction(
                     result.diagnostics,
                     Some(&trace_context),
                 ) {
-                    return RichDispatchOutcome::Return(Box::new(result));
+                    return RichDispatchOutcome::Return(Box::new(*result));
                 }
                 let value = result.value;
                 if let Err(message) = stack
@@ -2502,7 +2406,7 @@ pub(super) fn execute_rich_call_instruction(
                 return RichDispatchOutcome::Continue;
             }
             if let Err(result) = vm.autoload_static_class_if_missing(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 class_name,
                 instruction.span,
                 Some((
@@ -2511,18 +2415,12 @@ pub(super) fn execute_rich_call_instruction(
                     block_id,
                     instruction.id,
                 )),
-                output,
-                stack,
-                state,
             ) {
                 match vm.route_throwable_result(
-                    compiled,
-                    output,
-                    stack,
-                    state,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     exception_handlers,
                     pending_control,
-                    result,
+                    *result,
                 ) {
                     RaiseOutcome::Caught(target) => {
                         return RichDispatchOutcome::Jump(target);
@@ -2542,13 +2440,10 @@ pub(super) fn execute_rich_call_instruction(
                 vm.autoload_class_parents_if_missing(compiled, &class, output, stack, state)
             {
                 match vm.route_throwable_result(
-                    compiled,
-                    output,
-                    stack,
-                    state,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     exception_handlers,
                     pending_control,
-                    result,
+                    *result,
                 ) {
                     RaiseOutcome::Caught(target) => {
                         return RichDispatchOutcome::Jump(target);
@@ -2578,10 +2473,7 @@ pub(super) fn execute_rich_call_instruction(
                     Ok(result) => result,
                     Err(PhpTokenStaticMethodError::RuntimeClass(error)) => {
                         match vm.raise_runtime_class_entry_error(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             instruction.span,
@@ -2597,10 +2489,7 @@ pub(super) fn execute_rich_call_instruction(
                     }
                     Err(PhpTokenStaticMethodError::Runtime(message)) => {
                         match vm.raise_runtime_error(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             instruction.span,
@@ -2628,7 +2517,7 @@ pub(super) fn execute_rich_call_instruction(
                     result.diagnostics,
                     Some(&trace_context),
                 ) {
-                    return RichDispatchOutcome::Return(Box::new(result));
+                    return RichDispatchOutcome::Return(Box::new(*result));
                 }
                 let value = result.value;
                 if let Err(message) = stack
@@ -2669,13 +2558,10 @@ pub(super) fn execute_rich_call_instruction(
                         Ok(values) => values,
                         Err(result) => {
                             match vm.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
-                                result,
+                                *result,
                             ) {
                                 RaiseOutcome::Caught(target) => {
                                     return RichDispatchOutcome::Jump(target);
@@ -2697,10 +2583,7 @@ pub(super) fn execute_rich_call_instruction(
                     Some(&mut state.resources),
                 ) {
                     match vm.raise_runtime_error(
-                        compiled,
-                        output,
-                        stack,
-                        state,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         exception_handlers,
                         pending_control,
                         instruction.span,
@@ -2747,10 +2630,7 @@ pub(super) fn execute_rich_call_instruction(
                     instruction.span,
                 ) {
                     match vm.raise_runtime_error(
-                        compiled,
-                        output,
-                        stack,
-                        state,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         exception_handlers,
                         pending_control,
                         instruction.span,
@@ -2787,25 +2667,19 @@ pub(super) fn execute_rich_call_instruction(
                     )
                 {
                     let value = match vm.call_spl_append_iterator_method(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         &object,
                         method,
                         values.clone(),
-                        output,
-                        stack,
-                        state,
                         Some(instruction.span),
                     ) {
                         Ok(value) => value,
                         Err(result) => {
                             match vm.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
-                                result,
+                                *result,
                             ) {
                                 RaiseOutcome::Caught(target) => {
                                     return RichDispatchOutcome::Jump(target);
@@ -2835,24 +2709,18 @@ pub(super) fn execute_rich_call_instruction(
                     )
                 {
                     let value = match vm.call_spl_no_rewind_iterator_method(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         &object,
                         method,
                         values.clone(),
-                        output,
-                        stack,
-                        state,
                     ) {
                         Ok(value) => value,
                         Err(result) => {
                             match vm.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
-                                result,
+                                *result,
                             ) {
                                 RaiseOutcome::Caught(target) => {
                                     return RichDispatchOutcome::Jump(target);
@@ -2883,25 +2751,19 @@ pub(super) fn execute_rich_call_instruction(
                     "rewind" | "valid" | "current" | "next" | "callhaschildren" | "callgetchildren"
                 ) {
                     let value = match vm.call_spl_recursive_iterator_iterator_method(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         object.clone(),
                         method,
                         values.clone(),
                         Some(instruction.span),
-                        output,
-                        stack,
-                        state,
                     ) {
                         Ok(value) => value,
                         Err(result) => {
                             match vm.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
-                                result,
+                                *result,
                             ) {
                                 RaiseOutcome::Caught(target) => {
                                     return RichDispatchOutcome::Jump(target);
@@ -2935,10 +2797,7 @@ pub(super) fn execute_rich_call_instruction(
                         Ok(value) => value,
                         Err(message) => {
                             match vm.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 exception_handlers,
                                 pending_control,
                                 instruction.span,
@@ -3006,15 +2865,12 @@ pub(super) fn execute_rich_call_instruction(
                 Ok(None) => {
                     if let Some(object) = current_this_object(compiled, stack) {
                         let result = match vm.call_magic_instance_method(
-                            compiled,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             object,
                             "__call",
                             method,
                             values.clone(),
                             Some(instruction.span),
-                            output,
-                            stack,
-                            state,
                         ) {
                             Ok(Some(result)) => result,
                             Ok(None) => {
@@ -3022,16 +2878,15 @@ pub(super) fn execute_rich_call_instruction(
                                     compiled, stack, class_name, &class,
                                 );
                                 match vm.call_magic_static_method(
-                                    compiled,
-                                    &class,
-                                    "__callStatic",
-                                    method,
-                                    values,
-                                    called_class,
-                                    Some(instruction.span),
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
+                                    MagicStaticCallRequest {
+                                        class: &class,
+                                        magic_method: "__callStatic",
+                                        called_method: method,
+                                        args: values,
+                                        called_class,
+                                        call_span: Some(instruction.span),
+                                    },
                                 ) {
                                     Ok(Some(result)) => result,
                                     Ok(None) => {
@@ -3046,11 +2901,11 @@ pub(super) fn execute_rich_call_instruction(
                                                     )));
                                     }
                                     Err(result) => {
-                                        return RichDispatchOutcome::Return(Box::new(result));
+                                        return RichDispatchOutcome::Return(Box::new(*result));
                                     }
                                 }
                             }
-                            Err(result) => return RichDispatchOutcome::Return(Box::new(result)),
+                            Err(result) => return RichDispatchOutcome::Return(Box::new(*result)),
                         };
                         if !result.status.is_success() {
                             return RichDispatchOutcome::Return(Box::new(result));
@@ -3072,16 +2927,15 @@ pub(super) fn execute_rich_call_instruction(
                     let called_class =
                         called_class_for_static_call(compiled, stack, class_name, &class);
                     let result = match vm.call_magic_static_method(
-                        compiled,
-                        &class,
-                        "__callStatic",
-                        method,
-                        values,
-                        called_class,
-                        Some(instruction.span),
-                        output,
-                        stack,
-                        state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        MagicStaticCallRequest {
+                            class: &class,
+                            magic_method: "__callStatic",
+                            called_method: method,
+                            args: values,
+                            called_class,
+                            call_span: Some(instruction.span),
+                        },
                     ) {
                         Ok(Some(result)) => result,
                         Ok(None) => {
@@ -3095,7 +2949,7 @@ pub(super) fn execute_rich_call_instruction(
                                 ),
                             )));
                         }
-                        Err(result) => return RichDispatchOutcome::Return(Box::new(result)),
+                        Err(result) => return RichDispatchOutcome::Return(Box::new(*result)),
                     };
                     if !result.status.is_success() {
                         return RichDispatchOutcome::Return(Box::new(result));
@@ -3170,10 +3024,7 @@ pub(super) fn execute_rich_call_instruction(
                         declaring_class.display_name, method_entry.name
                     );
                     match vm.raise_runtime_error(
-                        compiled,
-                        output,
-                        stack,
-                        state,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         exception_handlers,
                         pending_control,
                         instruction.span,
@@ -3204,24 +3055,20 @@ pub(super) fn execute_rich_call_instruction(
                 let called_class =
                     called_class_for_static_call(compiled, stack, class_name, &class);
                 let result = match vm.call_magic_static_method(
-                    compiled,
-                    &class,
-                    "__callStatic",
-                    method,
-                    values,
-                    called_class,
-                    Some(instruction.span),
-                    output,
-                    stack,
-                    state,
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    MagicStaticCallRequest {
+                        class: &class,
+                        magic_method: "__callStatic",
+                        called_method: method,
+                        args: values,
+                        called_class,
+                        call_span: Some(instruction.span),
+                    },
                 ) {
                     Ok(Some(result)) => result,
                     Ok(None) => {
                         match vm.raise_runtime_error(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             instruction.span,
@@ -3235,7 +3082,7 @@ pub(super) fn execute_rich_call_instruction(
                             }
                         }
                     }
-                    Err(result) => return RichDispatchOutcome::Return(Box::new(result)),
+                    Err(result) => return RichDispatchOutcome::Return(Box::new(*result)),
                 };
                 if !result.status.is_success() {
                     return RichDispatchOutcome::Return(Box::new(result));
@@ -3273,10 +3120,7 @@ pub(super) fn execute_rich_call_instruction(
             };
             if let Err(message) = visibility {
                 match vm.raise_runtime_error(
-                    compiled,
-                    output,
-                    stack,
-                    state,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     exception_handlers,
                     pending_control,
                     instruction.span,
@@ -3312,10 +3156,7 @@ pub(super) fn execute_rich_call_instruction(
             );
             if !result.status.is_success() {
                 match vm.route_throwable_result(
-                    compiled,
-                    output,
-                    stack,
-                    state,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     exception_handlers,
                     pending_control,
                     result,
@@ -3330,12 +3171,14 @@ pub(super) fn execute_rich_call_instruction(
                 return RichDispatchOutcome::Return(Box::new(vm.propagate_fiber_suspension(
                     result,
                     compiled,
-                    *dst,
-                    block_id,
-                    instruction_index + 1,
-                    foreach_iterators,
-                    exception_handlers,
-                    pending_control,
+                    FiberContinuationState::new(
+                        *dst,
+                        block_id,
+                        instruction_index + 1,
+                        foreach_iterators,
+                        exception_handlers,
+                        pending_control,
+                    ),
                     output,
                     stack,
                 )));
@@ -3470,12 +3313,14 @@ pub(super) fn execute_rich_call_instruction(
                 return RichDispatchOutcome::Return(Box::new(vm.propagate_fiber_suspension(
                     result,
                     compiled,
-                    *dst,
-                    block_id,
-                    instruction_index + 1,
-                    foreach_iterators,
-                    exception_handlers,
-                    pending_control,
+                    FiberContinuationState::new(
+                        *dst,
+                        block_id,
+                        instruction_index + 1,
+                        foreach_iterators,
+                        exception_handlers,
+                        pending_control,
+                    ),
                     output,
                     stack,
                 )));
@@ -3498,10 +3343,7 @@ pub(super) fn execute_rich_call_instruction(
                 Ok(value) => value,
                 Err(message) => {
                     match vm.raise_runtime_error(
-                        compiled,
-                        output,
-                        stack,
-                        state,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         exception_handlers,
                         pending_control,
                         instruction.span,
@@ -3538,10 +3380,7 @@ pub(super) fn execute_rich_call_instruction(
                 Ok(value) => value,
                 Err(message) => {
                     match vm.raise_runtime_error(
-                        compiled,
-                        output,
-                        stack,
-                        state,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         exception_handlers,
                         pending_control,
                         instruction.span,
@@ -3613,10 +3452,7 @@ pub(super) fn execute_rich_call_instruction(
                     let candidates = destructor_candidates_for_value(&arg_value);
                     let rooted_object_ids = php_visible_non_register_root_object_ids(stack, state);
                     let sweep = vm.run_destructors_for_unreferenced_candidates_with_roots(
-                        compiled,
-                        output,
-                        stack,
-                        state,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         exception_handlers,
                         pending_control,
                         candidates,
@@ -3677,10 +3513,7 @@ pub(super) fn execute_rich_call_instruction(
                 )));
                 let candidates = destructor_candidates_for_value(&arg_value);
                 let sweep = vm.run_destructors_for_unreferenced_candidates_with_roots(
-                    compiled,
-                    output,
-                    stack,
-                    state,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     exception_handlers,
                     pending_control,
                     candidates,

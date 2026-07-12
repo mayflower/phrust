@@ -243,14 +243,6 @@
       "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
     },
     {
-      "id": "crates/php_vm/src/vm/mod.rs:module_wide_allow:dcabf7cdb6f0:1",
-      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
-    },
-    {
-      "id": "crates/php_vm/src/vm/mod.rs:module_wide_allow:effd818e0121:1",
-      "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
-    },
-    {
       "id": "crates/php_vm/src/vm/reflection.rs:module_wide_allow:effd818e0121:1",
       "reason": "pre-remediation module-wide lint debt; remove when the owning module is split"
     },

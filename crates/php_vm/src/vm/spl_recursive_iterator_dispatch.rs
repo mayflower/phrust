@@ -1,17 +1,28 @@
 use super::prelude::*;
 
+pub(super) struct SplDepthTransition {
+    previous_position: usize,
+    previous_depth: i64,
+    current_position: usize,
+    current_depth: i64,
+    call_span: Option<php_ir::IrSpan>,
+}
+
 impl Vm {
     pub(super) fn call_spl_recursive_iterator_iterator_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: ObjectRef,
         method: &str,
         args: Vec<CallArgument>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let normalized = normalize_method_name(method);
         let previous_position = spl_position(&object);
         let previous_depth = spl_entry_depths(&object)
@@ -21,7 +32,9 @@ impl Vm {
         if normalized == "callhaschildren" {
             if let Err(message) = validate_spl_iterator_arg_count(&object.class_name(), &args, 0, 0)
             {
-                return Err(self.runtime_error(output, compiled, stack, message));
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
             }
             let Some(iterator) = spl_rii_call_get_children_target(&object) else {
                 return Ok(Value::Bool(false));
@@ -42,7 +55,9 @@ impl Vm {
         if normalized == "callgetchildren" {
             if let Err(message) = validate_spl_iterator_arg_count(&object.class_name(), &args, 0, 0)
             {
-                return Err(self.runtime_error(output, compiled, stack, message));
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
             }
             let Some(iterator) = spl_rii_call_get_children_target(&object) else {
                 return Ok(Value::Null);
@@ -73,67 +88,49 @@ impl Vm {
                 .unwrap_or(0);
             if current_depth > 0 && !spl_rii_catches_get_child(&object) {
                 self.call_spl_rii_child_hook_at_depth(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &object,
                     "beginChildren",
                     current_depth,
                     "RecursiveIteratorIterator->next",
                     call_span,
-                    output,
-                    stack,
-                    state,
                 )?;
                 self.call_spl_rii_child_hook_at_depth(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &object,
                     "nextElement",
                     current_depth,
                     "RecursiveIteratorIterator->next",
                     call_span,
-                    output,
-                    stack,
-                    state,
                 )?;
             }
             self.call_spl_rii_child_hook(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 &object,
                 "callHasChildren",
                 "RecursiveIteratorIterator->next",
                 call_span,
-                output,
-                stack,
-                state,
             )?;
             if self.call_spl_rii_get_children_transition(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 &object,
                 None,
                 "RecursiveIteratorIterator->next",
                 call_span,
-                output,
-                stack,
-                state,
             )? {
                 self.call_spl_rii_child_hook(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &object,
                     "beginChildren",
                     "RecursiveIteratorIterator->next",
                     call_span,
-                    output,
-                    stack,
-                    state,
                 )?;
                 self.call_spl_rii_child_hook(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &object,
                     "nextElement",
                     "RecursiveIteratorIterator->next",
                     call_span,
-                    output,
-                    stack,
-                    state,
                 )?;
             }
         }
@@ -159,15 +156,12 @@ impl Vm {
                             spl_rii_note_active_child_depth(&object, hook_depth);
                         }
                         self.call_spl_rii_child_hook_at_depth(
-                            compiled,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             &object,
                             "endChildren",
                             hook_depth,
                             "RecursiveIteratorIterator->rewind",
                             call_span,
-                            output,
-                            stack,
-                            state,
                         )?;
                     }
                 }
@@ -212,14 +206,11 @@ impl Vm {
                     self.call_object_method_value(compiled, inner, "rewind", output, stack, state)?;
                 }
                 self.call_spl_rii_child_hook(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &object,
                     "callHasChildren",
                     "RecursiveIteratorIterator->rewind",
                     call_span,
-                    output,
-                    stack,
-                    state,
                 )?;
             }
             "valid" => {
@@ -233,14 +224,11 @@ impl Vm {
                             })
                     {
                         self.call_spl_rii_child_hook(
-                            compiled,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             &object,
                             "callHasChildren",
                             "RecursiveIteratorIterator->valid",
                             call_span,
-                            output,
-                            stack,
-                            state,
                         )?;
                     }
                     if spl_rii_notified_position(&object) != Some(position) {
@@ -260,13 +248,10 @@ impl Vm {
                     && let Some(previous_position) = spl_entries(&object).len().checked_sub(1)
                 {
                     self.call_spl_rii_exhausted_valid_at_depth(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         &object,
                         previous_position,
                         0,
-                        output,
-                        stack,
-                        state,
                     )?;
                 }
             }
@@ -283,16 +268,15 @@ impl Vm {
                     .unwrap_or(0);
                 if spl_runtime_marker(&object).as_deref() == Some("recursiveiteratoriterator") {
                     self.call_spl_rii_next_depth_transitions(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         &object,
-                        previous_position,
-                        previous_depth,
-                        current_position,
-                        current_depth,
-                        call_span,
-                        output,
-                        stack,
-                        state,
+                        SplDepthTransition {
+                            previous_position,
+                            previous_depth,
+                            current_position,
+                            current_depth,
+                            call_span,
+                        },
                     )?;
                     if spl_position(&object) >= spl_entries(&object).len()
                         && !spl_rii_end_iteration_called(&object)
@@ -321,49 +305,37 @@ impl Vm {
                     );
                 if previous_depth > current_depth || branch_changed_at_same_depth {
                     self.call_spl_rii_child_hook(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         &object,
                         "endChildren",
                         "RecursiveIteratorIterator->next",
                         call_span,
-                        output,
-                        stack,
-                        state,
                     )?;
                 }
                 if current_position < spl_entries(&object).len()
                     && (current_depth > previous_depth || branch_changed_at_same_depth)
                 {
                     self.call_spl_rii_child_hook_at_depth(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         &object,
                         "callHasChildren",
                         previous_depth,
                         "RecursiveIteratorIterator->next",
                         call_span,
-                        output,
-                        stack,
-                        state,
                     )?;
                     if self.call_spl_rii_get_children_transition(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         &object,
                         Some(previous_depth),
                         "RecursiveIteratorIterator->next",
                         call_span,
-                        output,
-                        stack,
-                        state,
                     )? {
                         self.call_spl_rii_child_hook(
-                            compiled,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             &object,
                             "beginChildren",
                             "RecursiveIteratorIterator->next",
                             call_span,
-                            output,
-                            stack,
-                            state,
                         )?;
                     }
                 }
@@ -390,52 +362,49 @@ impl Vm {
 
     pub(super) fn call_spl_rii_next_depth_transitions(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
-        previous_position: usize,
-        previous_depth: i64,
-        current_position: usize,
-        current_depth: i64,
-        call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+        transition: SplDepthTransition,
+    ) -> Result<(), Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
+        let SplDepthTransition {
+            previous_position,
+            previous_depth,
+            current_position,
+            current_depth,
+            call_span,
+        } = transition;
         if current_position >= spl_entries(object).len() {
             if previous_depth <= 0 {
                 self.call_spl_rii_exhausted_valid_at_depth(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object,
                     previous_position,
                     0,
-                    output,
-                    stack,
-                    state,
                 )?;
             }
             for depth in (1..=previous_depth.max(0)).rev() {
                 let active_depth = spl_rii_child_depth_is_active(object, depth);
                 if active_depth {
                     self.call_spl_rii_exhausted_valid_at_depth(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         object,
                         previous_position,
                         depth,
-                        output,
-                        stack,
-                        state,
                     )?;
                 }
                 self.call_spl_rii_child_hook_at_depth(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object,
                     "endChildren",
                     depth,
                     "RecursiveIteratorIterator->next",
                     call_span,
-                    output,
-                    stack,
-                    state,
                 )?;
             }
             return Ok(());
@@ -465,25 +434,19 @@ impl Vm {
                 let active_depth = spl_rii_child_depth_is_active(object, depth);
                 if active_depth {
                     self.call_spl_rii_exhausted_valid_at_depth(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         object,
                         previous_position,
                         depth,
-                        output,
-                        stack,
-                        state,
                     )?;
                 }
                 self.call_spl_rii_child_hook_at_depth(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object,
                     "endChildren",
                     depth,
                     "RecursiveIteratorIterator->next",
                     call_span,
-                    output,
-                    stack,
-                    state,
                 )?;
             }
         }
@@ -504,15 +467,12 @@ impl Vm {
         for enter_depth in enter_start..=current_depth.max(0) {
             let parent_depth = enter_depth.saturating_sub(1);
             let has_children = self.call_spl_rii_child_hook_at_depth(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object,
                 "callHasChildren",
                 parent_depth,
                 "RecursiveIteratorIterator->next",
                 call_span,
-                output,
-                stack,
-                state,
             )?;
             if has_children == Some(false) {
                 spl_rii_note_pruned_branch(object, current_position, current_depth);
@@ -530,29 +490,23 @@ impl Vm {
                 break;
             }
             if !self.call_spl_rii_get_children_transition(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object,
                 Some(parent_depth),
                 "RecursiveIteratorIterator->next",
                 call_span,
-                output,
-                stack,
-                state,
             )? {
                 spl_rii_note_pruned_branch(object, current_position, current_depth);
                 spl_rii_skip_branch_at_position(object, current_position, current_depth);
                 break;
             }
             self.call_spl_rii_child_hook_at_depth(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object,
                 "beginChildren",
                 enter_depth,
                 "RecursiveIteratorIterator->next",
                 call_span,
-                output,
-                stack,
-                state,
             )?;
         }
         Ok(())
@@ -560,14 +514,17 @@ impl Vm {
 
     pub(super) fn call_spl_rii_exhausted_valid_at_depth(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         previous_position: usize,
         depth: i64,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let Some(iterator) = spl_hook_iterators(object)
             .get(previous_position)
             .and_then(|iterators| iterators.get(depth.max(0) as usize))
@@ -583,15 +540,18 @@ impl Vm {
 
     pub(super) fn call_spl_rii_get_children_transition(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         depth: Option<i64>,
         builtin_call: &str,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<bool, VmResult> {
+    ) -> Result<bool, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if spl_runtime_marker(object).as_deref() == Some("recursivetreeiterator") {
             return Ok(true);
         }
@@ -608,27 +568,21 @@ impl Vm {
         let result = if has_hook {
             if let Some(depth) = depth {
                 self.call_spl_rii_child_hook_at_depth(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object,
                     "callGetChildren",
                     depth,
                     builtin_call,
                     call_span,
-                    output,
-                    stack,
-                    state,
                 )
                 .map(|_| ())
             } else {
                 self.call_spl_rii_child_hook(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object,
                     "callGetChildren",
                     builtin_call,
                     call_span,
-                    output,
-                    stack,
-                    state,
                 )
                 .map(|_| ())
             }
@@ -651,14 +605,11 @@ impl Vm {
                     } =>
                 {
                     let child = self.call_spl_recursive_iterator_iterator_method(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         object.clone(),
                         "callGetChildren",
                         Vec::new(),
                         call_span,
-                        output,
-                        stack,
-                        state,
                     )?;
                     if let Value::Object(child_iterator) = effective_value(&child) {
                         self.call_object_method_value(
@@ -708,15 +659,18 @@ impl Vm {
 
     pub(super) fn call_spl_rii_child_hook(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         hook: &str,
         builtin_call: &str,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Option<bool>, VmResult> {
+    ) -> Result<Option<bool>, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let position = spl_position(object);
         let normalized_hook = normalize_method_name(hook);
         match normalized_hook.as_str() {
@@ -768,14 +722,11 @@ impl Vm {
         if !has_hook {
             if normalized_hook == "callhaschildren" {
                 let value = self.call_spl_recursive_iterator_iterator_method(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object.clone(),
                     "callHasChildren",
                     Vec::new(),
                     call_span,
-                    output,
-                    stack,
-                    state,
                 )?;
                 let result = to_bool(&value).unwrap_or(false);
                 object.set_property("__rii_last_call_has_children", Value::Bool(result));
@@ -845,9 +796,9 @@ impl Vm {
                             match make_exception_object("UnexpectedValueException", &message) {
                                 Ok(object) => Value::Object(object),
                                 Err(message) => {
-                                    return Err(
-                                        self.runtime_error(output, compiled, stack, message)
-                                    );
+                                    return Err(Box::new(
+                                        self.runtime_error(output, compiled, stack, message),
+                                    ));
                                 }
                             };
                         if let Some(call_span) = call_span {
@@ -855,7 +806,7 @@ impl Vm {
                         }
                         state.pending_trace = Some(capture_backtrace_string(compiled, stack));
                         state.pending_throw = Some(throwable);
-                        return Err(VmResult::propagating_exception(output.clone()));
+                        return Err(Box::new(VmResult::propagating_exception(output.clone())));
                     }
                 }
                 Ok(None)
@@ -890,7 +841,7 @@ impl Vm {
                             ));
                     }
                     state.pending_throw = Some(throwable);
-                    return Err(VmResult::propagating_exception(output.clone()));
+                    return Err(Box::new(VmResult::propagating_exception(output.clone())));
                 }
                 Err(result)
             }
@@ -899,26 +850,26 @@ impl Vm {
 
     pub(super) fn call_spl_rii_child_hook_at_depth(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         hook: &str,
         depth: i64,
         builtin_call: &str,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Option<bool>, VmResult> {
+    ) -> Result<Option<bool>, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         object.set_property("__rii_hook_depth", Value::Int(depth));
         let result = self.call_spl_rii_child_hook(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             object,
             hook,
             builtin_call,
             call_span,
-            output,
-            stack,
-            state,
         );
         object.set_property("__rii_hook_depth", Value::Null);
         result
@@ -932,7 +883,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<Vec<CallArgument>, VmResult> {
+    ) -> Result<Vec<CallArgument>, Box<VmResult>> {
         if !matches!(
             normalize_class_name(class_name).as_str(),
             "recursiveiteratoriterator" | "recursivetreeiterator"

@@ -10,6 +10,11 @@ pub(super) struct RichInstructionSite<'a> {
     pub(super) frame_index: usize,
 }
 
+pub(super) struct RichControlState<'a> {
+    pub(super) exception_handlers: &'a mut Vec<ExceptionHandler>,
+    pub(super) pending_control: &'a mut Option<PendingControl>,
+}
+
 pub(super) fn next_dense_block_index(
     function: &DenseFunction,
     current: u32,

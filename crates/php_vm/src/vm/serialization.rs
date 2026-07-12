@@ -3,14 +3,17 @@ use super::prelude::*;
 impl Vm {
     pub(super) fn try_execute_serialization_builtin(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         name: &str,
         values: &[Value],
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Option<VmResult> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         match name {
             "serialize" => self.try_execute_serialize_with_magic(
                 compiled, values, call_span, output, stack, state,
@@ -59,7 +62,7 @@ impl Vm {
                     }
                     state.pending_throw = Some(throwable);
                 }
-                result
+                *result
             }
         })
     }
@@ -83,7 +86,7 @@ impl Vm {
                 self.unserialize_legacy_serializable(compiled, custom, output, stack, state);
             return Some(match result {
                 Ok(value) => VmResult::success(OutputBuffer::new(), Some(value)),
-                Err(result) => result,
+                Err(result) => *result,
             });
         }
         if let Some(message) = self.spl_unserialize_payload_error(compiled, state, &input) {
@@ -96,7 +99,7 @@ impl Vm {
         let result = self.resolve_unserialized_classes(compiled, value, output, stack, state);
         Some(match result {
             Ok(value) => VmResult::success(OutputBuffer::new(), Some(value)),
-            Err(result) => result,
+            Err(result) => *result,
         })
     }
 
@@ -107,7 +110,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
         match value {
             Value::Object(object) => {
                 let class_name = object.display_name();
@@ -200,16 +203,16 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<PhpString, VmResult> {
+    ) -> Result<PhpString, Box<VmResult>> {
         let Some(class) = lookup_class_in_state(compiled, state, &object.class_name()) else {
-            return serialize_value(&Value::Object(object)).map_err(|error| {
+            return Ok(serialize_value(&Value::Object(object)).map_err(|error| {
                 self.runtime_error(
                     output,
                     compiled,
                     stack,
                     Self::vm_serialize_error_message(error.message()),
                 )
-            });
+            })?);
         };
         if class_implements_in_state(
             compiled,
@@ -221,17 +224,24 @@ impl Vm {
         .map_err(|message| self.runtime_error(output, compiled, stack, message))?
         {
             return self.serialize_legacy_serializable(
-                compiled, object, &class, call_span, output, stack, state,
+                ExecutionCursor::new(compiled, output, stack, state),
+                object,
+                &class,
+                call_span,
             );
         }
         let serialize_method =
             match lookup_method_in_hierarchy(compiled, &class, "__serialize", None) {
                 Ok(method) => method,
-                Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+                Err(message) => {
+                    return Err(Box::new(
+                        self.runtime_error(output, compiled, stack, message),
+                    ));
+                }
             };
         if let Some(resolved) = serialize_method {
             if resolved.method.flags.is_static {
-                return Err(self.runtime_error(
+                return Err(Box::new(self.runtime_error(
                     output,
                     compiled,
                     stack,
@@ -239,7 +249,7 @@ impl Vm {
                         "E_PHP_VM_SLEEP_METHOD_INACCESSIBLE: method {}::__serialize is not public instance",
                         resolved.class.name
                     ),
-                ));
+                )));
             }
             let owner = class_owner_in_state(compiled, state, &resolved.class.name);
             let result = self.execute_function(
@@ -259,12 +269,12 @@ impl Vm {
                 state,
             );
             if !result.status.is_success() {
-                return Err(result);
+                return Err(Box::new(result));
             }
             let Value::Array(properties) =
                 effective_value(&result.return_value.unwrap_or(Value::Null))
             else {
-                return Err(self.runtime_error(
+                return Err(Box::new(self.runtime_error(
                     output,
                     compiled,
                     stack,
@@ -272,7 +282,7 @@ impl Vm {
                         "E_PHP_VM_SLEEP_RETURN_TYPE: {}::__serialize() must return an array",
                         class.display_name
                     ),
-                ));
+                )));
             };
             let runtime_class = runtime_class_entry(
                 compiled,
@@ -294,31 +304,35 @@ impl Vm {
                 };
                 filtered.set_property(name, effective_value(value));
             }
-            return serialize_value(&Value::Object(filtered)).map_err(|error| {
+            return Ok(serialize_value(&Value::Object(filtered)).map_err(|error| {
                 self.runtime_error(
                     output,
                     compiled,
                     stack,
                     Self::vm_serialize_error_message(error.message()),
                 )
-            });
+            })?);
         }
         let resolved = match lookup_method_in_hierarchy(compiled, &class, "__sleep", None) {
             Ok(Some(method)) => method,
             Ok(None) => {
-                return serialize_value(&Value::Object(object)).map_err(|error| {
+                return Ok(serialize_value(&Value::Object(object)).map_err(|error| {
                     self.runtime_error(
                         output,
                         compiled,
                         stack,
                         Self::vm_serialize_error_message(error.message()),
                     )
-                });
+                })?);
             }
-            Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+            Err(message) => {
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
+            }
         };
         if resolved.method.flags.is_static {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
@@ -326,7 +340,7 @@ impl Vm {
                     "E_PHP_VM_SLEEP_METHOD_INACCESSIBLE: method {}::__sleep is not public instance",
                     resolved.class.name
                 ),
-            ));
+            )));
         }
         let owner = class_owner_in_state(compiled, state, &resolved.class.name);
         let result = self.execute_function(
@@ -346,11 +360,11 @@ impl Vm {
             state,
         );
         if !result.status.is_success() {
-            return Err(result);
+            return Err(Box::new(result));
         }
         let Value::Array(selected) = effective_value(&result.return_value.unwrap_or(Value::Null))
         else {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
@@ -358,7 +372,7 @@ impl Vm {
                     "E_PHP_VM_SLEEP_RETURN_TYPE: {}::__sleep(): Return value must be of type array",
                     class.display_name
                 ),
-            ));
+            )));
         };
         let runtime_class = runtime_class_entry(
             compiled,
@@ -394,27 +408,30 @@ impl Vm {
             };
             filtered.set_property(storage_name, effective_value(&value));
         }
-        serialize_value(&Value::Object(filtered)).map_err(|error| {
+        Ok(serialize_value(&Value::Object(filtered)).map_err(|error| {
             self.runtime_error(
                 output,
                 compiled,
                 stack,
                 Self::vm_serialize_error_message(error.message()),
             )
-        })
+        })?)
     }
 
     pub(super) fn call_spl_container_method_with_magic(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: ObjectRef,
         method: &str,
         args: Vec<CallArgument>,
         call_span: Option<IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let normalized_method = normalize_method_name(method);
         if normalized_method == "serialize" {
             let runtime_class = spl_runtime_marker(&object)
@@ -426,13 +443,10 @@ impl Vm {
                 validate_spl_iterator_arg_count(&object.class_name(), &args, 0, 0)
                     .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
                 let bytes = self.serialize_spl_container_legacy(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &object,
                     &runtime_class,
                     call_span,
-                    output,
-                    stack,
-                    state,
                 )?;
                 return Ok(Value::String(bytes));
             }
@@ -457,10 +471,7 @@ impl Vm {
                 let mut handlers = Vec::new();
                 let mut pending_control = None;
                 let sweep = self.run_destructors_for_unreferenced_candidates_with_roots(
-                    compiled,
-                    output,
-                    stack,
-                    state,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &mut handlers,
                     &mut pending_control,
                     candidates,
@@ -470,7 +481,7 @@ impl Vm {
                 if let Some(outcome) = sweep.outcome {
                     match outcome {
                         RaiseOutcome::Caught(_) => {}
-                        RaiseOutcome::Done(result) => return Err(*result),
+                        RaiseOutcome::Done(result) => return Err(Box::new(*result)),
                     }
                 }
             }
@@ -480,14 +491,17 @@ impl Vm {
 
     pub(super) fn serialize_spl_container_legacy(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         runtime_class: &str,
         call_span: Option<IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<PhpString, VmResult> {
+    ) -> Result<PhpString, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let mut bytes = Vec::new();
         if normalize_class_name(runtime_class) == "splobjectstorage" {
             let records = spl_storage_entries(object);
@@ -553,19 +567,19 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<PhpString, VmResult> {
+    ) -> Result<PhpString, Box<VmResult>> {
         match effective_value(&value) {
             Value::Object(object) => {
                 self.serialize_object_with_magic(compiled, object, call_span, output, stack, state)
             }
-            other => serialize_value(&other).map_err(|error| {
+            other => Ok(serialize_value(&other).map_err(|error| {
                 self.runtime_error(
                     output,
                     compiled,
                     stack,
                     Self::vm_serialize_error_message(error.message()),
                 )
-            }),
+            })?),
         }
     }
 
@@ -622,30 +636,37 @@ impl Vm {
 
     pub(super) fn serialize_legacy_serializable(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: ObjectRef,
         class: &php_ir::module::ClassEntry,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<PhpString, VmResult> {
+    ) -> Result<PhpString, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let resolved = match lookup_method_in_hierarchy(compiled, class, "serialize", None) {
             Ok(Some(method)) => method,
             Ok(None) => {
-                return serialize_value(&Value::Object(object)).map_err(|error| {
+                return Ok(serialize_value(&Value::Object(object)).map_err(|error| {
                     self.runtime_error(
                         output,
                         compiled,
                         stack,
                         Self::vm_serialize_error_message(error.message()),
                     )
-                });
+                })?);
             }
-            Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+            Err(message) => {
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
+            }
         };
         if resolved.method.flags.is_static {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
@@ -653,7 +674,7 @@ impl Vm {
                     "E_PHP_VM_SERIALIZABLE_METHOD_INACCESSIBLE: method {}::serialize is not public instance",
                     resolved.class.name
                 ),
-            ));
+            )));
         }
         let result = self.execute_function(
             compiled,
@@ -671,12 +692,12 @@ impl Vm {
             state,
         );
         if !result.status.is_success() {
-            return Err(result);
+            return Err(Box::new(result));
         }
         match effective_value(&result.return_value.unwrap_or(Value::Null)) {
             Value::String(payload) => Ok(legacy_serializable_wire(&class.display_name, &payload)),
             Value::Null => Ok(PhpString::from_test_str("N;")),
-            _ => Err(self.throw_exception_result(
+            _ => Err(Box::new(self.throw_exception_result(
                 compiled,
                 output,
                 stack,
@@ -686,7 +707,7 @@ impl Vm {
                     "{}::serialize() must return a string or NULL",
                     class.display_name
                 ),
-            )),
+            ))),
         }
     }
 
@@ -697,7 +718,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
         self.autoload_class(compiled, &payload.class_name, output, stack, state, None)?;
         let Some(class) = lookup_class_in_state(compiled, state, &payload.class_name) else {
             let source = ObjectRef::new_with_display_name(
@@ -722,10 +743,14 @@ impl Vm {
         let resolved = match lookup_method_in_hierarchy(compiled, &class, "unserialize", None) {
             Ok(Some(method)) => method,
             Ok(None) => return Ok(Value::Object(object)),
-            Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+            Err(message) => {
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
+            }
         };
         if resolved.method.flags.is_static {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
@@ -733,7 +758,7 @@ impl Vm {
                     "E_PHP_VM_SERIALIZABLE_METHOD_INACCESSIBLE: method {}::unserialize is not public instance",
                     resolved.class.name
                 ),
-            ));
+            )));
         }
         let result = self.execute_function(
             compiled,
@@ -753,7 +778,7 @@ impl Vm {
             state,
         );
         if !result.status.is_success() {
-            return Err(result);
+            return Err(Box::new(result));
         }
         Ok(Value::Object(object))
     }
@@ -766,7 +791,7 @@ impl Vm {
         state: &mut ExecutionState,
         property: &str,
         call_span: Option<php_ir::IrSpan>,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         let diagnostic = RuntimeDiagnostic::new(
             "E_PHP_VM_SERIALIZE_SLEEP_MISSING_PROPERTY",
             RuntimeSeverity::Warning,

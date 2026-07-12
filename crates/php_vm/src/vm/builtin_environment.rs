@@ -1,17 +1,25 @@
 use super::builtin_adapter::builtin_source_span;
 use super::prelude::*;
 
+struct MockProcessOutput<'a> {
+    stdout: &'a str,
+    exit_status: i64,
+}
+
 impl Vm {
     pub(super) fn call_config_builtin(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         name: &str,
         args: Vec<CallArgument>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let values = match call_args_to_positional(name, args) {
             Ok(args) => args,
             Err(message) => return self.runtime_error(output, compiled, stack, message),
@@ -110,7 +118,7 @@ impl Vm {
                         &diagnostic,
                     ) {
                         Ok(handled) => handled,
-                        Err(result) => return result,
+                        Err(result) => return *result,
                     };
                     if !handled && error_reporting_allows(state, php_runtime::api::PHP_E_WARNING) {
                         emit_vm_diagnostic(
@@ -147,7 +155,7 @@ impl Vm {
                         &diagnostic,
                     ) {
                         Ok(handled) => handled,
-                        Err(result) => return result,
+                        Err(result) => return *result,
                     };
                     if !handled && error_reporting_allows(state, php_runtime::api::PHP_E_WARNING) {
                         emit_vm_diagnostic(
@@ -182,7 +190,7 @@ impl Vm {
                         &diagnostic,
                     ) {
                         Ok(handled) => handled,
-                        Err(result) => return result,
+                        Err(result) => return *result,
                     };
                     if !handled && error_reporting_allows(state, php_runtime::api::PHP_E_WARNING) {
                         emit_vm_diagnostic(
@@ -217,7 +225,7 @@ impl Vm {
                         &diagnostic,
                     ) {
                         Ok(handled) => handled,
-                        Err(result) => return result,
+                        Err(result) => return *result,
                     };
                     if !handled && error_reporting_allows(state, php_runtime::api::PHP_E_DEPRECATED)
                     {
@@ -526,24 +534,29 @@ impl Vm {
                 compiled,
                 name,
                 args,
-                mock_output,
-                *exit_status,
+                MockProcessOutput {
+                    stdout: mock_output,
+                    exit_status: *exit_status,
+                },
                 output,
                 stack,
             ),
         }
     }
 
-    pub(super) fn call_mocked_process_builtin(
+    fn call_mocked_process_builtin(
         &self,
         compiled: &CompiledUnit,
         name: &str,
         args: Vec<CallArgument>,
-        mock_output: &str,
-        exit_status: i64,
+        mock: MockProcessOutput<'_>,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
     ) -> VmResult {
+        let MockProcessOutput {
+            stdout: mock_output,
+            exit_status,
+        } = mock;
         match name {
             "shell_exec" => VmResult::success_no_output(Some(Value::string(mock_output))),
             "exec" => {

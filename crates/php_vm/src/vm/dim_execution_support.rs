@@ -492,16 +492,27 @@ pub(super) fn bind_dim_value_to_reference_cell(
     bind_dim_value_to_reference_cell(&mut child, rest, append, cell)
 }
 
+pub(super) struct PropertyDimReferenceBinding<'a> {
+    pub(super) object: &'a ObjectRef,
+    pub(super) property: &'a str,
+    pub(super) dims: &'a [ArrayKey],
+    pub(super) append: bool,
+    pub(super) cell: ReferenceCell,
+}
+
 pub(super) fn bind_property_dim_to_reference_cell(
     compiled: &CompiledUnit,
     state: &ExecutionState,
     stack: &CallStack,
-    object: &ObjectRef,
-    property: &str,
-    dims: &[ArrayKey],
-    append: bool,
-    cell: ReferenceCell,
+    binding: PropertyDimReferenceBinding<'_>,
 ) -> Result<(), String> {
+    let PropertyDimReferenceBinding {
+        object,
+        property,
+        dims,
+        append,
+        cell,
+    } = binding;
     let storage_name =
         property_dimension_storage_name(compiled, state, stack, object, property, true)?;
     let mut current = object

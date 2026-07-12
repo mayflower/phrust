@@ -187,17 +187,28 @@ pub(super) fn property_has_hooks_or_active(
         || property_hook_is_active(state, object, class, property)
 }
 
+pub(super) struct PropertyLayoutSite<'a> {
+    pub(super) receiver_class: &'a php_ir::module::ClassEntry,
+    pub(super) declaring_class: &'a php_ir::module::ClassEntry,
+    pub(super) property: &'a php_ir::module::ClassPropertyEntry,
+    pub(super) visibility_context: Option<&'a str>,
+    pub(super) layout_version: InvalidationEpoch,
+}
+
 pub(super) fn property_fetch_layout_metadata(
-    receiver_class: &php_ir::module::ClassEntry,
-    declaring_class: &php_ir::module::ClassEntry,
-    property: &php_ir::module::ClassPropertyEntry,
-    visibility_context: Option<&str>,
-    layout_version: InvalidationEpoch,
+    site: PropertyLayoutSite<'_>,
     has_magic_get: bool,
     has_property_hooks: bool,
     dynamic_property_fallback: bool,
     typed_property_initialized: bool,
 ) -> PropertyFetchLayoutMetadata {
+    let PropertyLayoutSite {
+        receiver_class,
+        declaring_class,
+        property,
+        visibility_context,
+        layout_version,
+    } = site;
     PropertyFetchLayoutMetadata {
         class_id: receiver_class.id.raw(),
         layout_version: layout_version.raw(),
@@ -214,18 +225,20 @@ pub(super) fn property_fetch_layout_metadata(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn property_assign_layout_metadata(
-    receiver_class: &php_ir::module::ClassEntry,
-    declaring_class: &php_ir::module::ClassEntry,
-    property: &php_ir::module::ClassPropertyEntry,
-    visibility_context: Option<&str>,
-    layout_version: InvalidationEpoch,
+    site: PropertyLayoutSite<'_>,
     has_magic_set: bool,
     has_property_hooks: bool,
     dynamic_property_fallback: bool,
     reference_slot: bool,
 ) -> PropertyAssignLayoutMetadata {
+    let PropertyLayoutSite {
+        receiver_class,
+        declaring_class,
+        property,
+        visibility_context,
+        layout_version,
+    } = site;
     PropertyAssignLayoutMetadata {
         class_id: receiver_class.id.raw(),
         layout_version: layout_version.raw(),

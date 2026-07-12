@@ -241,7 +241,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<PhpString, VmResult> {
+    ) -> Result<PhpString, Box<VmResult>> {
         match value {
             Value::Object(object) => {
                 self.object_to_string(compiled, object.clone(), output, stack, state)
@@ -259,8 +259,8 @@ impl Vm {
             Value::Reference(cell) => {
                 self.value_to_string(compiled, &cell.get(), output, stack, state)
             }
-            other => to_string(other)
-                .map_err(|message| self.runtime_error(output, compiled, stack, message)),
+            other => Ok(to_string(other)
+                .map_err(|message| self.runtime_error(output, compiled, stack, message))?),
         }
     }
 
@@ -272,7 +272,7 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
         source_span: RuntimeSourceSpan,
-    ) -> Result<PhpString, VmResult> {
+    ) -> Result<PhpString, Box<VmResult>> {
         match value {
             Value::Object(object) => self.object_to_string_with_source_span(
                 compiled,
@@ -294,9 +294,9 @@ impl Vm {
                 state,
                 source_span,
             ),
-            other => to_string(other).map_err(|message| {
+            other => Ok(to_string(other).map_err(|message| {
                 self.runtime_error_with_source_span(output, compiled, stack, source_span, message)
-            }),
+            })?),
         }
     }
 
@@ -308,7 +308,7 @@ impl Vm {
         property: Operand,
         output: &mut OutputBuffer,
         state: &mut ExecutionState,
-    ) -> Result<String, VmResult> {
+    ) -> Result<String, Box<VmResult>> {
         let value = read_operand(unit, stack, property)
             .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
         let property = self.value_to_string(compiled, &value, output, stack, state)?;
@@ -322,7 +322,7 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
         source_span: RuntimeSourceSpan,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         if state.suppress_array_to_string_warnings > 0 {
             return Ok(());
         }
@@ -355,7 +355,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<PhpString, VmResult> {
+    ) -> Result<PhpString, Box<VmResult>> {
         self.object_to_string_with_source_span(
             compiled,
             object,
@@ -373,7 +373,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &ExecutionState,
-    ) -> Result<bool, VmResult> {
+    ) -> Result<bool, Box<VmResult>> {
         if is_reflection_runtime_class(&object.class_name())
             || internal_throwable_instanceof(&object.class_name_handle(), "throwable").is_some()
             || spl_runtime_marker(object).is_some_and(|class| is_spl_caching_iterator_class(&class))
@@ -391,7 +391,9 @@ impl Vm {
                 && !resolved.method.flags.is_private
                 && !resolved.method.flags.is_protected),
             Ok(None) => Ok(false),
-            Err(message) => Err(self.runtime_error(output, compiled, stack, message)),
+            Err(message) => Err(Box::new(
+                self.runtime_error(output, compiled, stack, message),
+            )),
         }
     }
 
@@ -403,9 +405,9 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
         source_span: RuntimeSourceSpan,
-    ) -> Result<PhpString, VmResult> {
+    ) -> Result<PhpString, Box<VmResult>> {
         if is_reflection_runtime_class(&object.class_name()) {
-            return reflection_object_to_string(&object)
+            return Ok(reflection_object_to_string(&object)
                 .map(|value| PhpString::from(value.into_bytes()))
                 .map_err(|message| {
                     self.runtime_error_with_source_span(
@@ -415,7 +417,7 @@ impl Vm {
                         source_span.clone(),
                         message,
                     )
-                });
+                })?);
         }
         if internal_throwable_instanceof(&object.class_name_handle(), "throwable").is_some() {
             return Ok(PhpString::from_bytes(
@@ -425,13 +427,13 @@ impl Vm {
         if is_php_token_runtime_class(&object.class_name()) {
             return match object.get_property("text") {
                 Some(Value::String(text)) => Ok(text),
-                _ => Err(self.runtime_error_with_source_span(
+                _ => Err(Box::new(self.runtime_error_with_source_span(
                     output,
                     compiled,
                     stack,
                     source_span,
                     "E_PHP_VM_TOSTRING_RETURN_TYPE: PhpToken::__toString(): Return value must be of type string",
-                )),
+                ))),
             };
         }
         if spl_runtime_marker(&object).is_some_and(|class| is_spl_caching_iterator_class(&class)) {
@@ -452,7 +454,7 @@ impl Vm {
                 &self.options.runtime_context,
             ) {
                 Ok(Value::String(value)) => Ok(value),
-                Ok(other) => Err(self.runtime_error(
+                Ok(other) => Err(Box::new(self.runtime_error(
                     output,
                     compiled,
                     stack,
@@ -461,14 +463,14 @@ impl Vm {
                         object.class_name(),
                         value_type_name(&other)
                     ),
-                )),
-                Err(message) => Err(self.runtime_error(output, compiled, stack, message)),
+                ))),
+                Err(message) => Err(Box::new(self.runtime_error(output, compiled, stack, message))),
             };
         }
         if normalize_class_name(&object.class_name()) == "simplexmlelement" {
             return match php_runtime::api::xml::simplexml_text(&object) {
                 Value::String(value) => Ok(value),
-                other => Err(self.runtime_error_with_source_span(
+                other => Err(Box::new(self.runtime_error_with_source_span(
                     output,
                     compiled,
                     stack,
@@ -477,11 +479,11 @@ impl Vm {
                         "E_PHP_VM_TOSTRING_RETURN_TYPE: SimpleXMLElement::__toString(): Return value must be of type string, {} returned",
                         value_type_name(&other)
                     ),
-                )),
+                ))),
             };
         }
         let Some(class) = lookup_class_in_state(compiled, state, &object.class_name()) else {
-            return Err(self.runtime_error_with_source_span(
+            return Err(Box::new(self.runtime_error_with_source_span(
                 output,
                 compiled,
                 stack,
@@ -490,7 +492,7 @@ impl Vm {
                     "E_PHP_VM_UNKNOWN_CLASS: class {} is not defined",
                     object.class_name()
                 ),
-            ));
+            )));
         };
         let resolved = match lookup_resolved_method_in_state(
             compiled,
@@ -501,7 +503,7 @@ impl Vm {
         ) {
             Ok(Some(method)) => method,
             Ok(None) => {
-                return Err(self.runtime_error_with_source_span(
+                return Err(Box::new(self.runtime_error_with_source_span(
                     output,
                     compiled,
                     stack,
@@ -510,23 +512,23 @@ impl Vm {
                         "E_PHP_RUNTIME_OBJECT_TO_STRING_GAP: Object of class {} could not be converted to string",
                         class.display_name
                     ),
-                ));
+                )));
             }
             Err(message) => {
-                return Err(self.runtime_error_with_source_span(
+                return Err(Box::new(self.runtime_error_with_source_span(
                     output,
                     compiled,
                     stack,
                     source_span,
                     message,
-                ));
+                )));
             }
         };
         if resolved.method.flags.is_static
             || resolved.method.flags.is_private
             || resolved.method.flags.is_protected
         {
-            return Err(self.runtime_error_with_source_span(
+            return Err(Box::new(self.runtime_error_with_source_span(
                 output,
                 compiled,
                 stack,
@@ -535,24 +537,21 @@ impl Vm {
                     "E_PHP_VM_TOSTRING_INACCESSIBLE: method {}::__toString is not public instance",
                     resolved.class.name
                 ),
-            ));
+            )));
         }
         let result = self.call_object_method_callable(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             object.clone(),
             "__toString",
             Vec::new(),
             None,
-            output,
-            stack,
-            state,
         );
         if !result.status.is_success() {
-            return Err(result);
+            return Err(Box::new(result));
         }
         match result.return_value.unwrap_or(Value::Null) {
             Value::String(value) => Ok(value),
-            other => Err(self.runtime_error_with_source_span(
+            other => Err(Box::new(self.runtime_error_with_source_span(
                 output,
                 compiled,
                 stack,
@@ -562,7 +561,7 @@ impl Vm {
                     class.display_name,
                     value_type_name(&other)
                 ),
-            )),
+            ))),
         }
     }
 
@@ -590,7 +589,7 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
         value: &Value,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         let _source = layout_source::enter(layout_source::OUTPUT_STRING_CONVERSION);
         if Self::try_write_echo_fast(output, value) {
             return Ok(());
@@ -637,7 +636,7 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
         value: Option<Value>,
-    ) -> Result<i32, VmResult> {
+    ) -> Result<i32, Box<VmResult>> {
         match value {
             Some(Value::Int(code)) => Ok(normalize_exit_code(code)),
             Some(value) => {
@@ -650,15 +649,18 @@ impl Vm {
 
     pub(super) fn execute_binary(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         op: BinaryOp,
         lhs: &Value,
         rhs: &Value,
         source_span: RuntimeSourceSpan,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         match op {
             BinaryOp::Concat => {
                 if let Some(reason) = concat_fallback_reason(lhs, rhs) {
@@ -700,7 +702,7 @@ impl Vm {
                     return Ok(union);
                 }
                 if has_array_operand(lhs) || has_array_operand(rhs) {
-                    return Err(unsupported_operand_types_error(
+                    return Err(Box::new(unsupported_operand_types_error(
                         output,
                         compiled,
                         stack,
@@ -708,17 +710,14 @@ impl Vm {
                         op,
                         rhs,
                         source_span,
-                    ));
+                    )));
                 }
                 if let Some(value) = self.execute_numeric_string_int_binary(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     op,
                     lhs,
                     rhs,
                     source_span.clone(),
-                    output,
-                    stack,
-                    state,
                 ) {
                     return value;
                 }
@@ -729,15 +728,15 @@ impl Vm {
                 if lhs.leading_numeric_string || rhs.leading_numeric_string {
                     write_non_numeric_value_warning(output, state, source_span);
                 }
-                execute_arithmetic(op, lhs.value, rhs.value)
-                    .map_err(|message| self.runtime_error(output, compiled, stack, message))
+                Ok(execute_arithmetic(op, lhs.value, rhs.value)
+                    .map_err(|message| self.runtime_error(output, compiled, stack, message))?)
             }
             BinaryOp::BitAnd
             | BinaryOp::BitOr
             | BinaryOp::BitXor
             | BinaryOp::ShiftLeft
-            | BinaryOp::ShiftRight => execute_bitwise(op, lhs, rhs)
-                .map_err(|message| self.runtime_error(output, compiled, stack, message)),
+            | BinaryOp::ShiftRight => Ok(execute_bitwise(op, lhs, rhs)
+                .map_err(|message| self.runtime_error(output, compiled, stack, message))?),
             BinaryOp::Pow => {
                 let lhs = to_number(lhs)
                     .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
@@ -752,23 +751,26 @@ impl Vm {
                     rhs,
                     source_span,
                 );
-                execute_power(lhs, rhs)
-                    .map_err(|message| self.runtime_error(output, compiled, stack, message))
+                Ok(execute_power(lhs, rhs)
+                    .map_err(|message| self.runtime_error(output, compiled, stack, message))?)
             }
         }
     }
 
     pub(super) fn execute_numeric_string_int_binary(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         op: BinaryOp,
         lhs: &Value,
         rhs: &Value,
         source_span: RuntimeSourceSpan,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Option<Result<Value, VmResult>> {
+    ) -> Option<Result<Value, Box<VmResult>>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let lhs = effective_value(lhs);
         let rhs = effective_value(rhs);
         let (string, int, string_is_lhs) = match (&lhs, &rhs) {
@@ -779,7 +781,7 @@ impl Vm {
 
         let classified = classify_php_string(string);
         let Some(value) = classified.value else {
-            return Some(Err(non_numeric_string_type_error(
+            return Some(Err(Box::new(non_numeric_string_type_error(
                 output,
                 compiled,
                 stack,
@@ -787,7 +789,7 @@ impl Vm {
                 op,
                 &rhs,
                 source_span,
-            )));
+            ))));
         };
         if classified.kind == NumericStringKind::LeadingNumeric {
             write_non_numeric_value_warning(output, state, source_span);
@@ -821,41 +823,44 @@ impl Vm {
 
         Some(
             execute_arithmetic(op, lhs_number, rhs_number)
-                .map_err(|message| self.runtime_error(output, compiled, stack, message)),
+                .map_err(|message| Box::new(self.runtime_error(output, compiled, stack, message))),
         )
     }
 
     pub(super) fn execute_cast(
         &self,
-        compiled: &CompiledUnit,
         kind: CastKind,
         src: &Value,
         source_span: RuntimeSourceSpan,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+        cursor: ExecutionCursor<'_>,
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         match kind {
-            CastKind::Bool => to_bool(src)
+            CastKind::Bool => Ok(to_bool(src)
                 .map(Value::Bool)
-                .map_err(|message| self.runtime_error(output, compiled, stack, message)),
+                .map_err(|message| self.runtime_error(output, compiled, stack, message))?),
             CastKind::Int => match src {
                 Value::Object(object) => {
                     write_object_numeric_cast_warning(output, state, object, "int", source_span);
                     Ok(Value::Int(1))
                 }
-                _ => to_int(src)
+                _ => Ok(to_int(src)
                     .map(Value::Int)
-                    .map_err(|message| self.runtime_error(output, compiled, stack, message)),
+                    .map_err(|message| self.runtime_error(output, compiled, stack, message))?),
             },
             CastKind::Float => match src {
                 Value::Object(object) => {
                     write_object_numeric_cast_warning(output, state, object, "float", source_span);
                     Ok(Value::float(1.0))
                 }
-                _ => to_float(src)
+                _ => Ok(to_float(src)
                     .map(Value::float)
-                    .map_err(|message| self.runtime_error(output, compiled, stack, message)),
+                    .map_err(|message| self.runtime_error(output, compiled, stack, message))?),
             },
             CastKind::String => self
                 .value_to_string_with_source_span(compiled, src, output, stack, state, source_span)

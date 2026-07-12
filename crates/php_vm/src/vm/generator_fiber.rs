@@ -30,6 +30,47 @@ pub(super) struct FiberContinuation {
     pub(super) pending_control: Option<PendingControl>,
 }
 
+pub(super) struct FiberContinuationState<'a> {
+    resume_result: php_ir::ids::RegId,
+    block_id: BlockId,
+    instruction_index: usize,
+    foreach_iterators: &'a HashMap<php_ir::ids::RegId, ForeachIterator>,
+    exception_handlers: &'a [ExceptionHandler],
+    pending_control: &'a Option<PendingControl>,
+}
+
+impl<'a> FiberContinuationState<'a> {
+    pub(super) fn new(
+        resume_result: php_ir::ids::RegId,
+        block_id: BlockId,
+        instruction_index: usize,
+        foreach_iterators: &'a HashMap<php_ir::ids::RegId, ForeachIterator>,
+        exception_handlers: &'a [ExceptionHandler],
+        pending_control: &'a Option<PendingControl>,
+    ) -> Self {
+        Self {
+            resume_result,
+            block_id,
+            instruction_index,
+            foreach_iterators,
+            exception_handlers,
+            pending_control,
+        }
+    }
+
+    fn capture(self, frame: Frame) -> FiberContinuation {
+        FiberContinuation {
+            frame,
+            block_id: self.block_id,
+            instruction_index: self.instruction_index,
+            resume_result: self.resume_result,
+            foreach_iterators: self.foreach_iterators.clone(),
+            exception_handlers: self.exception_handlers.to_vec(),
+            pending_control: self.pending_control.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum FiberResumeInput {
     Value(Value),
@@ -76,14 +117,17 @@ pub(super) enum YieldFromStep {
 impl Vm {
     pub(super) fn resume_fiber_continuations(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         fiber: FiberRef,
         mut continuations: Vec<FiberContinuation>,
         mut input: FiberResumeInput,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         while let Some(continuation) = continuations.pop() {
             let function = continuation.frame.function;
             let result = self.execute_function(
@@ -111,14 +155,17 @@ impl Vm {
 
     pub(super) fn call_generator_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         generator: GeneratorRef,
         method: &str,
         args: Vec<CallArgument>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let method_name = normalize_method_name(method);
         if matches!(
             method_name.as_str(),
@@ -169,24 +216,24 @@ impl Vm {
                     )?;
                     Ok(Value::Null)
                 }
-                GeneratorState::Closed => Err(self.runtime_error(
+                GeneratorState::Closed => Err(Box::new(self.runtime_error(
                     output,
                     compiled,
                     stack,
                     "E_PHP_VM_GENERATOR_REWIND_CLOSED: cannot rewind a closed generator",
-                )),
-                GeneratorState::Running => Err(self.runtime_error(
+                ))),
+                GeneratorState::Running => Err(Box::new(self.runtime_error(
                     output,
                     compiled,
                     stack,
                     "E_PHP_VM_GENERATOR_REENTRANCY: generator is already running",
-                )),
-                GeneratorState::Errored => Err(self.runtime_error(
+                ))),
+                GeneratorState::Errored => Err(Box::new(self.runtime_error(
                     output,
                     compiled,
                     stack,
                     "E_PHP_VM_GENERATOR_ERRORED: generator already errored",
-                )),
+                ))),
             },
             "next" => {
                 match generator.state() {
@@ -202,20 +249,20 @@ impl Vm {
                     GeneratorState::Suspended => {}
                     GeneratorState::Closed => return Ok(Value::Null),
                     GeneratorState::Running => {
-                        return Err(self.runtime_error(
+                        return Err(Box::new(self.runtime_error(
                             output,
                             compiled,
                             stack,
                             "E_PHP_VM_GENERATOR_REENTRANCY: generator is already running",
-                        ));
+                        )));
                     }
                     GeneratorState::Errored => {
-                        return Err(self.runtime_error(
+                        return Err(Box::new(self.runtime_error(
                             output,
                             compiled,
                             stack,
                             "E_PHP_VM_GENERATOR_ERRORED: generator already errored",
-                        ));
+                        )));
                     }
                 }
                 if matches!(generator.state(), GeneratorState::Suspended) {
@@ -233,19 +280,19 @@ impl Vm {
             "getreturn" => match generator.state() {
                 GeneratorState::Closed => Ok(generator.return_value().unwrap_or(Value::Null)),
                 GeneratorState::Created | GeneratorState::Suspended | GeneratorState::Running => {
-                    Err(self.runtime_error(
+                    Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         stack,
                         "E_PHP_VM_GENERATOR_GET_RETURN_BEFORE_CLOSE: cannot get return value before generator completion",
-                    ))
+                    )))
                 }
-                GeneratorState::Errored => Err(self.runtime_error(
+                GeneratorState::Errored => Err(Box::new(self.runtime_error(
                     output,
                     compiled,
                     stack,
                     "E_PHP_VM_GENERATOR_ERRORED: generator already errored",
-                )),
+                ))),
             },
             "send" => {
                 validate_generator_arg_count(&method_name, &args, 1)
@@ -286,7 +333,7 @@ impl Vm {
                 }
                 let throwable = args[0].value.clone();
                 let Value::Object(object) = &throwable else {
-                    return Err(self.runtime_error(
+                    return Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         stack,
@@ -294,10 +341,10 @@ impl Vm {
                             "E_PHP_VM_GENERATOR_THROW_NON_THROWABLE: Generator::throw expects Throwable, {} given",
                             value_type_name(&throwable)
                         ),
-                    ));
+                    )));
                 };
                 if internal_throwable_instanceof(&object.class_name(), "throwable") != Some(true) {
-                    return Err(self.runtime_error(
+                    return Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         stack,
@@ -305,12 +352,12 @@ impl Vm {
                             "E_PHP_VM_GENERATOR_THROW_NON_THROWABLE: Generator::throw expects Throwable, {} given",
                             object.class_name()
                         ),
-                    ));
+                    )));
                 }
                 if !matches!(generator.state(), GeneratorState::Suspended) {
-                    return Err(self.handle_uncaught_exception(
+                    return Err(Box::new(self.handle_uncaught_exception(
                         compiled, output, stack, state, throwable,
-                    ));
+                    )));
                 }
                 let next = self.resume_generator_to_next_yield(
                     compiled,
@@ -322,25 +369,28 @@ impl Vm {
                 )?;
                 Ok(next.map(|(_, value)| value).unwrap_or(Value::Null))
             }
-            _ => Err(self.runtime_error(
+            _ => Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
                 format!("E_PHP_VM_UNKNOWN_METHOD: method Generator::{method} is not defined"),
-            )),
+            ))),
         }
     }
 
     pub(super) fn call_fiber_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         fiber: FiberRef,
         method: &str,
         args: Vec<CallArgument>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let method_name = normalize_method_name(method);
         match method_name.as_str() {
             "start" => {
@@ -352,28 +402,28 @@ impl Vm {
                 match fiber.state() {
                     FiberState::NotStarted => {}
                     FiberState::Running => {
-                        return Err(self.runtime_error(
+                        return Err(Box::new(self.runtime_error(
                             output,
                             compiled,
                             stack,
                             "E_PHP_VM_FIBER_ALREADY_RUNNING: FiberError: fiber is already running",
-                        ));
+                        )));
                     }
                     FiberState::Suspended => {
-                        return Err(self.runtime_error(
+                        return Err(Box::new(self.runtime_error(
                             output,
                             compiled,
                             stack,
                             "E_PHP_VM_FIBER_ALREADY_STARTED: FiberError: fiber has already started",
-                        ));
+                        )));
                     }
                     FiberState::Terminated | FiberState::Errored => {
-                        return Err(self.runtime_error(
+                        return Err(Box::new(self.runtime_error(
                             output,
                             compiled,
                             stack,
                             "E_PHP_VM_FIBER_ALREADY_TERMINATED: FiberError: fiber has already terminated",
-                        ));
+                        )));
                     }
                 }
                 fiber.set_state(FiberState::Running);
@@ -381,20 +431,17 @@ impl Vm {
                     "fiber start transition=not-started->running".to_owned()
                 });
                 let result = self.call_fiber_callable(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     fiber.clone(),
                     fiber.callable(),
                     args,
-                    output,
-                    stack,
-                    state,
                 );
                 if !result.status.is_success() {
                     fiber.set_state(FiberState::Errored);
                     self.record_runtime_trace_event(|| {
                         "fiber start transition=running->errored".to_owned()
                     });
-                    return Err(result);
+                    return Err(Box::new(result));
                 }
                 if let Some(suspension) = result.fiber_suspension {
                     state
@@ -445,20 +492,20 @@ impl Vm {
                 validate_fiber_arg_count_range(&method_name, &args, 0, 1)
                     .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
                 if !matches!(fiber.state(), FiberState::Suspended) {
-                    return Err(self.runtime_error(
+                    return Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         stack,
                         "E_PHP_VM_FIBER_NOT_SUSPENDED: FiberError: fiber is not suspended",
-                    ));
+                    )));
                 }
                 let Some(continuations) = state.fiber_continuations.remove(&fiber.id()) else {
-                    return Err(self.runtime_error(
+                    return Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         stack,
                         "E_PHP_VM_FIBER_CONTINUATION_MISSING: suspended fiber has no VM continuation",
-                    ));
+                    )));
                 };
                 let resume_value = args
                     .first()
@@ -472,20 +519,17 @@ impl Vm {
                     )
                 });
                 let result = self.resume_fiber_continuations(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     fiber.clone(),
                     continuations,
                     FiberResumeInput::Value(resume_value),
-                    output,
-                    stack,
-                    state,
                 );
                 if !result.status.is_success() {
                     fiber.set_state(FiberState::Errored);
                     self.record_runtime_trace_event(|| {
                         "fiber resume transition=running->errored".to_owned()
                     });
-                    return Err(result);
+                    return Err(Box::new(result));
                 }
                 if let Some(suspension) = result.fiber_suspension {
                     state
@@ -510,16 +554,16 @@ impl Vm {
                 validate_fiber_arg_count(&method_name, &args, 1)
                     .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
                 if !matches!(fiber.state(), FiberState::Suspended) {
-                    return Err(self.runtime_error(
+                    return Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         stack,
                         "E_PHP_VM_FIBER_NOT_SUSPENDED: FiberError: fiber is not suspended",
-                    ));
+                    )));
                 }
                 let throwable = args[0].value.clone();
                 let Value::Object(object) = &throwable else {
-                    return Err(self.runtime_error(
+                    return Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         stack,
@@ -527,10 +571,10 @@ impl Vm {
                             "E_PHP_VM_FIBER_THROW_NON_THROWABLE: Fiber::throw expects Throwable, {} given",
                             value_type_name(&throwable)
                         ),
-                    ));
+                    )));
                 };
                 if internal_throwable_instanceof(&object.class_name(), "throwable") != Some(true) {
-                    return Err(self.runtime_error(
+                    return Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         stack,
@@ -538,15 +582,15 @@ impl Vm {
                             "E_PHP_VM_FIBER_THROW_NON_THROWABLE: Fiber::throw expects Throwable, {} given",
                             object.class_name()
                         ),
-                    ));
+                    )));
                 }
                 let Some(continuations) = state.fiber_continuations.remove(&fiber.id()) else {
-                    return Err(self.runtime_error(
+                    return Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         stack,
                         "E_PHP_VM_FIBER_CONTINUATION_MISSING: suspended fiber has no VM continuation",
-                    ));
+                    )));
                 };
                 fiber.set_state(FiberState::Running);
                 self.record_runtime_trace_event(|| {
@@ -556,20 +600,17 @@ impl Vm {
                     )
                 });
                 let result = self.resume_fiber_continuations(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     fiber.clone(),
                     continuations,
                     FiberResumeInput::Throw(throwable),
-                    output,
-                    stack,
-                    state,
                 );
                 if !result.status.is_success() {
                     fiber.set_state(FiberState::Errored);
                     self.record_runtime_trace_event(|| {
                         "fiber throw transition=running->errored".to_owned()
                     });
-                    return Err(result);
+                    return Err(Box::new(result));
                 }
                 if let Some(suspension) = result.fiber_suspension {
                     state
@@ -595,34 +636,34 @@ impl Vm {
                     .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
                 match fiber.state() {
                     FiberState::Terminated => Ok(fiber.return_value().unwrap_or(Value::Null)),
-                    FiberState::Errored => Err(self.runtime_error(
+                    FiberState::Errored => Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         stack,
                         "E_PHP_VM_FIBER_ERRORED: FiberError: fiber terminated with an exception",
-                    )),
+                    ))),
                     FiberState::NotStarted | FiberState::Running | FiberState::Suspended => {
-                        Err(self.runtime_error(
+                        Err(Box::new(self.runtime_error(
                             output,
                             compiled,
                             stack,
                             "E_PHP_VM_FIBER_GET_RETURN_BEFORE_TERMINATION: FiberError: cannot get fiber return value before termination",
-                        ))
+                        )))
                     }
                 }
             }
-            "suspend" => Err(self.runtime_error(
+            "suspend" => Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
                 "E_PHP_VM_FIBER_SUSPEND_INSTANCE_CALL: Fiber::suspend must be called statically",
-            )),
-            _ => Err(self.runtime_error(
+            ))),
+            _ => Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
                 format!("E_PHP_VM_UNKNOWN_METHOD: method Fiber::{method} is not defined"),
-            )),
+            ))),
         }
     }
 
@@ -633,26 +674,26 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<Option<(Option<Value>, Value)>, VmResult> {
+    ) -> Result<Option<(Option<Value>, Value)>, Box<VmResult>> {
         match generator.state() {
             GeneratorState::Created => {}
             GeneratorState::Suspended => return Ok(generator.current()),
             GeneratorState::Closed => return Ok(None),
             GeneratorState::Running => {
-                return Err(self.runtime_error(
+                return Err(Box::new(self.runtime_error(
                     output,
                     compiled,
                     stack,
                     "E_PHP_VM_GENERATOR_REENTRANCY: generator is already running",
-                ));
+                )));
             }
             GeneratorState::Errored => {
-                return Err(self.runtime_error(
+                return Err(Box::new(self.runtime_error(
                     output,
                     compiled,
                     stack,
                     "E_PHP_VM_GENERATOR_ERRORED: generator already errored",
-                ));
+                )));
             }
         }
         generator.set_state(GeneratorState::Running);
@@ -703,7 +744,7 @@ impl Vm {
                     generator.function()
                 )
             });
-            return Err(result);
+            return Err(Box::new(result));
         }
         if let Some(yielded) = result.yielded {
             generator.suspend(yielded.key.clone(), yielded.value.clone());
@@ -740,43 +781,43 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<Option<(Option<Value>, Value)>, VmResult> {
+    ) -> Result<Option<(Option<Value>, Value)>, Box<VmResult>> {
         match generator.state() {
             GeneratorState::Suspended => {}
             GeneratorState::Closed => return Ok(None),
             GeneratorState::Running => {
-                return Err(self.runtime_error(
+                return Err(Box::new(self.runtime_error(
                     output,
                     compiled,
                     stack,
                     "E_PHP_VM_GENERATOR_REENTRANCY: generator is already running",
-                ));
+                )));
             }
             GeneratorState::Errored => {
-                return Err(self.runtime_error(
+                return Err(Box::new(self.runtime_error(
                     output,
                     compiled,
                     stack,
                     "E_PHP_VM_GENERATOR_ERRORED: generator already errored",
-                ));
+                )));
             }
             GeneratorState::Created => {
-                return Err(self.runtime_error(
+                return Err(Box::new(self.runtime_error(
                     output,
                     compiled,
                     stack,
                     "E_PHP_VM_GENERATOR_NOT_STARTED: generator has not reached a yield",
-                ));
+                )));
             }
         }
 
         let Some(continuation) = state.generator_continuations.remove(&generator.id()) else {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
                 "E_PHP_VM_GENERATOR_CONTINUATION_MISSING: suspended generator has no VM continuation",
-            ));
+            )));
         };
         generator.set_state(GeneratorState::Running);
         self.record_runtime_trace_event(|| {
@@ -808,7 +849,7 @@ impl Vm {
                     generator.function()
                 )
             });
-            return Err(result);
+            return Err(Box::new(result));
         }
         if let Some(yielded) = result.yielded {
             generator.suspend(yielded.key.clone(), yielded.value.clone());
@@ -846,12 +887,14 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<YieldFromStep, VmResult> {
+    ) -> Result<YieldFromStep, Box<VmResult>> {
         if !state.yield_from_delegations.contains_key(&key) {
             let source = match read_operand(compiled.unit(), stack, source) {
                 Ok(source) => source,
                 Err(message) => {
-                    return Err(self.runtime_error(output, compiled, stack, message));
+                    return Err(Box::new(
+                        self.runtime_error(output, compiled, stack, message),
+                    ));
                 }
             };
             let delegation = match source {
@@ -867,7 +910,7 @@ impl Vm {
                     started: false,
                 },
                 other => {
-                    return Err(self.runtime_error(
+                    return Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         stack,
@@ -875,19 +918,19 @@ impl Vm {
                             "E_PHP_VM_UNSUPPORTED_YIELD_FROM_SOURCE: yield from over {} is not implemented; runtime-semantics supports arrays and generator MVP objects",
                             value_type_name(&other)
                         ),
-                    ));
+                    )));
                 }
             };
             state.yield_from_delegations.insert(key.clone(), delegation);
         }
 
         let Some(mut delegation) = state.yield_from_delegations.remove(&key) else {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
                 "E_PHP_VM_YIELD_FROM_DELEGATION_MISSING: yield from delegation state is missing",
-            ));
+            )));
         };
         let step = match &mut delegation {
             YieldFromDelegation::Array { entries, position } => {
@@ -939,35 +982,30 @@ impl Vm {
         compiled: &CompiledUnit,
         running_fiber: &Option<FiberRef>,
         args: Vec<CallArgument>,
-        resume_result: php_ir::ids::RegId,
-        block_id: BlockId,
-        instruction_index: usize,
-        foreach_iterators: &HashMap<php_ir::ids::RegId, ForeachIterator>,
-        exception_handlers: &[ExceptionHandler],
-        pending_control: &Option<PendingControl>,
+        continuation: FiberContinuationState<'_>,
         output: &OutputBuffer,
         stack: &mut CallStack,
-    ) -> Result<VmResult, VmResult> {
+    ) -> Result<VmResult, Box<VmResult>> {
         let Some(fiber) = running_fiber.as_ref() else {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
                 "E_PHP_VM_FIBER_SUSPEND_OUTSIDE_FIBER: Fiber::suspend called outside a running fiber",
-            ));
+            )));
         };
         if let Some(name) = args.iter().find_map(|arg| arg.name.as_deref()) {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
                 format!(
                     "E_PHP_VM_UNKNOWN_NAMED_ARG: Fiber::suspend has no builtin parameter ${name}"
                 ),
-            ));
+            )));
         }
         if args.len() > 1 {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
@@ -975,7 +1013,7 @@ impl Vm {
                     "E_PHP_VM_TOO_MANY_ARGS: Fiber::suspend expects at most 1 argument(s), {} given",
                     args.len()
                 ),
-            ));
+            )));
         }
         let value = args
             .into_iter()
@@ -990,25 +1028,17 @@ impl Vm {
             )
         });
         let Some(frame) = stack.pop() else {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
                 "E_PHP_VM_FIBER_FRAME_MISSING: fiber frame missing at suspend",
-            ));
+            )));
         };
         let mut result = VmResult::success_no_output(None);
         result.fiber_suspension = Some(Box::new(FiberSuspension {
             value,
-            continuations: vec![FiberContinuation {
-                frame,
-                block_id,
-                instruction_index,
-                resume_result,
-                foreach_iterators: foreach_iterators.clone(),
-                exception_handlers: exception_handlers.to_vec(),
-                pending_control: pending_control.clone(),
-            }],
+            continuations: vec![continuation.capture(frame)],
         }));
         Ok(result)
     }
@@ -1017,12 +1047,7 @@ impl Vm {
         &self,
         mut result: VmResult,
         compiled: &CompiledUnit,
-        resume_result: php_ir::ids::RegId,
-        block_id: BlockId,
-        instruction_index: usize,
-        foreach_iterators: &HashMap<php_ir::ids::RegId, ForeachIterator>,
-        exception_handlers: &[ExceptionHandler],
-        pending_control: &Option<PendingControl>,
+        continuation: FiberContinuationState<'_>,
         output: &OutputBuffer,
         stack: &mut CallStack,
     ) -> VmResult {
@@ -1035,18 +1060,9 @@ impl Vm {
                     "E_PHP_VM_FIBER_FRAME_MISSING: caller frame missing while propagating fiber suspension",
                 );
             };
-            suspension.continuations.insert(
-                0,
-                FiberContinuation {
-                    frame,
-                    block_id,
-                    instruction_index,
-                    resume_result,
-                    foreach_iterators: foreach_iterators.clone(),
-                    exception_handlers: exception_handlers.to_vec(),
-                    pending_control: pending_control.clone(),
-                },
-            );
+            suspension
+                .continuations
+                .insert(0, continuation.capture(frame));
         }
         result
     }

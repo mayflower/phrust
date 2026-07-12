@@ -8,6 +8,15 @@ use super::builtin_array_sort::{
 };
 use super::builtin_callback_validation::{array_callback_type_error, validate_array_callback_arg};
 use super::prelude::*;
+
+struct SortComparison<'a> {
+    name: &'a str,
+    callback: Option<&'a Value>,
+    resolved_callback: Option<&'a FunctionCallCacheTarget>,
+    flags: i64,
+    left: &'a (ArrayKey, Value),
+    right: &'a (ArrayKey, Value),
+}
 use super::runtime_operations::object_has_public_to_string;
 
 pub(super) fn is_array_callback_builtin_name(name: &str) -> bool {
@@ -174,14 +183,17 @@ fn object_walk_reference_entries(
 impl Vm {
     pub(super) fn call_array_callback_builtin(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         name: &str,
         args: Vec<CallArgument>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let result = match name {
             "array_walk" => {
                 self.call_array_walk_builtin(compiled, args, call_span, output, stack, state)
@@ -439,21 +451,27 @@ impl Vm {
             stack,
         )?;
         self.walk_recursive_value(
-            compiled, array_cell, callback, userdata, output, stack, state,
+            ExecutionCursor::new(compiled, output, stack, state),
+            array_cell,
+            callback,
+            userdata,
         )?;
         Ok(Value::Bool(true))
     }
 
     pub(super) fn walk_recursive_value(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         cell: ReferenceCell,
         callback: Value,
         userdata: Option<Value>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Result<(), ArrayCallbackError> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         for (key, entry_cell) in
             array_walk_reference_entries("array_walk_recursive", compiled, state, stack, &cell)?
         {
@@ -462,13 +480,10 @@ impl Vm {
                 Value::Array(_)
             ) {
                 self.walk_recursive_value(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     entry_cell,
                     callback.clone(),
                     userdata.clone(),
-                    output,
-                    stack,
-                    state,
                 )?;
                 continue;
             }
@@ -606,14 +621,11 @@ impl Vm {
     ) -> Result<Value, ArrayCallbackError> {
         let call_args = args.into_iter().map(CallArgument::positional).collect();
         let mut result = self.execute_function_call_target(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             target.clone(),
             call_args,
             None,
             None,
-            output,
-            stack,
-            state,
             &None,
         );
         if !result.status.is_success() {
@@ -729,16 +741,15 @@ impl Vm {
                 (left, right)
             };
             self.compare_sort_entries(
-                compiled,
-                name,
-                callback.as_ref(),
-                resolved_callback.as_ref(),
-                flags,
-                left,
-                right,
-                output,
-                stack,
-                state,
+                ExecutionCursor::new(compiled, output, stack, state),
+                SortComparison {
+                    name,
+                    callback: callback.as_ref(),
+                    resolved_callback: resolved_callback.as_ref(),
+                    flags,
+                    left,
+                    right,
+                },
                 &mut bool_compare_deprecated,
             )
         })?;
@@ -872,13 +883,10 @@ impl Vm {
             while current > 0
                 && self
                     .multisort_compare_indices(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         &specs,
                         order[current - 1],
                         order[current],
-                        output,
-                        stack,
-                        state,
                     )?
                     .is_gt()
             {
@@ -895,20 +903,26 @@ impl Vm {
         Ok(Value::Bool(true))
     }
 
-    pub(super) fn compare_sort_entries(
+    fn compare_sort_entries(
         &self,
-        compiled: &CompiledUnit,
-        name: &str,
-        callback: Option<&Value>,
-        resolved_callback: Option<&FunctionCallCacheTarget>,
-        flags: i64,
-        left: &(ArrayKey, Value),
-        right: &(ArrayKey, Value),
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
+        comparison: SortComparison<'_>,
         bool_compare_deprecated: &mut bool,
     ) -> Result<std::cmp::Ordering, ArrayCallbackError> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
+        let SortComparison {
+            name,
+            callback,
+            resolved_callback,
+            flags,
+            left,
+            right,
+        } = comparison;
         if let Some(callback) = callback {
             let invoke = |vm: &Self,
                           args: Vec<Value>,
@@ -963,13 +977,10 @@ impl Vm {
         };
         if matches!(name, "natsort" | "natcasesort") {
             return self.compare_sort_natural_values(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 left_sort,
                 right_sort,
                 name == "natcasesort",
-                output,
-                stack,
-                state,
             );
         }
         if flags == SORT_REGULAR {
@@ -988,7 +999,10 @@ impl Vm {
         }
         if matches!(flags & !SORT_FLAG_CASE, SORT_STRING | SORT_LOCALE_STRING) {
             return self.compare_sort_string_values(
-                compiled, left_sort, right_sort, flags, output, stack, state,
+                ExecutionCursor::new(compiled, output, stack, state),
+                left_sort,
+                right_sort,
+                flags,
             );
         }
         compare_sort_values(left_sort, right_sort, flags)
@@ -997,14 +1011,17 @@ impl Vm {
 
     pub(super) fn multisort_compare_indices(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         specs: &[MultisortArraySpec],
         left: usize,
         right: usize,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Result<std::cmp::Ordering, ArrayCallbackError> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         for spec in specs {
             let ordering = if spec.flags == SORT_REGULAR {
                 self.compare_sort_regular_values(
@@ -1024,13 +1041,10 @@ impl Vm {
                 SORT_STRING | SORT_LOCALE_STRING
             ) {
                 self.compare_sort_string_values(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &spec.entries[left].1,
                     &spec.entries[right].1,
                     spec.flags,
-                    output,
-                    stack,
-                    state,
                 )?
             } else {
                 compare_sort_values(&spec.entries[left].1, &spec.entries[right].1, spec.flags)
@@ -1067,14 +1081,17 @@ impl Vm {
 
     pub(super) fn compare_sort_string_values(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         left: &Value,
         right: &Value,
         flags: i64,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Result<std::cmp::Ordering, ArrayCallbackError> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let case_insensitive = (flags & SORT_FLAG_CASE) != 0;
         let left = self.sort_string_value_for_compare(
             compiled,
@@ -1106,7 +1123,7 @@ impl Vm {
     ) -> Result<String, ArrayCallbackError> {
         let mut text = self
             .value_to_string(compiled, value, output, stack, state)
-            .map_err(|result| ArrayCallbackError::Runtime(Box::new(result)))?
+            .map_err(|result| ArrayCallbackError::Runtime(Box::new(*result)))?
             .to_string_lossy();
         if case_insensitive {
             text = text.to_ascii_lowercase();
@@ -1116,14 +1133,17 @@ impl Vm {
 
     pub(super) fn compare_sort_natural_values(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         left: &Value,
         right: &Value,
         case_insensitive: bool,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Result<std::cmp::Ordering, ArrayCallbackError> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let left =
             self.sort_natural_string_value(compiled, left, case_insensitive, output, stack, state)?;
         let right = self.sort_natural_string_value(
@@ -1159,7 +1179,7 @@ impl Vm {
             }
             Value::Object(_) => self
                 .value_to_string(compiled, value, output, stack, state)
-                .map_err(|result| ArrayCallbackError::Runtime(Box::new(result)))?
+                .map_err(|result| ArrayCallbackError::Runtime(Box::new(*result)))?
                 .to_string_lossy(),
             other => sort_string_value(other, false),
         };
@@ -1212,7 +1232,7 @@ impl Vm {
             Value::Object(object) if object_has_public_to_string(compiled, object) => self
                 .object_to_string(compiled, object.clone(), output, stack, state)
                 .map(Value::String)
-                .map_err(|result| ArrayCallbackError::Runtime(Box::new(result))),
+                .map_err(|result| ArrayCallbackError::Runtime(Box::new(*result))),
             other => Ok(other.clone()),
         }
     }

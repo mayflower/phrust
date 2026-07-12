@@ -2,20 +2,31 @@ use super::*;
 
 pub(super) fn execute_rich_exception_instruction(
     vm: &Vm,
-    compiled: &CompiledUnit,
-    unit: &IrUnit,
-    function: &IrFunction,
-    frame_index: usize,
-    kind: &InstructionKind,
-    span: IrSpan,
+    cursor: ExecutionCursor<'_>,
+    site: dispatch_contract::RichInstructionSite<'_>,
     shared_top_level_locals: &mut Option<&mut HashMap<String, Slot>>,
     diagnostics: &mut Vec<RuntimeDiagnostic>,
-    output: &mut OutputBuffer,
-    stack: &mut CallStack,
-    state: &mut ExecutionState,
-    exception_handlers: &mut Vec<ExceptionHandler>,
-    pending_control: &mut Option<PendingControl>,
+    control: dispatch_contract::RichControlState<'_>,
 ) -> RichDispatchOutcome {
+    let ExecutionCursor {
+        compiled,
+        output,
+        stack,
+        state,
+    } = cursor;
+    let dispatch_contract::RichInstructionSite {
+        unit,
+        function,
+        instruction,
+        frame_index,
+        ..
+    } = site;
+    let kind = &instruction.kind;
+    let span = instruction.span;
+    let dispatch_contract::RichControlState {
+        exception_handlers,
+        pending_control,
+    } = control;
     match kind {
         InstructionKind::EnterTry {
             catch,
@@ -33,7 +44,10 @@ pub(super) fn execute_rich_exception_instruction(
             });
             if let Some(catch) = *catch
                 && let Some(failure) = vm.validate_runtime_class_dependencies_in_try(
-                    compiled, function, catch, output, stack, state, span,
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    function,
+                    catch,
+                    span,
                 )
             {
                 match failure {
@@ -55,10 +69,7 @@ pub(super) fn execute_rich_exception_instruction(
                     }
                     ClassDependencyValidationFailure::Result(result) => {
                         match vm.route_throwable_result(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             *result,
@@ -100,10 +111,7 @@ pub(super) fn execute_rich_exception_instruction(
                     Ok(value) => value,
                     Err(message) => {
                         match vm.raise_runtime_error(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             exception_handlers,
                             pending_control,
                             span,

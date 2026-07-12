@@ -443,7 +443,7 @@ pub(super) fn validate_internal_builtin_args(
     call_span: Option<php_ir::IrSpan>,
     output: &mut OutputBuffer,
     state: &ExecutionState,
-) -> Result<Vec<Value>, VmResult> {
+) -> Result<Vec<Value>, Box<VmResult>> {
     if builtin_uses_custom_argument_validation(name) {
         return Ok(values);
     }
@@ -476,7 +476,7 @@ pub(super) fn validate_internal_builtin_args(
             }
             Ok(values)
         }
-        Err(error) => Err(arginfo_error_result(error, output)),
+        Err(error) => Err(Box::new(arginfo_error_result(error, output))),
     }
 }
 
@@ -507,14 +507,17 @@ fn builtin_uses_custom_argument_validation(name: &str) -> bool {
 
 pub(super) fn call_builtin_args_to_positional(
     vm: &Vm,
-    compiled: &CompiledUnit,
+    cursor: ExecutionCursor<'_>,
     function: &str,
     args: Vec<CallArgument>,
     call_span: Option<IrSpan>,
-    output: &mut OutputBuffer,
-    stack: &mut CallStack,
-    state: &mut ExecutionState,
 ) -> Result<Vec<Value>, InternalBuiltinArgError> {
+    let ExecutionCursor {
+        compiled,
+        output,
+        stack,
+        state,
+    } = cursor;
     let args = if internal_builtin_generated_named_args_supported(function)
         && args.iter().any(|arg| arg.name.is_some())
     {
@@ -579,7 +582,7 @@ pub(super) fn call_builtin_args_to_positional(
                     state,
                     source_span,
                 )
-                .map_err(|result| InternalBuiltinArgError::Fatal(Box::new(result)))?;
+                .map_err(|result| InternalBuiltinArgError::Fatal(Box::new(*result)))?;
             arg.value = Value::String(coerced);
         }
         values.push(arg.value);

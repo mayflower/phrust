@@ -58,14 +58,17 @@ pub(super) fn foreach_iterator_candidate_value(iterator: ForeachIterator) -> Opt
 impl Vm {
     pub(super) fn next_foreach_value(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
         foreach_iterators: &mut HashMap<RegId, ForeachIterator>,
         iterator: RegId,
         needs_key: bool,
-    ) -> Result<Option<(Option<Value>, Value)>, VmResult> {
+    ) -> Result<Option<(Option<Value>, Value)>, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         // Step the iterator in place: cloning the whole `ForeachIterator`
         // per step deep-copied the snapshot entries vector on every
         // iteration. Only the produced element is cloned (PHP by-value copy
@@ -140,14 +143,11 @@ impl Vm {
                 ) && spl_rii_should_call_valid_child_hook(&object)
                 {
                     self.call_spl_rii_child_hook(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         &object,
                         "callHasChildren",
                         "RecursiveIteratorIterator->valid",
                         None,
-                        output,
-                        stack,
-                        state,
                     )?;
                 }
                 let valid = self.call_object_method_value(
@@ -215,7 +215,7 @@ impl Vm {
                 }
             }
             Some(ForeachIterator::ByReference { .. }) | None => {
-                return Err(self.runtime_error(
+                return Err(Box::new(self.runtime_error(
                     output,
                     compiled,
                     stack,
@@ -223,7 +223,7 @@ impl Vm {
                         "E_PHP_VM_FOREACH_ITERATOR_MISSING: iterator r{} is not initialized",
                         iterator.raw()
                     ),
-                ));
+                )));
             }
         };
 
@@ -255,7 +255,7 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
         invalid_source_behavior: ForeachInvalidSourceBehavior,
-    ) -> Result<ForeachIterator, VmResult> {
+    ) -> Result<ForeachIterator, Box<VmResult>> {
         match source {
             Value::Array(array) => {
                 // Handle-based iteration: copy-on-write supplies snapshot
@@ -295,7 +295,7 @@ impl Vm {
                     RuntimeSourceSpan::default(),
                     stack_trace(compiled, stack),
                 );
-                Err(VmResult {
+                Err(Box::new(VmResult {
                     status: ExecutionStatus::unsupported(diagnostic.message().to_owned()),
                     output: output.clone(),
                     diagnostics: vec![diagnostic],
@@ -312,7 +312,7 @@ impl Vm {
                     http_response: None,
                     upload_registry: None,
                     session: None,
-                })
+                }))
             }
         }
     }
@@ -325,7 +325,7 @@ impl Vm {
         state: &mut ExecutionState,
         source: &Value,
         span: Option<php_ir::IrSpan>,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         let diagnostic = RuntimeDiagnostic::new(
             "E_PHP_VM_FOREACH_INVALID_SOURCE",
             RuntimeSeverity::Warning,
@@ -367,7 +367,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<ForeachIterator, VmResult> {
+    ) -> Result<ForeachIterator, Box<VmResult>> {
         let class_name = object.class_name();
         if self
             .spl_object_has_userland_method(compiled, state, &object, "getIterator")
@@ -486,7 +486,11 @@ impl Vm {
                 });
             }
             Ok(false) => {}
-            Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+            Err(message) => {
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
+            }
         }
         match class_is_a_in_state(compiled, state, &class_name, "IteratorAggregate") {
             Ok(true) => {
@@ -508,7 +512,11 @@ impl Vm {
                 );
             }
             Ok(false) => {}
-            Err(message) => return Err(self.runtime_error(output, compiled, stack, message)),
+            Err(message) => {
+                return Err(Box::new(
+                    self.runtime_error(output, compiled, stack, message),
+                ));
+            }
         }
         let scope = current_scope_class(compiled, stack);
         let entries = object_property_iteration_entries(compiled, state, &object, scope.as_deref())

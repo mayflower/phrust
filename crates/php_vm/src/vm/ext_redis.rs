@@ -1,6 +1,4 @@
 //! Runtime shim for the built-in `Redis` class, extracted from the VM module.
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::result_large_err)]
 
 use super::prelude::*;
 use php_runtime::api::{

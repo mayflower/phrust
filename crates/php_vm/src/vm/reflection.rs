@@ -1,6 +1,4 @@
 //! Runtime implementation of the Reflection* built-in classes, extracted from the VM module.
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::result_large_err)]
 
 use super::prelude::*;
 
@@ -453,15 +451,18 @@ impl Vm {
 }
 
 pub(super) fn reflection_method_value(
-    compiled: &CompiledUnit,
+    cursor: ExecutionCursor<'_>,
     object: &ObjectRef,
     method: &str,
     args: Vec<Value>,
-    output: &mut OutputBuffer,
-    stack: &CallStack,
-    state: &mut ExecutionState,
     source_span: RuntimeSourceSpan,
 ) -> Result<Value, String> {
+    let ExecutionCursor {
+        compiled,
+        output,
+        stack,
+        state,
+    } = cursor;
     let method = normalize_method_name(method);
     match normalize_class_name(&object.class_name()).as_str() {
         "reflectionattribute" => match method.as_str() {

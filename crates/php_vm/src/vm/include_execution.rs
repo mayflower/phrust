@@ -1,5 +1,12 @@
 use super::prelude::*;
 
+pub(super) struct IncludeExecutionRequest<'a> {
+    pub(super) site: UnitInlineCacheSite,
+    pub(super) instruction_span: php_ir::IrSpan,
+    pub(super) kind: IncludeKind,
+    pub(super) path: &'a Value,
+}
+
 impl Vm {
     pub(super) fn record_include_trace_event(&self, event: impl AsRef<str>) {
         if !(self.options.trace_includes || self.options.trace_runtime) {
@@ -115,7 +122,7 @@ impl Vm {
                     stack,
                     state,
                 ) {
-                    return result;
+                    return *result;
                 }
                 if dynamic_class_entry_by_normalized_name(state, normalized_name).is_some() {
                     continue;
@@ -255,19 +262,28 @@ impl Vm {
 
     pub(super) fn execute_include(
         &self,
-        compiled: &CompiledUnit,
-        cache_id: Option<InlineCacheId>,
-        unit_key: u64,
-        function_id: FunctionId,
-        block_id: BlockId,
-        instruction_id: php_ir::ids::InstrId,
-        instruction_span: php_ir::IrSpan,
-        kind: IncludeKind,
-        path: &Value,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
+        request: IncludeExecutionRequest<'_>,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
+        let IncludeExecutionRequest {
+            site:
+                UnitInlineCacheSite {
+                    cache_id,
+                    unit_key,
+                    function: function_id,
+                    block: block_id,
+                    instruction: instruction_id,
+                },
+            instruction_span,
+            kind,
+            path,
+        } = request;
         let path = match to_string(path) {
             Ok(path) => path.to_string_lossy(),
             Err(message) => return self.runtime_error(output, compiled, stack, message),
@@ -468,11 +484,13 @@ impl Vm {
                 }
             } else {
                 let cached = self.lookup_include_path_inline_cache(
-                    cache_id,
-                    unit_key,
-                    function_id,
-                    block_id,
-                    instruction_id,
+                    UnitInlineCacheSite::new(
+                        cache_id,
+                        unit_key,
+                        function_id,
+                        block_id,
+                        instruction_id,
+                    ),
                     &request,
                     InvalidationEpoch::default(),
                 );
@@ -521,11 +539,13 @@ impl Vm {
                             Ok(resolved) => {
                                 let target = IncludePathCacheTarget::from_resolved(&resolved);
                                 self.install_include_path_inline_cache(
-                                    cache_id,
-                                    unit_key,
-                                    function_id,
-                                    block_id,
-                                    instruction_id,
+                                    UnitInlineCacheSite::new(
+                                        cache_id,
+                                        unit_key,
+                                        function_id,
+                                        block_id,
+                                        instruction_id,
+                                    ),
                                     request.clone(),
                                     InvalidationEpoch::default(),
                                     target,
@@ -572,11 +592,13 @@ impl Vm {
                         Ok(resolved) => {
                             let target = IncludePathCacheTarget::from_resolved(&resolved);
                             self.install_include_path_inline_cache(
-                                cache_id,
-                                unit_key,
-                                function_id,
-                                block_id,
-                                instruction_id,
+                                UnitInlineCacheSite::new(
+                                    cache_id,
+                                    unit_key,
+                                    function_id,
+                                    block_id,
+                                    instruction_id,
+                                ),
                                 request,
                                 InvalidationEpoch::default(),
                                 target,
@@ -728,16 +750,13 @@ impl Vm {
         }
         let mut declaration_diagnostics = Vec::new();
         if let Err(result) = self.emit_duplicate_dynamic_constant_warnings(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             &included,
             DeclarationLoadKind::Include,
             None,
-            output,
-            stack,
-            state,
             &mut declaration_diagnostics,
         ) {
-            return result;
+            return *result;
         }
         register_dynamic_unit(
             state,
@@ -900,16 +919,13 @@ impl Vm {
                 return eval_failure(output, message, stack_trace(compiled, stack));
             }
             if let Err(result) = self.emit_duplicate_dynamic_constant_warnings(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 &evaluated,
                 DeclarationLoadKind::Eval,
                 Some(eval_span),
-                output,
-                stack,
-                state,
                 &mut declaration_diagnostics,
             ) {
-                return result;
+                return *result;
             }
             register_dynamic_unit(
                 state,

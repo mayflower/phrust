@@ -206,7 +206,7 @@ impl Vm {
                 Ok(handled) => handled,
                 Err(result) => {
                     stack.pop_recycle();
-                    return result;
+                    return *result;
                 }
             };
             if !handled && error_reporting_allows(state, PHP_E_WARNING) {
@@ -286,16 +286,17 @@ impl Vm {
                 let mut value =
                     std::mem::replace(&mut direct_values[arg_index], Value::Uninitialized);
                 if let Err(message) = coerce_or_check_param_type(
-                    compiled,
-                    state,
-                    ir_function,
-                    param,
-                    arg_index,
+                    ParamTypecheckRequest {
+                        compiled,
+                        state,
+                        function: ir_function,
+                        param,
+                        arg_index,
+                        fast_path: self.typecheck_fast_path_context(),
+                        strict_types: argument_policy.call_site_strict_types,
+                        call_span: call.call_span,
+                    },
                     &mut value,
-                    false,
-                    self.typecheck_fast_path_context(),
-                    argument_policy.call_site_strict_types,
-                    call.call_span,
                 ) {
                     // Cold: the frame's arguments are elided on this fast
                     // path, so the lazy trace has no source for the failing
@@ -347,16 +348,17 @@ impl Vm {
                 ir_function.params.iter().zip(prepared_args).enumerate()
             {
                 if let Err(message) = coerce_or_check_param_type(
-                    compiled,
-                    state,
-                    ir_function,
-                    param,
-                    arg_index,
+                    ParamTypecheckRequest {
+                        compiled,
+                        state,
+                        function: ir_function,
+                        param,
+                        arg_index,
+                        fast_path: self.typecheck_fast_path_context(),
+                        strict_types: argument_policy.call_site_strict_types,
+                        call_span: call.call_span,
+                    },
                     &mut arg.value,
-                    arg.reference.is_some(),
-                    self.typecheck_fast_path_context(),
-                    argument_policy.call_site_strict_types,
-                    call.call_span,
                 ) {
                     let result = self.runtime_error(output, compiled, stack, message);
                     if let Some(throwable) = runtime_error_throwable(&result) {
@@ -648,15 +650,12 @@ impl Vm {
                         // raised \Error / autoload throwable propagates to outer
                         // frames rather than routing in-frame.
                         let value = match self.fetch_class_constant_value(
-                            compiled,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             &class_name,
                             &constant,
                             Some(cache_site),
                             inline_cache_id,
                             span,
-                            output,
-                            stack,
-                            state,
                         ) {
                             Ok(value) => value,
                             Err(ClassConstantFetch::Throwable(result)) => {
@@ -677,10 +676,7 @@ impl Vm {
                                 let mut exception_handlers = Vec::new();
                                 let mut pending_control = None;
                                 match self.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     &mut exception_handlers,
                                     &mut pending_control,
                                     span,
@@ -776,15 +772,12 @@ impl Vm {
                             );
                         }
                         let value = match self.fetch_static_property_value(
-                            compiled,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             &class_name,
                             &property,
                             Some(cache_site),
                             inline_cache_id,
                             span,
-                            output,
-                            stack,
-                            state,
                         ) {
                             Ok(value) => value,
                             Err(ClassConstantFetch::Throwable(result)) => {
@@ -805,10 +798,7 @@ impl Vm {
                                 let mut exception_handlers = Vec::new();
                                 let mut pending_control = None;
                                 match self.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     &mut exception_handlers,
                                     &mut pending_control,
                                     span,
@@ -899,7 +889,7 @@ impl Vm {
                             Ok(value) => value,
                             Err(result) => {
                                 stack.pop_recycle();
-                                return result;
+                                return *result;
                             }
                         };
                         if let Err(message) = stack
@@ -961,10 +951,7 @@ impl Vm {
                                 let mut exception_handlers = Vec::new();
                                 let mut pending_control = None;
                                 match self.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     &mut exception_handlers,
                                     &mut pending_control,
                                     span,
@@ -1083,10 +1070,7 @@ impl Vm {
                                 let mut exception_handlers = Vec::new();
                                 let mut pending_control = None;
                                 match self.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     &mut exception_handlers,
                                     &mut pending_control,
                                     span,
@@ -1120,10 +1104,7 @@ impl Vm {
                             let mut exception_handlers = Vec::new();
                             let mut pending_control = None;
                             if let Some(outcome) = self.run_destructors_for_unreferenced_value(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 &mut exception_handlers,
                                 &mut pending_control,
                                 &previous_effective,
@@ -1196,9 +1177,7 @@ impl Vm {
                         let span = dense_instruction_span(dense, instruction);
                         let probe = match static_property_isset_empty_result(
                             self,
-                            compiled,
-                            state,
-                            stack,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             &class_name,
                             &property,
                             empty_probe,
@@ -1209,17 +1188,13 @@ impl Vm {
                                 BlockId::new(block_index),
                                 InstrId::new(dense_instruction_index),
                             )),
-                            output,
                         ) {
                             Ok(result) => result,
                             Err(StaticPropertyIssetEmptyError::Runtime(message)) => {
                                 let mut exception_handlers = Vec::new();
                                 let mut pending_control = None;
                                 match self.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     &mut exception_handlers,
                                     &mut pending_control,
                                     span,
@@ -1312,7 +1287,7 @@ impl Vm {
                             Ok(name) => name.to_string_lossy(),
                             Err(result) => {
                                 stack.pop_recycle();
-                                return result;
+                                return *result;
                             }
                         };
                         let object = match self.read_dense_operand(compiled, stack, object) {
@@ -1353,7 +1328,7 @@ impl Vm {
                             Ok(value) => value,
                             Err(result) => {
                                 stack.pop_recycle();
-                                return result;
+                                return *result;
                             }
                         };
                         if let Err(message) = stack
@@ -1436,10 +1411,7 @@ impl Vm {
                                 let mut exception_handlers = Vec::new();
                                 let mut pending_control = None;
                                 match self.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     &mut exception_handlers,
                                     &mut pending_control,
                                     span,
@@ -1628,10 +1600,7 @@ impl Vm {
                                 let mut exception_handlers = Vec::new();
                                 let mut pending_control = None;
                                 match self.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     &mut exception_handlers,
                                     &mut pending_control,
                                     span,
@@ -1777,7 +1746,7 @@ impl Vm {
                         if let Err(result) = self.write_echo(compiled, output, stack, state, &value)
                         {
                             stack.pop_recycle();
-                            return result;
+                            return *result;
                         }
                         if let Err(message) = stack
                             .current_mut()
@@ -1840,17 +1809,16 @@ impl Vm {
                                     if let Some(constant) = resolved.predefined
                                         && let Err(result) = self
                                             .emit_predefined_constant_deprecation(
-                                                compiled,
-                                                output,
-                                                stack,
-                                                state,
+                                                ExecutionCursor::new(
+                                                    compiled, output, stack, state,
+                                                ),
                                                 &mut diagnostics,
                                                 dense_instruction_span(dense, instruction),
                                                 constant,
                                             )
                                     {
                                         stack.pop_recycle();
-                                        return result;
+                                        return *result;
                                     }
                                     resolved.value
                                 }
@@ -1951,13 +1919,10 @@ impl Vm {
                             dense_instruction_span(dense, instruction),
                         );
                         let value = match self.execute_cast(
-                            compiled,
                             kind,
                             &src,
                             source_span,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                         ) {
                             Ok(value) => value,
                             Err(result) => {
@@ -1990,7 +1955,7 @@ impl Vm {
                                     return VmResult::propagating_exception(output.clone());
                                 }
                                 stack.pop_recycle();
-                                return result;
+                                return *result;
                             }
                         };
                         if let Err(message) = stack
@@ -2077,7 +2042,7 @@ impl Vm {
                             Ok(value) => value,
                             Err(result) => {
                                 stack.pop_recycle();
-                                return result;
+                                return *result;
                             }
                         };
                         if let Err(message) = stack
@@ -2158,7 +2123,7 @@ impl Vm {
                             Ok(value) => value,
                             Err(result) => {
                                 stack.pop_recycle();
-                                return result;
+                                return *result;
                             }
                         };
                         // Echo borrows the value, so echo first and move the
@@ -2167,7 +2132,7 @@ impl Vm {
                         if let Err(result) = self.write_echo(compiled, output, stack, state, &value)
                         {
                             stack.pop_recycle();
-                            return result;
+                            return *result;
                         }
                         if let Err(message) = stack
                             .current_mut()
@@ -2363,10 +2328,7 @@ impl Vm {
                             let mut exception_handlers = Vec::new();
                             let mut pending_control = None;
                             if let Some(outcome) = self.run_destructors_for_unreferenced_value(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 &mut exception_handlers,
                                 &mut pending_control,
                                 &previous,
@@ -2443,10 +2405,7 @@ impl Vm {
                         let mut exception_handlers = Vec::new();
                         let mut pending_control = None;
                         if let Some(outcome) = self.run_destructors_for_unreferenced_value(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             &mut exception_handlers,
                             &mut pending_control,
                             &previous,
@@ -2728,19 +2687,16 @@ impl Vm {
                                 let lhs = lhs.into_owned();
                                 let rhs = rhs.into_owned();
                                 match self.execute_binary(
-                                    compiled,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     BinaryOp::Concat,
                                     &lhs,
                                     &rhs,
                                     runtime_source_span(compiled, span),
-                                    output,
-                                    stack,
-                                    state,
                                 ) {
                                     Ok(value) => value,
                                     Err(result) => {
                                         stack.pop_recycle();
-                                        return result;
+                                        return *result;
                                     }
                                 }
                             }
@@ -2751,7 +2707,7 @@ impl Vm {
                         if let Err(result) = self.write_echo(compiled, output, stack, state, &value)
                         {
                             stack.pop_recycle();
-                            return result;
+                            return *result;
                         }
                         if let Err(message) = stack
                             .current_mut()
@@ -2808,7 +2764,7 @@ impl Vm {
                             state,
                         ) {
                             stack.pop_recycle();
-                            return result;
+                            return *result;
                         }
                     }
                     DenseOpcode::CompareEqual
@@ -2903,18 +2859,19 @@ impl Vm {
                             );
                         }
                         let result = self.execute_include(
-                            compiled,
-                            inline_cache_id,
-                            compiled_unit_cache_key(compiled),
-                            function_id,
-                            BlockId::new(block_index),
-                            InstrId::new(dense_instruction_index),
-                            dense_instruction_span(dense, instruction),
-                            kind,
-                            &path,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
+                            IncludeExecutionRequest {
+                                site: UnitInlineCacheSite::new(
+                                    inline_cache_id,
+                                    compiled_unit_cache_key(compiled),
+                                    function_id,
+                                    BlockId::new(block_index),
+                                    InstrId::new(dense_instruction_index),
+                                ),
+                                instruction_span: dense_instruction_span(dense, instruction),
+                                kind,
+                                path: &path,
+                            },
                         );
                         if !result.status.is_success() || state.pending_throw.is_some() {
                             if include_failure_allows_continuation(kind, &result) {
@@ -3028,10 +2985,7 @@ impl Vm {
                                     let mut pending_control = None;
                                     if let Some(outcome) = self
                                         .run_destructors_for_unreferenced_value(
-                                            compiled,
-                                            output,
-                                            stack,
-                                            state,
+                                            ExecutionCursor::new(compiled, output, stack, state),
                                             &mut exception_handlers,
                                             &mut pending_control,
                                             &value,
@@ -3161,10 +3115,12 @@ impl Vm {
                                 InlineCacheKind::FunctionCall,
                             );
                             self.lookup_function_call_inline_cache(
-                                compiled,
-                                function_id,
-                                BlockId::new(block_index),
-                                dense_instruction_id,
+                                IrInlineCacheSite::classic(
+                                    compiled,
+                                    function_id,
+                                    BlockId::new(block_index),
+                                    dense_instruction_id,
+                                ),
                                 &lowered_name,
                                 epoch,
                                 &call_shape,
@@ -3204,10 +3160,12 @@ impl Vm {
                                 );
                             } else {
                                 self.install_function_call_inline_cache(
-                                    compiled,
-                                    function_id,
-                                    BlockId::new(block_index),
-                                    dense_instruction_id,
+                                    IrInlineCacheSite::classic(
+                                        compiled,
+                                        function_id,
+                                        BlockId::new(block_index),
+                                        dense_instruction_id,
+                                    ),
                                     &lowered_name,
                                     epoch,
                                     call_shape,
@@ -3346,13 +3304,10 @@ impl Vm {
                                     // the tier never engages on real (dense) code.
                                     #[cfg(feature = "jit-copy-patch")]
                                     let native = self.try_execute_profiled_copy_patch_leaf(
-                                        compiled,
+                                        ExecutionCursor::new(compiled, output, stack, state),
                                         function,
                                         ir_function,
                                         &call,
-                                        output,
-                                        stack,
-                                        state,
                                     );
                                     #[cfg(not(feature = "jit-copy-patch"))]
                                     let native: Option<VmResult> = None;
@@ -3415,7 +3370,7 @@ impl Vm {
                             }
                         } else {
                             self.execute_function_call_target(
-                                compiled,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 target,
                                 values,
                                 Some((
@@ -3425,9 +3380,6 @@ impl Vm {
                                     InstrId::new(dense_instruction_index),
                                 )),
                                 dense.spans.get(instruction.span.index()).copied(),
-                                output,
-                                stack,
-                                state,
                                 &None,
                             )
                         };
@@ -3490,10 +3442,7 @@ impl Vm {
                             let mut exception_handlers = Vec::new();
                             let mut pending_control = None;
                             if let Some(outcome) = self.run_destructors_for_unreferenced_value(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 &mut exception_handlers,
                                 &mut pending_control,
                                 &value,
@@ -3669,10 +3618,7 @@ impl Vm {
                                 let mut exception_handlers = Vec::new();
                                 let mut pending_control = None;
                                 match self.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     &mut exception_handlers,
                                     &mut pending_control,
                                     dense
@@ -4465,7 +4411,7 @@ impl Vm {
                                         Ok(value) => value,
                                         Err(result) => {
                                             stack.pop_recycle();
-                                            return result;
+                                            return *result;
                                         }
                                     }
                                 }
@@ -4531,7 +4477,10 @@ impl Vm {
                             .copied()
                             .unwrap_or_default();
                         match self.try_userland_arrayaccess_offset_exists_local(
-                            compiled, output, stack, state, local, &dims, span,
+                            ExecutionCursor::new(compiled, output, stack, state),
+                            local,
+                            &dims,
+                            span,
                         ) {
                             Ok(Some(result)) => {
                                 if let Err(message) = stack
@@ -4551,7 +4500,7 @@ impl Vm {
                             Ok(None) => {}
                             Err(result) => {
                                 stack.pop_recycle();
-                                return result;
+                                return *result;
                             }
                         }
                         let local_value = if is_globals_local(ir_function, local) {
@@ -4564,19 +4513,16 @@ impl Vm {
                             .and_then(|value| spl_array_access_dim_target(value, &dims))
                         {
                             let exists = match self.call_array_access_dim_method(
-                                compiled,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 object,
                                 "offsetExists",
                                 key_value,
                                 Some(span),
-                                output,
-                                stack,
-                                state,
                             ) {
                                 Ok(value) => value,
                                 Err(result) => {
                                     stack.pop_recycle();
-                                    return result;
+                                    return *result;
                                 }
                             };
                             match to_bool(&exists) {
@@ -4659,7 +4605,10 @@ impl Vm {
                             .copied()
                             .unwrap_or_default();
                         match self.try_userland_arrayaccess_offset_empty_local(
-                            compiled, output, stack, state, local, &dims, span,
+                            ExecutionCursor::new(compiled, output, stack, state),
+                            local,
+                            &dims,
+                            span,
                         ) {
                             Ok(Some(result)) => {
                                 if let Err(message) = stack
@@ -4679,7 +4628,7 @@ impl Vm {
                             Ok(None) => {}
                             Err(result) => {
                                 stack.pop_recycle();
-                                return result;
+                                return *result;
                             }
                         }
                         let local_value = if is_globals_local(ir_function, local) {
@@ -4692,19 +4641,16 @@ impl Vm {
                             .and_then(|value| spl_array_access_dim_target(value, &dims))
                         {
                             let exists = match self.call_array_access_dim_method(
-                                compiled,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 object.clone(),
                                 "offsetExists",
                                 key_value.clone(),
                                 Some(span),
-                                output,
-                                stack,
-                                state,
                             ) {
                                 Ok(value) => value,
                                 Err(result) => {
                                     stack.pop_recycle();
-                                    return result;
+                                    return *result;
                                 }
                             };
                             let exists = match to_bool(&exists) {
@@ -4718,19 +4664,16 @@ impl Vm {
                             };
                             if exists {
                                 match self.call_array_access_dim_method(
-                                    compiled,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     object,
                                     "offsetGet",
                                     key_value,
                                     Some(span),
-                                    output,
-                                    stack,
-                                    state,
                                 ) {
                                     Ok(value) => value,
                                     Err(result) => {
                                         stack.pop_recycle();
-                                        return result;
+                                        return *result;
                                     }
                                 }
                             } else {
@@ -4827,7 +4770,10 @@ impl Vm {
                             .copied()
                             .unwrap_or_default();
                         match self.try_userland_arrayaccess_offset_unset_local(
-                            compiled, output, stack, state, local, &dims, span,
+                            ExecutionCursor::new(compiled, output, stack, state),
+                            local,
+                            &dims,
+                            span,
                         ) {
                             Ok(true) => {
                                 self.record_lvalue_trace_event("array-unset-dim", local, &dims);
@@ -4837,7 +4783,7 @@ impl Vm {
                             Ok(false) => {}
                             Err(result) => {
                                 stack.pop_recycle();
-                                return result;
+                                return *result;
                             }
                         }
                         let local_value = if is_globals_local(ir_function, local) {
@@ -4850,14 +4796,11 @@ impl Vm {
                             .and_then(|value| spl_array_access_dim_target(value, &dims))
                         {
                             match self.call_array_access_dim_method(
-                                compiled,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 object,
                                 "offsetUnset",
                                 key_value,
                                 Some(span),
-                                output,
-                                stack,
-                                state,
                             ) {
                                 Ok(_) => {
                                     self.record_lvalue_trace_event("array-unset-dim", local, &dims);
@@ -4866,7 +4809,7 @@ impl Vm {
                                 }
                                 Err(result) => {
                                     stack.pop_recycle();
-                                    return result;
+                                    return *result;
                                 }
                             }
                         }
@@ -4940,10 +4883,7 @@ impl Vm {
                         let local = LocalId::new(local);
                         let append = instruction.opcode == DenseOpcode::AppendDim;
                         match self.try_userland_arrayaccess_offset_set_local(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             local,
                             &dim_values,
                             append,
@@ -4972,7 +4912,7 @@ impl Vm {
                             Ok(false) => {}
                             Err(result) => {
                                 stack.pop_recycle();
-                                return result;
+                                return *result;
                             }
                         }
                         let dims = match dim_values_to_array_keys(&dim_values) {
@@ -5010,7 +4950,7 @@ impl Vm {
                                         }
                                         Err(result) => {
                                             stack.pop_recycle();
-                                            return result;
+                                            return *result;
                                         }
                                     }
                                 }
@@ -5179,7 +5119,7 @@ impl Vm {
                             Ok(iterator) => iterator,
                             Err(result) => {
                                 stack.pop_recycle();
-                                return result;
+                                return *result;
                             }
                         };
                         self.record_runtime_trace_event(|| {
@@ -5213,10 +5153,7 @@ impl Vm {
                             return result;
                         };
                         let next_value = match self.next_foreach_value(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             &mut foreach_iterators,
                             RegId::new(iterator),
                             key.is_some(),
@@ -5224,7 +5161,7 @@ impl Vm {
                             Ok(next) => next,
                             Err(result) => {
                                 stack.pop_recycle();
-                                return result;
+                                return *result;
                             }
                         };
                         let frame = stack
@@ -5284,10 +5221,7 @@ impl Vm {
                             let mut exception_handlers = Vec::new();
                             let mut pending_control = None;
                             if let Some(outcome) = self.run_destructors_for_unreferenced_value(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 &mut exception_handlers,
                                 &mut pending_control,
                                 &value,
@@ -5366,7 +5300,15 @@ impl Vm {
                             match object_read.as_value() {
                                 Value::Object(object) => {
                                     match self.property_dim_probe(
-                                        compiled, state, stack, object, property, &dims, is_empty,
+                                        compiled,
+                                        state,
+                                        stack,
+                                        PropertyDimProbe {
+                                            object,
+                                            property,
+                                            dims: &dims,
+                                            is_empty,
+                                        },
                                     ) {
                                         Ok(value) => Value::Bool(value),
                                         Err(message) => {
@@ -5526,7 +5468,7 @@ impl Vm {
                             Ok(value) => value,
                             Err(result) => {
                                 stack.pop_recycle();
-                                return result;
+                                return *result;
                             }
                         };
                         if let Err(message) = stack
@@ -5616,7 +5558,7 @@ impl Vm {
                             Ok(value) => value,
                             Err(result) => {
                                 stack.pop_recycle();
-                                return result;
+                                return *result;
                             }
                         };
                         if let Err(message) = stack
@@ -5662,7 +5604,7 @@ impl Vm {
                                 self.write_echo(compiled, output, stack, state, &value)
                             {
                                 stack.pop_recycle();
-                                return result;
+                                return *result;
                             }
                         }
                     }
@@ -5688,10 +5630,7 @@ impl Vm {
                         let mut exception_handlers = Vec::new();
                         let mut pending_control = None;
                         if let Some(outcome) = self.run_destructors_for_unreferenced_value(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             &mut exception_handlers,
                             &mut pending_control,
                             &value,
@@ -5915,7 +5854,7 @@ impl Vm {
                                 Ok(code) => code,
                                 Err(result) => {
                                     stack.pop_recycle();
-                                    return result;
+                                    return *result;
                                 }
                             };
                         state.process_exit_code = Some(code);

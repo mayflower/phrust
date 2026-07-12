@@ -1,6 +1,12 @@
 use super::builtin_adapter::builtin_source_span;
 use super::prelude::*;
 
+pub(super) struct SplIteratorAttachment<'a> {
+    iterator: Value,
+    info: Value,
+    type_error_prefix: &'a str,
+}
+
 impl Vm {
     pub(super) fn call_spl_multiple_iterator_attach_method(
         &self,
@@ -10,7 +16,7 @@ impl Vm {
         args: Vec<CallArgument>,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
         let method = normalize_method_name(method);
         let max_args = if method == "offsetset" { 2 } else { 3 };
         validate_spl_iterator_arg_count(&object.class_name(), &args, 1, max_args)
@@ -21,7 +27,7 @@ impl Vm {
             .map(|arg| arg.value.clone())
             .unwrap_or(Value::Null);
         if method == "offsetset" && args.len() != 2 {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
@@ -30,14 +36,16 @@ impl Vm {
                     object.display_name(),
                     args.len()
                 ),
-            ));
+            )));
         }
         self.spl_multiple_iterator_attach(
             compiled,
             object,
-            iterator,
-            info,
-            "MultipleIterator::attachIterator(): Argument #1 ($iterator) must be of type Iterator",
+            SplIteratorAttachment {
+                iterator,
+                info,
+                type_error_prefix: "MultipleIterator::attachIterator(): Argument #1 ($iterator) must be of type Iterator",
+            },
             output,
             stack,
         )?;
@@ -52,13 +60,15 @@ impl Vm {
         info: Value,
         output: &mut OutputBuffer,
         stack: &CallStack,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         self.spl_multiple_iterator_attach(
             compiled,
             object,
-            iterator,
-            info,
-            "Can only attach objects that implement the Iterator interface",
+            SplIteratorAttachment {
+                iterator,
+                info,
+                type_error_prefix: "Can only attach objects that implement the Iterator interface",
+            },
             output,
             stack,
         )
@@ -68,20 +78,23 @@ impl Vm {
         &self,
         compiled: &CompiledUnit,
         object: &ObjectRef,
-        iterator: Value,
-        info: Value,
-        type_error_prefix: &str,
+        attachment: SplIteratorAttachment<'_>,
         output: &mut OutputBuffer,
         stack: &CallStack,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
+        let SplIteratorAttachment {
+            iterator,
+            info,
+            type_error_prefix,
+        } = attachment;
         let Value::Object(iterator_object) = effective_value(&iterator) else {
             let message = spl_multiple_iterator_type_error(type_error_prefix, &iterator);
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
                 format!("E_PHP_VM_SPL_TYPE_ERROR: {message}"),
-            ));
+            )));
         };
         let is_iterator = object_instanceof(
             compiled,
@@ -94,28 +107,33 @@ impl Vm {
                 type_error_prefix,
                 &Value::Object(iterator_object.clone()),
             );
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
                 format!("E_PHP_VM_SPL_TYPE_ERROR: {message}"),
-            ));
+            )));
         }
-        spl_multiple_iterator_attach_validated(object, iterator_object, info)
-            .map_err(|message| self.runtime_error(output, compiled, stack, message))
+        Ok(
+            spl_multiple_iterator_attach_validated(object, iterator_object, info)
+                .map_err(|message| self.runtime_error(output, compiled, stack, message))?,
+        )
     }
 
     pub(super) fn call_spl_append_iterator_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         method: &str,
         args: Vec<CallArgument>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         call_span: Option<IrSpan>,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let method = normalize_method_name(method);
         match method.as_str() {
             "append" => {
@@ -127,7 +145,7 @@ impl Vm {
                     },
                 )?;
                 if !spl_bool_property(object, "__append_initialized") {
-                    return Err(self.runtime_error_at_optional_span(
+                    return Err(Box::new(self.runtime_error_at_optional_span(
                         compiled,
                         output,
                         stack,
@@ -135,10 +153,10 @@ impl Vm {
                         call_span,
                         "E_PHP_VM_SPL_ERROR: The object is in an invalid state as the parent constructor was not called"
                             .to_string(),
-                    ));
+                    )));
                 }
                 let Value::Object(iterator) = effective_value(&args[0].value) else {
-                    return Err(self.runtime_error_at_optional_span(
+                    return Err(Box::new(self.runtime_error_at_optional_span(
                         compiled,
                         output,
                         stack,
@@ -148,7 +166,7 @@ impl Vm {
                             "E_PHP_VM_SPL_TYPE_ERROR: AppendIterator::append(): Argument #1 ($iterator) must be of type Iterator, {} given",
                             type_error_value_name(&args[0].value)
                         ),
-                    ));
+                    )));
                 };
                 let is_iterator =
                     object_instanceof(compiled, &Value::Object(iterator.clone()), "Iterator")
@@ -158,7 +176,7 @@ impl Vm {
                             )
                         })?;
                 if !is_iterator {
-                    return Err(self.runtime_error_at_optional_span(
+                    return Err(Box::new(self.runtime_error_at_optional_span(
                         compiled,
                         output,
                         stack,
@@ -168,7 +186,7 @@ impl Vm {
                             "E_PHP_VM_SPL_TYPE_ERROR: AppendIterator::append(): Argument #1 ($iterator) must be of type Iterator, {} given",
                             type_error_value_name(&Value::Object(iterator.clone()))
                         ),
-                    ));
+                    )));
                 }
                 let iterator_id = iterator.id() as i64;
                 if !spl_append_rewound_iterator_ids(object).contains(&iterator_id) {
@@ -177,7 +195,7 @@ impl Vm {
                     )?;
                     spl_append_note_rewound_iterator_id(object, iterator_id);
                 }
-                call_spl_iterator_method(
+                Ok(call_spl_iterator_method(
                     object.clone(),
                     "append",
                     args,
@@ -187,7 +205,7 @@ impl Vm {
                     self.runtime_error_at_optional_span(
                         compiled, output, stack, state, call_span, message,
                     )
-                })
+                })?)
             }
             "rewind" => {
                 validate_spl_iterator_arg_count(&object.class_name(), &args, 0, 0).map_err(
@@ -237,14 +255,17 @@ impl Vm {
 
     pub(super) fn call_spl_multiple_iterator_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         method: &str,
         args: Vec<CallArgument>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let method = normalize_method_name(method);
         validate_spl_iterator_arg_count(&object.class_name(), &args, 0, 0)
             .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
@@ -295,7 +316,7 @@ impl Vm {
             "key" => self.call_spl_multiple_iterator_collect_method(
                 compiled, object, "key", output, stack, state,
             ),
-            _ => Err(self.runtime_error(
+            _ => Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
@@ -303,7 +324,7 @@ impl Vm {
                     "E_PHP_VM_UNKNOWN_METHOD: method {}::{method} is not defined",
                     object.class_name()
                 ),
-            )),
+            ))),
         }
     }
 
@@ -315,15 +336,15 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
         let records = spl_multiple_iterator_records(object);
         if records.is_empty() {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
                 format!("E_PHP_VM_SPL_RUNTIME_EXCEPTION: Called {method}() on an invalid iterator"),
-            ));
+            )));
         }
         let use_assoc = spl_multiple_iterator_uses_assoc_keys(object);
         let need_all = spl_multiple_iterator_needs_all(object);
@@ -342,14 +363,14 @@ impl Vm {
                 .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
             any_valid |= valid;
             if need_all && !valid {
-                return Err(self.runtime_error(
+                return Err(Box::new(self.runtime_error(
                     output,
                     compiled,
                     stack,
                     format!(
                         "E_PHP_VM_SPL_RUNTIME_EXCEPTION: Called {method}() with non valid sub iterator"
                     ),
-                ));
+                )));
             }
             let outer_key = if use_assoc {
                 spl_multiple_iterator_info_key(&info)
@@ -373,39 +394,42 @@ impl Vm {
             values.insert(outer_key, value);
         }
         if !any_valid {
-            return Err(self.runtime_error(
+            return Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
                 format!(
                     "E_PHP_VM_SPL_RUNTIME_EXCEPTION: Called {method}() with non valid sub iterator"
                 ),
-            ));
+            )));
         }
         Ok(Value::Array(values))
     }
 
     pub(super) fn call_spl_infinite_iterator_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         method: &str,
         args: Vec<CallArgument>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let normalized_method = normalize_method_name(method);
         validate_spl_iterator_arg_count(&object.class_name(), &args, 0, 0)
             .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
         let Some(inner) = spl_inner_iterator_delegation_target(object) else {
-            return call_spl_iterator_method(
+            return Ok(call_spl_iterator_method(
                 object.clone(),
                 method,
                 Vec::new(),
                 &self.options.runtime_context,
             )
-            .map_err(|message| self.runtime_error(output, compiled, stack, message));
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))?);
         };
         match normalized_method.as_str() {
             "rewind" => {
@@ -450,26 +474,29 @@ impl Vm {
 
     pub(super) fn call_spl_limit_iterator_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         method: &str,
         args: Vec<CallArgument>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let normalized_method = normalize_method_name(method);
         let max_args = if normalized_method == "seek" { 1 } else { 0 };
         validate_spl_iterator_arg_count(&object.class_name(), &args, max_args, max_args)
             .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
         let Some(inner) = spl_inner_iterator_delegation_target(object) else {
-            return call_spl_iterator_method(
+            return Ok(call_spl_iterator_method(
                 object.clone(),
                 method,
                 args,
                 &self.options.runtime_context,
             )
-            .map_err(|message| self.runtime_error(output, compiled, stack, message));
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))?);
         };
         match normalized_method.as_str() {
             "rewind" => {
@@ -486,13 +513,10 @@ impl Vm {
                     spl_delegation_target_supports_method(compiled, state, &inner, "seek");
                 if offset > 0 && inner_supports_seek {
                     self.call_object_method_value_with_positional_args(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         inner,
                         "seek",
                         vec![Value::Int(offset as i64)],
-                        output,
-                        stack,
-                        state,
                     )?;
                 } else {
                     for _ in 0..offset {
@@ -591,37 +615,34 @@ impl Vm {
                     .max(0) as usize;
                 let offset = spl_limit_offset(object);
                 if position < offset {
-                    return Err(self.runtime_error(
+                    return Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         stack,
                         format!(
                             "E_PHP_VM_SPL_OUT_OF_BOUNDS: Cannot seek to {position} which is below the offset {offset}"
                         ),
-                    ));
+                    )));
                 }
                 if let Some(count) = spl_limit_count(object) {
                     let upper = offset.saturating_add(count);
                     if position >= upper {
-                        return Err(self.runtime_error(
+                        return Err(Box::new(self.runtime_error(
                             output,
                             compiled,
                             stack,
                             format!(
                                 "E_PHP_VM_SPL_OUT_OF_BOUNDS: Cannot seek to {position} which is behind offset {offset} plus count {count}"
                             ),
-                        ));
+                        )));
                     }
                 }
                 if spl_delegation_target_supports_method(compiled, state, &inner, "seek") {
                     self.call_object_method_value_with_positional_args(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         inner,
                         "seek",
                         vec![Value::Int(position as i64)],
-                        output,
-                        stack,
-                        state,
                     )?;
                     spl_set_bool_property(object, "__limit_seek_pending_current_check", true);
                     spl_set_bool_property(object, "__limit_cached_after_seek", false);
@@ -700,25 +721,28 @@ impl Vm {
 
     pub(super) fn call_spl_caching_iterator_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         method: &str,
         args: Vec<CallArgument>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let normalized_method = normalize_method_name(method);
         validate_spl_iterator_arg_count(&object.class_name(), &args, 0, 0)
             .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
         let Some(inner) = spl_inner_iterator_delegation_target(object) else {
-            return call_spl_iterator_method(
+            return Ok(call_spl_iterator_method(
                 object.clone(),
                 method,
                 args,
                 &self.options.runtime_context,
             )
-            .map_err(|message| self.runtime_error(output, compiled, stack, message));
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))?);
         };
         match normalized_method.as_str() {
             "rewind" => {
@@ -813,7 +837,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<bool, VmResult> {
+    ) -> Result<bool, Box<VmResult>> {
         if spl_bool_property(object, "__caching_live_initialized") {
             return Ok(spl_bool_property(object, "__caching_live_valid"));
         }
@@ -853,7 +877,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         let valid =
             self.call_object_method_value(compiled, inner.clone(), "valid", output, stack, state)?;
         if !to_bool(&valid)
@@ -879,14 +903,17 @@ impl Vm {
 
     pub(super) fn call_spl_no_rewind_iterator_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         method: &str,
         args: Vec<CallArgument>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let normalized_method = normalize_method_name(method);
         validate_spl_iterator_arg_count(&object.class_name(), &args, 0, 0)
             .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
@@ -897,13 +924,13 @@ impl Vm {
             return Ok(Value::Null);
         }
         let Some(inner) = spl_inner_iterator_delegation_target(object) else {
-            return call_spl_iterator_method(
+            return Ok(call_spl_iterator_method(
                 object.clone(),
                 method,
                 Vec::new(),
                 &self.options.runtime_context,
             )
-            .map_err(|message| self.runtime_error(output, compiled, stack, message));
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))?);
         };
         match normalized_method.as_str() {
             "valid" => {
@@ -944,7 +971,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<bool, VmResult> {
+    ) -> Result<bool, Box<VmResult>> {
         while spl_position(&object) < spl_entries(&object).len() {
             object.set_property("__regex_accept_pre_parent", Value::Bool(true));
             state.suppress_array_to_string_warnings =
@@ -981,7 +1008,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         if !spl_rii_current_enters_recursive_caching_child(object)
             || spl_rii_array_string_warning_was_emitted(object)
         {
@@ -1007,7 +1034,7 @@ impl Vm {
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> Result<PhpString, VmResult> {
+    ) -> Result<PhpString, Box<VmResult>> {
         let flags = spl_caching_iterator_flags(object);
         let Some((key, value)) = spl_current_entry(object) else {
             return Ok(PhpString::from_bytes(Vec::new()));
@@ -1054,27 +1081,30 @@ impl Vm {
             );
             return Ok(PhpString::from_bytes(bytes));
         }
-        Err(self.runtime_error_with_source_span(
+        Err(Box::new(self.runtime_error_with_source_span(
             output,
             compiled,
             stack,
             source_span,
             "E_PHP_VM_SPL_BAD_METHOD_CALL: CachingIterator does not fetch string value (see CachingIterator::__construct)"
                 .to_owned(),
-        ))
+        )))
     }
 
     pub(super) fn call_spl_caching_iterator_offset_access_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         method: &str,
         args: Vec<CallArgument>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let normalized = normalize_method_name(method);
         if let Err(message) = validate_spl_iterator_arg_count(&object.class_name(), &args, 1, 1) {
             return self.runtime_error(output, compiled, stack, message);
@@ -1091,18 +1121,15 @@ impl Vm {
             .unwrap_or_default();
         let mut diagnostics = Vec::new();
         let (key, key_string) = match self.spl_caching_iterator_offset_key(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             object,
             &normalized,
             &args[0].value,
             source_span.clone(),
-            output,
-            stack,
-            state,
             &mut diagnostics,
         ) {
             Ok(key) => key,
-            Err(result) => return result,
+            Err(result) => return *result,
         };
 
         let cache = spl_caching_iterator_cache(object);
@@ -1140,7 +1167,7 @@ impl Vm {
                 .dispatch_error_handler(compiled, output, stack, state, level, diagnostic)
             {
                 Ok(handled) => handled,
-                Err(result) => return result,
+                Err(result) => return *result,
             };
             if !handled && error_reporting_allows(state, level) {
                 emit_vm_diagnostic(output, state, diagnostic, channel, level);
@@ -1151,16 +1178,19 @@ impl Vm {
 
     pub(super) fn spl_caching_iterator_offset_key(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         object: &ObjectRef,
         method: &str,
         value: &Value,
         source_span: RuntimeSourceSpan,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         diagnostics: &mut Vec<RuntimeDiagnostic>,
-    ) -> Result<(ArrayKey, PhpString), VmResult> {
+    ) -> Result<(ArrayKey, PhpString), Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let string = match effective_value(value) {
             Value::Null => {
                 diagnostics.push(RuntimeDiagnostic::new(
@@ -1185,7 +1215,7 @@ impl Vm {
                     stack,
                     state,
                 )? {
-                    return Err(self.runtime_error(
+                    return Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         stack,
@@ -1195,7 +1225,7 @@ impl Vm {
                             spl_iterator_display_method(method),
                             key_object.display_name()
                         ),
-                    ));
+                    )));
                 }
                 self.object_to_string(compiled, key_object, output, stack, state)?
             }

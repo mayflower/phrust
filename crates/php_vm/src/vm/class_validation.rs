@@ -7,18 +7,18 @@ pub(super) struct VmCompileError {
 }
 
 impl VmCompileError {
-    pub(super) fn new(message: impl Into<String>) -> Self {
-        Self {
+    pub(super) fn new(message: impl Into<String>) -> Box<Self> {
+        Box::new(Self {
             message: message.into(),
             diagnostic: None,
-        }
+        })
     }
 
     pub(super) fn typed(
         compiled: &CompiledUnit,
         payload: VmCompileDiagnostic,
         span: IrSpan,
-    ) -> Self {
+    ) -> Box<Self> {
         let message = payload.status_message();
         let diagnostic = RuntimeDiagnostic::with_payload(
             payload.id(),
@@ -29,10 +29,10 @@ impl VmCompileError {
             Some(php_runtime::api::PhpReferenceClassification::FatalError),
             RuntimeDiagnosticPayload::VmCompile(payload),
         );
-        Self {
+        Box::new(Self {
             message,
             diagnostic: Some(diagnostic),
-        }
+        })
     }
 
     pub(super) fn into_parts(self) -> (String, Option<RuntimeDiagnostic>) {
@@ -40,19 +40,19 @@ impl VmCompileError {
     }
 }
 
-impl From<String> for VmCompileError {
+impl From<String> for Box<VmCompileError> {
     fn from(message: String) -> Self {
-        Self::new(message)
+        VmCompileError::new(message)
     }
 }
 
-impl From<&str> for VmCompileError {
+impl From<&str> for Box<VmCompileError> {
     fn from(message: &str) -> Self {
-        Self::new(message)
+        VmCompileError::new(message)
     }
 }
 
-pub(super) fn validate_class_table(compiled: &CompiledUnit) -> Result<(), VmCompileError> {
+pub(super) fn validate_class_table(compiled: &CompiledUnit) -> Result<(), Box<VmCompileError>> {
     for class in compiled.class_table() {
         if class.flags.is_final && class.flags.is_abstract {
             return Err(format!(
@@ -177,7 +177,7 @@ pub(super) fn validate_class_table(compiled: &CompiledUnit) -> Result<(), VmComp
 pub(super) fn validate_traversable_direct_implementation(
     compiled: &CompiledUnit,
     class: &php_ir::module::ClassEntry,
-) -> Result<(), VmCompileError> {
+) -> Result<(), Box<VmCompileError>> {
     if !class
         .interfaces
         .iter()
@@ -204,7 +204,7 @@ pub(super) fn validate_traversable_direct_implementation(
 pub(super) fn validate_interface_declaration(
     compiled: &CompiledUnit,
     class: &php_ir::module::ClassEntry,
-) -> Result<(), VmCompileError> {
+) -> Result<(), Box<VmCompileError>> {
     for constant in &class.constants {
         if constant.flags.is_private || constant.flags.is_protected {
             return Err(VmCompileError::typed(
@@ -362,7 +362,7 @@ pub(super) fn validate_internal_interface_implementation(
     compiled: &CompiledUnit,
     class: &php_ir::module::ClassEntry,
     interface_name: &str,
-) -> Result<(), VmCompileError> {
+) -> Result<(), Box<VmCompileError>> {
     if normalize_class_name(interface_name) == "datetimeinterface" {
         return Ok(());
     }
@@ -488,7 +488,7 @@ pub(super) fn validate_final_method_overrides(
     compiled: &CompiledUnit,
     class: &php_ir::module::ClassEntry,
     parent: &php_ir::module::ClassEntry,
-) -> Result<(), VmCompileError> {
+) -> Result<(), Box<VmCompileError>> {
     for method in &class.methods {
         if let Some(parent_method) =
             lookup_method_in_hierarchy(compiled, parent, &method.name, None)?
@@ -514,7 +514,7 @@ pub(super) fn validate_parent_method_compatibility(
     compiled: &CompiledUnit,
     class: &php_ir::module::ClassEntry,
     parent: &php_ir::module::ClassEntry,
-) -> Result<(), VmCompileError> {
+) -> Result<(), Box<VmCompileError>> {
     for method in &class.methods {
         let Some(parent_method) = lookup_method_in_hierarchy(compiled, parent, &method.name, None)?
         else {
@@ -659,7 +659,7 @@ pub(super) fn validate_parent_property_compatibility(
     compiled: &CompiledUnit,
     class: &php_ir::module::ClassEntry,
     parent: &php_ir::module::ClassEntry,
-) -> Result<(), VmCompileError> {
+) -> Result<(), Box<VmCompileError>> {
     for property in &class.properties {
         let Some(parent_property) =
             lookup_property_in_hierarchy(compiled, parent, &property.name, None)?
@@ -737,7 +737,7 @@ pub(super) fn validate_parent_constant_compatibility(
     compiled: &CompiledUnit,
     class: &php_ir::module::ClassEntry,
     parent: &php_ir::module::ClassEntry,
-) -> Result<(), VmCompileError> {
+) -> Result<(), Box<VmCompileError>> {
     for constant in &class.constants {
         let Some(parent_constant) =
             lookup_constant_in_hierarchy(compiled, parent, &constant.name, None)?
@@ -919,7 +919,7 @@ pub(super) fn method_type_display(type_: &IrReturnType) -> String {
 pub(super) fn validate_no_unimplemented_abstract_methods(
     compiled: &CompiledUnit,
     class: &php_ir::module::ClassEntry,
-) -> Result<(), VmCompileError> {
+) -> Result<(), Box<VmCompileError>> {
     let mut lineage = Vec::new();
     collect_class_lineage_compiled(compiled, class, &mut lineage)?;
     for declaring in lineage {
@@ -950,7 +950,7 @@ pub(super) fn validate_interface_implementation(
     compiled: &CompiledUnit,
     class: &php_ir::module::ClassEntry,
     interface: &php_ir::module::ClassEntry,
-) -> Result<(), VmCompileError> {
+) -> Result<(), Box<VmCompileError>> {
     for parent_name in &interface.interfaces {
         let Some(parent) = compiled.lookup_class(parent_name) else {
             if is_internal_interface(parent_name) {
@@ -1011,7 +1011,7 @@ pub(super) fn validate_interface_implementation(
 pub(super) fn validate_inherited_interface_implementations(
     compiled: &CompiledUnit,
     class: &php_ir::module::ClassEntry,
-) -> Result<(), VmCompileError> {
+) -> Result<(), Box<VmCompileError>> {
     let mut lineage = Vec::new();
     collect_class_lineage_compiled(compiled, class, &mut lineage)?;
     let mut seen = Vec::new();

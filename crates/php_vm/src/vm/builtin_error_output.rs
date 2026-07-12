@@ -303,7 +303,7 @@ impl Vm {
         } else {
             match self.dispatch_error_handler(compiled, output, stack, state, level, &diagnostic) {
                 Ok(handled) => handled,
-                Err(result) => return result,
+                Err(result) => return *result,
             }
         };
         if handled {
@@ -345,7 +345,7 @@ impl Vm {
         state: &mut ExecutionState,
         level: i64,
         diagnostic: &RuntimeDiagnostic,
-    ) -> Result<bool, VmResult> {
+    ) -> Result<bool, Box<VmResult>> {
         let Some(handler) = state
             .error_handlers
             .last()
@@ -379,7 +379,7 @@ impl Vm {
             state,
         );
         if !result.status.is_success() {
-            return Err(result);
+            return Err(Box::new(result));
         }
         Ok(!matches!(
             result.return_value.as_ref(),
@@ -418,15 +418,18 @@ impl Vm {
 
     pub(super) fn emit_undefined_property_warning(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
         diagnostics: &mut Vec<RuntimeDiagnostic>,
         class_name: &str,
         property: &str,
         span: php_ir::IrSpan,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let diagnostic = RuntimeDiagnostic::new(
             "E_PHP_VM_UNDEFINED_PROPERTY",
             RuntimeSeverity::Warning,
@@ -459,15 +462,18 @@ impl Vm {
 
     pub(super) fn emit_non_object_property_read_warning(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
         diagnostics: &mut Vec<RuntimeDiagnostic>,
         receiver_type: &str,
         property: &str,
         span: php_ir::IrSpan,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let diagnostic = RuntimeDiagnostic::new(
             "E_PHP_VM_PROPERTY_FETCH_NON_OBJECT",
             RuntimeSeverity::Warning,

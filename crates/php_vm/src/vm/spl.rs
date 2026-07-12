@@ -1,8 +1,6 @@
 //! Runtime implementations of the SPL classes (iterators, ArrayObject/ArrayIterator,
 //! SplStack/Queue/DoublyLinkedList, SplHeap/PriorityQueue, SplFixedArray, SplObjectStorage,
 //! Recursive* iterators, and related helpers), extracted from the VM module.
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::result_large_err)]
 
 use super::prelude::*;
 

@@ -135,16 +135,30 @@ pub(super) fn method_call_cache_target_owner<'a>(
     }
 }
 
+pub(super) struct MethodDirectCallEligibility<'a> {
+    pub(super) compiled: &'a CompiledUnit,
+    pub(super) state: &'a ExecutionState,
+    pub(super) target: &'a MethodCallCacheTarget,
+    pub(super) class: &'a php_ir::module::ClassEntry,
+    pub(super) args: &'a [IrCallArg],
+    pub(super) values: &'a [CallArgument],
+    pub(super) has_magic_call: bool,
+    pub(super) epoch: InvalidationEpoch,
+}
+
 pub(super) fn method_direct_call_target_is_eligible(
-    compiled: &CompiledUnit,
-    state: &ExecutionState,
-    target: &MethodCallCacheTarget,
-    class: &php_ir::module::ClassEntry,
-    args: &[IrCallArg],
-    values: &[CallArgument],
-    has_magic_call: bool,
-    epoch: InvalidationEpoch,
+    eligibility: MethodDirectCallEligibility<'_>,
 ) -> bool {
+    let MethodDirectCallEligibility {
+        compiled,
+        state,
+        target,
+        class,
+        args,
+        values,
+        has_magic_call,
+        epoch,
+    } = eligibility;
     let resolved = target.resolved_target();
     let guard = &resolved.guard;
     if target.receiver_class_id() != class.id {

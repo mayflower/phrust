@@ -517,14 +517,11 @@ impl Vm {
             return None;
         }
         Some(self.call_object_method_callable(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             object,
             "count",
             Vec::new(),
             None,
-            output,
-            stack,
-            state,
         ))
     }
 }

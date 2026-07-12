@@ -21,21 +21,27 @@ impl Vm {
         let object = match callable_resolve_reference(object) {
             Value::Generator(generator) => {
                 self.record_counter_dense_call_fallback("generator_method_receiver");
-                let value = match self
-                    .call_generator_method(compiled, generator, method, args, output, stack, state)
-                {
+                let value = match self.call_generator_method(
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    generator,
+                    method,
+                    args,
+                ) {
                     Ok(value) => value,
-                    Err(result) => return result,
+                    Err(result) => return *result,
                 };
                 return VmResult::success_no_output(Some(value));
             }
             Value::Fiber(fiber) => {
                 self.record_counter_dense_call_fallback("fiber_method_receiver");
-                let value = match self
-                    .call_fiber_method(compiled, fiber, method, args, output, stack, state)
-                {
+                let value = match self.call_fiber_method(
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    fiber,
+                    method,
+                    args,
+                ) {
                     Ok(value) => value,
-                    Err(result) => return result,
+                    Err(result) => return *result,
                 };
                 return VmResult::success_no_output(Some(value));
             }
@@ -123,7 +129,11 @@ impl Vm {
         {
             self.record_counter_dense_call_fallback("runtime_method_receiver");
             return self.call_object_method_callable(
-                compiled, object, method, args, call_span, output, stack, state,
+                ExecutionCursor::new(compiled, output, stack, state),
+                object,
+                method,
+                args,
+                call_span,
             );
         }
 
@@ -148,9 +158,7 @@ impl Vm {
 
         let (cached_target, observation) = if let Some(id) = cache_id {
             self.lookup_dense_method_call_inline_cache(
-                id,
-                function_id,
-                instruction_id,
+                DenseInlineCacheSite::new(id, function_id, instruction_id),
                 &lowered_method,
                 &receiver_class,
                 scope.as_deref(),
@@ -165,10 +173,7 @@ impl Vm {
                 InlineCacheKind::MethodCall,
             );
             self.lookup_method_call_inline_cache(
-                compiled,
-                function_id,
-                block_id,
-                instruction_id,
+                IrInlineCacheSite::classic(compiled, function_id, block_id, instruction_id),
                 &lowered_method,
                 &receiver_class,
                 scope.as_deref(),
@@ -197,15 +202,12 @@ impl Vm {
             Ok(None) => {
                 self.record_counter_dense_call_fallback("magic_call");
                 return match self.call_magic_instance_method(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     object.clone(),
                     "__call",
                     method,
                     args,
                     call_span,
-                    output,
-                    stack,
-                    state,
                 ) {
                     Ok(Some(result)) => result,
                     Ok(None) => self.runtime_error(
@@ -218,7 +220,7 @@ impl Vm {
                             method
                         ),
                     ),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             Err(message) => return self.runtime_error(output, compiled, stack, message),
@@ -237,21 +239,18 @@ impl Vm {
         {
             self.record_counter_dense_call_fallback("visibility");
             return match self.call_magic_instance_method(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 object.clone(),
                 "__call",
                 method,
                 args,
                 call_span,
-                output,
-                stack,
-                state,
             ) {
                 Ok(Some(result)) => result,
                 Ok(None) => self.runtime_error_at_optional_span(
                     compiled, output, stack, state, call_span, message,
                 ),
-                Err(result) => result,
+                Err(result) => *result,
             };
         }
         if let Err(message) = validate_method_callable_in_state_scope(
@@ -308,10 +307,7 @@ impl Vm {
             );
         } else {
             self.install_method_call_inline_cache(
-                compiled,
-                function_id,
-                block_id,
-                instruction_id,
+                IrInlineCacheSite::classic(compiled, function_id, block_id, instruction_id),
                 &lowered_method,
                 &receiver_class,
                 scope.as_deref(),
@@ -321,7 +317,7 @@ impl Vm {
         }
         self.record_counter_dense_method_call_hit();
         self.execute_function_with_dense_plan(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             &class_owner,
             plan,
             method_entry.function,
@@ -337,9 +333,6 @@ impl Vm {
                         declaring,
                     )
             },
-            output,
-            stack,
-            state,
         )
     }
 
@@ -366,14 +359,22 @@ impl Vm {
         {
             self.record_counter_dense_call_fallback("runtime_static_method_receiver");
             return self.call_static_method_callable(
-                compiled, class_name, method, args, call_span, output, stack, state, false, None,
+                ExecutionCursor::new(compiled, output, stack, state),
+                StaticMethodCallableRequest {
+                    class_name,
+                    method,
+                    args,
+                    call_span,
+                    allow_by_ref_value_warnings: false,
+                    by_ref_warning_callable_name: None,
+                },
             );
         }
 
         // Match the rich-IR static-call arm: an unknown class must attempt
         // registered autoloaders before resolution fails.
         if let Err(result) = self.autoload_static_class_if_missing(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             class_name,
             call_span.unwrap_or_default(),
             Some((
@@ -382,11 +383,8 @@ impl Vm {
                 block_id,
                 instruction_id,
             )),
-            output,
-            stack,
-            state,
         ) {
-            return result;
+            return *result;
         }
 
         let class = match resolve_static_class_name(compiled, state, stack, class_name) {
@@ -427,7 +425,7 @@ impl Vm {
                 result.diagnostics,
                 trace_context.as_ref(),
             ) {
-                return result;
+                return *result;
             }
             return VmResult::success_no_output(Some(result.value));
         }
@@ -465,7 +463,7 @@ impl Vm {
                     state,
                 ) {
                     Ok(args) => args,
-                    Err(result) => return result,
+                    Err(result) => return *result,
                 }
             } else {
                 args
@@ -504,10 +502,14 @@ impl Vm {
                     && matches!(lowered_method.as_str(), "append" | "rewind" | "next")
                 {
                     return match self.call_spl_append_iterator_method(
-                        compiled, &object, method, args, output, stack, state, call_span,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        &object,
+                        method,
+                        args,
+                        call_span,
                     ) {
                         Ok(value) => VmResult::success_no_output(Some(value)),
-                        Err(result) => result,
+                        Err(result) => *result,
                     };
                 }
                 if spl_class == "norewinditerator"
@@ -517,10 +519,13 @@ impl Vm {
                     )
                 {
                     return match self.call_spl_no_rewind_iterator_method(
-                        compiled, &object, method, args, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        &object,
+                        method,
+                        args,
                     ) {
                         Ok(value) => VmResult::success_no_output(Some(value)),
-                        Err(result) => result,
+                        Err(result) => *result,
                     };
                 }
                 if matches!(
@@ -538,10 +543,14 @@ impl Vm {
                         | "endchildren"
                 ) {
                     return match self.call_spl_recursive_iterator_iterator_method(
-                        compiled, object, method, args, call_span, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        object,
+                        method,
+                        args,
+                        call_span,
                     ) {
                         Ok(value) => VmResult::success_no_output(Some(value)),
-                        Err(result) => result,
+                        Err(result) => *result,
                     };
                 }
                 return match call_spl_iterator_method(
@@ -561,17 +570,24 @@ impl Vm {
             {
                 self.record_counter_dense_call_fallback("spl_runtime_parent_method");
                 return match self.call_spl_container_method_with_magic(
-                    compiled, object, method, args, call_span, output, stack, state,
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    object,
+                    method,
+                    args,
+                    call_span,
                 ) {
                     Ok(value) => VmResult::success_no_output(Some(value)),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             if is_spl_heap_runtime_class(&spl_class) && spl_heap_method_is_supported(method) {
                 self.record_counter_dense_call_fallback("spl_runtime_parent_method");
-                return match self
-                    .call_spl_heap_method(compiled, object, method, args, output, stack, state)
-                {
+                return match self.call_spl_heap_method(
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    object,
+                    method,
+                    args,
+                ) {
                     Ok(value) => VmResult::success_no_output(Some(value)),
                     Err(SplHeapMethodError::Message(message)) => self
                         .runtime_error_at_optional_span(
@@ -600,9 +616,7 @@ impl Vm {
 
         let (cached_target, observation) = if let Some(id) = cache_id {
             self.lookup_dense_method_call_inline_cache(
-                id,
-                function_id,
-                instruction_id,
+                DenseInlineCacheSite::new(id, function_id, instruction_id),
                 &lowered_method,
                 &receiver_class,
                 scope.as_deref(),
@@ -617,10 +631,7 @@ impl Vm {
                 InlineCacheKind::MethodCall,
             );
             self.lookup_method_call_inline_cache(
-                compiled,
-                function_id,
-                block_id,
-                instruction_id,
+                IrInlineCacheSite::classic(compiled, function_id, block_id, instruction_id),
                 &lowered_method,
                 &receiver_class,
                 scope.as_deref(),
@@ -658,32 +669,28 @@ impl Vm {
                 self.record_counter_dense_call_fallback("magic_static_call");
                 if let Some(object) = current_this_object(compiled, stack) {
                     match self.call_magic_instance_method(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         object,
                         "__call",
                         method,
                         args.clone(),
                         call_span,
-                        output,
-                        stack,
-                        state,
                     ) {
                         Ok(Some(result)) => return result,
                         Ok(None) => {}
-                        Err(result) => return result,
+                        Err(result) => return *result,
                     }
                 }
                 return match self.call_magic_static_method(
-                    compiled,
-                    &class,
-                    "__callStatic",
-                    method,
-                    args,
-                    called_class,
-                    call_span,
-                    output,
-                    stack,
-                    state,
+                    ExecutionCursor::new(compiled, output, stack, state),
+                    MagicStaticCallRequest {
+                        class: &class,
+                        magic_method: "__callStatic",
+                        called_method: method,
+                        args,
+                        called_class,
+                        call_span,
+                    },
                 ) {
                     Ok(Some(result)) => result,
                     Ok(None) => self.runtime_error(
@@ -695,7 +702,7 @@ impl Vm {
                             class.name, method
                         ),
                     ),
-                    Err(result) => result,
+                    Err(result) => *result,
                 };
             }
             Err(message) => return self.runtime_error(output, compiled, stack, message),
@@ -728,16 +735,15 @@ impl Vm {
         {
             self.record_counter_dense_call_fallback("visibility");
             return match self.call_magic_static_method(
-                compiled,
-                &class,
-                "__callStatic",
-                method,
-                args,
-                called_class,
-                call_span,
-                output,
-                stack,
-                state,
+                ExecutionCursor::new(compiled, output, stack, state),
+                MagicStaticCallRequest {
+                    class: &class,
+                    magic_method: "__callStatic",
+                    called_method: method,
+                    args,
+                    called_class,
+                    call_span,
+                },
             ) {
                 Ok(Some(result)) => result,
                 Ok(None) => self.runtime_error_at_optional_span(
@@ -748,7 +754,7 @@ impl Vm {
                     call_span,
                     inaccessible,
                 ),
-                Err(result) => result,
+                Err(result) => *result,
             };
         }
         let visibility = if is_constructor_call {
@@ -820,10 +826,7 @@ impl Vm {
             );
         } else {
             self.install_method_call_inline_cache(
-                compiled,
-                function_id,
-                block_id,
-                instruction_id,
+                IrInlineCacheSite::classic(compiled, function_id, block_id, instruction_id),
                 &lowered_method,
                 &receiver_class,
                 scope.as_deref(),
@@ -834,7 +837,7 @@ impl Vm {
         self.record_counter_dense_static_call_hit();
         let class_owner = class_owner_in_state(compiled, state, &declaring_class.name);
         self.execute_function_with_dense_plan(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             &class_owner,
             plan,
             method_entry.function,
@@ -853,9 +856,6 @@ impl Vm {
                 }
                 call
             },
-            output,
-            stack,
-            state,
         )
     }
 
@@ -954,7 +954,7 @@ impl Vm {
             );
         }
         self.execute_function_with_dense_plan(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             &owner,
             plan,
             method_entry.function,
@@ -973,9 +973,6 @@ impl Vm {
                 }
                 call
             },
-            output,
-            stack,
-            state,
         )
     }
 
@@ -1021,7 +1018,7 @@ impl Vm {
             stack,
             state,
         ) {
-            return result;
+            return *result;
         }
         let Some(class) = self.cached_class_entry(compiled, state, class_name) else {
             return self.runtime_error(
@@ -1034,7 +1031,7 @@ impl Vm {
         if let Err(result) =
             self.autoload_class_parents_if_missing(compiled, &class, output, stack, state)
         {
-            return result;
+            return *result;
         }
         let class_owner = class_owner_in_state(compiled, state, &class.name);
         let runtime_class = match self.cached_runtime_class_entry(&class_owner, state, &class) {
@@ -1104,7 +1101,7 @@ impl Vm {
             let class_owner = dynamic_class_owner_in_state(state, &constructor.class.name)
                 .unwrap_or_else(|| compiled.clone());
             let result = self.execute_function_with_dense_plan(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 &class_owner,
                 plan,
                 constructor.method.function,
@@ -1120,9 +1117,6 @@ impl Vm {
                             declaring,
                         )
                 },
-                output,
-                stack,
-                state,
             );
             if !result.status.is_success() {
                 return result;

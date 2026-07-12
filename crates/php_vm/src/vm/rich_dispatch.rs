@@ -68,13 +68,10 @@ impl Vm {
         // propagated faithfully.
         #[cfg(feature = "jit-copy-patch")]
         if let Some(result) = self.try_execute_copy_patch_leaf(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             function_id,
             function,
             &call,
-            output,
-            stack,
-            state,
         ) {
             return result;
         }
@@ -281,7 +278,7 @@ impl Vm {
                     &diagnostic,
                 ) {
                     Ok(handled) => handled,
-                    Err(result) => return result,
+                    Err(result) => return *result,
                 };
                 if !handled && error_reporting_allows(state, php_runtime::api::PHP_E_WARNING) {
                     emit_vm_diagnostic(
@@ -328,15 +325,15 @@ impl Vm {
                     ),
                 )));
             }
-            if let Some(value) = self.try_execute_jit_leaf(
+            if let Some(value) = self.try_execute_jit_leaf(JitLeafRequest {
                 compiled,
                 state,
                 function_id,
                 function,
-                function_tier,
-                jit_call_shape_supported,
-                &args,
-            ) {
+                tier: function_tier,
+                call_shape_supported: jit_call_shape_supported,
+                args: &args,
+            }) {
                 return VmResult::success_no_output(Some(value));
             }
             let activation_context = FrameActivationContext {
@@ -433,16 +430,17 @@ impl Vm {
                     },
                 );
                 if let Err(message) = coerce_or_check_param_type(
-                    compiled,
-                    state,
-                    function,
-                    param,
-                    arg_index,
+                    ParamTypecheckRequest {
+                        compiled,
+                        state,
+                        function,
+                        param,
+                        arg_index,
+                        fast_path: self.typecheck_fast_path_context(),
+                        strict_types: argument_policy.call_site_strict_types,
+                        call_span: call.call_span,
+                    },
                     &mut arg.value,
-                    arg.reference.is_some(),
-                    self.typecheck_fast_path_context(),
-                    argument_policy.call_site_strict_types,
-                    call.call_span,
                 ) {
                     // Cold: materialize the trace snapshot (bound params from
                     // locals, the failing and later ones from the raw args) so
@@ -631,16 +629,15 @@ impl Vm {
                                     if let Some(constant) = resolved.predefined
                                         && let Err(result) = self
                                             .emit_predefined_constant_deprecation(
-                                                compiled,
-                                                output,
-                                                stack,
-                                                state,
+                                                ExecutionCursor::new(
+                                                    compiled, output, stack, state,
+                                                ),
                                                 &mut diagnostics,
                                                 instruction.span,
                                                 constant,
                                             )
                                     {
-                                        return result;
+                                        return *result;
                                     }
                                     resolved.value
                                 }
@@ -700,15 +697,12 @@ impl Vm {
                                 instruction.span,
                             );
                             if let Err(result) = self.emit_constant_already_defined_warning(
-                                compiled,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 source_span,
-                                output,
-                                stack,
-                                state,
                                 &mut diagnostics,
                                 name,
                             ) {
-                                return result;
+                                return *result;
                             }
                             continue;
                         }
@@ -775,10 +769,7 @@ impl Vm {
                             Err(RichBinaryError::Direct(result)) => return *result,
                             Err(RichBinaryError::Route(result)) => {
                                 match self.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     &mut exception_handlers,
                                     &mut pending_control,
                                     *result,
@@ -916,13 +907,10 @@ impl Vm {
                         };
                         let source_span = runtime_source_span(compiled, instruction.span);
                         let value = match self.execute_cast(
-                            compiled,
                             *kind,
                             &src,
                             source_span,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                         ) {
                             Ok(value) => value,
                             Err(result) => {
@@ -953,13 +941,10 @@ impl Vm {
                                     state.pending_throw = Some(throwable);
                                 }
                                 match self.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     &mut exception_handlers,
                                     &mut pending_control,
-                                    result,
+                                    *result,
                                 ) {
                                     RaiseOutcome::Caught(target) => {
                                         block_id = target;
@@ -988,10 +973,7 @@ impl Vm {
                             };
                         if let Some(value) = value {
                             if let Some(outcome) = self.run_destructors_for_unreferenced_value(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 &mut exception_handlers,
                                 &mut pending_control,
                                 &value,
@@ -1024,10 +1006,7 @@ impl Vm {
                             match local_value {
                                 Some(Value::Uninitialized) if is_this_local(function, *local) => {
                                     match self.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
+                                        ExecutionCursor::new(compiled, output, stack, state),
                                         &mut exception_handlers,
                                         &mut pending_control,
                                         instruction.span,
@@ -1081,7 +1060,7 @@ impl Vm {
                                         &diagnostic,
                                     ) {
                                         Ok(handled) => handled,
-                                        Err(result) => return result,
+                                        Err(result) => return *result,
                                     };
                                     if !handled
                                         && error_reporting_allows(state, php_runtime::api::PHP_E_WARNING)
@@ -1181,10 +1160,7 @@ impl Vm {
                             return self.runtime_error(output, compiled, stack, message);
                         }
                         if let Some(outcome) = self.run_destructors_for_unreferenced_value(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             &mut exception_handlers,
                             &mut pending_control,
                             &previous,
@@ -1305,10 +1281,7 @@ impl Vm {
                                 diagnostic,
                             );
                             match self.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 &mut exception_handlers,
                                 &mut pending_control,
                                 result,
@@ -1391,7 +1364,16 @@ impl Vm {
                             }
                         };
                         if let Err(message) = bind_property_dim_to_reference_cell(
-                            compiled, state, stack, &object, property, &dims, *append, cell,
+                            compiled,
+                            state,
+                            stack,
+                            PropertyDimReferenceBinding {
+                                object: &object,
+                                property,
+                                dims: &dims,
+                                append: *append,
+                                cell,
+                            },
                         ) {
                             return self.runtime_error(output, compiled, stack, message);
                         }
@@ -1639,7 +1621,7 @@ impl Vm {
                             AliasState::PropertyOrArrayDimReference,
                         );
                         if let Err(result) = self.autoload_static_class_if_missing(
-                            compiled,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             class_name,
                             instruction.span,
                             Some((
@@ -1648,18 +1630,12 @@ impl Vm {
                                 block_id,
                                 instruction.id,
                             )),
-                            output,
-                            stack,
-                            state,
                         ) {
                             match self.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 &mut exception_handlers,
                                 &mut pending_control,
-                                result,
+                                *result,
                             ) {
                                 RaiseOutcome::Caught(target) => {
                                     block_id = target;
@@ -1673,10 +1649,7 @@ impl Vm {
                                 Ok(class) => class,
                                 Err(message) => {
                                     match self.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
+                                        ExecutionCursor::new(compiled, output, stack, state),
                                         &mut exception_handlers,
                                         &mut pending_control,
                                         instruction.span,
@@ -1705,10 +1678,7 @@ impl Vm {
                                     class.display_name
                                 );
                                 match self.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     &mut exception_handlers,
                                     &mut pending_control,
                                     instruction.span,
@@ -1819,10 +1789,7 @@ impl Vm {
                             Ok(Value::Object(object)) => object,
                             Ok(Value::Callable(_)) => {
                                 match self.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     &mut exception_handlers,
                                     &mut pending_control,
                                     instruction.span,
@@ -1910,7 +1877,7 @@ impl Vm {
                                     }
                                 };
                                 match self.call_magic_property_method(
-                                    compiled,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     object.clone(),
                                     "__set",
                                     property,
@@ -1920,9 +1887,6 @@ impl Vm {
                                         )),
                                         CallArgument::positional(Value::Reference(cell.clone())),
                                     ],
-                                    output,
-                                    stack,
-                                    state,
                                 ) {
                                     Ok(Some(_)) => {
                                         self.record_counter_alias_state(local_alias_state(
@@ -1931,7 +1895,7 @@ impl Vm {
                                         continue;
                                     }
                                     Ok(None) => {}
-                                    Err(result) => return result,
+                                    Err(result) => return *result,
                                 }
                                 if let Some(diagnostic) = dynamic_property_deprecation_diagnostic(
                                     compiled,
@@ -1974,10 +1938,7 @@ impl Vm {
                                 )
                             }) {
                                 match self.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     &mut exception_handlers,
                                     &mut pending_control,
                                     instruction.span,
@@ -2035,10 +1996,7 @@ impl Vm {
                             )
                         }) {
                             match self.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 &mut exception_handlers,
                                 &mut pending_control,
                                 instruction.span,
@@ -2085,10 +2043,7 @@ impl Vm {
                             self.typecheck_fast_path_context(),
                         ) {
                             match self.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 &mut exception_handlers,
                                 &mut pending_control,
                                 instruction.span,
@@ -2131,7 +2086,7 @@ impl Vm {
                             AliasState::PropertyOrArrayDimReference,
                         );
                         if let Err(result) = self.autoload_static_class_if_missing(
-                            compiled,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             class_name,
                             instruction.span,
                             Some((
@@ -2140,18 +2095,12 @@ impl Vm {
                                 block_id,
                                 instruction.id,
                             )),
-                            output,
-                            stack,
-                            state,
                         ) {
                             match self.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 &mut exception_handlers,
                                 &mut pending_control,
-                                result,
+                                *result,
                             ) {
                                 RaiseOutcome::Caught(target) => {
                                     block_id = target;
@@ -2165,10 +2114,7 @@ impl Vm {
                                 Ok(class) => class,
                                 Err(message) => {
                                     match self.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
+                                        ExecutionCursor::new(compiled, output, stack, state),
                                         &mut exception_handlers,
                                         &mut pending_control,
                                         instruction.span,
@@ -2197,10 +2143,7 @@ impl Vm {
                                     class.display_name
                                 );
                                 match self.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                     &mut exception_handlers,
                                     &mut pending_control,
                                     instruction.span,
@@ -2262,10 +2205,7 @@ impl Vm {
                             self.typecheck_fast_path_context(),
                         ) {
                             match self.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 &mut exception_handlers,
                                 &mut pending_control,
                                 instruction.span,
@@ -2314,10 +2254,7 @@ impl Vm {
                             return self.runtime_error(output, compiled, stack, message);
                         }
                         if let Some(outcome) = self.run_destructors_for_unreferenced_value(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             &mut exception_handlers,
                             &mut pending_control,
                             &previous_effective,
@@ -2479,14 +2416,11 @@ impl Vm {
                             }
                         };
                         let result = self.call_object_method_callable(
-                            compiled,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             object,
                             method,
                             values,
                             Some(instruction.span),
-                            output,
-                            stack,
-                            state,
                         );
                         if !result.status.is_success() {
                             return result;
@@ -2516,26 +2450,29 @@ impl Vm {
                             *target,
                         ));
                     }
-                    kind @ (InstructionKind::EnterTry { .. }
+                    InstructionKind::EnterTry { .. }
                     | InstructionKind::LeaveTry
                     | InstructionKind::EndFinally { .. }
                     | InstructionKind::Throw { .. }
-                    | InstructionKind::MakeException { .. }) => {
+                    | InstructionKind::MakeException { .. } => {
                         match execute_rich_exception_instruction(
                             self,
-                            compiled,
-                            unit,
-                            function,
-                            frame_index,
-                            kind,
-                            instruction.span,
+                            ExecutionCursor::new(compiled, output, stack, state),
+                            dispatch_contract::RichInstructionSite {
+                                unit,
+                                function,
+                                function_id,
+                                block_id,
+                                instruction,
+                                instruction_index,
+                                frame_index,
+                            },
                             &mut call.shared_top_level_locals,
                             &mut diagnostics,
-                            output,
-                            stack,
-                            state,
-                            &mut exception_handlers,
-                            &mut pending_control,
+                            dispatch_contract::RichControlState {
+                                exception_handlers: &mut exception_handlers,
+                                pending_control: &mut pending_control,
+                            },
                         ) {
                             RichDispatchOutcome::Continue => {}
                             RichDispatchOutcome::Jump(target) => {
@@ -2633,7 +2570,7 @@ impl Vm {
                     | InstructionKind::UnsetDim { .. } => {
                         match rich_array_dispatch::execute_rich_array_instruction(
                             self,
-                            compiled,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             dispatch_contract::RichInstructionSite {
                                 unit,
                                 function,
@@ -2643,9 +2580,6 @@ impl Vm {
                                 instruction_index,
                                 frame_index,
                             },
-                            output,
-                            stack,
-                            state,
                             &mut diagnostics,
                             &mut exception_handlers,
                             &mut pending_control,
@@ -2730,10 +2664,7 @@ impl Vm {
                             return self.runtime_error(output, compiled, stack, message);
                         }
                         if let Some(outcome) = self.run_destructors_for_unreferenced_value(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             &mut exception_handlers,
                             &mut pending_control,
                             &previous,
@@ -2748,24 +2679,28 @@ impl Vm {
                         }
                         release_unrooted_object_handles(&previous);
                     }
-                    kind @ (InstructionKind::ForeachInit { .. }
+                    InstructionKind::ForeachInit { .. }
                     | InstructionKind::ForeachNext { .. }
                     | InstructionKind::ForeachCleanup { .. }
                     | InstructionKind::ForeachInitRef { .. }
-                    | InstructionKind::ForeachNextRef { .. }) => {
+                    | InstructionKind::ForeachNextRef { .. } => {
                         match execute_rich_foreach_instruction(
                             self,
-                            compiled,
-                            unit,
-                            frame_index,
-                            kind,
-                            instruction.span,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
+                            dispatch_contract::RichInstructionSite {
+                                unit,
+                                function,
+                                function_id,
+                                block_id,
+                                instruction,
+                                instruction_index,
+                                frame_index,
+                            },
                             &mut foreach_iterators,
-                            &mut exception_handlers,
-                            &mut pending_control,
+                            dispatch_contract::RichControlState {
+                                exception_handlers: &mut exception_handlers,
+                                pending_control: &mut pending_control,
+                            },
                         ) {
                             RichDispatchOutcome::Continue => {}
                             RichDispatchOutcome::Jump(target) => {
@@ -2814,13 +2749,10 @@ impl Vm {
                         if let Err(result) = self.write_echo(compiled, output, stack, state, &value)
                         {
                             match self.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 &mut exception_handlers,
                                 &mut pending_control,
-                                result,
+                                *result,
                             ) {
                                 RaiseOutcome::Caught(target) => {
                                     block_id = target;
@@ -2865,7 +2797,7 @@ impl Vm {
                             &diagnostic,
                         ) {
                             Ok(handled) => handled,
-                            Err(result) => return result,
+                            Err(result) => return *result,
                         };
                         if !handled && error_reporting_allows(state, level) {
                             emit_vm_diagnostic_with_options(
@@ -2965,7 +2897,7 @@ impl Vm {
                             state,
                         ) {
                             Ok(step) => step,
-                            Err(result) => return result,
+                            Err(result) => return *result,
                         };
                         match step {
                             YieldFromStep::Yield { key, value } => {
@@ -3017,7 +2949,7 @@ impl Vm {
                     | InstructionKind::Pipe { .. } => {
                         match rich_call_dispatch::execute_rich_call_instruction(
                             self,
-                            compiled,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             dispatch_contract::RichInstructionSite {
                                 unit,
                                 function,
@@ -3028,13 +2960,12 @@ impl Vm {
                                 frame_index,
                             },
                             &running_fiber,
-                            output,
-                            stack,
-                            state,
                             &mut diagnostics,
                             &mut foreach_iterators,
-                            &mut exception_handlers,
-                            &mut pending_control,
+                            dispatch_contract::RichControlState {
+                                exception_handlers: &mut exception_handlers,
+                                pending_control: &mut pending_control,
+                            },
                         ) {
                             RichDispatchOutcome::Continue => {}
                             RichDispatchOutcome::Jump(target) => {
@@ -3052,18 +2983,19 @@ impl Vm {
                             }
                         };
                         let result = self.execute_include(
-                            compiled,
-                            None,
-                            compiled_unit_cache_key(compiled),
-                            function_id,
-                            block_id,
-                            instruction.id,
-                            instruction.span,
-                            *kind,
-                            &path,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
+                            IncludeExecutionRequest {
+                                site: UnitInlineCacheSite::new(
+                                    None,
+                                    compiled_unit_cache_key(compiled),
+                                    function_id,
+                                    block_id,
+                                    instruction.id,
+                                ),
+                                instruction_span: instruction.span,
+                                kind: *kind,
+                                path: &path,
+                            },
                         );
                         if !result.status.is_success() {
                             if include_failure_allows_continuation(*kind, &result) {
@@ -3217,7 +3149,7 @@ impl Vm {
                     let code = match self.resolve_exit_value(compiled, output, stack, state, value)
                     {
                         Ok(code) => code,
-                        Err(result) => return result,
+                        Err(result) => return *result,
                     };
                     state.process_exit_code = Some(code);
                     stack.pop_frame_recycle(frame_index);
@@ -3356,10 +3288,7 @@ impl Vm {
                         rooted_object_ids.extend(preserved_object_ids);
                         let candidates = state.destructor_queue.objects_snapshot();
                         let sweep = self.run_destructors_for_unreferenced_candidates_with_roots(
-                            compiled,
-                            output,
-                            stack,
-                            state,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             &mut destructor_handlers,
                             &mut destructor_pending_control,
                             candidates,

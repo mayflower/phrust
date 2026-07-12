@@ -1,6 +1,15 @@
 use super::*;
 use std::hash::{Hash, Hasher};
 
+#[derive(Clone, Copy)]
+pub(super) struct ClassStaticCacheLookup<'a> {
+    pub(super) kind: ClassConstantStaticPropertyCacheKind,
+    pub(super) resolved_class: &'a str,
+    pub(super) member: &'a str,
+    pub(super) scope: Option<&'a str>,
+    pub(super) epoch: InvalidationEpoch,
+}
+
 #[derive(Clone, Debug)]
 struct SharedClassName(Arc<str>);
 
@@ -196,11 +205,13 @@ impl Vm {
             return;
         }
         let layout = property_fetch_layout_metadata(
-            receiver_entry,
-            declaring_class,
-            declaring_property,
-            cache_scope.as_deref(),
-            lookup_epoch,
+            PropertyLayoutSite {
+                receiver_class: receiver_entry,
+                declaring_class,
+                property: declaring_property,
+                visibility_context: cache_scope.as_deref(),
+                layout_version: lookup_epoch,
+            },
             receiver_has_magic_get,
             false,
             false,
@@ -237,10 +248,7 @@ impl Vm {
                 );
         } else {
             self.install_property_fetch_inline_cache(
-                compiled,
-                function_id,
-                block_id,
-                instruction_id,
+                IrInlineCacheSite::classic(compiled, function_id, block_id, instruction_id),
                 property,
                 receiver_class,
                 cache_scope.as_deref(),
@@ -305,11 +313,13 @@ impl Vm {
             return;
         }
         let layout = property_assign_layout_metadata(
-            receiver_entry,
-            declaring_class,
-            declaring_property,
-            cache_scope.as_deref(),
-            lookup_epoch,
+            PropertyLayoutSite {
+                receiver_class: receiver_entry,
+                declaring_class,
+                property: declaring_property,
+                visibility_context: cache_scope.as_deref(),
+                layout_version: lookup_epoch,
+            },
             receiver_has_magic_set,
             false,
             false,
@@ -350,10 +360,7 @@ impl Vm {
                 );
         } else {
             self.install_property_assign_inline_cache(
-                compiled,
-                function_id,
-                block_id,
-                instruction_id,
+                IrInlineCacheSite::classic(compiled, function_id, block_id, instruction_id),
                 property,
                 receiver_class,
                 cache_scope.as_deref(),
@@ -365,17 +372,23 @@ impl Vm {
 
     pub(super) fn lookup_class_constant_static_property_inline_cache(
         &self,
-        compiled: &CompiledUnit,
-        cache_id: Option<InlineCacheId>,
-        function_id: FunctionId,
-        block_id: BlockId,
-        instruction_id: php_ir::ids::InstrId,
-        kind: ClassConstantStaticPropertyCacheKind,
-        resolved_class: &str,
-        member: &str,
-        scope: Option<&str>,
-        epoch: InvalidationEpoch,
+        site: IrInlineCacheSite<'_>,
+        lookup: ClassStaticCacheLookup<'_>,
     ) -> Option<ClassConstantStaticPropertyCacheTarget> {
+        let IrInlineCacheSite {
+            compiled,
+            cache_id,
+            function,
+            block,
+            instruction,
+        } = site;
+        let ClassStaticCacheLookup {
+            kind,
+            resolved_class,
+            member,
+            scope,
+            epoch,
+        } = lookup;
         if !self.options.inline_caches.enabled() {
             return None;
         }
@@ -395,9 +408,9 @@ impl Vm {
                 .borrow_mut()
                 .lookup_class_constant_static_property(
                     compiled_unit_cache_key(compiled),
-                    function_id,
-                    block_id,
-                    instruction_id,
+                    function,
+                    block,
+                    instruction,
                     kind,
                     resolved_class,
                     member,
@@ -405,24 +418,30 @@ impl Vm {
                     epoch,
                 )
         };
-        self.record_inline_cache_site_event(function_id, instruction_id, observation);
+        self.record_inline_cache_site_event(function, instruction, observation);
         target
     }
 
     pub(super) fn install_class_constant_static_property_inline_cache(
         &self,
-        compiled: &CompiledUnit,
-        cache_id: Option<InlineCacheId>,
-        function_id: FunctionId,
-        block_id: BlockId,
-        instruction_id: php_ir::ids::InstrId,
-        kind: ClassConstantStaticPropertyCacheKind,
-        resolved_class: &str,
-        member: &str,
-        scope: Option<&str>,
-        epoch: InvalidationEpoch,
+        site: IrInlineCacheSite<'_>,
+        lookup: ClassStaticCacheLookup<'_>,
         target: ClassConstantStaticPropertyCacheTarget,
     ) {
+        let IrInlineCacheSite {
+            compiled,
+            cache_id,
+            function,
+            block,
+            instruction,
+        } = site;
+        let ClassStaticCacheLookup {
+            kind,
+            resolved_class,
+            member,
+            scope,
+            epoch,
+        } = lookup;
         if !self.options.inline_caches.enabled() {
             return;
         }
@@ -443,9 +462,9 @@ impl Vm {
                 .borrow_mut()
                 .install_class_constant_static_property(
                     compiled_unit_cache_key(compiled),
-                    function_id,
-                    block_id,
-                    instruction_id,
+                    function,
+                    block,
+                    instruction,
                     kind,
                     resolved_class,
                     member,

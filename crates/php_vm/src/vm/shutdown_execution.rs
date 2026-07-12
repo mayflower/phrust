@@ -6,7 +6,7 @@ impl Vm {
         compiled: &CompiledUnit,
         output: &mut OutputBuffer,
         state: &mut ExecutionState,
-    ) -> Result<Vec<RuntimeDiagnostic>, VmResult> {
+    ) -> Result<Vec<RuntimeDiagnostic>, Box<VmResult>> {
         let mut diagnostics = Vec::new();
         let mut executed = 0usize;
         while !state.destructor_queue.entries.is_empty() {
@@ -15,12 +15,12 @@ impl Vm {
                 executed += 1;
                 if executed > 4096 {
                     let stack = CallStack::new();
-                    return Err(self.runtime_error(
+                    return Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         &stack,
                         "E_PHP_VM_DESTRUCTOR_QUEUE_OVERFLOW: destructor queue exceeded 4096 executions",
-                    ));
+                    )));
                 }
                 let mut stack = CallStack::new();
                 if let Some(diagnostic) =
@@ -54,11 +54,12 @@ impl Vm {
                     state,
                 );
                 if let Some(throwable) = state.pending_throw.take() {
-                    return Err(self
-                        .handle_uncaught_exception(&owner, output, &mut stack, state, throwable));
+                    return Err(Box::new(self.handle_uncaught_exception(
+                        &owner, output, &mut stack, state, throwable,
+                    )));
                 }
                 if !result.status.is_success() {
-                    return Err(result);
+                    return Err(Box::new(result));
                 }
                 diagnostics.extend(result.diagnostics);
             }
@@ -71,7 +72,7 @@ impl Vm {
         compiled: &CompiledUnit,
         output: &mut OutputBuffer,
         state: &mut ExecutionState,
-    ) -> Result<Vec<RuntimeDiagnostic>, VmResult> {
+    ) -> Result<Vec<RuntimeDiagnostic>, Box<VmResult>> {
         let mut diagnostics = Vec::new();
         let mut executed = 0usize;
         while !state.shutdown_functions.is_empty() {
@@ -80,12 +81,12 @@ impl Vm {
                 executed += 1;
                 if executed > 4096 {
                     let stack = CallStack::new();
-                    return Err(self.runtime_error(
+                    return Err(Box::new(self.runtime_error(
                         output,
                         compiled,
                         &stack,
                         "E_PHP_VM_SHUTDOWN_FUNCTION_QUEUE_OVERFLOW: shutdown function queue exceeded 4096 executions",
-                    ));
+                    )));
                 }
                 let mut stack = CallStack::new();
                 let result = self.call_callable(
@@ -97,12 +98,12 @@ impl Vm {
                     state,
                 );
                 if let Some(throwable) = state.pending_throw.take() {
-                    return Err(self.handle_uncaught_exception(
+                    return Err(Box::new(self.handle_uncaught_exception(
                         compiled, output, &mut stack, state, throwable,
-                    ));
+                    )));
                 }
                 if !result.status.is_success() {
-                    return Err(result);
+                    return Err(Box::new(result));
                 }
                 diagnostics.extend(result.diagnostics);
             }
@@ -112,24 +113,24 @@ impl Vm {
 
     pub(super) fn run_destructors_for_unreferenced_value(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
         handlers: &mut Vec<ExceptionHandler>,
         pending_control: &mut Option<PendingControl>,
         _value: &Value,
     ) -> Option<RaiseOutcome> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if state.destructor_queue.is_empty() {
             return None;
         }
         let rooted_object_ids = php_visible_root_object_ids(stack, state);
         let candidates = state.destructor_queue.objects_snapshot();
         self.run_destructors_for_unreferenced_candidates_with_roots(
-            compiled,
-            output,
-            stack,
-            state,
+            ExecutionCursor::new(compiled, output, stack, state),
             handlers,
             pending_control,
             candidates,
@@ -141,16 +142,19 @@ impl Vm {
 
     pub(super) fn run_destructors_for_unreferenced_candidates_with_roots(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
         handlers: &mut Vec<ExceptionHandler>,
         pending_control: &mut Option<PendingControl>,
         candidates: Vec<ObjectRef>,
         rooted_object_ids: &GcObjectIdSet,
         scope_override: Option<&str>,
     ) -> DestructorSweep {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         for object in candidates {
             if rooted_object_ids.contains(&object.id()) {
                 continue;
@@ -167,10 +171,7 @@ impl Vm {
             {
                 return DestructorSweep {
                     outcome: Some(self.raise_runtime_error(
-                        compiled,
-                        output,
-                        stack,
-                        state,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         handlers,
                         pending_control,
                         php_ir::IrSpan::default(),
@@ -196,10 +197,7 @@ impl Vm {
             if !result.status.is_success() || state.pending_throw.is_some() {
                 return DestructorSweep {
                     outcome: Some(self.route_throwable_result(
-                        compiled,
-                        output,
-                        stack,
-                        state,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         handlers,
                         pending_control,
                         result,

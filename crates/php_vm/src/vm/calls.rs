@@ -3,6 +3,15 @@
 use super::builtin_intrinsics::try_execute_simple_literal_pcre_builtin;
 use super::prelude::*;
 
+pub(super) struct StaticMethodCallableRequest<'a> {
+    pub(super) class_name: &'a str,
+    pub(super) method: &'a str,
+    pub(super) args: Vec<CallArgument>,
+    pub(super) call_span: Option<php_ir::IrSpan>,
+    pub(super) allow_by_ref_value_warnings: bool,
+    pub(super) by_ref_warning_callable_name: Option<String>,
+}
+
 fn internal_registry_builtin_call_name(name: &str) -> Option<String> {
     let registry = BuiltinRegistry::new();
     if registry.contains(name) {
@@ -1434,7 +1443,10 @@ impl Vm {
                 let display_name = name.to_string_lossy();
                 if display_name.contains("::") {
                     self.call_callable_with_call_span(
-                        compiled, callee, values, call_span, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        callee,
+                        values,
+                        call_span,
                     )
                 } else {
                     let lowered_name = normalize_function_name(&display_name);
@@ -1443,10 +1455,12 @@ impl Vm {
                     let call_shape = function_call_shape(&values);
                     let target = self
                         .lookup_function_call_inline_cache(
-                            compiled,
-                            function_id,
-                            block_id,
-                            instruction_id,
+                            IrInlineCacheSite::classic(
+                                compiled,
+                                function_id,
+                                block_id,
+                                instruction_id,
+                            ),
                             &interned_name,
                             epoch,
                             &call_shape,
@@ -1460,10 +1474,12 @@ impl Vm {
                                 self.record_counter_builtin_call_ic(false);
                             }
                             self.install_function_call_inline_cache(
-                                compiled,
-                                function_id,
-                                block_id,
-                                instruction_id,
+                                IrInlineCacheSite::classic(
+                                    compiled,
+                                    function_id,
+                                    block_id,
+                                    instruction_id,
+                                ),
                                 &interned_name,
                                 epoch,
                                 call_shape.clone(),
@@ -1473,7 +1489,7 @@ impl Vm {
                         });
                     if let Some(target) = target {
                         self.execute_function_call_target(
-                            compiled,
+                            ExecutionCursor::new(compiled, output, stack, state),
                             target,
                             values,
                             Some((
@@ -1483,9 +1499,6 @@ impl Vm {
                                 instruction_id,
                             )),
                             call_span,
-                            output,
-                            stack,
-                            state,
                             running_fiber,
                         )
                     } else {
@@ -1503,7 +1516,10 @@ impl Vm {
                 }
             }
             _ => self.call_callable_with_call_span(
-                compiled, callee, values, call_span, output, stack, state,
+                ExecutionCursor::new(compiled, output, stack, state),
+                callee,
+                values,
+                call_span,
             ),
         }
     }
@@ -1518,22 +1534,35 @@ impl Vm {
         state: &mut ExecutionState,
     ) -> VmResult {
         self.call_callable_inner(
-            compiled, callee, args, None, output, stack, state, false, None,
+            ExecutionCursor::new(compiled, output, stack, state),
+            callee,
+            args,
+            None,
+            false,
+            None,
         )
     }
 
     pub(super) fn call_callable_with_call_span(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         callee: Value,
         args: Vec<CallArgument>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         self.call_callable_inner(
-            compiled, callee, args, call_span, output, stack, state, false, None,
+            ExecutionCursor::new(compiled, output, stack, state),
+            callee,
+            args,
+            call_span,
+            false,
+            None,
         )
     }
 
@@ -1547,22 +1576,30 @@ impl Vm {
         state: &mut ExecutionState,
     ) -> VmResult {
         self.call_callable_inner(
-            compiled, callee, args, None, output, stack, state, true, None,
+            ExecutionCursor::new(compiled, output, stack, state),
+            callee,
+            args,
+            None,
+            true,
+            None,
         )
     }
 
     pub(super) fn call_callable_inner(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         callee: Value,
         args: Vec<CallArgument>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         allow_by_ref_value_warnings: bool,
         by_ref_warning_callable_name: Option<String>,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         match callee {
             Value::Callable(callable) => match *callable {
             CallableValue::UserFunction { name } => {
@@ -1663,7 +1700,7 @@ impl Vm {
             CallableValue::InternalBuiltin { name } => {
                 if is_array_callback_builtin_name(&name) {
                     return self.call_array_callback_builtin(
-                        compiled, &name, args, call_span, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state), &name, args, call_span,
                     );
                 }
                 if is_array_sort_builtin_name(&name) {
@@ -1671,12 +1708,12 @@ impl Vm {
                 }
                 if is_autoload_builtin_name(&name) || is_symbol_introspection_builtin_name(&name) {
                     return self.call_autoload_builtin(
-                        compiled, &name, args, None, call_span, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state), &name, args, None, call_span,
                     );
                 }
                 if is_config_builtin_name(&name) {
                     return self.call_config_builtin(
-                        compiled, &name, args, call_span, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state), &name, args, call_span,
                     );
                 }
                 if is_error_handling_builtin_name(&name) {
@@ -1699,7 +1736,7 @@ impl Vm {
                 }
                 if is_pcre_callback_builtin_name(&name) {
                     return self.call_pcre_callback_builtin(
-                        compiled, &name, args, call_span, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state), &name, args, call_span,
                     );
                 }
                 if let Some(result) = self.try_execute_preg_match_start_offset_ascii_call_fast(
@@ -1708,7 +1745,7 @@ impl Vm {
                     return result;
                 }
                 let values = match call_builtin_args_to_positional(
-                    self, compiled, &name, args, call_span, output, stack, state,
+                    self, ExecutionCursor::new(compiled, output, stack, state), &name, args, call_span,
                 ) {
                     Ok(values) => values,
                     Err(InternalBuiltinArgError::Message(message)) => {
@@ -1717,7 +1754,7 @@ impl Vm {
                     Err(InternalBuiltinArgError::Fatal(result)) => return *result,
                 };
                 if let Some(result) = self.try_execute_serialization_builtin(
-                    compiled, &name, &values, call_span, output, stack, state,
+                    ExecutionCursor::new(compiled, output, stack, state), &name, &values, call_span,
                 ) {
                     return result;
                 }
@@ -1725,10 +1762,7 @@ impl Vm {
                     &name,
                     values,
                     call_span,
-                    output,
-                    stack,
-                    state,
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                 )
             }
             CallableValue::BoundMethod {
@@ -1736,7 +1770,7 @@ impl Vm {
                 method,
                 scope,
             } => self.call_bound_method_callable(
-                compiled, target, &method, scope, args, call_span, output, stack, state,
+                ExecutionCursor::new(compiled, output, stack, state), target, &method, scope, args, call_span,
             ),
             CallableValue::MethodPlaceholder { target } => self.runtime_error(
                 output,
@@ -1754,30 +1788,24 @@ impl Vm {
             ),
             },
             Value::String(name) => self.call_named_callable(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 &name.to_string_lossy(),
                 args,
                 call_span,
-                output,
-                stack,
-                state,
                 allow_by_ref_value_warnings,
                 by_ref_warning_callable_name.clone(),
             ),
             Value::Array(array) => {
                 self.call_array_callable(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     &array,
                     args,
                     call_span,
-                    output,
-                    stack,
-                    state,
                     allow_by_ref_value_warnings,
                 )
             }
             Value::Object(object) => {
-                self.call_object_callable(compiled, object, args, call_span, output, stack, state)
+                self.call_object_callable(ExecutionCursor::new(compiled, output, stack, state), object, args, call_span)
             }
             other => self.runtime_error(
                 output,
@@ -1793,14 +1821,17 @@ impl Vm {
 
     pub(super) fn call_fiber_callable(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         fiber: FiberRef,
         callee: Value,
         args: Vec<CallArgument>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         match callee {
             Value::Callable(callable) => match *callable {
                 CallableValue::UserFunction { name } => {
@@ -1897,28 +1928,30 @@ impl Vm {
 
     pub(super) fn call_named_callable(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         name: &str,
         args: Vec<CallArgument>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         allow_by_ref_value_warnings: bool,
         by_ref_warning_callable_name: Option<String>,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if let Some((class_name, method)) = name.split_once("::") {
             return self.call_static_method_callable(
-                compiled,
-                class_name,
-                method,
-                args,
-                call_span,
-                output,
-                stack,
-                state,
-                allow_by_ref_value_warnings,
-                by_ref_warning_callable_name,
+                ExecutionCursor::new(compiled, output, stack, state),
+                StaticMethodCallableRequest {
+                    class_name,
+                    method,
+                    args,
+                    call_span,
+                    allow_by_ref_value_warnings,
+                    by_ref_warning_callable_name,
+                },
             );
         }
         let normalized = name.to_ascii_lowercase();
@@ -1950,25 +1983,19 @@ impl Vm {
             || is_symbol_introspection_builtin_name(&normalized)
         {
             return self.call_autoload_builtin(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 &normalized,
                 args,
                 None,
                 call_span,
-                output,
-                stack,
-                state,
             );
         }
         if is_config_builtin_name(&normalized) {
             return self.call_config_builtin(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 &normalized,
                 args,
                 call_span,
-                output,
-                stack,
-                state,
             );
         }
         if is_error_handling_builtin_name(&normalized) {
@@ -1999,35 +2026,26 @@ impl Vm {
         }
         if is_pcre_callback_builtin_name(&normalized) {
             return self.call_pcre_callback_builtin(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 &normalized,
                 args,
                 call_span,
-                output,
-                stack,
-                state,
             );
         }
         if is_filter_callback_builtin_name(&normalized) {
             return self.call_filter_callback_builtin(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 &normalized,
                 args,
                 call_span,
-                output,
-                stack,
-                state,
             );
         }
         if is_array_callback_builtin_name(&normalized) {
             return self.call_array_callback_builtin(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 &normalized,
                 args,
                 call_span,
-                output,
-                stack,
-                state,
             );
         }
         if is_array_sort_builtin_name(&normalized) {
@@ -2045,13 +2063,10 @@ impl Vm {
         if BuiltinRegistry::new().contains(&normalized) {
             let values = match call_builtin_args_to_positional(
                 self,
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 &normalized,
                 args,
                 None,
-                output,
-                stack,
-                state,
             ) {
                 Ok(values) => values,
                 Err(InternalBuiltinArgError::Message(message)) => {
@@ -2060,13 +2075,10 @@ impl Vm {
                 Err(InternalBuiltinArgError::Fatal(result)) => return *result,
             };
             if let Some(result) = self.try_execute_serialization_builtin(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 &normalized,
                 &values,
                 call_span,
-                output,
-                stack,
-                state,
             ) {
                 return result;
             }
@@ -2079,10 +2091,7 @@ impl Vm {
                 &normalized,
                 values,
                 call_span,
-                output,
-                stack,
-                state,
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
             );
         }
         self.runtime_error(
@@ -2147,16 +2156,19 @@ impl Vm {
 
     pub(super) fn execute_function_call_target(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         target: FunctionCallCacheTarget,
         args: Vec<CallArgument>,
         call_site: Option<(u64, FunctionId, BlockId, InstrId)>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         running_fiber: &Option<FiberRef>,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         match target {
             FunctionCallCacheTarget::CurrentUnit {
                 unit_identity,
@@ -2215,10 +2227,17 @@ impl Vm {
                 self.profile_builtin_call(&name, || match kind {
                     FunctionCallBuiltinKind::AutoloadOrSymbolIntrospection => self
                         .call_autoload_builtin(
-                            compiled, &name, args, call_site, call_span, output, stack, state,
+                            ExecutionCursor::new(compiled, output, stack, state),
+                            &name,
+                            args,
+                            call_site,
+                            call_span,
                         ),
                     FunctionCallBuiltinKind::Config => self.call_config_builtin(
-                        compiled, &name, args, call_span, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        &name,
+                        args,
+                        call_span,
                     ),
                     FunctionCallBuiltinKind::ErrorHandling => self
                         .call_error_handling_builtin(compiled, &name, args, output, stack, state),
@@ -2232,13 +2251,22 @@ impl Vm {
                         self.call_process_builtin(compiled, &name, args, output, stack)
                     }
                     FunctionCallBuiltinKind::PcreCallback => self.call_pcre_callback_builtin(
-                        compiled, &name, args, call_span, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        &name,
+                        args,
+                        call_span,
                     ),
                     FunctionCallBuiltinKind::FilterCallback => self.call_filter_callback_builtin(
-                        compiled, &name, args, call_span, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        &name,
+                        args,
+                        call_span,
                     ),
                     FunctionCallBuiltinKind::ArrayCallback => self.call_array_callback_builtin(
-                        compiled, &name, args, call_span, output, stack, state,
+                        ExecutionCursor::new(compiled, output, stack, state),
+                        &name,
+                        args,
+                        call_span,
                     ),
                     FunctionCallBuiltinKind::ArraySort => {
                         self.call_array_sort_builtin(compiled, &name, args, output, stack, state)
@@ -2252,7 +2280,11 @@ impl Vm {
                             return result;
                         }
                         let values = match call_builtin_args_to_positional(
-                            self, compiled, &name, args, call_span, output, stack, state,
+                            self,
+                            ExecutionCursor::new(compiled, output, stack, state),
+                            &name,
+                            args,
+                            call_span,
                         ) {
                             Ok(values) => values,
                             Err(InternalBuiltinArgError::Message(message)) => {
@@ -2261,7 +2293,10 @@ impl Vm {
                             Err(InternalBuiltinArgError::Fatal(result)) => return *result,
                         };
                         if let Some(result) = self.try_execute_serialization_builtin(
-                            compiled, &name, &values, call_span, output, stack, state,
+                            ExecutionCursor::new(compiled, output, stack, state),
+                            &name,
+                            &values,
+                            call_span,
                         ) {
                             return result;
                         }
@@ -2271,7 +2306,10 @@ impl Vm {
                             return result;
                         }
                         self.execute_internal_registry_builtin(
-                            &name, values, call_span, output, stack, state, compiled,
+                            &name,
+                            values,
+                            call_span,
+                            ExecutionCursor::new(compiled, output, stack, state),
                         )
                     }
                 })
@@ -2281,15 +2319,18 @@ impl Vm {
 
     pub(super) fn execute_function_with_dense_plan(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         owner: &CompiledUnit,
         plan: Option<&DenseExecutionPlan>,
         function: FunctionId,
         call: FunctionCall<'_>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         // Copy-and-patch native leaf tier for method-path calls: dense method
         // dispatch executes bodies directly (bypassing `execute_function`), so
         // without this hook a recognized `$this` accessor leaf would never
@@ -2300,13 +2341,10 @@ impl Vm {
         #[cfg(feature = "jit-copy-patch")]
         if let Some(ir_function) = owner.unit().functions.get(function.index())
             && let Some(result) = self.try_execute_profiled_copy_patch_leaf(
-                owner,
+                ExecutionCursor::new(owner, output, stack, state),
                 function,
                 ir_function,
                 &call,
-                output,
-                stack,
-                state,
             )
         {
             return result;
@@ -2395,15 +2433,18 @@ impl Vm {
 
     pub(super) fn call_array_callable(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         array: &PhpArray,
         args: Vec<CallArgument>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         allow_by_ref_value_warnings: bool,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if array.len() != 2 {
             return self.runtime_error(
                 output,
@@ -2433,33 +2474,29 @@ impl Vm {
         match callable_resolve_reference(target.clone()) {
             Value::Object(object) => {
                 self.call_object_method_callable(
-                    compiled, object, &method, args, call_span, output, stack, state,
+                    ExecutionCursor::new(compiled, output, stack, state), object, &method, args, call_span,
                 )
             }
             Value::Callable(callable) if method.eq_ignore_ascii_case("__invoke") => {
                 self.call_callable_inner(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     Value::Callable(callable),
                     args,
                     call_span,
-                    output,
-                    stack,
-                    state,
                     allow_by_ref_value_warnings,
                     Some("Closure::__invoke".to_owned()),
                 )
             }
             Value::String(class_name) => self.call_static_method_callable(
-                compiled,
-                &class_name.to_string_lossy(),
-                &method,
-                args,
-                call_span,
-                output,
-                stack,
-                state,
-                allow_by_ref_value_warnings,
-                None,
+                ExecutionCursor::new(compiled, output, stack, state),
+                StaticMethodCallableRequest {
+                    class_name: &class_name.to_string_lossy(),
+                    method: &method,
+                    args,
+                    call_span,
+                    allow_by_ref_value_warnings,
+                    by_ref_warning_callable_name: None,
+                },
             ),
             other => self.runtime_error(
                 output,
@@ -2475,14 +2512,17 @@ impl Vm {
 
     pub(super) fn call_closure_call_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         callable: CallableValue,
         mut args: Vec<CallArgument>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         span: php_ir::IrSpan,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if args.is_empty() {
             return self.runtime_error(
                 output,
@@ -2518,29 +2558,23 @@ impl Vm {
                 .unwrap_or(false);
                 if !compatible {
                     if let Err(result) = self.emit_closure_call_bind_warning(
-                        compiled,
-                        output,
-                        stack,
-                        state,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         &object.class_name(),
                         &method,
                         &new_this.class_name(),
                         span,
                     ) {
-                        return result;
+                        return *result;
                     }
                     return VmResult::success_no_output(Some(Value::Null));
                 }
                 self.call_bound_object_method_callable(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     new_this,
                     &method,
                     scope,
                     args,
                     Some(span),
-                    output,
-                    stack,
-                    state,
                 )
             }
             callable @ CallableValue::Closure(_) => {
@@ -2553,30 +2587,24 @@ impl Vm {
                         &new_this.class_name(),
                         span,
                     ) {
-                        return result;
+                        return *result;
                     }
                     return VmResult::success_no_output(Some(Value::Null));
                 }
                 self.call_callable_inner(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     bind_closure_callable_value(callable, Some(new_this)),
                     args,
                     Some(span),
-                    output,
-                    stack,
-                    state,
                     false,
                     Some("Closure::call".to_owned()),
                 )
             }
             other => self.call_callable_inner(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 Value::Callable(Box::new(other)),
                 args,
                 Some(span),
-                output,
-                stack,
-                state,
                 false,
                 Some("Closure::call".to_owned()),
             ),
@@ -2585,14 +2613,17 @@ impl Vm {
 
     pub(super) fn call_closure_bind_to_method(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         callable: CallableValue,
         args: Vec<CallArgument>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         span: php_ir::IrSpan,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let mut values = match call_args_to_positional("Closure::bindTo", args) {
             Ok(values) => values,
             Err(message) => return self.runtime_error(output, compiled, stack, message),
@@ -2639,7 +2670,7 @@ impl Vm {
                     if let Err(result) =
                         self.emit_closure_unbind_this_warning(compiled, output, stack, state, span)
                     {
-                        return result;
+                        return *result;
                     }
                     return VmResult::success_no_output(Some(Value::Null));
                 }
@@ -2670,7 +2701,7 @@ impl Vm {
         state: &mut ExecutionState,
         class_name: &str,
         span: php_ir::IrSpan,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         let diagnostic = RuntimeDiagnostic::new(
             "E_PHP_VM_CLOSURE_INTERNAL_SCOPE_BIND_WARNING",
             RuntimeSeverity::Warning,
@@ -2710,7 +2741,7 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
         span: php_ir::IrSpan,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
         let diagnostic = RuntimeDiagnostic::new(
             "E_PHP_VM_CLOSURE_UNBIND_THIS_WARNING",
             RuntimeSeverity::Warning,
@@ -2742,15 +2773,18 @@ impl Vm {
 
     pub(super) fn emit_closure_call_bind_warning(
         &self,
-        compiled: &CompiledUnit,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
         declaring_class: &str,
         method: &str,
         target_class: &str,
         span: php_ir::IrSpan,
-    ) -> Result<(), VmResult> {
+    ) -> Result<(), Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let diagnostic = RuntimeDiagnostic::new(
             "E_PHP_VM_CLOSURE_CALL_BIND_WARNING",
             RuntimeSeverity::Warning,

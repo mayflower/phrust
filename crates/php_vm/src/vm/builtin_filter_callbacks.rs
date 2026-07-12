@@ -1,6 +1,14 @@
 use super::builtin_adapter::BuiltinTypeError;
 use super::prelude::*;
 
+struct FilterArrayRequest<'a> {
+    name: &'a str,
+    input: &'a PhpArray,
+    options: Option<&'a Value>,
+    add_empty: bool,
+    call_span: Option<php_ir::IrSpan>,
+}
+
 const VM_FILTER_DEFAULT: i64 = 516;
 const VM_FILTER_CALLBACK: i64 = 1_024;
 const VM_FILTER_REQUIRE_ARRAY: i64 = 16_777_216;
@@ -162,16 +170,23 @@ fn filter_callback_callable_name(callback: &Value) -> Option<String> {
 impl Vm {
     pub(super) fn call_filter_callback_builtin(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         name: &str,
         args: Vec<CallArgument>,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> VmResult {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let values = match call_builtin_args_to_positional(
-            self, compiled, name, args, call_span, output, stack, state,
+            self,
+            ExecutionCursor::new(compiled, output, stack, state),
+            name,
+            args,
+            call_span,
         ) {
             Ok(values) => values,
             Err(InternalBuiltinArgError::Message(message)) => {
@@ -181,85 +196,76 @@ impl Vm {
         };
         if !filter_call_needs_vm_callback(name, &values) {
             return self.execute_internal_registry_builtin(
-                name, values, call_span, output, stack, state, compiled,
+                name,
+                values,
+                call_span,
+                ExecutionCursor::new(compiled, output, stack, state),
             );
         }
         let mut diagnostics = Vec::new();
         let result = match name {
             "filter_var" => self.filter_var_callback_value(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 name,
                 &values,
                 call_span,
-                output,
-                stack,
-                state,
                 &mut diagnostics,
             ),
             "filter_input" => self.filter_input_callback_value(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 name,
                 &values,
                 call_span,
-                output,
-                stack,
-                state,
                 &mut diagnostics,
             ),
             "filter_input_array" => self.filter_input_array_callback_value(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 name,
                 &values,
                 call_span,
-                output,
-                stack,
-                state,
                 &mut diagnostics,
             ),
             "filter_var_array" => self.filter_var_array_callback_value(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 name,
                 &values,
                 call_span,
-                output,
-                stack,
-                state,
                 &mut diagnostics,
             ),
-            _ => Err(self.runtime_error(
+            _ => Err(Box::new(self.runtime_error(
                 output,
                 compiled,
                 stack,
                 format!("E_PHP_VM_UNKNOWN_FILTER_CALLBACK_BUILTIN: {name}"),
-            )),
+            ))),
         };
         match result {
             Ok(value) => VmResult::success_with_diagnostics_no_output(Some(value), diagnostics),
-            Err(result) => result,
+            Err(result) => *result,
         }
     }
 
     fn filter_var_callback_value(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         name: &str,
         values: &[Value],
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         diagnostics: &mut Vec<RuntimeDiagnostic>,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if values.is_empty() || values.len() > 3 {
             return Ok(self
                 .execute_internal_registry_builtin(
                     name,
                     values.to_vec(),
                     call_span,
-                    output,
-                    stack,
-                    state,
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                 )
                 .return_value
                 .unwrap_or(Value::Null));
@@ -276,10 +282,7 @@ impl Vm {
                     name,
                     values.to_vec(),
                     call_span,
-                    output,
-                    stack,
-                    state,
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                 )
                 .return_value
                 .unwrap_or(Value::Null));
@@ -287,39 +290,36 @@ impl Vm {
         let options = vm_filter_callback_options(values.get(2))
             .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
         self.apply_filter_callback_value(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             name,
             &values[0],
             &options,
             call_span,
-            output,
-            stack,
-            state,
             diagnostics,
         )
     }
 
     fn filter_input_callback_value(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         name: &str,
         values: &[Value],
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         diagnostics: &mut Vec<RuntimeDiagnostic>,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if !(2..=5).contains(&values.len()) {
             return Ok(self
                 .execute_internal_registry_builtin(
                     name,
                     values.to_vec(),
                     call_span,
-                    output,
-                    stack,
-                    state,
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                 )
                 .return_value
                 .unwrap_or(Value::Null));
@@ -341,10 +341,7 @@ impl Vm {
                     name,
                     values.to_vec(),
                     call_span,
-                    output,
-                    stack,
-                    state,
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                 )
                 .return_value
                 .unwrap_or(Value::Null));
@@ -358,39 +355,36 @@ impl Vm {
             return Ok(vm_filter_input_missing_value(&options));
         };
         self.apply_filter_callback_value(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             name,
             value,
             &options,
             call_span,
-            output,
-            stack,
-            state,
             diagnostics,
         )
     }
 
     fn filter_input_array_callback_value(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         name: &str,
         values: &[Value],
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         diagnostics: &mut Vec<RuntimeDiagnostic>,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if values.is_empty() || values.len() > 3 {
             return Ok(self
                 .execute_internal_registry_builtin(
                     name,
                     values.to_vec(),
                     call_span,
-                    output,
-                    stack,
-                    state,
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                 )
                 .return_value
                 .unwrap_or(Value::Null));
@@ -410,40 +404,39 @@ impl Vm {
             .map_err(|message| self.runtime_error(output, compiled, stack, message))?
             .unwrap_or(true);
         self.apply_filter_callback_array(
-            compiled,
-            name,
-            &array,
-            values.get(1),
-            add_empty,
-            call_span,
-            output,
-            stack,
-            state,
+            ExecutionCursor::new(compiled, output, stack, state),
+            FilterArrayRequest {
+                name,
+                input: &array,
+                options: values.get(1),
+                add_empty,
+                call_span,
+            },
             diagnostics,
         )
     }
 
     fn filter_var_array_callback_value(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         name: &str,
         values: &[Value],
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         diagnostics: &mut Vec<RuntimeDiagnostic>,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if values.is_empty() || values.len() > 3 {
             return Ok(self
                 .execute_internal_registry_builtin(
                     name,
                     values.to_vec(),
                     call_span,
-                    output,
-                    stack,
-                    state,
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                 )
                 .return_value
                 .unwrap_or(Value::Null));
@@ -454,10 +447,7 @@ impl Vm {
                     name,
                     values.to_vec(),
                     call_span,
-                    output,
-                    stack,
-                    state,
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                 )
                 .return_value
                 .unwrap_or(Value::Null));
@@ -469,42 +459,44 @@ impl Vm {
             .map_err(|message| self.runtime_error(output, compiled, stack, message))?
             .unwrap_or(true);
         self.apply_filter_callback_array(
-            compiled,
-            name,
-            &array,
-            values.get(1),
-            add_empty,
-            call_span,
-            output,
-            stack,
-            state,
+            ExecutionCursor::new(compiled, output, stack, state),
+            FilterArrayRequest {
+                name,
+                input: &array,
+                options: values.get(1),
+                add_empty,
+                call_span,
+            },
             diagnostics,
         )
     }
 
     fn apply_filter_callback_array(
         &self,
-        compiled: &CompiledUnit,
-        name: &str,
-        input: &PhpArray,
-        options: Option<&Value>,
-        add_empty: bool,
-        call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
+        cursor: ExecutionCursor<'_>,
+        request: FilterArrayRequest<'_>,
         diagnostics: &mut Vec<RuntimeDiagnostic>,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
+        let FilterArrayRequest {
+            name,
+            input,
+            options,
+            add_empty,
+            call_span,
+        } = request;
         match options.map(effective_value) {
-            None | Some(Value::Null) => self
+            None | Some(Value::Null) => Ok(self
                 .execute_internal_registry_builtin(
                     name,
                     vec![Value::Array(input.clone())],
                     call_span,
-                    output,
-                    stack,
-                    state,
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                 )
                 .return_value
                 .ok_or_else(|| {
@@ -514,27 +506,24 @@ impl Vm {
                         stack,
                         format!("E_PHP_VM_FILTER_CALLBACK_RESULT: {name} returned no value"),
                     )
-                }),
+                })?),
             Some(Value::Int(filter)) if filter == VM_FILTER_CALLBACK => {
                 let options = VmFilterCallbackOptions::default();
                 let mut result = PhpArray::new();
                 for (key, value) in input.iter() {
                     let filtered = self.apply_filter_callback_value(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         name,
                         value,
                         &options,
                         call_span,
-                        output,
-                        stack,
-                        state,
                         diagnostics,
                     )?;
                     result.insert(key.clone(), filtered);
                 }
                 Ok(Value::Array(result))
             }
-            Some(Value::Int(_)) => self
+            Some(Value::Int(_)) => Ok(self
                 .execute_internal_registry_builtin(
                     name,
                     vec![
@@ -542,10 +531,7 @@ impl Vm {
                         options.cloned().unwrap_or(Value::Null),
                     ],
                     call_span,
-                    output,
-                    stack,
-                    state,
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                 )
                 .return_value
                 .ok_or_else(|| {
@@ -555,7 +541,7 @@ impl Vm {
                         stack,
                         format!("E_PHP_VM_FILTER_CALLBACK_RESULT: {name} returned no value"),
                     )
-                }),
+                })?),
             Some(Value::Array(specs)) => {
                 let mut result = PhpArray::new();
                 for (key, spec) in specs.iter() {
@@ -566,14 +552,11 @@ impl Vm {
                                     self.runtime_error(output, compiled, stack, message)
                                 })?;
                             let filtered = self.apply_filter_callback_value(
-                                compiled,
+                                ExecutionCursor::new(compiled, output, stack, state),
                                 name,
                                 value,
                                 &options,
                                 call_span,
-                                output,
-                                stack,
-                                state,
                                 diagnostics,
                             )?;
                             result.insert(key.clone(), filtered);
@@ -588,10 +571,7 @@ impl Vm {
                                         spec.clone(),
                                     ],
                                     call_span,
-                                    output,
-                                    stack,
-                                    state,
-                                    compiled,
+                                    ExecutionCursor::new(compiled, output, stack, state),
                                 )
                                 .return_value
                                 .unwrap_or(Value::Null);
@@ -605,7 +585,7 @@ impl Vm {
                 }
                 Ok(Value::Array(result))
             }
-            Some(_) => self
+            Some(_) => Ok(self
                 .execute_internal_registry_builtin(
                     name,
                     vec![
@@ -613,10 +593,7 @@ impl Vm {
                         options.cloned().unwrap_or(Value::Null),
                     ],
                     call_span,
-                    output,
-                    stack,
-                    state,
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                 )
                 .return_value
                 .ok_or_else(|| {
@@ -626,22 +603,25 @@ impl Vm {
                         stack,
                         format!("E_PHP_VM_FILTER_CALLBACK_RESULT: {name} returned no value"),
                     )
-                }),
+                })?),
         }
     }
 
     fn apply_filter_callback_value(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         name: &str,
         value: &Value,
         options: &VmFilterCallbackOptions,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         diagnostics: &mut Vec<RuntimeDiagnostic>,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if let Value::Array(array) = effective_value(value) {
             if options.flags & VM_FILTER_REQUIRE_SCALAR != 0 {
                 return Ok(vm_filter_failure(options));
@@ -651,14 +631,11 @@ impl Vm {
                 result.insert(
                     key.clone(),
                     self.apply_filter_callback_array_value(
-                        compiled,
+                        ExecutionCursor::new(compiled, output, stack, state),
                         name,
                         value,
                         options,
                         call_span,
-                        output,
-                        stack,
-                        state,
                         diagnostics,
                     )?,
                 );
@@ -669,14 +646,11 @@ impl Vm {
             return Ok(vm_filter_failure(options));
         }
         let filtered = self.invoke_filter_callback(
-            compiled,
+            ExecutionCursor::new(compiled, output, stack, state),
             name,
             value,
             options,
             call_span,
-            output,
-            stack,
-            state,
             diagnostics,
         )?;
         if options.flags & VM_FILTER_FORCE_ARRAY != 0 {
@@ -687,26 +661,26 @@ impl Vm {
 
     fn apply_filter_callback_array_value(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         name: &str,
         value: &Value,
         options: &VmFilterCallbackOptions,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         diagnostics: &mut Vec<RuntimeDiagnostic>,
-    ) -> Result<Value, VmResult> {
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         let Value::Array(array) = effective_value(value) else {
             return self.invoke_filter_callback(
-                compiled,
+                ExecutionCursor::new(compiled, output, stack, state),
                 name,
                 value,
                 options,
                 call_span,
-                output,
-                stack,
-                state,
                 diagnostics,
             );
         };
@@ -715,14 +689,11 @@ impl Vm {
             result.insert(
                 key.clone(),
                 self.apply_filter_callback_array_value(
-                    compiled,
+                    ExecutionCursor::new(compiled, output, stack, state),
                     name,
                     value,
                     options,
                     call_span,
-                    output,
-                    stack,
-                    state,
                     diagnostics,
                 )?,
             );
@@ -732,39 +703,39 @@ impl Vm {
 
     fn invoke_filter_callback(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         name: &str,
         value: &Value,
         options: &VmFilterCallbackOptions,
         call_span: Option<php_ir::IrSpan>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
         diagnostics: &mut Vec<RuntimeDiagnostic>,
-    ) -> Result<Value, VmResult> {
-        let Some(callback) = options.callback.clone() else {
-            return Err(filter_callback_type_error_result(
-                output, compiled, stack, state, name, call_span,
-            ));
-        };
-        if !value_is_callable(compiled, state, &callback, false) {
-            return Err(filter_callback_type_error_result(
-                output, compiled, stack, state, name, call_span,
-            ));
-        }
-        let result = self.call_callable_inner(
+    ) -> Result<Value, Box<VmResult>> {
+        let ExecutionCursor {
             compiled,
-            callback.clone(),
-            vec![CallArgument::positional(value.clone())],
-            call_span,
             output,
             stack,
             state,
+        } = cursor;
+        let Some(callback) = options.callback.clone() else {
+            return Err(Box::new(filter_callback_type_error_result(
+                output, compiled, stack, state, name, call_span,
+            )));
+        };
+        if !value_is_callable(compiled, state, &callback, false) {
+            return Err(Box::new(filter_callback_type_error_result(
+                output, compiled, stack, state, name, call_span,
+            )));
+        }
+        let result = self.call_callable_inner(
+            ExecutionCursor::new(compiled, output, stack, state),
+            callback.clone(),
+            vec![CallArgument::positional(value.clone())],
+            call_span,
             true,
             filter_callback_callable_name(&callback),
         );
         if !result.status.is_success() {
-            return Err(result);
+            return Err(Box::new(result));
         }
         diagnostics.extend(result.diagnostics);
         Ok(result.return_value.unwrap_or(Value::Null))

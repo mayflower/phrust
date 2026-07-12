@@ -41,17 +41,8 @@ macro_rules! execute_rich_property_instruction {
                             Ok(Value::Object(object)) => object,
                             Ok(other) => {
                                 let receiver_type = value_type_name(&other);
-                                if let Err(result) = $vm.emit_non_object_property_read_warning(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $diagnostics,
-                                    receiver_type,
-                                    property,
-                                    instruction.span,
-                                ) {
-                                    return result;
+                                if let Err(result) = $vm.emit_non_object_property_read_warning(ExecutionCursor::new(compiled, output, stack, state), &mut $diagnostics, receiver_type, property, instruction.span) {
+                                    return *result;
                                 }
                                 if let Err(message) = stack
                                     .frame_mut(frame_index)
@@ -188,10 +179,12 @@ macro_rules! execute_rich_property_instruction {
                         );
                         let receiver_has_magic_get = class_has_public_magic_get(compiled, &class);
                         if let Some(target) = $vm.lookup_property_fetch_inline_cache(
-                            compiled,
-                            function_id,
-                            $block_id,
-                            instruction.id,
+                            IrInlineCacheSite::classic(
+                                compiled,
+                                function_id,
+                                $block_id,
+                                instruction.id,
+                            ),
                             property,
                             &receiver_class,
                             normalized_scope.as_deref(),
@@ -273,18 +266,9 @@ macro_rules! execute_rich_property_instruction {
                                         Vec::new(),
                                     ),
                                 );
-                                match $vm.call_magic_property_method(
-                                    compiled,
-                                    object.clone(),
-                                    "__get",
-                                    property,
-                                    vec![CallArgument::positional(Value::String(
+                                match $vm.call_magic_property_method(ExecutionCursor::new(compiled, output, stack, state), object.clone(), "__get", property, vec![CallArgument::positional(Value::String(
                                         PhpString::from_test_str(property),
-                                    ))],
-                                    output,
-                                    stack,
-                                    state,
-                                ) {
+                                    ))]) {
                                     Ok(Some(value)) => {
                                         if let Err(message) = stack
                                             .frame_mut(frame_index)
@@ -298,19 +282,10 @@ macro_rules! execute_rich_property_instruction {
                                         continue;
                                     }
                                     Ok(None) => {}
-                                    Err(result) => return result,
+                                    Err(result) => return *result,
                                 }
-                                if let Err(result) = $vm.emit_undefined_property_warning(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $diagnostics,
-                                    &object.display_name(),
-                                    property,
-                                    instruction.span,
-                                ) {
-                                    return result;
+                                if let Err(result) = $vm.emit_undefined_property_warning(ExecutionCursor::new(compiled, output, stack, state), &mut $diagnostics, &object.display_name(), property, instruction.span) {
+                                    return *result;
                                 }
                                 if let Err(message) = stack
                                     .frame_mut(frame_index)
@@ -336,16 +311,7 @@ macro_rules! execute_rich_property_instruction {
                                 resolved_class,
                                 resolved_property,
                             ) {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    access_error,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, access_error) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -365,17 +331,8 @@ macro_rules! execute_rich_property_instruction {
                             let value = match object.get_property(property) {
                                 Some(value) => value,
                                 None => {
-                                    if let Err(result) = $vm.emit_undefined_property_warning(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $diagnostics,
-                                        resolved_class.display_name.as_str(),
-                                        property,
-                                        instruction.span,
-                                    ) {
-                                        return result;
+                                    if let Err(result) = $vm.emit_undefined_property_warning(ExecutionCursor::new(compiled, output, stack, state), &mut $diagnostics, resolved_class.display_name.as_str(), property, instruction.span) {
+                                        return *result;
                                     }
                                     Value::Null
                                 }
@@ -419,18 +376,9 @@ macro_rules! execute_rich_property_instruction {
                                     vec!["not_visible"],
                                 ),
                             );
-                            match $vm.call_magic_property_method(
-                                compiled,
-                                object.clone(),
-                                "__get",
-                                property,
-                                vec![CallArgument::positional(Value::String(
+                            match $vm.call_magic_property_method(ExecutionCursor::new(compiled, output, stack, state), object.clone(), "__get", property, vec![CallArgument::positional(Value::String(
                                     PhpString::from_test_str(property),
-                                ))],
-                                output,
-                                stack,
-                                state,
-                            ) {
+                                ))]) {
                                 Ok(Some(value)) => {
                                     if let Err(message) = stack
                                         .frame_mut(frame_index)
@@ -486,7 +434,7 @@ macro_rules! execute_rich_property_instruction {
                                     }
                                     return result;
                                 }
-                                Err(result) => return result,
+                                Err(result) => return *result,
                             }
                         }
                         let resolved_has_property_hook = property_has_hooks_or_active(
@@ -519,17 +467,7 @@ macro_rules! execute_rich_property_instruction {
                                     Vec::new(),
                                 ),
                             );
-                            match $vm.call_property_hook(
-                                compiled,
-                                object.clone(),
-                                resolved_class,
-                                resolved_property,
-                                function,
-                                Vec::new(),
-                                output,
-                                stack,
-                                state,
-                            ) {
+                            match $vm.call_property_hook(ExecutionCursor::new(compiled, output, stack, state), object.clone(), resolved_class, resolved_property, function, Vec::new()) {
                                 Ok(value) => {
                                     if let Err(message) = stack
                                         .frame_mut(frame_index)
@@ -542,7 +480,7 @@ macro_rules! execute_rich_property_instruction {
                                     }
                                     continue;
                                 }
-                                Err(result) => return result,
+                                Err(result) => return *result,
                             }
                         }
                         let storage_name = property_storage_name(resolved_class, resolved_property);
@@ -566,18 +504,9 @@ macro_rules! execute_rich_property_instruction {
                                         vec!["missing_declared_storage"],
                                     ),
                                 );
-                                match $vm.call_magic_property_method(
-                                    compiled,
-                                    object.clone(),
-                                    "__get",
-                                    property,
-                                    vec![CallArgument::positional(Value::String(
+                                match $vm.call_magic_property_method(ExecutionCursor::new(compiled, output, stack, state), object.clone(), "__get", property, vec![CallArgument::positional(Value::String(
                                         PhpString::from_test_str(property),
-                                    ))],
-                                    output,
-                                    stack,
-                                    state,
-                                ) {
+                                    ))]) {
                                     Ok(Some(value)) => {
                                         if let Err(message) = stack
                                             .frame_mut(frame_index)
@@ -591,19 +520,10 @@ macro_rules! execute_rich_property_instruction {
                                         continue;
                                     }
                                     Ok(None) => {}
-                                    Err(result) => return result,
+                                    Err(result) => return *result,
                                 }
-                                if let Err(result) = $vm.emit_undefined_property_warning(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $diagnostics,
-                                    &object.display_name(),
-                                    property,
-                                    instruction.span,
-                                ) {
-                                    return result;
+                                if let Err(result) = $vm.emit_undefined_property_warning(ExecutionCursor::new(compiled, output, stack, state), &mut $diagnostics, &object.display_name(), property, instruction.span) {
+                                    return *result;
                                 }
                                 if let Err(message) = stack
                                     .frame_mut(frame_index)
@@ -638,16 +558,7 @@ macro_rules! execute_rich_property_instruction {
                                 "E_PHP_VM_UNINITIALIZED_PROPERTY: Typed property {}::${property} must not be accessed before initialization",
                                 resolved.class.display_name
                             );
-                            match $vm.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut $exception_handlers,
-                                &mut $pending_control,
-                                instruction.span,
-                                message,
-                            ) {
+                            match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                 RaiseOutcome::Caught(target) => {
                                     $block_id = target;
                                     continue $dispatch;
@@ -704,17 +615,7 @@ macro_rules! execute_rich_property_instruction {
                         class_name,
                         property,
                     } => {
-                        match $vm.fetch_static_property_value(
-                            compiled,
-                            class_name,
-                            property,
-                            Some((function_id, $block_id, instruction.id)),
-                            None,
-                            instruction.span,
-                            output,
-                            stack,
-                            state,
-                        ) {
+                        match $vm.fetch_static_property_value(ExecutionCursor::new(compiled, output, stack, state), class_name, property, Some((function_id, $block_id, instruction.id)), None, instruction.span) {
                             Ok(value) => {
                                 if let Err(message) = stack
                                     .frame_mut(frame_index)
@@ -726,15 +627,7 @@ macro_rules! execute_rich_property_instruction {
                                 }
                             }
                             Err(ClassConstantFetch::Throwable(result)) => {
-                                match $vm.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    *result,
-                                ) {
+                                match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -743,16 +636,7 @@ macro_rules! execute_rich_property_instruction {
                                 }
                             }
                             Err(ClassConstantFetch::Raise(span, message)) => {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -784,29 +668,13 @@ macro_rules! execute_rich_property_instruction {
                                     return $vm.runtime_error(output, compiled, stack, message);
                                 }
                             };
-                        if let Err(result) = $vm.autoload_static_class_if_missing(
-                            compiled,
-                            &class_name,
-                            instruction.span,
-                            Some((
+                        if let Err(result) = $vm.autoload_static_class_if_missing(ExecutionCursor::new(compiled, output, stack, state), &class_name, instruction.span, Some((
                                 compiled_unit_cache_key(compiled),
                                 function_id,
                                 $block_id,
                                 instruction.id,
-                            )),
-                            output,
-                            stack,
-                            state,
-                        ) {
-                            match $vm.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut $exception_handlers,
-                                &mut $pending_control,
-                                result,
-                            ) {
+                            ))) {
+                            match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                 RaiseOutcome::Caught(target) => {
                                     $block_id = target;
                                     continue $dispatch;
@@ -818,16 +686,7 @@ macro_rules! execute_rich_property_instruction {
                             match resolve_static_class_name(compiled, state, stack, &class_name) {
                                 Ok(class) => class,
                                 Err(message) => {
-                                    match $vm.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        instruction.span,
-                                        message,
-                                    ) {
+                                    match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -850,16 +709,7 @@ macro_rules! execute_rich_property_instruction {
                                     "E_PHP_VM_UNKNOWN_STATIC_PROPERTY: Access to undeclared static property {}::${property}",
                                     class.display_name
                                 );
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -917,16 +767,7 @@ macro_rules! execute_rich_property_instruction {
                                 "E_PHP_VM_UNINITIALIZED_STATIC_PROPERTY: typed static property {}::${} must not be accessed before initialization",
                                 resolved.class.display_name, resolved.property.name
                             );
-                            match $vm.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut $exception_handlers,
-                                &mut $pending_control,
-                                instruction.span,
-                                message,
-                            ) {
+                            match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                 RaiseOutcome::Caught(target) => {
                                     $block_id = target;
                                     continue $dispatch;
@@ -948,35 +789,15 @@ macro_rules! execute_rich_property_instruction {
                         class_name,
                         property,
                     } => {
-                        let result = match static_property_isset_empty_result(
-                            $vm,
-                            compiled,
-                            state,
-                            stack,
-                            class_name,
-                            property,
-                            false,
-                            instruction.span,
-                            Some((
+                        let result = match static_property_isset_empty_result($vm, ExecutionCursor::new(compiled, output, stack, state), class_name, property, false, instruction.span, Some((
                                 compiled_unit_cache_key(compiled),
                                 function_id,
                                 $block_id,
                                 instruction.id,
-                            )),
-                            output,
-                        ) {
+                            ))) {
                             Ok(result) => result,
                             Err(StaticPropertyIssetEmptyError::Runtime(message)) => {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -985,15 +806,7 @@ macro_rules! execute_rich_property_instruction {
                                 }
                             }
                             Err(StaticPropertyIssetEmptyError::Vm(result)) => {
-                                match $vm.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    *result,
-                                ) {
+                                match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -1016,35 +829,15 @@ macro_rules! execute_rich_property_instruction {
                         class_name,
                         property,
                     } => {
-                        let result = match static_property_isset_empty_result(
-                            $vm,
-                            compiled,
-                            state,
-                            stack,
-                            class_name,
-                            property,
-                            true,
-                            instruction.span,
-                            Some((
+                        let result = match static_property_isset_empty_result($vm, ExecutionCursor::new(compiled, output, stack, state), class_name, property, true, instruction.span, Some((
                                 compiled_unit_cache_key(compiled),
                                 function_id,
                                 $block_id,
                                 instruction.id,
-                            )),
-                            output,
-                        ) {
+                            ))) {
                             Ok(result) => result,
                             Err(StaticPropertyIssetEmptyError::Runtime(message)) => {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -1053,15 +846,7 @@ macro_rules! execute_rich_property_instruction {
                                 }
                             }
                             Err(StaticPropertyIssetEmptyError::Vm(result)) => {
-                                match $vm.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    *result,
-                                ) {
+                                match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -1092,36 +877,22 @@ macro_rules! execute_rich_property_instruction {
                                 return $vm.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let result = match static_property_dim_isset_empty_result(
-                            $vm,
-                            compiled,
-                            state,
-                            stack,
+                        let result = match static_property_dim_isset_empty_result($vm, ExecutionCursor::new(compiled, output, stack, state), StaticPropertyDimProbe {
                             class_name,
                             property,
-                            &dims,
-                            false,
-                            instruction.span,
-                            Some((
+                            dims: &dims,
+                            is_empty: false,
+                            span: instruction.span,
+                            call_site: Some((
                                 compiled_unit_cache_key(compiled),
                                 function_id,
                                 $block_id,
                                 instruction.id,
                             )),
-                            output,
-                        ) {
+                        }) {
                             Ok(result) => result,
                             Err(StaticPropertyIssetEmptyError::Runtime(message)) => {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -1130,15 +901,7 @@ macro_rules! execute_rich_property_instruction {
                                 }
                             }
                             Err(StaticPropertyIssetEmptyError::Vm(result)) => {
-                                match $vm.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    *result,
-                                ) {
+                                match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -1169,36 +932,22 @@ macro_rules! execute_rich_property_instruction {
                                 return $vm.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        let result = match static_property_dim_isset_empty_result(
-                            $vm,
-                            compiled,
-                            state,
-                            stack,
+                        let result = match static_property_dim_isset_empty_result($vm, ExecutionCursor::new(compiled, output, stack, state), StaticPropertyDimProbe {
                             class_name,
                             property,
-                            &dims,
-                            true,
-                            instruction.span,
-                            Some((
+                            dims: &dims,
+                            is_empty: true,
+                            span: instruction.span,
+                            call_site: Some((
                                 compiled_unit_cache_key(compiled),
                                 function_id,
                                 $block_id,
                                 instruction.id,
                             )),
-                            output,
-                        ) {
+                        }) {
                             Ok(result) => result,
                             Err(StaticPropertyIssetEmptyError::Runtime(message)) => {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -1207,15 +956,7 @@ macro_rules! execute_rich_property_instruction {
                                 }
                             }
                             Err(StaticPropertyIssetEmptyError::Vm(result)) => {
-                                match $vm.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    *result,
-                                ) {
+                                match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -1238,17 +979,7 @@ macro_rules! execute_rich_property_instruction {
                         class_name,
                         constant,
                     } => {
-                        match $vm.fetch_class_constant_value(
-                            compiled,
-                            class_name,
-                            constant,
-                            Some((function_id, $block_id, instruction.id)),
-                            None,
-                            instruction.span,
-                            output,
-                            stack,
-                            state,
-                        ) {
+                        match $vm.fetch_class_constant_value(ExecutionCursor::new(compiled, output, stack, state), class_name, constant, Some((function_id, $block_id, instruction.id)), None, instruction.span) {
                             Ok(value) => {
                                 if let Err(message) = stack
                                     .frame_mut(frame_index)
@@ -1260,15 +991,7 @@ macro_rules! execute_rich_property_instruction {
                                 }
                             }
                             Err(ClassConstantFetch::Throwable(result)) => {
-                                match $vm.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    *result,
-                                ) {
+                                match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -1277,16 +1000,7 @@ macro_rules! execute_rich_property_instruction {
                                 }
                             }
                             Err(ClassConstantFetch::Raise(span, message)) => {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -1312,20 +1026,11 @@ macro_rules! execute_rich_property_instruction {
                                     unit, compiled, stack, *property, output, state,
                                 ) {
                                     Ok(property) => property,
-                                    Err(result) => return result,
+                                    Err(result) => return *result,
                                 };
                                 let receiver_type = value_type_name(&other);
-                                if let Err(result) = $vm.emit_non_object_property_read_warning(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $diagnostics,
-                                    receiver_type,
-                                    &property,
-                                    instruction.span,
-                                ) {
-                                    return result;
+                                if let Err(result) = $vm.emit_non_object_property_read_warning(ExecutionCursor::new(compiled, output, stack, state), &mut $diagnostics, receiver_type, &property, instruction.span) {
+                                    return *result;
                                 }
                                 if let Err(message) = stack
                                     .frame_mut(frame_index)
@@ -1345,7 +1050,7 @@ macro_rules! execute_rich_property_instruction {
                             .dynamic_property_name(unit, compiled, stack, *property, output, state)
                         {
                             Ok(property) => property,
-                            Err(result) => return result,
+                            Err(result) => return *result,
                         };
                         if spl_array_object_uses_array_as_props(&object) {
                             let value = match spl_container_offset_get(
@@ -1398,18 +1103,9 @@ macro_rules! execute_rich_property_instruction {
                                         &resolved.class,
                                         &resolved.property,
                                     ) {
-                                        match $vm.call_magic_property_method(
-                                            compiled,
-                                            object.clone(),
-                                            "__get",
-                                            &property,
-                                            vec![CallArgument::positional(Value::String(
+                                        match $vm.call_magic_property_method(ExecutionCursor::new(compiled, output, stack, state), object.clone(), "__get", &property, vec![CallArgument::positional(Value::String(
                                                 PhpString::from_test_str(&property),
-                                            ))],
-                                            output,
-                                            stack,
-                                            state,
-                                        ) {
+                                            ))]) {
                                             Ok(Some(value)) => {
                                                 if let Err(message) = stack
                                                     .frame_mut(frame_index)
@@ -1424,16 +1120,7 @@ macro_rules! execute_rich_property_instruction {
                                                 continue;
                                             }
                                             Ok(None) => {
-                                                match $vm.raise_runtime_error(
-                                                    compiled,
-                                                    output,
-                                                    stack,
-                                                    state,
-                                                    &mut $exception_handlers,
-                                                    &mut $pending_control,
-                                                    instruction.span,
-                                                    access_error,
-                                                ) {
+                                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, access_error) {
                                                     RaiseOutcome::Caught(target) => {
                                                         $block_id = target;
                                                         continue $dispatch;
@@ -1441,7 +1128,7 @@ macro_rules! execute_rich_property_instruction {
                                                     RaiseOutcome::Done(result) => return *result,
                                                 }
                                             }
-                                            Err(result) => return result,
+                                            Err(result) => return *result,
                                         }
                                     }
                                 }
@@ -1455,21 +1142,12 @@ macro_rules! execute_rich_property_instruction {
                             .property_state_value(compiled, state, stack, &object, &property)
                         {
                             Some(value) => value,
-                            None => match $vm.call_magic_property_method(
-                                compiled,
-                                object.clone(),
-                                "__get",
-                                &property,
-                                vec![CallArgument::positional(Value::String(
+                            None => match $vm.call_magic_property_method(ExecutionCursor::new(compiled, output, stack, state), object.clone(), "__get", &property, vec![CallArgument::positional(Value::String(
                                     PhpString::from_test_str(&property),
-                                ))],
-                                output,
-                                stack,
-                                state,
-                            ) {
+                                ))]) {
                                 Ok(Some(value)) => value,
                                 Ok(None) => object.get_property(&property).unwrap_or(Value::Null),
-                                Err(result) => return result,
+                                Err(result) => return *result,
                             },
                         };
                         if let Err(message) = stack
@@ -1497,7 +1175,7 @@ macro_rules! execute_rich_property_instruction {
                             .isset_property_value(compiled, &object, property, output, stack, state)
                         {
                             Ok(value) => value,
-                            Err(result) => return result,
+                            Err(result) => return *result,
                         };
                         if let Err(message) = stack
                             .frame_mut(frame_index)
@@ -1521,7 +1199,7 @@ macro_rules! execute_rich_property_instruction {
                                     unit, compiled, stack, *property, output, state,
                                 ) {
                                     Ok(property) => property,
-                                    Err(result) => return result,
+                                    Err(result) => return *result,
                                 };
                                 if let Err(message) = stack
                                     .frame_mut(frame_index)
@@ -1542,25 +1220,16 @@ macro_rules! execute_rich_property_instruction {
                             .dynamic_property_name(unit, compiled, stack, *property, output, state)
                         {
                             Ok(property) => property,
-                            Err(result) => return result,
+                            Err(result) => return *result,
                         };
                         let value =
                             $vm.property_state_value(compiled, state, stack, &object, &property);
                         let result = if let Some(value) = value {
                             !matches!(value, Value::Uninitialized | Value::Null)
                         } else {
-                            match $vm.call_magic_property_method(
-                                compiled,
-                                object.clone(),
-                                "__isset",
-                                &property,
-                                vec![CallArgument::positional(Value::String(
+                            match $vm.call_magic_property_method(ExecutionCursor::new(compiled, output, stack, state), object.clone(), "__isset", &property, vec![CallArgument::positional(Value::String(
                                     PhpString::from_test_str(&property),
-                                ))],
-                                output,
-                                stack,
-                                state,
-                            ) {
+                                ))]) {
                                 Ok(Some(value)) => match to_bool(&value) {
                                     Ok(value) => value,
                                     Err(message) => {
@@ -1569,7 +1238,7 @@ macro_rules! execute_rich_property_instruction {
                                     }
                                 },
                                 Ok(None) => false,
-                                Err(result) => return result,
+                                Err(result) => return *result,
                             }
                         };
                         if let Err(message) = stack
@@ -1597,7 +1266,7 @@ macro_rules! execute_rich_property_instruction {
                             .empty_property_value(compiled, &object, property, output, stack, state)
                         {
                             Ok(value) => value,
-                            Err(result) => return result,
+                            Err(result) => return *result,
                         };
                         if let Err(message) = stack
                             .frame_mut(frame_index)
@@ -1621,7 +1290,7 @@ macro_rules! execute_rich_property_instruction {
                                     unit, compiled, stack, *property, output, state,
                                 ) {
                                     Ok(property) => property,
-                                    Err(result) => return result,
+                                    Err(result) => return *result,
                                 };
                                 if let Err(message) = stack
                                     .frame_mut(frame_index)
@@ -1642,7 +1311,7 @@ macro_rules! execute_rich_property_instruction {
                             .dynamic_property_name(unit, compiled, stack, *property, output, state)
                         {
                             Ok(property) => property,
-                            Err(result) => return result,
+                            Err(result) => return *result,
                         };
                         let result = match $vm
                             .property_state_value(compiled, state, stack, &object, &property)
@@ -1654,18 +1323,9 @@ macro_rules! execute_rich_property_instruction {
                                 }
                             },
                             None => {
-                                let isset = match $vm.call_magic_property_method(
-                                    compiled,
-                                    object.clone(),
-                                    "__isset",
-                                    &property,
-                                    vec![CallArgument::positional(Value::String(
+                                let isset = match $vm.call_magic_property_method(ExecutionCursor::new(compiled, output, stack, state), object.clone(), "__isset", &property, vec![CallArgument::positional(Value::String(
                                         PhpString::from_test_str(&property),
-                                    ))],
-                                    output,
-                                    stack,
-                                    state,
-                                ) {
+                                    ))]) {
                                     Ok(Some(value)) => match to_bool(&value) {
                                         Ok(value) => value,
                                         Err(message) => {
@@ -1674,23 +1334,14 @@ macro_rules! execute_rich_property_instruction {
                                         }
                                     },
                                     Ok(None) => false,
-                                    Err(result) => return result,
+                                    Err(result) => return *result,
                                 };
                                 if !isset {
                                     true
                                 } else {
-                                    match $vm.call_magic_property_method(
-                                        compiled,
-                                        object.clone(),
-                                        "__get",
-                                        &property,
-                                        vec![CallArgument::positional(Value::String(
+                                    match $vm.call_magic_property_method(ExecutionCursor::new(compiled, output, stack, state), object.clone(), "__get", &property, vec![CallArgument::positional(Value::String(
                                             PhpString::from_test_str(&property),
-                                        ))],
-                                        output,
-                                        stack,
-                                        state,
-                                    ) {
+                                        ))]) {
                                         Ok(Some(value)) => match php_empty_access_value(&value) {
                                             Ok(value) => value,
                                             Err(message) => {
@@ -1700,7 +1351,7 @@ macro_rules! execute_rich_property_instruction {
                                             }
                                         },
                                         Ok(None) => true,
-                                        Err(result) => return result,
+                                        Err(result) => return *result,
                                     }
                                 }
                             }
@@ -1732,7 +1383,7 @@ macro_rules! execute_rich_property_instruction {
                             .dynamic_property_name(unit, compiled, stack, *property, output, state)
                         {
                             Ok(property) => property,
-                            Err(result) => return result,
+                            Err(result) => return *result,
                         };
                         let dims = match read_dim_operands_at_frame(unit, stack, frame_index, dims)
                         {
@@ -1777,7 +1428,7 @@ macro_rules! execute_rich_property_instruction {
                             .dynamic_property_name(unit, compiled, stack, *property, output, state)
                         {
                             Ok(property) => property,
-                            Err(result) => return result,
+                            Err(result) => return *result,
                         };
                         let dims = match read_dim_operands_at_frame(unit, stack, frame_index, dims)
                         {
@@ -2000,16 +1651,7 @@ macro_rules! execute_rich_property_instruction {
                             Ok(()) => {}
                             Err(StaticPropertyAssignError::Vm(result)) => return *result,
                             Err(StaticPropertyAssignError::Raise(span, message)) => {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -2067,7 +1709,7 @@ macro_rules! execute_rich_property_instruction {
                                     unit, compiled, stack, *property, output, state,
                                 ) {
                                     Ok(property) => property,
-                                    Err(result) => return result,
+                                    Err(result) => return *result,
                                 };
                                 return $vm.runtime_error(
                                     output,
@@ -2087,7 +1729,7 @@ macro_rules! execute_rich_property_instruction {
                             .dynamic_property_name(unit, compiled, stack, *property, output, state)
                         {
                             Ok(property) => property,
-                            Err(result) => return result,
+                            Err(result) => return *result,
                         };
                         let class = compiled.lookup_class(&object.class_name());
                         let scope = current_scope_class(compiled, stack);
@@ -2112,30 +1754,12 @@ macro_rules! execute_rich_property_instruction {
                                 resolved.class,
                                 resolved.property,
                             ) {
-                                match $vm.call_magic_property_method(
-                                    compiled,
-                                    object.clone(),
-                                    "__unset",
-                                    &property,
-                                    vec![CallArgument::positional(Value::String(
+                                match $vm.call_magic_property_method(ExecutionCursor::new(compiled, output, stack, state), object.clone(), "__unset", &property, vec![CallArgument::positional(Value::String(
                                         PhpString::from_test_str(&property),
-                                    ))],
-                                    output,
-                                    stack,
-                                    state,
-                                ) {
+                                    ))]) {
                                     Ok(Some(_)) => {}
                                     Ok(None) => {
-                                        match $vm.raise_runtime_error(
-                                            compiled,
-                                            output,
-                                            stack,
-                                            state,
-                                            &mut $exception_handlers,
-                                            &mut $pending_control,
-                                            instruction.span,
-                                            message,
-                                        ) {
+                                        match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                             RaiseOutcome::Caught(target) => {
                                                 $block_id = target;
                                                 continue $dispatch;
@@ -2143,7 +1767,7 @@ macro_rules! execute_rich_property_instruction {
                                             RaiseOutcome::Done(result) => return *result,
                                         }
                                     }
-                                    Err(result) => return result,
+                                    Err(result) => return *result,
                                 }
                                 continue;
                             }
@@ -2155,22 +1779,13 @@ macro_rules! execute_rich_property_instruction {
                                 object.unset_property(&storage_name);
                             }
                         } else {
-                            match $vm.call_magic_property_method(
-                                compiled,
-                                object.clone(),
-                                "__unset",
-                                &property,
-                                vec![CallArgument::positional(Value::String(
+                            match $vm.call_magic_property_method(ExecutionCursor::new(compiled, output, stack, state), object.clone(), "__unset", &property, vec![CallArgument::positional(Value::String(
                                     PhpString::from_test_str(&property),
-                                ))],
-                                output,
-                                stack,
-                                state,
-                            ) {
+                                ))]) {
                                 Ok(Some(_)) | Ok(None) => {
                                     object.unset_property(&property);
                                 }
-                                Err(result) => return result,
+                                Err(result) => return *result,
                             }
                         }
                     }
@@ -2178,19 +1793,10 @@ macro_rules! execute_rich_property_instruction {
                         let object = match read_operand_at_frame(unit, stack, frame_index, *object) {
                             Ok(Value::Object(object)) => object,
                             Ok(other) => {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    format!(
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, format!(
                                         "E_PHP_VM_DYNAMIC_CLASS_NAME_TYPE: Cannot use \"::class\" on {}",
                                         value_type_name(&other)
-                                    ),
-                                ) {
+                                    )) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -2227,18 +1833,9 @@ macro_rules! execute_rich_property_instruction {
                         let object = match read_operand_at_frame(unit, stack, frame_index, *object) {
                             Ok(Value::Object(object)) => object,
                             Ok(Value::Callable(_)) => {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    format!(
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, format!(
                                         "E_PHP_VM_DYNAMIC_PROPERTY_ERROR: Cannot create dynamic property Closure::${property}"
-                                    ),
-                                ) {
+                                    )) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -2331,10 +1928,12 @@ macro_rules! execute_rich_property_instruction {
                         let lookup_epoch = state.lookup_epoch();
                         let receiver_has_magic_set = class_has_public_magic_set(compiled, &class);
                         if let Some(target) = $vm.lookup_property_assign_inline_cache(
-                            compiled,
-                            function_id,
-                            $block_id,
-                            instruction.id,
+                            IrInlineCacheSite::classic(
+                                compiled,
+                                function_id,
+                                $block_id,
+                                instruction.id,
+                            ),
                             property,
                             &receiver_class,
                             normalized_scope.as_deref(),
@@ -2389,21 +1988,12 @@ macro_rules! execute_rich_property_instruction {
                                                 .runtime_error(output, compiled, stack, message);
                                         }
                                     };
-                                match $vm.call_magic_property_method(
-                                    compiled,
-                                    object.clone(),
-                                    "__set",
-                                    property,
-                                    vec![
+                                match $vm.call_magic_property_method(ExecutionCursor::new(compiled, output, stack, state), object.clone(), "__set", property, vec![
                                         CallArgument::positional(Value::String(
                                             PhpString::from_test_str(property),
                                         )),
                                         CallArgument::positional(value.clone()),
-                                    ],
-                                    output,
-                                    stack,
-                                    state,
-                                ) {
+                                    ]) {
                                     Ok(Some(_)) => {
                                         $vm.record_counter_property_assign_ic_fallback(
                                             "magic_set_metadata",
@@ -2420,7 +2010,7 @@ macro_rules! execute_rich_property_instruction {
                                         continue;
                                     }
                                     Ok(None) => {}
-                                    Err(result) => return result,
+                                    Err(result) => return *result,
                                 }
                                 if let Some(diagnostic) = dynamic_property_deprecation_diagnostic(
                                     compiled,
@@ -2466,16 +2056,7 @@ macro_rules! execute_rich_property_instruction {
                                     entry,
                                 )
                             }) {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -2536,21 +2117,12 @@ macro_rules! execute_rich_property_instruction {
                                             .runtime_error(output, compiled, stack, message);
                                     }
                                 };
-                            match $vm.call_magic_property_method(
-                                compiled,
-                                object.clone(),
-                                "__set",
-                                property,
-                                vec![
+                            match $vm.call_magic_property_method(ExecutionCursor::new(compiled, output, stack, state), object.clone(), "__set", property, vec![
                                     CallArgument::positional(Value::String(
                                         PhpString::from_test_str(property),
                                     )),
                                     CallArgument::positional(value.clone()),
-                                ],
-                                output,
-                                stack,
-                                state,
-                            ) {
+                                ]) {
                                 Ok(Some(_)) => {
                                     $vm.record_counter_property_assign_ic_fallback(
                                         "magic_set_metadata",
@@ -2595,16 +2167,7 @@ macro_rules! execute_rich_property_instruction {
                                         }
                                         continue;
                                     }
-                                    match $vm.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        instruction.span,
-                                        message,
-                                    ) {
+                                    match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -2612,7 +2175,7 @@ macro_rules! execute_rich_property_instruction {
                                         RaiseOutcome::Done(result) => return *result,
                                     }
                                 }
-                                Err(result) => return result,
+                                Err(result) => return *result,
                             }
                         }
                         let value = match read_operand_at_frame(unit, stack, frame_index, *value) {
@@ -2632,16 +2195,7 @@ macro_rules! execute_rich_property_instruction {
                             $vm.typecheck_fast_path_context(),
                         ) {
                             $vm.record_counter_property_assign_ic_fallback("type_mismatch");
-                            match $vm.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut $exception_handlers,
-                                &mut $pending_control,
-                                instruction.span,
-                                message,
-                            ) {
+                            match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                 RaiseOutcome::Caught(target) => {
                                     $block_id = target;
                                     continue $dispatch;
@@ -2653,16 +2207,7 @@ macro_rules! execute_rich_property_instruction {
                             validate_property_write(resolved_class, entry, &object, stack, compiled)
                         {
                             $vm.record_counter_property_assign_ic_fallback("readonly_property");
-                            match $vm.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut $exception_handlers,
-                                &mut $pending_control,
-                                instruction.span,
-                                message,
-                            ) {
+                            match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                 RaiseOutcome::Caught(target) => {
                                     $block_id = target;
                                     continue $dispatch;
@@ -2676,17 +2221,7 @@ macro_rules! execute_rich_property_instruction {
                             $vm.record_counter_property_assign_ic_fallback(
                                 "property_hook_present",
                             );
-                            match $vm.call_property_hook(
-                                compiled,
-                                object.clone(),
-                                resolved_class,
-                                entry,
-                                function,
-                                vec![CallArgument::positional(value.clone())],
-                                output,
-                                stack,
-                                state,
-                            ) {
+                            match $vm.call_property_hook(ExecutionCursor::new(compiled, output, stack, state), object.clone(), resolved_class, entry, function, vec![CallArgument::positional(value.clone())]) {
                                 Ok(_) => {
                                     if let Err(message) = stack
                                         .frame_mut(frame_index)
@@ -2699,7 +2234,7 @@ macro_rules! execute_rich_property_instruction {
                                     }
                                     continue;
                                 }
-                                Err(result) => return result,
+                                Err(result) => return *result,
                             }
                         }
                         if !entry.hooks.backed
@@ -2723,21 +2258,12 @@ macro_rules! execute_rich_property_instruction {
                             && object.get_property(&storage_name).is_none()
                             && !magic_property_call_is_active(state, &object, "__set", property)
                         {
-                            match $vm.call_magic_property_method(
-                                compiled,
-                                object.clone(),
-                                "__set",
-                                property,
-                                vec![
+                            match $vm.call_magic_property_method(ExecutionCursor::new(compiled, output, stack, state), object.clone(), "__set", property, vec![
                                     CallArgument::positional(Value::String(
                                         PhpString::from_test_str(property),
                                     )),
                                     CallArgument::positional(value.clone()),
-                                ],
-                                output,
-                                stack,
-                                state,
-                            ) {
+                                ]) {
                                 Ok(Some(_)) => {
                                     if let Err(message) = stack
                                         .frame_mut(frame_index)
@@ -2751,7 +2277,7 @@ macro_rules! execute_rich_property_instruction {
                                     continue;
                                 }
                                 Ok(None) => {}
-                                Err(result) => return result,
+                                Err(result) => return *result,
                             }
                         }
                         if matches!(
@@ -2802,20 +2328,11 @@ macro_rules! execute_rich_property_instruction {
                                     unit, compiled, stack, *property, output, state,
                                 ) {
                                     Ok(property) => property,
-                                    Err(result) => return result,
+                                    Err(result) => return *result,
                                 };
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    format!(
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, format!(
                                         "E_PHP_VM_DYNAMIC_PROPERTY_ERROR: Cannot create dynamic property Closure::${property}"
-                                    ),
-                                ) {
+                                    )) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -2828,7 +2345,7 @@ macro_rules! execute_rich_property_instruction {
                                     unit, compiled, stack, *property, output, state,
                                 ) {
                                     Ok(property) => property,
-                                    Err(result) => return result,
+                                    Err(result) => return *result,
                                 };
                                 return $vm.runtime_error(
                                     output,
@@ -2848,7 +2365,7 @@ macro_rules! execute_rich_property_instruction {
                             .dynamic_property_name(unit, compiled, stack, *property, output, state)
                         {
                             Ok(property) => property,
-                            Err(result) => return result,
+                            Err(result) => return *result,
                         };
                         if spl_array_object_uses_array_as_props(&object) {
                             let value =
@@ -2929,21 +2446,12 @@ macro_rules! execute_rich_property_instruction {
                                                 .runtime_error(output, compiled, stack, message);
                                         }
                                     };
-                                match $vm.call_magic_property_method(
-                                    compiled,
-                                    object.clone(),
-                                    "__set",
-                                    &property,
-                                    vec![
+                                match $vm.call_magic_property_method(ExecutionCursor::new(compiled, output, stack, state), object.clone(), "__set", &property, vec![
                                         CallArgument::positional(Value::String(
                                             PhpString::from_test_str(&property),
                                         )),
                                         CallArgument::positional(value.clone()),
-                                    ],
-                                    output,
-                                    stack,
-                                    state,
-                                ) {
+                                    ]) {
                                     Ok(Some(_)) => {
                                         if let Err(message) = stack
                                             .frame_mut(frame_index)
@@ -2957,7 +2465,7 @@ macro_rules! execute_rich_property_instruction {
                                         continue;
                                     }
                                     Ok(None) => {}
-                                    Err(result) => return result,
+                                    Err(result) => return *result,
                                 }
                                 if let Some(diagnostic) = dynamic_property_deprecation_diagnostic(
                                     compiled,
@@ -3003,16 +2511,7 @@ macro_rules! execute_rich_property_instruction {
                                     entry,
                                 )
                             }) {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -3072,21 +2571,12 @@ macro_rules! execute_rich_property_instruction {
                                             .runtime_error(output, compiled, stack, message);
                                     }
                                 };
-                            match $vm.call_magic_property_method(
-                                compiled,
-                                object.clone(),
-                                "__set",
-                                &property,
-                                vec![
+                            match $vm.call_magic_property_method(ExecutionCursor::new(compiled, output, stack, state), object.clone(), "__set", &property, vec![
                                     CallArgument::positional(Value::String(
                                         PhpString::from_test_str(&property),
                                     )),
                                     CallArgument::positional(value.clone()),
-                                ],
-                                output,
-                                stack,
-                                state,
-                            ) {
+                                ]) {
                                 Ok(Some(_)) => {
                                     if let Err(message) = stack
                                         .frame_mut(frame_index)
@@ -3128,16 +2618,7 @@ macro_rules! execute_rich_property_instruction {
                                         }
                                         continue;
                                     }
-                                    match $vm.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        instruction.span,
-                                        message,
-                                    ) {
+                                    match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -3145,7 +2626,7 @@ macro_rules! execute_rich_property_instruction {
                                         RaiseOutcome::Done(result) => return *result,
                                     }
                                 }
-                                Err(result) => return result,
+                                Err(result) => return *result,
                             }
                         }
                         let value = match read_operand_at_frame(unit, stack, frame_index, *value) {
@@ -3164,16 +2645,7 @@ macro_rules! execute_rich_property_instruction {
                             &value,
                             $vm.typecheck_fast_path_context(),
                         ) {
-                            match $vm.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut $exception_handlers,
-                                &mut $pending_control,
-                                instruction.span,
-                                message,
-                            ) {
+                            match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                 RaiseOutcome::Caught(target) => {
                                     $block_id = target;
                                     continue $dispatch;
@@ -3184,16 +2656,7 @@ macro_rules! execute_rich_property_instruction {
                         if let Err(message) =
                             validate_property_write(resolved_class, entry, &object, stack, compiled)
                         {
-                            match $vm.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut $exception_handlers,
-                                &mut $pending_control,
-                                instruction.span,
-                                message,
-                            ) {
+                            match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                 RaiseOutcome::Caught(target) => {
                                     $block_id = target;
                                     continue $dispatch;
@@ -3204,17 +2667,7 @@ macro_rules! execute_rich_property_instruction {
                         if !property_hook_is_active(state, &object, resolved_class, entry)
                             && let Some(function) = entry.hooks.set
                         {
-                            match $vm.call_property_hook(
-                                compiled,
-                                object.clone(),
-                                resolved_class,
-                                entry,
-                                function,
-                                vec![CallArgument::positional(value.clone())],
-                                output,
-                                stack,
-                                state,
-                            ) {
+                            match $vm.call_property_hook(ExecutionCursor::new(compiled, output, stack, state), object.clone(), resolved_class, entry, function, vec![CallArgument::positional(value.clone())]) {
                                 Ok(_) => {
                                     if let Err(message) = stack
                                         .frame_mut(frame_index)
@@ -3227,7 +2680,7 @@ macro_rules! execute_rich_property_instruction {
                                     }
                                     continue;
                                 }
-                                Err(result) => return result,
+                                Err(result) => return *result,
                             }
                         }
                         if !entry.hooks.backed
@@ -3248,21 +2701,12 @@ macro_rules! execute_rich_property_instruction {
                             && object.get_property(&storage_name).is_none()
                             && !magic_property_call_is_active(state, &object, "__set", &property)
                         {
-                            match $vm.call_magic_property_method(
-                                compiled,
-                                object.clone(),
-                                "__set",
-                                &property,
-                                vec![
+                            match $vm.call_magic_property_method(ExecutionCursor::new(compiled, output, stack, state), object.clone(), "__set", &property, vec![
                                     CallArgument::positional(Value::String(
                                         PhpString::from_test_str(&property),
                                     )),
                                     CallArgument::positional(value.clone()),
-                                ],
-                                output,
-                                stack,
-                                state,
-                            ) {
+                                ]) {
                                 Ok(Some(_)) => {
                                     if let Err(message) = stack
                                         .frame_mut(frame_index)
@@ -3276,7 +2720,7 @@ macro_rules! execute_rich_property_instruction {
                                     continue;
                                 }
                                 Ok(None) => {}
-                                Err(result) => return result,
+                                Err(result) => return *result,
                             }
                         }
                         object.set_property(storage_name, value.clone());
@@ -3356,16 +2800,7 @@ macro_rules! execute_rich_property_instruction {
                                 }
                             }
                             Err(PropertyDimAssign::Raise(span, message)) => {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -3411,15 +2846,7 @@ macro_rules! execute_rich_property_instruction {
                         ) {
                             Ok(outcome) => outcome,
                             Err(StaticPropertyAssignError::Vm(result)) => {
-                                match $vm.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    *result,
-                                ) {
+                                match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -3428,16 +2855,7 @@ macro_rules! execute_rich_property_instruction {
                                 }
                             }
                             Err(StaticPropertyAssignError::Raise(span, message)) => {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -3449,15 +2867,7 @@ macro_rules! execute_rich_property_instruction {
                                 return $vm.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        if let Some(outcome) = $vm.run_destructors_for_unreferenced_value(
-                            compiled,
-                            output,
-                            stack,
-                            state,
-                            &mut $exception_handlers,
-                            &mut $pending_control,
-                            &previous_effective,
-                        ) {
+                        if let Some(outcome) = $vm.run_destructors_for_unreferenced_value(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, &previous_effective) {
                             match outcome {
                                 RaiseOutcome::Caught(target) => {
                                     $block_id = target;
@@ -3503,29 +2913,13 @@ macro_rules! execute_rich_property_instruction {
                                     return $vm.runtime_error(output, compiled, stack, message);
                                 }
                             };
-                        if let Err(result) = $vm.autoload_static_class_if_missing(
-                            compiled,
-                            &class_name,
-                            instruction.span,
-                            Some((
+                        if let Err(result) = $vm.autoload_static_class_if_missing(ExecutionCursor::new(compiled, output, stack, state), &class_name, instruction.span, Some((
                                 compiled_unit_cache_key(compiled),
                                 function_id,
                                 $block_id,
                                 instruction.id,
-                            )),
-                            output,
-                            stack,
-                            state,
-                        ) {
-                            match $vm.route_throwable_result(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut $exception_handlers,
-                                &mut $pending_control,
-                                result,
-                            ) {
+                            ))) {
+                            match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                 RaiseOutcome::Caught(target) => {
                                     $block_id = target;
                                     continue $dispatch;
@@ -3537,16 +2931,7 @@ macro_rules! execute_rich_property_instruction {
                             match resolve_static_class_name(compiled, state, stack, &class_name) {
                                 Ok(class) => class,
                                 Err(message) => {
-                                    match $vm.raise_runtime_error(
-                                        compiled,
-                                        output,
-                                        stack,
-                                        state,
-                                        &mut $exception_handlers,
-                                        &mut $pending_control,
-                                        instruction.span,
-                                        message,
-                                    ) {
+                                    match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                         RaiseOutcome::Caught(target) => {
                                             $block_id = target;
                                             continue $dispatch;
@@ -3569,16 +2954,7 @@ macro_rules! execute_rich_property_instruction {
                                     "E_PHP_VM_UNKNOWN_STATIC_PROPERTY: Access to undeclared static property {}::${property}",
                                     class.display_name
                                 );
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -3628,16 +3004,7 @@ macro_rules! execute_rich_property_instruction {
                             &value,
                             $vm.typecheck_fast_path_context(),
                         ) {
-                            match $vm.raise_runtime_error(
-                                compiled,
-                                output,
-                                stack,
-                                state,
-                                &mut $exception_handlers,
-                                &mut $pending_control,
-                                instruction.span,
-                                message,
-                            ) {
+                            match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                 RaiseOutcome::Caught(target) => {
                                     $block_id = target;
                                     continue $dispatch;
@@ -3680,15 +3047,7 @@ macro_rules! execute_rich_property_instruction {
                         ) {
                             return $vm.runtime_error(output, compiled, stack, message);
                         }
-                        if let Some(outcome) = $vm.run_destructors_for_unreferenced_value(
-                            compiled,
-                            output,
-                            stack,
-                            state,
-                            &mut $exception_handlers,
-                            &mut $pending_control,
-                            &previous_effective,
-                        ) {
+                        if let Some(outcome) = $vm.run_destructors_for_unreferenced_value(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, &previous_effective) {
                             match outcome {
                                 RaiseOutcome::Caught(target) => {
                                     $block_id = target;
@@ -3726,35 +3085,15 @@ macro_rules! execute_rich_property_instruction {
                                 return $vm.runtime_error(output, compiled, stack, message);
                             }
                         };
-                        match static_property_dim_unset_result(
-                            $vm,
-                            compiled,
-                            state,
-                            stack,
-                            class_name,
-                            property,
-                            &dims,
-                            instruction.span,
-                            Some((
+                        match static_property_dim_unset_result($vm, ExecutionCursor::new(compiled, output, stack, state), class_name, property, &dims, instruction.span, Some((
                                 compiled_unit_cache_key(compiled),
                                 function_id,
                                 $block_id,
                                 instruction.id,
-                            )),
-                            output,
-                        ) {
+                            ))) {
                             Ok(()) => {}
                             Err(StaticPropertyIssetEmptyError::Runtime(message)) => {
-                                match $vm.raise_runtime_error(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    instruction.span,
-                                    message,
-                                ) {
+                                match $vm.raise_runtime_error(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, instruction.span, message) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;
@@ -3763,15 +3102,7 @@ macro_rules! execute_rich_property_instruction {
                                 }
                             }
                             Err(StaticPropertyIssetEmptyError::Vm(result)) => {
-                                match $vm.route_throwable_result(
-                                    compiled,
-                                    output,
-                                    stack,
-                                    state,
-                                    &mut $exception_handlers,
-                                    &mut $pending_control,
-                                    *result,
-                                ) {
+                                match $vm.route_throwable_result(ExecutionCursor::new(compiled, output, stack, state), &mut $exception_handlers, &mut $pending_control, *result) {
                                     RaiseOutcome::Caught(target) => {
                                         $block_id = target;
                                         continue $dispatch;

@@ -1,26 +1,36 @@
 use super::*;
 
+pub(super) struct JitLeafRequest<'a> {
+    pub(super) compiled: &'a CompiledUnit,
+    pub(super) state: &'a ExecutionState,
+    pub(super) function_id: FunctionId,
+    pub(super) function: &'a IrFunction,
+    pub(super) tier: ExecutionTier,
+    pub(super) call_shape_supported: bool,
+    pub(super) args: &'a [PreparedArg],
+}
+
 impl Vm {
     #[cfg(feature = "jit-copy-patch")]
     pub(super) fn try_execute_profiled_copy_patch_leaf(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         function_id: FunctionId,
         function: &IrFunction,
         call: &FunctionCall<'_>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Option<VmResult> {
-        let profile_boundary = self.request_profile_boundary_start();
-        let result = self.try_execute_copy_patch_leaf(
+        let ExecutionCursor {
             compiled,
-            function_id,
-            function,
-            call,
             output,
             stack,
             state,
+        } = cursor;
+        let profile_boundary = self.request_profile_boundary_start();
+        let result = self.try_execute_copy_patch_leaf(
+            ExecutionCursor::new(compiled, output, stack, state),
+            function_id,
+            function,
+            call,
         );
         if result.is_some() {
             self.record_counter_function_profile(
@@ -35,16 +45,16 @@ impl Vm {
     }
 
     #[cfg(not(feature = "jit-cranelift"))]
-    pub(super) fn try_execute_jit_leaf(
-        &self,
-        _compiled: &CompiledUnit,
-        _state: &ExecutionState,
-        _function_id: FunctionId,
-        _function: &IrFunction,
-        tier: ExecutionTier,
-        _call_shape_supported: bool,
-        _args: &[PreparedArg],
-    ) -> Option<Value> {
+    pub(super) fn try_execute_jit_leaf(&self, request: JitLeafRequest<'_>) -> Option<Value> {
+        let _ = (
+            request.compiled,
+            request.state,
+            request.function_id,
+            request.function,
+            request.call_shape_supported,
+            request.args,
+        );
+        let tier = request.tier;
         if tier == ExecutionTier::Jit && matches!(self.options.jit, JitMode::Cranelift) {
             self.record_counter_native_candidate();
             self.record_counter_native_platform_unavailable();
@@ -68,14 +78,17 @@ impl Vm {
     #[cfg(all(feature = "jit-copy-patch", unix, target_arch = "aarch64"))]
     pub(super) fn try_execute_copy_patch_leaf(
         &self,
-        compiled: &CompiledUnit,
+        cursor: ExecutionCursor<'_>,
         function_id: FunctionId,
         function: &IrFunction,
         call: &FunctionCall<'_>,
-        output: &mut OutputBuffer,
-        stack: &mut CallStack,
-        state: &mut ExecutionState,
     ) -> Option<VmResult> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
         if !self
             .options
             .copy_patch_leaf_override
@@ -134,16 +147,17 @@ impl Vm {
         for (arg_index, param) in function.params.iter().enumerate() {
             let value = params.get_mut(param_offset + arg_index)?;
             if coerce_or_check_param_type(
-                compiled,
-                state,
-                function,
-                param,
-                arg_index,
+                ParamTypecheckRequest {
+                    compiled,
+                    state,
+                    function,
+                    param,
+                    arg_index,
+                    fast_path: self.typecheck_fast_path_context(),
+                    strict_types: call_site_strict_types,
+                    call_span: call.call_span,
+                },
                 value,
-                false,
-                self.typecheck_fast_path_context(),
-                call_site_strict_types,
-                call.call_span,
             )
             .is_err()
             {
@@ -612,16 +626,16 @@ impl Vm {
     // safety-audit.md): reconstitutes Box<Value> pointers produced by JIT
     // helpers for this synchronous call.
     #[allow(unsafe_code)]
-    pub(super) fn try_execute_jit_leaf(
-        &self,
-        compiled: &CompiledUnit,
-        state: &ExecutionState,
-        function_id: FunctionId,
-        function: &IrFunction,
-        tier: ExecutionTier,
-        call_shape_supported: bool,
-        args: &[PreparedArg],
-    ) -> Option<Value> {
+    pub(super) fn try_execute_jit_leaf(&self, request: JitLeafRequest<'_>) -> Option<Value> {
+        let JitLeafRequest {
+            compiled,
+            state,
+            function_id,
+            function,
+            tier,
+            call_shape_supported,
+            args,
+        } = request;
         if tier != ExecutionTier::Jit || !self.options.tiering.enabled {
             return None;
         }
