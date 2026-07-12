@@ -34,17 +34,23 @@ nix develop -c just verify-performance
 The gate includes:
 
 - `performance-tests`
-- `performance-regression`
+- `performance-regression` (includes the `perf-flag-matrix` A/B matrix)
 - `cache-roundtrip`
 - `optimizer-diff`
 - `quickening-smoke`
 - `inline-cache-smoke`
-- `callgrind-smoke`
 - `jit-smoke`
 - `safety-audit-smoke`
 - `benchmark-smoke`
 - `framework-smoke`
+
+The release-profile and report gates run as `verify-performance-extended`
+(its own job in the CI gate matrix):
+
+- `release-benchmark-smoke`
+- `callgrind-smoke`
 - `hotpath-inventory`
+- `fastest-hotpath-report`
 - `perf-report`
 
 Long benchmark suites remain opt-in and are not default pull-request gates:

@@ -494,8 +494,9 @@ small regression fixture:
 
 Regression fixtures must stay small, handwritten PHP files. They must not be
 large framework snapshots, vendored Composer trees, or generated reports.
-`regression-fixtures` is included by `runtime-semantics-fixtures`, so `verify-runtime`
-includes the regression corpus through the central Runtime semantics gate.
+`regression-fixtures` is a focused per-category gate; `verify-runtime` covers
+the regression corpus through its full-corpus differential run, which is a
+strict superset of every category gate.
 
 ## Core Documentation and ADRs
 
@@ -637,11 +638,15 @@ known-gap behavior, it needs a fixture and an updated ADR or topic document.
 ## Hardening and Unsafe Audit
 
 Runtime-semantics hardening is tracked in `docs/runtime/semantics-hardening.md`.
-`verify-runtime` includes:
+Unsafe enforcement lives in the crate roots (`#![deny(unsafe_code)]`, with the
+audited exceptions from ADR 0020 and ADR 0021), so it holds in every build and
+lint of these crates:
 
-- `just runtime-hardening-lints`, which runs Clippy for `php_runtime` and
-  `php_vm` with `-D warnings -D unsafe-code`;
-- `just runtime-toolchain-audit`, which checks that the Nix devshell exposes the
+- `just runtime-hardening-lints` remains as a focused Clippy run over
+  `php_runtime` and `php_vm`; it is a strict subset of the workspace
+  `just lint`, which combined runs and CI's workspace job execute anyway,
+  so `verify-runtime` no longer repeats it.
+- `just runtime-toolchain-audit` checks that the Nix devshell exposes the
   required local tools and pinned PHP reference metadata.
 
 Additional opt-in hardening targets are documented but are not part of the
