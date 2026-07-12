@@ -636,8 +636,14 @@ def resolve_php_fpm(args: argparse.Namespace, out_dir: Path, docroot: Path | Non
     fpm_port = available_port() if use_host_network else 9000
     nginx_port = available_port() if use_host_network else 80
     fpm_config = out_dir / "reference-php-fpm.conf"
+    fpm_listen_host = "127.0.0.1" if use_host_network else "0.0.0.0"
     fpm_config.write_text(
-        render_fpm_config(fpm_port, max(concurrency_levels(args.concurrency))), encoding="utf-8"
+        render_fpm_config(
+            fpm_listen_host,
+            fpm_port,
+            max(concurrency_levels(args.concurrency)),
+        ),
+        encoding="utf-8",
     )
     nginx_config = out_dir / "reference-nginx.conf"
     upstream = f"127.0.0.1:{fpm_port}" if use_host_network else f"{fpm_name}:9000"
@@ -729,13 +735,13 @@ def render_nginx_config(docroot: Path, upstream: str, listen_port: int) -> str:
 """
 
 
-def render_fpm_config(listen_port: int, children: int) -> str:
+def render_fpm_config(listen_host: str, listen_port: int, children: int) -> str:
     return f"""[global]
 daemonize = no
 error_log = /proc/self/fd/2
 
 [www]
-listen = 127.0.0.1:{listen_port}
+listen = {listen_host}:{listen_port}
 user = {os.getuid()}
 group = {os.getgid()}
 pm = static
@@ -1385,6 +1391,7 @@ def self_test() -> int:
     assert "fastcgi_param SERVER_NAME $host;" in render_nginx_config(
         Path("/tmp/wordpress"), "127.0.0.1:9000", 8080
     )
+    assert "listen = 0.0.0.0:9000" in render_fpm_config("0.0.0.0", 9000, 4)
     assert normalize_headers([("Date", "today"), ("Content-Type", " text/html ")]) == [["content-type", "text/html"]]
     (REPO_ROOT / "target").mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=REPO_ROOT / "target") as temporary:
