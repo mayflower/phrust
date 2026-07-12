@@ -3581,19 +3581,20 @@ fn write_triage_outputs(
         let selected_manifest_path = options
             .module_manifests_dir
             .join(format!("{safe_module}.selected.jsonl"));
-        let preserve_curated_module = has_curated_generated_manifest(&selected_manifest_path);
-        if !preserve_curated_module {
-            fs::write(
-                &doc_path,
-                render_module_doc(spec, index + 1, &stats, &selected_manifest_path),
-            )
-            .map_err(|error| format!("{}: {error}", doc_path.display()))?;
-            fs::write(
-                &manifest_path,
-                render_module_manifest(spec, index + 1, &stats, &selected_manifest_path),
-            )
-            .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
-        }
+        // The curated selected manifest preserves itself inside
+        // render_selected_manifest; the plan JSON and doc are derived data and
+        // must always be re-rendered so their counts track the current
+        // baseline instead of freezing at the curation timestamp.
+        fs::write(
+            &doc_path,
+            render_module_doc(spec, index + 1, &stats, &selected_manifest_path),
+        )
+        .map_err(|error| format!("{}: {error}", doc_path.display()))?;
+        fs::write(
+            &manifest_path,
+            render_module_manifest(spec, index + 1, &stats, &selected_manifest_path),
+        )
+        .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
         fs::write(
             &selected_manifest_path,
             render_selected_manifest(&selected_manifest_path, &stats, options.selected_limit),
@@ -6070,6 +6071,71 @@ mod tests {
 
         assert!(has_curated_generated_manifest(&manifest));
         assert_eq!(render_selected_manifest(&manifest, &stats, 200), existing);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn triage_refreshes_plan_counts_for_curated_modules() {
+        let dir = env::temp_dir().join(format!("phrust-curated-plan-{}", std::process::id()));
+        let modules_dir = dir.join("docs");
+        let manifests_dir = dir.join("manifests");
+        fs::create_dir_all(&manifests_dir).unwrap();
+        let selected = manifests_dir.join("zend.basic.selected.jsonl");
+        let curated = "{\"path\":\"tests/phpt/generated/zend.basic/regression-example.phpt\",\"module\":\"zend.basic\",\"kind\":\"regression\"}\n";
+        fs::write(&selected, curated).unwrap();
+
+        let mut triage = PhptTriage::default();
+        triage.modules.insert(
+            "zend.basic".to_string(),
+            ModuleTriageStats {
+                corpus_count: 3509,
+                pass_count: 987,
+                skip_count: 89,
+                fail_count: 2432,
+                known_failure_count: 2432,
+                ..ModuleTriageStats::default()
+            },
+        );
+        let options = TriageOptions {
+            corpus: dir.join("corpus.jsonl"),
+            known_failures: dir.join("failures.jsonl"),
+            metadata: dir.join("metadata.json"),
+            module_counts: dir.join("module-counts.jsonl"),
+            results: None,
+            report: dir.join("report.md"),
+            extension_policy_report: dir.join("extension-policy.md"),
+            known_gap_report: dir.join("known-gaps.md"),
+            known_gap_catalog: dir.join("known-gap-catalog.jsonl"),
+            priority: dir.join("priority.json"),
+            modules_dir: modules_dir.clone(),
+            module_manifests_dir: manifests_dir.clone(),
+            selected_limit: 200,
+        };
+        let metadata = BaselineMetadata {
+            schema_version: "phpt-full-baseline-v1".to_string(),
+            timestamp: "20260712T101615Z".to_string(),
+            corpus_count: 3509,
+            pass_count: 987,
+            skip_count: 89,
+            xfail_count: 1,
+            fail_count: 2432,
+            bork_count: 0,
+            known_failure_count: 2432,
+            failure_manifest: "failures.jsonl".to_string(),
+        };
+
+        write_triage_outputs(&options, &metadata, &triage, &[]).unwrap();
+
+        let plan = fs::read_to_string(manifests_dir.join("zend.basic.json")).unwrap();
+        assert!(
+            plan.contains("\"pass_count\":987") && plan.contains("\"fail_count\":2432"),
+            "curated module plan must track current baseline counts: {plan}"
+        );
+        assert_eq!(
+            fs::read_to_string(&selected).unwrap(),
+            curated,
+            "curated selected manifest must be preserved verbatim"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
