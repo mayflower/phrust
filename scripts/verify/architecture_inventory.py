@@ -15,6 +15,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BASELINE = ROOT / "scripts/verify/architecture_inventory_baseline.json"
+DEFAULT_SOURCE_CLASSIFICATION = (
+    ROOT / "scripts/verify/frontend_source_text_inventory.json"
+)
 DEFAULT_REPORT_JSON = ROOT / "target/architecture/inventory.json"
 DEFAULT_REPORT_MD = ROOT / "target/architecture/inventory.md"
 
@@ -27,6 +30,17 @@ SOURCE_REPARSE_PATTERNS = {
     "textual_split": re.compile(
         r"\b(?:source|source_text|rest|text|value)\.split_(?:once|whitespace)\("
     ),
+    "source_text_slice_method": re.compile(r"\b(?:self\.)?source_text\.slice\("),
+    "removed_structural_helper": re.compile(
+        r"\b(?:global_names_from_stmt_source|simple_construct_[A-Za-z0-9_]*_source|"
+        r"dynamic_member_[A-Za-z0-9_]*_source|"
+        r"define_constant_initializers_from_source|"
+        r"source_constant_from_default_source)\b"
+    ),
+}
+RAW_SOURCE_ACCESS_PATTERNS = {
+    "source_text_member": re.compile(r"\bself\.source_text\b"),
+    "token_text_reconstruction": re.compile(r"\bsource_text_no_trivia\b"),
 }
 POINTER_IDENTITY_PATTERN = re.compile(
     r"(?:Arc|Rc)::as_ptr\([^\n]+\)\s*(?:\.cast::<[^>]+>\(\))?\s+as\s+(?:u|i)size"
@@ -413,6 +427,11 @@ def collect_inventory() -> dict:
             SOURCE_REPARSE_PATTERNS,
             ("crates/php_ir/src/lower/", "crates/php_semantics/src/lower/"),
         ),
+        "raw_source_accesses": collect_findings(
+            sources,
+            RAW_SOURCE_ACCESS_PATTERNS,
+            ("crates/php_ir/src/lower/", "crates/php_semantics/src/lower/"),
+        ),
         "pointer_integer_identity": pointer_findings(sources),
         "diagnostic_string_parsing": collect_findings(
             sources, DIAGNOSTIC_PARSE_PATTERNS
@@ -421,8 +440,18 @@ def collect_inventory() -> dict:
     }
 
 
-def allowlist(rows: list[dict], reason: str) -> list[dict]:
-    return [{"id": row["id"], "reason": reason} for row in rows]
+def allowlist(
+    rows: list[dict], reason: str, previous_rows: list[dict] | None = None
+) -> list[dict]:
+    previous_reasons = {
+        row["id"]: row["reason"]
+        for row in previous_rows or []
+        if isinstance(row.get("id"), str) and isinstance(row.get("reason"), str)
+    }
+    return [
+        {"id": row["id"], "reason": previous_reasons.get(row["id"], reason)}
+        for row in rows
+    ]
 
 
 def native_ids(inventory: dict) -> list[str]:
@@ -450,7 +479,8 @@ def edge_ids(inventory: dict) -> list[str]:
     )
 
 
-def baseline_for(inventory: dict) -> dict:
+def baseline_for(inventory: dict, previous: dict | None = None) -> dict:
+    previous = previous or {}
     production_files = inventory["rust_sources"]["production"]["files"]
     large_files = {
         row["path"]: {"max_lines": row["lines"], "max_bytes": row["bytes"]}
@@ -481,18 +511,22 @@ def baseline_for(inventory: dict) -> dict:
         "module_wide_allowlist": allowlist(
             inventory["module_wide_allows"],
             "pre-remediation module-wide lint debt; remove when the owning module is split",
+            previous.get("module_wide_allowlist"),
         ),
         "source_reparsing_allowlist": allowlist(
             inventory["source_reparsing"],
             "pre-remediation typed frontend information loss; remove in Prompt 12",
+            previous.get("source_reparsing_allowlist"),
         ),
         "pointer_integer_identity_allowlist": allowlist(
             inventory["pointer_integer_identity"],
             "pre-remediation pointer identity; server cache identity is removed in Prompt 15",
+            previous.get("pointer_integer_identity_allowlist"),
         ),
         "diagnostic_string_parsing_allowlist": allowlist(
             inventory["diagnostic_string_parsing"],
             "pre-remediation diagnostic display parsing; remove in Prompt 02 or Prompt 15",
+            previous.get("diagnostic_string_parsing_allowlist"),
         ),
     }
 
@@ -504,6 +538,58 @@ def load_baseline(path: Path) -> dict:
         raise InventoryError(f"could not read baseline {path}: {error}") from error
     except json.JSONDecodeError as error:
         raise InventoryError(f"invalid baseline JSON in {path}: {error}") from error
+
+
+def load_source_classification(path: Path) -> dict:
+    classification = load_baseline(path)
+    if classification.get("schema_version") != 1:
+        raise InventoryError(
+            "frontend source-text inventory schema_version must be 1"
+        )
+    return classification
+
+
+def classify_raw_source_accesses(inventory: dict, classification: dict) -> list[str]:
+    entries = classification.get("entries")
+    if not isinstance(entries, list):
+        raise InventoryError("frontend source-text inventory entries must be a list")
+    by_id = {}
+    failures = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+            raise InventoryError("frontend source-text inventory entries need string ids")
+        entry_id = entry["id"]
+        if entry_id in by_id:
+            raise InventoryError(f"duplicate frontend source-text inventory id: {entry_id}")
+        category = entry.get("category")
+        if category not in {"A", "B", "C"}:
+            raise InventoryError(
+                f"frontend source-text inventory {entry_id} has invalid category {category!r}"
+            )
+        if category == "B":
+            failures.append(f"category B structural source recovery remains: {entry_id}")
+        if not isinstance(entry.get("purpose"), str) or not entry["purpose"].strip():
+            raise InventoryError(
+                f"frontend source-text inventory {entry_id} needs a purpose"
+            )
+        by_id[entry_id] = entry
+
+    current_ids = {row["id"] for row in inventory["raw_source_accesses"]}
+    classified_ids = set(by_id)
+    failures.extend(
+        f"unclassified raw source access: {entry_id}"
+        for entry_id in sorted(current_ids - classified_ids)
+    )
+    failures.extend(
+        f"stale raw source classification: {entry_id}"
+        for entry_id in sorted(classified_ids - current_ids)
+    )
+    for row in inventory["raw_source_accesses"]:
+        entry = by_id.get(row["id"])
+        if entry is not None:
+            row["classification"] = entry["category"]
+            row["purpose"] = entry["purpose"]
+    return failures
 
 
 def unexpected_ids(current: list[str], allowed: list[str], label: str) -> list[str]:
@@ -683,6 +769,7 @@ def render_markdown(inventory: dict, failures: list[str]) -> str:
     for title, key in (
         ("Module-wide Allows", "module_wide_allows"),
         ("Source Reparsing Fallbacks", "source_reparsing"),
+        ("Classified Raw Source Accesses", "raw_source_accesses"),
         ("Pointer Integer Identity", "pointer_integer_identity"),
         ("Diagnostic String Parsing", "diagnostic_string_parsing"),
     ):
@@ -698,7 +785,14 @@ def render_markdown(inventory: dict, failures: list[str]) -> str:
                     (
                         f"`{row['path']}`",
                         row["line"],
-                        row.get("category", row.get("allow", "")),
+                        (
+                            row.get("classification", row.get("category", row.get("allow", "")))
+                            + (
+                                f": {row['purpose']}"
+                                if row.get("purpose")
+                                else ""
+                            )
+                        ),
                     )
                     for row in rows
                 ),
@@ -733,6 +827,11 @@ def canonical_json(value: dict) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
+    parser.add_argument(
+        "--source-classification",
+        type=Path,
+        default=DEFAULT_SOURCE_CLASSIFICATION,
+    )
     parser.add_argument("--json-out", type=Path, default=DEFAULT_REPORT_JSON)
     parser.add_argument("--summary-out", type=Path, default=DEFAULT_REPORT_MD)
     parser.add_argument("--check", action="store_true", help="enforce the checked baseline")
@@ -753,13 +852,28 @@ def main() -> int:
     args = parse_args()
     try:
         inventory = collect_inventory()
+        previous_baseline = load_baseline(args.baseline)
+        classification = load_source_classification(args.source_classification)
+        classification_failures = classify_raw_source_accesses(
+            inventory, classification
+        )
         if args.verify_determinism:
             repeated = collect_inventory()
+            repeated_failures = classify_raw_source_accesses(repeated, classification)
+            if repeated_failures != classification_failures:
+                raise InventoryError(
+                    "two consecutive source-text classifications produced different failures"
+                )
             if canonical_json(inventory) != canonical_json(repeated):
                 raise InventoryError("two consecutive inventory runs produced different JSON")
         if args.write_baseline:
-            write_report(args.baseline, canonical_json(baseline_for(inventory)))
-        failures = check_baseline(inventory, load_baseline(args.baseline)) if args.check else []
+            write_report(
+                args.baseline,
+                canonical_json(baseline_for(inventory, previous_baseline)),
+            )
+        failures = classification_failures
+        if args.check:
+            failures.extend(check_baseline(inventory, load_baseline(args.baseline)))
         write_report(args.json_out, canonical_json(inventory))
         write_report(args.summary_out, render_markdown(inventory, failures))
     except InventoryError as error:

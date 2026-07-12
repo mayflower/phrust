@@ -5,20 +5,16 @@
       "reason": "legacy parameter type-check helper returns encoded text; replace with a typed runtime error in Prompt 07"
     },
     {
+      "id": "crates/php_vm/src/vm/diagnostics.rs:diagnostic_code_prefix_parse:99236549912f:1",
+      "reason": "negative string-offset rendering recovers a typed index from legacy text; move to typed VM diagnostics in Prompt 10"
+    },
+    {
       "id": "crates/php_vm/src/vm/exception_dispatch.rs:diagnostic_code_prefix_parse:ecc50dc89547:1",
       "reason": "function-redeclaration rendering strips a legacy code prefix; move to typed VM diagnostics in Prompt 10"
     },
     {
       "id": "crates/php_vm/src/vm/include_execution.rs:diagnostic_target_parse:d87ea97a5782:1",
       "reason": "include warning rendering recovers target and reason from legacy text; replace with typed include failures in Prompt 04"
-    },
-    {
-      "id": "crates/php_vm/src/vm/mod.rs:diagnostic_code_prefix_parse:51b252e1a273:1",
-      "reason": "builtin type-error rendering strips a legacy runtime prefix; replace at the runtime boundary in Prompt 07"
-    },
-    {
-      "id": "crates/php_vm/src/vm/diagnostics.rs:diagnostic_code_prefix_parse:99236549912f:1",
-      "reason": "negative string-offset rendering recovers a typed index from legacy text; move to typed VM diagnostics in Prompt 10"
     },
     {
       "id": "crates/php_vm_cli/src/commands.rs:diagnostic_target_parse:c7d6758f4d23:1",
@@ -150,12 +146,12 @@
   ],
   "large_file_limits": {
     "crates/php_ir/src/lower/expressions.rs": {
-      "max_bytes": 386474,
-      "max_lines": 10797
+      "max_bytes": 375552,
+      "max_lines": 10536
     },
     "crates/php_ir/src/lower/mod.rs": {
-      "max_bytes": 214487,
-      "max_lines": 5264
+      "max_bytes": 207553,
+      "max_lines": 5035
     },
     "crates/php_jit/src/copy_patch.rs": {
       "max_bytes": 215327,
@@ -165,10 +161,6 @@
       "max_bytes": 239719,
       "max_lines": 6645
     },
-    "crates/php_runtime/src/builtins/context.rs": {
-      "max_bytes": 48452,
-      "max_lines": 1336
-    },
     "crates/php_runtime/src/builtins/modules/core.rs": {
       "max_bytes": 468652,
       "max_lines": 14297
@@ -176,46 +168,6 @@
     "crates/php_vm/src/counters.rs": {
       "max_bytes": 256988,
       "max_lines": 7036
-    },
-    "crates/php_vm/src/include/cache.rs": {
-      "max_bytes": 4501,
-      "max_lines": 135
-    },
-    "crates/php_vm/src/include/compiled_cache.rs": {
-      "max_bytes": 20480,
-      "max_lines": 552
-    },
-    "crates/php_vm/src/include/compiler.rs": {
-      "max_bytes": 1802,
-      "max_lines": 47
-    },
-    "crates/php_vm/src/include/diagnostics.rs": {
-      "max_bytes": 1920,
-      "max_lines": 55
-    },
-    "crates/php_vm/src/include/metadata.rs": {
-      "max_bytes": 8770,
-      "max_lines": 232
-    },
-    "crates/php_vm/src/include/metrics.rs": {
-      "max_bytes": 6321,
-      "max_lines": 135
-    },
-    "crates/php_vm/src/include/mod.rs": {
-      "max_bytes": 1241,
-      "max_lines": 35
-    },
-    "crates/php_vm/src/include/resolution_cache.rs": {
-      "max_bytes": 11006,
-      "max_lines": 289
-    },
-    "crates/php_vm/src/include/resolver.rs": {
-      "max_bytes": 24737,
-      "max_lines": 622
-    },
-    "crates/php_vm/src/include/source.rs": {
-      "max_bytes": 8587,
-      "max_lines": 242
     },
     "crates/php_vm/src/inline_cache.rs": {
       "max_bytes": 164766,
@@ -229,21 +181,13 @@
       "max_bytes": 303847,
       "max_lines": 5942
     },
-    "crates/php_vm/src/vm/mod.rs": {
-      "max_bytes": 66723,
-      "max_lines": 1593
-    },
-    "crates/php_vm/src/vm/rich_dispatch.rs": {
-      "max_bytes": 170803,
-      "max_lines": 3459
-    },
     "crates/php_vm/src/vm/spl.rs": {
       "max_bytes": 257769,
       "max_lines": 6930
     },
     "crates/php_vm_cli/src/commands.rs": {
-      "max_bytes": 250655,
-      "max_lines": 6768
+      "max_bytes": 250410,
+      "max_lines": 6751
     }
   },
   "module_wide_allowlist": [
@@ -449,10 +393,6 @@
       "reason": "pre-remediation pointer identity; server cache identity is removed in Prompt 15"
     },
     {
-      "id": "crates/php_runtime/src/string.rs:pointer_integer_identity:ab06af0ee251:1",
-      "reason": "pre-remediation pointer identity; server cache identity is removed in Prompt 15"
-    },
-    {
       "id": "crates/php_server/src/state.rs:pointer_integer_identity:09df98bf4eec:1",
       "reason": "pre-remediation pointer identity; server cache identity is removed in Prompt 15"
     }
@@ -472,132 +412,7 @@
     }
   },
   "schema_version": 1,
-  "source_reparsing_allowlist": [
-    {
-      "id": "crates/php_ir/src/lower/expressions.rs:source_slice:78cef0c961aa:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_ir/src/lower/expressions.rs:source_slice:0ed3d245c635:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_ir/src/lower/expressions.rs:source_slice:6ab18a9c126e:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_ir/src/lower/expressions.rs:source_slice:78cef0c961aa:2",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_ir/src/lower/mod.rs:source_lines:8e7799843192:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_ir/src/lower/mod.rs:source_slice:db15c3374d5d:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_ir/src/lower/mod.rs:source_slice:07a24aa3b99b:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_ir/src/lower/mod.rs:source_slice:976b86af790f:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_ir/src/lower/mod.rs:textual_split:4f653d0814a9:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:06980dc35072:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:33885ed51fb0:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:textual_split:02400a9a88cf:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:textual_split:02400a9a88cf:2",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:textual_split:635ec670d93e:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:textual_split:91ba19a42560:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:textual_split:635ec670d93e:2",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:textual_split:2436253b6359:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:textual_split:1fd4d7bd13f4:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:textual_split:85eb600c07ab:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:c65abaafb1b4:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:d5f41feedf86:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:aaed65e10605:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:b973eed13250:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:6c4b1011f023:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:722bbd06729c:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:c4bd5f76ecb9:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:6c4b1011f023:2",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:11ed5a1f7691:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:5dcdd16325f0:1",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:6c4b1011f023:3",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    },
-    {
-      "id": "crates/php_semantics/src/lower/hir.rs:source_slice:11ed5a1f7691:2",
-      "reason": "pre-remediation typed frontend information loss; remove in Prompt 12"
-    }
-  ],
+  "source_reparsing_allowlist": [],
   "tolerances": {
     "default_max_file_bytes": 200000,
     "default_max_file_lines": 5000,
@@ -661,7 +476,6 @@
     "php_server:php_runtime:normal:false",
     "php_server:php_vm:normal:false",
     "php_std:php_extensions:normal:false",
-    "php_std:php_lexer:normal:false",
     "php_std:php_runtime:normal:false",
     "php_syntax:php_diagnostics:normal:false",
     "php_syntax:php_lexer:normal:false",

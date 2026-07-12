@@ -46,6 +46,7 @@ REQUIRED_FILES = [
     "scripts/performance/architecture_baseline.py",
     "scripts/verify/architecture_inventory.py",
     "scripts/verify/architecture_inventory_baseline.json",
+    "scripts/verify/frontend_source_text_inventory.json",
     "scripts/verify/dependency_boundaries.py",
     "scripts/verify/dependency_boundary_allowlist.json",
     "scripts/verify/panic_unwrap_policy.py",

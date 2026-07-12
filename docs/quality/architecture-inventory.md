@@ -12,6 +12,13 @@ counts the public module and re-export surfaces of `php_vm` and `php_runtime`.
 It also inventories module-wide Clippy allowances and narrowly identified
 source-reparsing, pointer-identity, and diagnostic-string control-flow debt.
 
+Raw source access in semantics and IR lowering is classified in
+`scripts/verify/frontend_source_text_inventory.json` as token/literal decoding
+(A), structural recovery for missing typed syntax (B), or diagnostic/source-map
+rendering (C). The gate rejects unclassified or stale entries and rejects every
+category B entry. Category A and C entries therefore document the complete
+remaining boundary rather than acting as structural-reparse allowances.
+
 The checked limits live in
 `scripts/verify/architecture_inventory_baseline.json`. Findings are identified
 by path, category, and normalized source text rather than line number, so moving
@@ -30,6 +37,15 @@ The remaining allowlisted parsers are narrower legacy rendering boundaries:
 typed include failures are owned by Prompt 04, runtime type errors by Prompt 07,
 and VM diagnostic construction by Prompt 10. Each baseline entry names its
 specific migration owner; new diagnostic-string control flow remains rejected.
+
+## Typed frontend boundary
+
+IR lowering no longer reconstructs globals, static locals, construct operands,
+dynamic members, default constants, or destructuring shape from raw source.
+The source-reparsing baseline is zero. The inventory also rejects the removed
+helper families and direct `source_text.slice(...)` calls, while the separate
+A/B/C inventory accounts for the remaining metadata, token spelling, and line
+number uses.
 
 Reports are generated under `target/architecture/` and remain untracked. To
 lower the baseline after a remediation, run:

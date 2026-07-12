@@ -1495,10 +1495,7 @@ impl LoweringContext<'_> {
         {
             map.insert(name, value);
         }
-        map.extend(define_constant_initializers_from_source(
-            self.source_text.as_str(),
-            &map,
-        ));
+        map.extend(define_constant_initializers_from_hir(module, &map));
         map
     }
 
@@ -1939,15 +1936,10 @@ impl LoweringContext<'_> {
     }
 
     pub(super) fn property_hooks_use_backing_storage(&self, property: &HirProperty) -> bool {
-        let Some(item) = property.items().first() else {
-            return false;
-        };
-        let needle = format!("->{}", local_name(item.name()));
-        property.hooks().iter().any(|hook| {
-            self.source_text
-                .slice(hook.span())
-                .is_some_and(|source| source.contains(&needle))
-        })
+        property
+            .hooks()
+            .iter()
+            .any(|hook| hook.uses_backing_storage())
     }
 
     pub(super) fn signature_for_expr(
@@ -2047,7 +2039,7 @@ impl LoweringContext<'_> {
                     return None;
                 }
                 match expr.kind() {
-                    HirExprKind::Variable { name } => {
+                    HirExprKind::Variable { name, .. } => {
                         let name = local_name(name).to_owned();
                         (!params.contains(&name)).then_some(name)
                     }
@@ -2066,10 +2058,8 @@ impl LoweringContext<'_> {
 
     pub(super) fn static_local_specs(
         &self,
-        stmt_id: StmtId,
-        initializers: &[ExprId],
+        locals: &[php_semantics::hir::HirStaticLocal],
     ) -> Vec<StaticLocalSpec> {
-        let stmt_span = self.span_for(SourceMappedId::from(stmt_id));
         let Some(module) = self
             .frontend
             .database()
@@ -2077,39 +2067,22 @@ impl LoweringContext<'_> {
         else {
             return Vec::new();
         };
-        let mut variables = module
-            .scopes()
+        locals
             .iter()
-            .flat_map(|(_, scope)| scope.statics().iter())
-            .filter_map(|binding| {
-                let variable = binding.variable();
-                range_contains(stmt_span, variable.span()).then(|| {
-                    (
-                        local_name(variable.name()).to_owned(),
-                        variable.span().start().to_usize(),
-                        variable.span().end().to_usize(),
-                    )
+            .filter_map(|local| {
+                let expression = module.expressions().get(local.variable)?;
+                let HirExprKind::Variable {
+                    name,
+                    sigil_count: 1,
+                    dynamic: None,
+                } = expression.kind()
+                else {
+                    return None;
+                };
+                Some(StaticLocalSpec {
+                    name: local_name(name).to_owned(),
+                    initializer: local.initializer,
                 })
-            })
-            .collect::<Vec<_>>();
-        variables.sort_by_key(|(_, start, _)| *start);
-        variables
-            .iter()
-            .enumerate()
-            .map(|(index, (name, _, end))| {
-                let next_start = variables
-                    .get(index + 1)
-                    .map(|(_, start, _)| *start)
-                    .unwrap_or_else(|| stmt_span.end().to_usize());
-                let initializer = initializers.iter().copied().find(|expr| {
-                    let span = self.span_for(SourceMappedId::from(*expr));
-                    let start = span.start().to_usize();
-                    start >= *end && start < next_start
-                });
-                StaticLocalSpec {
-                    name: name.clone(),
-                    initializer,
-                }
             })
             .collect()
     }

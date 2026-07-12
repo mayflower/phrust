@@ -609,232 +609,6 @@ fn stable_source_hash(source_path: &str) -> u64 {
     hash
 }
 
-fn named_constant_from_default_source(
-    source: &str,
-    named_constants: &HashMap<String, IrConstant>,
-) -> Option<IrConstant> {
-    let value = source
-        .split_once('=')
-        .map_or(source, |(_, value)| value)
-        .trim();
-    named_constants.get(value).cloned()
-}
-
-fn source_constant_from_default_source(
-    source: &str,
-    named_constants: &HashMap<String, IrConstant>,
-) -> Option<IrConstant> {
-    let value = source
-        .split_once('=')
-        .map_or(source, |(_, value)| value)
-        .trim();
-    legacy_array_constant_from_source(value, named_constants)
-        .or_else(|| named_constants.get(value).cloned())
-        .or_else(|| literal_constant(value))
-}
-
-fn define_constant_initializers_from_source(
-    source: &str,
-    named_constants: &HashMap<String, IrConstant>,
-) -> HashMap<String, IrConstant> {
-    let mut map = HashMap::new();
-    for line in source.lines().map(str::trim_start) {
-        let line = line.strip_prefix("<?php").map_or(line, str::trim_start);
-        let Some(rest) = line.strip_prefix("define") else {
-            continue;
-        };
-        let rest = rest.trim_start();
-        let Some(rest) = rest.strip_prefix('(') else {
-            continue;
-        };
-        let Some(end) = matching_top_level_close_paren(rest) else {
-            continue;
-        };
-        let args = &rest[..end];
-        let Some(args) = split_top_level_commas(args) else {
-            continue;
-        };
-        let [name, value, ..] = args.as_slice() else {
-            continue;
-        };
-        let Some(name) = source_constant_from_default_source(name, named_constants) else {
-            continue;
-        };
-        let IrConstant::String(name) = name else {
-            continue;
-        };
-        let Some(value) = source_constant_from_default_source(value, named_constants) else {
-            continue;
-        };
-        map.insert(name, value);
-    }
-    map
-}
-
-fn matching_top_level_close_paren(source: &str) -> Option<usize> {
-    let mut depth = 0_u32;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, ch) in source.char_indices() {
-        if let Some(quoted) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == quoted {
-                quote = None;
-            }
-            continue;
-        }
-        match ch {
-            '\'' | '"' => quote = Some(ch),
-            '(' => depth = depth.checked_add(1)?,
-            ')' if depth == 0 => return Some(index),
-            ')' => depth = depth.checked_sub(1)?,
-            _ => {}
-        }
-    }
-    None
-}
-
-fn legacy_array_constant_from_source(
-    source: &str,
-    named_constants: &HashMap<String, IrConstant>,
-) -> Option<IrConstant> {
-    let source = source.trim();
-    let (head, tail) = source.split_at(source.len().min(5));
-    if !head.eq_ignore_ascii_case("array") {
-        return None;
-    }
-    let tail = tail.trim_start();
-    let inner = tail.strip_prefix('(')?.strip_suffix(')')?;
-    let inner = inner.trim();
-    if inner.is_empty() {
-        return Some(IrConstant::Array(Vec::new()));
-    }
-    let mut entries = Vec::new();
-    for entry in split_top_level_commas(inner)? {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let (key, value) = split_top_level_arrow(entry).map_or((None, entry), |(key, value)| {
-            (Some(key.trim()), value.trim())
-        });
-        let key = match key {
-            Some(key) => Some(source_constant_from_default_source(key, named_constants)?),
-            None => None,
-        };
-        entries.push(IrConstantArrayEntry {
-            key,
-            value: source_constant_from_default_source(value, named_constants)?,
-        });
-    }
-    Some(IrConstant::Array(entries))
-}
-
-fn split_top_level_commas(source: &str) -> Option<Vec<&str>> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut depth = 0_u32;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, ch) in source.char_indices() {
-        if let Some(quoted) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == quoted {
-                quote = None;
-            }
-            continue;
-        }
-        match ch {
-            '\'' | '"' => quote = Some(ch),
-            '(' | '[' => depth = depth.checked_add(1)?,
-            ')' | ']' => depth = depth.checked_sub(1)?,
-            ',' if depth == 0 => {
-                parts.push(&source[start..index]);
-                start = index + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    if quote.is_some() || depth != 0 {
-        return None;
-    }
-    parts.push(&source[start..]);
-    Some(parts)
-}
-
-fn split_top_level_arrow(source: &str) -> Option<(&str, &str)> {
-    let mut depth = 0_u32;
-    let mut quote = None;
-    let mut escaped = false;
-    let mut iter = source.char_indices().peekable();
-    while let Some((index, ch)) = iter.next() {
-        if let Some(quoted) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == quoted {
-                quote = None;
-            }
-            continue;
-        }
-        match ch {
-            '\'' | '"' => quote = Some(ch),
-            '(' | '[' => depth = depth.checked_add(1)?,
-            ')' | ']' => depth = depth.checked_sub(1)?,
-            '=' if depth == 0 && iter.peek().is_some_and(|(_, next)| *next == '>') => {
-                return Some((&source[..index], &source[index + 2..]));
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn class_constant_from_default_source(
-    module: &HirModule,
-    source: &str,
-    current_class: Option<&str>,
-    named_constants: &HashMap<String, IrConstant>,
-    class_constants: &declarations::ClassConstantInitializerMap,
-    class_parents: &declarations::ClassParentMap,
-) -> Option<IrConstant> {
-    let value = source
-        .split_once('=')
-        .map_or(source, |(_, value)| value)
-        .trim();
-    let (target, member) = value.split_once("::")?;
-    let member = member.trim();
-    if member.is_empty() {
-        return None;
-    }
-    let target_class =
-        if target.eq_ignore_ascii_case("self") || target.eq_ignore_ascii_case("static") {
-            current_class.map(normalize_class_name)?
-        } else if target.eq_ignore_ascii_case("parent") {
-            current_class
-                .map(normalize_class_name)
-                .and_then(|class| class_parents.get(&class).cloned().flatten())?
-        } else {
-            normalize_class_name(target.trim_start_matches('\\'))
-        };
-    resolve_class_constant_initializer(
-        module,
-        &target_class,
-        member,
-        named_constants,
-        class_constants,
-        class_parents,
-        &mut Vec::new(),
-    )
-}
-
 fn constant_from_expr_with_names(
     module: &HirModule,
     expr_id: ExprId,
@@ -849,6 +623,54 @@ fn constant_from_expr_with_names(
         &HashMap::new(),
         &mut Vec::new(),
     )
+}
+
+fn define_constant_initializers_from_hir(
+    module: &HirModule,
+    named_constants: &HashMap<String, IrConstant>,
+) -> HashMap<String, IrConstant> {
+    let definitions = module
+        .expressions()
+        .iter()
+        .filter_map(|(_, expression)| {
+            let HirExprKind::Call {
+                callee: Some(callee),
+                args,
+            } = expression.kind()
+            else {
+                return None;
+            };
+            let callee = module.expressions().get(*callee)?;
+            let HirExprKind::Name { resolution } = callee.kind() else {
+                return None;
+            };
+            if !resolution.source().eq_ignore_ascii_case("define") || args.len() < 2 {
+                return None;
+            }
+            Some((args[0].value, args[1].value))
+        })
+        .collect::<Vec<_>>();
+
+    let mut resolved = HashMap::new();
+    loop {
+        let mut available = named_constants.clone();
+        available.extend(resolved.clone());
+        let before = resolved.len();
+        for (name, value) in &definitions {
+            let Some(IrConstant::String(name)) =
+                constant_from_expr_with_names(module, *name, &available)
+            else {
+                continue;
+            };
+            let Some(value) = constant_from_expr_with_names(module, *value, &available) else {
+                continue;
+            };
+            resolved.insert(name, value);
+        }
+        if resolved.len() == before {
+            return resolved;
+        }
+    }
 }
 
 fn constant_from_overlapping_default_expr(
@@ -1644,7 +1466,6 @@ fn destructuring_key(
 fn destructuring_patterns(
     module: &HirModule,
     expr: ExprId,
-    source_index: &dyn Fn(ExprId, usize, ExprId) -> Option<usize>,
 ) -> Option<Vec<(IrConstant, expressions::DestructuringPattern)>> {
     let expression = module.expressions().get(expr)?;
     let elements = match expression.kind().clone() {
@@ -1663,22 +1484,11 @@ fn destructuring_patterns(
                 value: Some(value),
                 unpack: false,
                 by_ref: false,
-            } => (
-                destructuring_key(module, index, source_index(expr, index, element), key)?,
-                value,
-            ),
+            } => (destructuring_key(module, index, None, key)?, value),
             HirExprKind::ArrayPair { .. } => return None,
-            _ => (
-                IrConstant::Int(
-                    source_index(expr, index, element)
-                        .unwrap_or(index)
-                        .try_into()
-                        .ok()?,
-                ),
-                element,
-            ),
+            _ => (IrConstant::Int(index.try_into().ok()?), element),
         };
-        let pattern = if let Some(children) = destructuring_patterns(module, value, source_index) {
+        let pattern = if let Some(children) = destructuring_patterns(module, value) {
             expressions::DestructuringPattern::Nested(children)
         } else {
             expressions::DestructuringPattern::Expr(value)
@@ -2469,6 +2279,38 @@ mod tests {
     }
 
     #[test]
+    fn closure_and_arrow_parameter_defaults_lower_from_typed_hir() {
+        let frontend = analyze_source(
+            "<?php $closure = function ($value = 'B') { return $value; }; $arrow = fn($value = 'C') => $value;",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let closure = result
+            .unit
+            .functions
+            .iter()
+            .find(|function| function.name.starts_with("closure@"))
+            .expect("closure function");
+        let arrow = result
+            .unit
+            .functions
+            .iter()
+            .find(|function| function.name.starts_with("arrow@"))
+            .expect("arrow function");
+
+        assert_eq!(
+            closure.params[0].default,
+            Some(IrConstant::String("B".to_owned()))
+        );
+        assert_eq!(
+            arrow.params[0].default,
+            Some(IrConstant::String("C".to_owned()))
+        );
+    }
+
+    #[test]
     fn parameter_default_array_preserves_external_class_constant() {
         let frontend = analyze_source(
             "<?php class Test { public function __construct($data = array('version' => External::LATEST_SCHEMA)) {} }",
@@ -2693,6 +2535,52 @@ mod tests {
         assert_eq!(snapshot.matches("bind_global").count(), 1, "{snapshot}");
         assert!(snapshot.contains("bind_global"), "{snapshot}");
         assert!(snapshot.contains("\"_SERVER\""), "{snapshot}");
+    }
+
+    #[test]
+    fn global_and_static_lists_lower_from_typed_hir() {
+        let frontend = analyze_source(
+            "<?php function f() { global /* first */ $first,\n $second; static $cache = 1 + 2, $empty; return $first; }",
+        );
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let snapshot = result.unit.to_snapshot_text();
+        assert_eq!(snapshot.matches("bind_global").count(), 2, "{snapshot}");
+        assert!(
+            snapshot.contains("bind_global local:0 \"first\""),
+            "{snapshot}"
+        );
+        assert!(
+            snapshot.contains("bind_global local:1 \"second\""),
+            "{snapshot}"
+        );
+        assert_eq!(
+            snapshot.matches("init_static_local").count(),
+            2,
+            "{snapshot}"
+        );
+        assert!(snapshot.contains("\"cache\""), "{snapshot}");
+        assert!(snapshot.contains("\"empty\""), "{snapshot}");
+        assert!(snapshot.contains("binary r"), "{snapshot}");
+    }
+
+    #[test]
+    fn dynamic_global_reports_typed_runtime_gap_without_inventing_a_name() {
+        let frontend =
+            analyze_source("<?php function f($which) { global $$which; return $which; }");
+        let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+        assert!(result.verification.is_ok(), "{:#?}", result.verification);
+        assert_eq!(result.diagnostics.len(), 1, "{:#?}", result.diagnostics);
+        assert_eq!(
+            result.diagnostics[0].message,
+            "dynamic global variables are not lowered to IR in runtime-semantics"
+        );
+        let snapshot = result.unit.to_snapshot_text();
+        assert!(!snapshot.contains("bind_global"), "{snapshot}");
+        assert!(!snapshot.contains("\"$which\""), "{snapshot}");
     }
 
     #[test]

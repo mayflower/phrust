@@ -36,7 +36,14 @@ pub enum HirExprKind {
     /// Literal token or string-like source.
     Literal { text: String },
     /// Variable fetch.
-    Variable { name: String },
+    Variable {
+        /// Exact non-trivia variable spelling retained for diagnostics and maps.
+        name: String,
+        /// Number of direct `$` sigils on this variable node.
+        sigil_count: usize,
+        /// Nested expression for variable variables such as `${$name}`.
+        dynamic: Option<ExprId>,
+    },
     /// Statically visible source name.
     Name { resolution: HirNameResolution },
     /// Array expression.
