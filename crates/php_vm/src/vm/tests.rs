@@ -86,6 +86,25 @@ fn dynamic_symbol_indexes_preserve_vector_order_and_first_declaration() {
 }
 
 #[test]
+fn apcu_builtin_and_callback_share_the_registered_request_slot() {
+    let result = execute_source(
+        r#"<?php
+$key = "__phrust_registered_apcu_slot";
+apcu_delete($key);
+var_dump(apcu_store($key, "seed"));
+var_dump(apcu_entry($key, function ($key) { return "wrong-owner"; }));
+var_dump(apcu_delete($key));
+"#,
+    );
+
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(
+        result.output.to_string_lossy(),
+        "bool(true)\nstring(4) \"seed\"\nbool(true)\n"
+    );
+}
+
+#[test]
 fn immutable_unit_validation_is_prepared_once_across_requests() {
     let source = "<?php class PreparedFixture { public function value(): int { return 7; } } echo (new PreparedFixture())->value();";
     let frontend = php_semantics::analyze_source(source);

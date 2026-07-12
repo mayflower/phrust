@@ -43,6 +43,8 @@ def main() -> int:
     vm_builtin_adapter = read("crates/php_vm/src/vm/builtin_adapter.rs")
     vm_execution_state = read("crates/php_vm/src/vm/execution_state.rs")
     vm_request_lifecycle = read("crates/php_vm/src/vm/request_lifecycle.rs")
+    extensions = read("crates/php_extensions/src/lib.rs")
+    apcu = read("crates/php_extensions/src/apcu.rs")
     migration = read("docs/runtime/request-state-slots.md")
 
     if "HashMap" in layout or "BTreeMap" in layout:
@@ -65,6 +67,18 @@ def main() -> int:
     for extension in MIGRATED:
         if extension in legacy.lower():
             failures.append(f"migrated {extension} state remains in BuiltinExtensionState")
+
+    if re.search(r"^\s+apcu_state:\s*ApcuState", legacy, re.MULTILINE):
+        failures.append("migrated APCu still has a fallback-owned context state")
+    if "set_apcu_state(" in context:
+        failures.append("legacy direct APCu state setter remains")
+    for symbol in (
+        "extension_request_state: Option<&'a mut RequestState>",
+        "apcu_state_slot: Option<ExtensionStateSlot<ApcuState>>",
+        "set_apcu_request_state",
+    ):
+        if symbol not in context:
+            failures.append(f"APCu registered request-state borrow is missing {symbol}")
 
     forbidden_accessors = (
         "curl_state",
@@ -139,6 +153,25 @@ def main() -> int:
         failures.append(
             "builtin adapter must borrow its request-state owner exactly once"
         )
+    if re.search(
+        r"^\s+pub\(super\) apcu_state:\s*php_runtime::api::ApcuState",
+        vm_adapter_state,
+        re.MULTILINE,
+    ):
+        failures.append("VM still directly owns a legacy APCu state")
+    for symbol in (
+        "RegisteredExtensionRequestState",
+        'request_state_slot("apcu")',
+        "registry.create_request_state()",
+        "registered_extensions.bind(&mut context)",
+    ):
+        if symbol not in vm_builtin_adapter:
+            failures.append(f"VM APCu registry integration is missing {symbol}")
+    for symbol in ("create_request_state", "request_state_slot"):
+        if symbol not in extensions:
+            failures.append(f"extension integration registry is missing {symbol}")
+    if "context.apcu_state().ok_or_else" not in apcu:
+        failures.append("APCu implementation does not fail closed on missing registered state")
 
     modules = {
         "json": read("crates/php_runtime/src/builtins/modules/json.rs"),
@@ -158,6 +191,7 @@ def main() -> int:
         match.group(1)
         for match in re.finditer(r"^\s+([a-z][a-z0-9_]+):", legacy, re.MULTILINE)
     }
+    legacy_fields.difference_update({"extension_request_state", "apcu_state_slot"})
     undocumented = sorted(field for field in legacy_fields if f"`{field}`" not in migration)
     if undocumented:
         failures.append(
@@ -171,7 +205,7 @@ def main() -> int:
         return 1
     print(
         "[ok] typed request slots, sole VM ownership, narrow migrated views, "
-        "and legacy removal inventory"
+        "registered APCu ownership, and legacy removal inventory"
     )
     return 0
 

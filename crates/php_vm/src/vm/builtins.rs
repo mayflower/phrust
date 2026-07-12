@@ -234,7 +234,7 @@ impl Vm {
             Ok(key) => key,
             Err(message) => return self.runtime_error(output, compiled, stack, message),
         };
-        if let Some(value) = state.builtins.apcu_state.fetch(key.as_bytes()) {
+        if let Some(value) = state.builtins.apcu_state_mut().fetch(key.as_bytes()) {
             return VmResult::success_no_output(Some(value));
         }
         let ttl = match values.get(2) {
@@ -259,7 +259,7 @@ impl Vm {
         let value = result.return_value.unwrap_or(Value::Null);
         state
             .builtins
-            .apcu_state
+            .apcu_state_mut()
             .store(key.as_bytes().to_vec(), value.clone(), ttl);
         VmResult::success_no_output(Some(value))
     }

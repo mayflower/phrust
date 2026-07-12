@@ -162,12 +162,43 @@ impl UserStreamWrapperRegistry {
     }
 }
 
+#[derive(Debug)]
+pub(super) struct RegisteredExtensionRequestState {
+    state: php_runtime::api::RequestState,
+    apcu: php_runtime::api::ExtensionStateSlot<php_runtime::api::ApcuState>,
+}
+
+impl Default for RegisteredExtensionRequestState {
+    fn default() -> Self {
+        let registry = BuiltinRegistry::new();
+        let apcu = registry
+            .request_state_slot("apcu")
+            .unwrap_or_else(|| unreachable!("default registry selects APCu"));
+        Self {
+            state: registry.create_request_state(),
+            apcu,
+        }
+    }
+}
+
+impl RegisteredExtensionRequestState {
+    fn bind<'a>(&'a mut self, context: &mut BuiltinContext<'a>) {
+        context.set_apcu_request_state(&mut self.state, self.apcu);
+    }
+
+    pub(super) fn apcu_mut(&mut self) -> &mut php_runtime::api::ApcuState {
+        self.state
+            .get_mut(self.apcu)
+            .unwrap_or_else(|| unreachable!("APCu slot belongs to the default registry layout"))
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct BuiltinAdapterState {
     pub(super) bcmath_scale: usize,
     pub(super) strtok_state: php_runtime::api::StrtokState,
     pub(super) iconv_state: php_runtime::api::IconvEncodingState,
-    pub(super) apcu_state: php_runtime::api::ApcuState,
+    registered_extensions: RegisteredExtensionRequestState,
     pub(super) opcache_state: php_runtime::api::OpcacheState,
     pub(super) soap_state: php_runtime::api::SoapState,
     pub(super) openssl_error_state: php_runtime::api::OpenSslErrorState,
@@ -199,6 +230,10 @@ pub(super) struct BuiltinAdapterState {
 }
 
 impl BuiltinAdapterState {
+    pub(super) fn apcu_state_mut(&mut self) -> &mut php_runtime::api::ApcuState {
+        self.registered_extensions.apcu_mut()
+    }
+
     pub(super) fn pcre_state_mut(&mut self) -> &mut php_runtime::api::PcreRequestState {
         self.builtin_request_state.pcre_mut()
     }
@@ -231,6 +266,7 @@ pub(super) fn execute_builtin_entry(
         Some(&mut state.resources),
         &mut state.builtins.builtin_request_state,
     );
+    state.builtins.registered_extensions.bind(&mut context);
     context.set_cwd_state(&mut state.cwd);
     context.set_include_path_shared(include_path);
     context.set_ini_registry_state(&mut state.ini);
@@ -245,7 +281,6 @@ pub(super) fn execute_builtin_entry(
     context.set_bcmath_scale(state.builtins.bcmath_scale);
     context.set_strtok_state(&mut state.builtins.strtok_state);
     context.set_iconv_state(&mut state.builtins.iconv_state);
-    context.set_apcu_state(&mut state.builtins.apcu_state);
     context.set_opcache_state(&mut state.builtins.opcache_state);
     context.set_soap_state(&mut state.builtins.soap_state);
     context.set_openssl_error_state(&mut state.builtins.openssl_error_state);

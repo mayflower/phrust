@@ -96,6 +96,15 @@ fn conversion_error(name: &str, message: String) -> BuiltinError {
     )
 }
 
+fn apcu_state<'a>(context: &'a mut BuiltinContext<'_>) -> Result<&'a mut ApcuState, BuiltinError> {
+    context.apcu_state().ok_or_else(|| {
+        BuiltinError::new(
+            "E_PHP_RUNTIME_EXTENSION_STATE",
+            "APCu extension state is not registered for this request",
+        )
+    })
+}
+
 fn string_arg(name: &str, value: &Value) -> Result<PhpString, BuiltinError> {
     to_string(value).map_err(|message| {
         BuiltinError::new(
@@ -145,7 +154,7 @@ fn builtin_apcu_store(
         .map(|value| int_arg("apcu_store", value))
         .transpose()?
         .unwrap_or(0);
-    context.apcu_state().store(key, args[1].clone(), ttl);
+    apcu_state(context)?.store(key, args[1].clone(), ttl);
     Ok(Value::Bool(true))
 }
 
@@ -163,7 +172,7 @@ fn builtin_apcu_add(
         .map(|value| int_arg("apcu_add", value))
         .transpose()?
         .unwrap_or(0);
-    Ok(Value::Bool(context.apcu_state().add(
+    Ok(Value::Bool(apcu_state(context)?.add(
         key,
         args[1].clone(),
         ttl,
@@ -179,7 +188,7 @@ fn builtin_apcu_entry(
         return Err(arity_error("apcu_entry", "two or three arguments"));
     }
     let key = string_arg("apcu_entry", &args[0])?;
-    if let Some(value) = context.apcu_state().fetch(key.as_bytes()) {
+    if let Some(value) = apcu_state(context)?.fetch(key.as_bytes()) {
         return Ok(value);
     }
     Err(BuiltinError::new(
@@ -197,7 +206,7 @@ fn builtin_apcu_fetch(
         return Err(arity_error("apcu_fetch", "one or two arguments"));
     }
     let key = string_arg("apcu_fetch", &args[0])?;
-    let value = context.apcu_state().fetch(key.as_bytes());
+    let value = apcu_state(context)?.fetch(key.as_bytes());
     assign_reference_arg(args.get(1), Value::Bool(value.is_some()));
     Ok(value.unwrap_or(Value::Bool(false)))
 }
@@ -211,7 +220,7 @@ fn builtin_apcu_exists(
         return Err(arity_error("apcu_exists", "one argument"));
     }
     let key = string_arg("apcu_exists", &args[0])?;
-    Ok(Value::Bool(context.apcu_state().exists(key.as_bytes())))
+    Ok(Value::Bool(apcu_state(context)?.exists(key.as_bytes())))
 }
 
 fn builtin_apcu_delete(
@@ -223,7 +232,7 @@ fn builtin_apcu_delete(
         return Err(arity_error("apcu_delete", "one argument"));
     }
     let key = string_arg("apcu_delete", &args[0])?;
-    Ok(Value::Bool(context.apcu_state().delete(key.as_bytes())))
+    Ok(Value::Bool(apcu_state(context)?.delete(key.as_bytes())))
 }
 
 fn builtin_apcu_clear_cache(
@@ -234,7 +243,7 @@ fn builtin_apcu_clear_cache(
     if !args.is_empty() {
         return Err(arity_error("apcu_clear_cache", "zero arguments"));
     }
-    context.apcu_state().clear();
+    apcu_state(context)?.clear();
     Ok(Value::Bool(true))
 }
 
@@ -263,7 +272,7 @@ fn builtin_apcu_cache_info(
         return Err(arity_error("apcu_cache_info", "zero or one argument"));
     }
     let limited = optional_bool("apcu_cache_info", args.first())?.unwrap_or(false);
-    let stats = context.apcu_state().stats();
+    let stats = apcu_state(context)?.stats();
     let mut result = PhpArray::new();
     result.insert(string_key("num_slots"), Value::Int(1));
     result.insert(string_key("ttl"), Value::Int(0));
@@ -326,8 +335,8 @@ fn apcu_counter(
         .transpose()?
         .unwrap_or(0);
     let next = match direction {
-        CounterDirection::Increment => context.apcu_state().increment(key.as_bytes(), step),
-        CounterDirection::Decrement => context.apcu_state().decrement(key.as_bytes(), step),
+        CounterDirection::Increment => apcu_state(context)?.increment(key.as_bytes(), step),
+        CounterDirection::Decrement => apcu_state(context)?.decrement(key.as_bytes(), step),
     };
     assign_reference_arg(args.get(2), Value::Bool(next.is_some()));
     Ok(next.map(Value::Int).unwrap_or(Value::Bool(false)))
@@ -349,7 +358,7 @@ fn string_key(value: &str) -> ArrayKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use php_runtime::api::OutputBuffer;
+    use php_runtime::api::{ExtensionStateLayoutBuilder, OutputBuffer};
 
     fn call_with_context(name: &str, args: Vec<Value>, context: &mut BuiltinContext<'_>) -> Value {
         ENTRIES
@@ -361,11 +370,30 @@ mod tests {
     }
 
     #[test]
-    fn counters_and_info_cover_process_local_cache_slice() {
+    fn missing_registered_state_fails_closed() {
         let mut output = OutputBuffer::default();
         let mut context = BuiltinContext::new(&mut output);
-        let mut apcu = ApcuState::isolated();
-        context.set_apcu_state(&mut apcu);
+        let error = ENTRIES
+            .iter()
+            .find(|entry| entry.name() == "apcu_store")
+            .expect("entry")
+            .function()(
+            &mut context,
+            vec![Value::string("key"), Value::Int(1)],
+            RuntimeSourceSpan::default(),
+        )
+        .expect_err("unregistered APCu state must not use a fallback owner");
+        assert_eq!(error.diagnostic_id(), "E_PHP_RUNTIME_EXTENSION_STATE");
+    }
+
+    #[test]
+    fn counters_and_info_cover_process_local_cache_slice() {
+        let mut output = OutputBuffer::default();
+        let mut layout = ExtensionStateLayoutBuilder::new();
+        let slot = layout.register(ApcuState::isolated).expect("APCu slot");
+        let mut request_state = layout.build().create_request_state();
+        let mut context = BuiltinContext::new(&mut output);
+        context.set_apcu_request_state(&mut request_state, slot);
 
         assert_eq!(
             call_with_context(

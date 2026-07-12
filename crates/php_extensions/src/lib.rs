@@ -189,6 +189,16 @@ impl BuiltinRegistry {
     pub fn contains(self, name: &str) -> bool {
         self.registry().contains(name)
     }
+
+    /// Allocates the states selected by the integration registry for one request.
+    pub fn create_request_state(self) -> RequestState {
+        self.registry().create_request_state()
+    }
+
+    /// Returns a registration-time typed slot for an enabled extension.
+    pub fn request_state_slot<T: 'static>(self, extension: &str) -> Option<ExtensionStateSlot<T>> {
+        self.registry().request_state_slot(extension)
+    }
 }
 
 #[cfg(test)]

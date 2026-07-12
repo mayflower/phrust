@@ -36,8 +36,9 @@ diagnostics, deterministic registration, and no request-state allocation.
 
 `APCu` is the stateful pilot. Its process-shared store handle exercises state
 factory metadata and the `Clock`/`ProcessSharedState` capability declarations.
-The VM's temporary APCu state adapter remains until Prompt 08 replaces the
-duplicated `BuiltinContext` state model with typed slots.
+The integration registry creates its request handle and resolves its typed slot
+once; the VM owns that registered request state and `BuiltinContext` only
+borrows it. No direct VM field or fallback-owned context state remains.
 
 Both implementations now live in `crates/php_extensions`; their old runtime
 module declarations and registry slices are removed.

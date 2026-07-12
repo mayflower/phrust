@@ -2,11 +2,11 @@
 
 use super::request_state::BuiltinRequestState;
 use crate::{
-    FilesystemCapabilities, IniRegistry, MysqlState, ObjectRef, OutputBuffer, PHP_E_DEPRECATED,
-    PHP_E_NOTICE, PHP_E_WARNING, PcreCache, PhpArray, PhpDiagnosticChannel,
-    PhpDiagnosticDisplayOptions, PostgresState, ReferenceCell, ResourceTable, RuntimeDiagnostic,
-    RuntimeHttpResponseState, RuntimeSeverity, SessionIdGenerateCallback, SessionLoadCallback,
-    SessionState, UploadRegistry, Value, datetime, emit_php_diagnostic,
+    ExtensionStateSlot, FilesystemCapabilities, IniRegistry, MysqlState, ObjectRef, OutputBuffer,
+    PHP_E_DEPRECATED, PHP_E_NOTICE, PHP_E_WARNING, PcreCache, PhpArray, PhpDiagnosticChannel,
+    PhpDiagnosticDisplayOptions, PostgresState, ReferenceCell, RequestState, ResourceTable,
+    RuntimeDiagnostic, RuntimeHttpResponseState, RuntimeSeverity, SessionIdGenerateCallback,
+    SessionLoadCallback, SessionState, UploadRegistry, Value, datetime, emit_php_diagnostic,
     source_span::RuntimeSourceSpan,
 };
 use curl::easy::{Handler, WriteError};
@@ -123,8 +123,8 @@ pub(in crate::builtins) struct BuiltinExtensionState<'a> {
     strtok_state: Option<&'a mut StrtokState>,
     iconv_state: IconvEncodingState,
     iconv_state_slot: Option<&'a mut IconvEncodingState>,
-    apcu_state: ApcuState,
-    apcu_state_slot: Option<&'a mut ApcuState>,
+    extension_request_state: Option<&'a mut RequestState>,
+    apcu_state_slot: Option<ExtensionStateSlot<ApcuState>>,
     opcache_state: OpcacheState,
     opcache_state_slot: Option<&'a mut OpcacheState>,
     soap_state: SoapState,
@@ -183,7 +183,7 @@ impl<'a> Default for BuiltinExtensionState<'a> {
             strtok_state: None,
             iconv_state: IconvEncodingState::default(),
             iconv_state_slot: None,
-            apcu_state: ApcuState::default(),
+            extension_request_state: None,
             apcu_state_slot: None,
             opcache_state: OpcacheState::default(),
             opcache_state_slot: None,
@@ -682,17 +682,23 @@ impl<'a> BuiltinContext<'a> {
         }
     }
 
-    /// Sets an APCu state handle. Default handles share process-local storage.
-    pub fn set_apcu_state(&mut self, state: &'a mut ApcuState) {
-        self.extensions.apcu_state_slot = Some(state);
+    /// Binds APCu to the state slot selected by the integration registry.
+    pub fn set_apcu_request_state(
+        &mut self,
+        state: &'a mut RequestState,
+        slot: ExtensionStateSlot<ApcuState>,
+    ) {
+        self.extensions.extension_request_state = Some(state);
+        self.extensions.apcu_state_slot = Some(slot);
     }
 
-    /// Mutable APCu state handle.
-    pub fn apcu_state(&mut self) -> &mut ApcuState {
-        match self.extensions.apcu_state_slot.as_deref_mut() {
-            Some(state) => state,
-            None => &mut self.extensions.apcu_state,
-        }
+    /// Returns APCu state only when the extension registry selected it.
+    pub fn apcu_state(&mut self) -> Option<&mut ApcuState> {
+        let slot = self.extensions.apcu_state_slot?;
+        self.extensions
+            .extension_request_state
+            .as_deref_mut()?
+            .get_mut(slot)
     }
 
     /// Sets request-local OPcache facade state.

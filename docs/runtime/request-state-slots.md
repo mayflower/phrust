@@ -20,15 +20,20 @@ exclusive: a context is either the owner or a borrower and never stores both.
 | JSON | `JsonRequestState` | `JsonBuiltinServices` exposes only JSON error state |
 | PCRE | `PcreRequestState` | `PcreBuiltinServices` exposes PCRE cache/error, INI, and diagnostics; `PcreCallbackServices` additionally exposes explicit callback invocation |
 | cURL | `CurlState` | `CurlBuiltinServices` exposes cURL handles, output/diagnostics, and the network capability bit |
+| APCu | registry-created `ApcuState` handle | `BuiltinContext` borrows the typed slot selected by `php_extensions`; no fallback owner exists |
 
-These states are absent from `BuiltinExtensionState`; their old broad
-`BuiltinContext` accessors are removed. Multi-state access uses
+The JSON, PCRE, and cURL payloads are absent from `BuiltinExtensionState`;
+APCu retains only a borrowed `RequestState` plus its typed slot, never a payload
+or fallback owner. Their old broad `BuiltinContext` accessors are removed.
+Multi-state access uses
 `RequestState::get_pair_mut`, which splits the slot vector safely and rejects
 identical or foreign-layout slots.
 
-APCu metadata explicitly requests `ProcessSharedState`. Its request slot holds
-a handle to process-local cache storage, so dropping one request owner drops
-the handle but not the shared cache. The registry tests cover this distinction.
+APCu metadata explicitly requests `ProcessSharedState`. `php_extensions` builds
+the selected layout and the VM owns exactly one request value from that layout.
+Normal builtin dispatch and the VM-mediated `apcu_entry` callback resolve the
+same numeric slot. Dropping one request owner drops its handle but not the
+process-local cache; registry and VM tests cover this distinction.
 
 ## Allocation Report
 
@@ -83,7 +88,6 @@ removes both members of every fallback/borrow pair together.
 | BCMath | `bcmath_scale` |
 | strtok | `strtok_state` |
 | iconv | `iconv_state`, `iconv_state_slot` |
-| legacy APCu | `apcu_state`, `apcu_state_slot` |
 | OPcache | `opcache_state`, `opcache_state_slot` |
 | SOAP | `soap_state`, `soap_state_slot` |
 | OpenSSL | `openssl_error_state`, `openssl_error_state_slot` |
