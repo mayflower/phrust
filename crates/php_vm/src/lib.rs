@@ -74,7 +74,9 @@ pub mod vm;
 /// stores.
 pub mod api {
     pub use crate::bytecode::BytecodeLayoutProfile;
-    pub use crate::compiled_unit::CompiledUnit;
+    pub use crate::compiled_unit::{
+        CompiledClass, CompiledUnit, CompiledUnitBuildError, CompiledUnitLayoutStats,
+    };
     pub use crate::counters::{
         BoundaryProfile, JitCompileDescriptor, MethodCallProfile, OperationProfile,
         PropertyFetchProfile, VmCounters,
@@ -199,7 +201,9 @@ pub use bytecode::{
     dense_block_key,
 };
 #[doc(hidden)]
-pub use compiled_unit::CompiledUnit;
+pub use compiled_unit::{
+    CompiledClass, CompiledUnit, CompiledUnitBuildError, CompiledUnitLayoutStats,
+};
 #[doc(hidden)]
 pub use counters::{BoundaryProfile, JitCompileDescriptor, OperationProfile, VmCounters};
 #[doc(hidden)]

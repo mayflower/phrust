@@ -22,7 +22,7 @@ impl Hash for SharedClassName {
 #[derive(Clone, Debug, Default)]
 pub(super) struct ObjectClassResolution {
     epoch: u64,
-    entries: HashMap<SharedClassName, Arc<php_ir::module::ClassEntry>>,
+    entries: HashMap<SharedClassName, CompiledClass>,
 }
 
 /// Per-unit lazily-resolved constant values with a one-entry hot-unit cache.
@@ -1646,7 +1646,7 @@ impl Vm {
         compiled: &CompiledUnit,
         state: &ExecutionState,
         object: &php_runtime::ObjectRef,
-    ) -> Option<Arc<php_ir::module::ClassEntry>> {
+    ) -> Option<CompiledClass> {
         let key = SharedClassName(object.class_name_handle());
         let epoch = state.class_table_epoch;
         {
@@ -1654,7 +1654,7 @@ impl Vm {
             if cache.epoch == epoch
                 && let Some(class) = cache.entries.get(&key)
             {
-                return Some(Arc::clone(class));
+                return Some(class.clone());
             }
         }
         let class = lookup_class_in_state(compiled, state, &key.0)?;
@@ -1663,7 +1663,7 @@ impl Vm {
             cache.entries.clear();
             cache.epoch = epoch;
         }
-        cache.entries.insert(key, Arc::clone(&class));
+        cache.entries.insert(key, class.clone());
         Some(class)
     }
 

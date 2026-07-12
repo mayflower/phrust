@@ -5,7 +5,7 @@ pub(super) fn resolve_static_class_name(
     state: &ExecutionState,
     stack: &CallStack,
     class_name: &str,
-) -> Result<Arc<php_ir::module::ClassEntry>, String> {
+) -> Result<CompiledClass, String> {
     // Returns a shared handle: `ClassEntry` is a large struct (method/property
     // tables), and this resolver runs on every `Name::`/`self::`/`static::`
     // access — deep-cloning it here was a top CPU hotspot on the WordPress
@@ -34,7 +34,8 @@ pub(super) fn resolve_static_class_name(
             };
             lookup_class_in_state(compiled, state, &called)
                 .or_else(|| {
-                    current_this_called_class(compiled, state, stack, &called).map(Arc::new)
+                    current_this_called_class(compiled, state, stack, &called)
+                        .map(CompiledClass::owned)
                 })
                 .ok_or_else(|| format!("E_PHP_VM_UNKNOWN_CLASS: class {called} is not defined"))
         }
@@ -53,7 +54,7 @@ pub(super) fn resolve_static_class_name(
             if let Some(parent) = class.parent.as_deref()
                 && let Some(parent) = internal_runtime_class_entry(&normalize_class_name(parent))
             {
-                return Ok(Arc::new(parent));
+                return Ok(CompiledClass::owned(parent));
             }
             let Some(parent_name) = class.parent.as_deref() else {
                 return Err(format!(
@@ -70,7 +71,8 @@ pub(super) fn resolve_static_class_name(
         }
         _ => lookup_class_in_state(compiled, state, class_name)
             .or_else(|| {
-                internal_runtime_class_entry(&normalize_class_name(class_name)).map(Arc::new)
+                internal_runtime_class_entry(&normalize_class_name(class_name))
+                    .map(CompiledClass::owned)
             })
             .ok_or_else(|| format!("E_PHP_VM_UNKNOWN_CLASS: class {class_name} is not defined")),
     }

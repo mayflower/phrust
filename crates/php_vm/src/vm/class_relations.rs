@@ -558,11 +558,12 @@ fn class_hierarchy(
     compiled: &CompiledUnit,
     state: &ExecutionState,
     class: &php_ir::module::ClassEntry,
-) -> Vec<Arc<php_ir::module::ClassEntry>> {
+) -> Vec<CompiledClass> {
     // Shared handles: entries are large (method/property tables) and callers
     // only read; one clone for the starting borrow, none per ancestor.
     let mut classes = Vec::new();
-    let mut current = Some(Arc::new(class.clone()));
+    let mut current = lookup_class_in_state(compiled, state, &class.name)
+        .or_else(|| Some(CompiledClass::owned(class.clone())));
     let mut seen = BTreeSet::new();
     while let Some(class) = current {
         let normalized = normalize_class_name(&class.name);
@@ -652,7 +653,7 @@ pub(super) fn lookup_resolved_method_in_state(
     lookup_resolved_method_in_state_inner(
         compiled,
         state,
-        class.into_arc(),
+        class.into_handle(),
         method,
         caller_scope,
         &mut Vec::new(),
@@ -686,7 +687,7 @@ fn lookup_private_method_in_caller_scope_in_state(
         return Ok(None);
     };
     Ok(Some(ResolvedMethodOwned {
-        class: scope_class.into_arc(),
+        class: scope_class.into_handle(),
         method: scope_method,
     }))
 }
@@ -694,7 +695,7 @@ fn lookup_private_method_in_caller_scope_in_state(
 fn lookup_resolved_method_in_state_inner(
     compiled: &CompiledUnit,
     state: &ExecutionState,
-    class: Arc<php_ir::module::ClassEntry>,
+    class: CompiledClass,
     method: &str,
     caller_scope: Option<&str>,
     seen: &mut Vec<String>,
@@ -723,7 +724,7 @@ fn lookup_resolved_method_in_state_inner(
             && let Some(parent_method) = lookup_resolved_method_in_state_inner(
                 compiled,
                 state,
-                parent_class.into_arc(),
+                parent_class.into_handle(),
                 method.name.as_str(),
                 caller_scope,
                 seen,
@@ -734,7 +735,7 @@ fn lookup_resolved_method_in_state_inner(
         }
         seen.pop();
         return Ok(Some(ResolvedMethodOwned {
-            class: Arc::clone(&class),
+            class: class.clone(),
             method: method.clone(),
         }));
     }
@@ -746,7 +747,7 @@ fn lookup_resolved_method_in_state_inner(
         let resolved = lookup_resolved_method_in_state_inner(
             compiled,
             state,
-            parent_class.into_arc(),
+            parent_class.into_handle(),
             method,
             caller_scope,
             seen,

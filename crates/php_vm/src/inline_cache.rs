@@ -300,7 +300,7 @@ pub struct MethodCallDispatchRoute {
     /// `Dense` in it at fill time.
     pub plan: std::sync::Arc<crate::bytecode::DenseExecutionPlan>,
     /// Declaring class entry, for trivial-method inlining on the hit path.
-    pub declaring_class: std::sync::Arc<php_ir::module::ClassEntry>,
+    pub declaring_class: crate::compiled_unit::CompiledClass,
     /// Normalized declaring-class name handle for frame class context.
     pub declaring_class_handle: std::sync::Arc<str>,
 }

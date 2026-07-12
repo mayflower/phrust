@@ -86,7 +86,10 @@ impl IncludeCompiler for TestIncludeCompiler {
             .with_context("stage", "ir_lowering")
             .with_context("detail", ir_lowering_failure_detail(&lowering)));
         }
-        Ok(CompiledUnit::new(lowering.unit))
+        Ok(CompiledUnit::with_ordered_sources(
+            lowering.unit,
+            [std::sync::Arc::<str>::from(source)],
+        ))
     }
 }
 
@@ -253,8 +256,12 @@ fn compile_include(
                 .with_context("stage", "optimizer")
             })?;
     }
+    let retained_sources = session
+        .files()
+        .iter()
+        .map(|file| std::sync::Arc::<str>::from(file.source()));
     Ok(CompiledInclude {
-        unit: CompiledUnit::new(lowering.unit),
+        unit: CompiledUnit::with_ordered_sources(lowering.unit, retained_sources),
         dependencies,
     })
 }

@@ -358,7 +358,7 @@ pub(super) fn lookup_property_in_state(
 pub(super) fn lookup_resolved_property_in_state(
     compiled: &CompiledUnit,
     state: &ExecutionState,
-    class: &Arc<php_ir::module::ClassEntry>,
+    class: &CompiledClass,
     property: &str,
     caller_scope: Option<&str>,
 ) -> Result<Option<ResolvedPropertyOwned>, String> {
@@ -409,7 +409,7 @@ fn lookup_private_property_in_state_caller_scope(
         return Ok(None);
     };
     Ok(Some(ResolvedPropertyOwned {
-        class: scope_class.into_arc(),
+        class: scope_class.into_handle(),
         property: scope_property,
     }))
 }
@@ -417,7 +417,7 @@ fn lookup_private_property_in_state_caller_scope(
 fn lookup_resolved_property_in_state_inner(
     compiled: &CompiledUnit,
     state: &ExecutionState,
-    class: &Arc<php_ir::module::ClassEntry>,
+    class: &CompiledClass,
     property: &str,
     caller_scope: Option<&str>,
     seen: &mut Vec<String>,
@@ -438,7 +438,7 @@ fn lookup_resolved_property_in_state_inner(
                 .parent
                 .as_deref()
                 .and_then(|parent| lookup_class_in_state_ref(compiled, state, parent))
-                .map(ClassLookup::into_arc)
+                .map(ClassLookup::into_handle)
             && let Some(parent_property) = lookup_resolved_property_in_state_inner(
                 compiled,
                 state,
@@ -453,7 +453,7 @@ fn lookup_resolved_property_in_state_inner(
         }
         seen.pop();
         return Ok(Some(ResolvedPropertyOwned {
-            class: Arc::clone(class),
+            class: class.clone(),
             property: entry.clone(),
         }));
     }
@@ -464,7 +464,7 @@ fn lookup_resolved_property_in_state_inner(
                 class.name, parent_name
             ));
         };
-        let parent_class = parent_class.into_arc();
+        let parent_class = parent_class.into_handle();
         let resolved = lookup_resolved_property_in_state_inner(
             compiled,
             state,

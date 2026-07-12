@@ -891,7 +891,6 @@ impl Vm {
             .any(|entry| entry.function != evaluated.unit().entry);
         let has_source_class_declarations = evaluated
             .class_table()
-            .iter()
             .any(|class| !is_lowered_internal_interface_skeleton(class));
         let has_constant_declarations = !evaluated.unit().constant_table.is_empty();
         let has_declarations = has_named_function_declarations

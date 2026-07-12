@@ -181,7 +181,7 @@ use crate::bytecode::{
     DenseOperand, DenseOperandKind, DenseOperands, SuperinstructionSelectionReport,
 };
 use crate::compiled_unit::{
-    CompiledUnit, DenseExecutionArtifactKey, DenseExecutionArtifactMode,
+    CompiledClass, CompiledUnit, DenseExecutionArtifactKey, DenseExecutionArtifactMode,
     PreparedClassValidationError, PreparedFunctionFacts,
 };
 #[cfg(feature = "jit-cranelift")]

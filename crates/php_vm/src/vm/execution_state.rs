@@ -192,7 +192,7 @@ pub(super) struct DynamicFunctionEntry {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct DynamicClassEntry {
     pub(super) lookup_name: String,
-    pub(super) class: Arc<php_ir::module::ClassEntry>,
+    pub(super) class: CompiledClass,
     pub(super) unit_index: usize,
     pub(super) origin: DeclarationOrigin,
 }

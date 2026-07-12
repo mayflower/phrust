@@ -178,17 +178,20 @@ pub(super) fn source_span_display_line(
     compiled.source_display_line(span, end)
 }
 
-pub(super) fn runtime_source_span_display_line(span: &RuntimeSourceSpan) -> Option<i64> {
+pub(super) fn runtime_source_span_display_line(
+    compiled: &CompiledUnit,
+    span: &RuntimeSourceSpan,
+) -> Option<i64> {
     let file = span.file.as_ref()?;
-    let source = std::fs::read_to_string(file).ok()?;
-    let offset = span.start as usize;
-    let offset = offset.min(source.len());
-    let line = source.as_bytes()[..offset]
+    let file = compiled
+        .unit()
+        .files
         .iter()
-        .filter(|byte| **byte == b'\n')
-        .count()
-        + 1;
-    Some(line as i64)
+        .find(|entry| entry.path == *file)?;
+    compiled.source_display_line(
+        php_ir::source_map::IrSpan::new(file.id, span.start, span.end),
+        false,
+    )
 }
 
 pub(super) fn source_span_file_line(
@@ -1665,7 +1668,7 @@ pub(super) fn reflection_class_reflection_constants_value(
 pub(super) fn reflection_class_constants_in_hierarchy(
     compiled: &CompiledUnit,
     state: &ExecutionState,
-    class: std::sync::Arc<php_ir::module::ClassEntry>,
+    class: CompiledClass,
 ) -> Result<Vec<ResolvedConstantOwned>, String> {
     let mut constants = Vec::new();
     let mut seen_classes = Vec::new();
@@ -1684,7 +1687,7 @@ pub(super) fn reflection_class_constants_in_hierarchy(
 pub(super) fn collect_reflection_class_constants(
     compiled: &CompiledUnit,
     state: &ExecutionState,
-    class: std::sync::Arc<php_ir::module::ClassEntry>,
+    class: CompiledClass,
     seen_classes: &mut Vec<String>,
     seen_names: &mut BTreeSet<String>,
     constants: &mut Vec<ResolvedConstantOwned>,

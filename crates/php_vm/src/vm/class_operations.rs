@@ -3342,18 +3342,27 @@ pub(super) fn register_dynamic_classes(
                 .map(|function| function.span.file)
         })
         .collect();
-    for class in compiled.unit().classes.iter().filter(|class| {
-        class.span != php_ir::source_map::IrSpan::default()
-            && !class.flags.is_conditional
-            && !inferred_files.contains(&class.span.file)
-    }) {
+    for (class_index, class) in compiled
+        .unit()
+        .classes
+        .iter()
+        .enumerate()
+        .filter(|(_, class)| {
+            class.span != php_ir::source_map::IrSpan::default()
+                && !class.flags.is_conditional
+                && !inferred_files.contains(&class.span.file)
+        })
+    {
         let normalized = normalize_class_name(&class.name);
         if state.dynamic_class_index.contains_key(&normalized) {
             continue;
         }
+        let Some(class_handle) = compiled.class_handle(class_index) else {
+            continue;
+        };
         state.push_dynamic_class(DynamicClassEntry {
             lookup_name: normalized,
-            class: Arc::new(class.clone()),
+            class: class_handle,
             unit_index,
             origin: declaration_origin(
                 compiled,
@@ -3404,7 +3413,7 @@ pub(super) fn declare_runtime_class(
             "Cannot declare class {class_name}, because the name is already in use"
         ));
     }
-    let Some(class) = compiled.lookup_unit_class(&normalized).cloned() else {
+    let Some(class) = compiled.lookup_unit_class_handle(&normalized) else {
         return Err(format!(
             "class declaration metadata for {class_name} is missing"
         ));
@@ -3419,7 +3428,7 @@ pub(super) fn declare_runtime_class(
             DeclarationKind::ClassLike,
             DeclarationLoadKind::Conditional,
         ),
-        class: Arc::new(class),
+        class,
         unit_index,
     });
     state.bump_class_table_epoch();
@@ -3507,10 +3516,10 @@ pub(super) fn dynamic_class_entry_by_normalized_name<'a>(
 pub(super) fn dynamic_class_in_loaded_units(
     state: &ExecutionState,
     class_name: &str,
-) -> Option<Arc<php_ir::module::ClassEntry>> {
+) -> Option<CompiledClass> {
     let normalized = normalize_class_name(class_name);
     state.dynamic_units.iter().rev().find_map(|unit| {
-        unit.lookup_class_arc(&normalized)
+        unit.lookup_class_handle(&normalized)
             .filter(|class| normalize_class_name(&class.name) == normalized)
     })
 }
@@ -3577,8 +3586,8 @@ pub(super) fn lookup_class_in_state(
     compiled: &CompiledUnit,
     state: &ExecutionState,
     class_name: &str,
-) -> Option<Arc<php_ir::module::ClassEntry>> {
-    lookup_class_in_state_ref(compiled, state, class_name).map(ClassLookup::into_arc)
+) -> Option<CompiledClass> {
+    lookup_class_in_state_ref(compiled, state, class_name).map(ClassLookup::into_handle)
 }
 
 pub(super) fn lookup_class_in_state_ref(
@@ -3588,9 +3597,9 @@ pub(super) fn lookup_class_in_state_ref(
 ) -> Option<ClassLookup> {
     let normalized = php_ir::module::normalized_class_name(class_name);
     if let Some(entry) = dynamic_class_entry_by_normalized_name(state, &normalized) {
-        return Some(ClassLookup::Shared(Arc::clone(&entry.class)));
+        return Some(ClassLookup::Shared(entry.class.clone()));
     }
-    if let Some(class) = compiled.lookup_class_arc(class_name) {
+    if let Some(class) = compiled.lookup_class_handle(class_name) {
         return Some(ClassLookup::Shared(class));
     }
     if let Some(class) = dynamic_class_in_loaded_units(state, &normalized) {
@@ -3871,13 +3880,7 @@ pub(super) fn lookup_class_constant_in_state(
     class_name: &str,
     reference_display_class_name: &str,
     constant_name: &str,
-) -> Result<
-    Option<(
-        Arc<php_ir::module::ClassEntry>,
-        php_ir::module::ClassConstantEntry,
-    )>,
-    String,
-> {
+) -> Result<Option<(CompiledClass, php_ir::module::ClassConstantEntry)>, String> {
     let Some(class) = lookup_class_in_state(compiled, state, class_name) else {
         return Err(format!(
             "E_PHP_VM_UNKNOWN_CLASS: Class \"{}\" not found",
@@ -3894,16 +3897,10 @@ pub(super) fn lookup_class_constant_in_state(
 fn lookup_class_constant_in_state_inner(
     compiled: &CompiledUnit,
     state: &ExecutionState,
-    class: Arc<php_ir::module::ClassEntry>,
+    class: CompiledClass,
     constant_name: &str,
     seen: &mut Vec<String>,
-) -> Result<
-    Option<(
-        Arc<php_ir::module::ClassEntry>,
-        php_ir::module::ClassConstantEntry,
-    )>,
-    String,
-> {
+) -> Result<Option<(CompiledClass, php_ir::module::ClassConstantEntry)>, String> {
     let normalized = normalize_class_name(&class.name);
     if seen.iter().any(|name| name == &normalized) {
         return Err(format!(

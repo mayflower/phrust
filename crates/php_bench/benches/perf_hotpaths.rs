@@ -1,6 +1,6 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use php_executor::ExecutorIncludeCompiler;
-use php_ir::ids::{BlockId, ClassId, FunctionId, InstrId};
+use php_ir::ids::{BlockId, ClassId, FileId, FunctionId, InstrId};
 use php_ir::{LoweringOptions, lower_frontend_result};
 use php_lexer::{LexerConfig, lex_all};
 use php_optimizer::OptimizationLevel;
@@ -294,6 +294,55 @@ fn bench_frontend(c: &mut Criterion) {
                 },
             );
             black_box(lowered.unit.functions.len());
+        });
+    });
+}
+
+fn bench_compiled_unit_artifact(c: &mut Criterion) {
+    let frontend = analyze_source(FRONTEND_SOURCE);
+    let lowered = lower_frontend_result(
+        &frontend,
+        LoweringOptions {
+            source_text: Some(FRONTEND_SOURCE.to_owned()),
+            ..LoweringOptions::default()
+        },
+    );
+    let retained_source = Arc::<str>::from(FRONTEND_SOURCE);
+    let compiled = CompiledUnit::try_with_sources(
+        lowered.unit.clone(),
+        [(FileId::new(0), Arc::clone(&retained_source))],
+    )
+    .expect("benchmark source file ID");
+    let stats = compiled.layout_stats();
+    eprintln!(
+        "compiled-unit ownership: source_files={} retained_source_bytes={} canonical_classes={} duplicated_classes={} indexed_symbols={} duplicated_symbol_name_bytes={}",
+        stats.retained_source_files,
+        stats.retained_source_bytes,
+        stats.canonical_classes,
+        stats.duplicated_classes,
+        stats.indexed_symbols,
+        stats.duplicated_symbol_name_bytes,
+    );
+
+    c.bench_function("performance/compiled_unit_construction", |b| {
+        b.iter_batched(
+            || lowered.unit.clone(),
+            |unit| {
+                black_box(
+                    CompiledUnit::try_with_sources(
+                        unit,
+                        [(FileId::new(0), Arc::clone(&retained_source))],
+                    )
+                    .expect("benchmark source file ID"),
+                );
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    c.bench_function("performance/compiled_unit_warmed_symbol_lookup", |b| {
+        b.iter(|| {
+            black_box(compiled.lookup_function(black_box("perf_add")));
+            black_box(compiled.lookup_class(black_box("perfbox")));
         });
     });
 }
@@ -866,6 +915,6 @@ fn bench_string_intrinsics(c: &mut Criterion) {
 criterion_group! {
     name = perf_hotpaths;
     config = configured_criterion();
-    targets = bench_frontend, bench_vm, bench_inline_cache_lookup, bench_dynamic_symbols, bench_runtime, bench_byte_kernels, bench_string_intrinsics, bench_include_cache_identity, bench_multi_file_include_compile
+    targets = bench_frontend, bench_compiled_unit_artifact, bench_vm, bench_inline_cache_lookup, bench_dynamic_symbols, bench_runtime, bench_byte_kernels, bench_string_intrinsics, bench_include_cache_identity, bench_multi_file_include_compile
 }
 criterion_main!(perf_hotpaths);

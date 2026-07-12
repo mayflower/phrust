@@ -210,10 +210,11 @@ impl CompiledPhpScript {
             lowering,
             ..
         } = pipeline;
+        let retained_source = source.shared_text();
         Self {
             path,
             source,
-            executable: CompiledUnit::new(lowering.unit),
+            executable: CompiledUnit::with_ordered_sources(lowering.unit, [retained_source]),
         }
     }
 
@@ -227,10 +228,13 @@ impl CompiledPhpScript {
         source: impl Into<String>,
         unit: php_ir::module::IrUnit,
     ) -> Self {
+        let path = source_path.into();
+        let source = SourceText::new(source);
+        let retained_source = source.shared_text();
         Self {
-            path: source_path.into(),
-            source: SourceText::new(source),
-            executable: CompiledUnit::new(unit),
+            path,
+            source,
+            executable: CompiledUnit::with_ordered_sources(unit, [retained_source]),
         }
     }
 

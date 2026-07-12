@@ -216,7 +216,7 @@ fn non_numeric_string_type_error(
         value_type_name(rhs)
     );
     let file = source_span.file.clone().unwrap_or_default();
-    let line = runtime_source_span_display_line(&source_span).unwrap_or(0);
+    let line = runtime_source_span_display_line(compiled, &source_span).unwrap_or(0);
     let trace = capture_backtrace_string(compiled, stack);
     output.write_test_str(&format!(
         "\nFatal error: Uncaught TypeError: {message} in {file}:{line}\nStack trace:\n{trace}\n  thrown in {file} on line {line}\n"

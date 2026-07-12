@@ -8,7 +8,7 @@ pub(super) struct ResolvedMethod<'a> {
 
 #[derive(Clone, Debug)]
 pub(super) struct ResolvedMethodOwned {
-    pub(super) class: Arc<php_ir::module::ClassEntry>,
+    pub(super) class: CompiledClass,
     pub(super) method: php_ir::module::ClassMethodEntry,
 }
 
@@ -20,7 +20,7 @@ pub(super) struct ResolvedProperty<'a> {
 
 #[derive(Clone)]
 pub(super) struct ResolvedPropertyOwned {
-    pub(super) class: Arc<php_ir::module::ClassEntry>,
+    pub(super) class: CompiledClass,
     pub(super) property: php_ir::module::ClassPropertyEntry,
 }
 
@@ -28,7 +28,7 @@ pub(super) enum ClassLookup {
     /// Boxed: `ClassEntry` is ~272 bytes and would dominate the enum size.
     Owned(Box<php_ir::module::ClassEntry>),
     /// Shared handle into a class table; cloning is a cheap refcount bump.
-    Shared(Arc<php_ir::module::ClassEntry>),
+    Shared(CompiledClass),
 }
 
 impl ClassLookup {
@@ -39,10 +39,10 @@ impl ClassLookup {
         }
     }
 
-    pub(super) fn into_arc(self) -> Arc<php_ir::module::ClassEntry> {
+    pub(super) fn into_handle(self) -> CompiledClass {
         match self {
             Self::Shared(class) => class,
-            Self::Owned(class) => Arc::new(*class),
+            Self::Owned(class) => CompiledClass::owned(*class),
         }
     }
 }

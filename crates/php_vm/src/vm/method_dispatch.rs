@@ -146,7 +146,7 @@ impl Vm {
         function: FunctionId,
         declaring_class: &php_ir::module::ClassEntry,
     ) -> Option<MethodCallDispatchRoute> {
-        let canonical_class = owner.lookup_class_arc(&declaring_class.name)?;
+        let canonical_class = owner.lookup_class_handle(&declaring_class.name)?;
         if canonical_class.id != declaring_class.id {
             return None;
         }
