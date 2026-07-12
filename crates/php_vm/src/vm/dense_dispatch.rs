@@ -2819,16 +2819,30 @@ impl Vm {
                             stack.pop_recycle();
                             return result;
                         };
-                        if let Err(message) = self.execute_dense_unary_op(
+                        match self.execute_dense_unary_op(
                             compiled,
                             stack,
                             instruction.opcode,
                             dst,
                             src,
                         ) {
-                            let result = self.runtime_error(output, compiled, stack, message);
-                            stack.pop_recycle();
-                            return result;
+                            Ok(None) => {}
+                            Ok(Some(deprecation)) => {
+                                let span = dense_instruction_span(dense, instruction);
+                                if let Err(result) = self.emit_implicit_int_deprecation(
+                                    ExecutionCursor::new(compiled, output, stack, state),
+                                    deprecation,
+                                    runtime_source_span(compiled, span),
+                                ) {
+                                    stack.pop_recycle();
+                                    return *result;
+                                }
+                            }
+                            Err(message) => {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result;
+                            }
                         }
                     }
                     DenseOpcode::Include => {

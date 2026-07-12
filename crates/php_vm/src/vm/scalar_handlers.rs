@@ -236,26 +236,66 @@ fn bitwise_string_bytes(op: BinaryOp, lhs: &[u8], rhs: &[u8]) -> Vec<u8> {
     }
 }
 
-fn execute_unary(op: UnaryOp, src: &Value) -> Result<Value, String> {
+/// Deprecation text for a float (or float-string) used in an int-only
+/// context when the conversion loses precision; integral in-range floats
+/// convert silently.
+pub(super) fn implicit_int_deprecation_message(value: &Value) -> Option<String> {
+    match effective_value(value) {
+        Value::Float(float_value) => {
+            let raw = float_value.to_f64();
+            let lossless = php_runtime::api::float_fits_int(raw) && raw.trunc() == raw;
+            (!lossless).then(|| {
+                let rendered = to_string(&Value::float(raw))
+                    .map(|text| text.to_string_lossy())
+                    .unwrap_or_else(|_| raw.to_string());
+                format!("Implicit conversion from float {rendered} to int loses precision")
+            })
+        }
+        Value::String(text) => {
+            let Ok(NumericValue::Float(raw)) = to_number(&Value::String(text.clone())) else {
+                return None;
+            };
+            let lossless = php_runtime::api::float_fits_int(raw) && raw.trunc() == raw;
+            (!lossless).then(|| {
+                format!(
+                    "Implicit conversion from float-string \"{}\" to int loses precision",
+                    text.to_string_lossy()
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Executes a unary operator; the second tuple slot carries a pending
+/// implicit-int-conversion deprecation for the stateful caller to emit.
+fn execute_unary(op: UnaryOp, src: &Value) -> Result<(Value, Option<String>), String> {
     match op {
         UnaryOp::Plus => match to_number(src)? {
-            NumericValue::Int(value) => Ok(Value::Int(value)),
-            NumericValue::Float(value) => Ok(Value::float(value)),
+            NumericValue::Int(value) => Ok((Value::Int(value), None)),
+            NumericValue::Float(value) => Ok((Value::float(value), None)),
         },
         UnaryOp::Minus => match to_number(src)? {
-            NumericValue::Int(value) => Ok(value
-                .checked_neg()
-                .map(Value::Int)
-                .unwrap_or_else(|| Value::float(-(value as f64)))),
-            NumericValue::Float(value) => Ok(Value::float(-value)),
+            NumericValue::Int(value) => Ok((
+                value
+                    .checked_neg()
+                    .map(Value::Int)
+                    .unwrap_or_else(|| Value::float(-(value as f64))),
+                None,
+            )),
+            NumericValue::Float(value) => Ok((Value::float(-value), None)),
         },
-        UnaryOp::Not => Ok(Value::Bool(!to_bool(src)?)),
-        UnaryOp::BitNot => match src {
-            Value::Int(value) => Ok(Value::Int(!value)),
+        UnaryOp::Not => Ok((Value::Bool(!to_bool(src)?), None)),
+        UnaryOp::BitNot => match effective_value(src) {
+            Value::Int(value) => Ok((Value::Int(!value), None)),
             Value::String(value) => {
                 let bytes: Vec<u8> = value.as_bytes().iter().map(|byte| !byte).collect();
-                Ok(Value::String(PhpString::from_bytes(bytes)))
+                Ok((Value::String(PhpString::from_bytes(bytes)), None))
             }
+            Value::Float(value) => Ok((
+                Value::Int(!php_runtime::api::php_float_to_int(value.to_f64())),
+                implicit_int_deprecation_message(src),
+            )),
             _ => Err("bitwise not is only implemented for int and string operands".to_owned()),
         },
     }
@@ -367,7 +407,7 @@ pub(super) fn execute_rich_binary_op(
 pub(super) fn execute_rich_unary_op(
     request: RichUnaryRequest<'_>,
     stack: &mut CallStack,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let RichUnaryRequest {
         unit,
         frame_index,
@@ -376,13 +416,13 @@ pub(super) fn execute_rich_unary_op(
         src,
     } = request;
     let src = read_operand_at_frame(unit, stack, frame_index, src)?;
-    let value = execute_unary(op, &src)?;
+    let (value, deprecation) = execute_unary(op, &src)?;
     stack
         .frame_mut(frame_index)
         .expect("frame was pushed")
         .registers
         .set(dst, value)?;
-    Ok(())
+    Ok(deprecation)
 }
 
 impl Vm {
@@ -481,15 +521,15 @@ impl Vm {
         opcode: DenseOpcode,
         dst: u32,
         src: DenseOperand,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         let src = self.read_dense_operand_ref(compiled, stack, src)?;
         let op = dense_unary_op(opcode).expect("dense unary opcode matched");
-        let value = execute_unary(op, src.as_value())?;
+        let (value, deprecation) = execute_unary(op, src.as_value())?;
         stack
             .current_mut()
             .expect("bytecode frame was pushed")
             .registers
             .set(RegId::new(dst), value)?;
-        Ok(())
+        Ok(deprecation)
     }
 }

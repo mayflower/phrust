@@ -9328,7 +9328,18 @@ fn expressions_modulo_coerces_numeric_operands() {
     let result = execute_source("<?php echo 5.5 % 2;");
 
     assert!(result.status.is_success(), "{:?}", result.status);
-    assert_eq!(result.output.as_bytes(), b"1");
+    // The fractional operand deprecates before converting, like the
+    // reference: modulo is an int-only context.
+    let text = String::from_utf8_lossy(result.output.as_bytes()).into_owned();
+    assert!(
+        text.contains("Deprecated: Implicit conversion from float 5.5 to int loses precision"),
+        "{text}"
+    );
+    assert!(text.ends_with('1'), "{text}");
+
+    let integral = execute_source("<?php echo 6.0 % 4;");
+    assert!(integral.status.is_success(), "{:?}", integral.status);
+    assert_eq!(integral.output.as_bytes(), b"2");
 }
 
 #[test]

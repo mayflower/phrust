@@ -885,7 +885,7 @@ impl Vm {
                         }
                     }
                     InstructionKind::Unary { dst, op, src } => {
-                        if let Err(message) = execute_rich_unary_op(
+                        match execute_rich_unary_op(
                             RichUnaryRequest {
                                 unit,
                                 frame_index,
@@ -895,7 +895,19 @@ impl Vm {
                             },
                             stack,
                         ) {
-                            return self.runtime_error(output, compiled, stack, message);
+                            Ok(None) => {}
+                            Ok(Some(deprecation)) => {
+                                if let Err(result) = self.emit_implicit_int_deprecation(
+                                    ExecutionCursor::new(compiled, output, stack, state),
+                                    deprecation,
+                                    runtime_source_span(compiled, instruction.span),
+                                ) {
+                                    return *result;
+                                }
+                            }
+                            Err(message) => {
+                                return self.runtime_error(output, compiled, stack, message);
+                            }
                         }
                     }
                     InstructionKind::Cast { dst, kind, src } => {

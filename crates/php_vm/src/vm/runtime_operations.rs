@@ -712,6 +712,17 @@ impl Vm {
                         source_span,
                     )));
                 }
+                if op == BinaryOp::Mod {
+                    for operand in [lhs, rhs] {
+                        if let Some(message) = implicit_int_deprecation_message(operand) {
+                            self.emit_implicit_int_deprecation(
+                                ExecutionCursor::new(compiled, output, stack, state),
+                                message,
+                                source_span.clone(),
+                            )?;
+                        }
+                    }
+                }
                 if let Some(value) = self.execute_numeric_string_int_binary(
                     ExecutionCursor::new(compiled, output, stack, state),
                     op,
@@ -735,8 +746,21 @@ impl Vm {
             | BinaryOp::BitOr
             | BinaryOp::BitXor
             | BinaryOp::ShiftLeft
-            | BinaryOp::ShiftRight => Ok(execute_bitwise(op, lhs, rhs)
-                .map_err(|message| self.runtime_error(output, compiled, stack, message))?),
+            | BinaryOp::ShiftRight => {
+                if !matches!((lhs, rhs), (Value::String(_), Value::String(_))) {
+                    for operand in [lhs, rhs] {
+                        if let Some(message) = implicit_int_deprecation_message(operand) {
+                            self.emit_implicit_int_deprecation(
+                                ExecutionCursor::new(compiled, output, stack, state),
+                                message,
+                                source_span.clone(),
+                            )?;
+                        }
+                    }
+                }
+                Ok(execute_bitwise(op, lhs, rhs)
+                    .map_err(|message| self.runtime_error(output, compiled, stack, message))?)
+            }
             BinaryOp::Pow => {
                 let lhs = to_number(lhs)
                     .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
@@ -884,6 +908,50 @@ impl Vm {
             format!("unexpected NAN value was coerced to {target}"),
             source_span,
         )
+    }
+
+    /// Emits the implicit float-to-int deprecation through the user error
+    /// handler, falling back to the deprecation output channel.
+    pub(super) fn emit_implicit_int_deprecation(
+        &self,
+        cursor: ExecutionCursor<'_>,
+        message: String,
+        source_span: RuntimeSourceSpan,
+    ) -> Result<(), Box<VmResult>> {
+        let ExecutionCursor {
+            compiled,
+            output,
+            stack,
+            state,
+        } = cursor;
+        let diagnostic = RuntimeDiagnostic::new(
+            "E_PHP_RUNTIME_IMPLICIT_FLOAT_TO_INT_DEPRECATION",
+            RuntimeSeverity::Deprecation,
+            message,
+            source_span,
+            Vec::new(),
+            Some(php_runtime::api::PhpReferenceClassification::Deprecation),
+        );
+        let handled = self.dispatch_error_handler(
+            compiled,
+            output,
+            stack,
+            state,
+            php_runtime::api::PHP_E_DEPRECATED,
+            &diagnostic,
+        )?;
+        if !handled && error_reporting_allows(state, php_runtime::api::PHP_E_DEPRECATED) {
+            Self::record_last_error(state, php_runtime::api::PHP_E_DEPRECATED, &diagnostic);
+            emit_vm_diagnostic(
+                output,
+                state,
+                &diagnostic,
+                php_runtime::api::PhpDiagnosticChannel::Deprecated,
+                php_runtime::api::PHP_E_DEPRECATED,
+            );
+            state.diagnostics.push(diagnostic);
+        }
+        Ok(())
     }
 
     pub(super) fn execute_cast(
