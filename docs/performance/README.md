@@ -38,3 +38,23 @@ markdown reports stay under `target/performance/`. The public status summary is
 Cranelift and native-tier documents are grouped under
 [cranelift/](cranelift/README.md). The native tier remains experimental and
 default-off unless a separate ADR changes that policy.
+
+## Additional References
+
+- [ARM performance tranche v2](arm-performance-tranche-v2.md)
+- [Performance Autoload Lookup Cache](autoload-lookup-cache.md)
+- [Performance Benchmark Corpus](benchmark-corpus.md)
+- [Dense Bytecode Block Layout](bytecode-layout.md)
+- [Class Relation Caches](class-relation-caches.md)
+- [App-Flow Overhead Counter Families](counter-families.md)
+- [Exit-Counter-Guided Specialization Policy](exit-policy.md)
+- [Performance Include Path Cache](include-path-cache.md)
+- [Performance Local Slot Layout](local-slot-layout.md)
+- [Performance Mode Matrix](mode-matrix.md)
+- [Performance Preflight](preflight.md)
+- [Performance Optimized-Path Regression Fixtures](regressions.md)
+- [Performance Shared Cache Research Spike](research-shared-cache.md)
+- [Performance Rule Selection](rule-selection.md)
+- [Runtime-memory safety audit](runtime-memory-safety-audit.md)
+- [Performance Typecheck Fast Paths](typecheck-fast-paths.md)
+- [VM frame-memory safety audit](vm-frame-safety-audit.md)

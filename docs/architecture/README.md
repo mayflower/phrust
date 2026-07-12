@@ -30,3 +30,8 @@ before changing a subsystem.
 Architecture docs describe stable contracts and boundaries. Implementation
 history, one-off benchmark captures, and local run evidence belong under
 `target/` or in a short-lived issue/PR discussion.
+
+## Additional References
+
+- [Architecture Guardrails](guardrails.md)
+- [Architecture Remediation Sign-off](refactor-signoff.md)

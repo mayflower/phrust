@@ -279,6 +279,7 @@ check:
 source-integrity:
     @just architecture-guardrails
     scripts/verify/panic_unwrap_policy.py
+    scripts/verify/docs_strategy.py
 
 architecture-guardrails:
     scripts/verify/architecture_guardrails.py --self-test
