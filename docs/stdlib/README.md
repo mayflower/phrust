@@ -3,6 +3,26 @@
 This directory owns standard-library contracts, extension coverage, generated
 function coverage summaries, and standard-library known gaps.
 
+## Fixture Areas
+
+Differential fixtures live under `tests/fixtures/stdlib/`:
+
+- `_harness/stdlib`: broad standard-library subset fixtures, including
+  optional `hash`, `hash_hmac`, `random_bytes`, and `random_int`
+  shape/range coverage.
+- `_harness/streams`: resource, `php://memory`, and local filesystem path
+  smoke fixtures.
+- `_harness/json-pcre-date`: JSON, PCRE, and Date/Time extension smoke
+  fixtures.
+- `_harness/spl-reflection`: SPL iterator/container and Reflection smoke
+  fixtures.
+- `corpus`: Composer/framework-style regression snippets for autoload,
+  environment, JSON config, routing, DateTime/version parsing, arrays,
+  and reflection attributes.
+
+The gate composition lives in the `justfile` (`just verify-stdlib` and the
+focused `diff-*` recipes); prose copies of it are not maintained here.
+
 ## Stable Contracts
 
 - [Standard library](standard-library.md)
