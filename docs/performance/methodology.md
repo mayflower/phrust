@@ -25,7 +25,7 @@ checks and enough environment detail to reproduce the run.
 Linux-only tools are added with Nix conditionals so Darwin shells and `nix
 flake check` do not evaluate them as required Darwin packages. The default
 Darwin shell uses `mkShellNoCC` plus a lightweight Nix tool surface for `just`,
-`jq`, `hyperfine`, `ripgrep`, `fd`, `python3`, `ccache`, and `sccache`, while
+`jq`, `hyperfine`, `ripgrep`, `fd`, `python3`, and `sccache`, while
 keeping the existing host Rust toolchain stable. Darwin shells intentionally do
 not pull `shellcheck` from Nix because that requires a large Haskell closure on
 current nixpkgs; script linting remains an optional host-tool check there.

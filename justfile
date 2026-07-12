@@ -1034,23 +1034,25 @@ vm-semantics-oracle *args:
     scripts/vm_semantics_oracle.py {{args}}
 
 runtime-toolchain-audit:
-    @for tool in cargo rustc rustfmt cargo-clippy just jq python3 rg clang sccache; do \
-      if ! command -v "$tool" >/dev/null 2>&1; then \
-        printf '%s\n' "[missing] required runtime semantics devshell tool: $tool" >&2; \
-        exit 1; \
-      fi; \
-    done; \
-    @if ! command -v shellcheck >/dev/null 2>&1; then \
-      case "$$(uname -s)" in \
-        Darwin) printf '%s\n' '[skip] shellcheck unavailable; Darwin devshell omits it to avoid the Haskell closure';; \
-        *) printf '%s\n' '[missing] required runtime semantics devshell tool: shellcheck' >&2; exit 1;; \
-      esac; \
-    fi; \
-    test "${PHP_REF_SERIES:-}" = "8.5"; \
-    test "${PHP_REF_VERSION:-}" = "8.5.7"; \
-    test "${PHP_REF_TAG:-}" = "php-8.5.7"; \
-    test -n "${CARGO_TARGET_DIR:-}"; \
-    test -n "${SCCACHE_DIR:-}"; \
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for tool in cargo rustc rustfmt cargo-clippy just jq python3 rg clang sccache; do
+      if ! command -v "$tool" >/dev/null 2>&1; then
+        printf '%s\n' "[missing] required runtime semantics devshell tool: $tool" >&2
+        exit 1
+      fi
+    done
+    if ! command -v shellcheck >/dev/null 2>&1; then
+      case "$(uname -s)" in
+        Darwin) printf '%s\n' '[skip] shellcheck unavailable; Darwin devshell omits it to avoid the Haskell closure';;
+        *) printf '%s\n' '[missing] required runtime semantics devshell tool: shellcheck' >&2; exit 1;;
+      esac
+    fi
+    test "${PHP_REF_SERIES:-}" = "8.5"
+    test "${PHP_REF_VERSION:-}" = "8.5.7"
+    test "${PHP_REF_TAG:-}" = "php-8.5.7"
+    test -n "${CARGO_TARGET_DIR:-}"
+    test -n "${SCCACHE_DIR:-}"
     printf '%s\n' '[ok] runtime semantics devshell toolchain audit passed'
 
 runtime-miri-smoke:
