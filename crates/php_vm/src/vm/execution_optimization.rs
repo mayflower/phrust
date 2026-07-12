@@ -30,7 +30,7 @@ impl Hash for SharedClassName {
 /// Receiver-class resolutions pinned by their shared name handles.
 #[derive(Clone, Debug, Default)]
 pub(super) struct ObjectClassResolution {
-    epoch: u64,
+    scope: Option<PersistentClassCacheScope>,
     entries: HashMap<SharedClassName, CompiledClass>,
 }
 
@@ -42,6 +42,61 @@ pub(super) struct ResolvedConstantTables {
 }
 
 impl Vm {
+    fn persistent_class_cache_scope(
+        &self,
+        owner: &CompiledUnit,
+        state: &ExecutionState,
+    ) -> PersistentClassCacheScope {
+        PersistentClassCacheScope {
+            owner_unit_identity: owner.cache_identity(),
+            include_cache_instance_id: self
+                .options
+                .include_cache
+                .as_ref()
+                .map_or(0, |cache| cache.instance_id().get()),
+            class_table_epoch: state.class_table_epoch,
+            function_table_epoch: state.function_table_epoch,
+            autoload_stack_epoch: state.autoload_stack_epoch,
+            include_config_epoch: state.include_config_epoch,
+        }
+    }
+
+    fn invalidate_persistent_class_cache<K, T>(
+        &self,
+        cached_scope: &mut Option<PersistentClassCacheScope>,
+        entries: &mut HashMap<K, T>,
+        scope: PersistentClassCacheScope,
+    ) {
+        if cached_scope.is_some_and(|cached| cached != scope) {
+            let reason = if cached_scope
+                .is_some_and(|cached| cached.owner_unit_identity != scope.owner_unit_identity)
+            {
+                "compiled_unit_identity"
+            } else if cached_scope.is_some_and(|cached| {
+                cached.include_cache_instance_id != scope.include_cache_instance_id
+            }) {
+                "include_cache_instance"
+            } else if cached_scope
+                .is_some_and(|cached| cached.class_table_epoch != scope.class_table_epoch)
+            {
+                "class_table_epoch"
+            } else if cached_scope
+                .is_some_and(|cached| cached.function_table_epoch != scope.function_table_epoch)
+            {
+                "function_table_epoch"
+            } else if cached_scope
+                .is_some_and(|cached| cached.autoload_stack_epoch != scope.autoload_stack_epoch)
+            {
+                "autoload_stack_epoch"
+            } else {
+                "include_config_epoch"
+            };
+            entries.clear();
+            self.record_counter_persistent_worker_invalidation(reason);
+        }
+        *cached_scope = Some(scope);
+    }
+
     #[cfg(feature = "jit-cranelift")]
     pub(super) fn maybe_write_cranelift_clif_dump(
         &self,
@@ -719,14 +774,17 @@ impl Vm {
         state: &ExecutionState,
         class: &php_ir::module::ClassEntry,
     ) -> Result<Rc<RuntimeClassEntry>, RuntimeClassEntryError> {
-        let epoch = state.class_table_epoch;
+        let scope = self.persistent_class_cache_scope(class_owner, state);
         let key = normalize_class_name(&class.name);
         {
             let mut cache = self.runtime_class_entry_cache.borrow_mut();
-            if cache.epoch != epoch {
-                cache.entries.clear();
-                cache.epoch = epoch;
-            } else if let Some(entry) = cache.entries.get(&key) {
+            let RuntimeClassEntryCache {
+                scope: cached_scope,
+                entries,
+            } = &mut *cache;
+            self.invalidate_persistent_class_cache(cached_scope, entries, scope);
+            if let Some(entry) = entries.get(&key) {
+                self.record_counter_persistent_worker_class_cache_hit();
                 return Ok(Rc::clone(entry));
             }
         }
@@ -739,10 +797,14 @@ impl Vm {
             &|reference| named_constant_reference_value(class_owner, state, reference),
         )?;
         let entry = Rc::new(entry);
-        self.runtime_class_entry_cache
-            .borrow_mut()
-            .entries
-            .insert(key, Rc::clone(&entry));
+        if persistent_runtime_class_entry_is_safe(&entry) {
+            self.runtime_class_entry_cache
+                .borrow_mut()
+                .entries
+                .insert(key, Rc::clone(&entry));
+        } else {
+            self.record_counter_persistent_worker_rejection("runtime_class_entry");
+        }
         Ok(entry)
     }
 
@@ -757,14 +819,17 @@ impl Vm {
         state: &ExecutionState,
         class_name: &str,
     ) -> Option<Rc<php_ir::module::ClassEntry>> {
-        let epoch = state.class_table_epoch;
+        let scope = self.persistent_class_cache_scope(compiled, state);
         let key = normalize_class_name(class_name);
         {
             let mut cache = self.ir_class_entry_cache.borrow_mut();
-            if cache.epoch != epoch {
-                cache.entries.clear();
-                cache.epoch = epoch;
-            } else if let Some(entry) = cache.entries.get(&key) {
+            let IrClassEntryCache {
+                scope: cached_scope,
+                entries,
+            } = &mut *cache;
+            self.invalidate_persistent_class_cache(cached_scope, entries, scope);
+            if let Some(entry) = entries.get(&key) {
+                self.record_counter_persistent_worker_class_cache_hit();
                 return Some(Rc::clone(entry));
             }
         }
@@ -790,18 +855,22 @@ impl Vm {
     /// stale defaults can never leak across a redeclaration.
     pub(super) fn cached_default_slot_template(
         &self,
+        class_owner: &CompiledUnit,
         state: &ExecutionState,
         runtime_class: &RuntimeClassEntry,
         display_name: &str,
     ) -> Rc<Vec<Option<Value>>> {
-        let epoch = state.class_table_epoch;
+        let scope = self.persistent_class_cache_scope(class_owner, state);
         let key = normalize_class_name(&runtime_class.name);
         {
             let mut cache = self.default_slot_template_cache.borrow_mut();
-            if cache.epoch != epoch {
-                cache.entries.clear();
-                cache.epoch = epoch;
-            } else if let Some(template) = cache.entries.get(&key) {
+            let DefaultSlotTemplateCache {
+                scope: cached_scope,
+                entries,
+            } = &mut *cache;
+            self.invalidate_persistent_class_cache(cached_scope, entries, scope);
+            if let Some(template) = entries.get(&key) {
+                self.record_counter_persistent_worker_default_slot_hit();
                 return Rc::clone(template);
             }
         }
@@ -809,10 +878,14 @@ impl Vm {
             runtime_class,
             display_name,
         ));
-        self.default_slot_template_cache
-            .borrow_mut()
-            .entries
-            .insert(key, Rc::clone(&template));
+        if persistent_runtime_class_entry_is_safe(runtime_class) {
+            self.default_slot_template_cache
+                .borrow_mut()
+                .entries
+                .insert(key, Rc::clone(&template));
+        } else {
+            self.record_counter_persistent_worker_rejection("default_slot_template");
+        }
         template
     }
 
@@ -842,17 +915,20 @@ impl Vm {
         class_name: &str,
         caller_scope: Option<&str>,
     ) -> Result<Option<ResolvedMethodOwned>, String> {
-        let epoch = state.class_table_epoch;
+        let scope = self.persistent_class_cache_scope(compiled, state);
         let key = (
             normalize_class_name(class_name),
             caller_scope.map(normalize_class_name),
         );
         {
             let mut cache = self.constructor_resolution_cache.borrow_mut();
-            if cache.epoch != epoch {
-                cache.entries.clear();
-                cache.epoch = epoch;
-            } else if let Some(outcome) = cache.entries.get(&key) {
+            let ConstructorResolutionCache {
+                scope: cached_scope,
+                entries,
+            } = &mut *cache;
+            self.invalidate_persistent_class_cache(cached_scope, entries, scope);
+            if let Some(outcome) = entries.get(&key) {
+                self.record_counter_persistent_worker_constructor_hit();
                 return outcome.clone();
             }
         }
@@ -1667,20 +1743,24 @@ impl Vm {
         object: &php_runtime::api::ObjectRef,
     ) -> Option<CompiledClass> {
         let key = SharedClassName(object.class_name_handle());
-        let epoch = state.class_table_epoch;
+        let scope = self.persistent_class_cache_scope(compiled, state);
         {
             let cache = self.object_class_resolution.borrow();
-            if cache.epoch == epoch
+            if cache.scope == Some(scope)
                 && let Some(class) = cache.entries.get(&key)
             {
+                self.record_counter_persistent_worker_class_cache_hit();
                 return Some(class.clone());
             }
         }
         let class = lookup_class_in_state(compiled, state, &key.0)?;
         let mut cache = self.object_class_resolution.borrow_mut();
-        if cache.epoch != epoch {
+        if cache.scope != Some(scope) {
+            if cache.scope.is_some() {
+                self.record_counter_persistent_worker_invalidation("object_class_scope");
+            }
             cache.entries.clear();
-            cache.epoch = epoch;
+            cache.scope = Some(scope);
         }
         cache.entries.insert(key, class.clone());
         Some(class)

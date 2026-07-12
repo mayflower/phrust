@@ -9484,6 +9484,76 @@ fn direct_frames_elide_argument_vectors_unless_observed() {
 }
 
 #[test]
+fn dense_direct_calls_use_inline_positional_storage() {
+    let source = "<?php \
+            function add($a, $b) { return $a + $b; } \
+            function forty_two() { return 42; } \
+            $sum = 0; for ($i = 0; $i < 6; $i++) { $sum += add($i, 1); } \
+            echo $sum, '|', forty_two();";
+    let result = execute_source_with_options(
+        source,
+        VmOptions {
+            collect_counters: true,
+            collect_profile_spans: false,
+            collect_layout_source_attribution: true,
+            execution_format: ExecutionFormat::Auto,
+            copy_patch_leaf_override: Some(false),
+            ..VmOptions::default()
+        },
+    );
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(result.output.as_bytes(), b"21|42");
+    let counters = result.counters.expect("counters");
+    assert!(counters.dense_call_bare_args_hits >= 7, "{counters:?}");
+    assert!(
+        counters.prepared_arg_vector_allocations_avoided >= 7,
+        "{counters:?}"
+    );
+}
+
+#[test]
+fn dense_builtin_intrinsics_run_before_argument_materialization() {
+    let source = "<?php \
+            $a = ['key' => 7]; $s = 'Hello'; \
+            echo strlen($s), '|', count($a), '|', is_string($s), '|', \
+                 array_key_exists('key', $a), '|', str_contains($s, 'ell'), '|', \
+                 strtolower($s);";
+    let result = execute_source_with_options(
+        source,
+        VmOptions {
+            collect_counters: true,
+            collect_profile_spans: false,
+            collect_layout_source_attribution: true,
+            execution_format: ExecutionFormat::Auto,
+            inline_caches: InlineCacheMode::On,
+            ..VmOptions::default()
+        },
+    );
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(result.output.as_bytes(), b"5|1|1|1|1|hello");
+    let counters = result.counters.expect("counters");
+    assert_eq!(counters.internal_function_dispatches, 0, "{counters:?}");
+    for intrinsic in [
+        "strlen",
+        "count",
+        "is_string",
+        "array_key_exists",
+        "str_contains",
+        "strtolower",
+    ] {
+        assert!(
+            counters
+                .intrinsic_hits
+                .get(intrinsic)
+                .copied()
+                .unwrap_or_default()
+                >= 1,
+            "missing pre-args hit for {intrinsic}: {counters:?}"
+        );
+    }
+}
+
+#[test]
 fn trivial_getters_and_setters_inline_through_slots() {
     let source = "<?php class Row { public $v = 1; private $s = 2; \
             public function getV() { return $this->v; } \

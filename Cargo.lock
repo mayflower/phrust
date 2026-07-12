@@ -2530,6 +2530,7 @@ dependencies = [
  "php_testkit",
  "redis",
  "serde_json",
+ "smallvec",
  "zip 2.4.2",
 ]
 

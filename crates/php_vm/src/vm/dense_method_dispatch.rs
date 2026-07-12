@@ -180,15 +180,35 @@ impl Vm {
                 epoch,
             )
         };
+        let had_cached_target = cached_target.is_some();
         if let Some(target) = cached_target {
             self.record_counter_dense_call_ic_hit();
-            self.record_counter_dense_method_call_hit();
-            return self.execute_method_call_target(
-                compiled, target, object, args, call_span, output, stack, state, &None, plan,
-            );
+            if !matches!(self.options.jit, JitMode::Cranelift)
+                || dense_method_direct_call_target_is_eligible(DenseMethodDirectCallEligibility {
+                    compiled,
+                    state,
+                    target: &target,
+                    class: &class,
+                    values: &args,
+                    has_magic_call,
+                    epoch,
+                })
+            {
+                self.record_counter_dense_method_call_hit();
+                if matches!(self.options.jit, JitMode::Cranelift) {
+                    self.record_counter_direct_call_hit();
+                }
+                return self.execute_method_call_target(
+                    compiled, target, object, args, call_span, output, stack, state, &None, plan,
+                );
+            }
+            self.record_counter_direct_call_fallback();
         }
         if observation.is_some() {
             self.record_counter_dense_call_ic_miss();
+        }
+        if matches!(self.options.jit, JitMode::Cranelift) && !had_cached_target {
+            self.record_counter_direct_call_fallback();
         }
 
         let resolved = match lookup_resolved_method_in_state(
@@ -265,7 +285,12 @@ impl Vm {
             );
         }
 
-        let has_by_ref_argument = dense_call_has_by_ref_argument(&args);
+        let class_owner = class_owner_in_state(compiled, state, &declaring_class.name);
+        let has_by_ref_argument = class_owner
+            .unit()
+            .functions
+            .get(method_entry.function.index())
+            .is_some_and(|callee| callee.params.iter().any(|param| param.by_ref));
         let method_guard = method_call_guard_metadata(
             &args,
             &class,
@@ -276,7 +301,6 @@ impl Vm {
             has_magic_call,
             has_by_ref_argument,
         );
-        let class_owner = class_owner_in_state(compiled, state, &declaring_class.name);
         let route =
             self.method_dispatch_route(&class_owner, method_entry.function, declaring_class);
         let method_target = Rc::new(MethodCallResolvedTarget {
@@ -1059,8 +1083,12 @@ impl Vm {
         // filter + `slot_by_name` hash-lookup loop the slow path runs. The
         // template is byte-identical to that loop's output and rebuilt on a
         // redefinition (epoch bump).
-        let slot_template =
-            self.cached_default_slot_template(state, &runtime_class, display_class_name);
+        let slot_template = self.cached_default_slot_template(
+            &class_owner,
+            state,
+            &runtime_class,
+            display_class_name,
+        );
         let object = ObjectRef::from_layout_slots(
             &runtime_class,
             display_class_name,

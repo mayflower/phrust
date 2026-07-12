@@ -2157,6 +2157,7 @@ dependencies = [
  "php_source",
  "php_std",
  "redis",
+ "smallvec",
  "zip 2.4.2",
 ]
 

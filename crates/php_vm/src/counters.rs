@@ -252,6 +252,13 @@ pub struct VmCounters {
     pub request_pool_resets: u64,
     pub persistent_engine_allocations: u64,
     pub persistent_engine_bytes: u64,
+    pub persistent_worker_ic_hits_by_family: BTreeMap<String, u64>,
+    pub persistent_worker_ic_misses_by_family: BTreeMap<String, u64>,
+    pub persistent_worker_class_cache_hits: u64,
+    pub persistent_worker_default_slot_template_hits: u64,
+    pub persistent_worker_constructor_hits: u64,
+    pub persistent_worker_invalidations_by_reason: BTreeMap<String, u64>,
+    pub persistent_worker_request_visible_rejections_by_family: BTreeMap<String, u64>,
     pub arena_fallback_allocations_by_reason: BTreeMap<String, u64>,
     pub destructor_sensitive_arena_blocks: u64,
     pub value_clones: u64,
@@ -299,6 +306,7 @@ pub struct VmCounters {
     pub direct_closure_frame_hits: u64,
     pub direct_constructor_frame_hits: u64,
     pub argument_vector_allocations_avoided: u64,
+    pub prepared_arg_vector_allocations_avoided: u64,
     pub direct_frame_fallback_by_reason: BTreeMap<String, u64>,
     pub symbolized_call_name_hits: u64,
     pub symbolized_method_name_hits: u64,
@@ -454,6 +462,14 @@ pub struct VmCounters {
     pub native_compiled_regions: u64,
     pub native_executions: u64,
     pub copy_patch_executed: u64,
+    pub native_leaf_cache_positive_hits: u64,
+    pub native_leaf_cache_negative_hits: u64,
+    pub native_leaf_prewarm_attempts: u64,
+    pub native_leaf_prewarm_compiled: u64,
+    pub native_leaf_prewarm_rejected: u64,
+    pub native_leaf_prewarm_code_bytes: u64,
+    pub native_leaf_prewarm_compile_time_nanos: u64,
+    pub native_leaf_rejections_by_shape: BTreeMap<String, u64>,
     pub native_compile_budget_rejections: u64,
     pub native_eligibility_rejections_by_reason: BTreeMap<String, u64>,
     pub native_side_exits_by_reason: BTreeMap<String, u64>,
@@ -878,6 +894,10 @@ impl VmCounters {
             .or_default() += 1;
     }
 
+    pub(crate) fn record_prepared_arg_vector_allocation_avoided(&mut self) {
+        self.prepared_arg_vector_allocations_avoided += 1;
+    }
+
     pub(crate) fn record_foreach_no_clone_hit(&mut self) {
         self.foreach_no_clone_hits += 1;
     }
@@ -1110,6 +1130,29 @@ impl VmCounters {
     pub(crate) fn record_persistent_engine_footprint(&mut self, entries: u64, bytes: u64) {
         self.persistent_engine_allocations = entries;
         self.persistent_engine_bytes = bytes;
+    }
+
+    pub(crate) fn record_persistent_worker_ic(&mut self, family: &str, hit: bool) {
+        let counters = if hit {
+            &mut self.persistent_worker_ic_hits_by_family
+        } else {
+            &mut self.persistent_worker_ic_misses_by_family
+        };
+        *counters.entry(family.to_owned()).or_default() += 1;
+    }
+
+    pub(crate) fn record_persistent_worker_invalidation(&mut self, reason: &str) {
+        *self
+            .persistent_worker_invalidations_by_reason
+            .entry(reason.to_owned())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_persistent_worker_request_visible_rejection(&mut self, family: &str) {
+        *self
+            .persistent_worker_request_visible_rejections_by_family
+            .entry(family.to_owned())
+            .or_default() += 1;
     }
 
     pub(crate) fn record_runtime_layout_stats(&mut self, stats: layout_stats::RuntimeLayoutStats) {
@@ -2952,6 +2995,48 @@ impl VmCounters {
         );
         push_string_u64_map_field(
             &mut json,
+            "persistent_worker_ic_hits_by_family",
+            &self.persistent_worker_ic_hits_by_family,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "persistent_worker_ic_misses_by_family",
+            &self.persistent_worker_ic_misses_by_family,
+            true,
+        );
+        push_field(
+            &mut json,
+            "persistent_worker_class_cache_hits",
+            self.persistent_worker_class_cache_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "persistent_worker_default_slot_template_hits",
+            self.persistent_worker_default_slot_template_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "persistent_worker_constructor_hits",
+            self.persistent_worker_constructor_hits,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "persistent_worker_invalidations_by_reason",
+            &self.persistent_worker_invalidations_by_reason,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
+            "persistent_worker_request_visible_rejections_by_family",
+            &self.persistent_worker_request_visible_rejections_by_family,
+            true,
+        );
+        push_string_u64_map_field(
+            &mut json,
             "arena_fallback_allocations_by_reason",
             &self.arena_fallback_allocations_by_reason,
             true,
@@ -3263,6 +3348,12 @@ impl VmCounters {
             &mut json,
             "argument_vector_allocations_avoided",
             self.argument_vector_allocations_avoided,
+            true,
+        );
+        push_field(
+            &mut json,
+            "prepared_arg_vector_allocations_avoided",
+            self.prepared_arg_vector_allocations_avoided,
             true,
         );
         push_string_u64_map_field(
@@ -4093,6 +4184,59 @@ impl VmCounters {
             self.copy_patch_executed,
             true,
         );
+        push_field(
+            &mut json,
+            "native_leaf_cache_positive_hits",
+            self.native_leaf_cache_positive_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "native_leaf_cache_negative_hits",
+            self.native_leaf_cache_negative_hits,
+            true,
+        );
+        push_field(
+            &mut json,
+            "native_leaf_prewarm_attempts",
+            self.native_leaf_prewarm_attempts,
+            true,
+        );
+        push_field(
+            &mut json,
+            "native_leaf_prewarm_compiled",
+            self.native_leaf_prewarm_compiled,
+            true,
+        );
+        push_field(
+            &mut json,
+            "native_leaf_prewarm_rejected",
+            self.native_leaf_prewarm_rejected,
+            true,
+        );
+        push_field(
+            &mut json,
+            "native_leaf_prewarm_code_bytes",
+            self.native_leaf_prewarm_code_bytes,
+            true,
+        );
+        push_field(
+            &mut json,
+            "native_leaf_prewarm_compile_time_nanos",
+            self.native_leaf_prewarm_compile_time_nanos,
+            true,
+        );
+        json.push_str("  \"native_leaf_rejections_by_shape\": {");
+        for (index, (shape, count)) in self.native_leaf_rejections_by_shape.iter().enumerate() {
+            if index > 0 {
+                json.push_str(", ");
+            }
+            json.push('"');
+            json.push_str(&escape_json(shape));
+            json.push_str("\": ");
+            json.push_str(&count.to_string());
+        }
+        json.push_str("},\n");
         push_field(
             &mut json,
             "native_compile_budget_rejections",

@@ -486,6 +486,13 @@ impl JitFunctionHandle {
         self.property_load_metadata.as_ref()
     }
 
+    /// Binds layout-sensitive metadata to the runtime epoch at compilation.
+    pub fn bind_runtime_layout_version(&mut self, layout_version: u64) {
+        if let Some(metadata) = self.property_load_metadata.as_mut() {
+            metadata.layout_version = layout_version;
+        }
+    }
+
     /// Returns true when this handle expects one opaque runtime value and one integer.
     #[must_use]
     pub const fn expects_value_i64(&self) -> bool {

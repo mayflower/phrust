@@ -94,8 +94,20 @@ pub(super) fn object_called_class_handle(object: &ObjectRef) -> Arc<str> {
 /// or shared enum-case singletons, so sharing a cached entry is behavior-neutral.
 #[derive(Clone, Debug, Default)]
 pub(super) struct RuntimeClassEntryCache {
-    pub(super) epoch: u64,
+    pub(super) scope: Option<PersistentClassCacheScope>,
     pub(super) entries: HashMap<String, Rc<RuntimeClassEntry>>,
+}
+
+/// Full worker-cache guard for class metadata. Request-local epoch numbers are
+/// insufficient on their own because they restart for a different entry unit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PersistentClassCacheScope {
+    pub(super) owner_unit_identity: u64,
+    pub(super) include_cache_instance_id: u64,
+    pub(super) class_table_epoch: u64,
+    pub(super) function_table_epoch: u64,
+    pub(super) autoload_stack_epoch: u64,
+    pub(super) include_config_epoch: u64,
 }
 
 /// Cache of resolved raw IR class entries, keyed by normalized class name and
@@ -107,7 +119,7 @@ pub(super) struct RuntimeClassEntryCache {
 /// fatal), and the cache is dropped when the epoch changes.
 #[derive(Clone, Debug, Default)]
 pub(super) struct IrClassEntryCache {
-    pub(super) epoch: u64,
+    pub(super) scope: Option<PersistentClassCacheScope>,
     pub(super) entries: HashMap<String, Rc<php_ir::module::ClassEntry>>,
 }
 
@@ -121,7 +133,7 @@ pub(super) struct IrClassEntryCache {
 /// template is byte-identical to the defaults the slow path builds.
 #[derive(Clone, Debug, Default)]
 pub(super) struct DefaultSlotTemplateCache {
-    pub(super) epoch: u64,
+    pub(super) scope: Option<PersistentClassCacheScope>,
     pub(super) entries: HashMap<String, Rc<Vec<Option<Value>>>>,
 }
 
@@ -139,9 +151,37 @@ pub(super) struct DefaultSlotTemplateCache {
 /// dropped when the epoch changes.
 #[derive(Clone, Debug, Default)]
 pub(super) struct ConstructorResolutionCache {
-    pub(super) epoch: u64,
+    pub(super) scope: Option<PersistentClassCacheScope>,
     pub(super) entries:
         HashMap<(String, Option<String>), Result<Option<ResolvedMethodOwned>, String>>,
+}
+
+pub(super) fn persistent_runtime_class_entry_is_safe(entry: &RuntimeClassEntry) -> bool {
+    fn value_is_metadata_only(value: &Value) -> bool {
+        matches!(
+            value,
+            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Uninitialized
+        )
+    }
+
+    fn attributes_are_safe(attributes: &[RuntimeAttributeEntry]) -> bool {
+        attributes
+            .iter()
+            .all(|attribute| attribute.arguments.iter().all(value_is_metadata_only))
+    }
+
+    entry.properties.iter().all(|property| {
+        value_is_metadata_only(&property.default) && attributes_are_safe(&property.attributes)
+    }) && entry.constants.iter().all(|constant| {
+        value_is_metadata_only(&constant.value) && attributes_are_safe(&constant.attributes)
+    }) && entry.enum_cases.iter().all(|case| {
+        case.value.as_ref().is_none_or(value_is_metadata_only)
+            && attributes_are_safe(&case.attributes)
+    }) && entry
+        .methods
+        .iter()
+        .all(|method| attributes_are_safe(&method.attributes))
+        && attributes_are_safe(&entry.attributes)
 }
 
 pub(super) fn is_reflection_runtime_class(name: &str) -> bool {

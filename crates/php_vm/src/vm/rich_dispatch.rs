@@ -41,7 +41,7 @@ impl Vm {
         // Bare positional values are a dense-executor hand-off; the rich path
         // binds from `call.args` and would silently see a zero-arg call.
         debug_assert!(
-            call.positional_values.is_empty(),
+            call.positional_values.is_none(),
             "pre-bound positional values reached the rich call path"
         );
         let unit = compiled.unit();

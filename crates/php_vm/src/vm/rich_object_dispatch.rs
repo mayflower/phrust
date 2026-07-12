@@ -480,6 +480,7 @@ macro_rules! execute_rich_object_instruction {
                         let spl_runtime_parent =
                             spl_runtime_parent_for_class(compiled, state, &class);
                         let slot_template = $vm.cached_default_slot_template(
+                            &class_owner,
                             state,
                             &runtime_class,
                             &display_class_name,
@@ -1722,6 +1723,7 @@ macro_rules! execute_rich_object_instruction {
                         let spl_runtime_parent =
                             spl_runtime_parent_for_class(compiled, state, &class);
                         let slot_template = $vm.cached_default_slot_template(
+                            &class_owner,
                             state,
                             &runtime_class,
                             display_class_name,

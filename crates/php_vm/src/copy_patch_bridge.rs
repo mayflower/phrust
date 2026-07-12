@@ -9,7 +9,7 @@
 //! interpreter side exit rather than misreading a heap handle as an integer.
 //!
 //! The interpreter's function-entry fork (`try_execute_copy_patch_leaf` in
-//! `crate::vm`) consults `cached_leaf` before dense dispatch, so recognized
+//! `crate::vm`) consults `cached_leaf_with_event` before dense dispatch, so recognized
 //! leaves run natively on their first call under the default engine. The bridge
 //! is additionally exercised by unit tests over a real
 //! [`LocalFile`](crate::frame::LocalFile) so the marshal-in / marshal-out ABI is
@@ -55,12 +55,19 @@ use php_jit::{
 #[cfg(all(unix, target_arch = "aarch64"))]
 use std::cell::RefCell;
 #[cfg(all(unix, target_arch = "aarch64"))]
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(all(unix, target_arch = "aarch64"))]
 use std::rc::Rc;
 
 #[cfg(all(unix, target_arch = "aarch64"))]
 use crate::compiled_unit::CompiledUnit;
+
+#[cfg(all(unix, target_arch = "aarch64"))]
+const ARRAY_FETCH_STATUS_KEY_MISS: i32 = 11;
+#[cfg(all(unix, target_arch = "aarch64"))]
+const ARRAY_FETCH_STATUS_KEY_COERCION: i32 = 12;
+#[cfg(all(unix, target_arch = "aarch64"))]
+const ARRAY_FETCH_STATUS_REFERENCE: i32 = 13;
 
 /// Marshal a VM `Value` into the flat-buffer `JitCValue` the native tier reads.
 ///
@@ -111,32 +118,35 @@ fn marshal_local(value: &Value) -> JitCValue {
         Value::Int(int) => JitCValue::int(*int),
         Value::Bool(boolean) => JitCValue::bool(*boolean),
         Value::Float(float) => JitCValue::float(float.to_f64()),
-        // Read-only borrowed array handle: the payload is a `*const Value` valid
-        // only for the synchronous native call (see the contract above).
-        Value::Array(_) => JitCValue {
-            tag: JitCValueTag::OpaqueArray,
-            reserved: 0,
-            payload: value as *const Value as u64,
-            aux: 0,
-        },
-        // Read-only borrowed string handle, same lifetime contract as the array
-        // handle above; the payload is read only for its byte length.
-        Value::String(_) => JitCValue {
-            tag: JitCValueTag::OpaqueString,
-            reserved: 0,
-            payload: value as *const Value as u64,
-            aux: 0,
-        },
-        // Read-only borrowed object handle, same lifetime contract; the payload
-        // is read only through the monomorphic property-load helper, which guards
-        // the object's layout and reads one declared property slot.
-        Value::Object(_) => JitCValue {
-            tag: JitCValueTag::OpaqueObject,
+        Value::String(_)
+        | Value::Array(_)
+        | Value::Object(_)
+        | Value::Resource(_)
+        | Value::Reference(_)
+        | Value::Callable(_)
+        | Value::Generator(_)
+        | Value::Fiber(_) => JitCValue {
+            tag: opaque_value_tag(value).expect("matched opaque value"),
             reserved: 0,
             payload: value as *const Value as u64,
             aux: 0,
         },
         _ => JitCValue::uninitialized(),
+    }
+}
+
+#[cfg(all(unix, target_arch = "aarch64"))]
+fn opaque_value_tag(value: &Value) -> Option<JitCValueTag> {
+    match value {
+        Value::String(_) => Some(JitCValueTag::OpaqueString),
+        Value::Array(_) => Some(JitCValueTag::OpaqueArray),
+        Value::Object(_) => Some(JitCValueTag::OpaqueObject),
+        Value::Resource(_) => Some(JitCValueTag::OpaqueResource),
+        Value::Reference(_) => Some(JitCValueTag::OpaqueReference),
+        Value::Callable(_) => Some(JitCValueTag::OpaqueCallable),
+        Value::Generator(_) => Some(JitCValueTag::OpaqueGenerator),
+        Value::Fiber(_) => Some(JitCValueTag::OpaqueFiber),
+        _ => None,
     }
 }
 
@@ -311,43 +321,51 @@ extern "C" fn copy_patch_property_load_abi(
     JIT_HELPER_STATUS_OK
 }
 
-/// C-ABI wrapper the packed-array-fetch stencil `blr`s: read element `index`
-/// of the borrowed packed-int array `Value` at `value_ptr` and write it
-/// through `out`. Delegates to `php_runtime::experimental::php_jit_array_fetch_int_slow`,
-/// the same safe facade the Cranelift tier's packed fetch uses, so both
-/// native tiers share one bounds/layout-guarded element read.
-///
-/// Read-only and non-re-entrant: it reads one packed element and never
-/// mutates, frees, or re-enters the VM. It returns a non-OK status (so the
-/// stencil side-exits to the interpreter) for a null pointer, a negative or
-/// out-of-bounds index (PHP emits the undefined-key warning and yields
-/// `null` — exactly the interpreter's job), a non-packed or non-int-element
-/// array, or a non-array value.
-///
-/// SAFETY: `value_ptr` is the `payload` of an `OpaqueArray` slot the bridge
-/// marshaled as `&Value as *const Value` into the live params/backing buffer,
-/// so it is a valid `Value` pointer for this synchronous call (see
-/// `marshal_local`). `out` is the stencil's stack out-slot, non-null and valid
-/// for the call.
+/// Exact integer/string-key array lookup returning a complete ABI value.
+/// Missing keys, coercion-sensitive keys, and references side-exit before any
+/// warning or other PHP-visible effect. Heap results remain borrowed from the
+/// live parameter array only for this synchronous invocation.
 #[cfg(all(unix, target_arch = "aarch64"))]
-extern "C" fn copy_patch_array_fetch_abi(value_ptr: usize, index: i64, out: *mut i64) -> i32 {
-    if value_ptr == 0 || out.is_null() {
+extern "C" fn copy_patch_array_fetch_abi(
+    value_ptr: usize,
+    slot_base: *const JitCValue,
+    key_slot: u32,
+    out: *mut JitCValue,
+) -> i32 {
+    if value_ptr == 0 || slot_base.is_null() || out.is_null() {
         return JIT_HELPER_STATUS_FALLBACK;
     }
-    let Ok(index) = usize::try_from(index) else {
+    // SAFETY: the emitted stencil passes a live parameter pointer and slot buffer.
+    let value = unsafe { &*(value_ptr as *const Value) };
+    let key = unsafe { &*slot_base.add(key_slot as usize) };
+    let Value::Array(array) = value else {
         return JIT_HELPER_STATUS_FALLBACK;
     };
-    // SAFETY: a live, borrowed `Value` valid for this call (see the doc above).
-    let value = unsafe { &*(value_ptr as *const Value) };
-    let mut element = 0_i64;
-    if php_runtime::experimental::php_jit_array_fetch_int_slow(value, index, &mut element)
-        != php_runtime::experimental::PHP_JIT_ARRAY_STATUS_OK
-    {
+    let key = match key.tag {
+        JitCValueTag::Int => php_runtime::api::ArrayKey::Int(key.payload as i64),
+        JitCValueTag::OpaqueString if key.payload != 0 && key.aux == 0 => {
+            // SAFETY: borrowed string pointer produced by `marshal_local`.
+            let key_value = unsafe { &*(key.payload as *const Value) };
+            let Value::String(string) = key_value else {
+                return JIT_HELPER_STATUS_FALLBACK;
+            };
+            php_runtime::api::ArrayKey::String(string.clone())
+        }
+        _ => return ARRAY_FETCH_STATUS_KEY_COERCION,
+    };
+    let Some(element) = array.get(&key) else {
+        return ARRAY_FETCH_STATUS_KEY_MISS;
+    };
+    if matches!(element, Value::Reference(_)) {
+        return ARRAY_FETCH_STATUS_REFERENCE;
+    }
+    let marshaled = marshal_local(element);
+    if marshaled.tag == JitCValueTag::Uninitialized {
         return JIT_HELPER_STATUS_FALLBACK;
     }
-    // SAFETY: `out` is non-null and valid for this synchronous call (checked).
+    // SAFETY: `out` is a valid stack-owned `JitCValue`.
     unsafe {
-        *out = element;
+        *out = marshaled;
     }
     JIT_HELPER_STATUS_OK
 }
@@ -410,7 +428,14 @@ extern "C" fn copy_patch_property_store_abi(
         JitCValueTag::FloatBits => Value::Float(php_runtime::api::FloatValue::from_f64(
             f64::from_bits(marshaled.payload),
         )),
-        JitCValueTag::OpaqueString | JitCValueTag::OpaqueArray | JitCValueTag::OpaqueObject => {
+        JitCValueTag::OpaqueString
+        | JitCValueTag::OpaqueArray
+        | JitCValueTag::OpaqueObject
+        | JitCValueTag::OpaqueResource
+        | JitCValueTag::OpaqueReference
+        | JitCValueTag::OpaqueCallable
+        | JitCValueTag::OpaqueGenerator
+        | JitCValueTag::OpaqueFiber => {
             if marshaled.payload == 0 || marshaled.aux != 0 {
                 return JIT_HELPER_STATUS_FALLBACK;
             }
@@ -462,13 +487,7 @@ fn unmarshal_result(value: &JitCValue) -> Option<Value> {
             } else {
                 return None;
             };
-            matches!(
-                (value.tag, &result),
-                (JitCValueTag::OpaqueString, Value::String(_))
-                    | (JitCValueTag::OpaqueArray, Value::Array(_))
-                    | (JitCValueTag::OpaqueObject, Value::Object(_))
-            )
-            .then_some(result)
+            (opaque_value_tag(&result) == Some(value.tag)).then_some(result)
         }
         _ => None,
     }
@@ -1137,7 +1156,7 @@ fn property_storage_name(class: &ClassEntry, property: &ClassPropertyEntry) -> S
 /// A recognized + compiled scalar-int leaf function, ready to invoke natively.
 ///
 /// Holds the finalized executable mapping so a function is recognized and lowered
-/// once, then reused across calls (the `cached_leaf` cache owns these).
+/// once, then reused across calls (the native leaf cache owns these).
 #[cfg(all(unix, target_arch = "aarch64"))]
 pub struct NativeLeaf {
     code: php_jit::code_memory::CodeMemory,
@@ -1200,6 +1219,7 @@ pub struct ResumePlan {
 #[cfg(all(unix, target_arch = "aarch64"))]
 pub struct ResumeSession {
     buffer: Vec<JitCValue>,
+    result_owners: Vec<Option<Box<Value>>>,
 }
 
 /// One step of driving a return-and-resume leaf.
@@ -1229,7 +1249,7 @@ pub enum LeafOutcome {
         args: Vec<Value>,
     },
     /// A guard/overflow side exit or an unrepresentable value: interpret instead.
-    Fallback,
+    Fallback { reason: Option<&'static str> },
 }
 
 #[cfg(all(unix, target_arch = "aarch64"))]
@@ -1268,7 +1288,7 @@ impl NativeLeaf {
         // disjoint from every scalar-int/float/builtin subset, so it never
         // steals another leaf, and on any mismatch it falls through to the
         // existing recognizers unchanged. `region_id` is the function's ID in
-        // the unit (see `cached_leaf`), which method recognition uses to
+        // the unit (see `cached_leaf_with_event`), which method recognition uses to
         // resolve the declaring class.
         if let Some(leaf) = recognize_property_load_leaf(unit, function, region_id) {
             // Box the metadata so its address is stable across the move into
@@ -1463,7 +1483,9 @@ impl NativeLeaf {
                 .and_then(unmarshal_result)
             {
                 Some(value) => LeafOutcome::Value(value),
-                None => LeafOutcome::Fallback,
+                None => LeafOutcome::Fallback {
+                    reason: Some("resume_value_tag_unsupported"),
+                },
             };
         }
         if status == JIT_HELPER_STATUS_TAILCALL
@@ -1472,7 +1494,9 @@ impl NativeLeaf {
             let mut args = Vec::with_capacity(plan.arg_slots.len());
             for &slot in &plan.arg_slots {
                 let Some(value) = buffer.get(slot as usize).and_then(unmarshal_result) else {
-                    return LeafOutcome::Fallback;
+                    return LeafOutcome::Fallback {
+                        reason: Some("resume_value_tag_unsupported"),
+                    };
                 };
                 args.push(value);
             }
@@ -1481,7 +1505,13 @@ impl NativeLeaf {
                 args,
             };
         }
-        LeafOutcome::Fallback
+        let reason = match status {
+            ARRAY_FETCH_STATUS_KEY_MISS => Some("array_key_miss_requires_warning"),
+            ARRAY_FETCH_STATUS_KEY_COERCION => Some("array_key_coercion"),
+            ARRAY_FETCH_STATUS_REFERENCE => Some("array_reference_value"),
+            _ => None,
+        };
+        LeafOutcome::Fallback { reason }
     }
 
     /// The return-and-resume plan, when this leaf is a call-composition region.
@@ -1550,33 +1580,31 @@ impl NativeLeaf {
             .collect();
         let status = self.run_at(0, &mut buffer);
         let step = self.resume_step(status, &buffer);
-        Some((ResumeSession { buffer }, step))
+        let result_owners = (0..self.resume.as_ref()?.sites.len())
+            .map(|_| None)
+            .collect();
+        Some((
+            ResumeSession {
+                buffer,
+                result_owners,
+            },
+            step,
+        ))
     }
 
-    /// Read call site `site`'s marshaled `Int` arguments out of the session.
-    /// `None` on a non-`Int` slot — impossible by construction (the region
-    /// guards or proves every argument source), so the driver treats it as an
-    /// invariant violation, never a fallback.
+    /// Read one site's complete ABI values out of the persistent slot buffer.
     #[must_use]
     pub fn resume_args(&self, session: &ResumeSession, site: usize) -> Option<Vec<Value>> {
         let plan = self.resume.as_ref()?;
         let slots = &plan.sites.get(site)?.arg_slots;
         let mut args = Vec::with_capacity(slots.len());
         for &slot in slots {
-            match session.buffer.get(slot as usize) {
-                Some(value) if value.tag == JitCValueTag::Int => {
-                    args.push(Value::Int(value.payload as i64));
-                }
-                _ => return None,
-            }
+            args.push(unmarshal_result(session.buffer.get(slot as usize)?)?);
         }
         Some(args)
     }
 
-    /// Write call site `site`'s result into its slot and re-enter the region at
-    /// the site's resume offset. `result` must be `Value::Int` (the callee's
-    /// declared `: int` return guarantees it; the driver validated it) —
-    /// anything else returns `Fallback` without re-entering.
+    /// Write a complete call result into its slot and re-enter the region.
     #[must_use]
     pub fn resume(&self, session: &mut ResumeSession, site: usize, result: &Value) -> ResumeStep {
         let Some(plan) = self.resume.as_ref() else {
@@ -1585,13 +1613,23 @@ impl NativeLeaf {
         let Some(site_plan) = plan.sites.get(site) else {
             return ResumeStep::Fallback;
         };
-        let Value::Int(int) = result else {
-            return ResumeStep::Fallback;
-        };
         let Some(slot) = session.buffer.get_mut(site_plan.result_slot as usize) else {
             return ResumeStep::Fallback;
         };
-        *slot = JitCValue::int(*int);
+        *slot = match result {
+            Value::Null => JitCValue::null(),
+            Value::Bool(value) => JitCValue::bool(*value),
+            Value::Int(value) => JitCValue::int(*value),
+            Value::Float(value) => JitCValue::float(value.to_f64()),
+            Value::Uninitialized => return ResumeStep::Fallback,
+            _ => {
+                let Some(owner) = session.result_owners.get_mut(site) else {
+                    return ResumeStep::Fallback;
+                };
+                *owner = Some(Box::new(result.clone()));
+                marshal_local(owner.as_deref().expect("resume result owner"))
+            }
+        };
         let status = self.run_at(site_plan.resume_offset, &mut session.buffer);
         self.resume_step(status, &session.buffer)
     }
@@ -1600,8 +1638,9 @@ impl NativeLeaf {
 /// Resolve `name` (as written at a call site) as a valid return-and-resume
 /// callee of arity `arity`: a same-unit plain userland function — not a
 /// method/closure/generator, no by-ref return or by-ref/variadic parameters —
-/// whose declared `: int` return type proves the call-result slot's tag
-/// without a runtime guard, and whose parameter list accepts `arity`
+/// whose return type can cross the complete Value ABI without return-site
+/// coercion after the normal callee has returned, and whose parameters accept
+/// `arity`
 /// positional arguments. Same-unit resolution is stable for the whole request:
 /// a unit function's name can never be legally redeclared, so a later dynamic
 /// unit cannot shadow it.
@@ -1616,7 +1655,21 @@ fn resume_callee_target(unit: &CompiledUnit, name: &str, arity: usize) -> Option
     if function.returns_by_ref || !function.captures.is_empty() {
         return None;
     }
-    if function.return_type != Some(IrReturnType::Int) {
+    if !matches!(
+        function.return_type,
+        None | Some(
+            IrReturnType::Mixed
+                | IrReturnType::Null
+                | IrReturnType::Void
+                | IrReturnType::Bool
+                | IrReturnType::Int
+                | IrReturnType::Float
+                | IrReturnType::String
+                | IrReturnType::Array
+                | IrReturnType::Object
+                | IrReturnType::Class { .. }
+        )
+    ) {
         return None;
     }
     if function
@@ -1637,59 +1690,179 @@ fn resume_callee_target(unit: &CompiledUnit, name: &str, arity: usize) -> Option
     Some(function_id)
 }
 
-/// `(compiled-unit cache identity, function id)` → compiled leaf, or `None` for a function proven
-/// outside the subset (so it is not re-recognized on every call).
+/// Cached positive and negative native-leaf recognition outcomes.
 #[cfg(all(unix, target_arch = "aarch64"))]
-type LeafCache = HashMap<(u64, u32), Option<Rc<NativeLeaf>>>;
+enum LeafCacheEntry {
+    Compiled(Rc<NativeLeaf>),
+    Rejected { shape: String },
+}
+
+#[cfg(all(unix, target_arch = "aarch64"))]
+type LeafCache = HashMap<(u64, u32), LeafCacheEntry>;
+
+#[cfg(all(unix, target_arch = "aarch64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeLeafCacheEvent {
+    PositiveHit,
+    NegativeHit {
+        shape: String,
+    },
+    Compiled {
+        compile_time_nanos: u64,
+        code_bytes: u64,
+    },
+    Rejected {
+        compile_time_nanos: u64,
+        shape: String,
+    },
+}
+
+#[cfg(all(unix, target_arch = "aarch64"))]
+pub struct NativeLeafCacheLookup {
+    pub leaf: Option<Rc<NativeLeaf>>,
+    pub event: NativeLeafCacheEvent,
+}
+
+#[cfg(all(unix, target_arch = "aarch64"))]
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct NativeLeafPrewarmStats {
+    pub attempts: u64,
+    pub compiled: u64,
+    pub rejected: u64,
+    pub code_bytes: u64,
+    pub compile_time_nanos: u64,
+    pub rejections_by_shape: BTreeMap<String, u64>,
+}
 
 #[cfg(all(unix, target_arch = "aarch64"))]
 thread_local! {
     /// Native code depends only on the function's immutable IR, so no epoch
     /// invalidation is needed within a process.
     static LEAF_CACHE: RefCell<LeafCache> = RefCell::new(HashMap::new());
+    static PREWARMED_UNITS: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
 }
 
-/// Look up — or recognize, compile, and cache — the native leaf for a function.
-///
-/// `unit` supplies the sibling functions the pre-inline pass may splice in; the
-/// cache key stays `(compiled-unit identity, function id)`. Compilation (including the inline
-/// pass) never re-enters this cache, so holding the borrow across it is safe.
+/// Look up or compile a leaf, returning metadata to attribute cache and compile costs.
+/// The cache key is `(compiled-unit identity, function id)`, so recompilation
+/// cannot inherit code from an older immutable unit.
 #[cfg(all(unix, target_arch = "aarch64"))]
-pub fn cached_leaf(
+pub fn cached_leaf_with_event(
     unit: &CompiledUnit,
     function_id: u32,
     function: &IrFunction,
     constants: &[IrConstant],
-) -> Option<Rc<NativeLeaf>> {
+) -> NativeLeafCacheLookup {
     // `IrUnit::id` is not globally unique (separate compilations commonly use
     // the same source-local id). The VM cache identity is process-unique, so a
     // recompiled script cannot inherit native code recognized for unrelated IR.
     let unit_id = unit.cache_identity();
     LEAF_CACHE.with(|cache| {
-        cache
-            .borrow_mut()
-            .entry((unit_id, function_id))
-            .or_insert_with(|| {
-                let leaf = NativeLeaf::compile(unit, function, constants, function_id).map(Rc::new);
-                if std::env::var_os("PHRUST_JIT_COPY_PATCH_DEBUG").is_some() {
-                    if leaf.is_some() {
-                        eprintln!(
-                            "[copy-patch] fn={} (id={}) recognized=true",
-                            function.name, function_id,
-                        );
-                    } else {
-                        eprintln!(
-                            "[copy-patch] fn={} (id={}) recognized=false shape={}",
-                            function.name,
-                            function_id,
-                            rejection_shape(function),
-                        );
-                    }
-                }
-                leaf
-            })
-            .clone()
+        let mut cache = cache.borrow_mut();
+        if let Some(entry) = cache.get(&(unit_id, function_id)) {
+            return match entry {
+                LeafCacheEntry::Compiled(leaf) => NativeLeafCacheLookup {
+                    leaf: Some(leaf.clone()),
+                    event: NativeLeafCacheEvent::PositiveHit,
+                },
+                LeafCacheEntry::Rejected { shape } => NativeLeafCacheLookup {
+                    leaf: None,
+                    event: NativeLeafCacheEvent::NegativeHit {
+                        shape: shape.clone(),
+                    },
+                },
+            };
+        }
+
+        let started = std::time::Instant::now();
+        let leaf = NativeLeaf::compile(unit, function, constants, function_id).map(Rc::new);
+        let compile_time_nanos = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let (entry, event) = if let Some(leaf) = leaf {
+            let code_bytes = leaf.code.len() as u64;
+            (
+                LeafCacheEntry::Compiled(leaf.clone()),
+                NativeLeafCacheEvent::Compiled {
+                    compile_time_nanos,
+                    code_bytes,
+                },
+            )
+        } else {
+            let shape = rejection_shape(function);
+            (
+                LeafCacheEntry::Rejected {
+                    shape: shape.clone(),
+                },
+                NativeLeafCacheEvent::Rejected {
+                    compile_time_nanos,
+                    shape,
+                },
+            )
+        };
+        if std::env::var_os("PHRUST_JIT_COPY_PATCH_DEBUG").is_some() {
+            match &entry {
+                LeafCacheEntry::Compiled(_) => eprintln!(
+                    "[copy-patch] fn={} (id={}) recognized=true",
+                    function.name, function_id,
+                ),
+                LeafCacheEntry::Rejected { shape } => eprintln!(
+                    "[copy-patch] fn={} (id={}) recognized=false shape={}",
+                    function.name, function_id, shape,
+                ),
+            }
+        }
+        let result = match &entry {
+            LeafCacheEntry::Compiled(leaf) => Some(leaf.clone()),
+            LeafCacheEntry::Rejected { .. } => None,
+        };
+        cache.insert((unit_id, function_id), entry);
+        NativeLeafCacheLookup {
+            leaf: result,
+            event,
+        }
     })
+}
+
+/// Compile a bounded set of leaves once per immutable unit on the worker thread.
+#[cfg(all(unix, target_arch = "aarch64"))]
+pub fn prewarm_copy_patch_leaves(
+    unit: &CompiledUnit,
+    max_functions: usize,
+    max_duration: std::time::Duration,
+) -> NativeLeafPrewarmStats {
+    let unit_id = unit.cache_identity();
+    if !PREWARMED_UNITS.with(|units| units.borrow_mut().insert(unit_id)) {
+        return NativeLeafPrewarmStats::default();
+    }
+
+    let started = std::time::Instant::now();
+    let mut stats = NativeLeafPrewarmStats::default();
+    for (function_id, function) in unit.unit().functions.iter().enumerate() {
+        if stats.attempts as usize >= max_functions || started.elapsed() >= max_duration {
+            break;
+        }
+        stats.attempts += 1;
+        let lookup =
+            cached_leaf_with_event(unit, function_id as u32, function, &unit.unit().constants);
+        match lookup.event {
+            NativeLeafCacheEvent::Compiled {
+                compile_time_nanos,
+                code_bytes,
+            } => {
+                stats.compiled += 1;
+                stats.compile_time_nanos += compile_time_nanos;
+                stats.code_bytes += code_bytes;
+            }
+            NativeLeafCacheEvent::Rejected {
+                compile_time_nanos,
+                shape,
+            } => {
+                stats.rejected += 1;
+                stats.compile_time_nanos += compile_time_nanos;
+                *stats.rejections_by_shape.entry(shape).or_default() += 1;
+            }
+            NativeLeafCacheEvent::PositiveHit | NativeLeafCacheEvent::NegativeHit { .. } => {}
+        }
+    }
+    stats
 }
 
 /// Recursion budget for the transitive inline pass. Bounds mutually-recursive

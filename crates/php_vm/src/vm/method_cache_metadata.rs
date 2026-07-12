@@ -210,6 +210,66 @@ pub(super) fn method_direct_call_target_is_eligible(
         && guard.by_ref_compatible
 }
 
+pub(super) struct DenseMethodDirectCallEligibility<'a> {
+    pub(super) compiled: &'a CompiledUnit,
+    pub(super) state: &'a ExecutionState,
+    pub(super) target: &'a MethodCallCacheTarget,
+    pub(super) class: &'a php_ir::module::ClassEntry,
+    pub(super) values: &'a [CallArgument],
+    pub(super) has_magic_call: bool,
+    pub(super) epoch: InvalidationEpoch,
+}
+
+pub(super) fn dense_method_direct_call_target_is_eligible(
+    eligibility: DenseMethodDirectCallEligibility<'_>,
+) -> bool {
+    let DenseMethodDirectCallEligibility {
+        compiled,
+        state,
+        target,
+        class,
+        values,
+        has_magic_call,
+        epoch,
+    } = eligibility;
+    let resolved = target.resolved_target();
+    let guard = &resolved.guard;
+    if target.receiver_class_id() != class.id
+        || guard.class_layout_epoch != epoch.raw()
+        || guard.method_table_epoch != epoch.raw()
+        || guard.has_magic_call != has_magic_call
+        || guard.argument_shape != method_call_shape(values)
+        || values.iter().any(|arg| arg.name.is_some())
+        || !guard.by_ref_compatible
+    {
+        return false;
+    }
+    let Some(owner) = method_call_cache_target_owner(compiled, state, target) else {
+        return false;
+    };
+    let Some(declaring_class) = owner.lookup_class(&resolved.declaring_class) else {
+        return false;
+    };
+    let Some(method_entry) = declaring_class
+        .methods
+        .iter()
+        .find(|method| method.function == resolved.function)
+    else {
+        return false;
+    };
+    guard.method_slot_index
+        == declaring_class
+            .methods
+            .iter()
+            .position(|entry| {
+                entry.name == method_entry.name && entry.function == method_entry.function
+            })
+            .and_then(|index| index.try_into().ok())
+        && guard.method_is_final == method_entry.flags.is_final
+        && guard.method_is_private == method_entry.flags.is_private
+        && guard.method_is_static == method_entry.flags.is_static
+}
+
 pub(super) fn method_callee_shape_is_jit_eligible(
     owner: &CompiledUnit,
     function: FunctionId,

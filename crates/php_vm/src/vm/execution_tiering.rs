@@ -11,6 +11,98 @@ pub(super) struct JitLeafRequest<'a> {
 }
 
 impl Vm {
+    #[cfg(feature = "jit-cranelift")]
+    pub(super) fn try_execute_dense_jit_leaf(
+        &self,
+        compiled: &CompiledUnit,
+        state: &ExecutionState,
+        function_id: FunctionId,
+        function: &IrFunction,
+        call: &FunctionCall<'_>,
+    ) -> Option<Value> {
+        let tier = self.tiering.borrow_mut().record_function_entry(
+            compiled_unit_cache_key(compiled),
+            function_id,
+            self.options.quickening,
+            self.options.jit,
+        );
+        self.record_counter_jit_tiering_decision(tier);
+
+        // The dense direct-call lane has already proved exact arity and plain
+        // positional binding. Keep the JIT adapter stack-inline and leave all
+        // richer shapes to the normal binder/interpreter path.
+        if call.arg_count() != function.params.len() || call.arg_count() > 8 {
+            return None;
+        }
+        let call_shape_supported = call.captures.is_empty()
+            && call.args.iter().all(|arg| {
+                arg.name.is_none()
+                    && arg.by_ref_dim.is_none()
+                    && arg.by_ref_property.is_none()
+                    && arg.by_ref_property_dim.is_none()
+            })
+            && call.this_value.is_none()
+            && call.scope_class.is_none()
+            && call.called_class.is_none()
+            && call.declaring_class.is_none()
+            && call.shared_top_level_locals.is_none()
+            && call.running_generator.is_none()
+            && call.running_fiber.is_none();
+        let mut args = smallvec::SmallVec::<[PreparedArg; 8]>::new();
+        if let Some(positional) = call.positional_values.as_ref() {
+            args.extend(positional.iter().cloned().map(|value| PreparedArg {
+                value,
+                reference: None,
+                trace_holds_reference: false,
+            }));
+        } else {
+            args.extend(call.args.iter().map(|arg| PreparedArg {
+                value: match &arg.value {
+                    Value::Reference(cell) => cell.get(),
+                    value => value.clone(),
+                },
+                reference: None,
+                trace_holds_reference: false,
+            }));
+        }
+
+        // Rich dispatch invokes Cranelift only after prepare_arguments. Apply
+        // the same scalar coercion/type checks here before native execution so
+        // weak typing and strict_types cannot diverge on the dense lane.
+        let strict_types = call
+            .argument_binding_policy(compiled)
+            .call_site_strict_types;
+        for (arg_index, (arg, param)) in args.iter_mut().zip(&function.params).enumerate() {
+            if coerce_or_check_param_type(
+                ParamTypecheckRequest {
+                    compiled,
+                    state,
+                    function,
+                    param,
+                    arg_index,
+                    fast_path: self.typecheck_fast_path_context(),
+                    strict_types,
+                    call_span: call.call_span,
+                },
+                &mut arg.value,
+            )
+            .is_err()
+            {
+                return None;
+            }
+        }
+
+        self.try_execute_jit_leaf(JitLeafRequest {
+            compiled,
+            state,
+            function_id,
+            function,
+            tier,
+            call_shape_supported,
+            args: &args,
+        })
+    }
+
     #[cfg(feature = "jit-copy-patch")]
     pub(super) fn try_execute_profiled_copy_patch_leaf(
         &self,
@@ -115,12 +207,23 @@ impl Vm {
         if call.args.iter().any(|arg| arg.name.is_some()) {
             return None;
         }
-        let leaf = crate::copy_patch_bridge::cached_leaf(
+        let lookup = crate::copy_patch_bridge::cached_leaf_with_event(
             compiled,
             function_id.raw(),
             function,
             &compiled.unit().constants,
-        )?;
+        );
+        match &lookup.event {
+            crate::copy_patch_bridge::NativeLeafCacheEvent::PositiveHit => {
+                self.record_counter_native_leaf_cache_lookup(true);
+            }
+            crate::copy_patch_bridge::NativeLeafCacheEvent::NegativeHit { .. } => {
+                self.record_counter_native_leaf_cache_lookup(false);
+            }
+            crate::copy_patch_bridge::NativeLeafCacheEvent::Compiled { .. }
+            | crate::copy_patch_bridge::NativeLeafCacheEvent::Rejected { .. } => {}
+        }
+        let leaf = lookup.leaf?;
         // Buffer slot `i` is marshaled from `params[i]`; a method's `$this`
         // occupies local 0 in method IR, so the receiver leads and the
         // declared parameters follow at their local indices.
@@ -129,10 +232,10 @@ impl Vm {
         if let Some(this) = call.this_value.as_ref() {
             params.push(Value::Object(this.clone()));
         }
-        if call.positional_values.is_empty() {
-            params.extend(call.args.iter().map(|arg| arg.value.clone()));
+        if let Some(positional_values) = call.positional_values.as_ref() {
+            params.extend(positional_values.iter().cloned());
         } else {
-            params.extend(call.positional_values.iter().cloned());
+            params.extend(call.args.iter().map(|arg| arg.value.clone()));
         }
         // The native hook runs before the interpreter's normal binding loop.
         // Apply the identical parameter coercion/type check here so a native
@@ -187,8 +290,10 @@ impl Vm {
             self.request_profile_operation_start(RequestProfileOperationCategory::Object, family)
         });
         let outcome = leaf.run_outcome(&params);
-        if matches!(&outcome, crate::copy_patch_bridge::LeafOutcome::Fallback)
-            && let Some(operation_profile) = operation_profile.as_mut()
+        if matches!(
+            &outcome,
+            crate::copy_patch_bridge::LeafOutcome::Fallback { .. }
+        ) && let Some(operation_profile) = operation_profile.as_mut()
         {
             operation_profile.cancel();
         }
@@ -210,7 +315,12 @@ impl Vm {
                 // interpreter path without duplicating observable effects.
                 Err(_) => None,
             },
-            crate::copy_patch_bridge::LeafOutcome::Fallback => None,
+            crate::copy_patch_bridge::LeafOutcome::Fallback { reason } => {
+                if let Some(reason) = reason {
+                    self.record_counter_copy_patch_side_exit(reason);
+                }
+                None
+            }
             // The native prefix computed the arguments and requested the userland
             // call. The bridge never re-enters the VM; the call runs here, on the
             // identical normal path, so behavior matches the interpreter exactly.
@@ -508,7 +618,7 @@ impl Vm {
                                 self,
                                 output,
                                 stack,
-                                "non-int marshaled argument slot",
+                                "unsupported marshaled argument slot",
                             );
                             stack.pop_recycle();
                             return Some(result);
@@ -564,16 +674,6 @@ impl Vm {
                         return Some(result);
                     }
                     let value = result.return_value.unwrap_or(Value::Null);
-                    if !matches!(value, Value::Int(_)) {
-                        let result = resume_invariant(
-                            self,
-                            output,
-                            stack,
-                            "resume callee returned a non-int despite a declared int return",
-                        );
-                        stack.pop_recycle();
-                        return Some(result);
-                    }
                     step = leaf.resume(&mut session, site, &value);
                 }
                 ResumeStep::Value(value) => {
@@ -1089,11 +1189,12 @@ impl Vm {
         );
         match compile_result {
             Ok(result) if result.status == php_jit::JitCompileStatus::Compiled => {
-                let Some(handle) = result.handle else {
+                let Some(mut handle) = result.handle else {
                     self.record_jit_compile_failure_for_key(key);
                     self.record_counter_jit_bailout();
                     return None;
                 };
+                handle.bind_runtime_layout_version(runtime_layout_epoch);
                 let descriptor = JitCompileDescriptor {
                     function_id: function_id.raw(),
                     function_name: function.name.clone(),
@@ -1347,6 +1448,13 @@ impl Vm {
                 call.expect("call should be available before execution starts"),
             );
         };
+        let entry_tier = self.tiering.borrow_mut().record_function_entry(
+            compiled_unit_cache_key(compiled),
+            function_id,
+            self.options.quickening,
+            self.options.jit,
+        );
+        self.record_counter_jit_tiering_decision(entry_tier);
         let plan = match self.get_or_build_dense_execution_plan(compiled) {
             Ok(plan) => plan,
             Err(message) => {
@@ -1460,6 +1568,14 @@ impl Vm {
                     );
                     return CachedDenseFunctionDispatch::Continue(call);
                 };
+                #[cfg(feature = "jit-cranelift")]
+                if let Some(value) =
+                    self.try_execute_dense_jit_leaf(compiled, state, function_id, function, &call)
+                {
+                    return CachedDenseFunctionDispatch::Executed(Box::new(
+                        VmResult::success_no_output(Some(value)),
+                    ));
+                }
                 CachedDenseFunctionDispatch::Executed(Box::new(self.execute_bytecode_function(
                     DenseExecutionRequest {
                         compiled,

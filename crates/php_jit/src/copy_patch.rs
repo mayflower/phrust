@@ -338,19 +338,10 @@ pub enum ScalarIntOp {
         metadata_ptr: u64,
         helper: u64,
     },
-    /// Guarded native packed-array element read: `slot[dst] =
-    /// <array at slot[array]>[slot[index]]`. Guards `slot[array]` is an
-    /// `OpaqueArray` and `slot[index]` is an `Int`, then `blr`s the
-    /// array-fetch ABI wrapper at `fetch_helper` over the C ABI (fp/lr saved;
-    /// a 16-byte scratch frame holding the out value and the saved slot
-    /// base). The array slot's payload is a borrowed `*const Value` the VM
-    /// marshaled for the call's duration; the helper performs a *read-only*
-    /// packed-int-layout fetch (`php_jit_array_fetch_int_slow`) with no
-    /// mutation, free, or VM re-entry. Any non-OK status — negative or
-    /// out-of-bounds index (PHP warns and yields `null`), a non-packed or
-    /// non-int-element array — side-exits so the interpreter reproduces the
-    /// exact value/diagnostic.
-    CallArrayFetchI64 {
+    /// Guarded native array read returning a complete `JitCValue`. The VM
+    /// helper accepts exact integer and string keys, and side-exits before
+    /// missing-key warnings, key coercion, references, or mutation.
+    CallArrayFetchValue {
         dst: u32,
         array: u32,
         index: u32,
@@ -439,13 +430,8 @@ pub struct CopyPatchRuntimeHelpers {
     /// status for any non-string value. `0` = unavailable → `strlen` is not
     /// lowered. Same ABI shape as `array_len`.
     pub strlen: u64,
-    /// Address of an `extern "C" fn(value_ptr: usize, index: i64, out: *mut
-    /// i64) -> i32` wrapping `php_jit_array_fetch_int_slow`: it reads element
-    /// `index` of the borrowed packed-int array `Value` at `value_ptr` and
-    /// writes it through `out`, returning a non-OK status for a negative or
-    /// out-of-bounds index (PHP emits the undefined-key warning and yields
-    /// `null` — interpreter territory), a non-packed/non-int-element array, or
-    /// a non-array value. `0` = unavailable → `$a[$i]` is not lowered.
+    /// Address of the VM's exact integer/string-key full-Value lookup helper.
+    /// Missing keys and coercion-sensitive cases return non-OK before effects.
     pub array_fetch: u64,
 }
 
@@ -728,38 +714,41 @@ fn emit_array_fetch(
     index: u32,
     helper: u64,
 ) {
-    // 1–2: guards + payloads while X0 is the slot base.
+    // Guard the array and retain both its borrowed payload and the slot base.
     emit_array_guard(asm, deopt, array);
-    emit_int_guard(asm, deopt, index);
     asm.ldr_x(X4, X0, payload_off(array));
-    asm.ldr_x(X5, X0, payload_off(index));
-    // 3: non-leaf frame + 16-byte scratch ([sp+0]=out, [sp+8]=slot base).
+    asm.mov(X5, X0);
+    // A full JitCValue occupies 24 bytes; keep the saved base at +24.
     asm.push_fp_lr();
-    asm.sub_imm(SP, SP, 16);
-    asm.str_x(X0, SP, 8);
-    // 4: C-ABI args — x0 = value_ptr, x1 = index, x2 = &out.
+    asm.sub_imm(SP, SP, 32);
+    asm.str_x(X0, SP, 24);
+    // x0=value_ptr, x1=slot base, w2=key slot, x3=&out.
     asm.mov(X0, X4);
     asm.mov(X1, X5);
-    asm.add_imm(X2, SP, 0);
-    // 5: call helper(value_ptr, index, &out) -> status in w0.
+    asm.movz(X2, index as u16);
+    asm.add_imm(X3, SP, 0);
     asm.mov_imm64(X9, helper);
     asm.blr(X9);
-    // 6: on a non-OK status, tear the frame down and take the shared side exit.
     let call_deopt = asm.new_label();
     let done = asm.new_label();
     asm.cmp_imm_w(X0, JIT_HELPER_STATUS_OK as u16);
     asm.b_cond(Cond::NotEqual, call_deopt);
-    // 7: OK — reload the element and slot base, free the frame, store the Int.
-    asm.ldr_x(X6, SP, 0);
-    asm.ldr_x(X0, SP, 8);
-    asm.add_imm(SP, SP, 16);
+    // Reload and store the complete tag/payload/ownership tuple.
+    asm.ldr_w(X3, SP, 0);
+    asm.ldr_x(X4, SP, 8);
+    asm.ldr_x(X5, SP, 16);
+    asm.ldr_x(X0, SP, 24);
+    asm.add_imm(SP, SP, 32);
     asm.pop_fp_lr();
-    emit_store_int(asm, dst, X6);
+    asm.str_w(X3, X0, tag_off(dst));
+    asm.str_x(X4, X0, payload_off(dst));
+    asm.str_x(X5, X0, aux_off(dst));
     asm.b(done);
     asm.bind(call_deopt);
-    asm.add_imm(SP, SP, 16);
+    asm.add_imm(SP, SP, 32);
     asm.pop_fp_lr();
-    asm.b(deopt);
+    // Preserve the VM helper's precise non-OK status for attribution.
+    asm.ret();
     asm.bind(done);
 }
 
@@ -1316,7 +1305,8 @@ mod x86_emit {
             // the shape — both ops side-exit before any effect, and neither
             // appears after a performed resume call). Real x86 stencils are
             // the documented follow-up.
-            ScalarIntOp::CallPropertyStoreScalar { .. } | ScalarIntOp::CallArrayFetchI64 { .. } => {
+            ScalarIntOp::CallPropertyStoreScalar { .. }
+            | ScalarIntOp::CallArrayFetchValue { .. } => {
                 asm.jmp(deopt);
             }
         }
@@ -1572,7 +1562,7 @@ fn check_op_slots(op: ScalarIntOp) -> Result<(), SlotSequenceError> {
             check_slot(object)?;
             check_slot(value)
         }
-        ScalarIntOp::CallArrayFetchI64 {
+        ScalarIntOp::CallArrayFetchValue {
             dst, array, index, ..
         } => {
             check_slot(dst)?;
@@ -1621,7 +1611,7 @@ fn emit_op(asm: &mut Aarch64Assembler, deopt: Label, op: ScalarIntOp) {
             metadata_ptr,
             helper,
         } => emit_property_store(asm, deopt, object, value, metadata_ptr, helper),
-        ScalarIntOp::CallArrayFetchI64 {
+        ScalarIntOp::CallArrayFetchValue {
             dst,
             array,
             index,
@@ -2737,7 +2727,16 @@ fn compile_scalar_int_cfg(
     }
     if !matches!(
         function.return_type,
-        Some(IrReturnType::Int) | Some(IrReturnType::Bool)
+        None | Some(
+            IrReturnType::Mixed
+                | IrReturnType::Null
+                | IrReturnType::Bool
+                | IrReturnType::Int
+                | IrReturnType::Float
+                | IrReturnType::String
+                | IrReturnType::Array
+                | IrReturnType::Object
+        )
     ) {
         return None;
     }
@@ -2749,7 +2748,10 @@ fn compile_scalar_int_cfg(
         // they are only readable through it (any scalar use fails the `Int`
         // operand guard and side-exits), and `array` declared types never
         // coerce at bind, so the marshaled handle equals the bound value.
-        if !matches!(param.type_, Some(IrReturnType::Int | IrReturnType::Array)) {
+        if !matches!(
+            param.type_,
+            Some(IrReturnType::Int | IrReturnType::String | IrReturnType::Array)
+        ) {
             return None;
         }
     }
@@ -2799,7 +2801,7 @@ fn compile_scalar_int_cfg(
             } = kind
                 && helpers.array_fetch != 0
             {
-                return Some(ScalarIntOp::CallArrayFetchI64 {
+                return Some(ScalarIntOp::CallArrayFetchValue {
                     dst: reg_slot(*dst),
                     array: reg_slot(*array_reg),
                     index: reg_slot(*key_reg),
@@ -3152,22 +3154,22 @@ fn compile_scalar_int_tailcall_leaf(
 
 /// One suspension point of a return-and-resume call region: when the region
 /// returns [`JIT_HELPER_STATUS_RESUME_CALL_BASE`]` + index`, it has marshaled
-/// this site's positional `Int` arguments into `arg_slots` and suspended
+/// this site's positional ABI arguments into `arg_slots` and suspended
 /// itself. The VM performs the call to `callee_name` through the normal
-/// interpreter path, writes the callee's result — guaranteed `Int` by the
-/// callee's own declared-`: int` return coercion — into `result_slot`, and
+/// interpreter path, writes the callee's post-coercion result into
+/// `result_slot`, and
 /// re-enters the finished code at byte `resume_offset` with the same buffer.
 /// Every live value sits in the flat slot buffer (nothing is kept in registers
 /// across ops), so re-entry at an op boundary is exactly like the region entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResumeCallSite {
     /// Callee name exactly as written at the call site; the VM resolved it to a
-    /// same-unit plain userland `: int` function at compile time and
+    /// same-unit plain userland function at compile time and
     /// re-validates the resolution before performing the first call.
     pub callee_name: String,
-    /// Buffer slots holding the marshaled positional `Int` arguments, in order.
+    /// Buffer slots holding marshaled positional ABI arguments, in order.
     pub arg_slots: Vec<u32>,
-    /// Slot the VM writes the callee's `Int` result into before resuming.
+    /// Slot the VM writes the callee's complete result into before resuming.
     pub result_slot: u32,
     /// Byte offset into the finished code where execution resumes.
     pub resume_offset: usize,
@@ -3217,7 +3219,7 @@ fn update_proven_int(proven: &mut HashSet<u32>, op: &ScalarIntOp) {
         | ScalarIntOp::CallStrlenI64 { dst, .. }
         | ScalarIntOp::IsType { dst, .. }
         | ScalarIntOp::CallPropertyLoadScalar { dst, .. }
-        | ScalarIntOp::CallArrayFetchI64 { dst, .. } => {
+        | ScalarIntOp::CallArrayFetchValue { dst, .. } => {
             // Bool results and helper-call results are not proven `Int` for the
             // post-call subset (helpers are conservative even though abs/count/
             // strlen do produce ints — they never appear post-call anyway).
@@ -3231,12 +3233,12 @@ fn update_proven_int(proven: &mut HashSet<u32>, op: &ScalarIntOp) {
 /// `permits.allow_userland_tailcall` and per-callee by `callee_allowed` (the VM
 /// owns function resolution; `php_jit` has no registry).
 ///
-/// The matched shape is a single-block `int`-returning free function (`int`,
+/// The matched shape is a single-block Value-returning free function (`int`,
 /// by-value, non-variadic, no-default parameters) whose meaningful
 /// instructions form: a scalar-int prefix, then one or more
 /// `CallFunction { dst, name, args }` steps separated by *move-only* segments
 /// (`LoadLocal`/`StoreLocal`/`Move`/`LoadConst` — no arithmetic, no compares),
-/// ending in `Return(%r)` of a proven-`Int` register. Sequenced calls
+/// ending in `Return(%r)` of a proven complete ABI value. Sequenced calls
 /// (`$a = h($x); return g($a);`) and nested compositions (`return g(h($x));`)
 /// both lower.
 ///
@@ -3249,11 +3251,10 @@ fn update_proven_int(proven: &mut HashSet<u32>, op: &ScalarIntOp) {
 ///   post-call operand must be *proven* `Int` (a parameter guarded at entry, a
 ///   call result whose callee declares `: int`, or a constant), so no
 ///   post-call guard or overflow exit can ever be needed.
-/// - **Callees must be statically resolved, plain userland `: int` functions**
+/// - **Callees must be statically resolved plain userland functions**
 ///   (`callee_allowed` — the VM validates against the unit's function table).
-///   The declared return type is what proves the result slot `Int` without a
-///   runtime guard: the callee's own return coercion either produced an `int`
-///   or threw, and a throw propagates instead of resuming.
+///   The normal VM call completes return coercion before the full Value ABI
+///   result is written into the persistent slot buffer.
 /// - Named/spread/by-ref-placeholder arguments, non-register/non-int-constant
 ///   argument values, and any out-of-subset instruction reject the whole leaf
 ///   (the interpreter runs it, exactly as before).
@@ -3279,7 +3280,21 @@ pub fn compile_scalar_int_resume_leaf(
     if function.returns_by_ref || !function.captures.is_empty() {
         return None;
     }
-    if function.return_type != Some(IrReturnType::Int) {
+    if !matches!(
+        function.return_type,
+        None | Some(
+            IrReturnType::Mixed
+                | IrReturnType::Null
+                | IrReturnType::Void
+                | IrReturnType::Bool
+                | IrReturnType::Int
+                | IrReturnType::Float
+                | IrReturnType::String
+                | IrReturnType::Array
+                | IrReturnType::Object
+                | IrReturnType::Class { .. }
+        )
+    ) {
         return None;
     }
     for param in &function.params {
@@ -3315,28 +3330,6 @@ pub fn compile_scalar_int_resume_leaf(
     if calls.is_empty() {
         return None;
     }
-    // Engagement heuristic: driving the suspend/perform-call/re-enter loop
-    // costs a buffer allocation, a materialized frame, and marshaling per
-    // invocation. When the region contains no real computation (pure
-    // move-only call glue like `$a = h($x); return g($a);`), the interpreter
-    // is measurably faster, so only compile when enough arithmetic/compare
-    // work moves into native code to pay for the loop. Move/const glue does
-    // not count; only compute ops do.
-    const RESUME_MIN_COMPUTE_OPS: usize = 4;
-    let compute_ops = segments
-        .iter()
-        .flatten()
-        .filter(|kind| {
-            matches!(
-                kind,
-                InstructionKind::Binary { .. } | InstructionKind::Compare { .. }
-            )
-        })
-        .count();
-    if compute_ops < RESUME_MIN_COMPUTE_OPS {
-        return None;
-    }
-
     let local_count = function.local_count;
     let reg_slot = |r: RegId| local_count + r.raw();
     let first_arg_slot = local_count.checked_add(function.register_count)?;
@@ -3395,6 +3388,7 @@ pub fn compile_scalar_int_resume_leaf(
             sources.push(source);
         }
         let result_slot = reg_slot(*dst);
+        // The VM writes a complete, post-coercion ABI value before re-entry.
         proven.insert(result_slot);
         next_arg_slot = next_arg_slot.checked_add(u32::try_from(args.len()).ok()?)?;
         site_specs.push(SiteSpec {
@@ -3424,7 +3418,7 @@ pub fn compile_scalar_int_resume_leaf(
         post_segments.push(ops);
     }
 
-    // The return value must be a proven-`Int` register.
+    // The return value must be a proven complete ABI value.
     let TerminatorKind::Return {
         value: Some(Operand::Register(ret_reg)),
         by_ref_local: None,

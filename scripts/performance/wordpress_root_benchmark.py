@@ -8,6 +8,7 @@ import copy
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -97,6 +98,16 @@ def main() -> int:
         if report["status"] == "skip" and args.strict:
             return 2
         return 0
+    if args.cranelift_ab:
+        report = run_cranelift_ab(args, out_dir)
+        write_json(report, out_dir / "summary.json")
+        write_cranelift_ab_markdown(report, out_dir / "summary.md")
+        print(f"[{report['status']}] Cranelift A/B wrote {rel(out_dir / 'summary.md')}")
+        if report["status"] == "fail":
+            return 1
+        if report["status"] == "skip" and args.strict:
+            return 2
+        return 0
     report = run(args, out_dir)
     write_json(report, out_dir / "summary.json")
     write_markdown(report, out_dir / "summary.md")
@@ -177,6 +188,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--feedback-ab",
         action="store_true",
         help="run isolated persistent-feedback off/on arms and write one comparison report",
+    )
+    parser.add_argument(
+        "--copy-patch",
+        choices=("on", "off"),
+        default="on",
+        help="A/B switch for the ARM copy-and-patch native tier",
+    )
+    parser.add_argument(
+        "--cranelift-ab",
+        action="store_true",
+        help="run ARM experimental-jit across feedback and copy-patch off/on arms",
     )
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--baseline", default="")
@@ -274,6 +296,97 @@ def run_feedback_ab(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     }
 
 
+def run_cranelift_ab(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
+    """Run clean and diagnostic evidence for the ARM native-tier matrix."""
+    errors = validate_configuration(args)
+    if errors:
+        return {
+            "schema_version": 1,
+            "status": "fail",
+            "mode": "cranelift-ab",
+            "timing_eligible": False,
+            "arms": {},
+            "failures": errors,
+        }
+    arms: dict[str, dict[str, Any]] = {}
+    full_reports: dict[str, dict[str, Any]] = {}
+    for feedback in ("off", "on"):
+        for copy_patch in ("off", "on"):
+            arm = f"feedback-{feedback}-copy-patch-{copy_patch}"
+            arm_dir = out_dir / arm
+            arm_dir.mkdir(parents=True, exist_ok=True)
+            clean_args = copy.copy(args)
+            clean_args.cranelift_ab = False
+            clean_args.engine_preset = "experimental-jit"
+            clean_args.persistent_feedback = feedback
+            clean_args.copy_patch = copy_patch
+            clean_args.mode = "clean"
+            clean_args.baseline = ""
+            clean_args.compare = ""
+            clean_args.record_baseline = ""
+            clean_dir = arm_dir / "clean"
+            clean_dir.mkdir(parents=True, exist_ok=True)
+            clean_report = run(clean_args, clean_dir)
+            write_json(clean_report, clean_dir / "summary.json")
+            write_markdown(clean_report, clean_dir / "summary.md")
+
+            diagnostic_args = copy.copy(clean_args)
+            diagnostic_args.mode = "diagnostic"
+            diagnostic_dir = arm_dir / "diagnostic"
+            diagnostic_dir.mkdir(parents=True, exist_ok=True)
+            diagnostic_report = run(diagnostic_args, diagnostic_dir)
+            write_json(diagnostic_report, diagnostic_dir / "summary.json")
+            write_markdown(diagnostic_report, diagnostic_dir / "summary.md")
+            full_reports[arm] = clean_report
+            native = (
+                ((diagnostic_report.get("profile") or {}).get("attribution") or {}).get("native")
+                or {}
+            )
+            arms[arm] = {
+                "status": combined_status(clean_report, diagnostic_report),
+                "persistent_feedback": feedback,
+                "copy_patch": copy_patch,
+                "clean_summary": rel(clean_dir / "summary.json"),
+                "diagnostic_summary": rel(diagnostic_dir / "summary.json"),
+                "phrust_identity": ((clean_report.get("engines") or {}).get("phrust") or {}).get(
+                    "identity"
+                ),
+                "compile": {
+                    "jit_compile_attempts": native.get("jit_compile_attempts"),
+                    "jit_compile_time_nanos": native.get("jit_compile_time_nanos"),
+                    "jit_compiled": native.get("jit_compiled"),
+                },
+                "request_phases_nanos": (diagnostic_report.get("profile") or {}).get(
+                    "phases_nanos", {}
+                ),
+            }
+    statuses = {arm["status"] for arm in arms.values()}
+    status = "fail" if "fail" in statuses else "skip" if "skip" in statuses else "pass"
+    return {
+        "schema_version": 1,
+        "status": status,
+        "mode": "cranelift-ab",
+        "timing_eligible": all(
+            report.get("timing_eligible") is True for report in full_reports.values()
+        ),
+        "engine_preset": "experimental-jit",
+        "comparisons": {
+            f"feedback-{feedback}-copy-patch-off-to-on": build_feedback_ab_ratios(
+                full_reports[f"feedback-{feedback}-copy-patch-off"],
+                full_reports[f"feedback-{feedback}-copy-patch-on"],
+            )
+            for feedback in ("off", "on")
+        },
+        "arms": arms,
+        "failures": [],
+    }
+
+
+def combined_status(*reports: dict[str, Any]) -> str:
+    statuses = {report.get("status") for report in reports}
+    return "fail" if "fail" in statuses else "skip" if "skip" in statuses else "pass"
+
+
 def build_feedback_ab_ratios(
     off_report: dict[str, Any], on_report: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -319,6 +432,14 @@ def validate_configuration(args: argparse.Namespace) -> list[str]:
         errors.append("--feedback-ab requires --mode clean")
     if args.feedback_ab and (args.baseline or args.compare or args.record_baseline):
         errors.append("--feedback-ab cannot record or compare a regression baseline")
+    if args.cranelift_ab and args.mode != "clean":
+        errors.append("--cranelift-ab requires --mode clean")
+    if args.cranelift_ab and args.feedback_ab:
+        errors.append("--cranelift-ab and --feedback-ab are mutually exclusive")
+    if args.cranelift_ab and (args.baseline or args.compare or args.record_baseline):
+        errors.append("--cranelift-ab cannot record or compare a regression baseline")
+    if args.cranelift_ab and platform.machine().lower() not in {"arm64", "aarch64"}:
+        errors.append("--cranelift-ab is supported only on ARM/aarch64")
     levels = concurrency_levels(args.concurrency)
     if args.samples < 1:
         errors.append("samples must be positive")
@@ -438,6 +559,7 @@ def resolve_phrust(args: argparse.Namespace, out_dir: Path, docroot: Path | None
     performance_environment["PHRUST_PERSISTENT_FEEDBACK"] = (
         "1" if args.persistent_feedback == "on" else "0"
     )
+    performance_environment["PHRUST_JIT_COPY_PATCH"] = "1" if args.copy_patch == "on" else "0"
     if args.mode == "clean":
         process_env.update(performance_environment)
         process_env.pop("PHRUST_PERF_ABLATION", None)
@@ -454,6 +576,7 @@ def resolve_phrust(args: argparse.Namespace, out_dir: Path, docroot: Path | None
     identity["deployment_mode"] = "immutable"
     identity["engine_preset"] = args.engine_preset
     identity["persistent_feedback"] = args.persistent_feedback
+    identity["copy_patch"] = args.copy_patch
     identity["performance_environment"] = (
         performance_environment if args.mode == "clean" else "diagnostic"
     )
@@ -1202,6 +1325,41 @@ def write_feedback_ab_markdown(report: dict[str, Any], path: Path) -> None:
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
+def write_cranelift_ab_markdown(report: dict[str, Any], path: Path) -> None:
+    lines = [
+        "# WordPress ARM Cranelift A/B",
+        "",
+        f"Status: `{report['status']}`",
+        "",
+        "Clean latency and instrumented compile evidence are collected in separate runs.",
+        "",
+    ]
+    for failure in report.get("failures", []):
+        lines.append(f"- {failure}")
+    lines.extend(["", "## Arms", ""])
+    for name, arm in report.get("arms", {}).items():
+        compile_evidence = arm.get("compile", {})
+        lines.append(
+            f"- `{name}`: {arm['status']}; JIT compiles "
+            f"{compile_evidence.get('jit_compile_attempts', 'unavailable')}, compile ns "
+            f"{compile_evidence.get('jit_compile_time_nanos', 'unavailable')}; "
+            f"clean `{arm['clean_summary']}`, diagnostic `{arm['diagnostic_summary']}`"
+        )
+    lines.extend(["", "## Copy-patch comparisons", ""])
+    for name, comparisons in report.get("comparisons", {}).items():
+        if not comparisons:
+            lines.append(f"- `{name}`: no comparable clean timing curves")
+            continue
+        for comparison in comparisons:
+            lines.append(
+                f"- `{name}` concurrency {comparison['concurrency']}: p50 off/on "
+                f"{format_ratio(comparison['off_to_on_p50_latency'])}, p95 off/on "
+                f"{format_ratio(comparison['off_to_on_p95_latency'])}, throughput on/off "
+                f"{format_ratio(comparison['on_to_off_requests_per_second'])}"
+            )
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
 def format_ratio(value: float | None) -> str:
     return "unsupported" if value is None else f"{value:.3f}x"
 
@@ -1267,6 +1425,11 @@ def self_test() -> int:
     assert not validate_configuration(diagnostic)
     invalid_ab = parse_args(["--mode", "diagnostic", "--feedback-ab"])
     assert "requires --mode clean" in " ".join(validate_configuration(invalid_ab))
+    cranelift_ab_errors = validate_configuration(parse_args(["--cranelift-ab"]))
+    if platform.machine().lower() in {"arm64", "aarch64"}:
+        assert "requires an ARM64 host" not in " ".join(cranelift_ab_errors)
+    else:
+        assert "requires an ARM64 host" in " ".join(cranelift_ab_errors)
     ab_off = {
         "engines": {
             "phrust": {

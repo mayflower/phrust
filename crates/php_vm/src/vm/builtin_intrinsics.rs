@@ -31,6 +31,33 @@ impl Vm {
         Some(VmResult::success_no_output(Some(result)))
     }
 
+    pub(super) fn try_execute_fast_builtin_stub_borrowed(
+        &self,
+        name: &str,
+        values: &[DenseOperandRead<'_>],
+    ) -> Option<VmResult> {
+        let (spec_index, spec) = builtin_intrinsic_spec(name)?;
+        if !builtin_intrinsic_metadata_matches_cached(spec_index)
+            || values.len() < spec.min_arity
+            || values.len() > spec.exact_arity
+            || values
+                .iter()
+                .any(|value| matches!(value.as_value(), Value::Reference(_)))
+        {
+            return None;
+        }
+        let result = fast_builtin_stub_result(spec.kind, values)?;
+        self.record_counter_builtin_intrinsic_candidate();
+        self.record_counter_builtin_fast_stub(name, true);
+        self.record_counter_intrinsic(spec.counter_name, true);
+        if name == "count" {
+            self.record_counter_array_count_fast_path_hit();
+            self.record_counter_internal_count_array_direct_fast_path_hit();
+            self.record_counter_count_array_shape_fast_hit();
+        }
+        Some(VmResult::success_no_output(Some(result)))
+    }
+
     /// Default-flags `json_encode` over scalar/array shapes, bypassing the
     /// serde tree and the full builtin-context construction. Fallback keeps
     /// the generic path authoritative for floats, objects, references,
@@ -1244,26 +1271,74 @@ fn fast_builtin_stub_result_for_spec(
     if fast_builtin_stub_fallback_reason_for_spec(spec_index, spec, values).is_some() {
         return None;
     }
-    match (spec.kind, values) {
-        (BuiltinIntrinsicKind::ArrayKeyExists, [key, Value::Array(array)]) => {
+    fast_builtin_stub_result(spec.kind, values)
+}
+
+trait IntrinsicValues {
+    fn len(&self) -> usize;
+    fn value(&self, index: usize) -> Option<&Value>;
+}
+
+impl IntrinsicValues for [Value] {
+    fn len(&self) -> usize {
+        <[Value]>::len(self)
+    }
+
+    fn value(&self, index: usize) -> Option<&Value> {
+        self.get(index)
+    }
+}
+
+impl IntrinsicValues for [DenseOperandRead<'_>] {
+    fn len(&self) -> usize {
+        <[DenseOperandRead<'_>]>::len(self)
+    }
+
+    fn value(&self, index: usize) -> Option<&Value> {
+        self.get(index).map(DenseOperandRead::as_value)
+    }
+}
+
+fn fast_builtin_stub_result(
+    values_kind: BuiltinIntrinsicKind,
+    values: &(impl IntrinsicValues + ?Sized),
+) -> Option<Value> {
+    let first = values.value(0);
+    let second = values.value(1);
+    let third = values.value(2);
+    match values_kind {
+        BuiltinIntrinsicKind::ArrayKeyExists if values.len() == 2 => {
+            let (Some(key), Some(Value::Array(array))) = (first, second) else {
+                return None;
+            };
             let key = ArrayKey::from_value(key)?;
             Some(Value::Bool(array.get(&key).is_some()))
         }
-        (BuiltinIntrinsicKind::CountArray, [Value::Array(array)]) => {
+        BuiltinIntrinsicKind::CountArray if values.len() == 1 => {
+            let Some(Value::Array(array)) = first else {
+                return None;
+            };
             Some(Value::Int(array.len() as i64))
         }
-        (BuiltinIntrinsicKind::IsArray, [value]) => {
+        BuiltinIntrinsicKind::IsArray if values.len() == 1 => {
+            let value = first?;
             Some(Value::Bool(matches!(value, Value::Array(_))))
         }
-        (BuiltinIntrinsicKind::IsInt, [value]) => Some(Value::Bool(matches!(value, Value::Int(_)))),
-        (BuiltinIntrinsicKind::IsBool, [value]) => {
+        BuiltinIntrinsicKind::IsInt if values.len() == 1 => {
+            Some(Value::Bool(matches!(first?, Value::Int(_))))
+        }
+        BuiltinIntrinsicKind::IsBool if values.len() == 1 => {
+            let value = first?;
             Some(Value::Bool(matches!(value, Value::Bool(_))))
         }
-        (BuiltinIntrinsicKind::IsFloat, [value]) => {
+        BuiltinIntrinsicKind::IsFloat if values.len() == 1 => {
+            let value = first?;
             Some(Value::Bool(matches!(value, Value::Float(_))))
         }
-        (BuiltinIntrinsicKind::IsNull, [value]) => Some(Value::Bool(matches!(value, Value::Null))),
-        (BuiltinIntrinsicKind::IsNumeric, [value]) => Some(Value::Bool(match value {
+        BuiltinIntrinsicKind::IsNull if values.len() == 1 => {
+            Some(Value::Bool(matches!(first?, Value::Null)))
+        }
+        BuiltinIntrinsicKind::IsNumeric if values.len() == 1 => Some(Value::Bool(match first? {
             Value::Int(_) | Value::Float(_) => true,
             // Matches the numeric-string classifier: only a whole trimmed
             // int/float string is numeric; leading-numeric ("12abc") and
@@ -1275,108 +1350,162 @@ fn fast_builtin_stub_result_for_spec(
             ),
             _ => false,
         })),
-        (BuiltinIntrinsicKind::IsObject, [value]) => Some(Value::Bool(matches!(
-            value,
+        BuiltinIntrinsicKind::IsObject if values.len() == 1 => Some(Value::Bool(matches!(
+            first?,
             Value::Object(_) | Value::Fiber(_) | Value::Generator(_) | Value::Callable(_)
         ))),
-        (BuiltinIntrinsicKind::IsScalar, [value]) => Some(Value::Bool(matches!(
-            value,
+        BuiltinIntrinsicKind::IsScalar if values.len() == 1 => Some(Value::Bool(matches!(
+            first?,
             Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::String(_)
         ))),
-        (BuiltinIntrinsicKind::PointerCurrent, [Value::Array(array)]) => {
+        BuiltinIntrinsicKind::PointerCurrent if values.len() == 1 => {
+            let Some(Value::Array(array)) = first else {
+                return None;
+            };
             Some(array.pointer_value().unwrap_or(Value::Bool(false)))
         }
-        (BuiltinIntrinsicKind::PointerKey, [Value::Array(array)]) => {
+        BuiltinIntrinsicKind::PointerKey if values.len() == 1 => {
+            let Some(Value::Array(array)) = first else {
+                return None;
+            };
             Some(array.pointer_key().map_or(Value::Null, array_key_to_value))
         }
-        (BuiltinIntrinsicKind::ArrayKeysAll, [Value::Array(array)]) => {
+        BuiltinIntrinsicKind::ArrayKeysAll if values.len() == 1 => {
+            let Some(Value::Array(array)) = first else {
+                return None;
+            };
             let keys = array
                 .iter()
                 .map(|(key, _)| array_key_to_value(key))
                 .collect::<Vec<_>>();
             Some(Value::Array(PhpArray::from_packed(keys)))
         }
-        (
-            BuiltinIntrinsicKind::ImplodeStringParts,
-            [Value::String(separator), Value::Array(parts)],
-        ) => php_runtime::experimental::builtin_intrinsics::string_intrinsics::implode_string_parts(separator, parts)
-            .map(Value::String),
-        (BuiltinIntrinsicKind::IsString, [value]) => {
-            Some(Value::Bool(matches!(value, Value::String(_))))
+        BuiltinIntrinsicKind::ImplodeStringParts if values.len() == 2 => {
+            let (Some(Value::String(separator)), Some(Value::Array(parts))) = (first, second)
+            else {
+                return None;
+            };
+            php_runtime::experimental::builtin_intrinsics::string_intrinsics::implode_string_parts(
+                separator, parts,
+            )
+            .map(Value::String)
         }
-        (BuiltinIntrinsicKind::StrLen, [Value::String(string)]) => {
+        BuiltinIntrinsicKind::IsString if values.len() == 1 => {
+            Some(Value::Bool(matches!(first?, Value::String(_))))
+        }
+        BuiltinIntrinsicKind::StrLen if values.len() == 1 => {
+            let Some(Value::String(string)) = first else {
+                return None;
+            };
             Some(Value::Int(string.len() as i64))
         }
-        (BuiltinIntrinsicKind::StrContains, [Value::String(haystack), Value::String(needle)]) => {
+        BuiltinIntrinsicKind::StrContains if values.len() == 2 => {
+            let (Some(Value::String(haystack)), Some(Value::String(needle))) = (first, second)
+            else {
+                return None;
+            };
             Some(Value::Bool(byte_slice_contains(
                 haystack.as_bytes(),
                 needle.as_bytes(),
             )))
         }
-        (BuiltinIntrinsicKind::StrStartsWith, [Value::String(haystack), Value::String(needle)]) => {
+        BuiltinIntrinsicKind::StrStartsWith if values.len() == 2 => {
+            let (Some(Value::String(haystack)), Some(Value::String(needle))) = (first, second)
+            else {
+                return None;
+            };
             Some(Value::Bool(
                 haystack.as_bytes().starts_with(needle.as_bytes()),
             ))
         }
-        (BuiltinIntrinsicKind::StrEndsWith, [Value::String(haystack), Value::String(needle)]) => {
+        BuiltinIntrinsicKind::StrEndsWith if values.len() == 2 => {
+            let (Some(Value::String(haystack)), Some(Value::String(needle))) = (first, second)
+            else {
+                return None;
+            };
             Some(Value::Bool(
                 haystack.as_bytes().ends_with(needle.as_bytes()),
             ))
         }
-        (BuiltinIntrinsicKind::StrToLower, [Value::String(string)]) => Some(Value::String(
-            php_runtime::experimental::builtin_intrinsics::string_intrinsics::strtolower_ascii(string),
-        )),
-        (BuiltinIntrinsicKind::StrToUpper, [Value::String(string)]) => Some(Value::String(
-            php_runtime::experimental::builtin_intrinsics::string_intrinsics::strtoupper_ascii(string),
-        )),
-        (
-            BuiltinIntrinsicKind::StrReplaceScalar,
-            [
-                Value::String(search),
-                Value::String(replace),
-                Value::String(subject),
-            ],
-        ) => Some(Value::String(
-            php_runtime::experimental::builtin_intrinsics::string_intrinsics::str_replace_scalar(search, replace, subject),
-        )),
-        (BuiltinIntrinsicKind::HtmlSpecialCharsDefault, [Value::String(string)]) => {
+        BuiltinIntrinsicKind::StrToLower if values.len() == 1 => {
+            let Some(Value::String(string)) = first else {
+                return None;
+            };
+            Some(Value::String(
+                php_runtime::experimental::builtin_intrinsics::string_intrinsics::strtolower_ascii(
+                    string,
+                ),
+            ))
+        }
+        BuiltinIntrinsicKind::StrToUpper if values.len() == 1 => {
+            let Some(Value::String(string)) = first else {
+                return None;
+            };
+            Some(Value::String(
+                php_runtime::experimental::builtin_intrinsics::string_intrinsics::strtoupper_ascii(
+                    string,
+                ),
+            ))
+        }
+        BuiltinIntrinsicKind::StrReplaceScalar if values.len() == 3 => {
+            let (
+                Some(Value::String(search)),
+                Some(Value::String(replace)),
+                Some(Value::String(subject)),
+            ) = (first, second, third)
+            else {
+                return None;
+            };
+            Some(Value::String(php_runtime::experimental::builtin_intrinsics::string_intrinsics::str_replace_scalar(search, replace, subject)))
+        }
+        BuiltinIntrinsicKind::HtmlSpecialCharsDefault if values.len() == 1 => {
+            let Some(Value::String(string)) = first else {
+                return None;
+            };
             Some(Value::String(
                 php_runtime::experimental::builtin_intrinsics::string_intrinsics::htmlspecialchars_default(string),
             ))
         }
-        (
-            BuiltinIntrinsicKind::ExplodeSingleByte,
-            [Value::String(separator), Value::String(subject)],
-        ) if separator.len() == 1 => Some(Value::Array(
-            php_runtime::experimental::builtin_intrinsics::string_intrinsics::explode_single_byte(
-                separator.as_bytes()[0],
-                subject,
-            ),
-        )),
-        (
-            BuiltinIntrinsicKind::SubstrBytes,
-            [Value::String(string), Value::Int(offset), rest @ ..],
-        ) => {
-            let length = match rest {
-                [] | [Value::Null] => None,
-                [Value::Int(length)] => Some(*length),
-                _ => return None,
+        BuiltinIntrinsicKind::ExplodeSingleByte if values.len() == 2 => {
+            let (Some(Value::String(separator)), Some(Value::String(subject))) = (first, second)
+            else {
+                return None;
+            };
+            if separator.len() != 1 {
+                return None;
+            }
+            Some(Value::Array(php_runtime::experimental::builtin_intrinsics::string_intrinsics::explode_single_byte(separator.as_bytes()[0], subject)))
+        }
+        BuiltinIntrinsicKind::SubstrBytes if (2..=3).contains(&values.len()) => {
+            let (Some(Value::String(string)), Some(Value::Int(offset))) = (first, second) else {
+                return None;
+            };
+            let length = match third {
+                None | Some(Value::Null) => None,
+                Some(Value::Int(length)) => Some(*length),
+                Some(_) => return None,
             };
             Some(Value::String(
-                php_runtime::experimental::builtin_intrinsics::string_intrinsics::substr_bytes(string, *offset, length),
+                php_runtime::experimental::builtin_intrinsics::string_intrinsics::substr_bytes(
+                    string, *offset, length,
+                ),
             ))
         }
-        (BuiltinIntrinsicKind::TrimDefault, [Value::String(string)]) => Some(Value::String(
-            php_runtime::experimental::builtin_intrinsics::string_intrinsics::trim_ascii_default(string),
-        )),
-        (
-            BuiltinIntrinsicKind::InArrayStrict,
-            [
-                needle @ (Value::Int(_) | Value::String(_)),
-                Value::Array(haystack),
-                Value::Bool(true),
-            ],
-        ) => {
+        BuiltinIntrinsicKind::TrimDefault if values.len() == 1 => {
+            let Some(Value::String(string)) = first else {
+                return None;
+            };
+            Some(Value::String(php_runtime::experimental::builtin_intrinsics::string_intrinsics::trim_ascii_default(string)))
+        }
+        BuiltinIntrinsicKind::InArrayStrict if values.len() == 3 => {
+            let (
+                Some(needle @ (Value::Int(_) | Value::String(_))),
+                Some(Value::Array(haystack)),
+                Some(Value::Bool(true)),
+            ) = (first, second, third)
+            else {
+                return None;
+            };
             Some(Value::Bool(haystack.iter().any(|(_, value)| {
                 php_runtime::api::identical(needle, value)
             })))

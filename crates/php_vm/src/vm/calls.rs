@@ -889,15 +889,17 @@ pub(super) struct PreparedArguments {
     pub(super) diagnostics: Vec<RuntimeDiagnostic>,
 }
 
+pub(super) type CallValuesSmall = smallvec::SmallVec<[Value; 8]>;
+
 pub(super) struct FunctionCall<'a> {
     pub(super) args: Vec<CallArgument>,
     /// R1.2 fast lane: bare positional argument values for an exact-arity
     /// plain-positional call to a known simple callee, pre-validated by the
-    /// dense call arm. When non-empty, `args` is empty and the executor's
+    /// dense call arm. When present, `args` is empty and the executor's
     /// direct-bind loop consumes these values straight into the frame locals
     /// — no `CallArgument` construction, no by-ref bookkeeping per argument.
     /// Values are already effective (references dereferenced at read).
-    pub(super) positional_values: Vec<Value>,
+    pub(super) positional_values: Option<CallValuesSmall>,
     pub(super) captures: Vec<ClosureCaptureValue>,
     pub(super) call_span: Option<php_ir::IrSpan>,
     pub(super) call_site_strict_types: Option<bool>,
@@ -922,7 +924,7 @@ impl FunctionCall<'_> {
     pub(super) fn new(args: Vec<CallArgument>, captures: Vec<ClosureCaptureValue>) -> Self {
         Self {
             args,
-            positional_values: Vec::new(),
+            positional_values: None,
             captures,
             call_span: None,
             call_site_strict_types: None,
@@ -949,19 +951,17 @@ impl FunctionCall<'_> {
         self
     }
 
-    pub(super) fn with_positional_values(mut self, values: Vec<Value>) -> Self {
+    pub(super) fn with_positional_values(mut self, values: CallValuesSmall) -> Self {
         debug_assert!(self.args.is_empty());
-        self.positional_values = values;
+        self.positional_values = Some(values);
         self
     }
 
     /// PHP-visible call arity across both argument representations.
     pub(super) fn arg_count(&self) -> usize {
-        if self.positional_values.is_empty() {
-            self.args.len()
-        } else {
-            self.positional_values.len()
-        }
+        self.positional_values
+            .as_ref()
+            .map_or(self.args.len(), CallValuesSmall::len)
     }
 
     pub(super) fn with_optional_call_span(mut self, span: Option<php_ir::IrSpan>) -> Self {

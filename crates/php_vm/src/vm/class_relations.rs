@@ -257,7 +257,7 @@ pub(super) fn class_relation_subject_name(value: &Value) -> Option<String> {
 pub(super) fn class_relation_config_fingerprint(compiled: &CompiledUnit) -> String {
     format!(
         "unit:{}:strict:{}",
-        compiled.unit().id.raw(),
+        compiled.cache_identity(),
         compiled.unit().strict_types
     )
 }

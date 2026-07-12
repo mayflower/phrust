@@ -874,6 +874,7 @@ fn native_json(counters: &VmCounters) -> Value {
             counters.native_compile_budget_rejections,
         ),
         ("jit_compile_attempts", counters.jit_compile_attempts),
+        ("jit_compile_time_nanos", counters.jit_compile_time_nanos),
         ("jit_compiled", counters.jit_compiled),
         ("jit_executed", counters.jit_executed),
         ("jit_bailouts", counters.jit_bailouts),

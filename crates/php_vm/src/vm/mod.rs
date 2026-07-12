@@ -542,7 +542,7 @@ pub struct Vm {
     /// entry unit, for scoping persistent callsite exports to replay-stable
     /// (entry-unit) IC sites.
     persistent_feedback_entry_unit_key: Cell<Option<u64>>,
-    inline_caches: RefCell<InlineCacheTable>,
+    inline_caches: Rc<RefCell<InlineCacheTable>>,
     #[allow(dead_code)]
     jit: Rc<RefCell<JitRuntimeState>>,
     tiering: Rc<RefCell<TieringState>>,
@@ -558,23 +558,23 @@ pub struct Vm {
     /// class do not rebuild the whole entry (lineage walk, property/constant
     /// evaluation, method mapping) on every `new`. Invalidated whenever the
     /// class table changes (tracked by `ExecutionState::class_table_epoch`).
-    runtime_class_entry_cache: RefCell<RuntimeClassEntryCache>,
+    runtime_class_entry_cache: Rc<RefCell<RuntimeClassEntryCache>>,
     /// Memoized raw IR class entries (shared via `Rc`) so repeated `new` of a
     /// class does not deep-clone the whole class definition per instantiation.
     /// Invalidated by `ExecutionState::class_table_epoch`.
-    ir_class_entry_cache: RefCell<IrClassEntryCache>,
+    ir_class_entry_cache: Rc<RefCell<IrClassEntryCache>>,
     /// Memoized default declared-slot templates so the hot `new C(...)` path
     /// clones a prebuilt slot vector instead of re-running the per-property
     /// default-materialization loop on every instantiation. Invalidated by
     /// `ExecutionState::class_table_epoch`, so a redefinition rebuilds it from
     /// the current class entry.
-    default_slot_template_cache: RefCell<DefaultSlotTemplateCache>,
+    default_slot_template_cache: Rc<RefCell<DefaultSlotTemplateCache>>,
     /// Memoized `__construct` resolution outcomes so the hot `new C(...)` path
     /// does not re-run the inheritance + visibility method-resolution walk on
     /// every instantiation. Keyed by (normalized class name, normalized caller
     /// scope) and guarded by `ExecutionState::class_table_epoch`, so a
     /// redeclaration or autoload (both bump the epoch) drops stale outcomes.
-    constructor_resolution_cache: RefCell<ConstructorResolutionCache>,
+    constructor_resolution_cache: Rc<RefCell<ConstructorResolutionCache>>,
     adaptive_tiny_unit_setup_skipped: Cell<bool>,
     include_execution_depth: Cell<u32>,
     request_profile_stack: RefCell<Vec<RequestProfileFrame>>,
@@ -583,7 +583,8 @@ pub struct Vm {
     /// otherwise, keeping the default dense read path byte-identical.
     last_use_move_plans: LastUseMovePlanCache,
     /// Per-request receiver-class lookup by shared class-name identity.
-    object_class_resolution: RefCell<ObjectClassResolution>,
+    object_class_resolution: Rc<RefCell<ObjectClassResolution>>,
+    class_relation_cache: Rc<RefCell<ClassRelationCache>>,
     /// Per-unit resolved constant tables (zend literal-table parity): each
     /// materializable `IrConstant` resolves once into an interned value and
     /// every later operand read is an indexed refcount bump instead of a
@@ -605,6 +606,13 @@ pub struct VmWorkerState {
     internal_function_dispatch_cache: Rc<RefCell<InternalFunctionDispatchCache>>,
     jit: Rc<RefCell<JitRuntimeState>>,
     tiering: Rc<RefCell<TieringState>>,
+    inline_caches: Rc<RefCell<InlineCacheTable>>,
+    runtime_class_entry_cache: Rc<RefCell<RuntimeClassEntryCache>>,
+    ir_class_entry_cache: Rc<RefCell<IrClassEntryCache>>,
+    default_slot_template_cache: Rc<RefCell<DefaultSlotTemplateCache>>,
+    constructor_resolution_cache: Rc<RefCell<ConstructorResolutionCache>>,
+    object_class_resolution: Rc<RefCell<ObjectClassResolution>>,
+    class_relation_cache: Rc<RefCell<ClassRelationCache>>,
 }
 
 impl VmWorkerState {
@@ -620,6 +628,15 @@ impl VmWorkerState {
             )),
             jit: Rc::new(RefCell::new(JitRuntimeState::default())),
             tiering: Rc::new(RefCell::new(TieringState::new(tiering))),
+            inline_caches: Rc::new(RefCell::new(InlineCacheTable::default())),
+            runtime_class_entry_cache: Rc::new(RefCell::new(RuntimeClassEntryCache::default())),
+            ir_class_entry_cache: Rc::new(RefCell::new(IrClassEntryCache::default())),
+            default_slot_template_cache: Rc::new(RefCell::new(DefaultSlotTemplateCache::default())),
+            constructor_resolution_cache: Rc::new(RefCell::new(
+                ConstructorResolutionCache::default(),
+            )),
+            object_class_resolution: Rc::new(RefCell::new(ObjectClassResolution::default())),
+            class_relation_cache: Rc::new(RefCell::new(ClassRelationCache::default())),
         }
     }
 }
@@ -653,14 +670,14 @@ impl Vm {
             literal_pool: RefCell::new(LiteralPool::default()),
             trivial_method_plans: worker_state.trivial_method_plans,
             class_name_handles: worker_state.class_name_handles,
-            runtime_class_entry_cache: RefCell::new(RuntimeClassEntryCache::default()),
-            ir_class_entry_cache: RefCell::new(IrClassEntryCache::default()),
-            default_slot_template_cache: RefCell::new(DefaultSlotTemplateCache::default()),
-            constructor_resolution_cache: RefCell::new(ConstructorResolutionCache::default()),
+            runtime_class_entry_cache: worker_state.runtime_class_entry_cache,
+            ir_class_entry_cache: worker_state.ir_class_entry_cache,
+            default_slot_template_cache: worker_state.default_slot_template_cache,
+            constructor_resolution_cache: worker_state.constructor_resolution_cache,
             quickening: RefCell::new(QuickeningTable::default()),
             persistent_feedback_epochs: Cell::new(None),
             persistent_feedback_entry_unit_key: Cell::new(None),
-            inline_caches: RefCell::new(InlineCacheTable::default()),
+            inline_caches: worker_state.inline_caches,
             jit: worker_state.jit,
             tiering: worker_state.tiering,
             internal_function_dispatch_cache: worker_state.internal_function_dispatch_cache,
@@ -669,7 +686,8 @@ impl Vm {
             request_profile_stack: RefCell::new(Vec::new()),
             last_use_move_plans: worker_state.last_use_move_plans,
             resolved_constants: worker_state.resolved_constants,
-            object_class_resolution: RefCell::new(ObjectClassResolution::default()),
+            object_class_resolution: worker_state.object_class_resolution,
+            class_relation_cache: worker_state.class_relation_cache,
         }
     }
 
@@ -686,11 +704,6 @@ impl Vm {
         let mut output = OutputBuffer::with_capacity(output_preallocation_hint(unit.unit()));
         self.trace.borrow_mut().clear();
         *self.literal_pool.borrow_mut() = LiteralPool::default();
-        *self.object_class_resolution.borrow_mut() = ObjectClassResolution::default();
-        *self.runtime_class_entry_cache.borrow_mut() = RuntimeClassEntryCache::default();
-        *self.ir_class_entry_cache.borrow_mut() = IrClassEntryCache::default();
-        *self.default_slot_template_cache.borrow_mut() = DefaultSlotTemplateCache::default();
-        *self.constructor_resolution_cache.borrow_mut() = ConstructorResolutionCache::default();
         *self.quickening.borrow_mut() = QuickeningTable::default();
         self.persistent_feedback_epochs.set(None);
         // IC slots and the entry-unit scope filter share the compiled unit's
@@ -704,7 +717,7 @@ impl Vm {
                 .borrow_mut()
                 .seed_persistent_sites(&self.options.quickening_seed);
         }
-        *self.inline_caches.borrow_mut() = InlineCacheTable::default();
+        let dynamic_ic_invalidations = self.inline_caches.borrow_mut().begin_request();
         let mut persistent_feedback_seeded_callsites = 0usize;
         if self.options.inline_caches.enabled() && !self.options.callsite_seed.is_empty() {
             // Only seed a callsite whose recorded target function still exists
@@ -749,6 +762,9 @@ impl Vm {
             }
             counters
         });
+        for _ in 0..dynamic_ic_invalidations {
+            self.record_counter_persistent_worker_invalidation("dynamic_unit_target");
+        }
         if self.options.collect_counters {
             php_runtime::experimental::numeric_string::reset_cache_and_stats();
             php_runtime::experimental::layout_stats::reset_layout_stats();
@@ -835,6 +851,19 @@ impl Vm {
                 None => VmResult::compile_error(output, message),
             };
         }
+        #[cfg(all(feature = "jit-copy-patch", unix, target_arch = "aarch64"))]
+        if self
+            .options
+            .copy_patch_leaf_override
+            .unwrap_or_else(crate::copy_patch_bridge::copy_patch_leaf_enabled)
+        {
+            let stats = crate::copy_patch_bridge::prewarm_copy_patch_leaves(
+                &unit,
+                64,
+                std::time::Duration::from_millis(10),
+            );
+            self.record_counter_native_leaf_prewarm(&stats);
+        }
         self.warm_literal_pool(unit.unit());
 
         let mut stack = CallStack::new();
@@ -860,6 +889,7 @@ impl Vm {
             filter_input_arrays,
             network_requests_enabled,
             spl_autoload_extensions: ".inc,.php".to_owned(),
+            class_relation_cache: Rc::clone(&self.class_relation_cache),
             request: RequestLifecycleState::from_runtime_context(&self.options.runtime_context),
             execution_deadline_at: self
                 .options
@@ -1275,23 +1305,27 @@ impl Vm {
             config_fingerprint: class_relation_config_fingerprint(compiled),
         };
         let epochs = state.class_relation_epochs();
-        match state.class_relation_cache.lookup(&key, epochs) {
+        let lookup = state.class_relation_cache.borrow_mut().lookup(&key, epochs);
+        match lookup {
             ClassRelationCacheLookup::Hit(target) => {
+                self.record_counter_persistent_worker_ic("class_relation", true);
                 self.record_counter_class_relation_cache_hit();
                 self.record_counter_instanceof_cache_hit();
                 return Ok(target.matches);
             }
             ClassRelationCacheLookup::Invalidated => {
+                self.record_counter_persistent_worker_ic("class_relation", false);
                 self.record_counter_class_relation_cache_invalidation();
                 self.record_counter_instanceof_cache_miss();
             }
             ClassRelationCacheLookup::Miss => {
+                self.record_counter_persistent_worker_ic("class_relation", false);
                 self.record_counter_class_relation_cache_miss();
                 self.record_counter_instanceof_cache_miss();
             }
         }
         let matches = object_instanceof_in_state(compiled, state, value, class_name)?;
-        state.class_relation_cache.install(
+        state.class_relation_cache.borrow_mut().install(
             key,
             epochs,
             ClassRelationCacheTarget {

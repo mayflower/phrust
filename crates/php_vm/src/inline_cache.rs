@@ -646,7 +646,7 @@ pub struct ClassRelationCacheTarget {
     pub declaring_class: Option<String>,
 }
 
-/// One request-local class-relation cache entry.
+/// One guarded class-relation cache entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClassRelationCacheEntry {
     pub slot: InlineCacheId,
@@ -663,7 +663,8 @@ pub enum ClassRelationCacheLookup {
     Invalidated,
 }
 
-/// Request-local class-relation cache.
+/// Worker-persistent class-relation cache. Keys include compiled-unit config
+/// identity and every declaration/autoload epoch needed for safe reuse.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ClassRelationCache {
     next_slot: u32,
@@ -732,6 +733,8 @@ pub struct InlineCacheHeader {
     /// Entries were installed from persistent feedback (attribution only;
     /// every guard still validates at lookup).
     pub seeded: bool,
+    /// The guarded payload existed before the current request began.
+    pub persistent_worker: bool,
     pub state: InlineCacheState,
     pub unit_key: u64,
     pub function: FunctionId,
@@ -988,6 +991,7 @@ pub struct InlineCacheObservation {
     pub candidate: bool,
     /// The slot's current entries were installed from persistent feedback.
     pub seeded: bool,
+    pub persistent_worker: bool,
     pub slot_allocated: bool,
     pub kind: Option<InlineCacheKind>,
     pub hit: bool,
@@ -1062,6 +1066,7 @@ impl InlineCacheObservation {
         Self {
             candidate: false,
             seeded: false,
+            persistent_worker: false,
             slot_allocated: false,
             kind: None,
             hit: false,
@@ -1098,6 +1103,7 @@ fn record_slot_hit(slot: &mut InlineCacheSlot) -> InlineCacheObservation {
     slot.stats.protocol.record_guard_hit();
     InlineCacheObservation {
         seeded: slot.seeded,
+        persistent_worker: slot.persistent_worker,
         monomorphic: slot.state == InlineCacheState::Monomorphic,
         polymorphic: slot.state == InlineCacheState::Polymorphic,
         ..InlineCacheObservation::hit()
@@ -1107,7 +1113,10 @@ fn record_slot_hit(slot: &mut InlineCacheSlot) -> InlineCacheObservation {
 fn record_slot_miss(slot: &mut InlineCacheSlot) -> InlineCacheObservation {
     slot.stats.misses = slot.stats.misses.saturating_add(1);
     slot.stats.protocol.record_cold_fallback();
-    InlineCacheObservation::miss()
+    InlineCacheObservation {
+        persistent_worker: slot.persistent_worker,
+        ..InlineCacheObservation::miss()
+    }
 }
 
 fn record_slot_invalidation(slot: &mut InlineCacheSlot) -> InlineCacheObservation {
@@ -1116,10 +1125,12 @@ fn record_slot_invalidation(slot: &mut InlineCacheSlot) -> InlineCacheObservatio
     slot.stats.protocol.record_cold_fallback();
     slot.state = InlineCacheState::Cold;
     let seeded = slot.seeded;
+    let persistent_worker = slot.persistent_worker;
     slot.seeded = false;
     clear_slot_targets(slot);
     InlineCacheObservation {
         seeded,
+        persistent_worker,
         ..InlineCacheObservation::invalidation()
     }
 }
@@ -1187,6 +1198,7 @@ fn mark_slot_megamorphic(slot: &mut InlineCacheSlot) {
 fn clear_slot_targets(slot: &mut InlineCacheSlot) {
     let kind = slot.payload.kind();
     slot.payload = InlineCachePayload::empty(kind);
+    slot.persistent_worker = false;
 }
 
 fn finish_polymorphic_install(
@@ -1202,6 +1214,7 @@ fn finish_polymorphic_install(
     };
     slot.epoch = epoch;
     slot.seeded = false;
+    slot.persistent_worker = false;
 }
 
 fn sync_function_call_primary(slot: &mut InlineCacheSlot) {
@@ -1278,6 +1291,85 @@ pub struct InlineCacheTable {
 }
 
 impl InlineCacheTable {
+    /// Marks guarded payloads that survived from an earlier request. Empty
+    /// slots remain ordinary cold misses and are not attributed as reuse.
+    pub fn begin_request(&mut self) -> usize {
+        let mut dynamic_invalidations = 0usize;
+        for slot in &mut self.slots {
+            let mut removed = 0usize;
+            let retained = match &mut slot.payload {
+                InlineCachePayload::FunctionCall(entries) => {
+                    let before = entries.len();
+                    entries.retain(|entry| {
+                        matches!(entry.target, FunctionCallCacheTarget::CurrentUnit { .. })
+                    });
+                    removed = before.saturating_sub(entries.len());
+                    !entries.is_empty()
+                }
+                InlineCachePayload::MethodCall(entries) => {
+                    let before = entries.len();
+                    entries.retain(|entry| {
+                        matches!(entry.target, MethodCallCacheTarget::CurrentUnit { .. })
+                    });
+                    removed = before.saturating_sub(entries.len());
+                    !entries.is_empty()
+                }
+                InlineCachePayload::PropertyFetch(entries) => {
+                    let before = entries.len();
+                    entries.retain(|entry| {
+                        matches!(entry.target, PropertyFetchCacheTarget::CurrentUnit { .. })
+                    });
+                    removed = before.saturating_sub(entries.len());
+                    !entries.is_empty()
+                }
+                InlineCachePayload::PropertyAssign(entries) => {
+                    let before = entries.len();
+                    entries.retain(|entry| {
+                        matches!(entry.target, PropertyAssignCacheTarget::CurrentUnit { .. })
+                    });
+                    removed = before.saturating_sub(entries.len());
+                    !entries.is_empty()
+                }
+                InlineCachePayload::ClassStatic(entries) => {
+                    let before = entries.len();
+                    entries.retain(|entry| {
+                        matches!(
+                            entry.target,
+                            ClassConstantStaticPropertyCacheTarget::CurrentUnit { .. }
+                        )
+                    });
+                    removed = before.saturating_sub(entries.len());
+                    !entries.is_empty()
+                }
+                InlineCachePayload::Empty(_) => false,
+                InlineCachePayload::IncludePath(_) | InlineCachePayload::AutoloadLookup(_) => true,
+            };
+            dynamic_invalidations = dynamic_invalidations.saturating_add(removed);
+            if !retained && removed > 0 {
+                clear_slot_targets(slot);
+                slot.state = InlineCacheState::Cold;
+            } else if removed > 0 {
+                let entry_count = match &slot.payload {
+                    InlineCachePayload::FunctionCall(entries) => entries.len(),
+                    InlineCachePayload::MethodCall(entries) => entries.len(),
+                    InlineCachePayload::PropertyFetch(entries) => entries.len(),
+                    InlineCachePayload::PropertyAssign(entries) => entries.len(),
+                    InlineCachePayload::ClassStatic(entries) => entries.len(),
+                    InlineCachePayload::IncludePath(entries) => entries.len(),
+                    InlineCachePayload::AutoloadLookup(entries) => entries.len(),
+                    InlineCachePayload::Empty(_) => 0,
+                };
+                slot.state = if entry_count == 1 {
+                    InlineCacheState::Monomorphic
+                } else {
+                    InlineCacheState::Polymorphic
+                };
+            }
+            slot.persistent_worker = !matches!(slot.payload, InlineCachePayload::Empty(_));
+        }
+        dynamic_invalidations
+    }
+
     /// Allocates or finds the dense ID for one inline-cache candidate.
     pub fn bind_slot(
         &mut self,
@@ -1306,6 +1398,7 @@ impl InlineCacheTable {
             header: InlineCacheHeader {
                 id,
                 seeded: false,
+                persistent_worker: false,
                 state: InlineCacheState::Cold,
                 unit_key,
                 function,
@@ -1763,6 +1856,7 @@ impl InlineCacheTable {
             // `seeded` after its own install call, keeping the flag true only
             // for slots touched exclusively by seeding.
             slot.seeded = false;
+            slot.persistent_worker = false;
             let new_entry = FunctionCallPolymorphicEntry {
                 lowered_name: lowered_name.clone(),
                 epoch,

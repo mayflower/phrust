@@ -1,6 +1,42 @@
 use super::*;
 
 impl Vm {
+    pub(super) fn record_counter_persistent_worker_ic(&self, family: &str, hit: bool) {
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_persistent_worker_ic(family, hit);
+        }
+    }
+
+    pub(super) fn record_counter_persistent_worker_class_cache_hit(&self) {
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.persistent_worker_class_cache_hits += 1;
+        }
+    }
+
+    pub(super) fn record_counter_persistent_worker_default_slot_hit(&self) {
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.persistent_worker_default_slot_template_hits += 1;
+        }
+    }
+
+    pub(super) fn record_counter_persistent_worker_constructor_hit(&self) {
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.persistent_worker_constructor_hits += 1;
+        }
+    }
+
+    pub(super) fn record_counter_persistent_worker_invalidation(&self, reason: &str) {
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_persistent_worker_invalidation(reason);
+        }
+    }
+
+    pub(super) fn record_counter_persistent_worker_rejection(&self, family: &str) {
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_persistent_worker_request_visible_rejection(family);
+        }
+    }
+
     pub(super) fn record_counter_instruction(&self, kind: &InstructionKind) {
         if !self.options.collect_counters {
             return;
@@ -588,6 +624,12 @@ impl Vm {
             return;
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            if observation.persistent_worker
+                && let Some(kind) = observation.kind
+                && (observation.hit || observation.miss)
+            {
+                counters.record_persistent_worker_ic(kind.counter_name(), observation.hit);
+            }
             counters.record_inline_cache(observation);
         }
     }
@@ -906,6 +948,46 @@ impl Vm {
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_copy_patch_executed();
+        }
+    }
+
+    #[cfg(all(feature = "jit-copy-patch", unix, target_arch = "aarch64"))]
+    pub(super) fn record_counter_copy_patch_side_exit(&self, reason: &str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_native_side_exit(reason);
+        }
+    }
+
+    #[cfg(all(feature = "jit-copy-patch", unix, target_arch = "aarch64"))]
+    pub(super) fn record_counter_native_leaf_cache_lookup(&self, positive: bool) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_native_leaf_cache_lookup(positive);
+        }
+    }
+
+    #[cfg(all(feature = "jit-copy-patch", unix, target_arch = "aarch64"))]
+    pub(super) fn record_counter_native_leaf_prewarm(
+        &self,
+        stats: &crate::copy_patch_bridge::NativeLeafPrewarmStats,
+    ) {
+        if !self.options.collect_counters || stats.attempts == 0 {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_native_leaf_prewarm(
+                stats.attempts,
+                stats.compiled,
+                stats.rejected,
+                stats.code_bytes,
+                stats.compile_time_nanos,
+                &stats.rejections_by_shape,
+            );
         }
     }
 
@@ -1267,6 +1349,15 @@ impl Vm {
             } else {
                 counters.record_direct_frame_fallback("argument_vector_observed");
             }
+        }
+    }
+
+    pub(super) fn record_counter_prepared_arg_vector_allocation_avoided(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_prepared_arg_vector_allocation_avoided();
         }
     }
 

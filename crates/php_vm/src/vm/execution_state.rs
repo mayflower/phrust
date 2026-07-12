@@ -32,7 +32,7 @@ pub(super) struct ExecutionState {
     pub(super) class_table_epoch: u64,
     pub(super) include_config_epoch: u64,
     pub(super) parsed_include_path: Arc<Vec<PathBuf>>,
-    pub(super) class_relation_cache: ClassRelationCache,
+    pub(super) class_relation_cache: Rc<RefCell<ClassRelationCache>>,
     pub(super) autoload_registry: AutoloadRegistry,
     pub(super) autoload_stack: Vec<String>,
     pub(super) spl_autoload_extensions: String,

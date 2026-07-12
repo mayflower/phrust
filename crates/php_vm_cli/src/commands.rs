@@ -5580,7 +5580,11 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let counters = parse_json_text(&json);
         assert_eq!(counters["jit_mode"], "off");
-        assert_eq!(counters["native_executions"], counters["jit_executed"]);
+        assert_eq!(counters["jit_executed"], 0);
+        assert_eq!(
+            counters["native_executions"],
+            counters["copy_patch_executed"]
+        );
         assert!(
             counters["bytecode_lower_attempts"].as_u64().unwrap() > 0,
             "{json}"

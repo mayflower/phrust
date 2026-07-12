@@ -68,22 +68,24 @@ impl Vm {
         // R1.2 fast lane: the dense call arm may hand bare positional values
         // (pre-validated shape, references already dereferenced at operand
         // read) — no `CallArgument` vector exists at all for those calls.
-        let prebound_values = std::mem::take(&mut call.positional_values);
+        let prebound_values = call.positional_values.take();
         // The dense fast lane may only pre-bind values for the exact shape the
         // classic predicate accepts; anything else must arrive as
         // `CallArgument`s so the general binder sees it.
         debug_assert!(
-            prebound_values.is_empty()
+            prebound_values.is_none()
                 || (elide_frame_args
                     && call.args.is_empty()
-                    && prebound_values.len() == ir_function.params.len()
+                    && prebound_values
+                        .as_ref()
+                        .is_some_and(|values| { values.len() == ir_function.params.len() })
                     && arguments::params_bind_direct(ir_function)),
             "pre-bound positional values outside the direct-bind fast shape"
         );
-        let direct_bind = !prebound_values.is_empty()
+        let direct_bind = prebound_values.is_some()
             || (elide_frame_args && arguments::is_direct_bind_fast_shape(ir_function, &call.args));
-        let mut direct_values: Vec<Value> = Vec::new();
-        let mut prepared_args: Vec<PreparedArg> = Vec::new();
+        let mut direct_values = CallValuesSmall::new();
+        let mut prepared_args: Option<Vec<PreparedArg>> = None;
         let mut frame_args: Vec<Value> = Vec::new();
         let mut binding_diagnostics: Vec<RuntimeDiagnostic> = Vec::new();
         let has_by_ref_arg;
@@ -94,7 +96,9 @@ impl Vm {
             // params, no defaults, no variadic, and no named arguments, so
             // `frame_args`/`binding_diagnostics` stay empty as they would on the
             // general path for this shape.
-            direct_values = if prebound_values.is_empty() {
+            direct_values = if let Some(prebound_values) = prebound_values {
+                prebound_values
+            } else {
                 std::mem::take(&mut call.args)
                     .into_iter()
                     .map(|arg| match arg.value {
@@ -102,9 +106,8 @@ impl Vm {
                         value => value,
                     })
                     .collect()
-            } else {
-                prebound_values
             };
+            self.record_counter_prepared_arg_vector_allocation_avoided();
             has_by_ref_arg = false;
         } else {
             let prepared = match arguments::prepare_arguments(
@@ -148,7 +151,7 @@ impl Vm {
             has_by_ref_arg = frame_reuse_prepared_args_blocked_reason(&prepared.args).is_some();
             frame_args = prepared.frame_args;
             binding_diagnostics = prepared.diagnostics;
-            prepared_args = prepared.args;
+            prepared_args = Some(prepared.args);
         }
         let frame_reuse_blocked_reason =
             frame_reuse_call_shape_reason.or_else(|| has_by_ref_arg.then_some("by_ref_argument"));
@@ -225,7 +228,7 @@ impl Vm {
             let args_is_empty = if direct_bind {
                 direct_values.is_empty()
             } else {
-                prepared_args.is_empty()
+                prepared_args.as_ref().is_none_or(Vec::is_empty)
             };
             if specialized_tiny_frame {
                 self.record_counter_specialized_frame_hit();
@@ -244,7 +247,7 @@ impl Vm {
                     arg_count: if direct_bind {
                         direct_values.len() as u32
                     } else {
-                        prepared_args.len() as u32
+                        prepared_args.as_ref().map_or(0, Vec::len) as u32
                     },
                 };
             }
@@ -344,8 +347,11 @@ impl Vm {
                 }
             }
         } else {
-            for (arg_index, (param, mut arg)) in
-                ir_function.params.iter().zip(prepared_args).enumerate()
+            for (arg_index, (param, mut arg)) in ir_function
+                .params
+                .iter()
+                .zip(prepared_args.unwrap_or_default())
+                .enumerate()
             {
                 if let Err(message) = coerce_or_check_param_type(
                     ParamTypecheckRequest {
@@ -3175,6 +3181,47 @@ impl Vm {
                             resolved
                         };
                         self.record_counter_dense_direct_call_hit();
+                        // Resolve first so userland shadowing and namespace
+                        // fallback remain authoritative, then run registry
+                        // intrinsics from borrowed dense operands before any
+                        // call-argument/value vector is materialized.
+                        let pre_args_intrinsic = if bare_positional_shape
+                            && deferred_values.is_none()
+                            && args.len() <= 8
+                            && args.iter().all(|arg| {
+                                arg.by_ref_dim.is_none()
+                                    && arg.by_ref_property.is_none()
+                                    && arg.by_ref_property_dim.is_none()
+                            })
+                            && self.options.inline_caches.enabled()
+                            && let FunctionCallCacheTarget::Builtin {
+                                kind: FunctionCallBuiltinKind::InternalRegistry,
+                                name: builtin_name,
+                            } = &target
+                        {
+                            let mut borrowed_values =
+                                smallvec::SmallVec::<[DenseOperandRead<'_>; 8]>::new();
+                            for arg in args {
+                                match self.read_dense_operand_ref(compiled, stack, arg.value) {
+                                    Ok(value) => borrowed_values.push(value),
+                                    Err(message) => {
+                                        drop(borrowed_values);
+                                        let result =
+                                            self.runtime_error(output, compiled, stack, message);
+                                        stack.pop_recycle();
+                                        return result;
+                                    }
+                                }
+                            }
+                            self.profile_builtin_call(builtin_name, || {
+                                self.try_execute_fast_builtin_stub_borrowed(
+                                    builtin_name,
+                                    &borrowed_values,
+                                )
+                            })
+                        } else {
+                            None
+                        };
                         // R1.2 fast lane: the IC resolved a current-unit dense
                         // callee whose bind shape sends arguments straight into
                         // frame locals (`is_direct_bind_fast_shape` split: the
@@ -3183,7 +3230,7 @@ impl Vm {
                         // operands as bare `Value`s; the direct-bind loop in
                         // `execute_bytecode_function` coerces and writes them
                         // to locals with no `Vec<CallArgument>` in between.
-                        let mut fast_lane_values: Option<Vec<Value>> = None;
+                        let mut fast_lane_values: Option<CallValuesSmall> = None;
                         if bare_positional_shape
                             && let Some(plan) = plan
                             && let FunctionCallCacheTarget::CurrentUnit {
@@ -3201,8 +3248,9 @@ impl Vm {
                                 plan.call_shape_meta.get(function.index()).copied()
                             && callee_meta.params_bind_direct
                             && callee_meta.elide_frame_args
+                            && args.len() <= 8
                         {
-                            let mut positional = Vec::with_capacity(args.len());
+                            let mut positional = CallValuesSmall::new();
                             for arg in args {
                                 match self.read_dense_operand_with_source(
                                     compiled,
@@ -3227,7 +3275,7 @@ impl Vm {
                             self.record_counter_dense_call_bare_args_hit();
                             fast_lane_values = Some(positional);
                         }
-                        let values = if fast_lane_values.is_some() {
+                        let values = if pre_args_intrinsic.is_some() || fast_lane_values.is_some() {
                             Vec::new()
                         } else if let Some(values) = deferred_values {
                             values
@@ -3244,7 +3292,9 @@ impl Vm {
                                 }
                             }
                         };
-                        let result = if let Some(plan) = plan
+                        let result = if let Some(result) = pre_args_intrinsic {
+                            result
+                        } else if let Some(plan) = plan
                             && let FunctionCallCacheTarget::CurrentUnit {
                                 unit_identity,
                                 function,
@@ -3313,6 +3363,23 @@ impl Vm {
                                     let native: Option<VmResult> = None;
                                     if let Some(result) = native {
                                         result
+                                    } else if let Some(value) = {
+                                        #[cfg(feature = "jit-cranelift")]
+                                        {
+                                            self.try_execute_dense_jit_leaf(
+                                                compiled,
+                                                state,
+                                                function,
+                                                ir_function,
+                                                &call,
+                                            )
+                                        }
+                                        #[cfg(not(feature = "jit-cranelift"))]
+                                        {
+                                            None
+                                        }
+                                    } {
+                                        VmResult::success_no_output(Some(value))
                                     } else {
                                         self.execute_bytecode_function(
                                             DenseExecutionRequest {
