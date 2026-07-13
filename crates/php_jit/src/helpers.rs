@@ -14,21 +14,11 @@ pub const JIT_HELPER_STATUS_OK: i32 = 0;
 pub const JIT_HELPER_STATUS_FALLBACK: i32 = 1;
 /// Native inline arithmetic overflowed and the VM must fall back.
 pub const JIT_HELPER_STATUS_OVERFLOW: i32 = 2;
-/// A native region requested a userland tail call after marshaling positional
-/// arguments into its ABI buffer. This is a region return status, not a helper
-/// return status.
-pub const JIT_HELPER_STATUS_TAILCALL: i32 = 3;
 /// Native execution reached an explicit deterministic PHP runtime fatal.
 pub const JIT_HELPER_STATUS_FATAL: i32 = 4;
-/// Base of the return-and-resume call-request region statuses: a region
-/// returning `RESUME_CALL_BASE + i` has marshaled the positional `Int`
-/// arguments of its `i`-th call site into their buffer slots and suspended
-/// itself. The runtime performs the call, writes the result into the site's
-/// result slot, and enters the corresponding continuation. The base is `16` so the
-/// range never aliases `OK`/`FALLBACK`/`OVERFLOW`/`TAILCALL` and leaves room
-/// for future scalar statuses below it.
-pub const JIT_HELPER_STATUS_RESUME_CALL_BASE: i32 = 16;
-
+/// Native target resolution requires compilation or generation refresh. The
+/// runtime may compile and retry, but must not enter an interpreter loop.
+pub const JIT_HELPER_STATUS_COMPILE_REQUIRED: i32 = 5;
 /// Helper argument kind.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

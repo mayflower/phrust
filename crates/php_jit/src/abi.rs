@@ -5,17 +5,18 @@
 //! future native code.
 
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use php_ir::{BlockId, FunctionId, InstrId, LocalId, RegId};
 
 /// Version for the C-compatible runtime ABI records.
-pub const JIT_RUNTIME_ABI_VERSION: u32 = 4;
+pub const JIT_RUNTIME_ABI_VERSION: u32 = 5;
 
 /// Stable ABI fingerprint for Cranelift ABI.
 ///
 /// This is updated only when a `repr(C)` boundary type changes layout or tag
 /// meaning. It is intentionally independent from Rust type names.
-pub const JIT_RUNTIME_ABI_HASH: u64 = 0x07c1_a817_0000_0004;
+pub const JIT_RUNTIME_ABI_HASH: u64 = 0x07c1_a817_0000_0005;
 
 /// Maximum number of scalar VM locals materialized by one native side exit.
 pub const JIT_DEOPT_MAX_SLOTS: usize = 64;
@@ -67,6 +68,7 @@ impl JitCallStatus {
     pub const FIBER_SUSPEND: Self = Self(4);
     pub const DEOPT: Self = Self(5);
     pub const ABI_MISMATCH: Self = Self(6);
+    pub const COMPILE_REQUIRED: Self = Self(7);
 }
 
 /// Stable tagged value passed across the generic helper boundary.
@@ -97,6 +99,179 @@ impl Default for JitCallResult {
             detail: 0,
             value: JitAbiSlot::default(),
         }
+    }
+}
+
+/// Stable native-call target family. Numeric values are ABI-visible.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct JitNativeCallKind(pub u32);
+
+impl JitNativeCallKind {
+    pub const FUNCTION: Self = Self(1);
+    pub const METHOD: Self = Self(2);
+    pub const STATIC_METHOD: Self = Self(3);
+    pub const CLOSURE: Self = Self(4);
+    pub const CALLABLE: Self = Self(5);
+    pub const PIPE: Self = Self(6);
+    pub const CONSTRUCTOR: Self = Self(7);
+    pub const DYNAMIC_CONSTRUCTOR: Self = Self(8);
+    pub const MAGIC_METHOD: Self = Self(9);
+    pub const PROPERTY_HOOK: Self = Self(10);
+    pub const AUTOLOAD_CALLBACK: Self = Self(11);
+    pub const ERROR_HANDLER: Self = Self(12);
+    pub const SHUTDOWN_FUNCTION: Self = Self(13);
+    pub const DESTRUCTOR: Self = Self(14);
+    pub const BUILTIN_CALLBACK: Self = Self(15);
+}
+
+/// ABI-visible flags for one prepared native argument.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct JitNativeArgFlags(pub u32);
+
+impl JitNativeArgFlags {
+    pub const NAMED: Self = Self(1 << 0);
+    pub const UNPACK: Self = Self(1 << 1);
+    pub const BY_REFERENCE: Self = Self(1 << 2);
+    pub const INDIRECT_TEMPORARY: Self = Self(1 << 3);
+    pub const BY_REF_RETURN_DESTINATION: Self = Self(1 << 4);
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+/// One argument slot written directly into a native callee-frame buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitNativeCallArgument {
+    pub value: JitAbiSlot,
+    /// Stable symbol hash for a named argument, zero for positional arguments.
+    pub name_hash: u64,
+    pub flags: JitNativeArgFlags,
+    /// Caller local/lvalue index for by-reference binding, or `u32::MAX`.
+    pub source_slot: u32,
+}
+
+/// Stable target descriptor resolved through generation-safe indirection.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitNativeCallTarget {
+    pub kind: JitNativeCallKind,
+    /// Known `FunctionId`, or `u32::MAX` for dynamic resolution.
+    pub function_id: u32,
+    /// Stable deployment generation expected by the caller.
+    pub generation: u64,
+    /// Function/method/callable symbol hash; no persisted absolute address.
+    pub symbol_hash: u64,
+    /// Class/receiver-context symbol hash when applicable.
+    pub class_hash: u64,
+}
+
+/// One ABI-stable PHP native frame shared by direct and dynamic calls.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JitNativeCallFrame {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub function_id: u32,
+    pub region_id: u32,
+    pub continuation_id: u32,
+    pub result_slot: u32,
+    pub local_count: u32,
+    pub temporary_count: u32,
+    pub argument_count: u32,
+    pub flags: u32,
+    /// Caller-owned `JitAbiSlot` table.
+    pub local_slots: u64,
+    /// Caller-owned `JitAbiSlot` table.
+    pub temporary_slots: u64,
+    /// Caller-owned `JitNativeCallArgument` table.
+    pub arguments: u64,
+    pub caller_frame: u64,
+    pub receiver_handle: u64,
+    pub class_context: u64,
+    pub exception_metadata: u64,
+    pub trace_metadata: u64,
+    pub generator_handle: u64,
+    pub fiber_handle: u64,
+    pub target: JitNativeCallTarget,
+}
+
+impl Default for JitNativeCallFrame {
+    fn default() -> Self {
+        Self {
+            abi_version: JIT_RUNTIME_ABI_VERSION,
+            struct_size: std::mem::size_of::<Self>() as u32,
+            function_id: u32::MAX,
+            region_id: u32::MAX,
+            continuation_id: u32::MAX,
+            result_slot: u32::MAX,
+            local_count: 0,
+            temporary_count: 0,
+            argument_count: 0,
+            flags: 0,
+            local_slots: 0,
+            temporary_slots: 0,
+            arguments: 0,
+            caller_frame: 0,
+            receiver_handle: 0,
+            class_context: 0,
+            exception_metadata: 0,
+            trace_metadata: 0,
+            generator_handle: 0,
+            fiber_handle: 0,
+            target: JitNativeCallTarget::default(),
+        }
+    }
+}
+
+/// Dynamic call resolver/invoker. It may compile and retry a native entry, but
+/// it must never invoke a bytecode or IR interpreter.
+pub type JitNativeDispatchTrampoline = unsafe extern "C" fn(
+    vm_context: u64,
+    frame: *mut JitNativeCallFrame,
+    out: *mut JitCallResult,
+) -> i32;
+
+/// Generation-safe process-local indirection entry. Persisted code stores only
+/// `function_id` and generation; absolute addresses remain in this live table.
+#[derive(Debug)]
+pub struct JitNativeIndirectionEntry {
+    function_id: u32,
+    generation: AtomicU64,
+    address: AtomicUsize,
+}
+
+impl JitNativeIndirectionEntry {
+    #[must_use]
+    pub const fn new(function_id: u32) -> Self {
+        Self {
+            function_id,
+            generation: AtomicU64::new(0),
+            address: AtomicUsize::new(0),
+        }
+    }
+
+    #[must_use]
+    pub const fn function_id(&self) -> u32 {
+        self.function_id
+    }
+
+    /// Publishes a new generation after the native entry address is visible.
+    pub fn publish(&self, generation: u64, address: usize) {
+        self.address.store(address, Ordering::Release);
+        self.generation.store(generation, Ordering::Release);
+    }
+
+    /// Resolves only the exact generation expected by compiled code.
+    #[must_use]
+    pub fn resolve(&self, expected_generation: u64) -> Option<usize> {
+        (self.generation.load(Ordering::Acquire) == expected_generation)
+            .then(|| self.address.load(Ordering::Acquire))
+            .filter(|address| *address != 0)
     }
 }
 
@@ -832,8 +1007,9 @@ mod tests {
     use super::{
         JIT_RUNTIME_ABI_HASH, JIT_RUNTIME_ABI_VERSION, JitCExit, JitCExitTag, JitCFrameView,
         JitCValue, JitCValueTag, JitCallResult, JitCallStatus, JitFrameHandle, JitFrameView,
-        JitOpaqueHandle, JitOpaqueValueKind, JitSideExit, JitVmContextHandle, SideExitReason,
-        helper_id, jit_default_helper_dispatch,
+        JitNativeArgFlags, JitNativeCallArgument, JitNativeCallFrame, JitNativeCallKind,
+        JitNativeIndirectionEntry, JitOpaqueHandle, JitOpaqueValueKind, JitSideExit,
+        JitVmContextHandle, SideExitReason, helper_id, jit_default_helper_dispatch,
     };
 
     #[test]
@@ -863,7 +1039,7 @@ mod tests {
 
     #[test]
     fn c_abi_layout_is_stable() {
-        assert_eq!(JIT_RUNTIME_ABI_VERSION, 4);
+        assert_eq!(JIT_RUNTIME_ABI_VERSION, 5);
         assert_ne!(JIT_RUNTIME_ABI_HASH, 0);
         assert_eq!(size_of::<JitOpaqueHandle>(), 8);
         assert_eq!(size_of::<JitCValueTag>(), 4);
@@ -874,6 +1050,40 @@ mod tests {
         assert_eq!(size_of::<JitCExitTag>(), 4);
         assert_eq!(size_of::<JitCExit>(), 48);
         assert_eq!(align_of::<JitCExit>(), 8);
+        assert_eq!(align_of::<JitNativeCallArgument>(), 8);
+        assert_eq!(align_of::<JitNativeCallFrame>(), 8);
+        assert_eq!(
+            JitNativeCallFrame::default().struct_size as usize,
+            size_of::<JitNativeCallFrame>()
+        );
+    }
+
+    #[test]
+    fn native_call_frame_and_generation_indirection_are_stable() {
+        let mut frame = JitNativeCallFrame::default();
+        frame.function_id = 7;
+        frame.continuation_id = 11;
+        frame.target.kind = JitNativeCallKind::METHOD;
+        frame.argument_count = 2;
+        assert_eq!(frame.abi_version, JIT_RUNTIME_ABI_VERSION);
+        assert_eq!(frame.target.kind, JitNativeCallKind::METHOD);
+
+        let argument = JitNativeCallArgument {
+            flags: JitNativeArgFlags::NAMED.union(JitNativeArgFlags::BY_REFERENCE),
+            source_slot: 3,
+            ..JitNativeCallArgument::default()
+        };
+        assert_ne!(argument.flags.0 & JitNativeArgFlags::NAMED.0, 0);
+
+        let entry = JitNativeIndirectionEntry::new(7);
+        assert_eq!(entry.function_id(), 7);
+        assert_eq!(entry.resolve(1), None);
+        entry.publish(1, 0x1234);
+        assert_eq!(entry.resolve(1), Some(0x1234));
+        assert_eq!(entry.resolve(2), None);
+        entry.publish(2, 0x5678);
+        assert_eq!(entry.resolve(1), None);
+        assert_eq!(entry.resolve(2), Some(0x5678));
     }
 
     #[test]

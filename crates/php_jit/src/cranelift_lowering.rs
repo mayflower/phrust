@@ -9,9 +9,9 @@ use crate::code_manager::ManagedCompileError;
 #[cfg(test)]
 use crate::region_ir::build_baseline_region;
 use crate::region_ir::{
-    BaselineRegionBuilder, CompileMetadata, NativeCompilerTier, RegionBinaryOp,
-    RegionCompareOpCode, RegionGraph, RegionInstruction, RegionInstructionKind, RegionOperand,
-    RegionTerminator,
+    BaselineRegionBuilder, CompileMetadata, NativeCompilerTier, RegionBinaryOp, RegionCallResult,
+    RegionCallTarget, RegionCompareOpCode, RegionGraph, RegionInstruction, RegionInstructionKind,
+    RegionNativeCall, RegionOperand, RegionTerminator,
 };
 use crate::{
     CraneliftCodeKey, CraneliftCompilerIdentity, JIT_HELPER_STATUS_FATAL, JIT_HELPER_STATUS_OK,
@@ -282,6 +282,7 @@ const STRING_CONCAT_HELPER_SYMBOL: &str = "php_jit_concat_string_string_fast";
 const RECORD_ARRAY_LOOKUP_HELPER_SYMBOL: &str = "phrust_jit_record_array_lookup";
 #[cfg(test)]
 const PROPERTY_LOAD_HELPER_SYMBOL: &str = "php_jit_property_load_monomorphic_fast";
+const NATIVE_CALL_DISPATCH_SYMBOL: &str = "phrust_jit_native_call_dispatch";
 
 /// Mandatory Cranelift native compiler.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -351,7 +352,12 @@ fn compile_authoritative_region(request: &NativeCompileRequest<'_>) -> NativeCom
         }
     };
     let start = Instant::now();
-    match executable_region::compile_region_graph_native(unit, &region, request.compile) {
+    match executable_region::compile_region_graph_native(
+        unit,
+        &region,
+        request.runtime_helpers.native_call_dispatch,
+        request.compile,
+    ) {
         Ok(compiled) => {
             let elapsed = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
             NativeCompileOutcome::compiled(
@@ -394,6 +400,7 @@ fn runtime_helper_abi_hash(helpers: crate::JitRuntimeHelperAddresses) -> u64 {
         helpers.string_concat,
         helpers.property_load,
         helpers.record_array_lookup,
+        helpers.native_call_dispatch,
     ] {
         for byte in address.to_le_bytes() {
             hash ^= u64::from(byte);
@@ -690,7 +697,12 @@ impl CraneliftNativeCompiler {
 
         if let Ok(region) = build_baseline_region(unit, function) {
             let start = Instant::now();
-            match executable_region::compile_region_graph_native(unit, &region, request.compile) {
+            match executable_region::compile_region_graph_native(
+                unit,
+                &region,
+                request.runtime_helpers.native_call_dispatch,
+                request.compile,
+            ) {
                 Ok(compiled) => {
                     let elapsed = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
                     return NativeCompileOutcome::compiled(
@@ -3441,6 +3453,7 @@ fn lower_region_instruction(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     functions: &BTreeMap<FunctionId, FuncId>,
+    native_call_helper: Option<FuncId>,
     locals: &BTreeMap<LocalId, Variable>,
     registers: &mut BTreeMap<RegId, ir::Value>,
     instruction: &RegionInstruction,
@@ -3483,8 +3496,29 @@ fn lower_region_instruction(
             )?;
             registers.insert(*dst, cl_value);
         }
-        RegionInstructionKind::DirectCall { dst, target, args } => {
-            let callee = functions.get(target).copied().ok_or_else(|| {
+        RegionInstructionKind::NativeCall(call) => {
+            let direct = match call.result {
+                RegionCallResult::Register(dst) => {
+                    call.direct_compiled_target().map(|target| (dst, target))
+                }
+                RegionCallResult::ReferenceLocal(_) => None,
+            };
+            let Some((dst, target)) = direct else {
+                lower_native_call_trampoline(
+                    module,
+                    builder,
+                    native_call_helper,
+                    locals,
+                    registers,
+                    call,
+                    instruction,
+                    function,
+                    local_count,
+                    pointer_type,
+                )?;
+                return Ok(());
+            };
+            let callee = functions.get(&target).copied().ok_or_else(|| {
                 CraneliftLoweringError::new(
                     "JIT_CRANELIFT_REJECT_DIRECT_CALLEE",
                     format!("native direct callee {} was not declared", target.raw()),
@@ -3496,9 +3530,18 @@ fn lower_region_instruction(
                 3,
             ));
             let result_out = builder.ins().stack_addr(pointer_type, result_slot, 0);
-            let mut call_args = args
+            let mut call_args = call
+                .operands
                 .iter()
-                .map(|operand| lower_region_operand(builder, locals, registers, *operand))
+                .map(|operand| {
+                    let operand = operand.ok_or_else(|| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_NATIVE_CALL_BINDER_REQUIRED",
+                            "direct call argument requires the typed native binder",
+                        )
+                    })?;
+                    lower_region_operand(builder, locals, registers, operand)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             call_args.push(result_out);
             call_args.push(deopt_out);
@@ -3518,7 +3561,7 @@ fn lower_region_instruction(
             builder.ins().return_(&[status]);
             builder.switch_to_block(ok);
             let value = builder.ins().stack_load(types::I64, result_slot, 0);
-            registers.insert(*dst, value);
+            registers.insert(dst, value);
         }
         RegionInstructionKind::Compare { dst, op, lhs, rhs } => {
             let lhs = lower_region_operand(builder, locals, registers, *lhs)?;
@@ -3552,6 +3595,306 @@ fn lower_region_instruction(
                     instruction.span.end
                 ),
             ));
+        }
+    }
+    Ok(())
+}
+
+fn native_call_target_metadata(target: &RegionCallTarget) -> (u32, u32, u64, u64) {
+    match target {
+        RegionCallTarget::Function { name, function } => (
+            crate::JitNativeCallKind::FUNCTION.0,
+            function.map_or(u32::MAX, FunctionId::raw),
+            stable_call_symbol_hash(name),
+            0,
+        ),
+        RegionCallTarget::Method { method, .. } => (
+            crate::JitNativeCallKind::METHOD.0,
+            u32::MAX,
+            stable_call_symbol_hash(method),
+            0,
+        ),
+        RegionCallTarget::StaticMethod { class_name, method } => (
+            crate::JitNativeCallKind::STATIC_METHOD.0,
+            u32::MAX,
+            stable_call_symbol_hash(method),
+            stable_call_symbol_hash(class_name),
+        ),
+        RegionCallTarget::Closure { .. } => (crate::JitNativeCallKind::CLOSURE.0, u32::MAX, 0, 0),
+        RegionCallTarget::Callable { .. } => (crate::JitNativeCallKind::CALLABLE.0, u32::MAX, 0, 0),
+        RegionCallTarget::Pipe { .. } => (crate::JitNativeCallKind::PIPE.0, u32::MAX, 0, 0),
+        RegionCallTarget::Constructor { class_name, .. } => (
+            crate::JitNativeCallKind::CONSTRUCTOR.0,
+            u32::MAX,
+            0,
+            stable_call_symbol_hash(class_name),
+        ),
+        RegionCallTarget::DynamicConstructor { .. } => (
+            crate::JitNativeCallKind::DYNAMIC_CONSTRUCTOR.0,
+            u32::MAX,
+            0,
+            0,
+        ),
+    }
+}
+
+fn stable_call_symbol_hash(name: &str) -> u64 {
+    name.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte.to_ascii_lowercase())).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+fn native_argument_flags(argument: &php_ir::instruction::IrCallArg) -> u32 {
+    let mut flags = crate::JitNativeArgFlags::default();
+    if argument.name.is_some() {
+        flags = flags.union(crate::JitNativeArgFlags::NAMED);
+    }
+    if argument.unpack {
+        flags = flags.union(crate::JitNativeArgFlags::UNPACK);
+    }
+    if argument.by_ref_local.is_some()
+        || argument.by_ref_dim.is_some()
+        || argument.by_ref_property.is_some()
+        || argument.by_ref_property_dim.is_some()
+    {
+        flags = flags.union(crate::JitNativeArgFlags::BY_REFERENCE);
+    }
+    if argument.value_kind == php_ir::instruction::IrCallArgValueKind::IndirectTemporary {
+        flags = flags.union(crate::JitNativeArgFlags::INDIRECT_TEMPORARY);
+    }
+    flags.0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_native_call_trampoline(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    native_call_helper: Option<FuncId>,
+    locals: &BTreeMap<LocalId, Variable>,
+    registers: &mut BTreeMap<RegId, ir::Value>,
+    call: &RegionNativeCall,
+    instruction: &RegionInstruction,
+    function: FunctionId,
+    local_count: u32,
+    pointer_type: ir::Type,
+) -> Result<(), CraneliftLoweringError> {
+    let helper = native_call_helper.ok_or_else(|| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_NATIVE_CALL_TRAMPOLINE",
+            "native call site has no typed dispatch trampoline",
+        )
+    })?;
+    let argument_size = std::mem::size_of::<crate::JitNativeCallArgument>();
+    let arguments_ptr = if call.args.is_empty() {
+        builder.ins().iconst(pointer_type, 0)
+    } else {
+        let bytes = argument_size.checked_mul(call.args.len()).ok_or_else(|| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_NATIVE_CALL_ARGUMENTS",
+                "native call argument table size overflowed",
+            )
+        })?;
+        let bytes = u32::try_from(bytes).map_err(|_| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_NATIVE_CALL_ARGUMENTS",
+                "native call argument table exceeds stack-slot limits",
+            )
+        })?;
+        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            bytes,
+            3,
+        ));
+        let pointer = builder.ins().stack_addr(pointer_type, slot, 0);
+        for (index, argument) in call.args.iter().enumerate() {
+            let base = i32::try_from(index.saturating_mul(argument_size)).unwrap_or(i32::MAX);
+            let lowered = call
+                .operands
+                .get(index)
+                .copied()
+                .flatten()
+                .map(|operand| lower_region_operand(builder, locals, registers, operand))
+                .transpose()?;
+            let tag = if lowered.is_some() { 3 } else { 0 };
+            let tag = builder.ins().iconst(types::I32, tag);
+            builder.ins().store(MemFlagsData::new(), tag, pointer, base);
+            let abi_flags = builder.ins().iconst(types::I32, 0);
+            builder
+                .ins()
+                .store(MemFlagsData::new(), abi_flags, pointer, base + 4);
+            let payload = lowered.unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+            builder
+                .ins()
+                .store(MemFlagsData::new(), payload, pointer, base + 8);
+            let name_hash = argument.name.as_deref().map_or(0, stable_call_symbol_hash);
+            let name_hash = builder.ins().iconst(types::I64, name_hash as i64);
+            builder
+                .ins()
+                .store(MemFlagsData::new(), name_hash, pointer, base + 16);
+            let flags = builder
+                .ins()
+                .iconst(types::I32, i64::from(native_argument_flags(argument)));
+            builder
+                .ins()
+                .store(MemFlagsData::new(), flags, pointer, base + 24);
+            let source_slot = argument.by_ref_local.map_or(u32::MAX, LocalId::raw);
+            let source_slot = builder.ins().iconst(types::I32, i64::from(source_slot));
+            builder
+                .ins()
+                .store(MemFlagsData::new(), source_slot, pointer, base + 28);
+        }
+        pointer
+    };
+
+    let frame_size =
+        u32::try_from(std::mem::size_of::<crate::JitNativeCallFrame>()).map_err(|_| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_NATIVE_CALL_FRAME",
+                "native call frame exceeds stack-slot limits",
+            )
+        })?;
+    let frame_slot = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        frame_size,
+        3,
+    ));
+    let frame_ptr = builder.ins().stack_addr(pointer_type, frame_slot, 0);
+    let zero = builder.ins().iconst(types::I64, 0);
+    for offset in (0..frame_size).step_by(8) {
+        builder.ins().store(
+            MemFlagsData::new(),
+            zero,
+            frame_ptr,
+            i32::try_from(offset).unwrap_or(i32::MAX),
+        );
+    }
+    let store_i32 = |builder: &mut FunctionBuilder<'_>, offset: usize, value: u32| {
+        let value = builder.ins().iconst(types::I32, i64::from(value));
+        builder.ins().store(
+            MemFlagsData::new(),
+            value,
+            frame_ptr,
+            i32::try_from(offset).unwrap_or(i32::MAX),
+        );
+    };
+    store_i32(
+        builder,
+        std::mem::offset_of!(crate::JitNativeCallFrame, abi_version),
+        crate::JIT_RUNTIME_ABI_VERSION,
+    );
+    store_i32(
+        builder,
+        std::mem::offset_of!(crate::JitNativeCallFrame, struct_size),
+        frame_size,
+    );
+    store_i32(
+        builder,
+        std::mem::offset_of!(crate::JitNativeCallFrame, function_id),
+        function.raw(),
+    );
+    store_i32(
+        builder,
+        std::mem::offset_of!(crate::JitNativeCallFrame, region_id),
+        function.raw(),
+    );
+    store_i32(
+        builder,
+        std::mem::offset_of!(crate::JitNativeCallFrame, continuation_id),
+        instruction.continuation_id,
+    );
+    let result_slot = match call.result {
+        RegionCallResult::Register(register) => register.raw(),
+        RegionCallResult::ReferenceLocal(local) => local.raw(),
+    };
+    store_i32(
+        builder,
+        std::mem::offset_of!(crate::JitNativeCallFrame, result_slot),
+        result_slot,
+    );
+    store_i32(
+        builder,
+        std::mem::offset_of!(crate::JitNativeCallFrame, local_count),
+        local_count,
+    );
+    store_i32(
+        builder,
+        std::mem::offset_of!(crate::JitNativeCallFrame, argument_count),
+        u32::try_from(call.args.len()).unwrap_or(u32::MAX),
+    );
+    let frame_flags =
+        u32::from(call.caller_strict_types) | if call.returns_by_reference { 1 << 1 } else { 0 };
+    store_i32(
+        builder,
+        std::mem::offset_of!(crate::JitNativeCallFrame, flags),
+        frame_flags,
+    );
+    builder.ins().store(
+        MemFlagsData::new(),
+        arguments_ptr,
+        frame_ptr,
+        std::mem::offset_of!(crate::JitNativeCallFrame, arguments) as i32,
+    );
+    let (kind, target_function, symbol_hash, class_hash) =
+        native_call_target_metadata(&call.target);
+    let target_offset = std::mem::offset_of!(crate::JitNativeCallFrame, target);
+    store_i32(
+        builder,
+        target_offset + std::mem::offset_of!(crate::JitNativeCallTarget, kind),
+        kind,
+    );
+    store_i32(
+        builder,
+        target_offset + std::mem::offset_of!(crate::JitNativeCallTarget, function_id),
+        target_function,
+    );
+    for (offset, value) in [
+        (
+            target_offset + std::mem::offset_of!(crate::JitNativeCallTarget, symbol_hash),
+            symbol_hash,
+        ),
+        (
+            target_offset + std::mem::offset_of!(crate::JitNativeCallTarget, class_hash),
+            class_hash,
+        ),
+    ] {
+        let value = builder.ins().iconst(types::I64, value as i64);
+        builder.ins().store(
+            MemFlagsData::new(),
+            value,
+            frame_ptr,
+            i32::try_from(offset).unwrap_or(i32::MAX),
+        );
+    }
+
+    let out_size = std::mem::size_of::<crate::JitCallResult>() as u32;
+    let out_slot = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        out_size,
+        3,
+    ));
+    let out_ptr = builder.ins().stack_addr(pointer_type, out_slot, 0);
+    let helper_ref = module.declare_func_in_func(helper, builder.func);
+    let vm_context = builder.ins().iconst(types::I64, 0);
+    let helper_call = builder
+        .ins()
+        .call(helper_ref, &[vm_context, frame_ptr, out_ptr]);
+    let status = builder.inst_results(helper_call)[0];
+    let ok = builder.create_block();
+    let side_exit = builder.create_block();
+    let is_ok = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, status, i64::from(JIT_HELPER_STATUS_OK));
+    builder.ins().brif(is_ok, ok, &[], side_exit, &[]);
+    builder.switch_to_block(side_exit);
+    builder.ins().return_(&[status]);
+    builder.switch_to_block(ok);
+    let value = builder.ins().stack_load(types::I64, out_slot, 16);
+    match call.result {
+        RegionCallResult::Register(register) => {
+            registers.insert(register, value);
+        }
+        RegionCallResult::ReferenceLocal(local) => {
+            builder.def_var(local_variable(locals, local)?, value);
         }
     }
     Ok(())
@@ -4036,6 +4379,54 @@ mod tests {
     }
 
     #[test]
+    fn cranelift_dynamic_call_uses_typed_native_trampoline() {
+        extern "C" fn trampoline(
+            _vm_context: u64,
+            frame: *mut crate::JitNativeCallFrame,
+            out: *mut crate::JitCallResult,
+        ) -> i32 {
+            assert!(!frame.is_null());
+            assert!(!out.is_null());
+            // SAFETY: The generated call owns both ABI records for this
+            // synchronous test invocation.
+            let frame = unsafe { &*frame };
+            assert_eq!(frame.abi_version, crate::JIT_RUNTIME_ABI_VERSION);
+            assert_eq!(frame.target.kind, crate::JitNativeCallKind::FUNCTION);
+            // SAFETY: `out` is a checked, caller-owned result record.
+            unsafe {
+                out.write(crate::JitCallResult {
+                    status: crate::JitCallStatus::COMPILE_REQUIRED,
+                    detail: frame.continuation_id,
+                    value: crate::JitAbiSlot::default(),
+                });
+            }
+            crate::JIT_HELPER_STATUS_COMPILE_REQUIRED
+        }
+
+        let (unit, function) = scalar_dynamic_call_fixture();
+        let mut backend = CraneliftNativeCompiler;
+        let request = JitCompileRequest::new("cl.region.dynamic-call");
+        let outcome = backend.compile_region(&NativeCompileRequest {
+            compile: &request,
+            unit: Some(&unit),
+            function: Some(function),
+            runtime_helpers: crate::JitRuntimeHelperAddresses {
+                native_call_dispatch: trampoline as *const () as usize,
+                ..crate::JitRuntimeHelperAddresses::default()
+            },
+        });
+        assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+        let handle = outcome.handle.expect("dynamic call should compile");
+        let crate::JitI64InvokeOutcome::SideExit { status, .. } = handle
+            .invoke_i64_with_deopt(&[], JIT_RUNTIME_ABI_HASH)
+            .expect("dynamic call trampoline should execute")
+        else {
+            panic!("dynamic call unexpectedly returned");
+        };
+        assert_eq!(status, crate::JIT_HELPER_STATUS_COMPILE_REQUIRED);
+    }
+
+    #[test]
     fn cranelift_helper_arithmetic_overflow_returns_native_status() {
         let (unit, function) = helper_overflow_fixture();
         let mut backend = CraneliftNativeCompiler;
@@ -4156,6 +4547,7 @@ mod tests {
                 string_concat: 0,
                 property_load: 0,
                 record_array_lookup: 0,
+                native_call_dispatch: 0,
             },
         });
 
@@ -4202,6 +4594,7 @@ mod tests {
                 string_concat: 0,
                 property_load: 0,
                 record_array_lookup: 0,
+                native_call_dispatch: 0,
             },
         });
 
@@ -4240,6 +4633,7 @@ mod tests {
                 string_concat: 0,
                 property_load: 0,
                 record_array_lookup: 0,
+                native_call_dispatch: 0,
             },
         });
 
@@ -4283,6 +4677,7 @@ mod tests {
                 string_concat: test_string_concat_helper as *const () as usize,
                 property_load: 0,
                 record_array_lookup: 0,
+                native_call_dispatch: 0,
             },
         });
 
@@ -4654,6 +5049,29 @@ mod tests {
             span,
         );
         (builder.finish(), caller, callee)
+    }
+
+    fn scalar_dynamic_call_fixture() -> (php_ir::IrUnit, FunctionId) {
+        let mut builder = IrBuilder::new(UnitId::new(0));
+        let file = builder.add_file("dynamic-call.php");
+        let span = IrSpan::new(file, 0, 1);
+        let function = builder.start_function("dynamic_wrapper", FunctionFlags::default(), span);
+        builder.set_entry(function);
+        builder.set_return_type(function, Some(IrReturnType::Int));
+        let block = builder.append_block(function);
+        let result = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::CallFunction {
+                dst: result,
+                name: "deployment_function".to_owned(),
+                args: Vec::new(),
+            },
+            span,
+        );
+        builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+        (builder.finish(), function)
     }
 
     fn scalar_loop_fixture() -> (php_ir::IrUnit, FunctionId) {

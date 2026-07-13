@@ -1,6 +1,6 @@
 //! Structured executable Region IR lowered from `php_ir`.
 
-use php_ir::instruction::{IrCallArgValueKind, TerminatorKind};
+use php_ir::instruction::{IrCallArg, IrCallArgValueKind, TerminatorKind};
 use php_ir::{
     AttributeEntry, BinaryOp, BlockId, ClassMethodEntry, CompareOp, FunctionEntry, FunctionFlags,
     FunctionId, InstrId, InstructionKind, IrCapture, IrConstant, IrParam, IrReturnType, IrSpan,
@@ -108,6 +108,83 @@ pub enum RegionOperand {
     I64(i64),
 }
 
+/// Destination written by one unified native call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegionCallResult {
+    Register(RegId),
+    ReferenceLocal(LocalId),
+}
+
+/// Typed target resolved by a direct indirection entry or the native trampoline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RegionCallTarget {
+    Function {
+        name: String,
+        function: Option<FunctionId>,
+    },
+    Method {
+        receiver: Operand,
+        method: String,
+    },
+    StaticMethod {
+        class_name: String,
+        method: String,
+    },
+    Closure {
+        callee: Operand,
+    },
+    Callable {
+        callee: Operand,
+    },
+    Pipe {
+        callable: Operand,
+    },
+    Constructor {
+        display_class_name: String,
+        class_name: String,
+    },
+    DynamicConstructor {
+        class_name: Operand,
+    },
+}
+
+/// One call-site contract. Argument metadata remains typed and is materialized
+/// directly into native slots during lowering, never into VM call objects.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegionNativeCall {
+    pub result: RegionCallResult,
+    pub target: RegionCallTarget,
+    pub args: Vec<IrCallArg>,
+    /// Compile-time scalar operands for direct-slot materialization. `None`
+    /// selects the native binder/trampoline for that argument.
+    pub operands: Vec<Option<RegionOperand>>,
+    pub direct_arity: Option<u32>,
+    pub returns_by_reference: bool,
+    pub caller_strict_types: bool,
+}
+
+impl RegionNativeCall {
+    /// Returns the fixed-arity userland callee for the allocation-free path.
+    /// Every other call shape is resolved by the typed native trampoline.
+    #[must_use]
+    pub fn direct_compiled_target(&self) -> Option<FunctionId> {
+        let RegionCallTarget::Function {
+            function: Some(function),
+            ..
+        } = self.target
+        else {
+            return None;
+        };
+        (!self.returns_by_reference
+            && self.direct_arity == u32::try_from(self.args.len()).ok()
+            && self.operands.iter().all(Option::is_some)
+            && self.args.iter().all(|arg| {
+                arg.name.is_none() && !arg.unpack && arg.value_kind == IrCallArgValueKind::Direct
+            }))
+        .then_some(function)
+    }
+}
+
 /// One executable Region IR instruction.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegionInstruction {
@@ -153,11 +230,7 @@ pub enum RegionInstructionKind {
         lhs: RegionOperand,
         rhs: RegionOperand,
     },
-    DirectCall {
-        dst: RegId,
-        target: FunctionId,
-        args: Vec<RegionOperand>,
-    },
+    NativeCall(RegionNativeCall),
     /// Explicit fatal produced by IR lowering; native code returns fatal status.
     RuntimeFatal {
         diagnostic_id: String,
@@ -294,12 +367,23 @@ impl RegionGraph {
         let mut callees = BTreeSet::new();
         for block in &self.blocks {
             for instruction in &block.instructions {
-                if let RegionInstructionKind::DirectCall { target, .. } = &instruction.kind {
-                    callees.insert(*target);
+                if let RegionInstructionKind::NativeCall(call) = &instruction.kind
+                    && let Some(target) = call.direct_compiled_target()
+                {
+                    callees.insert(target);
                 }
             }
         }
         callees.into_iter().collect()
+    }
+
+    #[must_use]
+    pub fn has_native_trampoline_calls(&self) -> bool {
+        self.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(&instruction.kind, RegionInstructionKind::NativeCall(call) if call.direct_compiled_target().is_none())
+            })
+        })
     }
 
     /// Verifies dense IDs and all explicit CFG targets.
@@ -438,44 +522,185 @@ impl BaselineRegionBuilder {
                         }
                     }
                     InstructionKind::CallFunction { dst, name, args } => {
-                        if args.iter().any(|arg| {
-                            arg.name.is_some()
-                                || arg.unpack
-                                || arg.value_kind != IrCallArgValueKind::Direct
-                        }) {
-                            RegionInstructionKind::MissingLowering
-                        } else if let Some(target) = unit
+                        let function = unit
                             .function_table
                             .iter()
                             .find(|entry| entry.name == *name)
-                            .map(|entry| entry.function)
-                        {
-                            let operands = args
-                                .iter()
-                                .map(|arg| lower_operand(unit, arg.value))
-                                .collect::<Result<Vec<_>, _>>();
-                            if unit
-                                .functions
-                                .get(target.index())
-                                .is_some_and(|target_function| {
-                                    args.len() == target_function.params.len()
-                                })
-                            {
-                                operands.map_or(RegionInstructionKind::MissingLowering, |args| {
-                                    fast_path_operations = fast_path_operations.saturating_add(1);
-                                    RegionInstructionKind::DirectCall {
-                                        dst: *dst,
-                                        target,
-                                        args,
-                                    }
-                                })
-                            } else {
-                                RegionInstructionKind::MissingLowering
-                            }
-                        } else {
-                            RegionInstructionKind::MissingLowering
+                            .map(|entry| entry.function);
+                        if function.is_some() {
+                            fast_path_operations = fast_path_operations.saturating_add(1);
                         }
+                        let direct_arity = function.and_then(|function| {
+                            unit.functions
+                                .get(function.index())
+                                .and_then(|target| u32::try_from(target.params.len()).ok())
+                        });
+                        RegionInstructionKind::NativeCall(RegionNativeCall {
+                            result: RegionCallResult::Register(*dst),
+                            target: RegionCallTarget::Function {
+                                name: name.clone(),
+                                function,
+                            },
+                            args: args.clone(),
+                            operands: lower_call_operands(unit, args),
+                            direct_arity,
+                            returns_by_reference: false,
+                            caller_strict_types: unit.strict_types,
+                        })
                     }
+                    InstructionKind::CallMethod {
+                        dst,
+                        object,
+                        method,
+                        args,
+                    } => RegionInstructionKind::NativeCall(RegionNativeCall {
+                        result: RegionCallResult::Register(*dst),
+                        target: RegionCallTarget::Method {
+                            receiver: *object,
+                            method: method.clone(),
+                        },
+                        args: args.clone(),
+                        operands: lower_call_operands(unit, args),
+                        direct_arity: None,
+                        returns_by_reference: false,
+                        caller_strict_types: unit.strict_types,
+                    }),
+                    InstructionKind::CallStaticMethod {
+                        dst,
+                        class_name,
+                        method,
+                        args,
+                    } => RegionInstructionKind::NativeCall(RegionNativeCall {
+                        result: RegionCallResult::Register(*dst),
+                        target: RegionCallTarget::StaticMethod {
+                            class_name: class_name.clone(),
+                            method: method.clone(),
+                        },
+                        args: args.clone(),
+                        operands: lower_call_operands(unit, args),
+                        direct_arity: None,
+                        returns_by_reference: false,
+                        caller_strict_types: unit.strict_types,
+                    }),
+                    InstructionKind::CallClosure { dst, callee, args } => {
+                        RegionInstructionKind::NativeCall(RegionNativeCall {
+                            result: RegionCallResult::Register(*dst),
+                            target: RegionCallTarget::Closure { callee: *callee },
+                            args: args.clone(),
+                            operands: lower_call_operands(unit, args),
+                            direct_arity: None,
+                            returns_by_reference: false,
+                            caller_strict_types: unit.strict_types,
+                        })
+                    }
+                    InstructionKind::CallCallable { dst, callee, args } => {
+                        RegionInstructionKind::NativeCall(RegionNativeCall {
+                            result: RegionCallResult::Register(*dst),
+                            target: RegionCallTarget::Callable { callee: *callee },
+                            args: args.clone(),
+                            operands: lower_call_operands(unit, args),
+                            direct_arity: None,
+                            returns_by_reference: false,
+                            caller_strict_types: unit.strict_types,
+                        })
+                    }
+                    InstructionKind::Pipe {
+                        dst,
+                        input,
+                        callable,
+                    } => RegionInstructionKind::NativeCall(RegionNativeCall {
+                        result: RegionCallResult::Register(*dst),
+                        target: RegionCallTarget::Pipe {
+                            callable: *callable,
+                        },
+                        args: vec![IrCallArg {
+                            name: None,
+                            value: *input,
+                            unpack: false,
+                            value_kind: IrCallArgValueKind::Direct,
+                            by_ref_local: None,
+                            by_ref_dim: None,
+                            by_ref_property: None,
+                            by_ref_property_dim: None,
+                        }],
+                        operands: vec![lower_operand(unit, *input).ok()],
+                        direct_arity: None,
+                        returns_by_reference: false,
+                        caller_strict_types: unit.strict_types,
+                    }),
+                    InstructionKind::BindReferenceFromCall { target, name, args } => {
+                        let function = unit
+                            .function_table
+                            .iter()
+                            .find(|entry| entry.name == *name)
+                            .map(|entry| entry.function);
+                        let direct_arity = function.and_then(|function| {
+                            unit.functions
+                                .get(function.index())
+                                .and_then(|target| u32::try_from(target.params.len()).ok())
+                        });
+                        RegionInstructionKind::NativeCall(RegionNativeCall {
+                            result: RegionCallResult::ReferenceLocal(*target),
+                            target: RegionCallTarget::Function {
+                                name: name.clone(),
+                                function,
+                            },
+                            args: args.clone(),
+                            operands: lower_call_operands(unit, args),
+                            direct_arity,
+                            returns_by_reference: true,
+                            caller_strict_types: unit.strict_types,
+                        })
+                    }
+                    InstructionKind::BindReferenceFromMethodCall {
+                        target,
+                        object,
+                        method,
+                        args,
+                    } => RegionInstructionKind::NativeCall(RegionNativeCall {
+                        result: RegionCallResult::ReferenceLocal(*target),
+                        target: RegionCallTarget::Method {
+                            receiver: *object,
+                            method: method.clone(),
+                        },
+                        args: args.clone(),
+                        operands: lower_call_operands(unit, args),
+                        direct_arity: None,
+                        returns_by_reference: true,
+                        caller_strict_types: unit.strict_types,
+                    }),
+                    InstructionKind::NewObject {
+                        dst,
+                        display_class_name,
+                        class_name,
+                        args,
+                    } => RegionInstructionKind::NativeCall(RegionNativeCall {
+                        result: RegionCallResult::Register(*dst),
+                        target: RegionCallTarget::Constructor {
+                            display_class_name: display_class_name.clone(),
+                            class_name: class_name.clone(),
+                        },
+                        args: args.clone(),
+                        operands: lower_call_operands(unit, args),
+                        direct_arity: None,
+                        returns_by_reference: false,
+                        caller_strict_types: unit.strict_types,
+                    }),
+                    InstructionKind::DynamicNewObject {
+                        dst,
+                        class_name,
+                        args,
+                    } => RegionInstructionKind::NativeCall(RegionNativeCall {
+                        result: RegionCallResult::Register(*dst),
+                        target: RegionCallTarget::DynamicConstructor {
+                            class_name: *class_name,
+                        },
+                        args: args.clone(),
+                        operands: lower_call_operands(unit, args),
+                        direct_arity: None,
+                        returns_by_reference: false,
+                        caller_strict_types: unit.strict_types,
+                    }),
                     InstructionKind::RuntimeError {
                         diagnostic_id,
                         message,
@@ -503,8 +728,6 @@ impl BaselineRegionBuilder {
                     | InstructionKind::BindReferenceFromDim { .. }
                     | InstructionKind::BindReferenceFromStaticPropertyDim { .. }
                     | InstructionKind::BindReferenceStaticProperty { .. }
-                    | InstructionKind::BindReferenceFromCall { .. }
-                    | InstructionKind::BindReferenceFromMethodCall { .. }
                     | InstructionKind::InitStaticLocal { .. }
                     | InstructionKind::InstanceOf { .. }
                     | InstructionKind::DynamicInstanceOf { .. }
@@ -514,8 +737,6 @@ impl BaselineRegionBuilder {
                     | InstructionKind::EmitDiagnostic { .. }
                     | InstructionKind::Yield { .. }
                     | InstructionKind::YieldFrom { .. }
-                    | InstructionKind::CallMethod { .. }
-                    | InstructionKind::CallStaticMethod { .. }
                     | InstructionKind::CloneObject { .. }
                     | InstructionKind::CloneWith { .. }
                     | InstructionKind::EnterTry { .. }
@@ -524,15 +745,10 @@ impl BaselineRegionBuilder {
                     | InstructionKind::Throw { .. }
                     | InstructionKind::MakeException { .. }
                     | InstructionKind::MakeClosure { .. }
-                    | InstructionKind::CallClosure { .. }
                     | InstructionKind::ResolveCallable { .. }
                     | InstructionKind::AcquireCallable { .. }
-                    | InstructionKind::CallCallable { .. }
-                    | InstructionKind::Pipe { .. }
                     | InstructionKind::Include { .. }
                     | InstructionKind::Eval { .. }
-                    | InstructionKind::NewObject { .. }
-                    | InstructionKind::DynamicNewObject { .. }
                     | InstructionKind::FetchProperty { .. }
                     | InstructionKind::FetchDynamicProperty { .. }
                     | InstructionKind::IssetProperty { .. }
@@ -823,6 +1039,12 @@ fn lower_operand(unit: &IrUnit, operand: Operand) -> Result<RegionOperand, Nativ
     }
 }
 
+fn lower_call_operands(unit: &IrUnit, args: &[IrCallArg]) -> Vec<Option<RegionOperand>> {
+    args.iter()
+        .map(|argument| lower_operand(unit, argument.value).ok())
+        .collect()
+}
+
 fn lower_constant(
     unit: &IrUnit,
     constant: php_ir::ConstId,
@@ -1018,6 +1240,109 @@ mod tests {
         let method = region.declarations.method.expect("method identity");
         assert_eq!(method.class_display_name, "Widget");
         assert_eq!(method.method.function, function);
+    }
+
+    #[test]
+    fn every_ir_call_form_enters_the_unified_native_call_model() {
+        let mut builder = IrBuilder::new(UnitId::new(95));
+        let file = builder.add_file("calls.php");
+        let span = IrSpan::new(file, 0, 20);
+        let function = builder.start_function("calls", FunctionFlags::default(), span);
+        let block = builder.append_block(function);
+        let constant = builder.intern_constant(IrConstant::Int(1));
+        let value = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::LoadConst {
+                dst: value,
+                constant,
+            },
+            span,
+        );
+        let argument = IrCallArg {
+            name: None,
+            value: Operand::Register(value),
+            unpack: false,
+            value_kind: IrCallArgValueKind::Direct,
+            by_ref_local: None,
+            by_ref_dim: None,
+            by_ref_property: None,
+            by_ref_property_dim: None,
+        };
+        let local = builder.intern_local(function, "reference");
+        let calls = [
+            InstructionKind::CallFunction {
+                dst: builder.alloc_register(function),
+                name: "f".to_owned(),
+                args: vec![argument.clone()],
+            },
+            InstructionKind::CallMethod {
+                dst: builder.alloc_register(function),
+                object: Operand::Register(value),
+                method: "m".to_owned(),
+                args: vec![argument.clone()],
+            },
+            InstructionKind::CallStaticMethod {
+                dst: builder.alloc_register(function),
+                class_name: "c".to_owned(),
+                method: "m".to_owned(),
+                args: vec![argument.clone()],
+            },
+            InstructionKind::CallClosure {
+                dst: builder.alloc_register(function),
+                callee: Operand::Register(value),
+                args: vec![argument.clone()],
+            },
+            InstructionKind::CallCallable {
+                dst: builder.alloc_register(function),
+                callee: Operand::Register(value),
+                args: vec![argument.clone()],
+            },
+            InstructionKind::Pipe {
+                dst: builder.alloc_register(function),
+                input: Operand::Register(value),
+                callable: Operand::Register(value),
+            },
+            InstructionKind::BindReferenceFromCall {
+                target: local,
+                name: "by_ref".to_owned(),
+                args: vec![argument.clone()],
+            },
+            InstructionKind::BindReferenceFromMethodCall {
+                target: local,
+                object: Operand::Register(value),
+                method: "byRef".to_owned(),
+                args: vec![argument.clone()],
+            },
+            InstructionKind::NewObject {
+                dst: builder.alloc_register(function),
+                display_class_name: "C".to_owned(),
+                class_name: "c".to_owned(),
+                args: vec![argument.clone()],
+            },
+            InstructionKind::DynamicNewObject {
+                dst: builder.alloc_register(function),
+                class_name: Operand::Register(value),
+                args: vec![argument],
+            },
+        ];
+        for call in calls {
+            builder.emit(function, block, call, span);
+        }
+        builder.terminate_return(function, block, Some(Operand::Register(value)), span);
+        let unit = builder.finish();
+        let region = build_baseline_region(&unit, function).expect("call graph");
+        let native_calls = region.blocks[0]
+            .instructions
+            .iter()
+            .filter(|instruction| matches!(instruction.kind, RegionInstructionKind::NativeCall(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(native_calls.len(), 10);
+        assert!(native_calls.iter().all(|instruction| !matches!(
+            instruction.kind,
+            RegionInstructionKind::MissingLowering
+        )));
     }
 
     #[test]

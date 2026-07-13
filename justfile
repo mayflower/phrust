@@ -1666,6 +1666,19 @@ cranelift-typed-runtime-ops:
     cargo test -p php_vm expressions_execute_
     cargo check --workspace --all-targets
 
+# Prompt 6 cutover gate: every PHP call form uses one native frame and either
+# generation-bound compiled code or the typed native dispatch trampoline.
+cranelift-native-calls:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo run --quiet -p php_jit --example cranelift_native_call_audit
+    scripts/verify/cranelift_native_calls.py
+    scripts/verify/cranelift_only_stage_ratchet.py
+    cargo test -p php_jit --lib native_call
+    cargo test -p php_jit --lib cranelift_region_calls_same_unit_compiled_callee_directly
+    cargo test -p php_vm native_call_trampoline_requests_compile_without_interpreter_reentry
+    cargo check --workspace --all-targets
+
 jit-cranelift-smoke:
     @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
     cargo check --workspace

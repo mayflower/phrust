@@ -28,7 +28,9 @@ pub use abi::{
     JIT_DEOPT_MAX_SLOTS, JIT_RUNTIME_ABI_HASH, JIT_RUNTIME_ABI_VERSION, JitAbiSlot, JitAbiValue,
     JitBailout, JitBailoutKind, JitCExit, JitCExitTag, JitCFrameView, JitCValue, JitCValueTag,
     JitCallResult, JitCallStatus, JitDeoptState, JitExceptionMarker, JitFrameHandle, JitFrameView,
-    JitHelperDispatch, JitOpaqueHandle, JitOpaqueValueKind, JitRegionResult, JitRuntimeCallout,
+    JitHelperDispatch, JitNativeArgFlags, JitNativeCallArgument, JitNativeCallFrame,
+    JitNativeCallKind, JitNativeCallTarget, JitNativeDispatchTrampoline, JitNativeIndirectionEntry,
+    JitOpaqueHandle, JitOpaqueValueKind, JitRegionResult, JitRuntimeCallout,
     JitRuntimeCalloutResult, JitRuntimeHelperTable, JitSideExit, JitVmContextHandle,
     SideExitReason, helper_id, jit_default_helper_dispatch,
 };
@@ -48,10 +50,9 @@ pub use eligibility::{
     JitEligibilityStats, analyze_jit_eligibility, call_args_are_jit_primitive,
 };
 pub use helpers::{
-    JIT_HELPER_REGISTRY_ABI_HASH, JIT_HELPER_STATUS_FALLBACK, JIT_HELPER_STATUS_FATAL,
-    JIT_HELPER_STATUS_OK, JIT_HELPER_STATUS_OVERFLOW, JIT_HELPER_STATUS_RESUME_CALL_BASE,
-    JIT_HELPER_STATUS_TAILCALL, JIT_HELPER_SYMBOLS, JitHelperArgKind, JitHelperId,
-    JitHelperReturnKind, JitHelperSymbol, helper_registry_is_stable,
+    JIT_HELPER_REGISTRY_ABI_HASH, JIT_HELPER_STATUS_COMPILE_REQUIRED, JIT_HELPER_STATUS_FALLBACK,
+    JIT_HELPER_STATUS_FATAL, JIT_HELPER_STATUS_OK, JIT_HELPER_STATUS_OVERFLOW, JIT_HELPER_SYMBOLS,
+    JitHelperArgKind, JitHelperId, JitHelperReturnKind, JitHelperSymbol, helper_registry_is_stable,
     helper_registry_layout_summary, lookup_helper_by_id, lookup_helper_by_name,
 };
 pub use host_isa::{CraneliftHostIsaError, CraneliftHostIsaIdentity, cranelift_host_isa_identity};
@@ -91,6 +92,8 @@ pub struct JitRuntimeHelperAddresses {
     pub property_load: usize,
     /// ABI wrapper for record-shape symbol-guarded array lookups.
     pub record_array_lookup: usize,
+    /// Typed dynamic-call resolver/invoker; never an interpreter dispatcher.
+    pub native_call_dispatch: usize,
 }
 
 /// Request to compile one future JIT region.

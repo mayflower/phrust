@@ -39,8 +39,9 @@ pub use coverage::{
 pub use dump::dump_region_graph;
 pub use executable::{
     BaselineRegionBuilder, CompileMetadata, NativeCompileError, NativeCompilerTier, RegionBinaryOp,
-    RegionBlock, RegionCompareOpCode, RegionDeclarationMetadata, RegionExceptionRegion,
-    RegionGraph, RegionInstruction, RegionInstructionKind, RegionMethodIdentity, RegionOperand,
+    RegionBlock, RegionCallResult, RegionCallTarget, RegionCompareOpCode,
+    RegionDeclarationMetadata, RegionExceptionRegion, RegionGraph, RegionInstruction,
+    RegionInstructionKind, RegionMethodIdentity, RegionNativeCall, RegionOperand,
     RegionOsrEntryPoint, RegionTerminator, build_baseline_region,
 };
 pub use ids::{ConstId, EntryId, ExitId, NodeId, RegionId, SnapshotId, VmSlotId};

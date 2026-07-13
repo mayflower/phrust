@@ -131,3 +131,37 @@ It writes `target/cranelift-only/runtime-helper-audit.json` and Markdown, then
 checks required families, stable IDs, complete audit metadata, native-tier
 callability, forbidden generic-dispatch shortcuts, the IR-to-helper mapping,
 the shared VM semantics, and the complete workspace graph.
+
+## Prompt 6 unified native calls
+
+All IR call instructions now enter `RegionNativeCall`: function, instance and
+static method, closure, callable, pipe, both by-reference call destinations,
+and static/dynamic construction. The call contract retains named and unpacked
+arguments, lvalue/by-reference metadata, strict-types mode, direct arity, and
+an explicit by-reference return destination.
+
+`JitNativeCallFrame` is the single ABI record for native PHP frames. It carries
+function/region identity, local and temporary slot tables, caller continuation,
+result slot, receiver and class context, exception and trace metadata, and
+generator/fiber handles. `JitNativeCallArgument` carries values, name hashes,
+unpack/by-reference flags, and caller lvalue slots. Runtime callback kinds for
+builtins, magic methods, hooks, autoload, error handlers, shutdown functions,
+and destructors use the same target tags.
+
+Fixed-arity scalar calls within a generation remain compiled-to-compiled.
+Dynamic or complex calls write the ABI records directly into native stack slots
+and call `jit_native_call_dispatch_abi`. A missing or stale target returns
+`COMPILE_REQUIRED`; the trampoline has no executor-loop entry. Live absolute
+addresses are represented by `JitNativeIndirectionEntry` and checked against a
+deployment generation instead of being part of persisted target identity. The
+retired tailcall/resume statuses and their orphan emitter source are deleted.
+
+Run the gate with:
+
+```sh
+nix develop -c just cranelift-native-calls
+```
+
+The generated `target/cranelift-only/native-call-model.{json,md}` records the
+ABI layout and coverage. The gate rejects missing call forms, VM call objects
+in native lowering, interpreter re-entry, and the old tailcall/resume protocol.

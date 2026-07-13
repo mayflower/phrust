@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn compile_region_graph_native(
     unit: &IrUnit,
     region: &RegionGraph,
+    native_call_dispatch: usize,
     request: &JitCompileRequest,
 ) -> Result<NativeScalarRegionCompileResult, CraneliftLoweringError> {
     validate_region_native_coverage(region)?;
@@ -14,15 +15,53 @@ pub(super) fn compile_region_graph_native(
         .map(|region| region.fast_path_operations)
         .sum();
     let has_control_flow = regions.values().any(RegionGraph::has_control_flow);
+    let needs_call_trampoline = regions
+        .values()
+        .any(RegionGraph::has_native_trampoline_calls);
+    if needs_call_trampoline && native_call_dispatch == 0 {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_NATIVE_CALL_TRAMPOLINE",
+            "dynamic or complex call requires the typed native dispatch trampoline",
+        ));
+    }
+    let native_call_symbol = NATIVE_CALL_DISPATCH_SYMBOL.to_owned();
+    let mut imports = vec![(
+        "region-runtime-helper-abi".to_owned(),
+        region.compile_metadata.helper_abi_hash as usize,
+    )];
+    if needs_call_trampoline {
+        imports.push((native_call_symbol.clone(), native_call_dispatch));
+    }
+    let import_refs = imports
+        .iter()
+        .map(|(name, address)| (name.as_str(), *address))
+        .collect::<Vec<_>>();
     let compiled = compile_managed_native(
         request,
         function,
         "executable-region-v2",
-        &[(
-            "region-runtime-helper-abi",
-            region.compile_metadata.helper_abi_hash as usize,
-        )],
+        &import_refs,
         |module, name| {
+            let native_call_helper = if needs_call_trampoline {
+                let pointer_type = module.target_config().pointer_type();
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.returns.push(AbiParam::new(types::I32));
+                Some(
+                    module
+                        .declare_function(&native_call_symbol, Linkage::Import, &signature)
+                        .map_err(|error| {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_NATIVE_CALL_TRAMPOLINE",
+                                format!("failed to declare native call trampoline: {error}"),
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
             let mut functions = BTreeMap::new();
             for candidate in regions.values() {
                 let symbol = if candidate.function == function {
@@ -46,8 +85,13 @@ pub(super) fn compile_region_graph_native(
             let mut native_pc_ranges = Vec::new();
             for candidate in regions.values() {
                 let func_id = functions[&candidate.function];
-                let (candidate_bytes, mut candidate_ranges) =
-                    define_region_graph_function(module, candidate, func_id, &functions)?;
+                let (candidate_bytes, mut candidate_ranges) = define_region_graph_function(
+                    module,
+                    candidate,
+                    func_id,
+                    &functions,
+                    native_call_helper,
+                )?;
                 code_bytes = code_bytes.saturating_add(candidate_bytes);
                 native_pc_ranges.append(&mut candidate_ranges);
             }
@@ -251,6 +295,7 @@ fn define_region_graph_function(
     region: &RegionGraph,
     func_id: FuncId,
     functions: &BTreeMap<FunctionId, FuncId>,
+    native_call_helper: Option<FuncId>,
 ) -> Result<(u64, Vec<crate::JitNativePcRange>), CraneliftLoweringError> {
     let arity = region_arity(region)?;
     let pointer_type = module.target_config().pointer_type();
@@ -321,6 +366,7 @@ fn define_region_graph_function(
                     module,
                     &mut builder,
                     functions,
+                    native_call_helper,
                     &locals,
                     &mut registers,
                     instruction,
@@ -434,7 +480,16 @@ fn region_graph_metadata<'a>(
             .flat_map(|region| &region.blocks)
             .flat_map(|block| &block.instructions)
             .filter(|instruction| {
-                matches!(instruction.kind, RegionInstructionKind::DirectCall { .. })
+                matches!(
+                    instruction.kind,
+                    RegionInstructionKind::NativeCall(RegionNativeCall {
+                        target: RegionCallTarget::Function {
+                            function: Some(_),
+                            ..
+                        },
+                        ..
+                    })
+                )
             })
             .count() as u64,
         continuations,

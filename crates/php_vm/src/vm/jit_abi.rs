@@ -19,6 +19,50 @@ pub(super) fn jit_runtime_helper_table() -> &'static php_jit::JitRuntimeHelperTa
     &JIT_RUNTIME_HELPER_TABLE
 }
 
+/// Typed native call trampoline entry. Target compilation/lookup is requested
+/// explicitly; this boundary never invokes dense, rich, or IR dispatch.
+#[allow(unsafe_code)]
+pub(super) extern "C" fn jit_native_call_dispatch_abi(
+    _vm_context: u64,
+    frame: *mut php_jit::JitNativeCallFrame,
+    out: *mut php_jit::JitCallResult,
+) -> i32 {
+    if frame.is_null() || out.is_null() {
+        return php_jit::JIT_HELPER_STATUS_FATAL;
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: The generated caller owns both records for this synchronous
+        // call and the pointers were checked for null above.
+        let frame = unsafe { &*frame };
+        if frame.abi_version != php_jit::JIT_RUNTIME_ABI_VERSION
+            || frame.struct_size as usize != std::mem::size_of::<php_jit::JitNativeCallFrame>()
+            || (frame.argument_count != 0 && frame.arguments == 0)
+        {
+            return (
+                php_jit::JIT_HELPER_STATUS_FATAL,
+                php_jit::JitCallStatus::ABI_MISMATCH,
+            );
+        }
+        (
+            php_jit::JIT_HELPER_STATUS_COMPILE_REQUIRED,
+            php_jit::JitCallStatus::COMPILE_REQUIRED,
+        )
+    }));
+    let (status, call_status) = result.unwrap_or((
+        php_jit::JIT_HELPER_STATUS_FATAL,
+        php_jit::JitCallStatus::ABI_MISMATCH,
+    ));
+    // SAFETY: `out` is a checked, caller-owned result record.
+    unsafe {
+        out.write(php_jit::JitCallResult {
+            status: call_status,
+            detail: status as u32,
+            value: php_jit::JitAbiSlot::default(),
+        });
+    }
+    status
+}
+
 pub(super) fn jit_guard_kind_for_side_exit(reason: php_jit::SideExitReason) -> Option<GuardKind> {
     match reason {
         php_jit::SideExitReason::TypeMismatch => Some(GuardKind::QuickeningType),
@@ -265,5 +309,30 @@ pub(super) extern "C" fn jit_property_load_monomorphic_fast(
             php_jit::JIT_HELPER_STATUS_OK
         }
         Err(status) => status,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::jit_native_call_dispatch_abi;
+
+    #[test]
+    fn native_call_trampoline_requests_compile_without_interpreter_reentry() {
+        let mut frame = php_jit::JitNativeCallFrame::default();
+        frame.function_id = 3;
+        frame.continuation_id = 7;
+        let mut out = php_jit::JitCallResult::default();
+        assert_eq!(
+            jit_native_call_dispatch_abi(0, &mut frame, &mut out),
+            php_jit::JIT_HELPER_STATUS_COMPILE_REQUIRED
+        );
+        assert_eq!(out.status, php_jit::JitCallStatus::COMPILE_REQUIRED);
+
+        frame.abi_version = frame.abi_version.saturating_add(1);
+        assert_eq!(
+            jit_native_call_dispatch_abi(0, &mut frame, &mut out),
+            php_jit::JIT_HELPER_STATUS_FATAL
+        );
+        assert_eq!(out.status, php_jit::JitCallStatus::ABI_MISMATCH);
     }
 }
