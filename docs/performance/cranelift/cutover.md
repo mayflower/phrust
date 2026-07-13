@@ -102,3 +102,32 @@ nix develop -c just cranelift-exhaustive-lowering
 `RuntimeError` is represented as a native fatal status. `Unsupported` remains
 an explicit compile fatal during the staged migration and must be absent from
 reachable production IR by the final cutover.
+
+## Prompt 5 typed runtime operations
+
+The stable `JitHelperId` type is owned by `php_runtime` and shared by both
+Cranelift tiers. The runtime-operation registry records a versioned signature,
+typed operands and result/status, ownership, concrete implementation, callers,
+PHP-visible effects, and safepoint requirements for every required semantic
+family. Native-callable entries must identify a real backend-neutral
+`php_runtime::api::native_*` operation and be callable from both baseline and
+optimizing code.
+
+Unary, binary, comparison, cast, and echo semantics are the first IR operations
+mapped to this ABI. Their implementations were extracted from VM scalar
+dispatch into `php_runtime`; the VM now consumes the same operations. Results
+use caller-owned `Value` slots, failures use explicit statuses and request
+diagnostic state, operands are compiler-independent enums, and the operation
+module has no dependency on VM or IR dispatch types. The native cache key folds
+in the runtime-operation ABI hash.
+
+Run the gate with:
+
+```sh
+nix develop -c just cranelift-typed-runtime-ops
+```
+
+It writes `target/cranelift-only/runtime-helper-audit.json` and Markdown, then
+checks required families, stable IDs, complete audit metadata, native-tier
+callability, forbidden generic-dispatch shortcuts, the IR-to-helper mapping,
+the shared VM semantics, and the complete workspace graph.

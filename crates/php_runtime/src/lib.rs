@@ -53,6 +53,7 @@ mod globals;
 mod ini;
 mod jit_array;
 mod layout_stats;
+mod native_ops;
 mod numeric_string;
 mod object;
 mod output;
@@ -198,6 +199,15 @@ pub mod api {
     pub use crate::generator::{GeneratorCallContext, GeneratorRef, GeneratorState};
     pub use crate::globals::GlobalSymbolTable;
     pub use crate::ini::{IniEntrySnapshot, IniRegistry};
+    pub use crate::native_ops::{
+        JIT_HELPER_ECHO_VALUE, JIT_HELPER_SCALAR_BINARY, JIT_HELPER_SCALAR_CAST,
+        JIT_HELPER_SCALAR_COMPARE, JIT_HELPER_SCALAR_UNARY, JitHelperId, NATIVE_OPERATION_ABI_HASH,
+        NATIVE_OPERATION_ABI_VERSION, NATIVE_OPERATION_REGISTRY, NativeAbiType, NativeBinaryOp,
+        NativeCastOp, NativeCompareOp, NativeOperationContext, NativeOperationDescriptor,
+        NativeOperationFamily, NativeOperationStatus, NativeOwnership, NativeUnaryOp,
+        lookup_native_operation, native_binary, native_cast, native_compare, native_echo,
+        native_operation_registry_is_stable, native_unary,
+    };
     pub use crate::object::{
         AttributeEntry, ClassConstantEntry, ClassConstantFlags, ClassEntry, ClassEnumBackingType,
         ClassEnumCaseEntry, ClassFlags, ClassMethodEntry, ClassMethodFlags, ClassPropertyEntry,

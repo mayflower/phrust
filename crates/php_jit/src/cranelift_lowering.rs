@@ -132,7 +132,10 @@ fn compile_managed_native(
         } else {
             "optimizing".to_owned()
         },
-        helper_abi_hash: config_hash ^ JIT_RUNTIME_ABI_HASH,
+        helper_abi_hash: config_hash
+            ^ JIT_RUNTIME_ABI_HASH
+            ^ crate::JIT_HELPER_REGISTRY_ABI_HASH
+            ^ php_runtime::api::NATIVE_OPERATION_ABI_HASH,
         target_cpu: format!(
             "{}:{}:{}",
             identity.target_triple, identity.isa_name, identity.feature_fingerprint
@@ -379,7 +382,9 @@ fn compile_authoritative_region(request: &NativeCompileRequest<'_>) -> NativeCom
 }
 
 fn runtime_helper_abi_hash(helpers: crate::JitRuntimeHelperAddresses) -> u64 {
-    let mut hash = JIT_RUNTIME_ABI_HASH;
+    let mut hash = JIT_RUNTIME_ABI_HASH
+        ^ crate::JIT_HELPER_REGISTRY_ABI_HASH
+        ^ php_runtime::api::NATIVE_OPERATION_ABI_HASH;
     for address in [
         helpers.helper_table,
         helpers.packed_array_len,

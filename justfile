@@ -1652,6 +1652,20 @@ cranelift-exhaustive-lowering:
     cargo test -p php_jit --lib runtime_error_lowers_to_native_fatal_status
     cargo check -p php_jit --all-targets
 
+# Prompt 5 cutover gate: helper-mapped IR operations use the shared typed
+# runtime ABI, with explicit effects, ownership, status, and caller audit data.
+cranelift-typed-runtime-ops:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo run --quiet -p php_jit --example cranelift_instruction_coverage
+    cargo run --quiet -p php_runtime --example native_operation_audit
+    scripts/verify/cranelift_typed_runtime_ops.py
+    scripts/verify/cranelift_only_stage_ratchet.py
+    cargo test -p php_runtime native_ops
+    cargo test -p php_jit --lib region_ir::coverage
+    cargo test -p php_vm expressions_execute_
+    cargo check --workspace --all-targets
+
 jit-cranelift-smoke:
     @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
     cargo check --workspace

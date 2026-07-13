@@ -85,154 +85,53 @@ pub(super) fn execute_arithmetic(
     lhs: NumericValue,
     rhs: NumericValue,
 ) -> Result<Value, String> {
-    match op {
-        BinaryOp::Add if !lhs.is_float() && !rhs.is_float() => match (lhs, rhs) {
-            (NumericValue::Int(lhs), NumericValue::Int(rhs)) => Ok(lhs
-                .checked_add(rhs)
-                .map(Value::Int)
-                .unwrap_or_else(|| Value::float(lhs as f64 + rhs as f64))),
-            _ => unreachable!("guarded by integer check"),
-        },
-        BinaryOp::Sub if !lhs.is_float() && !rhs.is_float() => match (lhs, rhs) {
-            (NumericValue::Int(lhs), NumericValue::Int(rhs)) => Ok(lhs
-                .checked_sub(rhs)
-                .map(Value::Int)
-                .unwrap_or_else(|| Value::float(lhs as f64 - rhs as f64))),
-            _ => unreachable!("guarded by integer check"),
-        },
-        BinaryOp::Mul if !lhs.is_float() && !rhs.is_float() => match (lhs, rhs) {
-            (NumericValue::Int(lhs), NumericValue::Int(rhs)) => Ok(lhs
-                .checked_mul(rhs)
-                .map(Value::Int)
-                .unwrap_or_else(|| Value::float(lhs as f64 * rhs as f64))),
-            _ => unreachable!("guarded by integer check"),
-        },
-        BinaryOp::Div => {
-            if rhs.as_f64() == 0.0 {
-                return Err("division by zero".to_owned());
-            }
-            if let (NumericValue::Int(lhs), NumericValue::Int(rhs)) = (lhs, rhs)
-                && lhs % rhs == 0
-            {
-                return Ok(Value::Int(lhs / rhs));
-            }
-            Ok(Value::float(lhs.as_f64() / rhs.as_f64()))
-        }
-        BinaryOp::Mod => match (lhs, rhs) {
-            (NumericValue::Int(_), NumericValue::Int(0)) => Err("modulo by zero".to_owned()),
-            (NumericValue::Int(lhs), NumericValue::Int(rhs)) => Ok(Value::Int(lhs % rhs)),
-            _ => {
-                let rhs = rhs.as_f64() as i64;
-                if rhs == 0 {
-                    return Err("modulo by zero".to_owned());
-                }
-                Ok(Value::Int((lhs.as_f64() as i64) % rhs))
-            }
-        },
-        BinaryOp::Add => Ok(Value::float(lhs.as_f64() + rhs.as_f64())),
-        BinaryOp::Sub => Ok(Value::float(lhs.as_f64() - rhs.as_f64())),
-        BinaryOp::Mul => Ok(Value::float(lhs.as_f64() * rhs.as_f64())),
-        BinaryOp::Concat
-        | BinaryOp::Pow
-        | BinaryOp::BitAnd
-        | BinaryOp::BitOr
-        | BinaryOp::BitXor
-        | BinaryOp::ShiftLeft
-        | BinaryOp::ShiftRight => unreachable!("handled outside arithmetic"),
-    }
+    native_binary_result(op, &numeric_value(lhs), &numeric_value(rhs))
 }
 
 pub(super) fn execute_power(lhs: NumericValue, rhs: NumericValue) -> Result<Value, String> {
-    if let (NumericValue::Int(lhs), NumericValue::Int(rhs)) = (lhs, rhs)
-        && rhs >= 0
-        && let Ok(exponent) = u32::try_from(rhs)
-        && let Some(value) = lhs.checked_pow(exponent)
-    {
-        return Ok(Value::Int(value));
-    }
-    Ok(Value::float(lhs.as_f64().powf(rhs.as_f64())))
+    native_binary_result(BinaryOp::Pow, &numeric_value(lhs), &numeric_value(rhs))
 }
 
 pub(super) fn execute_bitwise(op: BinaryOp, lhs: &Value, rhs: &Value) -> Result<Value, String> {
-    match op {
-        BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor
-            if matches!((lhs, rhs), (Value::String(_), Value::String(_))) =>
-        {
-            let (Value::String(lhs), Value::String(rhs)) = (lhs, rhs) else {
-                unreachable!("guarded by string match");
-            };
-            Ok(Value::String(PhpString::from_bytes(bitwise_string_bytes(
-                op,
-                lhs.as_bytes(),
-                rhs.as_bytes(),
-            ))))
-        }
-        BinaryOp::BitAnd => Ok(Value::Int(to_int(lhs)? & to_int(rhs)?)),
-        BinaryOp::BitOr => Ok(Value::Int(to_int(lhs)? | to_int(rhs)?)),
-        BinaryOp::BitXor => Ok(Value::Int(to_int(lhs)? ^ to_int(rhs)?)),
-        BinaryOp::ShiftLeft => {
-            let shift = to_int(rhs)?;
-            if shift < 0 {
-                return Err("bit shift by negative number".to_owned());
-            }
-            Ok(Value::Int(to_int(lhs)?.wrapping_shl(shift as u32)))
-        }
-        BinaryOp::ShiftRight => {
-            let shift = to_int(rhs)?;
-            if shift < 0 {
-                return Err("bit shift by negative number".to_owned());
-            }
-            Ok(Value::Int(to_int(lhs)?.wrapping_shr(shift as u32)))
-        }
-        BinaryOp::Add
-        | BinaryOp::Sub
-        | BinaryOp::Mul
-        | BinaryOp::Div
-        | BinaryOp::Mod
-        | BinaryOp::Concat
-        | BinaryOp::Pow => unreachable!("handled outside bitwise"),
+    native_binary_result(op, lhs, rhs)
+}
+
+fn numeric_value(value: NumericValue) -> Value {
+    match value {
+        NumericValue::Int(value) => Value::Int(value),
+        NumericValue::Float(value) => Value::float(value),
     }
 }
 
-fn bitwise_string_bytes(op: BinaryOp, lhs: &[u8], rhs: &[u8]) -> Vec<u8> {
+fn native_binary_op(op: BinaryOp) -> NativeBinaryOp {
     match op {
-        BinaryOp::BitAnd => lhs
-            .iter()
-            .zip(rhs.iter())
-            .map(|(left, right)| left & right)
-            .collect(),
-        BinaryOp::BitXor => lhs
-            .iter()
-            .zip(rhs.iter())
-            .map(|(left, right)| left ^ right)
-            .collect(),
-        BinaryOp::BitOr => {
-            let (longer, shorter, lhs_is_longer) = if lhs.len() >= rhs.len() {
-                (lhs, rhs, true)
-            } else {
-                (rhs, lhs, false)
-            };
-            let mut bytes = Vec::with_capacity(longer.len());
-            for index in 0..longer.len() {
-                let byte = match (longer.get(index), shorter.get(index)) {
-                    (Some(long), Some(short)) if lhs_is_longer => long | short,
-                    (Some(long), Some(short)) => short | long,
-                    (Some(long), None) => *long,
-                    _ => unreachable!("bounded by longer length"),
-                };
-                bytes.push(byte);
-            }
-            bytes
-        }
-        BinaryOp::Add
-        | BinaryOp::Sub
-        | BinaryOp::Mul
-        | BinaryOp::Div
-        | BinaryOp::Mod
-        | BinaryOp::Concat
-        | BinaryOp::Pow
-        | BinaryOp::ShiftLeft
-        | BinaryOp::ShiftRight => unreachable!("not a string bitwise op"),
+        BinaryOp::Add => NativeBinaryOp::Add,
+        BinaryOp::Sub => NativeBinaryOp::Sub,
+        BinaryOp::Mul => NativeBinaryOp::Mul,
+        BinaryOp::Div => NativeBinaryOp::Div,
+        BinaryOp::Mod => NativeBinaryOp::Mod,
+        BinaryOp::Concat => NativeBinaryOp::Concat,
+        BinaryOp::Pow => NativeBinaryOp::Pow,
+        BinaryOp::BitAnd => NativeBinaryOp::BitAnd,
+        BinaryOp::BitOr => NativeBinaryOp::BitOr,
+        BinaryOp::BitXor => NativeBinaryOp::BitXor,
+        BinaryOp::ShiftLeft => NativeBinaryOp::ShiftLeft,
+        BinaryOp::ShiftRight => NativeBinaryOp::ShiftRight,
+    }
+}
+
+fn native_binary_result(op: BinaryOp, lhs: &Value, rhs: &Value) -> Result<Value, String> {
+    let mut context = NativeOperationContext::default();
+    let mut out = Value::Uninitialized;
+    match native_binary(&mut context, native_binary_op(op), lhs, rhs, &mut out) {
+        NativeOperationStatus::Ok => Ok(out),
+        NativeOperationStatus::RuntimeError
+        | NativeOperationStatus::Throw
+        | NativeOperationStatus::CallUserland
+        | NativeOperationStatus::Suspend
+        | NativeOperationStatus::Unsupported => Err(context
+            .message
+            .unwrap_or_else(|| "native binary operation failed".to_owned())),
     }
 }
 
@@ -270,57 +169,53 @@ pub(super) fn implicit_int_deprecation_message(value: &Value) -> Option<String> 
 /// Executes a unary operator; the second tuple slot carries a pending
 /// implicit-int-conversion deprecation for the stateful caller to emit.
 fn execute_unary(op: UnaryOp, src: &Value) -> Result<(Value, Option<String>), String> {
-    match op {
-        UnaryOp::Plus => match to_number(src)? {
-            NumericValue::Int(value) => Ok((Value::Int(value), None)),
-            NumericValue::Float(value) => Ok((Value::float(value), None)),
-        },
-        UnaryOp::Minus => match to_number(src)? {
-            NumericValue::Int(value) => Ok((
-                value
-                    .checked_neg()
-                    .map(Value::Int)
-                    .unwrap_or_else(|| Value::float(-(value as f64))),
-                None,
-            )),
-            NumericValue::Float(value) => Ok((Value::float(-value), None)),
-        },
-        UnaryOp::Not => Ok((Value::Bool(!to_bool(src)?), None)),
-        UnaryOp::BitNot => match effective_value(src) {
-            Value::Int(value) => Ok((Value::Int(!value), None)),
-            Value::String(value) => {
-                let bytes: Vec<u8> = value.as_bytes().iter().map(|byte| !byte).collect();
-                Ok((Value::String(PhpString::from_bytes(bytes)), None))
-            }
-            Value::Float(value) => Ok((
-                Value::Int(!php_runtime::api::php_float_to_int(value.to_f64())),
-                implicit_int_deprecation_message(src),
-            )),
-            _ => Err("bitwise not is only implemented for int and string operands".to_owned()),
-        },
+    let native_op = match op {
+        UnaryOp::Plus => NativeUnaryOp::Plus,
+        UnaryOp::Minus => NativeUnaryOp::Minus,
+        UnaryOp::Not => NativeUnaryOp::Not,
+        UnaryOp::BitNot => NativeUnaryOp::BitNot,
+    };
+    let deprecation = matches!(op, UnaryOp::BitNot)
+        .then(|| implicit_int_deprecation_message(src))
+        .flatten();
+    let mut context = NativeOperationContext::default();
+    let mut out = Value::Uninitialized;
+    match native_unary(&mut context, native_op, src, &mut out) {
+        NativeOperationStatus::Ok => Ok((out, deprecation)),
+        NativeOperationStatus::RuntimeError
+        | NativeOperationStatus::Throw
+        | NativeOperationStatus::CallUserland
+        | NativeOperationStatus::Suspend
+        | NativeOperationStatus::Unsupported => Err(context
+            .message
+            .unwrap_or_else(|| "native unary operation failed".to_owned())),
     }
 }
 
 fn execute_compare(op: CompareOp, lhs: &Value, rhs: &Value) -> Result<Value, String> {
-    let value = match op {
-        CompareOp::Equal => Value::Bool(equal(lhs, rhs)?),
-        CompareOp::NotEqual => Value::Bool(!equal(lhs, rhs)?),
-        CompareOp::Identical => Value::Bool(identical(lhs, rhs)),
-        CompareOp::NotIdentical => Value::Bool(!identical(lhs, rhs)),
-        CompareOp::Less => Value::Bool(compare(lhs, rhs)?.is_lt()),
-        CompareOp::LessEqual => Value::Bool(!compare(lhs, rhs)?.is_gt()),
-        CompareOp::Greater => Value::Bool(compare(lhs, rhs)?.is_gt()),
-        CompareOp::GreaterEqual => Value::Bool(!compare(lhs, rhs)?.is_lt()),
-        CompareOp::Spaceship => {
-            let result = match compare(lhs, rhs)? {
-                std::cmp::Ordering::Less => -1,
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Greater => 1,
-            };
-            Value::Int(result)
-        }
+    let native_op = match op {
+        CompareOp::Equal => NativeCompareOp::Equal,
+        CompareOp::NotEqual => NativeCompareOp::NotEqual,
+        CompareOp::Identical => NativeCompareOp::Identical,
+        CompareOp::NotIdentical => NativeCompareOp::NotIdentical,
+        CompareOp::Less => NativeCompareOp::Less,
+        CompareOp::LessEqual => NativeCompareOp::LessEqual,
+        CompareOp::Greater => NativeCompareOp::Greater,
+        CompareOp::GreaterEqual => NativeCompareOp::GreaterEqual,
+        CompareOp::Spaceship => NativeCompareOp::Spaceship,
     };
-    Ok(value)
+    let mut context = NativeOperationContext::default();
+    let mut out = Value::Uninitialized;
+    match native_compare(&mut context, native_op, lhs, rhs, &mut out) {
+        NativeOperationStatus::Ok => Ok(out),
+        NativeOperationStatus::RuntimeError
+        | NativeOperationStatus::Throw
+        | NativeOperationStatus::CallUserland
+        | NativeOperationStatus::Suspend
+        | NativeOperationStatus::Unsupported => Err(context
+            .message
+            .unwrap_or_else(|| "native compare operation failed".to_owned())),
+    }
 }
 
 pub(super) fn execute_rich_compare_op(

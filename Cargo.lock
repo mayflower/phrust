@@ -2334,6 +2334,7 @@ dependencies = [
  "cranelift-native",
  "libc",
  "php_ir",
+ "php_runtime",
 ]
 
 [[package]]

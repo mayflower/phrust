@@ -3,6 +3,10 @@
 use crate::JitHelperId;
 use php_ir::instruction::{CallableKind, IrCallArgValueKind, TerminatorKind};
 use php_ir::{BinaryOp, CastKind, CompareOp, IncludeKind, InstructionKind, UnaryOp};
+use php_runtime::api::{
+    JIT_HELPER_ECHO_VALUE, JIT_HELPER_SCALAR_BINARY, JIT_HELPER_SCALAR_CAST,
+    JIT_HELPER_SCALAR_COMPARE, JIT_HELPER_SCALAR_UNARY,
+};
 
 /// Exactly one baseline lowering route for an IR operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +65,12 @@ const IO: BaselineEffectFlags = BaselineEffectFlags::IO;
 const READ_WRITE: BaselineEffectFlags = READ.union(WRITE);
 const ALLOCATE_WRITE: BaselineEffectFlags = ALLOCATE.union(WRITE);
 const CONTROL_WRITE: BaselineEffectFlags = CONTROL.union(WRITE);
+
+const HELPER_UNARY: JitHelperId = JIT_HELPER_SCALAR_UNARY;
+const HELPER_BINARY: JitHelperId = JIT_HELPER_SCALAR_BINARY;
+const HELPER_COMPARE: JitHelperId = JIT_HELPER_SCALAR_COMPARE;
+const HELPER_CAST: JitHelperId = JIT_HELPER_SCALAR_CAST;
+const HELPER_ECHO: JitHelperId = JIT_HELPER_ECHO_VALUE;
 
 macro_rules! define_instruction_coverage {
     ($($pattern:pat => ($variant:literal, $class:expr, $effects:expr, $throw:literal, $diagnose:literal, $user:literal, $suspend:literal, $safepoint:literal);)+) => {
@@ -124,14 +134,14 @@ define_instruction_coverage! {
     InstructionKind::BindReferenceFromCall { .. } => ("BindReferenceFromCall", BaselineLoweringClass::NativeControlFlow, CONTROL_WRITE, true, true, true, false, true);
     InstructionKind::BindReferenceFromMethodCall { .. } => ("BindReferenceFromMethodCall", BaselineLoweringClass::NativeControlFlow, CONTROL_WRITE, true, true, true, false, true);
     InstructionKind::InitStaticLocal { .. } => ("InitStaticLocal", BaselineLoweringClass::NativeStateMachine, READ_WRITE, true, true, false, false, true);
-    InstructionKind::Binary { .. } => ("Binary", BaselineLoweringClass::NativeStateMachine, PURE, true, true, true, false, true);
-    InstructionKind::Compare { .. } => ("Compare", BaselineLoweringClass::NativeStateMachine, PURE, true, true, true, false, true);
+    InstructionKind::Binary { .. } => ("Binary", BaselineLoweringClass::TypedRuntimeHelper(HELPER_BINARY), PURE, true, true, true, false, true);
+    InstructionKind::Compare { .. } => ("Compare", BaselineLoweringClass::TypedRuntimeHelper(HELPER_COMPARE), PURE, true, true, true, false, true);
     InstructionKind::InstanceOf { .. } => ("InstanceOf", BaselineLoweringClass::NativeStateMachine, READ, true, true, true, false, true);
     InstructionKind::DynamicInstanceOf { .. } => ("DynamicInstanceOf", BaselineLoweringClass::NativeStateMachine, READ, true, true, true, false, true);
-    InstructionKind::Unary { .. } => ("Unary", BaselineLoweringClass::NativeStateMachine, PURE, true, true, true, false, true);
-    InstructionKind::Cast { .. } => ("Cast", BaselineLoweringClass::NativeStateMachine, ALLOCATE, true, true, true, false, true);
+    InstructionKind::Unary { .. } => ("Unary", BaselineLoweringClass::TypedRuntimeHelper(HELPER_UNARY), PURE, true, true, true, false, true);
+    InstructionKind::Cast { .. } => ("Cast", BaselineLoweringClass::TypedRuntimeHelper(HELPER_CAST), ALLOCATE, true, true, true, false, true);
     InstructionKind::Discard { .. } => ("Discard", BaselineLoweringClass::DirectClif, PURE, false, false, false, false, false);
-    InstructionKind::Echo { .. } => ("Echo", BaselineLoweringClass::NativeStateMachine, IO, true, true, true, false, true);
+    InstructionKind::Echo { .. } => ("Echo", BaselineLoweringClass::TypedRuntimeHelper(HELPER_ECHO), IO, true, true, true, false, true);
     InstructionKind::EmitDiagnostic { .. } => ("EmitDiagnostic", BaselineLoweringClass::NativeStateMachine, IO, false, true, true, false, true);
     InstructionKind::Yield { .. } => ("Yield", BaselineLoweringClass::NativeStateMachine, CONTROL_WRITE, true, true, true, true, true);
     InstructionKind::YieldFrom { .. } => ("YieldFrom", BaselineLoweringClass::NativeStateMachine, CONTROL_WRITE, true, true, true, true, true);
@@ -251,56 +261,56 @@ define_terminator_coverage! {
 #[must_use]
 pub const fn baseline_unary_class(op: UnaryOp) -> BaselineLoweringClass {
     match op {
-        UnaryOp::Plus => BaselineLoweringClass::NativeStateMachine,
-        UnaryOp::Minus => BaselineLoweringClass::NativeStateMachine,
-        UnaryOp::Not => BaselineLoweringClass::NativeStateMachine,
-        UnaryOp::BitNot => BaselineLoweringClass::NativeStateMachine,
+        UnaryOp::Plus => BaselineLoweringClass::TypedRuntimeHelper(HELPER_UNARY),
+        UnaryOp::Minus => BaselineLoweringClass::TypedRuntimeHelper(HELPER_UNARY),
+        UnaryOp::Not => BaselineLoweringClass::TypedRuntimeHelper(HELPER_UNARY),
+        UnaryOp::BitNot => BaselineLoweringClass::TypedRuntimeHelper(HELPER_UNARY),
     }
 }
 
 #[must_use]
 pub const fn baseline_binary_class(op: BinaryOp) -> BaselineLoweringClass {
     match op {
-        BinaryOp::Add => BaselineLoweringClass::NativeStateMachine,
-        BinaryOp::Sub => BaselineLoweringClass::NativeStateMachine,
-        BinaryOp::Mul => BaselineLoweringClass::NativeStateMachine,
-        BinaryOp::Div => BaselineLoweringClass::NativeStateMachine,
-        BinaryOp::Mod => BaselineLoweringClass::NativeStateMachine,
-        BinaryOp::Concat => BaselineLoweringClass::NativeStateMachine,
-        BinaryOp::Pow => BaselineLoweringClass::NativeStateMachine,
-        BinaryOp::BitAnd => BaselineLoweringClass::NativeStateMachine,
-        BinaryOp::BitOr => BaselineLoweringClass::NativeStateMachine,
-        BinaryOp::BitXor => BaselineLoweringClass::NativeStateMachine,
-        BinaryOp::ShiftLeft => BaselineLoweringClass::NativeStateMachine,
-        BinaryOp::ShiftRight => BaselineLoweringClass::NativeStateMachine,
+        BinaryOp::Add => BaselineLoweringClass::TypedRuntimeHelper(HELPER_BINARY),
+        BinaryOp::Sub => BaselineLoweringClass::TypedRuntimeHelper(HELPER_BINARY),
+        BinaryOp::Mul => BaselineLoweringClass::TypedRuntimeHelper(HELPER_BINARY),
+        BinaryOp::Div => BaselineLoweringClass::TypedRuntimeHelper(HELPER_BINARY),
+        BinaryOp::Mod => BaselineLoweringClass::TypedRuntimeHelper(HELPER_BINARY),
+        BinaryOp::Concat => BaselineLoweringClass::TypedRuntimeHelper(HELPER_BINARY),
+        BinaryOp::Pow => BaselineLoweringClass::TypedRuntimeHelper(HELPER_BINARY),
+        BinaryOp::BitAnd => BaselineLoweringClass::TypedRuntimeHelper(HELPER_BINARY),
+        BinaryOp::BitOr => BaselineLoweringClass::TypedRuntimeHelper(HELPER_BINARY),
+        BinaryOp::BitXor => BaselineLoweringClass::TypedRuntimeHelper(HELPER_BINARY),
+        BinaryOp::ShiftLeft => BaselineLoweringClass::TypedRuntimeHelper(HELPER_BINARY),
+        BinaryOp::ShiftRight => BaselineLoweringClass::TypedRuntimeHelper(HELPER_BINARY),
     }
 }
 
 #[must_use]
 pub const fn baseline_compare_class(op: CompareOp) -> BaselineLoweringClass {
     match op {
-        CompareOp::Equal => BaselineLoweringClass::NativeStateMachine,
-        CompareOp::NotEqual => BaselineLoweringClass::NativeStateMachine,
-        CompareOp::Identical => BaselineLoweringClass::NativeStateMachine,
-        CompareOp::NotIdentical => BaselineLoweringClass::NativeStateMachine,
-        CompareOp::Less => BaselineLoweringClass::NativeStateMachine,
-        CompareOp::LessEqual => BaselineLoweringClass::NativeStateMachine,
-        CompareOp::Greater => BaselineLoweringClass::NativeStateMachine,
-        CompareOp::GreaterEqual => BaselineLoweringClass::NativeStateMachine,
-        CompareOp::Spaceship => BaselineLoweringClass::NativeStateMachine,
+        CompareOp::Equal => BaselineLoweringClass::TypedRuntimeHelper(HELPER_COMPARE),
+        CompareOp::NotEqual => BaselineLoweringClass::TypedRuntimeHelper(HELPER_COMPARE),
+        CompareOp::Identical => BaselineLoweringClass::TypedRuntimeHelper(HELPER_COMPARE),
+        CompareOp::NotIdentical => BaselineLoweringClass::TypedRuntimeHelper(HELPER_COMPARE),
+        CompareOp::Less => BaselineLoweringClass::TypedRuntimeHelper(HELPER_COMPARE),
+        CompareOp::LessEqual => BaselineLoweringClass::TypedRuntimeHelper(HELPER_COMPARE),
+        CompareOp::Greater => BaselineLoweringClass::TypedRuntimeHelper(HELPER_COMPARE),
+        CompareOp::GreaterEqual => BaselineLoweringClass::TypedRuntimeHelper(HELPER_COMPARE),
+        CompareOp::Spaceship => BaselineLoweringClass::TypedRuntimeHelper(HELPER_COMPARE),
     }
 }
 
 #[must_use]
 pub const fn baseline_cast_class(kind: CastKind) -> BaselineLoweringClass {
     match kind {
-        CastKind::Bool => BaselineLoweringClass::NativeStateMachine,
-        CastKind::Int => BaselineLoweringClass::NativeStateMachine,
-        CastKind::Float => BaselineLoweringClass::NativeStateMachine,
-        CastKind::String => BaselineLoweringClass::NativeStateMachine,
-        CastKind::Array => BaselineLoweringClass::NativeStateMachine,
-        CastKind::Object => BaselineLoweringClass::NativeStateMachine,
-        CastKind::Void => BaselineLoweringClass::NativeStateMachine,
+        CastKind::Bool => BaselineLoweringClass::TypedRuntimeHelper(HELPER_CAST),
+        CastKind::Int => BaselineLoweringClass::TypedRuntimeHelper(HELPER_CAST),
+        CastKind::Float => BaselineLoweringClass::TypedRuntimeHelper(HELPER_CAST),
+        CastKind::String => BaselineLoweringClass::TypedRuntimeHelper(HELPER_CAST),
+        CastKind::Array => BaselineLoweringClass::TypedRuntimeHelper(HELPER_CAST),
+        CastKind::Object => BaselineLoweringClass::TypedRuntimeHelper(HELPER_CAST),
+        CastKind::Void => BaselineLoweringClass::TypedRuntimeHelper(HELPER_CAST),
     }
 }
 
@@ -335,6 +345,7 @@ pub const fn baseline_call_arg_class(kind: IrCallArgValueKind) -> BaselineLoweri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use php_runtime::api::{NATIVE_OPERATION_REGISTRY, lookup_native_operation};
 
     #[test]
     fn manifest_has_every_current_instruction_and_terminator() {
@@ -346,6 +357,35 @@ mod tests {
                 .filter(|entry| entry.variant == "RuntimeError")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn every_helper_mapped_instruction_has_a_real_typed_runtime_operation() {
+        let mapped = BASELINE_INSTRUCTION_MANIFEST
+            .iter()
+            .filter_map(|entry| match entry.class {
+                BaselineLoweringClass::TypedRuntimeHelper(id) => Some(id),
+                BaselineLoweringClass::DirectClif
+                | BaselineLoweringClass::NativeControlFlow
+                | BaselineLoweringClass::NativeStateMachine
+                | BaselineLoweringClass::CompileTimeFatal => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(mapped.len(), 5);
+        for id in mapped {
+            let operation = lookup_native_operation(id).expect("registered runtime operation");
+            assert!(operation.native_callable);
+            assert!(operation.gc_safepoint);
+            assert!(operation.native_callers.contains(&"baseline"));
+            assert!(operation.native_callers.contains(&"optimizing"));
+        }
+        assert_eq!(
+            NATIVE_OPERATION_REGISTRY
+                .iter()
+                .filter(|operation| operation.native_callable)
+                .count(),
+            5
         );
     }
 }

@@ -2,6 +2,8 @@
 
 use std::mem::size_of;
 
+pub use php_runtime::api::JitHelperId;
+
 /// Stable ABI fingerprint for the helper-symbol registry. Bumped whenever the
 /// registry's symbol set or any helper ABI changes.
 pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x07c1_481f_0000_0005;
@@ -26,11 +28,6 @@ pub const JIT_HELPER_STATUS_FATAL: i32 = 4;
 /// range never aliases `OK`/`FALLBACK`/`OVERFLOW`/`TAILCALL` and leaves room
 /// for future scalar statuses below it.
 pub const JIT_HELPER_STATUS_RESUME_CALL_BASE: i32 = 16;
-
-/// Stable helper id.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct JitHelperId(pub u32);
 
 /// Helper argument kind.
 #[repr(u32)]
