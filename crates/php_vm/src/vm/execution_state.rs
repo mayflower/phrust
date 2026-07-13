@@ -892,59 +892,17 @@ pub(super) struct DestructorSweep {
 /// `run_destructors_for_unreferenced_value` path, which is gated on the
 /// destructor queue.
 pub(super) fn release_unrooted_object_handles(value: &Value) {
-    // Hot-path guard: the deep root traversal below walks every frame local/
-    // register/reference plus globals per call, which turned every
-    // object-overwriting store into a full-heap scan (measured 5x on the
-    // WordPress request). The common shapes never need it:
-    // - A top-level object whose storage is held only by the dropped value
-    //   and the candidate list (strong count <= 2) provably has no other
-    //   holder, so it is unrooted — release it without any scan.
-    // - Anything shared or nested keeps its handle until the natural drop
-    //   recycles the id; per this function's contract the eager scan only
-    //   tightens id-reuse timing (destructor timing runs through the separate
-    //   destructor queue), so skipping it is safe, just less eager.
+    // The overwritten value drops immediately after this hook. Its natural
+    // drop recursively releases unshared container contents and recycles
+    // their object ids, while shared or cyclic graphs must stay alive. Walking
+    // every nested array/reference/callable here only duplicates that work.
+    // Keep the constant-time direct-object case for stale VM temporaries, and
+    // leave every container shape to the drop/destructor paths.
     if let Value::Object(object) = value {
         if object.gc_refcount_estimate() <= 1 {
             object.release_php_handle();
         }
-        return;
     }
-    let (candidates, saw_shared_container) = destructor_candidates_with_share_flag(value);
-    if candidates.is_empty() {
-        return;
-    }
-    if candidates
-        .iter()
-        .all(|object| object.gc_refcount_estimate() > 2)
-    {
-        return;
-    }
-    // Scan-free fast path: with no shared container anywhere in the graph,
-    // the only strong paths into it run through the dropped value, so a
-    // candidate held exactly by the graph plus the candidate list cannot be
-    // reachable from any root — the eager release below covers precisely
-    // this set. Any external holder either bumps the candidate's own count
-    // (objects) or marks a traversed container as shared (arrays, reference
-    // cells, callable payloads).
-    if !saw_shared_container
-        && candidates
-            .iter()
-            .all(|object| object.gc_refcount_estimate() <= 2)
-    {
-        for object in candidates {
-            object.release_php_handle();
-        }
-    }
-    // Mixed shapes (a shared container in the graph, or mixed handle counts)
-    // defer to the natural drop instead of walking the full root set. Per
-    // this function's contract the eager scan only tightens id-reuse timing:
-    // an acyclic unrooted candidate is freed by the overwrite's own drop
-    // before the next instruction runs, a rooted candidate must not release
-    // either way, and cycle members always carry more than two handles so
-    // the all-shared gate above already left them to the destructor queue.
-    // `object-id-release-on-overwrite.php` and
-    // `object-id-cycle-survives-overwrite.php` pin the observable timing
-    // against the reference oracle.
 }
 
 pub(super) fn release_unrooted_direct_object_handle(value: &Value) {
