@@ -21,6 +21,16 @@ pub struct CraneliftCodeKey {
     pub region: String,
     /// Runtime ABI hash embedded in the native entry.
     pub abi_hash: u64,
+    /// Compiler tier that produced the code.
+    pub compiler_tier: String,
+    /// Runtime-helper ABI/address-set identity.
+    pub helper_abi_hash: u64,
+    /// Exact target and host-CPU feature identity.
+    pub target_cpu: String,
+    /// PHP-visible compiler semantic configuration identity.
+    pub semantic_config_hash: u64,
+    /// Linked source/dependency identity.
+    pub dependency_identity: String,
     /// Effective compiler/runtime configuration hash.
     pub config_hash: u64,
     /// Layout or invalidation generation supplied by the runtime.
@@ -38,6 +48,11 @@ impl CraneliftCodeKey {
             self.compiled_unit.as_bytes(),
             self.region.as_bytes(),
             &self.abi_hash.to_le_bytes(),
+            self.compiler_tier.as_bytes(),
+            &self.helper_abi_hash.to_le_bytes(),
+            self.target_cpu.as_bytes(),
+            &self.semantic_config_hash.to_le_bytes(),
+            self.dependency_identity.as_bytes(),
             &self.config_hash.to_le_bytes(),
             &self.invalidation_generation.to_le_bytes(),
             self.specialization.as_bytes(),
@@ -618,6 +633,11 @@ mod tests {
             compiled_unit: format!("unit-{index}"),
             region: format!("function-{index}"),
             abi_hash: JIT_RUNTIME_ABI_HASH,
+            compiler_tier: "baseline".to_owned(),
+            helper_abi_hash: JIT_RUNTIME_ABI_HASH,
+            target_cpu: "test-target:test-cpu".to_owned(),
+            semantic_config_hash: 7,
+            dependency_identity: format!("dependency-{index}"),
             config_hash: 7,
             invalidation_generation: generation,
             specialization: "test-constant-v1".to_owned(),

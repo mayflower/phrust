@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use php_ir::rule_selection::RuleSelectionReport;
 
 use super::{
-    RegionBuilder, RegionCompareOp, RegionGraph, RegionId, RegionValueType, SnapshotEntry,
+    OptimizerRegionGraph, RegionBuilder, RegionCompareOp, RegionId, RegionValueType, SnapshotEntry,
     VmSlotId, rules::select_region_rules,
 };
 
@@ -292,7 +292,7 @@ impl TemplateLoweringStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TemplateLoweredArtifact {
     /// Optional scalar region graph.
-    pub graph: Option<RegionGraph>,
+    pub graph: Option<OptimizerRegionGraph>,
     /// Optional rule-selection metadata for the graph.
     pub rule_selection: Option<RuleSelectionReport>,
     /// Metadata-only facts emitted by the template.
@@ -580,7 +580,10 @@ fn lower_packed_foreach_int_sum(
     TemplateLoweringOutcome::rejected("reference_or_cow_sensitive_array")
 }
 
-fn lowered_graph(graph: RegionGraph, metadata: Vec<&'static str>) -> TemplateLoweringOutcome {
+fn lowered_graph(
+    graph: OptimizerRegionGraph,
+    metadata: Vec<&'static str>,
+) -> TemplateLoweringOutcome {
     let rule_selection = select_region_rules(&graph);
     TemplateLoweringOutcome::lowered(TemplateLoweredArtifact {
         graph: Some(graph),

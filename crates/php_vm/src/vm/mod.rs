@@ -762,58 +762,62 @@ impl Vm {
             );
         }
 
-        let eligibility = php_jit::analyze_jit_eligibility(unit.unit(), entry);
-        if !matches!(eligibility.eligibility, php_jit::JitEligibility::Eligible) {
-            let reason = eligibility.reasons.first();
-            let location = reason
-                .and_then(|reason| reason.block.zip(reason.instruction))
-                .and_then(|(block, instruction)| {
-                    function
-                        .blocks
-                        .get(block as usize)
-                        .and_then(|block| block.instructions.get(instruction as usize))
-                });
-            let instruction = location
-                .map(|instruction| format!("{:?}", instruction.kind))
-                .unwrap_or_else(|| "function-signature".to_owned());
-            let span = location.map_or(function.span, |instruction| instruction.span);
-            let detail = reason.map_or("unsupported function shape", |reason| {
-                reason.detail.as_str()
-            });
-            return VmResult::compile_error(
-                output,
-                format!(
-                    "E_NATIVE_UNSUPPORTED_LOWERING: function={} instruction_kind={} span={}:{}-{}: {}",
-                    function.name,
-                    instruction,
-                    span.file.raw(),
-                    span.start,
-                    span.end,
-                    detail
-                ),
-            );
-        }
-
         let mut compiler = php_jit::JitEngine::new();
-        let compiled = match compiler.compile_function(
+        let records = match compiler.compile_unit_with_runtime_helpers(
             unit.unit(),
-            entry,
-            php_jit::JitCompileRequest::new(format!("entry.{}", function.name))
+            php_jit::JitCompileRequest::new(format!("unit.{}", unit.unit().id.raw()))
                 .with_function_name(function.name.clone())
                 .with_opt_level(if self.options.native_optimization.is_optimizing() {
                     2
                 } else {
                     0
                 }),
+            php_jit::JitRuntimeHelperAddresses {
+                helper_table: jit_runtime_helper_table() as *const _ as usize,
+                packed_array_len: jit_array_len_abi as *const () as usize,
+                packed_array_fetch_int_slow: jit_array_fetch_int_slow_abi as *const () as usize,
+                known_strlen: jit_strlen_known_abi as *const () as usize,
+                known_count: jit_count_known_abi as *const () as usize,
+                string_concat: jit_concat_string_string_fast as *const () as usize,
+                property_load: jit_property_load_monomorphic_fast as *const () as usize,
+                record_array_lookup: jit_record_array_lookup_abi as *const () as usize,
+            },
         ) {
             Ok(compiled) => compiled,
             Err(error) => {
                 return VmResult::compile_error(output, format!("E_NATIVE_COMPILE_SETUP: {error}"));
             }
         };
-        let Some(handle) = compiled.handle else {
-            let reason = match compiled.status {
-                php_jit::JitCompileStatus::Rejected { reason } => reason,
+        let Some(entry_record) = records.iter().find(|record| record.function == entry) else {
+            return VmResult::compile_error(output, "E_NATIVE_COMPILE_SETUP: entry record missing");
+        };
+        if let Some(rejected) = records
+            .iter()
+            .find(|record| !matches!(&record.result.status, php_jit::JitCompileStatus::Compiled))
+        {
+            let name = unit
+                .unit()
+                .functions
+                .get(rejected.function.index())
+                .map_or("<missing>", |function| function.name.as_str());
+            let reason = match &rejected.result.status {
+                php_jit::JitCompileStatus::Rejected { reason } => reason.as_str(),
+                php_jit::JitCompileStatus::Compiled => "compiler reported no native code",
+            };
+            let detail = rejected
+                .result
+                .diagnostics
+                .first()
+                .map_or("", String::as_str);
+            return VmResult::compile_error(
+                output,
+                format!("E_NATIVE_UNSUPPORTED_LOWERING: function={name}: {reason}: {detail}"),
+            );
+        }
+        let compiled = &entry_record.result;
+        let Some(handle) = compiled.handle.as_ref() else {
+            let reason = match &compiled.status {
+                php_jit::JitCompileStatus::Rejected { reason } => reason.clone(),
                 php_jit::JitCompileStatus::Compiled => {
                     "compiler reported success without a native entry".to_owned()
                 }

@@ -59,3 +59,26 @@ nix develop -c just cranelift-only-mandatory
 The gate checks every product binary's Cargo graph, builds the release server,
 requires Cranelift compiler symbols, and rejects retired emitter or interpreter
 entry symbols in that binary.
+
+## Prompt 3 authoritative compiler pipeline
+
+`BaselineRegionBuilder` constructs a complete multi-block `RegionGraph`
+directly from `php_ir::IrFunction`. The graph retains the source operation and
+span even when Cranelift coverage is missing, so unsupported semantics produce
+a stable missing-lowering error instead of selecting another executor.
+
+Methods, closures, generators, by-reference declarations, strict-types mode,
+captures, declaration identity, and function attributes all enter this same
+pipeline. Native ABI gaps may still prevent publication, but function shape no
+longer prevents graph construction. `JitEngine::compile_unit` creates a
+baseline record for every known body before the VM publishes the entry point.
+
+Run the authoritative-IR gate with:
+
+```sh
+nix develop -c just cranelift-baseline-ir-coverage
+```
+
+Native code cache identity includes the IR fingerprint, compiler tier,
+runtime/helper ABI identity, target CPU, semantic configuration, dependency
+identity, and invalidation generation.

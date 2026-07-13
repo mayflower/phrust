@@ -17,6 +17,7 @@ IGNORED = {
     "scripts/verify/cranelift_only_allowlist.json",
     "scripts/verify/cranelift_only_stage_ratchet.py",
     "scripts/verify/no_copy_patch.py",
+    "scripts/verify/native_server_symbols.py",
 }
 COPY_PATTERN = re.compile(
     "copy" + r".?" + "patch" + "|jit" + "-copy-patch|PHRUST_JIT_" + "COPY_PATCH",

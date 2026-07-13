@@ -1,23 +1,27 @@
 use super::*;
 
-pub(super) fn compile_executable_region_native(
+pub(super) fn compile_region_graph_native(
     unit: &IrUnit,
-    region: &ExecutableRegion,
+    region: &RegionGraph,
     request: &JitCompileRequest,
 ) -> Result<NativeScalarRegionCompileResult, CraneliftLoweringError> {
-    let regions = collect_executable_regions(unit, region)?;
+    validate_region_native_coverage(region)?;
+    let regions = collect_region_graphs(unit, region)?;
     let function = region.function;
     let arity = region_arity(region)?;
     let fast_path_hits = regions
         .values()
         .map(|region| region.fast_path_operations)
         .sum();
-    let has_control_flow = regions.values().any(ExecutableRegion::has_control_flow);
+    let has_control_flow = regions.values().any(RegionGraph::has_control_flow);
     let compiled = compile_managed_native(
         request,
         function,
         "executable-region-v2",
-        &[],
+        &[(
+            "region-runtime-helper-abi",
+            region.compile_metadata.helper_abi_hash as usize,
+        )],
         |module, name| {
             let mut functions = BTreeMap::new();
             for candidate in regions.values() {
@@ -26,7 +30,7 @@ pub(super) fn compile_executable_region_native(
                 } else {
                     format!("{name}.callee.{}", candidate.function.raw())
                 };
-                let signature = executable_region_signature(module, candidate)?;
+                let signature = region_graph_signature(module, candidate)?;
                 let func_id = module
                     .declare_function(&symbol, Linkage::Local, &signature)
                     .map_err(|error| {
@@ -43,7 +47,7 @@ pub(super) fn compile_executable_region_native(
             for candidate in regions.values() {
                 let func_id = functions[&candidate.function];
                 let (candidate_bytes, mut candidate_ranges) =
-                    define_executable_region_function(module, candidate, func_id, &functions)?;
+                    define_region_graph_function(module, candidate, func_id, &functions)?;
                 code_bytes = code_bytes.saturating_add(candidate_bytes);
                 native_pc_ranges.append(&mut candidate_ranges);
             }
@@ -56,7 +60,7 @@ pub(super) fn compile_executable_region_native(
             let root = functions[&function];
             let address = module.get_finalized_function(root) as usize;
             let region_state_metadata =
-                executable_region_metadata(region.local_count, regions.values(), native_pc_ranges);
+                region_graph_metadata(region.local_count, regions.values(), native_pc_ranges);
             let handle = JitFunctionHandle::i64_status_out_native(
                 u64::from(function.raw()) + 1,
                 request.region_id.clone(),
@@ -79,10 +83,10 @@ pub(super) fn compile_executable_region_native(
     })
 }
 
-fn collect_executable_regions(
+fn collect_region_graphs(
     unit: &IrUnit,
-    root: &ExecutableRegion,
-) -> Result<BTreeMap<FunctionId, ExecutableRegion>, CraneliftLoweringError> {
+    root: &RegionGraph,
+) -> Result<BTreeMap<FunctionId, RegionGraph>, CraneliftLoweringError> {
     let mut regions = BTreeMap::new();
     regions.insert(root.function, root.clone());
     let mut pending = root.direct_callees();
@@ -90,15 +94,18 @@ fn collect_executable_regions(
         if regions.contains_key(&function) {
             continue;
         }
-        let region = build_executable_region(unit, function).map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_DIRECT_CALLEE",
-                format!(
-                    "direct callee {} is not executable: {error}",
-                    function.raw()
-                ),
-            )
-        })?;
+        let region = BaselineRegionBuilder::build(unit, function, &root.compile_metadata).map_err(
+            |error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_DIRECT_CALLEE",
+                    format!(
+                        "direct callee {} is not executable: {error}",
+                        function.raw()
+                    ),
+                )
+            },
+        )?;
+        validate_region_native_coverage(&region)?;
         pending.extend(region.direct_callees());
         regions.insert(function, region);
     }
@@ -110,7 +117,97 @@ fn collect_executable_regions(
     Ok(regions)
 }
 
-fn region_arity(region: &ExecutableRegion) -> Result<u8, CraneliftLoweringError> {
+fn validate_region_native_coverage(region: &RegionGraph) -> Result<(), CraneliftLoweringError> {
+    if region.params.len() > 4 {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_MISSING_FUNCTION_ABI_LOWERING",
+            format!(
+                "function {} has {} parameters; native status ABI currently supports four",
+                region.function_name,
+                region.params.len()
+            ),
+        ));
+    }
+    if region.local_count as usize > crate::JIT_DEOPT_MAX_SLOTS {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_MISSING_DEOPT_SLOT_LOWERING",
+            format!(
+                "function {} has {} locals; native state ABI supports {}",
+                region.function_name,
+                region.local_count,
+                crate::JIT_DEOPT_MAX_SLOTS
+            ),
+        ));
+    }
+    if region.return_type.as_ref() != Some(&IrReturnType::Int) {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_MISSING_RETURN_ABI_LOWERING",
+            format!(
+                "function {} return metadata {:?} has no native ABI lowering",
+                region.function_name, region.return_type
+            ),
+        ));
+    }
+    if let Some(param) = region.params.iter().find(|param| {
+        param.by_ref
+            || param.variadic
+            || param.default.is_some()
+            || param.type_.as_ref() != Some(&IrReturnType::Int)
+    }) {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_MISSING_PARAMETER_ABI_LOWERING",
+            format!(
+                "function {} parameter ${} metadata has no native ABI lowering",
+                region.function_name, param.name
+            ),
+        ));
+    }
+    if region.returns_by_ref || !region.captures.is_empty() || region.flags.is_generator {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_MISSING_FUNCTION_STATE_LOWERING",
+            format!(
+                "function {} flags={:?} returns_by_ref={} captures={} has no native state lowering",
+                region.function_name,
+                region.flags,
+                region.returns_by_ref,
+                region.captures.len()
+            ),
+        ));
+    }
+    for block in &region.blocks {
+        for instruction in &block.instructions {
+            if matches!(instruction.kind, RegionInstructionKind::MissingLowering) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_MISSING_INSTRUCTION_LOWERING",
+                    format!(
+                        "function={} instruction={:?} span={}:{}-{}",
+                        region.function_name,
+                        instruction.source_kind,
+                        instruction.span.file.raw(),
+                        instruction.span.start,
+                        instruction.span.end
+                    ),
+                ));
+            }
+        }
+        if matches!(block.terminator, RegionTerminator::MissingLowering) {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_MISSING_TERMINATOR_LOWERING",
+                format!(
+                    "function={} terminator={:?} span={}:{}-{}",
+                    region.function_name,
+                    block.source_terminator,
+                    block.terminator_span.file.raw(),
+                    block.terminator_span.start,
+                    block.terminator_span.end
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn region_arity(region: &RegionGraph) -> Result<u8, CraneliftLoweringError> {
     region.arity().try_into().map_err(|_| {
         CraneliftLoweringError::new(
             "JIT_CRANELIFT_REJECT_REGION_ARITY",
@@ -119,9 +216,9 @@ fn region_arity(region: &ExecutableRegion) -> Result<u8, CraneliftLoweringError>
     })
 }
 
-fn executable_region_signature(
+fn region_graph_signature(
     module: &JITModule,
-    region: &ExecutableRegion,
+    region: &RegionGraph,
 ) -> Result<Signature, CraneliftLoweringError> {
     let pointer_type = module.target_config().pointer_type();
     let mut signature = module.make_signature();
@@ -136,16 +233,16 @@ fn executable_region_signature(
     Ok(signature)
 }
 
-fn define_executable_region_function(
+fn define_region_graph_function(
     module: &mut JITModule,
-    region: &ExecutableRegion,
+    region: &RegionGraph,
     func_id: FuncId,
     functions: &BTreeMap<FunctionId, FuncId>,
 ) -> Result<(u64, Vec<crate::JitNativePcRange>), CraneliftLoweringError> {
     let arity = region_arity(region)?;
     let pointer_type = module.target_config().pointer_type();
     let mut ctx = module.make_context();
-    ctx.func.signature = executable_region_signature(module, region)?;
+    ctx.func.signature = region_graph_signature(module, region)?;
     ctx.func.name = UserFuncName::user(0, func_id.as_u32());
     let mut builder_context = FunctionBuilderContext::new();
     {
@@ -270,9 +367,9 @@ fn define_executable_region_function(
     Ok((code_bytes, native_pc_ranges))
 }
 
-fn executable_region_metadata<'a>(
+fn region_graph_metadata<'a>(
     root_local_count: u32,
-    regions: impl Iterator<Item = &'a ExecutableRegion>,
+    regions: impl Iterator<Item = &'a RegionGraph>,
     native_pc_ranges: Vec<crate::JitNativePcRange>,
 ) -> crate::JitRegionStateMetadata {
     let regions = regions.collect::<Vec<_>>();
@@ -324,10 +421,7 @@ fn executable_region_metadata<'a>(
             .flat_map(|region| &region.blocks)
             .flat_map(|block| &block.instructions)
             .filter(|instruction| {
-                matches!(
-                    instruction.kind,
-                    ExecutableRegionInstructionKind::DirectCall { .. }
-                )
+                matches!(instruction.kind, RegionInstructionKind::DirectCall { .. })
             })
             .count() as u64,
         continuations,

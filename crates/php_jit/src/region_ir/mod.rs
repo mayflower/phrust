@@ -1,14 +1,14 @@
 //! Backend-neutral region IR for native compilation and optimizer analysis.
 //!
-//! [`ExecutableRegion`] is the structured, multi-block compiler input consumed
-//! by Cranelift. [`RegionGraph`] remains the index-based optimizer and snapshot
+//! [`RegionGraph`] is the structured, multi-block compiler input consumed
+//! by Cranelift. [`OptimizerRegionGraph`] remains the index-based optimizer and snapshot
 //! substrate used for region-local analysis.
 
 /// Version of the executable Region IR contract consumed by native codegen.
 ///
 /// Increment this whenever serialized cache identity or lowering semantics can
 /// no longer be shared with code produced from an earlier Region IR shape.
-pub const REGION_IR_SCHEMA_VERSION: u32 = 1;
+pub const REGION_IR_SCHEMA_VERSION: u32 = 2;
 
 mod bind;
 mod builder;
@@ -30,10 +30,10 @@ pub use bind::{
 pub use builder::{RegionBuilder, RegionBuilderOptions, build_minimal_scalar_region};
 pub use dump::dump_region_graph;
 pub use executable::{
-    ExecutableRegion, ExecutableRegionBlock, ExecutableRegionBuildError,
-    ExecutableRegionInstruction, ExecutableRegionInstructionKind, ExecutableRegionOperand,
-    ExecutableRegionOsrEntry, ExecutableRegionTerminator, RegionBinaryOp, RegionCompareOpCode,
-    build_executable_region,
+    BaselineRegionBuilder, CompileMetadata, NativeCompileError, NativeCompilerTier, RegionBinaryOp,
+    RegionBlock, RegionCompareOpCode, RegionDeclarationMetadata, RegionExceptionRegion,
+    RegionGraph, RegionInstruction, RegionInstructionKind, RegionMethodIdentity, RegionOperand,
+    RegionOsrEntryPoint, RegionTerminator, build_baseline_region,
 };
 pub use ids::{ConstId, EntryId, ExitId, NodeId, RegionId, SnapshotId, VmSlotId};
 pub use interpreter::{
@@ -122,7 +122,7 @@ pub struct RegionFoldCounters {
 
 /// Compact, table-backed region optimizer graph.
 #[derive(Clone, Debug, PartialEq)]
-pub struct RegionGraph {
+pub struct OptimizerRegionGraph {
     nodes: Vec<RegionNode>,
     constants: Vec<RegionConst>,
     snapshots: Vec<RegionSnapshot>,
@@ -132,7 +132,7 @@ pub struct RegionGraph {
     fold_counters: RegionFoldCounters,
 }
 
-impl RegionGraph {
+impl OptimizerRegionGraph {
     /// Creates an empty graph.
     #[must_use]
     pub fn new(region_id: RegionId, name: impl Into<String>) -> Self {
@@ -252,7 +252,7 @@ impl RegionGraph {
 #[cfg(test)]
 mod tests {
     use super::{
-        RegionBuilder, RegionConst, RegionEffects, RegionGraph, RegionId, RegionNode,
+        OptimizerRegionGraph, RegionBuilder, RegionConst, RegionEffects, RegionId, RegionNode,
         RegionNodeKind, RegionPlacement, RegionValueType, SnapshotEntry, VmSlotId,
         build_minimal_scalar_region, dump_region_graph, verify_region_graph,
     };
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn region_ir_rejects_invalid_node_reference() {
-        let mut graph = RegionGraph::new(RegionId::new(7), "bad-ref");
+        let mut graph = OptimizerRegionGraph::new(RegionId::new(7), "bad-ref");
         graph.add_node(RegionNode::new(
             RegionNodeKind::Add,
             vec![super::NodeId::new(99), super::NodeId::new(0)],
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn region_ir_rejects_missing_snapshot() {
-        let mut graph = RegionGraph::new(RegionId::new(3), "missing-snapshot");
+        let mut graph = OptimizerRegionGraph::new(RegionId::new(3), "missing-snapshot");
         let start = graph.add_node(RegionNode::new(
             RegionNodeKind::Start,
             Vec::new(),

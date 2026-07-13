@@ -108,6 +108,8 @@ pub struct JitCompileRequest {
     pub config_hash: u64,
     /// Runtime invalidation generation (for example a class-layout epoch).
     pub invalidation_generation: u64,
+    /// Stable identity of linked source/dependency inputs.
+    pub dependency_identity: Option<String>,
 }
 
 impl JitCompileRequest {
@@ -121,6 +123,7 @@ impl JitCompileRequest {
             opt_level: 0,
             config_hash: 0,
             invalidation_generation: 0,
+            dependency_identity: None,
         }
     }
 
@@ -156,6 +159,13 @@ impl JitCompileRequest {
     #[must_use]
     pub const fn with_invalidation_generation(mut self, generation: u64) -> Self {
         self.invalidation_generation = generation;
+        self
+    }
+
+    /// Adds the linked dependency identity used by native code caches.
+    #[must_use]
+    pub fn with_dependency_identity(mut self, identity: impl Into<String>) -> Self {
+        self.dependency_identity = Some(identity.into());
         self
     }
 }
@@ -1208,6 +1218,13 @@ pub struct JitCompileResult {
     pub stats: JitStats,
 }
 
+/// Baseline compilation record for one function in an IR unit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JitUnitCompileRecord {
+    pub function: FunctionId,
+    pub result: JitCompileResult,
+}
+
 /// JIT error type for invalid API use.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JitError {
@@ -1319,6 +1336,52 @@ impl JitEngine {
         self.compile_function_with_backend(unit, function, request, &mut backend)
     }
 
+    /// Compiles every known function body before an IR unit is executable.
+    pub fn compile_unit(
+        &mut self,
+        unit: &IrUnit,
+        request: JitCompileRequest,
+    ) -> Result<Vec<JitUnitCompileRecord>, JitError> {
+        self.compile_unit_with_runtime_helpers(unit, request, JitRuntimeHelperAddresses::default())
+    }
+
+    /// Compiles every body with the runtime helper table used by native code.
+    pub fn compile_unit_with_runtime_helpers(
+        &mut self,
+        unit: &IrUnit,
+        mut request: JitCompileRequest,
+        runtime_helpers: JitRuntimeHelperAddresses,
+    ) -> Result<Vec<JitUnitCompileRecord>, JitError> {
+        if request.region_id.is_empty() {
+            return Err(JitError::EmptyRegionId);
+        }
+        if request.ir_fingerprint.is_none() {
+            request.ir_fingerprint = Some(stable_ir_fingerprint(unit));
+        }
+        if request.dependency_identity.is_none() {
+            request.dependency_identity = Some(stable_dependency_identity(unit));
+        }
+        let base_region = request.region_id.clone();
+        let mut records = Vec::with_capacity(unit.functions.len());
+        for (index, function) in unit.functions.iter().enumerate() {
+            let function_id = FunctionId::new(index as u32);
+            let mut function_request = request.clone();
+            function_request.region_id = format!("{base_region}.function.{index}");
+            function_request.function_name = Some(function.name.clone());
+            let result = self.compile_function_with_runtime_helpers(
+                unit,
+                function_id,
+                function_request,
+                runtime_helpers,
+            )?;
+            records.push(JitUnitCompileRecord {
+                function: function_id,
+                result,
+            });
+        }
+        Ok(records)
+    }
+
     /// Attempts to compile one IR function with runtime helper addresses.
     pub fn compile_function_with_runtime_helpers(
         &mut self,
@@ -1415,6 +1478,34 @@ impl JitEngine {
     }
 }
 
+fn stable_ir_fingerprint(unit: &IrUnit) -> String {
+    format!(
+        "php-ir-v{}-{:016x}",
+        unit.version,
+        stable_text_hash(&format!("{unit:?}"))
+    )
+}
+
+fn stable_dependency_identity(unit: &IrUnit) -> String {
+    let dependencies = format!(
+        "{:?}:{:?}:{:?}",
+        unit.files, unit.linked_file_entries, unit.linked_entry_autoload_declarations
+    );
+    format!(
+        "php-dependencies-v1-{:016x}",
+        stable_text_hash(&dependencies)
+    )
+}
+
+fn stable_text_hash(text: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 impl Default for JitEngine {
     fn default() -> Self {
         Self::new()
@@ -1443,6 +1534,45 @@ mod tests {
 
         assert_eq!(error, JitError::EmptyRegionId);
         assert_eq!(engine.stats().compile_requests, 0);
+    }
+
+    #[test]
+    fn compile_unit_records_every_known_function_before_publication() {
+        let mut builder = IrBuilder::new(UnitId::new(44));
+        let file = builder.add_file("unit.php");
+        let span = IrSpan::new(file, 0, 8);
+        let constant = builder.intern_constant(IrConstant::Int(4));
+        let mut functions = Vec::new();
+        for name in ["entry", "declared_later"] {
+            let function = builder.start_function(name, FunctionFlags::default(), span);
+            builder.set_return_type(function, Some(IrReturnType::Int));
+            let block = builder.append_block(function);
+            let value = builder.alloc_register(function);
+            builder.emit(
+                function,
+                block,
+                InstructionKind::LoadConst {
+                    dst: value,
+                    constant,
+                },
+                span,
+            );
+            builder.terminate_return(function, block, Some(Operand::Register(value)), span);
+            functions.push(function);
+        }
+        builder.set_entry(functions[0]);
+        let unit = builder.finish();
+        let mut engine = JitEngine::new();
+        let records = engine
+            .compile_unit(&unit, JitCompileRequest::new("whole-unit"))
+            .expect("unit compile records");
+
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| {
+            matches!(record.result.status, crate::JitCompileStatus::Compiled)
+                && record.result.handle.is_some()
+        }));
+        assert_eq!(engine.stats().compile_requests, 2);
     }
 
     #[test]

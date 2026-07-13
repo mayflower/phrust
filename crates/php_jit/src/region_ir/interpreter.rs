@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::opt::{RegionCfg, build_cfg};
 use super::{
-    NodeId, RegionCompareOp, RegionConst, RegionGraph, RegionNodeKind, RegionValueType,
+    NodeId, OptimizerRegionGraph, RegionCompareOp, RegionConst, RegionNodeKind, RegionValueType,
     SnapshotEntry, SnapshotId, VmSlotId, verify_region_graph,
 };
 
@@ -153,14 +153,14 @@ impl RegionInterpretResult {
 /// Interprets one region graph with scalar parameter inputs.
 #[must_use]
 pub fn interpret_region(
-    graph: &RegionGraph,
+    graph: &OptimizerRegionGraph,
     inputs: &RegionInterpretInputs,
 ) -> RegionInterpretResult {
     RegionInterpreter::new(graph, inputs).run()
 }
 
 struct RegionInterpreter<'a> {
-    graph: &'a RegionGraph,
+    graph: &'a OptimizerRegionGraph,
     inputs: &'a RegionInterpretInputs,
     cfg: RegionCfg,
     executed_nodes: u64,
@@ -168,7 +168,7 @@ struct RegionInterpreter<'a> {
 }
 
 impl<'a> RegionInterpreter<'a> {
-    fn new(graph: &'a RegionGraph, inputs: &'a RegionInterpretInputs) -> Self {
+    fn new(graph: &'a OptimizerRegionGraph, inputs: &'a RegionInterpretInputs) -> Self {
         Self {
             graph,
             inputs,
@@ -591,8 +591,9 @@ mod tests {
     };
     use crate::region_ir::opt::analyze_region_graph;
     use crate::region_ir::{
-        NodeId, RegionBuilder, RegionCompareOp, RegionConst, RegionEffects, RegionGraph, RegionId,
-        RegionNode, RegionNodeKind, RegionPlacement, RegionValueType, SnapshotEntry, VmSlotId,
+        NodeId, OptimizerRegionGraph, RegionBuilder, RegionCompareOp, RegionConst, RegionEffects,
+        RegionId, RegionNode, RegionNodeKind, RegionPlacement, RegionValueType, SnapshotEntry,
+        VmSlotId,
     };
 
     #[test]
@@ -701,7 +702,7 @@ mod tests {
 
     #[test]
     fn unsupported_nodes_fail_explicitly() {
-        let mut graph = RegionGraph::new(RegionId::new(425), "unsupported-call");
+        let mut graph = OptimizerRegionGraph::new(RegionId::new(425), "unsupported-call");
         let start = control_node(&mut graph, RegionNodeKind::Start, None);
         let call = graph.add_node(RegionNode::new(
             RegionNodeKind::Call,
@@ -734,7 +735,7 @@ mod tests {
 
     #[test]
     fn select_and_phi_are_supported_for_simple_scalar_tests() {
-        let mut graph = RegionGraph::new(RegionId::new(426), "select-phi");
+        let mut graph = OptimizerRegionGraph::new(RegionId::new(426), "select-phi");
         let start = control_node(&mut graph, RegionNodeKind::Start, None);
         let c_true = graph.add_constant(RegionConst::Bool(true));
         let condition = graph.add_node(RegionNode::new(
@@ -779,7 +780,7 @@ mod tests {
     }
 
     fn control_node(
-        graph: &mut RegionGraph,
+        graph: &mut OptimizerRegionGraph,
         kind: RegionNodeKind,
         control: Option<NodeId>,
     ) -> NodeId {
@@ -793,7 +794,7 @@ mod tests {
         ))
     }
 
-    fn const_i64(graph: &mut RegionGraph, value: i64) -> NodeId {
+    fn const_i64(graph: &mut OptimizerRegionGraph, value: i64) -> NodeId {
         let constant = graph.add_constant(RegionConst::I64(value));
         graph.add_node(RegionNode::new(
             RegionNodeKind::Const(constant),

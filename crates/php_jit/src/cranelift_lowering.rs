@@ -6,17 +6,21 @@
 //! the caller to opt in explicitly.
 
 use crate::code_manager::ManagedCompileError;
+#[cfg(test)]
+use crate::region_ir::build_baseline_region;
 use crate::region_ir::{
-    ExecutableRegion, ExecutableRegionInstruction, ExecutableRegionInstructionKind,
-    ExecutableRegionOperand, ExecutableRegionTerminator, RegionBinaryOp, RegionCompareOpCode,
-    build_executable_region,
+    BaselineRegionBuilder, CompileMetadata, NativeCompilerTier, RegionBinaryOp,
+    RegionCompareOpCode, RegionGraph, RegionInstruction, RegionInstructionKind, RegionOperand,
+    RegionTerminator,
 };
 use crate::{
     CraneliftCodeKey, CraneliftCompilerIdentity, JIT_HELPER_STATUS_OK, JIT_HELPER_STATUS_OVERFLOW,
     JIT_RUNTIME_ABI_HASH, JitCompileRequest, JitCompileStatus, JitEligibility, JitFunctionHandle,
-    JitNativeSpecialization, JitPropertyLoadMetadata, ManagedJitFunction, NativeCompileOutcome,
-    NativeCompileRequest, NativeCompilerApi, analyze_jit_eligibility, global_code_manager,
+    ManagedJitFunction, NativeCompileOutcome, NativeCompileRequest, NativeCompilerApi,
+    analyze_jit_eligibility, global_code_manager,
 };
+#[cfg(test)]
+use crate::{JitNativeSpecialization, JitPropertyLoadMetadata};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
     self, AbiParam, Function, InstBuilder, MemFlagsData, Signature, StackSlotData, StackSlotKind,
@@ -28,10 +32,14 @@ use cranelift_codegen::verifier::verify_function;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Linkage, Module};
-use php_ir::instruction::{Terminator, TerminatorKind};
+#[cfg(test)]
+use php_ir::IrParam;
+#[cfg(test)]
+use php_ir::instruction::Terminator;
+use php_ir::instruction::TerminatorKind;
 use php_ir::{
-    BinaryOp, BlockId, FunctionId, InstructionKind, IrConstant, IrFunction, IrParam, IrReturnType,
-    IrUnit, LocalId, Operand, RegId,
+    BinaryOp, BlockId, FunctionId, InstructionKind, IrConstant, IrFunction, IrReturnType, IrUnit,
+    LocalId, Operand, RegId,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -62,12 +70,14 @@ pub struct CraneliftMachineCodeHandle {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct ConstantReturnCandidate {
     value: i64,
     arity: u8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct NativeConstantCompileResult {
     handle: JitFunctionHandle,
     code_bytes: u64,
@@ -95,10 +105,10 @@ fn compile_managed_native(
         .ir_fingerprint
         .clone()
         .unwrap_or_else(|| format!("unfingerprinted-function-{}", function.raw()));
+    let identity = crate::cranelift_host_isa_identity().map_err(|error| {
+        CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_NATIVE_TARGET", error.to_string())
+    })?;
     let mut config_hash = if request.config_hash == 0 {
-        let identity = crate::cranelift_host_isa_identity().map_err(|error| {
-            CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_NATIVE_TARGET", error.to_string())
-        })?;
         identity.feature_fingerprint ^ u64::from(request.opt_level)
     } else {
         request.config_hash
@@ -109,10 +119,26 @@ fn compile_managed_native(
             config_hash = config_hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
+    let dependency_identity = request
+        .dependency_identity
+        .clone()
+        .unwrap_or_else(|| format!("ir:{compiled_unit}"));
     let key = CraneliftCodeKey {
         compiled_unit,
         region: format!("{}:function:{}", request.region_id, function.raw()),
         abi_hash: JIT_RUNTIME_ABI_HASH,
+        compiler_tier: if request.opt_level == 0 {
+            "baseline".to_owned()
+        } else {
+            "optimizing".to_owned()
+        },
+        helper_abi_hash: config_hash ^ JIT_RUNTIME_ABI_HASH,
+        target_cpu: format!(
+            "{}:{}:{}",
+            identity.target_triple, identity.isa_name, identity.feature_fingerprint
+        ),
+        semantic_config_hash: request.config_hash,
+        dependency_identity,
         config_hash,
         invalidation_generation: request.invalidation_generation,
         specialization: specialization.to_owned(),
@@ -130,39 +156,46 @@ fn compile_managed_native(
         })
 }
 
+#[cfg(test)]
 fn runtime_helper_symbol(base: &str, address: usize) -> String {
     format!("{base}_{address:016x}")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct PackedArrayFetchCandidate {
     array_param: LocalId,
     index_param: LocalId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct NativePackedArrayFetchCompileResult {
     handle: JitFunctionHandle,
     code_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct PackedForeachIntSumCandidate {
     array_param: LocalId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct NativePackedForeachIntSumCompileResult {
     handle: JitFunctionHandle,
     code_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum KnownCallKind {
     Strlen,
     Count,
 }
 
+#[cfg(test)]
 impl KnownCallKind {
     const fn function_name(self) -> &'static str {
         match self {
@@ -187,49 +220,64 @@ impl KnownCallKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct KnownCallCandidate {
     kind: KnownCallKind,
     value_param: LocalId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct NativeKnownCallCompileResult {
     handle: JitFunctionHandle,
     code_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct StringConcatCandidate {
     lhs_param: LocalId,
     rhs_param: LocalId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct NativeStringConcatCompileResult {
     handle: JitFunctionHandle,
     code_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct PropertyLoadCandidate {
     object_param: LocalId,
     metadata: JitPropertyLoadMetadata,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct NativePropertyLoadCompileResult {
     handle: JitFunctionHandle,
     code_bytes: u64,
 }
 
+#[cfg(test)]
 const JIT_PACKED_ARRAY_STATUS_BOUNDS_EXIT: i32 = 2;
+#[cfg(test)]
 const JIT_PACKED_ARRAY_STATUS_LAYOUT_EXIT: i32 = 3;
+#[cfg(test)]
 const PACKED_ARRAY_LEN_HELPER_SYMBOL: &str = "phrust_jit_array_len_abi";
+#[cfg(test)]
 const PACKED_ARRAY_FETCH_HELPER_SYMBOL: &str = "phrust_jit_array_fetch_int_slow_abi";
+#[cfg(test)]
 const KNOWN_STRLEN_HELPER_SYMBOL: &str = "phrust_jit_strlen_known_abi";
+#[cfg(test)]
 const KNOWN_COUNT_HELPER_SYMBOL: &str = "phrust_jit_count_known_abi";
+#[cfg(test)]
 const STRING_CONCAT_HELPER_SYMBOL: &str = "php_jit_concat_string_string_fast";
+#[cfg(test)]
 const RECORD_ARRAY_LOOKUP_HELPER_SYMBOL: &str = "phrust_jit_record_array_lookup";
+#[cfg(test)]
 const PROPERTY_LOAD_HELPER_SYMBOL: &str = "php_jit_property_load_monomorphic_fast";
 
 /// Mandatory Cranelift native compiler.
@@ -238,6 +286,125 @@ pub struct CraneliftNativeCompiler;
 
 impl NativeCompilerApi for CraneliftNativeCompiler {
     fn compile_region(&mut self, request: &NativeCompileRequest<'_>) -> NativeCompileOutcome {
+        compile_authoritative_region(request)
+    }
+}
+
+fn compile_authoritative_region(request: &NativeCompileRequest<'_>) -> NativeCompileOutcome {
+    let (Some(unit), Some(function)) = (request.unit, request.function) else {
+        return NativeCompileOutcome::skipped(
+            JitCompileStatus::Rejected {
+                reason: "JIT_CRANELIFT_REJECT_MISSING_IR".to_owned(),
+            },
+            format!(
+                "Cranelift native compiler missing IR context for region `{}`",
+                request.compile.region_id
+            ),
+        );
+    };
+    let isa = match crate::cranelift_host_isa_identity() {
+        Ok(isa) => isa,
+        Err(error) => {
+            return NativeCompileOutcome::skipped(
+                JitCompileStatus::Rejected {
+                    reason: error.code.to_owned(),
+                },
+                error.to_string(),
+            );
+        }
+    };
+    let metadata = CompileMetadata {
+        ir_fingerprint: request
+            .compile
+            .ir_fingerprint
+            .clone()
+            .unwrap_or_else(|| format!("unit-{}-function-{}", unit.id.raw(), function.raw())),
+        tier: if request.compile.opt_level == 0 {
+            NativeCompilerTier::Baseline
+        } else {
+            NativeCompilerTier::Optimizing
+        },
+        helper_abi_hash: runtime_helper_abi_hash(request.runtime_helpers),
+        target_cpu: format!(
+            "{}:{}:{}",
+            isa.target_triple, isa.isa_name, isa.feature_fingerprint
+        ),
+        semantic_config_hash: request.compile.config_hash,
+        dependency_identity: request
+            .compile
+            .dependency_identity
+            .clone()
+            .unwrap_or_else(|| format!("unit-{}-version-{}", unit.id.raw(), unit.version)),
+    };
+    let region = match BaselineRegionBuilder::build(unit, function, &metadata) {
+        Ok(region) => region,
+        Err(error) => {
+            return NativeCompileOutcome::skipped(
+                JitCompileStatus::Rejected {
+                    reason: error.code.to_owned(),
+                },
+                error.to_string(),
+            );
+        }
+    };
+    let start = Instant::now();
+    match executable_region::compile_region_graph_native(unit, &region, request.compile) {
+        Ok(compiled) => {
+            let elapsed = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
+            NativeCompileOutcome::compiled(
+                compiled.handle,
+                format!(
+                    "Cranelift baseline Region IR `{}` function={} abi_hash={} code_bytes={} fast_path_hits={} control_flow={}",
+                    request.compile.region_id,
+                    function.raw(),
+                    JIT_RUNTIME_ABI_HASH,
+                    compiled.code_bytes,
+                    compiled.fast_path_hits,
+                    compiled.has_control_flow
+                ),
+                compiled.code_bytes,
+                elapsed.max(1),
+            )
+        }
+        Err(error) => NativeCompileOutcome::skipped(
+            JitCompileStatus::Rejected {
+                reason: error.code.to_owned(),
+            },
+            format!(
+                "Cranelift baseline Region IR compile rejected region `{}`: {error}",
+                request.compile.region_id
+            ),
+        ),
+    }
+}
+
+fn runtime_helper_abi_hash(helpers: crate::JitRuntimeHelperAddresses) -> u64 {
+    let mut hash = JIT_RUNTIME_ABI_HASH;
+    for address in [
+        helpers.helper_table,
+        helpers.packed_array_len,
+        helpers.packed_array_fetch_int_slow,
+        helpers.known_strlen,
+        helpers.known_count,
+        helpers.string_concat,
+        helpers.property_load,
+        helpers.record_array_lookup,
+    ] {
+        for byte in address.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+#[cfg(test)]
+impl CraneliftNativeCompiler {
+    #[allow(dead_code)]
+    fn compile_candidate_differential(
+        &mut self,
+        request: &NativeCompileRequest<'_>,
+    ) -> NativeCompileOutcome {
         let (Some(unit), Some(function)) = (request.unit, request.function) else {
             return NativeCompileOutcome::skipped(
                 JitCompileStatus::Rejected {
@@ -516,13 +683,9 @@ impl NativeCompilerApi for CraneliftNativeCompiler {
             }
         }
 
-        if let Ok(region) = build_executable_region(unit, function) {
+        if let Ok(region) = build_baseline_region(unit, function) {
             let start = Instant::now();
-            match executable_region::compile_executable_region_native(
-                unit,
-                &region,
-                request.compile,
-            ) {
+            match executable_region::compile_region_graph_native(unit, &region, request.compile) {
                 Ok(compiled) => {
                     let elapsed = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
                     return NativeCompileOutcome::compiled(
@@ -920,6 +1083,7 @@ fn constant_value(unit: &IrUnit, constant: php_ir::ConstId) -> Result<i64, Crane
     }
 }
 
+#[cfg(test)]
 fn constant_return_candidate(
     unit: &IrUnit,
     function: FunctionId,
@@ -1028,6 +1192,7 @@ fn constant_return_candidate(
     Ok(ConstantReturnCandidate { value, arity })
 }
 
+#[cfg(test)]
 fn constant_operand_value(
     unit: &IrUnit,
     registers: &BTreeMap<RegId, i64>,
@@ -1051,6 +1216,7 @@ fn constant_operand_value(
     }
 }
 
+#[cfg(test)]
 fn packed_array_fetch_candidate(
     unit: &IrUnit,
     function: FunctionId,
@@ -1156,6 +1322,7 @@ fn packed_array_fetch_candidate(
     }
 }
 
+#[cfg(test)]
 fn check_packed_fetch_param(
     param: &IrParam,
     expected: IrReturnType,
@@ -1176,6 +1343,7 @@ fn check_packed_fetch_param(
     Ok(())
 }
 
+#[cfg(test)]
 fn packed_foreach_int_sum_candidate(
     unit: &IrUnit,
     function: FunctionId,
@@ -1547,6 +1715,7 @@ fn packed_foreach_int_sum_candidate(
     }
 }
 
+#[cfg(test)]
 fn known_call_candidate(
     unit: &IrUnit,
     function: FunctionId,
@@ -1703,6 +1872,7 @@ fn known_call_candidate(
     })
 }
 
+#[cfg(test)]
 struct RecordArrayLookupCandidate {
     #[allow(dead_code)]
     array_param: LocalId,
@@ -1710,6 +1880,7 @@ struct RecordArrayLookupCandidate {
     key_param: LocalId,
 }
 
+#[cfg(test)]
 struct NativeRecordArrayLookupCompileResult {
     handle: JitFunctionHandle,
     code_bytes: u64,
@@ -1718,6 +1889,7 @@ struct NativeRecordArrayLookupCompileResult {
 /// Leaf shape `function f(array $map, string $key) { return $map[$key]; }`
 /// with untyped return: the record-shape and key-symbol guards live in the
 /// runtime helper, which reports exact side-exit statuses.
+#[cfg(test)]
 fn record_array_lookup_candidate(
     unit: &IrUnit,
     function: FunctionId,
@@ -1844,6 +2016,7 @@ fn record_array_lookup_candidate(
     }
 }
 
+#[cfg(test)]
 fn compile_record_array_lookup_native(
     function: FunctionId,
     _candidate: &RecordArrayLookupCandidate,
@@ -1962,6 +2135,7 @@ fn compile_record_array_lookup_native(
     })
 }
 
+#[cfg(test)]
 fn string_concat_candidate(
     unit: &IrUnit,
     function: FunctionId,
@@ -2100,6 +2274,7 @@ fn string_concat_candidate(
     })
 }
 
+#[cfg(test)]
 fn property_load_candidate(
     unit: &IrUnit,
     function: FunctionId,
@@ -2301,6 +2476,7 @@ fn property_load_candidate(
     })
 }
 
+#[cfg(test)]
 fn lookup_class<'a>(unit: &'a IrUnit, name: &str) -> Option<&'a php_ir::module::ClassEntry> {
     let normalized = normalize_class_name(name);
     unit.classes
@@ -2308,6 +2484,7 @@ fn lookup_class<'a>(unit: &'a IrUnit, name: &str) -> Option<&'a php_ir::module::
         .find(|class| normalize_class_name(&class.name) == normalized)
 }
 
+#[cfg(test)]
 fn lookup_property_in_unit<'a>(
     unit: &'a IrUnit,
     class: &'a php_ir::module::ClassEntry,
@@ -2326,6 +2503,7 @@ fn lookup_property_in_unit<'a>(
     lookup_property_in_unit(unit, parent, property)
 }
 
+#[cfg(test)]
 fn class_or_parent_has_public_magic_get(unit: &IrUnit, class: &php_ir::module::ClassEntry) -> bool {
     if class.methods.iter().any(|method| {
         method.name.eq_ignore_ascii_case("__get")
@@ -2342,6 +2520,7 @@ fn class_or_parent_has_public_magic_get(unit: &IrUnit, class: &php_ir::module::C
         .is_some_and(|parent| class_or_parent_has_public_magic_get(unit, parent))
 }
 
+#[cfg(test)]
 fn property_storage_name(
     class: &php_ir::module::ClassEntry,
     property: &php_ir::module::ClassPropertyEntry,
@@ -2357,10 +2536,12 @@ fn property_storage_name(
     }
 }
 
+#[cfg(test)]
 fn normalize_class_name(name: &str) -> String {
     name.trim_start_matches('\\').to_ascii_lowercase()
 }
 
+#[cfg(test)]
 fn compile_constant_return_native(
     function: FunctionId,
     value: i64,
@@ -2438,6 +2619,7 @@ fn compile_constant_return_native(
     })
 }
 
+#[cfg(test)]
 fn compile_packed_array_fetch_native(
     function: FunctionId,
     _candidate: &PackedArrayFetchCandidate,
@@ -2571,6 +2753,7 @@ fn compile_packed_array_fetch_native(
     })
 }
 
+#[cfg(test)]
 fn compile_packed_foreach_int_sum_native(
     function: FunctionId,
     _candidate: &PackedForeachIntSumCandidate,
@@ -2821,6 +3004,7 @@ fn compile_packed_foreach_int_sum_native(
     })
 }
 
+#[cfg(test)]
 fn compile_known_call_native(
     function: FunctionId,
     candidate: &KnownCallCandidate,
@@ -2935,6 +3119,7 @@ fn compile_known_call_native(
     })
 }
 
+#[cfg(test)]
 fn compile_string_concat_native(
     function: FunctionId,
     _candidate: &StringConcatCandidate,
@@ -3051,6 +3236,7 @@ fn compile_string_concat_native(
     })
 }
 
+#[cfg(test)]
 fn compile_property_load_native(
     function: FunctionId,
     candidate: &PropertyLoadCandidate,
@@ -3171,7 +3357,7 @@ fn compile_property_load_native(
 
 fn create_region_cranelift_blocks(
     builder: &mut FunctionBuilder<'_>,
-    region: &ExecutableRegion,
+    region: &RegionGraph,
 ) -> Result<Vec<ir::Block>, CraneliftLoweringError> {
     let mut blocks = Vec::with_capacity(region.blocks.len());
     for (index, region_block) in region.blocks.iter().enumerate() {
@@ -3232,17 +3418,17 @@ fn lower_region_operand(
     builder: &mut FunctionBuilder<'_>,
     locals: &BTreeMap<LocalId, Variable>,
     registers: &BTreeMap<RegId, ir::Value>,
-    operand: ExecutableRegionOperand,
+    operand: RegionOperand,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     match operand {
-        ExecutableRegionOperand::Register(reg) => registers.get(&reg).copied().ok_or_else(|| {
+        RegionOperand::Register(reg) => registers.get(&reg).copied().ok_or_else(|| {
             CraneliftLoweringError::new(
                 "JIT_CRANELIFT_REJECT_MISSING_REGISTER",
                 format!("register {} has not been lowered in this block", reg.raw()),
             )
         }),
-        ExecutableRegionOperand::I64(value) => Ok(builder.ins().iconst(types::I64, value)),
-        ExecutableRegionOperand::Local(local) => use_local_variable(builder, locals, local),
+        RegionOperand::I64(value) => Ok(builder.ins().iconst(types::I64, value)),
+        RegionOperand::Local(local) => use_local_variable(builder, locals, local),
     }
 }
 
@@ -3252,31 +3438,31 @@ fn lower_region_instruction(
     functions: &BTreeMap<FunctionId, FuncId>,
     locals: &BTreeMap<LocalId, Variable>,
     registers: &mut BTreeMap<RegId, ir::Value>,
-    instruction: &ExecutableRegionInstruction,
+    instruction: &RegionInstruction,
     deopt_out: ir::Value,
     function: FunctionId,
     local_count: u32,
     pointer_type: ir::Type,
 ) -> Result<(), CraneliftLoweringError> {
     match &instruction.kind {
-        ExecutableRegionInstructionKind::Nop => {}
-        ExecutableRegionInstructionKind::Move { dst, src } => {
+        RegionInstructionKind::Nop => {}
+        RegionInstructionKind::Move { dst, src } => {
             let cl_value = lower_region_operand(builder, locals, registers, *src)?;
             registers.insert(*dst, cl_value);
         }
-        ExecutableRegionInstructionKind::LoadLocal { dst, local } => {
+        RegionInstructionKind::LoadLocal { dst, local } => {
             let cl_value = use_local_variable(builder, locals, *local)?;
             registers.insert(*dst, cl_value);
         }
-        ExecutableRegionInstructionKind::StoreLocal { local, src } => {
+        RegionInstructionKind::StoreLocal { local, src } => {
             let cl_value = lower_region_operand(builder, locals, registers, *src)?;
             let variable = local_variable(locals, *local)?;
             builder.def_var(variable, cl_value);
         }
-        ExecutableRegionInstructionKind::Discard { src } => {
+        RegionInstructionKind::Discard { src } => {
             let _ = lower_region_operand(builder, locals, registers, *src)?;
         }
-        ExecutableRegionInstructionKind::Binary { dst, op, lhs, rhs } => {
+        RegionInstructionKind::Binary { dst, op, lhs, rhs } => {
             let lhs = lower_region_operand(builder, locals, registers, *lhs)?;
             let rhs = lower_region_operand(builder, locals, registers, *rhs)?;
             let cl_value = lower_checked_region_binary(
@@ -3292,7 +3478,7 @@ fn lower_region_instruction(
             )?;
             registers.insert(*dst, cl_value);
         }
-        ExecutableRegionInstructionKind::DirectCall { dst, target, args } => {
+        RegionInstructionKind::DirectCall { dst, target, args } => {
             let callee = functions.get(target).copied().ok_or_else(|| {
                 CraneliftLoweringError::new(
                     "JIT_CRANELIFT_REJECT_DIRECT_CALLEE",
@@ -3329,11 +3515,23 @@ fn lower_region_instruction(
             let value = builder.ins().stack_load(types::I64, result_slot, 0);
             registers.insert(*dst, value);
         }
-        ExecutableRegionInstructionKind::Compare { dst, op, lhs, rhs } => {
+        RegionInstructionKind::Compare { dst, op, lhs, rhs } => {
             let lhs = lower_region_operand(builder, locals, registers, *lhs)?;
             let rhs = lower_region_operand(builder, locals, registers, *rhs)?;
             let cl_value = builder.ins().icmp(region_compare_intcc(*op), lhs, rhs);
             registers.insert(*dst, cl_value);
+        }
+        RegionInstructionKind::MissingLowering => {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_MISSING_INSTRUCTION_LOWERING",
+                format!(
+                    "instruction {:?} at {}:{}-{} has no native lowering",
+                    instruction.source_kind,
+                    instruction.span.file.raw(),
+                    instruction.span.start,
+                    instruction.span.end
+                ),
+            ));
         }
     }
     Ok(())
@@ -3347,7 +3545,7 @@ fn lower_checked_region_binary(
     deopt_out: ir::Value,
     function: FunctionId,
     local_count: u32,
-    instruction: &ExecutableRegionInstruction,
+    instruction: &RegionInstruction,
     locals: &BTreeMap<LocalId, Variable>,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     let (result, overflow) = match op {
@@ -3416,7 +3614,7 @@ fn lower_region_condition(
     builder: &mut FunctionBuilder<'_>,
     locals: &BTreeMap<LocalId, Variable>,
     registers: &BTreeMap<RegId, ir::Value>,
-    condition: ExecutableRegionOperand,
+    condition: RegionOperand,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     let value = lower_region_operand(builder, locals, registers, condition)?;
     if builder.func.dfg.value_type(value) == types::I64 {
@@ -3433,13 +3631,13 @@ fn lower_region_terminator(
     locals: &BTreeMap<LocalId, Variable>,
     registers: &BTreeMap<RegId, ir::Value>,
     result_out: ir::Value,
-    terminator: &ExecutableRegionTerminator,
+    terminator: &RegionTerminator,
 ) -> Result<(), CraneliftLoweringError> {
     match terminator {
-        ExecutableRegionTerminator::Jump { target } => {
+        RegionTerminator::Jump { target } => {
             builder.ins().jump(cranelift_block(blocks, *target)?, &[]);
         }
-        ExecutableRegionTerminator::JumpIfFalse {
+        RegionTerminator::JumpIfFalse {
             condition,
             target,
             fallthrough,
@@ -3451,7 +3649,7 @@ fn lower_region_terminator(
                 .ins()
                 .brif(condition, true_block, &[], false_block, &[]);
         }
-        ExecutableRegionTerminator::JumpIfTrue {
+        RegionTerminator::JumpIfTrue {
             condition,
             target,
             fallthrough,
@@ -3463,7 +3661,7 @@ fn lower_region_terminator(
                 .ins()
                 .brif(condition, true_block, &[], false_block, &[]);
         }
-        ExecutableRegionTerminator::JumpIf {
+        RegionTerminator::JumpIf {
             condition,
             if_true,
             if_false,
@@ -3477,7 +3675,7 @@ fn lower_region_terminator(
                 &[],
             );
         }
-        ExecutableRegionTerminator::Return { value } => {
+        RegionTerminator::Return { value } => {
             let value = lower_region_operand(builder, locals, registers, *value)?;
             builder
                 .ins()
@@ -3486,6 +3684,12 @@ fn lower_region_terminator(
                 .ins()
                 .iconst(types::I32, i64::from(JIT_HELPER_STATUS_OK));
             builder.ins().return_(&[status]);
+        }
+        RegionTerminator::MissingLowering => {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_MISSING_TERMINATOR_LOWERING",
+                "terminator has no native lowering",
+            ));
         }
     }
     Ok(())
@@ -3562,7 +3766,7 @@ mod tests {
     }
 
     #[test]
-    fn cranelift_backend_verifies_non_executable_clif_without_handle() {
+    fn production_pipeline_reports_concrete_missing_return_abi() {
         let (unit, function) = arithmetic_fixture();
         let mut backend = CraneliftNativeCompiler;
         let request = JitCompileRequest::new("cl.no_exec.verified");
@@ -3576,14 +3780,11 @@ mod tests {
         assert_eq!(
             outcome.status,
             JitCompileStatus::Rejected {
-                reason:
-                    "cranelift backend verified CLIF but region is not in native executable subset"
-                        .to_owned()
+                reason: "JIT_CRANELIFT_MISSING_RETURN_ABI_LOWERING".to_owned()
             }
         );
         assert!(outcome.handle.is_none());
-        assert!(outcome.diagnostics[0].contains("verified"));
-        assert!(outcome.diagnostics[0].contains("clif_bytes="));
+        assert!(outcome.diagnostics[0].contains("return metadata"));
     }
 
     #[test]
@@ -3680,7 +3881,7 @@ mod tests {
         });
 
         assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-        assert!(outcome.diagnostics[0].contains("executable Region IR"));
+        assert!(outcome.diagnostics[0].contains("baseline Region IR"));
         assert!(outcome.diagnostics[0].contains("fast_path_hits=0"));
         let handle = outcome
             .handle
@@ -3706,7 +3907,7 @@ mod tests {
         });
 
         assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-        assert!(outcome.diagnostics[0].contains("executable Region IR"));
+        assert!(outcome.diagnostics[0].contains("baseline Region IR"));
         assert!(outcome.diagnostics[0].contains("control_flow=true"));
         let handle = outcome.handle.expect("multi-block region should compile");
         assert_eq!(
@@ -3869,11 +4070,11 @@ mod tests {
     }
 
     #[test]
-    fn cranelift_backend_compiles_packed_array_fetch_helper_native_handle() {
+    fn differential_candidate_compiles_packed_array_fetch_helper_native_handle() {
         let (unit, function) = packed_array_fetch_fixture();
         let mut backend = CraneliftNativeCompiler;
         let request = JitCompileRequest::new("cl.packed.fetch");
-        let outcome = backend.compile_region(&NativeCompileRequest {
+        let outcome = backend.compile_candidate_differential(&NativeCompileRequest {
             compile: &request,
             unit: Some(&unit),
             function: Some(function),
@@ -3914,11 +4115,11 @@ mod tests {
     }
 
     #[test]
-    fn cranelift_backend_compiles_packed_foreach_int_sum_native_loop() {
+    fn differential_candidate_compiles_packed_foreach_int_sum_native_loop() {
         let (unit, function) = packed_foreach_int_sum_fixture();
         let mut backend = CraneliftNativeCompiler;
         let request = JitCompileRequest::new("cl.packed.foreach.sum");
-        let outcome = backend.compile_region(&NativeCompileRequest {
+        let outcome = backend.compile_candidate_differential(&NativeCompileRequest {
             compile: &request,
             unit: Some(&unit),
             function: Some(function),
@@ -3953,11 +4154,11 @@ mod tests {
     }
 
     #[test]
-    fn cranelift_backend_compiles_known_strlen_helper_native_handle() {
+    fn differential_candidate_compiles_known_strlen_helper_native_handle() {
         let (unit, function) = known_strlen_fixture();
         let mut backend = CraneliftNativeCompiler;
         let request = JitCompileRequest::new("cl.known.strlen");
-        let outcome = backend.compile_region(&NativeCompileRequest {
+        let outcome = backend.compile_candidate_differential(&NativeCompileRequest {
             compile: &request,
             unit: Some(&unit),
             function: Some(function),
@@ -3996,11 +4197,11 @@ mod tests {
     }
 
     #[test]
-    fn cranelift_backend_compiles_string_concat_helper_native_handle() {
+    fn differential_candidate_compiles_string_concat_helper_native_handle() {
         let (unit, function) = string_concat_fixture();
         let mut backend = CraneliftNativeCompiler;
         let request = JitCompileRequest::new("cl.string.concat");
-        let outcome = backend.compile_region(&NativeCompileRequest {
+        let outcome = backend.compile_candidate_differential(&NativeCompileRequest {
             compile: &request,
             unit: Some(&unit),
             function: Some(function),

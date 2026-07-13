@@ -1630,6 +1630,16 @@ cranelift-only-mandatory:
     cargo build --release -p php_server --bin phrust-server
     scripts/verify/native_server_symbols.py "${CARGO_TARGET_DIR:-target}/release/phrust-server"
 
+# Prompt 3 cutover gate: every function starts from authoritative php_ir and
+# reaches the same baseline Region IR compiler path without candidate matching.
+cranelift-baseline-ir-coverage:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    scripts/verify/cranelift_baseline_ir_coverage.py
+    scripts/verify/cranelift_only_stage_ratchet.py
+    cargo test -p php_jit --lib
+    cargo check --workspace --all-targets
+
 jit-cranelift-smoke:
     @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
     cargo check --workspace
