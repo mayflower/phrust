@@ -96,6 +96,7 @@ help:
       '  just cranelift-native-dynamic-code Verify native include/eval/declaration compilation' \
       '  just cranelift-native-transitions Verify native-to-native guard exits and OSR' \
       '  just cranelift-native-executor Verify the legacy executor is absent' \
+      '  just cranelift-native-cache Verify restart-persistent PNA1 native artifacts' \
       '  just wordpress-root-diagnostics Run timing-ineligible Phrust diagnostics' \
       '  just wordpress-clone-churn-report Summarize clone/COW attribution from latest request profile' \
       '  just wordpress-array-hotpath-report Summarize array hotpath attribution from latest request profile' \
@@ -468,6 +469,7 @@ verify-runtime:
     fi
     just bytecode-snapshots
     just cranelift-native-executor
+    just cranelift-native-cache
     just vm-smoke
     just vm-trace-smoke
     just runtime-fixtures
@@ -1710,6 +1712,18 @@ cranelift-native-executor:
     cargo check --workspace --all-targets
     cargo build --release -p php_server --bin phrust-server
     scripts/verify/native_server_symbols.py "${CARGO_TARGET_DIR:-target}/release/phrust-server"
+
+# Prompt 12 cutover gate: a fresh process loads validated PNA1 machine code,
+# corrupt artifacts rebuild, and loader/concurrency controls remain covered.
+cranelift-native-cache:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    scripts/verify/cranelift_native_cache.py
+    scripts/verify/cranelift_only_stage_ratchet.py
+    cargo test -p php_jit --lib native_cache
+    cargo test -p php_vm vm_reloads_native_artifact_without_compilation
+    cargo test -p php_vm_cli native_cache_controls_parse
+    cargo check --workspace --all-targets
 
 jit-cranelift-smoke:
     @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi

@@ -4,7 +4,7 @@ use php_runtime::api::{
     ExitStatus, RuntimeContext, RuntimeDiagnostic, RuntimeHttpResponseState, SessionState,
     UploadRegistry, Value,
 };
-use php_vm::api::{TieringStats, VmCounters, VmOptions};
+use php_vm::api::{NativeCacheStats, TieringStats, VmCounters, VmOptions};
 use std::path::PathBuf;
 
 /// Executor-wide defaults.
@@ -72,6 +72,9 @@ pub struct PhpExecutionOutput {
     pub trace: Vec<String>,
     pub counters: Option<VmCounters>,
     pub tiering_stats: Option<TieringStats>,
+    pub native_cache_stats: Option<NativeCacheStats>,
+    pub native_cache_load_nanos: u64,
+    pub native_compile_nanos: u64,
 }
 
 impl PhpExecutionOutput {
@@ -89,6 +92,9 @@ impl PhpExecutionOutput {
             trace: Vec::new(),
             counters: None,
             tiering_stats: None,
+            native_cache_stats: None,
+            native_cache_load_nanos: 0,
+            native_compile_nanos: 0,
         }
     }
 }

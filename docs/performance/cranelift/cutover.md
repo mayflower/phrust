@@ -312,3 +312,42 @@ nix develop -c just cranelift-native-executor
 The gate verifies the deleted paths and public names, checks an empty stage-11
 allowlist, builds every workspace target, builds the release server, and scans
 its symbols for Cranelift while rejecting retired executor entry symbols.
+
+## Prompt 12 restart-persistent native cache
+
+PNA1 stores actual Cranelift machine code plus bounded code/rodata, function
+and continuation entries, relocations, stable helper imports, internal symbols,
+trap/exception metadata, root maps, resume entries, identity, checksum, and
+optional signature metadata. Cache identity includes source, complete IR,
+dependencies, build and Cranelift versions/settings, Region IR schema,
+runtime/helper ABIs, target, pointer width, CPU features, optimization policy,
+and PHP semantic configuration. Development builds derive a deterministic
+build fingerprint from the native compiler/IR/runtime sources; release builds
+may supply `PHRUST_BUILD_ID` to use their immutable release identity.
+
+The loader opens artifacts without following symlinks, checks every section,
+range, alignment, overlap, relocation and stable ID before allocating code,
+then performs one RW-to-RX transition. Invalid artifacts are quarantined and a
+read-write cache rebuilds them. Same-directory temporary files, fsync, atomic
+rename, per-key owner locks, dead-writer recovery, and size/count limits make
+writes restart- and race-safe.
+
+The native CLI exposes `--native-cache=off|read|write|read-write`,
+`--native-cache-dir`, `--clear-native-cache`, and `--native-cache-stats`;
+`PHRUST_NATIVE_CACHE` and `PHRUST_NATIVE_CACHE_DIR` provide defaults. Timing
+JSON reports native cache lookup, native compilation, and native execution as
+separate phases. Persistence is currently conservative: only proven
+relocation-free single-function graphs are emitted; all other graphs remain on
+the mandatory in-process Cranelift path until their relocation metadata can be
+serialized completely.
+
+Run the gate with:
+
+```sh
+nix develop -c just cranelift-native-cache
+```
+
+It starts two fresh processes, proves that the second executes cached code
+without compilation, corrupts the artifact and proves safe rebuilding, then
+runs identity, malformed-artifact, symlink, dead-writer, concurrency, W^X, and
+workspace checks.

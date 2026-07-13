@@ -47,6 +47,7 @@ pub mod api {
     pub use crate::vm::{
         JitBlacklistMode, NativeOptimizationPolicy, Vm, VmOptions, VmResult, VmWorkerState,
     };
+    pub use php_jit::{NativeCacheMode, NativeCacheStats};
 }
 
 /// Instrumentation and native optimization metadata used by tooling.

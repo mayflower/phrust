@@ -2335,6 +2335,7 @@ dependencies = [
  "libc",
  "php_ir",
  "php_runtime",
+ "sha2 0.10.9",
 ]
 
 [[package]]

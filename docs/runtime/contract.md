@@ -30,6 +30,8 @@ source-map metadata.
   boundary and publish before first execution.
 - Generator and fiber suspension persists native continuation identity and live
   state; resume does not dispatch PHP instructions in Rust.
+- Eligible native entries may be loaded from a validated PNA1 artifact. The
+  cache never changes language semantics and never supplies a second executor.
 
 ## Runtime ownership
 
@@ -59,6 +61,7 @@ The architectural acceptance gate is:
 
 ```sh
 nix develop -c just cranelift-native-executor
+nix develop -c just cranelift-native-cache
 ```
 
 Runtime behavior gates invoke the pinned `REFERENCE_PHP` 8.5.7 binary when it

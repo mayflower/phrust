@@ -1,6 +1,7 @@
 use crate::include::{IncludeCache, IncludeCompiler, IncludeLoader};
 use crate::inline_cache::InlineCacheMode;
 use crate::tiering::TieringOptions;
+use php_jit::NativeCacheMode;
 use php_runtime::api::RuntimeContext;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,6 +43,12 @@ pub struct VmOptions {
     pub jit_blacklist: JitBlacklistMode,
     /// Optional diagnostic path for dumping Cranelift IR.
     pub jit_dump_clif: Option<PathBuf>,
+    /// Restart-persistent native artifact cache access policy.
+    pub native_cache: NativeCacheMode,
+    /// Directory containing validated PNA1 native artifacts.
+    pub native_cache_dir: PathBuf,
+    /// Include native cache counters in execution results.
+    pub native_cache_stats: bool,
     /// Native tier compilation budgets and publication policy.
     pub tiering: TieringOptions,
 }
@@ -49,6 +56,7 @@ pub struct VmOptions {
 impl Default for VmOptions {
     fn default() -> Self {
         let tiering = TieringOptions::default();
+        let native_cache = php_jit::NativeCacheConfig::default();
         Self {
             verify_ir: true,
             revalidate_prepared_unit: false,
@@ -67,6 +75,9 @@ impl Default for VmOptions {
             jit_threshold: tiering.function_entry_threshold,
             jit_blacklist: JitBlacklistMode::On,
             jit_dump_clif: None,
+            native_cache: native_cache.mode,
+            native_cache_dir: native_cache.directory,
+            native_cache_stats: false,
             tiering,
         }
     }

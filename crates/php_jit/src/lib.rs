@@ -23,6 +23,7 @@ mod dynamic_code;
 mod eligibility;
 mod helpers;
 mod host_isa;
+mod native_cache;
 pub mod region_ir;
 
 pub use abi::{
@@ -66,6 +67,14 @@ pub use helpers::{
     helper_registry_layout_summary, lookup_helper_by_id, lookup_helper_by_name,
 };
 pub use host_isa::{CraneliftHostIsaError, CraneliftHostIsaIdentity, cranelift_host_isa_identity};
+pub use native_cache::{
+    NativeArtifactCache, NativeArtifactImage, NativeCacheConfig, NativeCacheError,
+    NativeCacheEvent, NativeCacheIdentity, NativeCacheMode, NativeCacheStats,
+    NativeContinuationEntry, NativeExceptionEntry, NativeFunctionAbi, NativeFunctionImage,
+    NativeHelperImport, NativeLoadedArtifact, NativeRelocation, NativeRelocationKind,
+    NativeRelocationTarget, NativeResumeEntry, NativeRootMap, NativeSymbol, NativeTrapEntry,
+    PNA_FORMAT_VERSION, PNA_MAGIC,
+};
 use php_ir::{BlockId, FunctionId, InstrId, IrSpan, IrUnit, LocalId};
 use std::fmt;
 use std::mem;
@@ -74,6 +83,8 @@ use std::sync::Arc;
 const JIT_NATIVE_HANDLER_RESUME_TAG: u32 = 0x8000_0000;
 const JIT_NATIVE_SUSPENSION_RESUME_TAG: u32 = 0x4000_0000;
 pub const JIT_NATIVE_TRANSITION_RESUME_TAG: u32 = 0x2000_0000;
+/// Cranelift release included in restart-persistent native cache identity.
+pub const CRANELIFT_VERSION: &str = "0.133.1";
 
 const fn native_handler_resume_id(block: BlockId) -> i32 {
     (JIT_NATIVE_HANDLER_RESUME_TAG | block.raw()) as i32
@@ -772,6 +783,27 @@ impl JitFunctionHandle {
     #[must_use]
     pub const fn code_bytes(&self) -> u64 {
         self.code_bytes
+    }
+
+    /// Copies relocation-free machine code for restart-cache emission.
+    ///
+    /// Callers must restrict this to a single-function Region graph with no
+    /// helper or external call relocations. General graphs must use a
+    /// relocation-aware artifact emitter instead.
+    pub fn copy_relocation_free_machine_code(&self) -> Option<Vec<u8>> {
+        let address = self.native_entry_address()?;
+        let length = usize::try_from(self.code_bytes).ok()?;
+        if length == 0
+            || self.helper_calls_per_invocation != 0
+            || self
+                .region_state_metadata()
+                .is_some_and(|metadata| metadata.function_entries.len() != 1)
+        {
+            return None;
+        }
+        // SAFETY: a native handle owns an executable allocation of at least
+        // `code_bytes` for its published entry for the lifetime of `self`.
+        Some(unsafe { std::slice::from_raw_parts(address as *const u8, length) }.to_vec())
     }
 
     /// Returns statically known helper calls per successful native invocation.
@@ -1965,7 +1997,9 @@ impl JitEngine {
     }
 }
 
-fn stable_ir_fingerprint(unit: &IrUnit) -> String {
+/// Stable full-IR fingerprint used by process and restart-persistent caches.
+#[must_use]
+pub fn stable_ir_fingerprint(unit: &IrUnit) -> String {
     format!(
         "php-ir-v{}-{:016x}",
         unit.version,
@@ -1973,7 +2007,9 @@ fn stable_ir_fingerprint(unit: &IrUnit) -> String {
     )
 }
 
-fn stable_dependency_identity(unit: &IrUnit) -> String {
+/// Stable dependency-graph fingerprint used by native cache identities.
+#[must_use]
+pub fn stable_dependency_identity(unit: &IrUnit) -> String {
     let dependencies = format!(
         "{:?}:{:?}:{:?}",
         unit.files, unit.linked_file_entries, unit.linked_entry_autoload_declarations

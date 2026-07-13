@@ -1,5 +1,6 @@
 use crate::counters::VmCounters;
 use crate::tiering::TieringStats;
+use php_jit::NativeCacheStats;
 use php_runtime::api::{
     ExecutionStatus, OutputBuffer, RuntimeDiagnostic, RuntimeHttpResponseState, SessionState,
     UploadRegistry, Value,
@@ -20,6 +21,9 @@ pub struct VmResult {
     pub trace: Vec<String>,
     pub counters: Option<Box<VmCounters>>,
     pub tiering_stats: Option<Box<TieringStats>>,
+    pub native_cache_stats: Option<Box<NativeCacheStats>>,
+    pub native_cache_load_nanos: u64,
+    pub native_compile_nanos: u64,
 }
 
 impl VmResult {
@@ -37,6 +41,9 @@ impl VmResult {
             trace: Vec::new(),
             counters: None,
             tiering_stats: None,
+            native_cache_stats: None,
+            native_cache_load_nanos: 0,
+            native_compile_nanos: 0,
         }
     }
 
@@ -54,6 +61,9 @@ impl VmResult {
             trace: Vec::new(),
             counters: None,
             tiering_stats: None,
+            native_cache_stats: None,
+            native_cache_load_nanos: 0,
+            native_compile_nanos: 0,
         }
     }
 }

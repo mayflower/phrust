@@ -164,6 +164,9 @@ pub(crate) fn execution_output_from_vm(
         trace: result.trace,
         counters: result.counters.map(|counters| *counters),
         tiering_stats: result.tiering_stats.map(|stats| *stats),
+        native_cache_stats: result.native_cache_stats.map(|stats| *stats),
+        native_cache_load_nanos: result.native_cache_load_nanos,
+        native_compile_nanos: result.native_compile_nanos,
     }
 }
 

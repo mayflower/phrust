@@ -8,7 +8,7 @@ use php_executor::{
 };
 use php_optimizer::OptimizationLevel;
 use php_runtime::api::RuntimeContext;
-use php_vm::api::{InlineCacheMode, JitBlacklistMode, NativeOptimizationPolicy};
+use php_vm::api::{InlineCacheMode, JitBlacklistMode, NativeCacheMode, NativeOptimizationPolicy};
 use serde_json::json;
 use std::env;
 use std::fs;
@@ -113,6 +113,10 @@ struct NativeRunOptions {
     jit_threshold: Option<u64>,
     jit_blacklist: Option<JitBlacklistMode>,
     jit_dump_clif: Option<PathBuf>,
+    native_cache: Option<NativeCacheMode>,
+    native_cache_dir: Option<PathBuf>,
+    clear_native_cache: bool,
+    native_cache_stats: bool,
     tiering_enabled: Option<bool>,
     jit_eager: bool,
     jit_max_compile_us: Option<u64>,
@@ -136,6 +140,10 @@ fn parse_run_options(args: &[String]) -> Result<NativeRunOptions, String> {
         jit_threshold: None,
         jit_blacklist: None,
         jit_dump_clif: None,
+        native_cache: None,
+        native_cache_dir: None,
+        clear_native_cache: false,
+        native_cache_stats: false,
         tiering_enabled: None,
         jit_eager: false,
         jit_max_compile_us: None,
@@ -215,6 +223,14 @@ fn parse_run_options(args: &[String]) -> Result<NativeRunOptions, String> {
                 });
             }
             "--jit-dump-clif" => options.jit_dump_clif = Some(PathBuf::from(value(name)?)),
+            "--native-cache" => {
+                options.native_cache = Some(value(name)?.parse::<NativeCacheMode>()?);
+            }
+            "--native-cache-dir" => {
+                options.native_cache_dir = Some(PathBuf::from(value(name)?));
+            }
+            "--clear-native-cache" => options.clear_native_cache = true,
+            "--native-cache-stats" => options.native_cache_stats = true,
             "--tiering" => options.tiering_enabled = Some(parse_toggle(&value(name)?)?),
             "--jit-eager" => options.jit_eager = true,
             "--jit-max-compile-us" => {
@@ -227,7 +243,7 @@ fn parse_run_options(args: &[String]) -> Result<NativeRunOptions, String> {
         }
         index += 1;
     }
-    if options.path.is_empty() {
+    if options.path.is_empty() && !options.clear_native_cache {
         return Err("php-vm run requires <path.php>".to_owned());
     }
     Ok(options)
@@ -247,7 +263,6 @@ where
 {
     let options = parse_run_options(args)?;
     let total_started = Instant::now();
-    let (source, real_path, source_path) = php_executor::read_script(Path::new(&options.path))?;
     let mut executor_options = PhpExecutorOptions::for_profile(options.profile);
     if let Some(level) = options.opt_level {
         executor_options.optimization_level = level;
@@ -271,6 +286,29 @@ where
         vm.jit_blacklist = mode;
     }
     vm.jit_dump_clif = options.jit_dump_clif;
+    if let Some(mode) = options.native_cache {
+        vm.native_cache = mode;
+    }
+    if let Some(directory) = options.native_cache_dir {
+        vm.native_cache_dir = directory;
+    }
+    vm.native_cache_stats = options.native_cache_stats;
+    if options.clear_native_cache {
+        let cache = php_jit::NativeArtifactCache::new(php_jit::NativeCacheConfig {
+            mode: NativeCacheMode::ReadWrite,
+            directory: vm.native_cache_dir.clone(),
+            ..php_jit::NativeCacheConfig::default()
+        })
+        .map_err(|error| format!("clear native cache: {error}"))?;
+        let removed = cache
+            .clear()
+            .map_err(|error| format!("clear native cache: {error}"))?;
+        writeln!(stderr, "{{\"native_cache_cleared\":{removed}}}")
+            .map_err(|error| error.to_string())?;
+        if options.path.is_empty() {
+            return Ok(EXIT_SUCCESS);
+        }
+    }
     if let Some(enabled) = options.tiering_enabled {
         vm.tiering.enabled = enabled;
     }
@@ -285,6 +323,10 @@ where
     if let Some(limit) = options.jit_max_functions {
         vm.tiering.jit_max_functions = limit;
     }
+    let native_cache_mode = vm.native_cache;
+    let native_cache_directory = vm.native_cache_dir.clone();
+
+    let (source, real_path, source_path) = php_executor::read_script(Path::new(&options.path))?;
 
     let compile_started = Instant::now();
     let executor = PhpExecutor::with_options(executor_options);
@@ -338,13 +380,40 @@ where
         let counters = output.counters.as_ref().cloned().unwrap_or_default();
         write_parented(&path, counters.to_json().as_bytes())?;
     }
+    if options.native_cache_stats {
+        let stats = output.native_cache_stats.unwrap_or_default();
+        writeln!(
+            stderr,
+            "{}",
+            json!({
+                "native_cache": {
+                    "mode": native_cache_mode.as_str(),
+                    "directory": native_cache_directory,
+                    "hits": stats.hits,
+                    "misses": stats.misses,
+                    "writes": stats.writes,
+                    "rebuilds": stats.rebuilds,
+                    "invalid_artifacts": stats.invalid_artifacts,
+                    "compile_waits": stats.compile_waits,
+                    "bytes_loaded": stats.bytes_loaded,
+                    "bytes_written": stats.bytes_written,
+                }
+            })
+        )
+        .map_err(|error| error.to_string())?;
+    }
     if let Some(path) = options.timings_json {
+        let native_cache_load_ms = output.native_cache_load_nanos as f64 / 1_000_000.0;
+        let native_compile_ms = output.native_compile_nanos as f64 / 1_000_000.0;
         let report = json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "command": "run",
             "phases_ms": {
                 "compile_ms": compile_ms,
-                "execute_ms": execute_ms,
+                "native_cache_load_ms": native_cache_load_ms,
+                "native_compile_ms": native_compile_ms,
+                "native_execution_ms": (execute_ms - native_cache_load_ms - native_compile_ms).max(0.0),
+                "execute_total_ms": execute_ms,
                 "total_ms": total_started.elapsed().as_secs_f64() * 1_000.0
             }
         });
@@ -541,7 +610,7 @@ fn write_parented(path: &Path, bytes: &[u8]) -> Result<(), String> {
 fn print_usage<W: Write>(stdout: &mut W) -> Result<(), String> {
     writeln!(
         stdout,
-        "Usage:\n  php-vm run [native options] <file> [-- args...]\n  php-vm compile <file> [--json] [--opt-level 0|1|2]\n  php-vm dump-ir <file> [--with-source]\n\nNative options:\n  --engine-preset baseline|default|fast\n  --opt-level 0|1|2\n  --native-optimization baseline|optimizing\n  --inline-caches off|on\n  --jit=cranelift\n  --jit-threshold N\n  --jit-blacklist off|on\n  --jit-dump-clif PATH\n  --tiering off|on\n  --jit-eager\n  --jit-max-compile-us N\n  --jit-max-functions N\n  --counters-json PATH\n  --timings-json PATH\n  --trace --trace-runtime --trace-includes\n  --env KEY=VALUE"
+        "Usage:\n  php-vm run [native options] <file> [-- args...]\n  php-vm run --clear-native-cache [--native-cache-dir PATH]\n  php-vm compile <file> [--json] [--opt-level 0|1|2]\n  php-vm dump-ir <file> [--with-source]\n\nNative options:\n  --engine-preset baseline|default|fast\n  --opt-level 0|1|2\n  --native-optimization baseline|optimizing\n  --inline-caches off|on\n  --jit=cranelift\n  --jit-threshold N\n  --jit-blacklist off|on\n  --jit-dump-clif PATH\n  --native-cache off|read|write|read-write\n  --native-cache-dir PATH\n  --clear-native-cache\n  --native-cache-stats\n  --tiering off|on\n  --jit-eager\n  --jit-max-compile-us N\n  --jit-max-functions N\n  --counters-json PATH\n  --timings-json PATH\n  --trace --trace-runtime --trace-includes\n  --env KEY=VALUE"
     )
     .map_err(|error| error.to_string())
 }
@@ -558,5 +627,23 @@ mod tests {
         ])
         .expect_err("removed option");
         assert!(error.contains("unsupported native run option"));
+    }
+
+    #[test]
+    fn native_cache_controls_parse() {
+        let options = parse_run_options(&[
+            "--native-cache=read-write".to_owned(),
+            "--native-cache-dir".to_owned(),
+            "/tmp/phrust-cache".to_owned(),
+            "--native-cache-stats".to_owned(),
+            "fixture.php".to_owned(),
+        ])
+        .expect("native cache controls");
+        assert_eq!(options.native_cache, Some(NativeCacheMode::ReadWrite));
+        assert_eq!(
+            options.native_cache_dir,
+            Some(PathBuf::from("/tmp/phrust-cache"))
+        );
+        assert!(options.native_cache_stats);
     }
 }

@@ -98,6 +98,9 @@ impl PhpExecutor {
                 trace: Vec::new(),
                 counters: None,
                 tiering_stats: None,
+                native_cache_stats: None,
+                native_cache_load_nanos: 0,
+                native_compile_nanos: 0,
             })));
         }
         Ok(CompilationResult {
