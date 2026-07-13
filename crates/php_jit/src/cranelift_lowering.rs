@@ -14,10 +14,10 @@ use crate::region_ir::{
     RegionTerminator,
 };
 use crate::{
-    CraneliftCodeKey, CraneliftCompilerIdentity, JIT_HELPER_STATUS_OK, JIT_HELPER_STATUS_OVERFLOW,
-    JIT_RUNTIME_ABI_HASH, JitCompileRequest, JitCompileStatus, JitEligibility, JitFunctionHandle,
-    ManagedJitFunction, NativeCompileOutcome, NativeCompileRequest, NativeCompilerApi,
-    analyze_jit_eligibility, global_code_manager,
+    CraneliftCodeKey, CraneliftCompilerIdentity, JIT_HELPER_STATUS_FATAL, JIT_HELPER_STATUS_OK,
+    JIT_HELPER_STATUS_OVERFLOW, JIT_RUNTIME_ABI_HASH, JitCompileRequest, JitCompileStatus,
+    JitEligibility, JitFunctionHandle, ManagedJitFunction, NativeCompileOutcome,
+    NativeCompileRequest, NativeCompilerApi, analyze_jit_eligibility, global_code_manager,
 };
 #[cfg(test)]
 use crate::{JitNativeSpecialization, JitPropertyLoadMetadata};
@@ -3521,6 +3521,21 @@ fn lower_region_instruction(
             let cl_value = builder.ins().icmp(region_compare_intcc(*op), lhs, rhs);
             registers.insert(*dst, cl_value);
         }
+        RegionInstructionKind::RuntimeFatal { .. } => {
+            let status = builder
+                .ins()
+                .iconst(types::I32, i64::from(JIT_HELPER_STATUS_FATAL));
+            builder.ins().return_(&[status]);
+            let unreachable = builder.create_block();
+            builder.switch_to_block(unreachable);
+            builder.seal_block(unreachable);
+        }
+        RegionInstructionKind::CompileTimeFatal { diagnostic_id } => {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_IR_COMPILE_FATAL",
+                diagnostic_id.clone(),
+            ));
+        }
         RegionInstructionKind::MissingLowering => {
             return Err(CraneliftLoweringError::new(
                 "JIT_CRANELIFT_MISSING_INSTRUCTION_LOWERING",
@@ -3701,8 +3716,8 @@ mod tests {
         CraneliftNativeCompiler, build_trivial_add_clif_smoke, lower_function_to_cranelift,
     };
     use crate::{
-        JIT_HELPER_STATUS_OVERFLOW, JIT_RUNTIME_ABI_HASH, JitCompileRequest, JitCompileStatus,
-        NativeCompileRequest, NativeCompilerApi,
+        JIT_HELPER_STATUS_FATAL, JIT_HELPER_STATUS_OVERFLOW, JIT_RUNTIME_ABI_HASH,
+        JitCompileRequest, JitCompileStatus, NativeCompileRequest, NativeCompilerApi,
     };
     use php_ir::{
         BinaryOp, FunctionFlags, FunctionId, InstructionKind, IrBuilder, IrConstant, IrParam,
@@ -3785,6 +3800,55 @@ mod tests {
         );
         assert!(outcome.handle.is_none());
         assert!(outcome.diagnostics[0].contains("return metadata"));
+    }
+
+    #[test]
+    fn runtime_error_lowers_to_native_fatal_status() {
+        let mut builder = IrBuilder::new(UnitId::new(704));
+        let file = builder.add_file("runtime-fatal.php");
+        let span = IrSpan::new(file, 3, 9);
+        let function = builder.start_function("runtime_fatal", FunctionFlags::default(), span);
+        builder.set_return_type(function, Some(IrReturnType::Int));
+        let block = builder.append_block(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::RuntimeError {
+                diagnostic_id: "E_TEST_RUNTIME_FATAL".to_owned(),
+                message: "explicit fatal".to_owned(),
+            },
+            span,
+        );
+        let constant = builder.intern_constant(IrConstant::Int(0));
+        let result = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::LoadConst {
+                dst: result,
+                constant,
+            },
+            span,
+        );
+        builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+        let unit = builder.finish();
+        let mut backend = CraneliftNativeCompiler;
+        let request = JitCompileRequest::new("cl.runtime-fatal");
+        let outcome = backend.compile_region(&NativeCompileRequest {
+            compile: &request,
+            unit: Some(&unit),
+            function: Some(function),
+            runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+        });
+
+        assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+        assert_eq!(
+            outcome
+                .handle
+                .expect("native fatal handle")
+                .invoke_i64(&[], JIT_RUNTIME_ABI_HASH),
+            Err(crate::JitInvokeError::NativeStatus(JIT_HELPER_STATUS_FATAL))
+        );
     }
 
     #[test]

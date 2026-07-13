@@ -176,6 +176,19 @@ fn validate_region_native_coverage(region: &RegionGraph) -> Result<(), Cranelift
     }
     for block in &region.blocks {
         for instruction in &block.instructions {
+            if let RegionInstructionKind::CompileTimeFatal { diagnostic_id } = &instruction.kind {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_IR_COMPILE_FATAL",
+                    format!(
+                        "function={} diagnostic={} span={}:{}-{}",
+                        region.function_name,
+                        diagnostic_id,
+                        instruction.span.file.raw(),
+                        instruction.span.start,
+                        instruction.span.end
+                    ),
+                ));
+            }
             if matches!(instruction.kind, RegionInstructionKind::MissingLowering) {
                 return Err(CraneliftLoweringError::new(
                     "JIT_CRANELIFT_MISSING_INSTRUCTION_LOWERING",

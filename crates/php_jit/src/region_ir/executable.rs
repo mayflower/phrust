@@ -158,6 +158,15 @@ pub enum RegionInstructionKind {
         target: FunctionId,
         args: Vec<RegionOperand>,
     },
+    /// Explicit fatal produced by IR lowering; native code returns fatal status.
+    RuntimeFatal {
+        diagnostic_id: String,
+        message: String,
+    },
+    /// Explicit unsupported-feature fatal emitted by the frontend.
+    CompileTimeFatal {
+        diagnostic_id: String,
+    },
     /// The semantic graph is complete, but Cranelift has no lowering yet.
     MissingLowering,
 }
@@ -395,39 +404,37 @@ impl BaselineRegionBuilder {
                             RegionInstructionKind::Discard { src }
                         }),
                     InstructionKind::Binary { dst, op, lhs, rhs } => {
-                        match (
+                        if let (Ok(op), Ok(lhs), Ok(rhs)) = (
                             lower_binary(*op),
                             lower_operand(unit, *lhs),
                             lower_operand(unit, *rhs),
                         ) {
-                            (Ok(op), Ok(lhs), Ok(rhs)) => {
-                                fast_path_operations = fast_path_operations.saturating_add(1);
-                                RegionInstructionKind::Binary {
-                                    dst: *dst,
-                                    op,
-                                    lhs,
-                                    rhs,
-                                }
+                            fast_path_operations = fast_path_operations.saturating_add(1);
+                            RegionInstructionKind::Binary {
+                                dst: *dst,
+                                op,
+                                lhs,
+                                rhs,
                             }
-                            _ => RegionInstructionKind::MissingLowering,
+                        } else {
+                            RegionInstructionKind::MissingLowering
                         }
                     }
                     InstructionKind::Compare { dst, op, lhs, rhs } => {
-                        match (
+                        if let (Ok(op), Ok(lhs), Ok(rhs)) = (
                             lower_compare(*op),
                             lower_operand(unit, *lhs),
                             lower_operand(unit, *rhs),
                         ) {
-                            (Ok(op), Ok(lhs), Ok(rhs)) => {
-                                fast_path_operations = fast_path_operations.saturating_add(1);
-                                RegionInstructionKind::Compare {
-                                    dst: *dst,
-                                    op,
-                                    lhs,
-                                    rhs,
-                                }
+                            fast_path_operations = fast_path_operations.saturating_add(1);
+                            RegionInstructionKind::Compare {
+                                dst: *dst,
+                                op,
+                                lhs,
+                                rhs,
                             }
-                            _ => RegionInstructionKind::MissingLowering,
+                        } else {
+                            RegionInstructionKind::MissingLowering
                         }
                     }
                     InstructionKind::CallFunction { dst, name, args } => {
@@ -469,7 +476,108 @@ impl BaselineRegionBuilder {
                             RegionInstructionKind::MissingLowering
                         }
                     }
-                    _ => RegionInstructionKind::MissingLowering,
+                    InstructionKind::RuntimeError {
+                        diagnostic_id,
+                        message,
+                    } => RegionInstructionKind::RuntimeFatal {
+                        diagnostic_id: diagnostic_id.clone(),
+                        message: message.clone(),
+                    },
+                    InstructionKind::Unsupported { diagnostic_id } => {
+                        RegionInstructionKind::CompileTimeFatal {
+                            diagnostic_id: diagnostic_id.clone(),
+                        }
+                    }
+                    InstructionKind::FetchConst { .. }
+                    | InstructionKind::RegisterConstant { .. }
+                    | InstructionKind::DeclareFunction { .. }
+                    | InstructionKind::DeclareClass { .. }
+                    | InstructionKind::BindReference { .. }
+                    | InstructionKind::BindGlobal { .. }
+                    | InstructionKind::BindReferenceDim { .. }
+                    | InstructionKind::BindReferenceProperty { .. }
+                    | InstructionKind::BindReferencePropertyDim { .. }
+                    | InstructionKind::BindReferenceDimFromProperty { .. }
+                    | InstructionKind::BindReferenceFromProperty { .. }
+                    | InstructionKind::BindReferenceFromPropertyDim { .. }
+                    | InstructionKind::BindReferenceFromDim { .. }
+                    | InstructionKind::BindReferenceFromStaticPropertyDim { .. }
+                    | InstructionKind::BindReferenceStaticProperty { .. }
+                    | InstructionKind::BindReferenceFromCall { .. }
+                    | InstructionKind::BindReferenceFromMethodCall { .. }
+                    | InstructionKind::InitStaticLocal { .. }
+                    | InstructionKind::InstanceOf { .. }
+                    | InstructionKind::DynamicInstanceOf { .. }
+                    | InstructionKind::Unary { .. }
+                    | InstructionKind::Cast { .. }
+                    | InstructionKind::Echo { .. }
+                    | InstructionKind::EmitDiagnostic { .. }
+                    | InstructionKind::Yield { .. }
+                    | InstructionKind::YieldFrom { .. }
+                    | InstructionKind::CallMethod { .. }
+                    | InstructionKind::CallStaticMethod { .. }
+                    | InstructionKind::CloneObject { .. }
+                    | InstructionKind::CloneWith { .. }
+                    | InstructionKind::EnterTry { .. }
+                    | InstructionKind::LeaveTry
+                    | InstructionKind::EndFinally { .. }
+                    | InstructionKind::Throw { .. }
+                    | InstructionKind::MakeException { .. }
+                    | InstructionKind::MakeClosure { .. }
+                    | InstructionKind::CallClosure { .. }
+                    | InstructionKind::ResolveCallable { .. }
+                    | InstructionKind::AcquireCallable { .. }
+                    | InstructionKind::CallCallable { .. }
+                    | InstructionKind::Pipe { .. }
+                    | InstructionKind::Include { .. }
+                    | InstructionKind::Eval { .. }
+                    | InstructionKind::NewObject { .. }
+                    | InstructionKind::DynamicNewObject { .. }
+                    | InstructionKind::FetchProperty { .. }
+                    | InstructionKind::FetchDynamicProperty { .. }
+                    | InstructionKind::IssetProperty { .. }
+                    | InstructionKind::IssetDynamicProperty { .. }
+                    | InstructionKind::EmptyProperty { .. }
+                    | InstructionKind::EmptyDynamicProperty { .. }
+                    | InstructionKind::IssetDynamicPropertyDim { .. }
+                    | InstructionKind::EmptyDynamicPropertyDim { .. }
+                    | InstructionKind::IssetPropertyDim { .. }
+                    | InstructionKind::EmptyPropertyDim { .. }
+                    | InstructionKind::UnsetProperty { .. }
+                    | InstructionKind::UnsetPropertyDim { .. }
+                    | InstructionKind::UnsetDynamicProperty { .. }
+                    | InstructionKind::FetchStaticProperty { .. }
+                    | InstructionKind::FetchDynamicStaticProperty { .. }
+                    | InstructionKind::IssetStaticProperty { .. }
+                    | InstructionKind::EmptyStaticProperty { .. }
+                    | InstructionKind::IssetStaticPropertyDim { .. }
+                    | InstructionKind::EmptyStaticPropertyDim { .. }
+                    | InstructionKind::UnsetStaticPropertyDim { .. }
+                    | InstructionKind::FetchClassConstant { .. }
+                    | InstructionKind::FetchObjectClassName { .. }
+                    | InstructionKind::AssignProperty { .. }
+                    | InstructionKind::AssignPropertyDim { .. }
+                    | InstructionKind::AssignDynamicProperty { .. }
+                    | InstructionKind::AssignStaticProperty { .. }
+                    | InstructionKind::AssignDynamicStaticProperty { .. }
+                    | InstructionKind::NewArray { .. }
+                    | InstructionKind::ArrayInsert { .. }
+                    | InstructionKind::ArraySpread { .. }
+                    | InstructionKind::FetchDim { .. }
+                    | InstructionKind::AssignDim { .. }
+                    | InstructionKind::AppendDim { .. }
+                    | InstructionKind::IssetLocal { .. }
+                    | InstructionKind::EmptyLocal { .. }
+                    | InstructionKind::UnsetLocal { .. }
+                    | InstructionKind::IssetDim { .. }
+                    | InstructionKind::EmptyDim { .. }
+                    | InstructionKind::UnsetDim { .. }
+                    | InstructionKind::ForeachInit { .. }
+                    | InstructionKind::ForeachNext { .. }
+                    | InstructionKind::ForeachCleanup { .. }
+                    | InstructionKind::ForeachInitRef { .. }
+                    | InstructionKind::ForeachNextRef { .. }
+                    | InstructionKind::ArrayGet { .. } => RegionInstructionKind::MissingLowering,
                 };
                 instructions.push(RegionInstruction {
                     id: instruction.id,
@@ -670,11 +778,26 @@ fn lower_binary(op: BinaryOp) -> Result<RegionBinaryOp, NativeCompileError> {
         BinaryOp::Add => Ok(RegionBinaryOp::Add),
         BinaryOp::Sub => Ok(RegionBinaryOp::Sub),
         BinaryOp::Mul => Ok(RegionBinaryOp::Mul),
-        other => Err(NativeCompileError::new(
+        BinaryOp::Div => Err(NativeCompileError::new(
             "JIT_REGION_REJECT_BINARY",
-            format!("binary operation {other:?} has no scalar Region IR lowering"),
+            "binary operation Div has no scalar Region IR lowering",
         )),
+        BinaryOp::Mod => unsupported_binary("Mod"),
+        BinaryOp::Concat => unsupported_binary("Concat"),
+        BinaryOp::Pow => unsupported_binary("Pow"),
+        BinaryOp::BitAnd => unsupported_binary("BitAnd"),
+        BinaryOp::BitOr => unsupported_binary("BitOr"),
+        BinaryOp::BitXor => unsupported_binary("BitXor"),
+        BinaryOp::ShiftLeft => unsupported_binary("ShiftLeft"),
+        BinaryOp::ShiftRight => unsupported_binary("ShiftRight"),
     }
+}
+
+fn unsupported_binary(name: &'static str) -> Result<RegionBinaryOp, NativeCompileError> {
+    Err(NativeCompileError::new(
+        "JIT_REGION_REJECT_BINARY",
+        format!("binary operation {name} has no scalar Region IR lowering"),
+    ))
 }
 
 fn lower_compare(op: CompareOp) -> Result<RegionCompareOpCode, NativeCompileError> {
@@ -685,9 +808,9 @@ fn lower_compare(op: CompareOp) -> Result<RegionCompareOpCode, NativeCompileErro
         CompareOp::LessEqual => Ok(RegionCompareOpCode::LessEqual),
         CompareOp::Greater => Ok(RegionCompareOpCode::Greater),
         CompareOp::GreaterEqual => Ok(RegionCompareOpCode::GreaterEqual),
-        other => Err(NativeCompileError::new(
+        CompareOp::Spaceship => Err(NativeCompileError::new(
             "JIT_REGION_REJECT_COMPARE",
-            format!("comparison {other:?} has no scalar Region IR lowering"),
+            "comparison Spaceship has no scalar Region IR lowering",
         )),
     }
 }
@@ -766,9 +889,20 @@ fn lower_terminator(
         } => Ok(RegionTerminator::Return {
             value: lower_operand(unit, *value)?,
         }),
-        other => Err(NativeCompileError::new(
+        TerminatorKind::Return { value: None, .. } => Err(NativeCompileError::new(
             "JIT_REGION_REJECT_TERMINATOR",
-            format!("terminator {other:?} has no executable Region IR lowering"),
+            "void return has no scalar Region IR lowering",
+        )),
+        TerminatorKind::Return {
+            value: Some(_),
+            by_ref_local: Some(_),
+        } => Err(NativeCompileError::new(
+            "JIT_REGION_REJECT_TERMINATOR",
+            "by-reference return has no scalar Region IR lowering",
+        )),
+        TerminatorKind::Exit { .. } => Err(NativeCompileError::new(
+            "JIT_REGION_REJECT_TERMINATOR",
+            "Exit has no scalar Region IR lowering",
         )),
     }
 }

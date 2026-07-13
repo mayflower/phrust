@@ -12,6 +12,7 @@ pub const REGION_IR_SCHEMA_VERSION: u32 = 2;
 
 mod bind;
 mod builder;
+mod coverage;
 mod dump;
 mod executable;
 mod ids;
@@ -28,6 +29,13 @@ pub use bind::{
     VmSlotKind, VmSlotSemanticFlags, validate_bind_map,
 };
 pub use builder::{RegionBuilder, RegionBuilderOptions, build_minimal_scalar_region};
+pub use coverage::{
+    BASELINE_INSTRUCTION_MANIFEST, BASELINE_TERMINATOR_MANIFEST, BaselineEffectFlags,
+    BaselineLoweringClass, BaselineLoweringManifestEntry, baseline_binary_class,
+    baseline_call_arg_class, baseline_callable_class, baseline_cast_class, baseline_compare_class,
+    baseline_include_class, baseline_instruction_lowering, baseline_terminator_lowering,
+    baseline_unary_class,
+};
 pub use dump::dump_region_graph;
 pub use executable::{
     BaselineRegionBuilder, CompileMetadata, NativeCompileError, NativeCompilerTier, RegionBinaryOp,

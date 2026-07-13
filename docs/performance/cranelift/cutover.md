@@ -82,3 +82,23 @@ nix develop -c just cranelift-baseline-ir-coverage
 Native code cache identity includes the IR fingerprint, compiler tier,
 runtime/helper ABI identity, target CPU, semantic configuration, dependency
 identity, and invalidation generation.
+
+## Prompt 4 exhaustive lowering inventory
+
+All 102 `InstructionKind` variants and all six `TerminatorKind` variants are
+classified by exhaustive Rust matches generated from one typed manifest list.
+The nested unary, binary, comparison, cast, include, callable, and call-argument
+enums also have wildcard-free classifiers. Adding a variant therefore fails to
+compile until its lowering class and effect metadata are supplied.
+
+The gate writes the generated reports to
+`target/cranelift-only/instruction-coverage.json` and
+`target/cranelift-only/instruction-coverage.md`:
+
+```sh
+nix develop -c just cranelift-exhaustive-lowering
+```
+
+`RuntimeError` is represented as a native fatal status. `Unsupported` remains
+an explicit compile fatal during the staged migration and must be absent from
+reachable production IR by the final cutover.

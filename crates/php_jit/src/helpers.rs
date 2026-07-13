@@ -16,6 +16,8 @@ pub const JIT_HELPER_STATUS_OVERFLOW: i32 = 2;
 /// arguments into its ABI buffer. This is a region return status, not a helper
 /// return status.
 pub const JIT_HELPER_STATUS_TAILCALL: i32 = 3;
+/// Native execution reached an explicit deterministic PHP runtime fatal.
+pub const JIT_HELPER_STATUS_FATAL: i32 = 4;
 /// Base of the return-and-resume call-request region statuses: a region
 /// returning `RESUME_CALL_BASE + i` has marshaled the positional `Int`
 /// arguments of its `i`-th call site into their buffer slots and suspended

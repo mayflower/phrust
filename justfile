@@ -1640,6 +1640,18 @@ cranelift-baseline-ir-coverage:
     cargo test -p php_jit --lib
     cargo check --workspace --all-targets
 
+# Prompt 4 cutover gate: Rust exhaustiveness and the generated manifest must
+# cover every IR operation without wildcard or generic-dispatch escape hatches.
+cranelift-exhaustive-lowering:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo run --quiet -p php_jit --example cranelift_instruction_coverage
+    scripts/verify/cranelift_exhaustive_lowering.py
+    scripts/verify/cranelift_only_stage_ratchet.py
+    cargo test -p php_jit --lib region_ir::coverage
+    cargo test -p php_jit --lib runtime_error_lowers_to_native_fatal_status
+    cargo check -p php_jit --all-targets
+
 jit-cranelift-smoke:
     @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
     cargo check --workspace
