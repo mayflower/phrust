@@ -23,13 +23,15 @@
 // still holds for the rest of php_vm.
 #![allow(unsafe_code)]
 
+#[cfg(all(unix, target_arch = "aarch64"))]
 use std::sync::OnceLock;
 
-#[cfg(test)]
+#[cfg(all(test, unix, target_arch = "aarch64"))]
 use php_jit::copy_patch::CompiledScalarRegion;
+#[cfg(all(unix, target_arch = "aarch64"))]
 use php_runtime::api::Value;
 
-#[cfg(test)]
+#[cfg(all(test, unix, target_arch = "aarch64"))]
 use crate::frame::LocalFile;
 
 // The marshaling types, local addressing, and compiled-leaf cache are only
@@ -541,16 +543,6 @@ pub fn run_scalar_int_region(compiled: &CompiledScalarRegion, locals: &LocalFile
     result
 }
 
-/// Hosts without a copy-and-patch emitter (non-aarch64 / non-unix) always fall
-/// back to the interpreter.
-#[cfg(all(test, not(all(unix, target_arch = "aarch64"))))]
-pub fn run_scalar_int_region(
-    _compiled: &CompiledScalarRegion,
-    _locals: &LocalFile,
-) -> Option<Value> {
-    None
-}
-
 /// Process-global enable for the copy-patch leaf tier, read once. Default **on**
 /// (the `jit-copy-patch` cargo feature is in the default feature set, and this
 /// tier engages unless explicitly disabled). Set `PHRUST_JIT_COPY_PATCH` to a
@@ -559,6 +551,7 @@ pub fn run_scalar_int_region(
 /// interpreter on a workload. Any other value (or leaving it unset) keeps the
 /// tier on. On a non-aarch64/non-unix host the tier is inert regardless.
 #[must_use]
+#[cfg(all(unix, target_arch = "aarch64"))]
 pub fn copy_patch_leaf_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var("PHRUST_JIT_COPY_PATCH") {

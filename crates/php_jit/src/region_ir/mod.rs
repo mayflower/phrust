@@ -1,13 +1,13 @@
-//! Compact region optimizer IR for future no-exec native-tier experiments.
+//! Backend-neutral region IR for native compilation and optimizer analysis.
 //!
-//! This IR is intentionally separate from `php_ir` and dense bytecode. It is an
-//! index-based optimizer substrate for region-local analysis, metadata, and
-//! validation; it is not a runtime execution format and does not allocate or
-//! execute native code.
+//! [`ExecutableRegion`] is the structured, multi-block compiler input consumed
+//! by Cranelift. [`RegionGraph`] remains the index-based optimizer and snapshot
+//! substrate used for region-local analysis.
 
 mod bind;
 mod builder;
 mod dump;
+mod executable;
 mod ids;
 mod interpreter;
 mod node;
@@ -23,6 +23,12 @@ pub use bind::{
 };
 pub use builder::{RegionBuilder, RegionBuilderOptions, build_minimal_scalar_region};
 pub use dump::dump_region_graph;
+pub use executable::{
+    ExecutableRegion, ExecutableRegionBlock, ExecutableRegionBuildError,
+    ExecutableRegionInstruction, ExecutableRegionInstructionKind, ExecutableRegionOperand,
+    ExecutableRegionOsrEntry, ExecutableRegionTerminator, RegionBinaryOp, RegionCompareOpCode,
+    build_executable_region,
+};
 pub use ids::{ConstId, EntryId, ExitId, NodeId, RegionId, SnapshotId, VmSlotId};
 pub use interpreter::{
     RegionGuardExitReason, RegionInterpretInputs, RegionInterpretResult, RegionInterpretStatus,

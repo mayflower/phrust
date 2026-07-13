@@ -1,6 +1,700 @@
+use super::dense_activation::DenseActivationResult;
 use super::prelude::*;
 
+pub(super) struct DenseDirectMethodActivation {
+    pub(super) function: FunctionId,
+    pub(super) receiver: ObjectRef,
+    pub(super) class_context: CompactClassContext,
+}
+
+pub(super) struct DenseDirectStaticActivation {
+    pub(super) function: FunctionId,
+    pub(super) receiver: Option<ObjectRef>,
+    pub(super) class_context: CompactClassContext,
+}
+
+pub(super) struct DenseDirectConstructorActivation {
+    pub(super) function: FunctionId,
+    pub(super) object: ObjectRef,
+    pub(super) class: Rc<php_ir::module::ClassEntry>,
+    pub(super) class_context: CompactClassContext,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn direct_dense_call<'a>(
+    args: &'a [DenseCallArg],
+    dst: u32,
+    compiled: &CompiledUnit,
+    dense: &DenseBytecodeUnit,
+    move_plan: Option<&crate::last_use::LastUseMovePlan>,
+    instruction: &DenseInstruction,
+    dense_instruction_index: u32,
+    frame_index: usize,
+    receiver: Option<ObjectRef>,
+    class_context: CompactClassContext,
+) -> DirectCall<'a> {
+    let move_source = args.iter().find_map(|arg| {
+        (arg.value.kind == DenseOperandKind::Register
+            && move_plan.is_some_and(|plan| {
+                plan.is_move_eligible(dense_instruction_index, arg.value.index)
+            }))
+        .then(|| RegId::new(arg.value.index))
+    });
+    DirectCall {
+        caller_frame: frame_index,
+        argument_sources: DirectArgumentSources::Dense(args),
+        destination: CallDestination::Register(RegId::new(dst)),
+        strict_types: compiled.unit().strict_types,
+        span: dense.spans.get(instruction.span.index()).copied(),
+        receiver,
+        class_context,
+        move_source,
+    }
+}
+
 impl Vm {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn execute_dense_new_object_operands(
+        &self,
+        dense: &DenseBytecodeUnit,
+        compiled: &CompiledUnit,
+        plan: Option<&DenseExecutionPlan>,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: InstrId,
+        cache_id: Option<InlineCacheId>,
+        class_name: &str,
+        display_class_name: &str,
+        args: &[DenseCallArg],
+        call_span: Option<IrSpan>,
+        dst: RegId,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<(), VmResult> {
+        let values = self
+            .read_dense_call_args(dense, compiled, stack, args)
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
+        let result = self.execute_dense_new_object(
+            compiled,
+            plan,
+            function_id,
+            block_id,
+            instruction_id,
+            cache_id,
+            class_name,
+            display_class_name,
+            values,
+            call_span,
+            output,
+            stack,
+            state,
+        );
+        if !result.status.is_success() {
+            return Err(result);
+        }
+        stack
+            .current_mut()
+            .expect("bytecode caller frame is active")
+            .registers
+            .set(dst, result.return_value.unwrap_or(Value::Null))
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn execute_dense_method_operands(
+        &self,
+        dense: &DenseBytecodeUnit,
+        compiled: &CompiledUnit,
+        plan: Option<&DenseExecutionPlan>,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: InstrId,
+        cache_id: Option<InlineCacheId>,
+        object: Value,
+        method: &str,
+        args: &[DenseCallArg],
+        call_span: Option<IrSpan>,
+        dst: RegId,
+        frame_index: usize,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<(), VmResult> {
+        let values = self
+            .read_dense_call_args(dense, compiled, stack, args)
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
+        let result = self.execute_dense_method_call(
+            compiled,
+            plan,
+            function_id,
+            block_id,
+            instruction_id,
+            cache_id,
+            object,
+            method,
+            values,
+            call_span,
+            output,
+            stack,
+            state,
+        );
+        let return_value =
+            self.dense_method_result_value(result, "method", compiled, output, stack)?;
+        stack
+            .frame_mut(frame_index)
+            .expect("bytecode frame is active")
+            .registers
+            .set(dst, return_value)
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn execute_dense_static_operands(
+        &self,
+        dense: &DenseBytecodeUnit,
+        compiled: &CompiledUnit,
+        plan: Option<&DenseExecutionPlan>,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: InstrId,
+        cache_id: Option<InlineCacheId>,
+        class_name: &str,
+        method: &str,
+        args: &[DenseCallArg],
+        call_span: Option<IrSpan>,
+        dst: RegId,
+        frame_index: usize,
+        output: &mut OutputBuffer,
+        stack: &mut CallStack,
+        state: &mut ExecutionState,
+    ) -> Result<(), VmResult> {
+        let values = self
+            .read_dense_call_args(dense, compiled, stack, args)
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
+        let result = self.execute_dense_static_method_call(
+            compiled,
+            plan,
+            function_id,
+            block_id,
+            instruction_id,
+            cache_id,
+            class_name,
+            method,
+            values,
+            call_span,
+            output,
+            stack,
+            state,
+        );
+        let return_value =
+            self.dense_method_result_value(result, "static", compiled, output, stack)?;
+        stack
+            .frame_mut(frame_index)
+            .expect("bytecode frame is active")
+            .registers
+            .set(dst, return_value)
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))?;
+        unset_consumed_dense_call_arg_registers_at_frame(stack, frame_index, args, Some(dst))
+            .map_err(|message| self.runtime_error(output, compiled, stack, message))
+    }
+
+    fn dense_method_result_value(
+        &self,
+        result: VmResult,
+        kind: &'static str,
+        compiled: &CompiledUnit,
+        output: &OutputBuffer,
+        stack: &CallStack,
+    ) -> Result<Value, VmResult> {
+        if !result.status.is_success() {
+            self.record_counter_dense_call_fallback("dispatch_error");
+            return Err(result);
+        }
+        if result.fiber_suspension.is_some() {
+            self.record_counter_dense_call_fallback("fiber_suspension");
+            return Err(VmResult::unsupported(
+                output.clone(),
+                format!(
+                    "E_PHP_VM_DENSE_BYTECODE_CALL_FIBER_UNSUPPORTED: dense bytecode {kind} calls do not support fiber suspension yet"
+                ),
+            ));
+        }
+        let _ = (compiled, stack);
+        Ok(result.return_value.unwrap_or(Value::Null))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dense_direct_method_transfer(
+        &self,
+        target: DenseDirectMethodActivation,
+        args: &[DenseCallArg],
+        dst: u32,
+        compiled: &CompiledUnit,
+        dense: &DenseBytecodeUnit,
+        move_plan: Option<&crate::last_use::LastUseMovePlan>,
+        instruction: &DenseInstruction,
+        function_id: FunctionId,
+        block_index: u32,
+        next_instruction_offset: usize,
+        dense_instruction_index: u32,
+        frame_index: usize,
+        foreach_iterators: HashMap<RegId, ForeachIterator>,
+        diagnostics: Vec<RuntimeDiagnostic>,
+        steps: usize,
+    ) -> DenseActivationResult {
+        self.record_counter_dense_method_call_hit();
+        Self::dense_call_activation_signal(
+            target.function,
+            direct_dense_call(
+                args,
+                dst,
+                compiled,
+                dense,
+                move_plan,
+                instruction,
+                dense_instruction_index,
+                frame_index,
+                Some(target.receiver),
+                target.class_context,
+            ),
+            function_id,
+            block_index,
+            next_instruction_offset,
+            dense_instruction_index,
+            frame_index,
+            foreach_iterators,
+            diagnostics,
+            steps,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dense_direct_static_transfer(
+        &self,
+        target: DenseDirectStaticActivation,
+        args: &[DenseCallArg],
+        dst: u32,
+        compiled: &CompiledUnit,
+        dense: &DenseBytecodeUnit,
+        move_plan: Option<&crate::last_use::LastUseMovePlan>,
+        instruction: &DenseInstruction,
+        function_id: FunctionId,
+        block_index: u32,
+        next_instruction_offset: usize,
+        dense_instruction_index: u32,
+        frame_index: usize,
+        foreach_iterators: HashMap<RegId, ForeachIterator>,
+        diagnostics: Vec<RuntimeDiagnostic>,
+        steps: usize,
+    ) -> DenseActivationResult {
+        self.record_counter_dense_static_call_hit();
+        Self::dense_call_activation_signal(
+            target.function,
+            direct_dense_call(
+                args,
+                dst,
+                compiled,
+                dense,
+                move_plan,
+                instruction,
+                dense_instruction_index,
+                frame_index,
+                target.receiver,
+                target.class_context,
+            ),
+            function_id,
+            block_index,
+            next_instruction_offset,
+            dense_instruction_index,
+            frame_index,
+            foreach_iterators,
+            diagnostics,
+            steps,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dense_direct_constructor_transfer(
+        &self,
+        target: DenseDirectConstructorActivation,
+        args: &[DenseCallArg],
+        dst: u32,
+        compiled: &CompiledUnit,
+        dense: &DenseBytecodeUnit,
+        move_plan: Option<&crate::last_use::LastUseMovePlan>,
+        instruction: &DenseInstruction,
+        function_id: FunctionId,
+        block_index: u32,
+        next_instruction_offset: usize,
+        dense_instruction_index: u32,
+        frame_index: usize,
+        foreach_iterators: HashMap<RegId, ForeachIterator>,
+        diagnostics: Vec<RuntimeDiagnostic>,
+        steps: usize,
+    ) -> DenseActivationResult {
+        Self::dense_constructor_activation_signal(
+            target.function,
+            direct_dense_call(
+                args,
+                dst,
+                compiled,
+                dense,
+                move_plan,
+                instruction,
+                dense_instruction_index,
+                frame_index,
+                Some(target.object.clone()),
+                target.class_context,
+            ),
+            target.object,
+            target.class,
+            function_id,
+            block_index,
+            next_instruction_offset,
+            dense_instruction_index,
+            frame_index,
+            foreach_iterators,
+            diagnostics,
+            steps,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_dense_direct_constructor_activation(
+        &self,
+        compiled: &CompiledUnit,
+        plan: Option<&DenseExecutionPlan>,
+        class_name: &str,
+        display_class_name: &str,
+        args: &[DenseCallArg],
+        stack: &CallStack,
+        state: &mut ExecutionState,
+    ) -> Option<DenseDirectConstructorActivation> {
+        let plan = plan?;
+        if args.len() > 8 || args.iter().any(|arg| arg.name.is_some()) {
+            return None;
+        }
+        let Some(class) = self.cached_class_entry(compiled, state, class_name) else {
+            self.record_counter_dense_call_fallback("direct_constructor_class");
+            return None;
+        };
+        if spl_runtime_parent_for_class(compiled, state, &class).is_some() {
+            self.record_counter_dense_call_fallback("direct_constructor_runtime_parent");
+            return None;
+        }
+        let caller_scope = current_scope_class(compiled, stack);
+        let Some(constructor) = lookup_resolved_method_in_state(
+            compiled,
+            state,
+            &class.name,
+            "__construct",
+            caller_scope.as_deref(),
+        )
+        .ok()
+        .flatten() else {
+            self.record_counter_dense_call_fallback("direct_constructor_resolution");
+            return None;
+        };
+        if validate_constructor_callable_in_state_scope(
+            compiled,
+            state,
+            caller_scope.as_deref(),
+            &constructor.class,
+            &constructor.method,
+        )
+        .is_err()
+        {
+            self.record_counter_dense_call_fallback("direct_constructor_visibility");
+            return None;
+        }
+        let owner = class_owner_in_state(compiled, state, &constructor.class.name);
+        if owner.cache_identity() != compiled.cache_identity()
+            || !matches!(
+                plan.function_plan(constructor.method.function.index()),
+                Some(DenseFunctionPlan::Dense)
+            )
+        {
+            self.record_counter_dense_call_fallback("direct_constructor_owner_or_plan");
+            return None;
+        }
+        let Some(callee) = compiled
+            .unit()
+            .functions
+            .get(constructor.method.function.index())
+        else {
+            self.record_counter_dense_call_fallback("direct_constructor_callee");
+            return None;
+        };
+        let Some(meta) = plan
+            .call_shape_meta
+            .get(constructor.method.function.index())
+            .copied()
+        else {
+            self.record_counter_dense_call_fallback("direct_constructor_meta");
+            return None;
+        };
+        if args.len() != callee.params.len()
+            || !meta.params_bind_direct
+            || !meta.elide_frame_args
+            || !callee.attributes.is_empty()
+        {
+            self.record_counter_dense_call_fallback("direct_constructor_callee_shape");
+            return None;
+        }
+        let Ok(runtime_class) = self.cached_runtime_class_entry(&owner, state, &class) else {
+            self.record_counter_dense_call_fallback("direct_constructor_runtime_class");
+            return None;
+        };
+        if validate_object_mvp(&runtime_class).is_err() {
+            self.record_counter_dense_call_fallback("direct_constructor_object_shape");
+            return None;
+        }
+        let slot_template =
+            self.cached_default_slot_template(&owner, state, &runtime_class, display_class_name);
+        let object = ObjectRef::from_layout_slots(
+            &runtime_class,
+            display_class_name,
+            (*slot_template).clone(),
+        );
+        let declaring = self.class_name_handles(&constructor.class.name).normalized;
+        Some(DenseDirectConstructorActivation {
+            function: constructor.method.function,
+            object: object.clone(),
+            class,
+            class_context: CompactClassContext {
+                scope: Some(declaring.clone()),
+                called: Some(object_called_class_handle(&object)),
+                declaring: Some(declaring),
+            },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_dense_direct_static_activation(
+        &self,
+        compiled: &CompiledUnit,
+        plan: Option<&DenseExecutionPlan>,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: InstrId,
+        cache_id: Option<InlineCacheId>,
+        class_name: &str,
+        method: &str,
+        args: &[DenseCallArg],
+        stack: &CallStack,
+        state: &ExecutionState,
+    ) -> Option<DenseDirectStaticActivation> {
+        let plan = plan?;
+        if args.len() > 8 || args.iter().any(|arg| arg.name.is_some()) {
+            return None;
+        }
+        let class = resolve_static_class_name(compiled, state, stack, class_name).ok()?;
+        let scope = method_lookup_scope_for_static_call(compiled, stack, class_name);
+        let lowered_method = normalize_method_name(method);
+        let epoch = state.lookup_epoch();
+        let called_class = called_class_for_static_call(compiled, stack, class_name, &class);
+        let cached = if let Some(id) = cache_id {
+            self.dense_method_call_inline_cache_has_target(
+                id,
+                &lowered_method,
+                &class.name,
+                scope.as_deref(),
+                epoch,
+            )
+        } else {
+            self.method_call_inline_cache_has_target(
+                IrInlineCacheSite::classic(compiled, function_id, block_id, instruction_id),
+                &lowered_method,
+                &class.name,
+                scope.as_deref(),
+                epoch,
+            )
+        };
+        if !cached {
+            return None;
+        }
+        let (target, _) = if let Some(id) = cache_id {
+            self.lookup_dense_method_call_inline_cache(
+                DenseInlineCacheSite::new(id, function_id, instruction_id),
+                &lowered_method,
+                &class.name,
+                scope.as_deref(),
+                epoch,
+            )
+        } else {
+            self.lookup_method_call_inline_cache(
+                IrInlineCacheSite::classic(compiled, function_id, block_id, instruction_id),
+                &lowered_method,
+                &class.name,
+                scope.as_deref(),
+                epoch,
+            )
+        };
+        let target = target?;
+        let resolved = target.resolved_target();
+        if resolved.guard.argument_shape
+            != (MethodCallShape {
+                arity: args.len().try_into().unwrap_or(u32::MAX),
+                named_arguments: Vec::new(),
+                by_ref_arguments: CallReferenceMask::from_flags(
+                    args.iter().map(dense_call_arg_has_reference_metadata),
+                ),
+            })
+            || !resolved.guard.by_ref_compatible
+            || !resolved.guard.method_is_static
+        {
+            return None;
+        }
+        let route = resolved.route.as_ref()?;
+        if route.owner.cache_identity() != compiled.cache_identity()
+            || !matches!(
+                plan.function_plan(resolved.function.index()),
+                Some(DenseFunctionPlan::Dense)
+            )
+        {
+            return None;
+        }
+        let callee = compiled.unit().functions.get(resolved.function.index())?;
+        let meta = plan
+            .call_shape_meta
+            .get(resolved.function.index())
+            .copied()?;
+        if args.len() != callee.params.len()
+            || !meta.params_bind_direct
+            || !meta.elide_frame_args
+            || !callee.attributes.is_empty()
+        {
+            return None;
+        }
+        let declaring = route.declaring_class_handle.clone();
+        Some(DenseDirectStaticActivation {
+            function: resolved.function,
+            receiver: None,
+            class_context: CompactClassContext {
+                scope: Some(declaring.clone()),
+                called: Some(self.class_name_handles(&called_class).display),
+                declaring: Some(declaring),
+            },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_dense_direct_method_activation(
+        &self,
+        compiled: &CompiledUnit,
+        plan: Option<&DenseExecutionPlan>,
+        function_id: FunctionId,
+        block_id: BlockId,
+        instruction_id: InstrId,
+        cache_id: Option<InlineCacheId>,
+        object: &ObjectRef,
+        method: &str,
+        args: &[DenseCallArg],
+        stack: &CallStack,
+        state: &ExecutionState,
+    ) -> Option<DenseDirectMethodActivation> {
+        let plan = plan?;
+        if args.len() > 8 || args.iter().any(|arg| arg.name.is_some()) {
+            return None;
+        }
+        let receiver_class = object.class_name();
+        let class = lookup_class_in_state(compiled, state, &receiver_class)?.clone();
+        let scope = current_scope_class(compiled, stack);
+        let lowered_method = normalize_method_name(method);
+        let epoch = state.lookup_epoch();
+        let has_magic_call =
+            class_has_public_magic_call_in_state(compiled, state, &receiver_class).ok()?;
+        let cached = if let Some(id) = cache_id {
+            self.dense_method_call_inline_cache_has_target(
+                id,
+                &lowered_method,
+                &receiver_class,
+                scope.as_deref(),
+                epoch,
+            )
+        } else {
+            self.method_call_inline_cache_has_target(
+                IrInlineCacheSite::classic(compiled, function_id, block_id, instruction_id),
+                &lowered_method,
+                &receiver_class,
+                scope.as_deref(),
+                epoch,
+            )
+        };
+        if !cached {
+            return None;
+        }
+        let (target, _) = if let Some(id) = cache_id {
+            self.lookup_dense_method_call_inline_cache(
+                DenseInlineCacheSite::new(id, function_id, instruction_id),
+                &lowered_method,
+                &receiver_class,
+                scope.as_deref(),
+                epoch,
+            )
+        } else {
+            self.lookup_method_call_inline_cache(
+                IrInlineCacheSite::classic(compiled, function_id, block_id, instruction_id),
+                &lowered_method,
+                &receiver_class,
+                scope.as_deref(),
+                epoch,
+            )
+        };
+        let target = target?;
+        let argument_shape = MethodCallShape {
+            arity: args.len().try_into().unwrap_or(u32::MAX),
+            named_arguments: Vec::new(),
+            by_ref_arguments: CallReferenceMask::from_flags(
+                args.iter().map(dense_call_arg_has_reference_metadata),
+            ),
+        };
+        if !dense_method_direct_call_target_is_eligible(DenseMethodDirectCallEligibility {
+            compiled,
+            state,
+            target: &target,
+            class: &class,
+            argument_shape,
+            has_magic_call,
+            epoch,
+        }) {
+            return None;
+        }
+        let resolved = target.resolved_target();
+        let route = resolved.route.as_ref()?;
+        if route.owner.cache_identity() != compiled.cache_identity()
+            || !matches!(
+                plan.function_plan(resolved.function.index()),
+                Some(DenseFunctionPlan::Dense)
+            )
+        {
+            return None;
+        }
+        let callee = compiled.unit().functions.get(resolved.function.index())?;
+        let meta = plan
+            .call_shape_meta
+            .get(resolved.function.index())
+            .copied()?;
+        if args.len() != callee.params.len()
+            || !meta.params_bind_direct
+            || !meta.elide_frame_args
+            || !callee.attributes.is_empty()
+        {
+            return None;
+        }
+        let declaring = route.declaring_class_handle.clone();
+        Some(DenseDirectMethodActivation {
+            function: resolved.function,
+            receiver: object.clone(),
+            class_context: CompactClassContext {
+                scope: Some(declaring.clone()),
+                called: Some(object_called_class_handle(object)),
+                declaring: Some(declaring),
+            },
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn execute_dense_method_call(
         &self,
@@ -200,7 +894,7 @@ impl Vm {
                     state,
                     target: &target,
                     class: &class,
-                    values: &args,
+                    argument_shape: method_call_shape(&args),
                     has_magic_call,
                     epoch,
                 })
@@ -1185,4 +1879,11 @@ impl Vm {
         result.diagnostics = constructor_diagnostics;
         result
     }
+}
+
+fn dense_call_arg_has_reference_metadata(arg: &DenseCallArg) -> bool {
+    arg.by_ref_local.is_some()
+        || arg.by_ref_dim.is_some()
+        || arg.by_ref_property.is_some()
+        || arg.by_ref_property_dim.is_some()
 }

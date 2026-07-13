@@ -26,9 +26,10 @@ impl Vm {
         // callbacks it re-enters) counts as `builtin_body` unless a more
         // specific family is entered deeper in the call.
         let _source = layout_source::enter_default(layout_source::BUILTIN_BODY);
-        let Some(entry) = self.lookup_internal_function_dispatch(name) else {
+        let Some(cached_entry) = self.lookup_internal_function_dispatch(name) else {
             return unknown_builtin_result(name, output);
         };
+        let entry = self.compact_builtin_entry(name).unwrap_or(cached_entry);
         if self.options.inline_caches.enabled() {
             if let Some(result) = self.try_execute_fast_builtin_stub(name, &values, output) {
                 return result;

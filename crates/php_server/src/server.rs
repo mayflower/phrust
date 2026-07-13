@@ -932,6 +932,38 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+        assert_eq!(
+            state
+                .services
+                .metrics
+                .script_cache_ready
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            state
+                .services
+                .metrics
+                .jit_prewarm_complete
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            state
+                .services
+                .metrics
+                .jit_compile_queue_empty
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(
+            state
+                .services
+                .metrics
+                .jit_prewarm_nanos
+                .load(Ordering::Relaxed)
+                > 0
+        );
         assert!(state.compile_script(&first).expect("first cached").hit);
         assert!(state.compile_script(&second).expect("second cached").hit);
 

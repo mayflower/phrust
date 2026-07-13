@@ -1450,6 +1450,20 @@ pub(crate) fn append_vm_counters_to_trace(
         ("vm_jit_compiled", counters.jit_compiled),
         ("vm_jit_executed", counters.jit_executed),
         ("vm_jit_side_exits", counters.jit_side_exits),
+        ("vm_jit_process_cache_hits", counters.jit_process_cache_hits),
+        (
+            "vm_jit_process_cache_misses",
+            counters.jit_process_cache_misses,
+        ),
+        ("vm_jit_compile_waits", counters.jit_compile_waits),
+        (
+            "vm_jit_duplicate_compiles_avoided",
+            counters.jit_duplicate_compiles_avoided,
+        ),
+        ("vm_jit_code_bytes_live", counters.jit_code_bytes_live),
+        ("vm_jit_code_bytes_retired", counters.jit_code_bytes_retired),
+        ("vm_jit_code_generations", counters.jit_code_generations),
+        ("vm_jit_evictions", counters.jit_evictions),
     ]);
 }
 

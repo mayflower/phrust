@@ -173,7 +173,7 @@ impl Vm {
         let (blacklist_reason, invalidations) = {
             let mut jit = self.jit.borrow_mut();
             let entry = jit.functions.entry(key).or_default();
-            let reason = entry.record_side_exit(side_exit.reason);
+            let reason = entry.record_side_exit(side_exit.reason, entry.runtime_epoch);
             let invalidations = if reason.is_some() {
                 jit.invalidate_compile_cache_for_function(key.function)
             } else {

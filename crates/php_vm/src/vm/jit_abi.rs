@@ -41,6 +41,15 @@ pub(super) const JIT_PROPERTY_LOAD_STATUS_UNINITIALIZED_EXIT: i32 = 23;
 pub(super) const JIT_PROPERTY_LOAD_STATUS_STORAGE_EXIT: i32 = 24;
 
 #[cfg(feature = "jit-cranelift")]
+static JIT_RUNTIME_HELPER_TABLE: php_jit::JitRuntimeHelperTable =
+    php_jit::JitRuntimeHelperTable::new(php_jit::jit_default_helper_dispatch);
+
+#[cfg(feature = "jit-cranelift")]
+pub(super) fn jit_runtime_helper_table() -> &'static php_jit::JitRuntimeHelperTable {
+    &JIT_RUNTIME_HELPER_TABLE
+}
+
+#[cfg(feature = "jit-cranelift")]
 pub(super) fn jit_guard_kind_for_side_exit(reason: php_jit::SideExitReason) -> Option<GuardKind> {
     match reason {
         php_jit::SideExitReason::TypeMismatch => Some(GuardKind::QuickeningType),

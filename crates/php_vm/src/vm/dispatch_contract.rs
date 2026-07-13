@@ -182,6 +182,8 @@ pub(super) struct DenseExecutionRequest<'unit, 'call> {
     pub(super) ir_function: &'unit IrFunction,
     pub(super) function_id: FunctionId,
     pub(super) call: FunctionCall<'call>,
+    pub(super) direct_call: Option<DirectCall<'unit>>,
+    pub(super) resume: Option<super::dense_activation::DenseResumeState>,
 }
 
 pub(super) struct DenseBinaryRequest<'unit> {

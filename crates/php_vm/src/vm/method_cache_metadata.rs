@@ -215,7 +215,7 @@ pub(super) struct DenseMethodDirectCallEligibility<'a> {
     pub(super) state: &'a ExecutionState,
     pub(super) target: &'a MethodCallCacheTarget,
     pub(super) class: &'a php_ir::module::ClassEntry,
-    pub(super) values: &'a [CallArgument],
+    pub(super) argument_shape: MethodCallShape,
     pub(super) has_magic_call: bool,
     pub(super) epoch: InvalidationEpoch,
 }
@@ -228,7 +228,7 @@ pub(super) fn dense_method_direct_call_target_is_eligible(
         state,
         target,
         class,
-        values,
+        argument_shape,
         has_magic_call,
         epoch,
     } = eligibility;
@@ -238,8 +238,7 @@ pub(super) fn dense_method_direct_call_target_is_eligible(
         || guard.class_layout_epoch != epoch.raw()
         || guard.method_table_epoch != epoch.raw()
         || guard.has_magic_call != has_magic_call
-        || guard.argument_shape != method_call_shape(values)
-        || values.iter().any(|arg| arg.name.is_some())
+        || guard.argument_shape != argument_shape
         || !guard.by_ref_compatible
     {
         return false;

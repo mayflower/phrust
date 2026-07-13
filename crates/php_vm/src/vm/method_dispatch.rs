@@ -284,6 +284,8 @@ impl Vm {
                 ir_function,
                 function_id: function,
                 call,
+                direct_call: None,
+                resume: None,
             },
             output,
             stack,

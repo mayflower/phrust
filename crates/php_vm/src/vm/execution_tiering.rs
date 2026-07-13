@@ -7,7 +7,44 @@ pub(super) struct JitLeafRequest<'a> {
     pub(super) function: &'a IrFunction,
     pub(super) tier: ExecutionTier,
     pub(super) call_shape_supported: bool,
-    pub(super) args: &'a [PreparedArg],
+    pub(super) args: JitArgumentSlots<'a>,
+}
+
+pub(super) enum JitArgumentSlots<'a> {
+    Prepared(&'a [PreparedArg]),
+    DirectFrame(&'a Frame),
+}
+
+impl JitArgumentSlots<'_> {
+    fn len(&self, function: &IrFunction) -> usize {
+        match self {
+            Self::Prepared(args) => args.len(),
+            Self::DirectFrame(_) => function.params.len(),
+        }
+    }
+
+    fn value<'a>(&'a self, function: &IrFunction, index: usize) -> Option<&'a Value> {
+        match self {
+            Self::Prepared(args) => args.get(index).map(|arg| &arg.value),
+            Self::DirectFrame(frame) => {
+                let param = function.params.get(index)?;
+                match frame.locals.get_slot(param.local)? {
+                    Slot::Value(value) => Some(value),
+                    Slot::Reference(_) => None,
+                }
+            }
+        }
+    }
+
+    pub(super) fn has_reference(&self) -> bool {
+        match self {
+            Self::Prepared(args) => args.iter().any(|arg| arg.reference.is_some()),
+            Self::DirectFrame(frame) => frame
+                .locals
+                .iter()
+                .any(|(_, slot)| matches!(slot, Slot::Reference(_))),
+        }
+    }
 }
 
 impl Vm {
@@ -49,22 +86,14 @@ impl Vm {
             && call.running_generator.is_none()
             && call.running_fiber.is_none();
         let mut args = smallvec::SmallVec::<[PreparedArg; 8]>::new();
-        if let Some(positional) = call.positional_values.as_ref() {
-            args.extend(positional.iter().cloned().map(|value| PreparedArg {
-                value,
-                reference: None,
-                trace_holds_reference: false,
-            }));
-        } else {
-            args.extend(call.args.iter().map(|arg| PreparedArg {
-                value: match &arg.value {
-                    Value::Reference(cell) => cell.get(),
-                    value => value.clone(),
-                },
-                reference: None,
-                trace_holds_reference: false,
-            }));
-        }
+        args.extend(call.args.iter().map(|arg| PreparedArg {
+            value: match &arg.value {
+                Value::Reference(cell) => cell.get(),
+                value => value.clone(),
+            },
+            reference: None,
+            trace_holds_reference: false,
+        }));
 
         // Rich dispatch invokes Cranelift only after prepare_arguments. Apply
         // the same scalar coercion/type checks here before native execution so
@@ -99,7 +128,7 @@ impl Vm {
             function,
             tier,
             call_shape_supported,
-            args: &args,
+            args: JitArgumentSlots::Prepared(&args),
         })
     }
 
@@ -202,8 +231,6 @@ impl Vm {
         // potential write-back; they are set for any variable passed positionally
         // and are moot here because the recognizer already rejects functions with
         // by-reference *parameters* — the value is passed by value regardless.
-        // (`positional_values` is positional by construction, so only the
-        // `CallArgument` form can carry names.)
         if call.args.iter().any(|arg| arg.name.is_some()) {
             return None;
         }
@@ -232,11 +259,7 @@ impl Vm {
         if let Some(this) = call.this_value.as_ref() {
             params.push(Value::Object(this.clone()));
         }
-        if let Some(positional_values) = call.positional_values.as_ref() {
-            params.extend(positional_values.iter().cloned());
-        } else {
-            params.extend(call.args.iter().map(|arg| arg.value.clone()));
-        }
+        params.extend(call.args.iter().map(|arg| arg.value.clone()));
         // The native hook runs before the interpreter's normal binding loop.
         // Apply the identical parameter coercion/type check here so a native
         // leaf cannot erase weak scalar coercions, strict `TypeError`s, or the
@@ -710,13 +733,10 @@ impl Vm {
     #[cfg(all(feature = "jit-copy-patch", not(all(unix, target_arch = "aarch64"))))]
     pub(super) fn try_execute_copy_patch_leaf(
         &self,
-        _compiled: &CompiledUnit,
+        _cursor: ExecutionCursor<'_>,
         _function_id: FunctionId,
         _function: &IrFunction,
         _call: &FunctionCall<'_>,
-        _output: &mut OutputBuffer,
-        _stack: &mut CallStack,
-        _state: &mut ExecutionState,
     ) -> Option<VmResult> {
         None
     }
@@ -743,8 +763,8 @@ impl Vm {
             return None;
         }
         self.record_counter_native_candidate();
-        if !jit_leaf_call_shape_is_supported(function, call_shape_supported, args) {
-            let reason = native_leaf_rejection_reason(function, call_shape_supported, args);
+        if !jit_leaf_call_shape_is_supported(function, call_shape_supported, &args) {
+            let reason = native_leaf_rejection_reason(function, call_shape_supported, &args);
             self.record_counter_native_eligibility_rejection(reason);
             return None;
         }
@@ -758,11 +778,21 @@ impl Vm {
         {
             let mut jit = self.jit.borrow_mut();
             let entry = jit.functions.entry(key).or_default();
-            if (self.options.jit_blacklist.enabled() && entry.blacklisted) || entry.disabled {
+            entry.calls = entry.calls.saturating_add(1);
+            entry.runtime_epoch = runtime_layout_epoch;
+            if entry.unsupported_epoch == Some(runtime_layout_epoch) {
+                return None;
+            }
+            if entry.unsupported_epoch.is_some() {
+                entry.unsupported_epoch = None;
+            }
+            if (self.options.jit_blacklist.enabled()
+                && !entry.allows_execution(runtime_layout_epoch))
+                || entry.disabled
+            {
                 self.record_counter_jit_tiering_blacklist_rejection();
                 return None;
             }
-            entry.calls = entry.calls.saturating_add(1);
         }
 
         let cache_lookup = self
@@ -808,7 +838,10 @@ impl Vm {
         };
 
         if handle.expects_value_metadata() {
-            let [object_arg] = args else {
+            let Some(object_arg) = (args.len(function) == 1)
+                .then(|| args.value(function, 0))
+                .flatten()
+            else {
                 self.record_jit_side_exit_for_key(
                     key,
                     php_jit::JitSideExit::new(php_jit::SideExitReason::TypeMismatch),
@@ -832,7 +865,7 @@ impl Vm {
                 return None;
             };
             if let Some(status) =
-                property_load_pre_guard_status(compiled, state, &object_arg.value, metadata)
+                property_load_pre_guard_status(compiled, state, object_arg, metadata)
             {
                 self.record_jit_side_exit_for_key(
                     key,
@@ -849,7 +882,7 @@ impl Vm {
                 }
                 return None;
             }
-            let value_ptr = &object_arg.value as *const Value as usize;
+            let value_ptr = object_arg as *const Value as usize;
             let metadata_ptr = metadata as *const php_jit::JitPropertyLoadMetadata as usize;
             match handle.invoke_value_metadata(
                 value_ptr,
@@ -908,7 +941,10 @@ impl Vm {
         }
 
         if handle.expects_value() {
-            let [array_arg] = args else {
+            let Some(array_arg) = (args.len(function) == 1)
+                .then(|| args.value(function, 0))
+                .flatten()
+            else {
                 self.record_jit_side_exit_for_key(
                     key,
                     php_jit::JitSideExit::new(php_jit::SideExitReason::TypeMismatch),
@@ -917,7 +953,7 @@ impl Vm {
                 self.record_counter_jit_slow_path_call();
                 return None;
             };
-            let value_ptr = &array_arg.value as *const Value as usize;
+            let value_ptr = array_arg as *const Value as usize;
             match handle.invoke_value(value_ptr, php_jit::JIT_RUNTIME_ABI_HASH) {
                 Ok(value) => {
                     self.record_counter_jit_helper_calls(handle.helper_calls_per_invocation());
@@ -977,7 +1013,8 @@ impl Vm {
         }
 
         if handle.expects_value_value() {
-            let [lhs_arg, rhs_arg] = args else {
+            let (Some(lhs_arg), Some(rhs_arg)) = (args.value(function, 0), args.value(function, 1))
+            else {
                 self.record_jit_side_exit_for_key(
                     key,
                     php_jit::JitSideExit::new(php_jit::SideExitReason::TypeMismatch),
@@ -987,8 +1024,11 @@ impl Vm {
                 self.record_counter_string_concat_fast_path(false);
                 return None;
             };
-            let lhs_ptr = &lhs_arg.value as *const Value as usize;
-            let rhs_ptr = &rhs_arg.value as *const Value as usize;
+            if args.len(function) != 2 {
+                return None;
+            }
+            let lhs_ptr = lhs_arg as *const Value as usize;
+            let rhs_ptr = rhs_arg as *const Value as usize;
             match handle.invoke_value_value(lhs_ptr, rhs_ptr, php_jit::JIT_RUNTIME_ABI_HASH) {
                 Ok(value_ptr) if value_ptr != 0 => {
                     // SAFETY: Successful value/value helpers return a pointer
@@ -1061,7 +1101,9 @@ impl Vm {
         }
 
         if handle.expects_value_i64() {
-            let [array_arg, index_arg] = args else {
+            let (Some(array_arg), Some(index_arg)) =
+                (args.value(function, 0), args.value(function, 1))
+            else {
                 self.record_jit_side_exit_for_key(
                     key,
                     php_jit::JitSideExit::new(php_jit::SideExitReason::TypeMismatch),
@@ -1070,7 +1112,10 @@ impl Vm {
                 self.record_counter_jit_slow_path_call();
                 return None;
             };
-            let Value::Int(index) = index_arg.value else {
+            if args.len(function) != 2 {
+                return None;
+            }
+            let Value::Int(index) = index_arg else {
                 self.record_jit_side_exit_for_key(
                     key,
                     php_jit::JitSideExit::new(php_jit::SideExitReason::TypeMismatch),
@@ -1079,8 +1124,8 @@ impl Vm {
                 self.record_counter_jit_slow_path_call();
                 return None;
             };
-            let value_ptr = &array_arg.value as *const Value as usize;
-            match handle.invoke_value_i64(value_ptr, index, php_jit::JIT_RUNTIME_ABI_HASH) {
+            let value_ptr = array_arg as *const Value as usize;
+            match handle.invoke_value_i64(value_ptr, *index, php_jit::JIT_RUNTIME_ABI_HASH) {
                 Ok(value) => {
                     self.record_counter_jit_helper_calls(handle.helper_calls_per_invocation());
                     self.record_counter_jit_fast_path_hits(handle.fast_path_hits_per_invocation());
@@ -1116,13 +1161,9 @@ impl Vm {
             }
         }
 
-        let native_args = match args
-            .iter()
-            .map(|arg| value_as_jit_int(&arg.value))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(args) => args,
-            Err(()) => {
+        let mut native_args = smallvec::SmallVec::<[i64; 8]>::new();
+        for index in 0..args.len(function) {
+            let Some(value) = args.value(function, index) else {
                 self.record_jit_side_exit_for_key(
                     key,
                     php_jit::JitSideExit::new(php_jit::SideExitReason::TypeMismatch),
@@ -1130,12 +1171,30 @@ impl Vm {
                 self.record_counter_jit_bailout();
                 self.record_counter_jit_slow_path_call();
                 return None;
-            }
-        };
+            };
+            let Ok(value) = value_as_jit_int(value) else {
+                self.record_jit_side_exit_for_key(
+                    key,
+                    php_jit::JitSideExit::new(php_jit::SideExitReason::TypeMismatch),
+                );
+                self.record_counter_jit_bailout();
+                self.record_counter_jit_slow_path_call();
+                return None;
+            };
+            native_args.push(value);
+        }
+        if matches!(args, JitArgumentSlots::DirectFrame(_)) {
+            self.record_counter_cranelift_direct_slot_marshal(native_args.len());
+        } else {
+            self.record_counter_cranelift_prepared_arg_materialization();
+        }
         match handle.invoke_i64(&native_args, php_jit::JIT_RUNTIME_ABI_HASH) {
             Ok(value) => {
                 self.record_counter_jit_helper_calls(handle.helper_calls_per_invocation());
                 self.record_counter_jit_fast_path_hits(handle.fast_path_hits_per_invocation());
+                self.record_counter_compiled_to_compiled_calls(
+                    handle.compiled_to_compiled_calls_per_invocation(),
+                );
                 self.record_counter_jit_executed();
                 Some(Value::Int(value))
             }
@@ -1150,6 +1209,64 @@ impl Vm {
                 None
             }
         }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    /// Precompiles a bounded set of eligible functions without executing the
+    /// script. Published code is retained by the process code manager and can
+    /// be adopted by every worker that later requests the same cache key.
+    pub fn prewarm_cranelift(&self, compiled: &CompiledUnit) -> u64 {
+        if self.options.jit != JitMode::Cranelift || !self.options.tiering.enabled {
+            return 0;
+        }
+        const MAX_FUNCTIONS: usize = 64;
+        const MAX_TIME: Duration = Duration::from_millis(10);
+        let started = Instant::now();
+        let runtime_epoch = if self.options.worker_symbol_epoch {
+            WORKER_SYMBOL_LEDGER.with(|ledger| ledger.epoch.get())
+        } else {
+            0
+        };
+        let mut compiled_count = 0_u64;
+        for (index, function) in compiled
+            .unit()
+            .functions
+            .iter()
+            .enumerate()
+            .take(MAX_FUNCTIONS)
+        {
+            if started.elapsed() >= MAX_TIME {
+                break;
+            }
+            let function_id = FunctionId::new(index as u32);
+            let key = JitFunctionKey {
+                unit: compiled_unit_cache_key(compiled),
+                function: function_id,
+            };
+            let cache_key = jit_compile_cache_key(function_id, function, &self.options);
+            if matches!(
+                self.jit
+                    .borrow_mut()
+                    .lookup_compile_cache(&cache_key, runtime_epoch),
+                JitCompileCacheLookup::Hit(_)
+            ) {
+                continue;
+            }
+            if self
+                .compile_cranelift_jit_leaf(
+                    compiled,
+                    function_id,
+                    function,
+                    key,
+                    cache_key,
+                    runtime_epoch,
+                )
+                .is_some()
+            {
+                compiled_count = compiled_count.saturating_add(1);
+            }
+        }
+        compiled_count
     }
 
     #[cfg(feature = "jit-cranelift")]
@@ -1176,8 +1293,11 @@ impl Vm {
             function_id,
             php_jit::JitCompileRequest::new(format!("function.{}", function.name))
                 .with_function_name(function.name.clone())
-                .with_ir_fingerprint(format!("{:016x}", cache_key.ir_fingerprint)),
+                .with_ir_fingerprint(format!("{:016x}", cache_key.ir_fingerprint))
+                .with_config_hash(cache_key.config_hash)
+                .with_invalidation_generation(runtime_layout_epoch),
             php_jit::JitRuntimeHelperAddresses {
+                helper_table: jit_runtime_helper_table() as *const _ as usize,
                 packed_array_len: jit_array_len_abi as *const () as usize,
                 packed_array_fetch_int_slow: jit_array_fetch_int_slow_abi as *const () as usize,
                 known_strlen: jit_strlen_known_abi as *const () as usize,
@@ -1187,6 +1307,14 @@ impl Vm {
                 record_array_lookup: jit_record_array_lookup_abi as *const () as usize,
             },
         );
+        if let Ok(result) = &compile_result
+            && let Some(event) = result
+                .handle
+                .as_ref()
+                .and_then(php_jit::JitFunctionHandle::code_manager_event)
+        {
+            self.record_counter_jit_code_manager_event(event);
+        }
         match compile_result {
             Ok(result) if result.status == php_jit::JitCompileStatus::Compiled => {
                 let Some(mut handle) = result.handle else {
@@ -1223,7 +1351,16 @@ impl Vm {
                 self.record_jit_compile_budget_spent(result.stats.native_compile_time_nanos);
                 Some(handle)
             }
-            Ok(_) | Err(_) => {
+            Ok(_) => {
+                // A normal unsupported PHP shape is not a compiler failure and
+                // must remain eligible for a later specialization/version.
+                if let Some(entry) = self.jit.borrow_mut().functions.get_mut(&key) {
+                    entry.unsupported_epoch = Some(runtime_layout_epoch);
+                }
+                self.record_counter_jit_bailout();
+                None
+            }
+            Err(_) => {
                 self.record_jit_compile_failure_for_key(key);
                 self.record_counter_jit_bailout();
                 None
@@ -1483,6 +1620,8 @@ impl Vm {
                             ir_function,
                             function_id,
                             call: call.take().expect("call should be consumed exactly once"),
+                            direct_call: None,
+                            resume: None,
                         },
                         output,
                         stack,
@@ -1585,6 +1724,8 @@ impl Vm {
                         ir_function: function,
                         function_id,
                         call,
+                        direct_call: None,
+                        resume: None,
                     },
                     output,
                     stack,

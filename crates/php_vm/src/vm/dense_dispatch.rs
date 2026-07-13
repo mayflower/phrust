@@ -1,14 +1,16 @@
+use super::dense_activation::{DenseActivationResult, DenseFrameCompletion};
 use super::dispatch_contract::DenseBinaryRequest;
 use super::prelude::*;
+use super::result::FrameOutcome;
 
 impl Vm {
-    pub(super) fn execute_bytecode_function(
+    pub(super) fn execute_dense_activation(
         &self,
         request: DenseExecutionRequest<'_, '_>,
         output: &mut OutputBuffer,
         stack: &mut CallStack,
         state: &mut ExecutionState,
-    ) -> VmResult {
+    ) -> DenseActivationResult {
         let DenseExecutionRequest {
             compiled,
             dense,
@@ -17,7 +19,23 @@ impl Vm {
             ir_function,
             function_id,
             mut call,
+            direct_call,
+            resume,
         } = request;
+        if let Some(direct) = direct_call.as_ref() {
+            call.call_site_strict_types = Some(direct.strict_types);
+            call.call_span = direct.span;
+            call.this_value = direct.receiver.clone();
+            call.scope_class = direct.class_context.scope.clone();
+            call.called_class = direct.class_context.called.clone();
+            call.declaring_class = direct.class_context.declaring.clone();
+            debug_assert!(matches!(
+                direct.destination,
+                CallDestination::Register(_)
+                    | CallDestination::Discard
+                    | CallDestination::OuterReturn
+            ));
+        }
         self.record_counter_dense_function_executed();
         if call.resume_continuation.is_some()
             || call.resume_fiber_continuation.is_some()
@@ -27,374 +45,352 @@ impl Vm {
             return VmResult::unsupported(
                 output.clone(),
                 "E_PHP_VM_DENSE_BYTECODE_CALL_SHAPE_UNSUPPORTED: dense bytecode function calls do not support generator or fiber continuations yet",
-            );
-        }
-        let mut diagnostics = Vec::new();
-        // Function-invariant call-shape facts come from the execution plan
-        // when it carries them (one Vec index) and fall back to the hashed
-        // per-(unit, function) memo caches for plan-less calls.
-        let call_shape_meta = plan
-            .and_then(|plan| plan.call_shape_meta.get(function_id.index()))
-            .copied();
-        let frame_shape = match call_shape_meta {
-            Some(meta) => FrameShapeFlags {
-                has_try_or_finally: meta.has_try_or_finally,
-                may_hold_destructor_sensitive_value: meta.may_hold_destructor_sensitive_value,
-                has_inline_blocker: meta.has_inline_blocker,
-            },
-            None => self.frame_shape_flags(compiled, function_id, ir_function),
-        };
-        let frame_reuse_call_shape_reason = frame_reuse_call_shape_blocked_reason(
-            ir_function,
-            &call,
-            frame_shape,
-            self.options.reuse_class_context_frames,
-        );
-        let frame_layout = call_frame_layout_class(ir_function, &call, frame_shape);
-        let argument_policy = call.argument_binding_policy(compiled);
-        let elide_frame_args = match call_shape_meta {
-            Some(meta) => meta.elide_frame_args,
-            None => self.frame_args_elidable(compiled, function_id, ir_function),
-        };
-        self.record_counter_direct_frame(frame_layout, ir_function, elide_frame_args);
-        // R1 fast path: an exact-arity plain-positional by-value call binds its
-        // arguments straight into the callee frame's locals, reusing the
-        // incoming `Vec<CallArgument>` as the hand-off buffer and skipping the
-        // per-call `Vec<PreparedArg>` allocation. Guarded to the identical shape
-        // as `bind_arguments`'s fast path, so coercion, strict-types, TypeError
-        // reporting, and the backtrace snapshot stay byte-identical (see the
-        // shared `is_direct_bind_fast_shape`, `coerce_or_check_param_type`, and
-        // `trace_value_for_bound_param`).
-        // R1.2 fast lane: the dense call arm may hand bare positional values
-        // (pre-validated shape, references already dereferenced at operand
-        // read) — no `CallArgument` vector exists at all for those calls.
-        let prebound_values = call.positional_values.take();
-        // The dense fast lane may only pre-bind values for the exact shape the
-        // classic predicate accepts; anything else must arrive as
-        // `CallArgument`s so the general binder sees it.
-        debug_assert!(
-            prebound_values.is_none()
-                || (elide_frame_args
-                    && call.args.is_empty()
-                    && prebound_values
-                        .as_ref()
-                        .is_some_and(|values| { values.len() == ir_function.params.len() })
-                    && arguments::params_bind_direct(ir_function)),
-            "pre-bound positional values outside the direct-bind fast shape"
-        );
-        let direct_bind = prebound_values.is_some()
-            || (elide_frame_args && arguments::is_direct_bind_fast_shape(ir_function, &call.args));
-        let mut direct_values = CallValuesSmall::new();
-        let mut prepared_args: Option<Vec<PreparedArg>> = None;
-        let mut frame_args: Vec<Value> = Vec::new();
-        let mut binding_diagnostics: Vec<RuntimeDiagnostic> = Vec::new();
-        let has_by_ref_arg;
-        if direct_bind {
-            // Resolve reference arguments in place, exactly as the fast path in
-            // `bind_arguments` does, so the trace snapshot and the locals both
-            // observe the dereferenced value. The shape guarantees no by-ref
-            // params, no defaults, no variadic, and no named arguments, so
-            // `frame_args`/`binding_diagnostics` stay empty as they would on the
-            // general path for this shape.
-            direct_values = if let Some(prebound_values) = prebound_values {
-                prebound_values
-            } else {
-                std::mem::take(&mut call.args)
-                    .into_iter()
-                    .map(|arg| match arg.value {
-                        Value::Reference(cell) => cell.get(),
-                        value => value,
-                    })
-                    .collect()
-            };
-            self.record_counter_prepared_arg_vector_allocation_avoided();
-            has_by_ref_arg = false;
-        } else {
-            let prepared = match arguments::prepare_arguments(
-                compiled,
-                ir_function,
-                std::mem::take(&mut call.args),
-                stack,
-                state,
-                self.typecheck_fast_path_context(),
-                argument_policy,
-                call.allow_by_ref_value_warnings,
-                call.call_span,
-                call.by_ref_warning_callable_name.as_deref(),
-                elide_frame_args,
-            ) {
-                Ok(args) => args,
-                Err(message) => {
-                    let error_compiled = call.error_context_compiled.as_ref().unwrap_or(compiled);
-                    let error_span = call.call_span.unwrap_or(ir_function.span);
-                    let caller_only_trace =
-                        message.code() == "E_PHP_VM_BY_REF_ARG_NOT_REFERENCEABLE";
-                    let result = self.runtime_error(output, error_compiled, stack, message);
-                    if let Some(throwable) = runtime_error_throwable(&result) {
-                        tag_throwable_location(&throwable, error_compiled, error_span);
-                        state.pending_trace = Some(if caller_only_trace {
-                            capture_backtrace_string(error_compiled, stack)
-                        } else {
-                            capture_backtrace_string_with_failed_call(
-                                error_compiled,
-                                stack,
-                                ir_function,
-                                error_span,
-                            )
-                        });
-                        state.pending_throw = Some(throwable);
-                        return VmResult::propagating_exception(output.clone());
-                    }
-                    return result;
-                }
-            };
-            has_by_ref_arg = frame_reuse_prepared_args_blocked_reason(&prepared.args).is_some();
-            frame_args = prepared.frame_args;
-            binding_diagnostics = prepared.diagnostics;
-            prepared_args = Some(prepared.args);
-        }
-        let frame_reuse_blocked_reason =
-            frame_reuse_call_shape_reason.or_else(|| has_by_ref_arg.then_some("by_ref_argument"));
-        self.record_counter_call_frame_layout(frame_layout);
-        let specialized_frame_fallback = specialized_call_frame_fallback_reason(
-            frame_layout,
-            frame_reuse_blocked_reason,
-            has_by_ref_arg,
-        );
-        let specialized_tiny_frame = specialized_frame_fallback.is_none();
-        if frame_layout == "tiny_leaf_frame" {
-            self.record_counter_tiny_frame_candidate();
-        }
-        if let Some(reason) = specialized_frame_fallback {
-            self.record_counter_generic_frame_fallback(reason);
-        }
-        let activation_context = FrameActivationContext {
-            scope_class: call.scope_class.take(),
-            called_class: call.called_class.take(),
-            declaring_class: call.declaring_class.take(),
-            call_span: call.call_span,
-        };
-        let reused_frame = if let Some(reason) = frame_reuse_blocked_reason {
-            self.record_counter_frame_reuse_blocked(reason);
-            stack.push_fresh_frame(
-                function_id,
-                dense_function.register_count,
-                dense_function.local_count,
-                activation_context,
-            );
-            false
-        } else {
-            stack.push_reusable_frame(
-                function_id,
-                dense_function.register_count,
-                dense_function.local_count,
-                activation_context,
             )
-        };
-        let frame_index = stack.len().saturating_sub(1);
-        self.record_counter_frame_activation(
-            reused_frame,
-            dense_function.register_count,
-            dense_function.local_count,
-        );
-        for diagnostic in binding_diagnostics {
-            let handled = match self.dispatch_error_handler(
-                compiled,
-                output,
-                stack,
-                state,
-                PHP_E_WARNING,
-                &diagnostic,
-            ) {
-                Ok(handled) => handled,
-                Err(result) => {
-                    stack.pop_recycle();
-                    return *result;
-                }
-            };
-            if !handled && error_reporting_allows(state, PHP_E_WARNING) {
-                emit_vm_diagnostic(
-                    output,
-                    state,
-                    &diagnostic,
-                    PhpDiagnosticChannel::Warning,
-                    PHP_E_WARNING,
-                );
-                diagnostics.push(diagnostic);
-            }
+            .into();
         }
-        {
-            let frame = stack.current_mut().expect("bytecode frame was pushed");
-            let args_is_empty = if direct_bind {
-                direct_values.is_empty()
-            } else {
-                prepared_args.as_ref().is_none_or(Vec::is_empty)
-            };
-            if specialized_tiny_frame {
-                self.record_counter_specialized_frame_hit();
-                if !args_is_empty {
-                    self.record_counter_arg_array_avoided();
-                }
-                if reused_frame {
-                    self.record_counter_heap_frame_avoided();
-                }
-            } else {
-                frame.arguments = frame_args;
-                // Backtrace arguments reconstruct lazily from the live locals
-                // (reference-engine semantics: traces show current slot
-                // values), so no per-call snapshot is built here.
-                frame.trace_arguments = TraceArguments::Lazy {
-                    arg_count: if direct_bind {
-                        direct_values.len() as u32
-                    } else {
-                        prepared_args.as_ref().map_or(0, Vec::len) as u32
-                    },
-                };
-            }
-        }
-        if let Err(message) = initialize_captures(ir_function, call.captures, stack) {
-            let result = self.runtime_error(output, compiled, stack, message);
-            stack.pop_recycle();
-            return result;
-        }
-        if let Some(this_value) = call.this_value
-            && let Err(message) =
-                initialize_this(compiled, state, function_id, ir_function, this_value, stack)
-        {
-            let result = self.runtime_error(output, compiled, stack, message);
-            stack.pop_recycle();
-            return result;
-        }
-        if let Some(shared) = call.shared_top_level_locals.as_deref_mut() {
-            import_shared_locals(
-                ir_function,
-                stack,
-                state,
-                shared,
-                call.shared_top_level_bind_missing_globals,
-            );
-        } else if ir_function.flags.is_top_level {
-            bind_top_level_global_locals(ir_function, stack, state);
-        }
-        if direct_bind {
-            // Direct-to-locals: coerce each raw by-value argument with the same
-            // `coerce_or_check_param_type` at the same program point as the
-            // general path, then write it straight into the frame's locals. The
-            // fast shape has no by-ref params, so there is no reference cell to
-            // bind (`coerce_or_check_param_type` ignores the by-ref flag anyway).
-            let mut direct_values = direct_values;
-            let bound_count = direct_values.len().min(ir_function.params.len());
-            for arg_index in 0..bound_count {
-                let param = &ir_function.params[arg_index];
-                let mut value =
-                    std::mem::replace(&mut direct_values[arg_index], Value::Uninitialized);
-                if let Err(message) = coerce_or_check_param_type(
-                    ParamTypecheckRequest {
-                        compiled,
-                        state,
-                        function: ir_function,
-                        param,
-                        arg_index,
-                        fast_path: self.typecheck_fast_path_context(),
-                        strict_types: argument_policy.call_site_strict_types,
-                        call_span: call.call_span,
-                    },
-                    &mut value,
-                ) {
-                    // Cold: the frame's arguments are elided on this fast
-                    // path, so the lazy trace has no source for the failing
-                    // (and any later) argument — materialize the snapshot from
-                    // the already-bound locals plus the remaining raw args so
-                    // the TypeError's own trace shows the real values.
-                    direct_values[arg_index] = value;
-                    let entries: Vec<FrameTraceArgument> = (0..direct_values.len())
-                        .map(|index| {
-                            let param = ir_function.params.get(index);
-                            let value = match param {
-                                Some(param) if index < arg_index => stack
-                                    .current()
-                                    .and_then(|frame| frame.locals.get(param.local))
-                                    .unwrap_or(Value::Null),
-                                _ => direct_values[index].clone(),
-                            };
-                            let sensitive = param.is_some_and(param_is_sensitive);
-                            FrameTraceArgument {
-                                name: None,
-                                value: trace_value_for_param(&value, sensitive),
-                            }
-                        })
-                        .collect();
-                    if let Some(frame) = stack.current_mut() {
-                        frame.trace_arguments = TraceArguments::Materialized(entries);
-                    }
-                    let result = self.runtime_error(output, compiled, stack, message);
-                    if let Some(throwable) = runtime_error_throwable(&result) {
-                        tag_throwable_location(&throwable, compiled, ir_function.span);
-                        state.pending_trace = Some(capture_backtrace_string(compiled, stack));
-                        return self.propagate_exception(output, stack, state, throwable);
-                    }
-                    stack.pop_recycle();
-                    return result;
-                }
-                let locals = &mut stack
-                    .current_mut()
-                    .expect("bytecode frame was pushed")
-                    .locals;
-                if let Err(message) = locals.set(param.local, value) {
-                    let result = self.runtime_error(output, compiled, stack, message);
-                    stack.pop_recycle();
-                    return result;
-                }
-            }
+        let (mut diagnostics, frame_index, resumed) = if let Some(mut resume) = resume {
+            let diagnostics = std::mem::take(&mut resume.diagnostics);
+            (diagnostics, resume.frame_index, Some(resume))
         } else {
-            for (arg_index, (param, mut arg)) in ir_function
-                .params
-                .iter()
-                .zip(prepared_args.unwrap_or_default())
-                .enumerate()
-            {
-                if let Err(message) = coerce_or_check_param_type(
-                    ParamTypecheckRequest {
-                        compiled,
-                        state,
-                        function: ir_function,
-                        param,
-                        arg_index,
-                        fast_path: self.typecheck_fast_path_context(),
-                        strict_types: argument_policy.call_site_strict_types,
-                        call_span: call.call_span,
-                    },
-                    &mut arg.value,
+            let mut diagnostics = Vec::new();
+            // Function-invariant call-shape facts come from the execution plan
+            // when it carries them (one Vec index) and fall back to the hashed
+            // per-(unit, function) memo caches for plan-less calls.
+            let call_shape_meta = plan
+                .and_then(|plan| plan.call_shape_meta.get(function_id.index()))
+                .copied();
+            let frame_shape = match call_shape_meta {
+                Some(meta) => FrameShapeFlags {
+                    has_try_or_finally: meta.has_try_or_finally,
+                    may_hold_destructor_sensitive_value: meta.may_hold_destructor_sensitive_value,
+                    has_inline_blocker: meta.has_inline_blocker,
+                },
+                None => self.frame_shape_flags(compiled, function_id, ir_function),
+            };
+            let frame_reuse_call_shape_reason = frame_reuse_call_shape_blocked_reason(
+                ir_function,
+                &call,
+                frame_shape,
+                self.options.reuse_class_context_frames,
+            );
+            let frame_layout = call_frame_layout_class(ir_function, &call, frame_shape);
+            let argument_policy = call.argument_binding_policy(compiled);
+            let elide_frame_args = match call_shape_meta {
+                Some(meta) => meta.elide_frame_args,
+                None => self.frame_args_elidable(compiled, function_id, ir_function),
+            };
+            self.record_counter_direct_frame(frame_layout, ir_function, elide_frame_args);
+            // Exact positional calls bind sources directly under shared binder predicates.
+            let direct_arg_count = direct_call
+                .as_ref()
+                .map_or(0, |call| call.argument_sources.len());
+            // The dense fast lane may only pre-bind values for the exact shape the
+            // classic predicate accepts; anything else must arrive as
+            // `CallArgument`s so the general binder sees it.
+            debug_assert!(
+                direct_call.is_none()
+                    || (elide_frame_args
+                        && call.args.is_empty()
+                        && arguments::params_bind_direct(ir_function)),
+                "pre-bound positional values outside the direct-bind fast shape"
+            );
+            let direct_bind = direct_call.is_some()
+                || (elide_frame_args
+                    && arguments::is_direct_bind_fast_shape(ir_function, &call.args));
+            let mut direct_values = Vec::new();
+            let mut prepared_args: Option<Vec<PreparedArg>> = None;
+            let mut frame_args: Vec<Value> = Vec::new();
+            let mut binding_diagnostics: Vec<RuntimeDiagnostic> = Vec::new();
+            let has_by_ref_arg;
+            if direct_bind {
+                // Resolve reference arguments in place, exactly as the fast path in
+                // `bind_arguments` does, so the trace snapshot and the locals both
+                // observe the dereferenced value. The shape guarantees no by-ref
+                // params, no defaults, no variadic, and no named arguments, so
+                // `frame_args`/`binding_diagnostics` stay empty as they would on the
+                // general path for this shape.
+                direct_values = if direct_call.is_some() {
+                    Vec::new()
+                } else {
+                    std::mem::take(&mut call.args)
+                        .into_iter()
+                        .map(|arg| match arg.value {
+                            Value::Reference(cell) => cell.get(),
+                            value => value,
+                        })
+                        .collect()
+                };
+                self.record_counter_prepared_arg_vector_allocation_avoided();
+                has_by_ref_arg = false;
+            } else {
+                let prepared = match arguments::prepare_arguments(
+                    compiled,
+                    ir_function,
+                    std::mem::take(&mut call.args),
+                    stack,
+                    state,
+                    self.typecheck_fast_path_context(),
+                    argument_policy,
+                    call.allow_by_ref_value_warnings,
+                    call.call_span,
+                    call.by_ref_warning_callable_name.as_deref(),
+                    elide_frame_args,
                 ) {
-                    let result = self.runtime_error(output, compiled, stack, message);
-                    if let Some(throwable) = runtime_error_throwable(&result) {
-                        tag_throwable_location(&throwable, compiled, ir_function.span);
-                        state.pending_trace = Some(capture_backtrace_string(compiled, stack));
-                        return self.propagate_exception(output, stack, state, throwable);
+                    Ok(args) => args,
+                    Err(message) => {
+                        let error_compiled =
+                            call.error_context_compiled.as_ref().unwrap_or(compiled);
+                        let error_span = call.call_span.unwrap_or(ir_function.span);
+                        let caller_only_trace =
+                            message.code() == "E_PHP_VM_BY_REF_ARG_NOT_REFERENCEABLE";
+                        let result = self.runtime_error(output, error_compiled, stack, message);
+                        if let Some(throwable) = runtime_error_throwable(&result) {
+                            tag_throwable_location(&throwable, error_compiled, error_span);
+                            state.pending_trace = Some(if caller_only_trace {
+                                capture_backtrace_string(error_compiled, stack)
+                            } else {
+                                capture_backtrace_string_with_failed_call(
+                                    error_compiled,
+                                    stack,
+                                    ir_function,
+                                    error_span,
+                                )
+                            });
+                            state.pending_throw = Some(throwable);
+                            return DenseActivationResult::throwing();
+                        }
+                        return result.into();
                     }
-                    stack.pop_recycle();
-                    return result;
+                };
+                has_by_ref_arg = frame_reuse_prepared_args_blocked_reason(&prepared.args).is_some();
+                frame_args = prepared.frame_args;
+                binding_diagnostics = prepared.diagnostics;
+                prepared_args = Some(prepared.args);
+            }
+            let frame_reuse_blocked_reason = frame_reuse_call_shape_reason
+                .or_else(|| has_by_ref_arg.then_some("by_ref_argument"));
+            self.record_counter_call_frame_layout(frame_layout);
+            let specialized_frame_fallback = specialized_call_frame_fallback_reason(
+                frame_layout,
+                frame_reuse_blocked_reason,
+                has_by_ref_arg,
+            );
+            let specialized_tiny_frame = specialized_frame_fallback.is_none();
+            if frame_layout == "tiny_leaf_frame" {
+                self.record_counter_tiny_frame_candidate();
+            }
+            if let Some(reason) = specialized_frame_fallback {
+                self.record_counter_generic_frame_fallback(reason);
+            }
+            let activation_context = FrameActivationContext {
+                scope_class: call.scope_class.take(),
+                called_class: call.called_class.take(),
+                declaring_class: call.declaring_class.take(),
+                call_span: call.call_span,
+            };
+            let reused_frame = if let Some(reason) = frame_reuse_blocked_reason {
+                self.record_counter_frame_reuse_blocked(reason);
+                stack.push_fresh_frame(
+                    function_id,
+                    dense_function.register_count,
+                    dense_function.local_count,
+                    activation_context,
+                );
+                false
+            } else {
+                stack.push_reusable_frame(
+                    function_id,
+                    dense_function.register_count,
+                    dense_function.local_count,
+                    activation_context,
+                )
+            };
+            let frame_index = stack.len().saturating_sub(1);
+            self.record_counter_frame_activation(
+                reused_frame,
+                dense_function.register_count,
+                dense_function.local_count,
+            );
+            for diagnostic in binding_diagnostics {
+                let handled = match self.dispatch_error_handler(
+                    compiled,
+                    output,
+                    stack,
+                    state,
+                    PHP_E_WARNING,
+                    &diagnostic,
+                ) {
+                    Ok(handled) => handled,
+                    Err(result) => {
+                        stack.pop_recycle();
+                        return (*result).into();
+                    }
+                };
+                if !handled && error_reporting_allows(state, PHP_E_WARNING) {
+                    emit_vm_diagnostic(
+                        output,
+                        state,
+                        &diagnostic,
+                        PhpDiagnosticChannel::Warning,
+                        PHP_E_WARNING,
+                    );
+                    diagnostics.push(diagnostic);
                 }
-                let locals = &mut stack
-                    .current_mut()
-                    .expect("bytecode frame was pushed")
-                    .locals;
-                let result = if param.by_ref {
-                    if let Some(reference) = arg.reference {
-                        reference.set(arg.value);
-                        locals.bind_reference_cell(param.local, reference)
-                    } else {
-                        locals.set(param.local, arg.value)
+            }
+            {
+                let frame = stack.current_mut().expect("bytecode frame was pushed");
+                let args_is_empty = if direct_call.is_some() {
+                    direct_arg_count == 0
+                } else if direct_bind {
+                    direct_values.is_empty()
+                } else {
+                    prepared_args.as_ref().is_none_or(Vec::is_empty)
+                };
+                if specialized_tiny_frame {
+                    self.record_counter_specialized_frame_hit();
+                    if !args_is_empty {
+                        self.record_counter_arg_array_avoided();
+                    }
+                    if reused_frame {
+                        self.record_counter_heap_frame_avoided();
                     }
                 } else {
-                    locals.set(param.local, arg.value)
-                };
-                if let Err(message) = result {
-                    let result = self.runtime_error(output, compiled, stack, message);
-                    stack.pop_recycle();
-                    return result;
+                    frame.arguments = frame_args;
+                    frame.trace_arguments = TraceArguments::Lazy {
+                        arg_count: if direct_call.is_some() {
+                            direct_arg_count as u32
+                        } else if direct_bind {
+                            direct_values.len() as u32
+                        } else {
+                            prepared_args.as_ref().map_or(0, Vec::len) as u32
+                        },
+                    };
                 }
             }
+            if let Err(message) = initialize_captures(ir_function, call.captures, stack) {
+                let result = self.runtime_error(output, compiled, stack, message);
+                stack.pop_recycle();
+                return result.into();
+            }
+            if let Some(this_value) = call.this_value
+                && let Err(message) =
+                    initialize_this(compiled, state, function_id, ir_function, this_value, stack)
+            {
+                let result = self.runtime_error(output, compiled, stack, message);
+                stack.pop_recycle();
+                return result.into();
+            }
+            if let Some(shared) = call.shared_top_level_locals.as_deref_mut() {
+                import_shared_locals(
+                    ir_function,
+                    stack,
+                    state,
+                    shared,
+                    call.shared_top_level_bind_missing_globals,
+                );
+            } else if ir_function.flags.is_top_level {
+                bind_top_level_global_locals(ir_function, stack, state);
+            }
+            if let Some(direct_call) = direct_call.as_ref() {
+                if let Err(result) = self.bind_dense_direct_call(
+                    direct_call,
+                    compiled,
+                    ir_function,
+                    frame_index,
+                    output,
+                    stack,
+                    state,
+                ) {
+                    return result.into();
+                }
+            } else if direct_bind {
+                if let Err(result) = self.bind_owned_direct_values(
+                    direct_values,
+                    compiled,
+                    ir_function,
+                    argument_policy.call_site_strict_types,
+                    call.call_span,
+                    output,
+                    stack,
+                    state,
+                ) {
+                    return result.into();
+                }
+            } else {
+                for (arg_index, (param, mut arg)) in ir_function
+                    .params
+                    .iter()
+                    .zip(prepared_args.unwrap_or_default())
+                    .enumerate()
+                {
+                    if let Err(message) = coerce_or_check_param_type(
+                        ParamTypecheckRequest {
+                            compiled,
+                            state,
+                            function: ir_function,
+                            param,
+                            arg_index,
+                            fast_path: self.typecheck_fast_path_context(),
+                            strict_types: argument_policy.call_site_strict_types,
+                            call_span: call.call_span,
+                        },
+                        &mut arg.value,
+                    ) {
+                        let result = self.runtime_error(output, compiled, stack, message);
+                        if let Some(throwable) = runtime_error_throwable(&result) {
+                            tag_throwable_location(&throwable, compiled, ir_function.span);
+                            state.pending_trace = Some(capture_backtrace_string(compiled, stack));
+                            return self
+                                .propagate_exception(output, stack, state, throwable)
+                                .into();
+                        }
+                        stack.pop_recycle();
+                        return result.into();
+                    }
+                    let locals = &mut stack
+                        .current_mut()
+                        .expect("bytecode frame was pushed")
+                        .locals;
+                    let result = if param.by_ref {
+                        if let Some(reference) = arg.reference {
+                            reference.set(arg.value);
+                            locals.bind_reference_cell(param.local, reference)
+                        } else {
+                            locals.set(param.local, arg.value)
+                        }
+                    } else {
+                        locals.set(param.local, arg.value)
+                    };
+                    if let Err(message) = result {
+                        let result = self.runtime_error(output, compiled, stack, message);
+                        stack.pop_recycle();
+                        return result.into();
+                    }
+                }
+            }
+            (diagnostics, frame_index, None)
+        };
+        #[cfg(feature = "jit-cranelift")]
+        if let Some(value) = direct_call.as_ref().and_then(|direct| {
+            stack.current().and_then(|frame| {
+                self.try_execute_direct_jit(
+                    compiled,
+                    state,
+                    function_id,
+                    ir_function,
+                    direct,
+                    frame,
+                )
+            })
+        }) {
+            stack.pop_recycle();
+            return DenseActivationResult::Frame(DenseFrameCompletion {
+                outcome: FrameOutcome::Return {
+                    value: Some(value),
+                    explicit: true,
+                },
+                diagnostics,
+            });
         }
         let unit_id = compiled.unit().id;
         let dense_inline_cache_ids = if self.options.inline_caches.enabled() {
@@ -417,26 +413,35 @@ impl Vm {
         // unchanged by default. Built once per (unit, function) and reused.
         let move_plan = self.last_use_move_plan(compiled, plan, function_id, dense_function);
         let move_plan = move_plan.as_deref();
-        let mut foreach_iterators: HashMap<RegId, ForeachIterator> = HashMap::new();
-        let mut block_index = 0_u32;
-        let mut steps = 0_usize;
+        let (mut foreach_iterators, mut block_index, mut steps, mut resume_instruction_offset) =
+            if let Some(resume) = resumed {
+                debug_assert_eq!(resume.function_id, function_id);
+                (
+                    resume.foreach_iterators,
+                    resume.block_index,
+                    resume.steps,
+                    Some(resume.instruction_offset),
+                )
+            } else {
+                (HashMap::new(), 0_u32, 0_usize, None)
+            };
         'dispatch: loop {
             if let Some(code) = state.process_exit_code {
                 stack.pop_frame_recycle(frame_index);
-                return script_exit_result(output, state, code);
+                return script_exit_result(output, state, code).into();
             }
             steps += 1;
             match execution_limit_exceeded(state, steps, self.options.max_steps) {
                 Some(ExecutionLimitExceeded::Timeout) => {
                     let result = self.execution_timeout(output, compiled, stack);
                     stack.pop_recycle();
-                    return result;
+                    return result.into();
                 }
                 Some(ExecutionLimitExceeded::StepLimit) => {
                     let result =
                         self.runtime_error(output, compiled, stack, "VM step limit exceeded");
                     stack.pop_recycle();
-                    return result;
+                    return result.into();
                 }
                 None => {}
             }
@@ -448,7 +453,7 @@ impl Vm {
                     format!("invalid dense bytecode block block:{block_index}"),
                 );
                 stack.pop_recycle();
-                return result;
+                return result.into();
             };
             self.record_counter_dense_block_entry(function_id.raw(), block_index);
             let start = block.first_instruction as usize;
@@ -461,7 +466,7 @@ impl Vm {
                     format!("invalid dense bytecode instruction range for block:{block_index}"),
                 );
                 stack.pop_recycle();
-                return result;
+                return result.into();
             };
             match try_execute_dense_pcre_ascii_offset_block_fast_path(
                 compiled,
@@ -485,10 +490,10 @@ impl Vm {
                 Err(message) => {
                     let result = self.runtime_error(output, compiled, stack, message);
                     stack.pop_recycle();
-                    return result;
+                    return result.into();
                 }
             }
-            let mut instruction_offset = 0_usize;
+            let mut instruction_offset = resume_instruction_offset.take().unwrap_or(0);
             while instruction_offset < instructions.len() {
                 let instruction = &instructions[instruction_offset];
                 let inline_cache_id = instruction.cache_slot.and_then(|slot| {
@@ -508,7 +513,7 @@ impl Vm {
                             "E_PHP_VM_DENSE_BYTECODE_SITE_INDEX_OVERFLOW: dense instruction index exceeds u32",
                         );
                         stack.pop_recycle();
-                        return result;
+                        return result.into();
                     }
                 };
                 let next_instruction_offset = if instruction.opcode.is_superinstruction()
@@ -539,7 +544,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let Some(name) = dense.names.get(name as usize) else {
                             let result = self.runtime_error(
@@ -549,7 +554,7 @@ impl Vm {
                                 format!("invalid dense bytecode function declaration name n{name}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let name = name.clone();
                         if let Err(message) = declare_runtime_function(
@@ -566,7 +571,7 @@ impl Vm {
                                 message,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::DeclareClass => {
@@ -578,7 +583,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let Some(name) = dense.names.get(name as usize) else {
                             let result = self.runtime_error(
@@ -588,13 +593,13 @@ impl Vm {
                                 format!("invalid dense bytecode class declaration name n{name}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let name = name.clone();
                         if let Err(message) = declare_runtime_class(compiled, state, &name) {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::FetchClassConstant => {
@@ -611,7 +616,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let dst = *dst;
                         let Some(class_name) = dense.names.get(*class_name as usize) else {
@@ -622,7 +627,7 @@ impl Vm {
                                 format!("invalid dense bytecode class name n{class_name}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let Some(constant) = dense.names.get(*constant as usize) else {
                             let result = self.runtime_error(
@@ -632,7 +637,7 @@ impl Vm {
                                 format!("invalid dense bytecode class constant name n{constant}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let class_name = class_name.clone();
                         let constant = constant.clone();
@@ -673,10 +678,11 @@ impl Vm {
                                 {
                                     // propagate_exception pops this frame.
                                     return self
-                                        .propagate_exception(output, stack, state, throwable);
+                                        .propagate_exception(output, stack, state, throwable)
+                                        .into();
                                 }
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                             Err(ClassConstantFetch::Raise(span, message)) => {
                                 let mut exception_handlers = Vec::new();
@@ -696,20 +702,20 @@ impl Vm {
                                             "E_PHP_VM_DENSE_FETCH_CLASS_CONSTANT_HANDLER: dense functions have no local exception handlers".to_string(),
                                         );
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                     RaiseOutcome::Done(result) => {
                                         if state.pending_throw.is_none() {
                                             stack.pop_recycle();
                                         }
-                                        return *result;
+                                        return (*result).into();
                                     }
                                 }
                             }
                             Err(ClassConstantFetch::Fatal(message)) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         if let Err(message) = stack
@@ -720,7 +726,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::FetchStaticProperty => {
@@ -737,7 +743,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let dst = *dst;
                         let Some(class_name) = dense.names.get(*class_name as usize) else {
@@ -748,7 +754,7 @@ impl Vm {
                                 format!("invalid dense bytecode class name n{class_name}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let Some(property) = dense.names.get(*constant as usize) else {
                             let result = self.runtime_error(
@@ -758,7 +764,7 @@ impl Vm {
                                 format!("invalid dense bytecode static property name n{constant}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let class_name = class_name.clone();
                         let property = property.clone();
@@ -795,10 +801,11 @@ impl Vm {
                                 {
                                     // propagate_exception pops this frame.
                                     return self
-                                        .propagate_exception(output, stack, state, throwable);
+                                        .propagate_exception(output, stack, state, throwable)
+                                        .into();
                                 }
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                             Err(ClassConstantFetch::Raise(span, message)) => {
                                 let mut exception_handlers = Vec::new();
@@ -818,20 +825,20 @@ impl Vm {
                                             "E_PHP_VM_DENSE_FETCH_STATIC_PROPERTY_HANDLER: dense functions have no local exception handlers".to_string(),
                                         );
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                     RaiseOutcome::Done(result) => {
                                         if state.pending_throw.is_none() {
                                             stack.pop_recycle();
                                         }
-                                        return *result;
+                                        return (*result).into();
                                     }
                                 }
                             }
                             Err(ClassConstantFetch::Fatal(message)) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         if let Err(message) = stack
@@ -842,7 +849,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::IssetProperty | DenseOpcode::EmptyProperty => {
@@ -859,7 +866,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let dst = *dst;
                         let object = *object;
@@ -871,7 +878,7 @@ impl Vm {
                                 format!("invalid dense bytecode property name n{property}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let property = property.clone();
                         let object = match self.read_dense_operand(compiled, stack, object) {
@@ -879,7 +886,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let probe = if instruction.opcode == DenseOpcode::IssetProperty {
@@ -895,7 +902,7 @@ impl Vm {
                             Ok(value) => value,
                             Err(result) => {
                                 stack.pop_recycle();
-                                return *result;
+                                return (*result).into();
                             }
                         };
                         if let Err(message) = stack
@@ -906,7 +913,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::CloneObject => {
@@ -918,7 +925,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let dst = *dst;
                         let src = *src;
@@ -927,7 +934,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let value = match self.clone_object_value(
@@ -948,10 +955,11 @@ impl Vm {
                                 {
                                     // propagate_exception pops this frame.
                                     return self
-                                        .propagate_exception(output, stack, state, throwable);
+                                        .propagate_exception(output, stack, state, throwable)
+                                        .into();
                                 }
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                             Err(ClassConstantFetch::Raise(span, message)) => {
                                 let mut exception_handlers = Vec::new();
@@ -971,20 +979,20 @@ impl Vm {
                                             "E_PHP_VM_DENSE_CLONE_HANDLER: dense functions have no local exception handlers".to_string(),
                                         );
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                     RaiseOutcome::Done(result) => {
                                         if state.pending_throw.is_none() {
                                             stack.pop_recycle();
                                         }
-                                        return *result;
+                                        return (*result).into();
                                     }
                                 }
                             }
                             Err(ClassConstantFetch::Fatal(message)) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         if let Err(message) = stack
@@ -995,7 +1003,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::AssignStaticProperty => {
@@ -1013,7 +1021,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let dst = *dst;
                         let value_operand = *value;
@@ -1028,7 +1036,7 @@ impl Vm {
                                 "invalid dense bytecode static property names".to_owned(),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let class_name = class_name.clone();
                         let property = property.clone();
@@ -1037,7 +1045,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let span = dense_instruction_span(dense, instruction);
@@ -1067,10 +1075,11 @@ impl Vm {
                                 {
                                     // propagate_exception pops this frame.
                                     return self
-                                        .propagate_exception(output, stack, state, throwable);
+                                        .propagate_exception(output, stack, state, throwable)
+                                        .into();
                                 }
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                             Err(StaticPropertyAssignError::Raise(span, message)) => {
                                 let mut exception_handlers = Vec::new();
@@ -1090,20 +1099,20 @@ impl Vm {
                                             "E_PHP_VM_DENSE_ASSIGN_STATIC_PROPERTY_HANDLER: dense functions have no local exception handlers".to_string(),
                                         );
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                     RaiseOutcome::Done(result) => {
                                         if state.pending_throw.is_none() {
                                             stack.pop_recycle();
                                         }
-                                        return *result;
+                                        return (*result).into();
                                     }
                                 }
                             }
                             Err(StaticPropertyAssignError::Fatal(message)) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         {
@@ -1124,13 +1133,13 @@ impl Vm {
                                             "E_PHP_VM_DENSE_ASSIGN_STATIC_PROPERTY_HANDLER: dense functions have no local exception handlers".to_string(),
                                         );
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                     RaiseOutcome::Done(result) => {
                                         if state.pending_throw.is_none() {
                                             stack.pop_recycle();
                                         }
-                                        return *result;
+                                        return (*result).into();
                                     }
                                 }
                             }
@@ -1143,7 +1152,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::IssetStaticProperty | DenseOpcode::EmptyStaticProperty => {
@@ -1162,7 +1171,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let dst = *dst;
                         let (Some(class_name), Some(property)) = (
@@ -1176,7 +1185,7 @@ impl Vm {
                                 "invalid dense bytecode static property names".to_owned(),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let class_name = class_name.clone();
                         let property = property.clone();
@@ -1214,13 +1223,13 @@ impl Vm {
                                             "E_PHP_VM_DENSE_STATIC_PROPERTY_PROBE_HANDLER: dense functions have no local exception handlers".to_string(),
                                         );
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                     RaiseOutcome::Done(result) => {
                                         if state.pending_throw.is_none() {
                                             stack.pop_recycle();
                                         }
-                                        return *result;
+                                        return (*result).into();
                                     }
                                 }
                             }
@@ -1233,10 +1242,11 @@ impl Vm {
                                 {
                                     // propagate_exception pops this frame.
                                     return self
-                                        .propagate_exception(output, stack, state, throwable);
+                                        .propagate_exception(output, stack, state, throwable)
+                                        .into();
                                 }
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         if let Err(message) = stack
@@ -1247,7 +1257,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::AssignDynamicProperty => {
@@ -1269,7 +1279,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let property_value = match self
                             .read_dense_operand(compiled, stack, property)
@@ -1278,7 +1288,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         // Mirrors `dynamic_property_name` on the rich path:
@@ -1293,7 +1303,7 @@ impl Vm {
                             Ok(name) => name.to_string_lossy(),
                             Err(result) => {
                                 stack.pop_recycle();
-                                return *result;
+                                return (*result).into();
                             }
                         };
                         let object = match self.read_dense_operand(compiled, stack, object) {
@@ -1301,7 +1311,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let value = match self.read_dense_operand(compiled, stack, value) {
@@ -1309,7 +1319,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let span = dense
@@ -1334,7 +1344,7 @@ impl Vm {
                             Ok(value) => value,
                             Err(result) => {
                                 stack.pop_recycle();
-                                return *result;
+                                return (*result).into();
                             }
                         };
                         if let Err(message) = stack
@@ -1345,7 +1355,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::UnsetProperty => {
@@ -1359,7 +1369,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let object_operand = *object;
                         let Some(property) = dense.names.get(*property as usize) else {
@@ -1370,7 +1380,7 @@ impl Vm {
                                 format!("invalid dense bytecode property name n{property}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let property = property.clone();
                         let object = match self.read_dense_operand(compiled, stack, object_operand)
@@ -1387,12 +1397,12 @@ impl Vm {
                                     ),
                                 );
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let span = dense_instruction_span(dense, instruction);
@@ -1408,10 +1418,11 @@ impl Vm {
                                     .or_else(|| runtime_error_throwable(&result))
                                 {
                                     return self
-                                        .propagate_exception(output, stack, state, throwable);
+                                        .propagate_exception(output, stack, state, throwable)
+                                        .into();
                                 }
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                             Err(StaticPropertyAssignError::Raise(span, message)) => {
                                 let mut exception_handlers = Vec::new();
@@ -1431,20 +1442,20 @@ impl Vm {
                                             "E_PHP_VM_DENSE_UNSET_PROPERTY_HANDLER: dense functions have no local exception handlers".to_string(),
                                         );
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                     RaiseOutcome::Done(result) => {
                                         if state.pending_throw.is_none() {
                                             stack.pop_recycle();
                                         }
-                                        return *result;
+                                        return (*result).into();
                                     }
                                 }
                             }
                             Err(StaticPropertyAssignError::Fatal(message)) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         }
                     }
@@ -1462,7 +1473,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let object_operand = *object;
                         let Some(property) = dense.names.get(*property as usize) else {
@@ -1473,7 +1484,7 @@ impl Vm {
                                 format!("invalid dense bytecode property name n{property}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let property = property.clone();
                         let object = match self.read_dense_operand(compiled, stack, object_operand)
@@ -1490,12 +1501,12 @@ impl Vm {
                                     ),
                                 );
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let dims = match self.read_dense_dim_operands(compiled, stack, dims) {
@@ -1503,7 +1514,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         if let Err(message) =
@@ -1511,7 +1522,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::AssignPropertyDim => {
@@ -1531,7 +1542,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let dst = *dst;
                         let append = *append;
@@ -1545,7 +1556,7 @@ impl Vm {
                                 format!("invalid dense bytecode property name n{property}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let property = property.clone();
                         let dims = match self.read_dense_dim_operands(compiled, stack, dims) {
@@ -1553,7 +1564,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let object = match self.read_dense_operand(compiled, stack, object_operand)
@@ -1570,12 +1581,12 @@ impl Vm {
                                     ),
                                 );
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let assigned = match self.read_dense_operand(compiled, stack, value_operand)
@@ -1584,7 +1595,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let span = dense_instruction_span(dense, instruction);
@@ -1620,24 +1631,24 @@ impl Vm {
                                             "E_PHP_VM_DENSE_PROPERTY_DIM_ASSIGN_HANDLER: dense functions have no local exception handlers".to_string(),
                                         );
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                     RaiseOutcome::Done(result) => {
                                         if state.pending_throw.is_none() {
                                             stack.pop_recycle();
                                         }
-                                        return *result;
+                                        return (*result).into();
                                     }
                                 }
                             }
                             Err(PropertyDimAssign::Fatal(message)) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                             Err(PropertyDimAssign::Return(result)) => {
                                 stack.pop_recycle();
-                                return *result;
+                                return (*result).into();
                             }
                         };
                         if let Err(message) = stack
@@ -1648,7 +1659,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::LoadConst | DenseOpcode::LoadConstLoadConst => {
@@ -1674,7 +1685,7 @@ impl Vm {
                                     instruction,
                                 );
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let value = match self
@@ -1684,7 +1695,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         if let Err(message) = stack
@@ -1695,7 +1706,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         if let Some((second_dst, second_constant)) = fused_const {
                             let value = match self
@@ -1706,7 +1717,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             };
                             if let Err(message) = stack
@@ -1717,7 +1728,7 @@ impl Vm {
                             {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         }
                     }
@@ -1734,7 +1745,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let value = match self
                             .cached_constant_value(compiled, ConstId::new(constant))
@@ -1743,7 +1754,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         // Echo borrows the value, so echo first and move the
@@ -1752,7 +1763,7 @@ impl Vm {
                         if let Err(result) = self.write_echo(compiled, output, stack, state, &value)
                         {
                             stack.pop_recycle();
-                            return *result;
+                            return (*result).into();
                         }
                         if let Err(message) = stack
                             .current_mut()
@@ -1762,7 +1773,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::FetchConst => {
@@ -1774,7 +1785,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let Some(name) = dense.names.get(name as usize) else {
                             let result = self.runtime_error(
@@ -1784,7 +1795,7 @@ impl Vm {
                                 format!("invalid dense name index {name}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let value = match name.as_str() {
                             "STDIN" => {
@@ -1824,7 +1835,7 @@ impl Vm {
                                             )
                                     {
                                         stack.pop_recycle();
-                                        return *result;
+                                        return (*result).into();
                                     }
                                     resolved.value
                                 }
@@ -1838,13 +1849,13 @@ impl Vm {
                                         ),
                                     );
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                                 Err(message) => {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             },
                         };
@@ -1856,7 +1867,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::Move => {
@@ -1868,7 +1879,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let value = match self.read_dense_operand_last_use(
                             compiled,
@@ -1881,7 +1892,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         if let Err(message) = stack
@@ -1892,7 +1903,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::Cast => {
@@ -1904,7 +1915,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let src = match self.read_dense_operand_last_use(
                             compiled,
@@ -1917,7 +1928,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let source_span = runtime_source_span(
@@ -1958,10 +1969,10 @@ impl Vm {
                                     );
                                     state.pending_throw = Some(throwable);
                                     stack.pop_recycle();
-                                    return VmResult::propagating_exception(output.clone());
+                                    return DenseActivationResult::throwing();
                                 }
                                 stack.pop_recycle();
-                                return *result;
+                                return (*result).into();
                             }
                         };
                         if let Err(message) = stack
@@ -1972,7 +1983,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::LoadLocal | DenseOpcode::LoadLocalLoadConst => {
@@ -1994,7 +2005,7 @@ impl Vm {
                                     instruction,
                                 );
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         if src.kind != DenseOperandKind::Local {
@@ -2005,7 +2016,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         let span = dense
                             .spans
@@ -2048,7 +2059,7 @@ impl Vm {
                             Ok(value) => value,
                             Err(result) => {
                                 stack.pop_recycle();
-                                return *result;
+                                return (*result).into();
                             }
                         };
                         if let Err(message) = stack
@@ -2059,7 +2070,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         if let Some((second_dst, constant)) = fused_const {
                             let value = match self
@@ -2070,7 +2081,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             };
                             if let Err(message) = stack
@@ -2081,7 +2092,7 @@ impl Vm {
                             {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         }
                     }
@@ -2098,7 +2109,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         if src.kind != DenseOperandKind::Local {
                             let result = self.invalid_bytecode_operand_shape(
@@ -2108,7 +2119,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         let span = dense
                             .spans
@@ -2129,7 +2140,7 @@ impl Vm {
                             Ok(value) => value,
                             Err(result) => {
                                 stack.pop_recycle();
-                                return *result;
+                                return (*result).into();
                             }
                         };
                         // Echo borrows the value, so echo first and move the
@@ -2138,7 +2149,7 @@ impl Vm {
                         if let Err(result) = self.write_echo(compiled, output, stack, state, &value)
                         {
                             stack.pop_recycle();
-                            return *result;
+                            return (*result).into();
                         }
                         if let Err(message) = stack
                             .current_mut()
@@ -2148,7 +2159,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::LoadLocalQuiet => {
@@ -2160,7 +2171,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         if src.kind != DenseOperandKind::Local {
                             let result = self.invalid_bytecode_operand_shape(
@@ -2170,7 +2181,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         let local = LocalId::new(src.index);
                         let value = if is_globals_local(ir_function, local) {
@@ -2196,7 +2207,7 @@ impl Vm {
                                         format!("invalid local local:{}", local.raw()),
                                     );
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             }
                         };
@@ -2208,7 +2219,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::IssetLocal | DenseOpcode::EmptyLocal => {
@@ -2220,7 +2231,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         if src.kind != DenseOperandKind::Local {
                             let result = self.invalid_bytecode_operand_shape(
@@ -2230,7 +2241,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         let local = LocalId::new(src.index);
                         self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
@@ -2246,7 +2257,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             }
                         };
@@ -2258,7 +2269,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::StoreLocal | DenseOpcode::StoreLocalDiscard => {
@@ -2271,7 +2282,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         // The discard variant unsets the source register right
                         // after the store, so a register read here is a move by
@@ -2294,7 +2305,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let previous = if instruction.opcode == DenseOpcode::StoreLocalDiscard {
@@ -2323,13 +2334,13 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         if instruction.opcode == DenseOpcode::StoreLocalDiscard {
                             if let Err(message) = unset_dense_register_operand(stack, src) {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                             let mut exception_handlers = Vec::new();
                             let mut pending_control = None;
@@ -2344,7 +2355,7 @@ impl Vm {
                                         if state.pending_throw.is_none() {
                                             stack.pop_recycle();
                                         }
-                                        return *result;
+                                        return (*result).into();
                                     }
                                     RaiseOutcome::Caught(_) => {
                                         let result = self.runtime_error(
@@ -2354,7 +2365,7 @@ impl Vm {
                                             "E_PHP_VM_BYTECODE_DESTRUCTOR_CATCH_UNSUPPORTED: bytecode store/discard cannot route a caught destructor exception",
                                         );
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                 }
                             }
@@ -2370,7 +2381,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let local = LocalId::new(local);
                         self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
@@ -2406,7 +2417,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         let mut exception_handlers = Vec::new();
                         let mut pending_control = None;
@@ -2419,7 +2430,7 @@ impl Vm {
                             match outcome {
                                 RaiseOutcome::Done(result) => {
                                     stack.pop_recycle();
-                                    return *result;
+                                    return (*result).into();
                                 }
                                 RaiseOutcome::Caught(_) => {
                                     let result = self.runtime_error(
@@ -2429,7 +2440,7 @@ impl Vm {
                                         "E_PHP_VM_BYTECODE_DESTRUCTOR_CATCH_UNSUPPORTED: bytecode unset cannot route a caught destructor exception",
                                     );
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             }
                         }
@@ -2444,7 +2455,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let Some(name) = dense.names.get(name as usize) else {
                             let result = self.runtime_error(
@@ -2454,7 +2465,7 @@ impl Vm {
                                 format!("invalid dense name index {name}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         self.record_counter_alias_state_transition(
                             AliasState::NoReferencesObserved,
@@ -2476,7 +2487,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::BindReferenceDim => {
@@ -2494,7 +2505,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         self.record_counter_alias_state_transition(
                             AliasState::NoReferencesObserved,
@@ -2508,7 +2519,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let local = LocalId::new(local);
@@ -2528,7 +2539,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         if let Some(object) =
@@ -2558,14 +2569,15 @@ impl Vm {
                                 output.clone(),
                                 message,
                                 diagnostic,
-                            );
+                            )
+                            .into();
                         }
                         if let Err(message) =
                             bind_dim_local_to_reference_cell(stack, local, &dims, append, cell)
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         self.record_counter_alias_state(local_alias_state(stack, local));
                         self.record_lvalue_trace_event(
@@ -2592,7 +2604,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let Some(name) = dense.names.get(name as usize) else {
                             let result = self.runtime_error(
@@ -2602,7 +2614,7 @@ impl Vm {
                                 format!("invalid dense bytecode static local name n{name}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         self.record_counter_alias_state_transition(
                             AliasState::NoReferencesObserved,
@@ -2621,7 +2633,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             };
                             let cell = ReferenceCell::new(value);
@@ -2637,7 +2649,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         self.record_counter_alias_state(local_alias_state(stack, local));
                     }
@@ -2654,7 +2666,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         // Borrow both operands for the quickened concat fast
                         // path; only the generic fallback materializes owned
@@ -2664,7 +2676,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let rhs = match self.read_dense_operand_ref(compiled, stack, rhs) {
@@ -2672,7 +2684,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let span = dense
@@ -2702,7 +2714,7 @@ impl Vm {
                                     Ok(value) => value,
                                     Err(result) => {
                                         stack.pop_recycle();
-                                        return *result;
+                                        return (*result).into();
                                     }
                                 }
                             }
@@ -2713,7 +2725,7 @@ impl Vm {
                         if let Err(result) = self.write_echo(compiled, output, stack, state, &value)
                         {
                             stack.pop_recycle();
-                            return *result;
+                            return (*result).into();
                         }
                         if let Err(message) = stack
                             .current_mut()
@@ -2723,7 +2735,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::BinaryAdd
@@ -2746,7 +2758,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let span = dense
                             .spans
@@ -2770,7 +2782,7 @@ impl Vm {
                             state,
                         ) {
                             stack.pop_recycle();
-                            return *result;
+                            return (*result).into();
                         }
                     }
                     DenseOpcode::CompareEqual
@@ -2790,7 +2802,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         if let Err(message) = self.execute_dense_compare_op(
                             compiled,
@@ -2802,7 +2814,7 @@ impl Vm {
                         ) {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::UnaryPlus
@@ -2817,7 +2829,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         match self.execute_dense_unary_op(
                             compiled,
@@ -2835,13 +2847,13 @@ impl Vm {
                                     runtime_source_span(compiled, span),
                                 ) {
                                     stack.pop_recycle();
-                                    return *result;
+                                    return (*result).into();
                                 }
                             }
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         }
                     }
@@ -2855,14 +2867,14 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let path = match self.read_dense_operand(compiled, stack, path) {
                             Ok(value) => value,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         // The include-path inline cache only installs into an
@@ -2905,13 +2917,13 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                                 instruction_offset = next_instruction_offset;
                                 continue;
                             }
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         diagnostics.extend(result.diagnostics);
                         let return_value = result.return_value.unwrap_or(Value::Int(1));
@@ -2923,7 +2935,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::CallFunction | DenseOpcode::CallFunctionDiscard => {
@@ -2940,7 +2952,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let name_index = name;
                         let Some(name) = dense.names.get(name as usize) else {
@@ -2951,7 +2963,7 @@ impl Vm {
                                 format!("invalid dense bytecode name n{name}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let dense_pcre_fast = self
                             .try_execute_dense_preg_match_start_offset_ascii_fast(
@@ -2968,7 +2980,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                                 if let Err(message) =
                                     unset_consumed_dense_call_arg_registers_at_frame(
@@ -2981,7 +2993,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                                 if instruction.opcode == DenseOpcode::CallFunctionDiscard {
                                     let discard_src = DenseOperand {
@@ -2998,7 +3010,7 @@ impl Vm {
                                             let result = self
                                                 .runtime_error(output, compiled, stack, message);
                                             stack.pop_recycle();
-                                            return result;
+                                            return result.into();
                                         }
                                     };
                                     let mut exception_handlers = Vec::new();
@@ -3014,7 +3026,7 @@ impl Vm {
                                         match outcome {
                                             RaiseOutcome::Done(result) => {
                                                 stack.pop_recycle();
-                                                return *result;
+                                                return (*result).into();
                                             }
                                             RaiseOutcome::Caught(_) => {
                                                 let result = self.runtime_error(
@@ -3024,7 +3036,7 @@ impl Vm {
                                                     "E_PHP_VM_BYTECODE_DESTRUCTOR_CATCH_UNSUPPORTED: bytecode discard cannot route a caught destructor exception",
                                                 );
                                                 stack.pop_recycle();
-                                                return result;
+                                                return result.into();
                                             }
                                         }
                                     }
@@ -3036,28 +3048,11 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         }
-                        // R1.2: a plain positional argument list (no names,
-                        // direct values only) has a call shape fully determined
-                        // by the dense metadata — byte-identical to what
-                        // `function_call_shape` derives after materializing
-                        // `CallArgument`s. Deriving it up front lets the IC
-                        // resolve the callee before any operand is read, so a
-                        // qualifying dense→dense direct-bind call reads bare
-                        // values straight into the callee binder and never
-                        // allocates the `Vec<CallArgument>`. `by_ref_local` is
-                        // set for *any* variable passed positionally (write-back
-                        // tracking) and is admitted: the callee gate below
-                        // excludes by-ref params, the classic direct-bind shape
-                        // ignores it too, and the shared post-call register
-                        // unset works from the dense metadata either way. The
-                        // dim/property by-ref targets stay on the materialized
-                        // path — building them reads object operands and can
-                        // fault before the call. Plain operand reads are
-                        // effect-free (no warnings), so deferring them past the
-                        // IC lookup is not observable.
+                        // Plain positional metadata can resolve a dense callee
+                        // before reading any caller operand.
                         let bare_positional_shape = args.iter().all(|arg| {
                             arg.name.is_none()
                                 && matches!(arg.value_kind, IrCallArgValueKind::Direct)
@@ -3076,7 +3071,7 @@ impl Vm {
                                         let result =
                                             self.runtime_error(output, compiled, stack, message);
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                 },
                             );
@@ -3174,10 +3169,10 @@ impl Vm {
                                         Some(capture_backtrace_string(compiled, stack));
                                     state.pending_throw = Some(throwable);
                                     stack.pop_recycle();
-                                    return VmResult::propagating_exception(output.clone());
+                                    return DenseActivationResult::throwing();
                                 }
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             };
                             if let Some(id) = inline_cache_id {
                                 self.install_dense_function_call_inline_cache(
@@ -3208,7 +3203,8 @@ impl Vm {
                         // fallback remain authoritative, then run registry
                         // intrinsics from borrowed dense operands before any
                         // call-argument/value vector is materialized.
-                        let pre_args_intrinsic = if bare_positional_shape
+                        let pre_args_intrinsic = if instruction.opcode == DenseOpcode::CallFunction
+                            && bare_positional_shape
                             && deferred_values.is_none()
                             && args.len() <= 8
                             && args.iter().all(|arg| {
@@ -3232,7 +3228,7 @@ impl Vm {
                                         let result =
                                             self.runtime_error(output, compiled, stack, message);
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                 }
                             }
@@ -3245,60 +3241,46 @@ impl Vm {
                         } else {
                             None
                         };
-                        // R1.2 fast lane: the IC resolved a current-unit dense
-                        // callee whose bind shape sends arguments straight into
-                        // frame locals (`is_direct_bind_fast_shape` split: the
-                        // dense metadata proved the argument side above, the
-                        // callee's params prove the rest here). Read the
-                        // operands as bare `Value`s; the direct-bind loop in
-                        // `execute_bytecode_function` coerces and writes them
-                        // to locals with no `Vec<CallArgument>` in between.
-                        let mut fast_lane_values: Option<CallValuesSmall> = None;
-                        if bare_positional_shape
-                            && let Some(plan) = plan
-                            && let FunctionCallCacheTarget::CurrentUnit {
-                                unit_identity,
-                                function,
-                            } = &target
-                            && *unit_identity == compiled.cache_identity()
-                            && matches!(
-                                plan.function_plan(function.index()),
-                                Some(DenseFunctionPlan::Dense)
-                            )
-                            && let Some(callee) = compiled.unit().functions.get(function.index())
-                            && args.len() == callee.params.len()
-                            && let Some(callee_meta) =
-                                plan.call_shape_meta.get(function.index()).copied()
-                            && callee_meta.params_bind_direct
-                            && callee_meta.elide_frame_args
-                            && args.len() <= 8
-                        {
-                            let mut positional = CallValuesSmall::new();
-                            for arg in args {
-                                match self.read_dense_operand_with_source(
-                                    compiled,
-                                    stack,
-                                    arg.value,
-                                    layout_source::CALL_ARGUMENT_SNAPSHOT,
-                                ) {
-                                    Ok(value) => {
-                                        self.record_counter_value_clone_reason(
-                                            layout_source::CALL_ARGUMENT_SNAPSHOT.name(),
-                                        );
-                                        positional.push(value);
-                                    }
-                                    Err(message) => {
-                                        let result =
-                                            self.runtime_error(output, compiled, stack, message);
-                                        stack.pop_recycle();
-                                        return result;
-                                    }
-                                }
+                        if let Some(BuiltinOutcome::Return(return_value)) = pre_args_intrinsic {
+                            if let Err(message) = stack
+                                .frame_mut(frame_index)
+                                .expect("bytecode frame is active")
+                                .registers
+                                .set(RegId::new(dst), return_value)
+                            {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result.into();
                             }
-                            self.record_counter_dense_call_bare_args_hit();
-                            fast_lane_values = Some(positional);
+                            if let Err(message) = unset_consumed_dense_call_arg_registers_at_frame(
+                                stack,
+                                frame_index,
+                                args,
+                                Some(RegId::new(dst)),
+                            ) {
+                                let result = self.runtime_error(output, compiled, stack, message);
+                                stack.pop_recycle();
+                                return result.into();
+                            }
+                            instruction_offset = next_instruction_offset;
+                            continue;
                         }
-                        let values = if pre_args_intrinsic.is_some() || fast_lane_values.is_some() {
+                        // Eligible calls retain operand sources until the callee
+                        // frame is active; no owned PHP-value buffer is built.
+                        let mut fast_direct_call = self.try_dense_direct_function_call(
+                            instruction.opcode,
+                            bare_positional_shape,
+                            &target,
+                            plan,
+                            compiled,
+                            args,
+                            dst,
+                            instruction,
+                            move_plan,
+                            dense_instruction_index,
+                            frame_index,
+                        );
+                        let values = if fast_direct_call.is_some() {
                             Vec::new()
                         } else if let Some(values) = deferred_values {
                             values
@@ -3311,13 +3293,11 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             }
                         };
-                        let result = if let Some(result) = pre_args_intrinsic {
-                            result
-                        } else if let Some(plan) = plan
+                        let result = if let Some(plan) = plan
                             && let FunctionCallCacheTarget::CurrentUnit {
                                 unit_identity,
                                 function,
@@ -3339,7 +3319,7 @@ impl Vm {
                                             ),
                                         );
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     };
                                     let Some(ir_function) =
                                         compiled.unit().functions.get(function.index())
@@ -3354,9 +3334,9 @@ impl Vm {
                                             ),
                                         );
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     };
-                                    let mut call = FunctionCall::new(values, Vec::new())
+                                    let call = FunctionCall::new(values, Vec::new())
                                         .with_call_site_strict_types(
                                             compiled.unit().strict_types,
                                         )
@@ -3366,9 +3346,6 @@ impl Vm {
                                                 .get(instruction.span.index())
                                                 .copied(),
                                         );
-                                    if let Some(positional) = fast_lane_values.take() {
-                                        call = call.with_positional_values(positional);
-                                    }
                                     if !ir_function.attributes.is_empty()
                                         && let Some(message) =
                                             Self::deprecated_attribute_call_message(
@@ -3382,14 +3359,10 @@ impl Vm {
                                         )
                                     {
                                         stack.pop_recycle();
-                                        return *result;
+                                        return (*result).into();
                                     }
-                                    // Copy-and-patch native leaf tier, fired from
-                                    // the hot dense call path. The dense fast path
-                                    // dispatches straight to `execute_bytecode_function`,
-                                    // bypassing `execute_function_inner` where the
-                                    // rich path's leaf hook lives — so without this
-                                    // the tier never engages on real (dense) code.
+                                    // Dense calls bypass the rich-path leaf hook, so
+                                    // engage copy-and-patch directly at this site.
                                     #[cfg(feature = "jit-copy-patch")]
                                     let native = self.try_execute_profiled_copy_patch_leaf(
                                         ExecutionCursor::new(compiled, output, stack, state),
@@ -3401,7 +3374,8 @@ impl Vm {
                                     let native: Option<VmResult> = None;
                                     if let Some(result) = native {
                                         result
-                                    } else if let Some(value) = {
+                                    } else if fast_direct_call.is_none()
+                                        && let Some(value) = {
                                         #[cfg(feature = "jit-cranelift")]
                                         {
                                             self.try_execute_dense_jit_leaf(
@@ -3419,6 +3393,20 @@ impl Vm {
                                     } {
                                         VmResult::success_no_output(Some(value))
                                     } else {
+                                        if let Some(direct) = fast_direct_call.take() {
+                                            return Self::dense_call_activation_signal(
+                                                function,
+                                                direct,
+                                                function_id,
+                                                block_index,
+                                                next_instruction_offset,
+                                                dense_instruction_index,
+                                                frame_index,
+                                                foreach_iterators,
+                                                diagnostics,
+                                                steps,
+                                            );
+                                        }
                                         self.execute_bytecode_function(
                                             DenseExecutionRequest {
                                                 compiled,
@@ -3428,6 +3416,8 @@ impl Vm {
                                                 ir_function,
                                                 function_id: function,
                                                 call,
+                                                direct_call: None,
+                                                resume: None,
                                             },
                                             output,
                                             stack,
@@ -3491,7 +3481,7 @@ impl Vm {
                         if !result.status.is_success() {
                             self.record_counter_dense_call_fallback("dispatch_error");
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         if result.fiber_suspension.is_some() {
                             self.record_counter_dense_call_fallback("fiber_suspension");
@@ -3500,7 +3490,7 @@ impl Vm {
                                 "E_PHP_VM_DENSE_BYTECODE_CALL_FIBER_UNSUPPORTED: dense bytecode direct calls do not support fiber suspension yet",
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         let return_value = result.return_value.unwrap_or(Value::Null);
                         if let Err(message) = stack
@@ -3511,7 +3501,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         if let Err(message) = unset_consumed_dense_call_arg_registers_at_frame(
                             stack,
@@ -3521,7 +3511,7 @@ impl Vm {
                         ) {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         if instruction.opcode == DenseOpcode::CallFunctionDiscard {
                             // Same sequence as the standalone Discard arm:
@@ -3541,7 +3531,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             };
                             let mut exception_handlers = Vec::new();
@@ -3557,7 +3547,7 @@ impl Vm {
                                         if state.pending_throw.is_none() {
                                             stack.pop_recycle();
                                         }
-                                        return *result;
+                                        return (*result).into();
                                     }
                                     RaiseOutcome::Caught(_) => {
                                         let result = self.runtime_error(
@@ -3567,7 +3557,7 @@ impl Vm {
                                             "E_PHP_VM_BYTECODE_DESTRUCTOR_CATCH_UNSUPPORTED: bytecode discard cannot route a caught destructor exception",
                                         );
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                 }
                             }
@@ -3588,7 +3578,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let Some(class_name) = dense.names.get(class_name as usize) else {
                             let result = self.runtime_error(
@@ -3598,7 +3588,7 @@ impl Vm {
                                 format!("invalid dense bytecode class name n{class_name}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let Some(display_class_name) = dense.names.get(display_class_name as usize)
                         else {
@@ -3609,17 +3599,37 @@ impl Vm {
                                 format!("invalid dense bytecode class name n{display_class_name}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
-                        let values = match self.read_dense_call_args(dense, compiled, stack, args) {
-                            Ok(values) => values,
-                            Err(message) => {
-                                let result = self.runtime_error(output, compiled, stack, message);
-                                stack.pop_recycle();
-                                return result;
-                            }
-                        };
-                        let result = self.execute_dense_new_object(
+                        if let Some(target) = self.try_dense_direct_constructor_activation(
+                            compiled,
+                            plan,
+                            class_name,
+                            display_class_name,
+                            args,
+                            stack,
+                            state,
+                        ) {
+                            return self.dense_direct_constructor_transfer(
+                                target,
+                                args,
+                                dst,
+                                compiled,
+                                dense,
+                                move_plan,
+                                instruction,
+                                function_id,
+                                block_index,
+                                next_instruction_offset,
+                                dense_instruction_index,
+                                frame_index,
+                                foreach_iterators,
+                                diagnostics,
+                                steps,
+                            );
+                        }
+                        if let Err(result) = self.execute_dense_new_object_operands(
+                            dense,
                             compiled,
                             plan,
                             function_id,
@@ -3628,26 +3638,15 @@ impl Vm {
                             inline_cache_id,
                             class_name,
                             display_class_name,
-                            values,
+                            args,
                             dense.spans.get(instruction.span.index()).copied(),
+                            RegId::new(dst),
                             output,
                             stack,
                             state,
-                        );
-                        if !result.status.is_success() {
+                        ) {
                             stack.pop_recycle();
-                            return result;
-                        }
-                        let value = result.return_value.unwrap_or(Value::Null);
-                        if let Err(message) = stack
-                            .current_mut()
-                            .expect("bytecode caller frame is active")
-                            .registers
-                            .set(RegId::new(dst), value)
-                        {
-                            let result = self.runtime_error(output, compiled, stack, message);
-                            stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::MakeClosure => {
@@ -3664,7 +3663,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let captured = match self
                             .evaluate_dense_closure_captures(dense, compiled, stack, captures)
@@ -3673,7 +3672,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let value = make_closure_value(
@@ -3691,7 +3690,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::AcquireCallable => {
@@ -3703,14 +3702,14 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let value = match self.read_dense_operand(compiled, stack, src) {
                             Ok(value) => value,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let value = match acquire_callable_value(compiled, state, stack, value) {
@@ -3741,13 +3740,13 @@ impl Vm {
                                             "E_PHP_VM_DENSE_ACQUIRE_CALLABLE_HANDLER: dense functions have no local exception handlers",
                                         );
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                     RaiseOutcome::Done(result) => {
                                         if state.pending_throw.is_none() {
                                             stack.pop_recycle();
                                         }
-                                        return *result;
+                                        return (*result).into();
                                     }
                                 }
                             }
@@ -3760,7 +3759,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::CallCallable => {
@@ -3777,14 +3776,14 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let callee = match self.read_dense_operand(compiled, stack, callee) {
                             Ok(value) => value,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let values = match self.read_dense_call_args(dense, compiled, stack, args) {
@@ -3792,7 +3791,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         // Register the dense call site so IC installs and
@@ -3830,10 +3829,10 @@ impl Vm {
                                 let result =
                                     self.propagate_exception(output, stack, state, throwable);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         if result.fiber_suspension.is_some() {
                             self.record_counter_dense_call_fallback("fiber_suspension");
@@ -3842,7 +3841,7 @@ impl Vm {
                                 "E_PHP_VM_DENSE_BYTECODE_CALL_FIBER_UNSUPPORTED: dense bytecode callable calls do not support fiber suspension yet",
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         self.record_counter_dense_callable_call_hit();
                         let value = result.return_value.unwrap_or(Value::Null);
@@ -3854,7 +3853,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         if let Err(message) = unset_consumed_dense_call_arg_registers_at_frame(
                             stack,
@@ -3864,7 +3863,7 @@ impl Vm {
                         ) {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::ResolveCallable => {
@@ -3878,7 +3877,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let Some(target_name) = dense.names.get(target as usize) else {
                             let result = self.runtime_error(
@@ -3888,7 +3887,7 @@ impl Vm {
                                 format!("invalid dense bytecode callable name n{target}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let callable = match kind {
                             DenseCallableKind::FunctionName => {
@@ -3922,7 +3921,7 @@ impl Vm {
                                     message,
                                 );
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         if let Err(message) = stack
@@ -3933,7 +3932,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::Pipe => {
@@ -3950,14 +3949,14 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let input = match self.read_dense_operand(compiled, stack, input) {
                             Ok(value) => value,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let callee = match self.read_dense_operand(compiled, stack, callable) {
@@ -3965,7 +3964,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         // Pipe calls share the callable-call site machinery,
@@ -4000,10 +3999,10 @@ impl Vm {
                                 let result =
                                     self.propagate_exception(output, stack, state, throwable);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         if result.fiber_suspension.is_some() {
                             self.record_counter_dense_call_fallback("fiber_suspension");
@@ -4012,7 +4011,7 @@ impl Vm {
                                 "E_PHP_VM_DENSE_BYTECODE_CALL_FIBER_UNSUPPORTED: dense bytecode pipe calls do not support fiber suspension yet",
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         self.record_counter_dense_callable_call_hit();
                         let value = result.return_value.unwrap_or(Value::Null);
@@ -4024,7 +4023,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::CallMethod => {
@@ -4042,14 +4041,14 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let object = match self.read_dense_operand(compiled, stack, object) {
                             Ok(value) => value,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         if dense.interned_name(method).is_some() {
@@ -4065,17 +4064,43 @@ impl Vm {
                                 format!("invalid dense bytecode method name n{method}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
-                        let values = match self.read_dense_call_args(dense, compiled, stack, args) {
-                            Ok(values) => values,
-                            Err(message) => {
-                                let result = self.runtime_error(output, compiled, stack, message);
-                                stack.pop_recycle();
-                                return result;
-                            }
-                        };
-                        let result = self.execute_dense_method_call(
+                        if let Value::Object(receiver) = &object
+                            && let Some(target) = self.try_dense_direct_method_activation(
+                                compiled,
+                                plan,
+                                function_id,
+                                BlockId::new(block_index),
+                                InstrId::new(dense_instruction_index),
+                                inline_cache_id,
+                                receiver,
+                                method,
+                                args,
+                                stack,
+                                state,
+                            )
+                        {
+                            return self.dense_direct_method_transfer(
+                                target,
+                                args,
+                                dst,
+                                compiled,
+                                dense,
+                                move_plan,
+                                instruction,
+                                function_id,
+                                block_index,
+                                next_instruction_offset,
+                                dense_instruction_index,
+                                frame_index,
+                                foreach_iterators,
+                                diagnostics,
+                                steps,
+                            );
+                        }
+                        if let Err(result) = self.execute_dense_method_operands(
+                            dense,
                             compiled,
                             plan,
                             function_id,
@@ -4084,36 +4109,16 @@ impl Vm {
                             inline_cache_id,
                             object,
                             method,
-                            values,
+                            args,
                             dense.spans.get(instruction.span.index()).copied(),
+                            RegId::new(dst),
+                            frame_index,
                             output,
                             stack,
                             state,
-                        );
-                        if !result.status.is_success() {
-                            self.record_counter_dense_call_fallback("dispatch_error");
+                        ) {
                             stack.pop_recycle();
-                            return result;
-                        }
-                        if result.fiber_suspension.is_some() {
-                            self.record_counter_dense_call_fallback("fiber_suspension");
-                            let result = VmResult::unsupported(
-                                output.clone(),
-                                "E_PHP_VM_DENSE_BYTECODE_CALL_FIBER_UNSUPPORTED: dense bytecode method calls do not support fiber suspension yet",
-                            );
-                            stack.pop_recycle();
-                            return result;
-                        }
-                        let return_value = result.return_value.unwrap_or(Value::Null);
-                        if let Err(message) = stack
-                            .frame_mut(frame_index)
-                            .expect("bytecode frame is active")
-                            .registers
-                            .set(RegId::new(dst), return_value)
-                        {
-                            let result = self.runtime_error(output, compiled, stack, message);
-                            stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::CallStaticMethod => {
@@ -4131,7 +4136,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let Some(class_name) = dense.names.get(class_name as usize) else {
                             let result = self.runtime_error(
@@ -4141,7 +4146,7 @@ impl Vm {
                                 format!("invalid dense bytecode class name n{class_name}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         if dense.interned_name(method).is_some() {
                             self.record_counter_symbolized_method_name_hit();
@@ -4156,17 +4161,9 @@ impl Vm {
                                 format!("invalid dense bytecode method name n{method}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
-                        let values = match self.read_dense_call_args(dense, compiled, stack, args) {
-                            Ok(values) => values,
-                            Err(message) => {
-                                let result = self.runtime_error(output, compiled, stack, message);
-                                stack.pop_recycle();
-                                return result;
-                            }
-                        };
-                        let result = self.execute_dense_static_method_call(
+                        if let Some(target) = self.try_dense_direct_static_activation(
                             compiled,
                             plan,
                             function_id,
@@ -4175,46 +4172,48 @@ impl Vm {
                             inline_cache_id,
                             class_name,
                             method,
-                            values,
+                            args,
+                            stack,
+                            state,
+                        ) {
+                            return self.dense_direct_static_transfer(
+                                target,
+                                args,
+                                dst,
+                                compiled,
+                                dense,
+                                move_plan,
+                                instruction,
+                                function_id,
+                                block_index,
+                                next_instruction_offset,
+                                dense_instruction_index,
+                                frame_index,
+                                foreach_iterators,
+                                diagnostics,
+                                steps,
+                            );
+                        }
+                        if let Err(result) = self.execute_dense_static_operands(
+                            dense,
+                            compiled,
+                            plan,
+                            function_id,
+                            BlockId::new(block_index),
+                            InstrId::new(dense_instruction_index),
+                            inline_cache_id,
+                            class_name,
+                            method,
+                            args,
                             dense.spans.get(instruction.span.index()).copied(),
+                            RegId::new(dst),
+                            frame_index,
                             output,
                             stack,
                             state,
-                        );
-                        if !result.status.is_success() {
-                            self.record_counter_dense_call_fallback("dispatch_error");
-                            stack.pop_recycle();
-                            return result;
-                        }
-                        if result.fiber_suspension.is_some() {
-                            self.record_counter_dense_call_fallback("fiber_suspension");
-                            let result = VmResult::unsupported(
-                                output.clone(),
-                                "E_PHP_VM_DENSE_BYTECODE_CALL_FIBER_UNSUPPORTED: dense bytecode static calls do not support fiber suspension yet",
-                            );
-                            stack.pop_recycle();
-                            return result;
-                        }
-                        let return_value = result.return_value.unwrap_or(Value::Null);
-                        if let Err(message) = stack
-                            .frame_mut(frame_index)
-                            .expect("bytecode frame is active")
-                            .registers
-                            .set(RegId::new(dst), return_value)
-                        {
-                            let result = self.runtime_error(output, compiled, stack, message);
-                            stack.pop_recycle();
-                            return result;
-                        }
-                        if let Err(message) = unset_consumed_dense_call_arg_registers_at_frame(
-                            stack,
-                            frame_index,
-                            args,
-                            Some(RegId::new(dst)),
                         ) {
-                            let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::NewArray => {
@@ -4226,7 +4225,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         if let Err(message) = stack
                             .current_mut()
@@ -4236,7 +4235,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::ArrayInsert | DenseOpcode::LoadConstArrayInsert => {
@@ -4263,7 +4262,7 @@ impl Vm {
                                         let result =
                                             self.runtime_error(output, compiled, stack, message);
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                 };
                                 if let Err(message) = stack
@@ -4275,7 +4274,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                                 (
                                     array,
@@ -4295,7 +4294,7 @@ impl Vm {
                                     instruction,
                                 );
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let key = match key {
@@ -4308,7 +4307,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             },
                             None => None,
@@ -4327,7 +4326,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             }
                         } else {
@@ -4343,7 +4342,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             }
                         };
@@ -4360,7 +4359,7 @@ impl Vm {
                                 "E_PHP_VM_ARRAY_INSERT_TARGET: target is not an array register",
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let was_packed = array_value.is_packed_fast();
                         if let Some(key) = key {
@@ -4407,7 +4406,7 @@ impl Vm {
                                         let result =
                                             self.runtime_error(output, compiled, stack, message);
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                 };
                                 if let Err(message) = stack
@@ -4419,7 +4418,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                                 (
                                     dst,
@@ -4439,7 +4438,7 @@ impl Vm {
                                     instruction,
                                 );
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let span = dense
@@ -4467,7 +4466,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             }
                         };
@@ -4476,7 +4475,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         if let Value::String(key_string) = key_ref.as_value()
@@ -4516,7 +4515,7 @@ impl Vm {
                                         Ok(value) => value,
                                         Err(result) => {
                                             stack.pop_recycle();
-                                            return *result;
+                                            return (*result).into();
                                         }
                                     }
                                 }
@@ -4540,7 +4539,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::IssetDim => {
@@ -4562,7 +4561,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let local = LocalId::new(local);
                         if let Err(result) = self.emit_dense_dim_float_key_diagnostics(
@@ -4572,14 +4571,14 @@ impl Vm {
                             dense_instruction_span(dense, instruction),
                         ) {
                             stack.pop_recycle();
-                            return *result;
+                            return (*result).into();
                         }
                         let dims = match self.read_dense_dim_operands(compiled, stack, dims) {
                             Ok(dims) => dims,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
@@ -4606,7 +4605,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                                 instruction_offset = next_instruction_offset;
                                 continue;
@@ -4614,7 +4613,7 @@ impl Vm {
                             Ok(None) => {}
                             Err(result) => {
                                 stack.pop_recycle();
-                                return *result;
+                                return (*result).into();
                             }
                         }
                         let local_value = if is_globals_local(ir_function, local) {
@@ -4636,7 +4635,7 @@ impl Vm {
                                 Ok(value) => value,
                                 Err(result) => {
                                     stack.pop_recycle();
-                                    return *result;
+                                    return (*result).into();
                                 }
                             };
                             match to_bool(&exists) {
@@ -4646,7 +4645,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             }
                         } else if let (Some(base_value), [key]) =
@@ -4677,7 +4676,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::EmptyDim => {
@@ -4699,7 +4698,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let local = LocalId::new(local);
                         let dims = match self.read_dense_dim_operands(compiled, stack, dims) {
@@ -4707,7 +4706,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
@@ -4734,7 +4733,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                                 instruction_offset = next_instruction_offset;
                                 continue;
@@ -4742,7 +4741,7 @@ impl Vm {
                             Ok(None) => {}
                             Err(result) => {
                                 stack.pop_recycle();
-                                return *result;
+                                return (*result).into();
                             }
                         }
                         let local_value = if is_globals_local(ir_function, local) {
@@ -4764,7 +4763,7 @@ impl Vm {
                                 Ok(value) => value,
                                 Err(result) => {
                                     stack.pop_recycle();
-                                    return *result;
+                                    return (*result).into();
                                 }
                             };
                             let exists = match to_bool(&exists) {
@@ -4773,7 +4772,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             };
                             if exists {
@@ -4787,7 +4786,7 @@ impl Vm {
                                     Ok(value) => value,
                                     Err(result) => {
                                         stack.pop_recycle();
-                                        return *result;
+                                        return (*result).into();
                                     }
                                 }
                             } else {
@@ -4829,7 +4828,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         if let Err(message) = stack
@@ -4840,7 +4839,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::UnsetDim => {
@@ -4859,7 +4858,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let local = LocalId::new(local);
                         if let Err(result) = self.emit_dense_dim_float_key_diagnostics(
@@ -4869,14 +4868,14 @@ impl Vm {
                             dense_instruction_span(dense, instruction),
                         ) {
                             stack.pop_recycle();
-                            return *result;
+                            return (*result).into();
                         }
                         let dims = match self.read_dense_dim_operands(compiled, stack, dims) {
                             Ok(dims) => dims,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         self.record_counter_local_slot_fast_path(local_slot_is_in_bounds(
@@ -4906,7 +4905,7 @@ impl Vm {
                             Ok(false) => {}
                             Err(result) => {
                                 stack.pop_recycle();
-                                return *result;
+                                return (*result).into();
                             }
                         }
                         let local_value = if is_globals_local(ir_function, local) {
@@ -4932,7 +4931,7 @@ impl Vm {
                                 }
                                 Err(result) => {
                                     stack.pop_recycle();
-                                    return *result;
+                                    return (*result).into();
                                 }
                             }
                         }
@@ -4944,7 +4943,7 @@ impl Vm {
                         if let Err(message) = result {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         if !is_globals_local(ir_function, local)
                             && was_packed
@@ -4979,14 +4978,14 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let dim_values = match self.read_dense_dim_values(compiled, stack, dims) {
                             Ok(dims) => dims,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let value = match self.read_dense_operand_last_use(
@@ -5000,7 +4999,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let local = LocalId::new(local);
@@ -5027,7 +5026,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                                 instruction_offset = next_instruction_offset;
                                 continue;
@@ -5035,7 +5034,7 @@ impl Vm {
                             Ok(false) => {}
                             Err(result) => {
                                 stack.pop_recycle();
-                                return *result;
+                                return (*result).into();
                             }
                         }
                         if dim_values.iter().any(is_float_dim_key) {
@@ -5056,7 +5055,7 @@ impl Vm {
                                     )
                                 {
                                     stack.pop_recycle();
-                                    return *result;
+                                    return (*result).into();
                                 }
                             }
                         }
@@ -5088,14 +5087,14 @@ impl Vm {
                                                     output, compiled, stack, message,
                                                 );
                                                 stack.pop_recycle();
-                                                return result;
+                                                return result.into();
                                             }
                                             instruction_offset = next_instruction_offset;
                                             continue;
                                         }
                                         Err(result) => {
                                             stack.pop_recycle();
-                                            return *result;
+                                            return (*result).into();
                                         }
                                     }
                                 }
@@ -5113,7 +5112,7 @@ impl Vm {
                                         let result =
                                             self.runtime_error(output, compiled, stack, message);
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                     if let Err(message) = stack
                                         .current_mut()
@@ -5124,14 +5123,14 @@ impl Vm {
                                         let result =
                                             self.runtime_error(output, compiled, stack, message);
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                     instruction_offset = next_instruction_offset;
                                     continue;
                                 }
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         // The assignment-expression result register is dead
@@ -5196,14 +5195,14 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                                 instruction_offset = next_instruction_offset;
                                 continue;
                             }
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         self.record_lvalue_trace_event(
                             if append {
@@ -5223,7 +5222,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::ForeachInit => {
@@ -5240,14 +5239,14 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let source = match self.read_dense_operand(compiled, stack, source) {
                             Ok(value) => value,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let span = dense.spans.get(instruction.span.index());
@@ -5264,7 +5263,7 @@ impl Vm {
                             Ok(iterator) => iterator,
                             Err(result) => {
                                 stack.pop_recycle();
-                                return *result;
+                                return (*result).into();
                             }
                         };
                         self.record_runtime_trace_event(|| {
@@ -5295,7 +5294,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let next_value = match self.next_foreach_value(
                             ExecutionCursor::new(compiled, output, stack, state),
@@ -5306,7 +5305,7 @@ impl Vm {
                             Ok(next) => next,
                             Err(result) => {
                                 stack.pop_recycle();
-                                return *result;
+                                return (*result).into();
                             }
                         };
                         let frame = stack
@@ -5319,7 +5318,7 @@ impl Vm {
                             {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                             instruction_offset = next_instruction_offset;
                             continue;
@@ -5330,7 +5329,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         if let Some(key) = key
                             && let Err(message) = frame
@@ -5339,12 +5338,12 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                         if let Err(message) = frame.registers.set(RegId::new(value), entry_value) {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::ForeachCleanup => {
@@ -5357,7 +5356,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         if let Some(value) = foreach_iterators
                             .remove(&RegId::new(iterator))
@@ -5376,7 +5375,7 @@ impl Vm {
                                         if state.pending_throw.is_none() {
                                             stack.pop_recycle();
                                         }
-                                        return *result;
+                                        return (*result).into();
                                     }
                                     RaiseOutcome::Caught(target) => {
                                         let result = self.runtime_error(
@@ -5389,7 +5388,7 @@ impl Vm {
                                             ),
                                         );
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                 }
                             }
@@ -5410,7 +5409,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let is_empty = instruction.opcode == DenseOpcode::EmptyPropertyDim;
                         let Some(property) = dense.names.get(*property as usize) else {
@@ -5421,14 +5420,14 @@ impl Vm {
                                 format!("invalid dense bytecode property name n{property}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let dims = match self.read_dense_dim_operands(compiled, stack, dims) {
                             Ok(dims) => dims,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let result = {
@@ -5439,7 +5438,7 @@ impl Vm {
                                         let result =
                                             self.runtime_error(output, compiled, stack, message);
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                 };
                             match object_read.as_value() {
@@ -5460,7 +5459,7 @@ impl Vm {
                                             let result = self
                                                 .runtime_error(output, compiled, stack, message);
                                             stack.pop_recycle();
-                                            return result;
+                                            return result.into();
                                         }
                                     }
                                 }
@@ -5476,7 +5475,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::InstanceOf => {
@@ -5493,7 +5492,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let Some(class_name) = dense.names.get(*class_name as usize) else {
                             let result = self.runtime_error(
@@ -5503,7 +5502,7 @@ impl Vm {
                                 format!("invalid dense bytecode class name n{class_name}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         // instanceof only inspects the operand; a borrowed
                         // read avoids cloning object/array handles.
@@ -5515,7 +5514,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             };
                             match self.object_instanceof_cached(
@@ -5529,7 +5528,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             }
                         };
@@ -5541,7 +5540,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::FetchProperty => {
@@ -5564,7 +5563,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         if dense.interned_name(property).is_some() {
                             self.record_counter_symbolized_property_name_hit();
@@ -5581,14 +5580,14 @@ impl Vm {
                                 format!("invalid dense bytecode property name n{property}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let object = match self.read_dense_operand(compiled, stack, object) {
                             Ok(value) => value,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let span = dense
@@ -5613,7 +5612,7 @@ impl Vm {
                             Ok(value) => value,
                             Err(result) => {
                                 stack.pop_recycle();
-                                return *result;
+                                return (*result).into();
                             }
                         };
                         if let Err(message) = stack
@@ -5624,7 +5623,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::AssignProperty => {
@@ -5646,7 +5645,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         if dense.interned_name(property).is_some() {
                             self.record_counter_symbolized_property_name_hit();
@@ -5663,14 +5662,14 @@ impl Vm {
                                 format!("invalid dense bytecode property name n{property}"),
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let object = match self.read_dense_operand(compiled, stack, object) {
                             Ok(value) => value,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let value = match self.read_dense_operand(compiled, stack, value) {
@@ -5678,7 +5677,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let span = dense
@@ -5703,7 +5702,7 @@ impl Vm {
                             Ok(value) => value,
                             Err(result) => {
                                 stack.pop_recycle();
-                                return *result;
+                                return (*result).into();
                             }
                         };
                         if let Err(message) = stack
@@ -5714,7 +5713,7 @@ impl Vm {
                         {
                             let result = self.runtime_error(output, compiled, stack, message);
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         }
                     }
                     DenseOpcode::Echo => {
@@ -5730,7 +5729,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         // Borrow the operand for the shared echo fast path;
                         // only conversion/`__toString` fallbacks need an
@@ -5740,7 +5739,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         if !Self::try_write_echo_fast(output, value.as_value()) {
@@ -5749,7 +5748,7 @@ impl Vm {
                                 self.write_echo(compiled, output, stack, state, &value)
                             {
                                 stack.pop_recycle();
-                                return *result;
+                                return (*result).into();
                             }
                         }
                     }
@@ -5762,14 +5761,14 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let value = match self.take_consumed_dense_operand(compiled, stack, src) {
                             Ok(value) => value,
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let mut exception_handlers = Vec::new();
@@ -5783,7 +5782,7 @@ impl Vm {
                             match outcome {
                                 RaiseOutcome::Done(result) => {
                                     stack.pop_recycle();
-                                    return *result;
+                                    return (*result).into();
                                 }
                                 RaiseOutcome::Caught(_) => {
                                     let result = self.runtime_error(
@@ -5793,7 +5792,7 @@ impl Vm {
                                         "E_PHP_VM_BYTECODE_DESTRUCTOR_CATCH_UNSUPPORTED: bytecode discard cannot route a caught destructor exception",
                                     );
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             }
                         }
@@ -5807,7 +5806,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         block_index = target;
                         continue 'dispatch;
@@ -5822,7 +5821,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let truthy = match self.read_dense_operand_branch_truthy(
                             compiled,
@@ -5836,7 +5835,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let jump = if instruction.opcode == DenseOpcode::JumpIfFalse {
@@ -5854,7 +5853,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             }
                         };
@@ -5882,7 +5881,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let truthy = match self.read_dense_operand_branch_truthy(
                             compiled,
@@ -5896,7 +5895,7 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         let next_block = if truthy { if_true } else { if_false };
@@ -5919,7 +5918,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let value = match value {
                             // The frame dies with this return; register
@@ -5938,7 +5937,7 @@ impl Vm {
                                         let result =
                                             self.runtime_error(output, compiled, stack, message);
                                         stack.pop_recycle();
-                                        return result;
+                                        return result.into();
                                     }
                                 }
                             }
@@ -5955,21 +5954,22 @@ impl Vm {
                             Err(message) => {
                                 let result = self.runtime_error(output, compiled, stack, message);
                                 stack.pop_recycle();
-                                return result;
+                                return result.into();
                             }
                         };
                         if let Some(shared) = call.shared_top_level_locals.as_deref_mut() {
                             export_shared_locals(ir_function, stack, shared);
                         }
                         stack.pop_recycle();
-                        let mut result =
-                            VmResult::success_with_diagnostics_no_output(value, diagnostics);
-                        result.returned_explicitly = !is_synthetic_eof_return(
+                        let explicit = !is_synthetic_eof_return(
                             ir_function,
                             dense_instruction_span(dense, instruction),
-                            result.return_value.as_ref(),
+                            value.as_ref(),
                         );
-                        return result;
+                        return DenseActivationResult::Frame(DenseFrameCompletion {
+                            outcome: FrameOutcome::Return { value, explicit },
+                            diagnostics,
+                        });
                     }
                     DenseOpcode::Exit => {
                         let DenseOperands::Exit { value } = instruction.operands else {
@@ -5980,7 +5980,7 @@ impl Vm {
                                 instruction,
                             );
                             stack.pop_recycle();
-                            return result;
+                            return result.into();
                         };
                         let value = match value {
                             Some(value) => match self.read_dense_operand(compiled, stack, value) {
@@ -5989,7 +5989,7 @@ impl Vm {
                                     let result =
                                         self.runtime_error(output, compiled, stack, message);
                                     stack.pop_recycle();
-                                    return result;
+                                    return result.into();
                                 }
                             },
                             None => None,
@@ -5999,17 +5999,17 @@ impl Vm {
                                 Ok(code) => code,
                                 Err(result) => {
                                     stack.pop_recycle();
-                                    return *result;
+                                    return (*result).into();
                                 }
                             };
                         state.process_exit_code = Some(code);
                         stack.pop_recycle();
-                        return script_exit_result(output, state, code);
+                        return script_exit_result(output, state, code).into();
                     }
                 }
                 if let Some(code) = state.process_exit_code {
                     stack.pop_recycle();
-                    return script_exit_result(output, state, code);
+                    return script_exit_result(output, state, code).into();
                 }
                 instruction_offset = next_instruction_offset;
             }
@@ -6020,7 +6020,7 @@ impl Vm {
                 format!("dense bytecode block block:{block_index} has no terminator"),
             );
             stack.pop_recycle();
-            return result;
+            return result.into();
         }
     }
 }

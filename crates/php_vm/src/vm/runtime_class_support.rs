@@ -283,12 +283,20 @@ pub(super) fn jit_compile_cache_key(
     function: &IrFunction,
     options: &VmOptions,
 ) -> JitCompileCacheKey {
+    let target_isa = php_jit::cranelift_host_isa_identity()
+        .map(|identity| {
+            format!(
+                "{}; feature_fingerprint={:016x}",
+                identity.display, identity.feature_fingerprint
+            )
+        })
+        .unwrap_or_else(|_| format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS));
     JitCompileCacheKey {
         function: function_id.raw(),
         ir_fingerprint: stable_hash_bytes(format!("{function:?}").as_bytes()),
         abi_hash: php_jit::JIT_RUNTIME_ABI_HASH,
         config_hash: jit_config_hash(options),
-        target_isa: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+        target_isa,
     }
 }
 

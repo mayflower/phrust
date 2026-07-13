@@ -889,17 +889,54 @@ pub(super) struct PreparedArguments {
     pub(super) diagnostics: Vec<RuntimeDiagnostic>,
 }
 
-pub(super) type CallValuesSmall = smallvec::SmallVec<[Value; 8]>;
+/// Destination of a compact direct call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(super) enum CallDestination {
+    Register(RegId),
+    Discard,
+    OuterReturn,
+}
+
+/// Borrowed argument sources. Values remain in the caller frame until the
+/// callee frame has been pushed and validated.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum DirectArgumentSources<'a> {
+    Dense(&'a [DenseCallArg]),
+}
+
+impl DirectArgumentSources<'_> {
+    pub(super) fn len(self) -> usize {
+        match self {
+            Self::Dense(args) => args.len(),
+        }
+    }
+}
+
+/// Compact class context carried only by direct method-like calls.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct CompactClassContext {
+    pub(super) scope: Option<Arc<str>>,
+    pub(super) called: Option<Arc<str>>,
+    pub(super) declaring: Option<Arc<str>>,
+}
+
+/// Hot direct-call descriptor. It contains no inline PHP values and no named,
+/// unpacked, by-reference, capture, continuation or error-detail state.
+#[derive(Clone, Debug)]
+pub(super) struct DirectCall<'a> {
+    pub(super) caller_frame: usize,
+    pub(super) argument_sources: DirectArgumentSources<'a>,
+    pub(super) destination: CallDestination,
+    pub(super) strict_types: bool,
+    pub(super) span: Option<php_ir::IrSpan>,
+    pub(super) receiver: Option<ObjectRef>,
+    pub(super) class_context: CompactClassContext,
+    pub(super) move_source: Option<RegId>,
+}
 
 pub(super) struct FunctionCall<'a> {
     pub(super) args: Vec<CallArgument>,
-    /// R1.2 fast lane: bare positional argument values for an exact-arity
-    /// plain-positional call to a known simple callee, pre-validated by the
-    /// dense call arm. When present, `args` is empty and the executor's
-    /// direct-bind loop consumes these values straight into the frame locals
-    /// — no `CallArgument` construction, no by-ref bookkeeping per argument.
-    /// Values are already effective (references dereferenced at read).
-    pub(super) positional_values: Option<CallValuesSmall>,
     pub(super) captures: Vec<ClosureCaptureValue>,
     pub(super) call_span: Option<php_ir::IrSpan>,
     pub(super) call_site_strict_types: Option<bool>,
@@ -924,7 +961,6 @@ impl FunctionCall<'_> {
     pub(super) fn new(args: Vec<CallArgument>, captures: Vec<ClosureCaptureValue>) -> Self {
         Self {
             args,
-            positional_values: None,
             captures,
             call_span: None,
             call_site_strict_types: None,
@@ -951,17 +987,9 @@ impl FunctionCall<'_> {
         self
     }
 
-    pub(super) fn with_positional_values(mut self, values: CallValuesSmall) -> Self {
-        debug_assert!(self.args.is_empty());
-        self.positional_values = Some(values);
-        self
-    }
-
-    /// PHP-visible call arity across both argument representations.
+    /// PHP-visible call arity.
     pub(super) fn arg_count(&self) -> usize {
-        self.positional_values
-            .as_ref()
-            .map_or(self.args.len(), CallValuesSmall::len)
+        self.args.len()
     }
 
     pub(super) fn with_optional_call_span(mut self, span: Option<php_ir::IrSpan>) -> Self {
@@ -2404,10 +2432,8 @@ impl Vm {
                                 .is_some()
                                 .then(|| (ir_function.name.clone(), ir_function.flags.is_method));
                             if !ir_function.attributes.is_empty()
-                                && let Some(message) = Self::deprecated_attribute_call_message(
-                                    unit,
-                                    ir_function,
-                                )
+                                && let Some(message) =
+                                    Self::deprecated_attribute_call_message(unit, ir_function)
                                 && let Err(result) = self.emit_deprecated_call(
                                     ExecutionCursor::new(unit, output, stack, state),
                                     message,
@@ -2425,6 +2451,8 @@ impl Vm {
                                     ir_function,
                                     function_id: function,
                                     call,
+                                    direct_call: None,
+                                    resume: None,
                                 },
                                 output,
                                 stack,

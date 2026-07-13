@@ -418,6 +418,15 @@ pub struct VmCounters {
     pub direct_constructor_frame_hits: u64,
     pub argument_vector_allocations_avoided: u64,
     pub prepared_arg_vector_allocations_avoided: u64,
+    pub direct_call_source_reads: u64,
+    pub direct_call_moves: u64,
+    pub direct_call_clones: u64,
+    pub direct_call_owned_value_buffers: u64,
+    pub cranelift_prepared_arg_materializations: u64,
+    pub cranelift_direct_slot_marshals: u64,
+    pub dense_activation_transfers: u64,
+    pub nested_vm_results_avoided: u64,
+    pub recursive_dense_calls_avoided: u64,
     pub direct_frame_fallback_by_reason: BTreeMap<String, u64>,
     pub symbolized_call_name_hits: u64,
     pub symbolized_method_name_hits: u64,
@@ -604,6 +613,7 @@ pub struct VmCounters {
     pub jit_tiering_budget_rejections: u64,
     pub jit_helper_calls: u64,
     pub jit_fast_path_hits: u64,
+    pub compiled_to_compiled_calls: u64,
     pub packed_fetch_fast_hits: u64,
     pub record_lookup_fast_hits: u64,
     pub record_lookup_key_miss_exits: u64,
@@ -630,6 +640,14 @@ pub struct VmCounters {
     pub jit_compile_cache_hits: u64,
     pub jit_compile_cache_misses: u64,
     pub jit_compile_cache_invalidations: u64,
+    pub jit_process_cache_hits: u64,
+    pub jit_process_cache_misses: u64,
+    pub jit_compile_waits: u64,
+    pub jit_duplicate_compiles_avoided: u64,
+    pub jit_code_bytes_live: u64,
+    pub jit_code_bytes_retired: u64,
+    pub jit_code_generations: u64,
+    pub jit_evictions: u64,
     pub jit_compile_descriptors: Vec<JitCompileDescriptor>,
     pub inline_cache_observations: u64,
     pub inline_cache_slots: u64,
@@ -1015,6 +1033,30 @@ impl VmCounters {
 
     pub(crate) fn record_prepared_arg_vector_allocation_avoided(&mut self) {
         self.prepared_arg_vector_allocations_avoided += 1;
+    }
+
+    pub(crate) fn record_direct_call_transfer(&mut self, moved: bool) {
+        self.direct_call_source_reads += 1;
+        if moved {
+            self.direct_call_moves += 1;
+        } else {
+            self.direct_call_clones += 1;
+        }
+    }
+
+    pub(crate) fn record_cranelift_prepared_arg_materialization(&mut self) {
+        self.cranelift_prepared_arg_materializations += 1;
+    }
+
+    pub(crate) fn record_cranelift_direct_slot_marshal(&mut self, count: u64) {
+        self.cranelift_direct_slot_marshals =
+            self.cranelift_direct_slot_marshals.saturating_add(count);
+    }
+
+    pub(crate) fn record_dense_activation_transfer(&mut self) {
+        self.dense_activation_transfers = self.dense_activation_transfers.saturating_add(1);
+        self.nested_vm_results_avoided = self.nested_vm_results_avoided.saturating_add(1);
+        self.recursive_dense_calls_avoided = self.recursive_dense_calls_avoided.saturating_add(1);
     }
 
     pub(crate) fn record_foreach_no_clone_hit(&mut self) {
@@ -1807,24 +1849,6 @@ impl VmCounters {
         self.record_fast_path_disabled_by_reference(AliasState::PropertyOrArrayDimReference);
     }
 
-    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
-    pub(crate) fn record_packed_foreach_sum_fast_hit(&mut self) {
-        self.packed_foreach_sum_fast_hits += 1;
-        self.record_array_fast_path_hit("packed_int_sum");
-    }
-
-    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
-    pub(crate) fn record_packed_foreach_sum_layout_exit(&mut self) {
-        self.packed_foreach_sum_layout_exits += 1;
-        self.record_array_fast_path_fallback("layout_or_element");
-    }
-
-    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
-    pub(crate) fn record_packed_foreach_sum_overflow_exit(&mut self) {
-        self.packed_foreach_sum_overflow_exits += 1;
-        self.record_array_fast_path_fallback("overflow");
-    }
-
     pub(crate) fn record_array_fast_path_fallback(&mut self, reason: &str) {
         *self
             .array_fast_path_fallback_by_reason
@@ -1876,48 +1900,6 @@ impl VmCounters {
             PhpArrayShapeLookupFallback::UnsupportedShape => {}
         }
         self.record_array_fast_path_fallback(fallback.as_str());
-    }
-
-    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
-    pub(crate) fn record_known_call_fast_hit(&mut self) {
-        self.known_call_fast_hits += 1;
-    }
-
-    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
-    pub(crate) fn record_known_call_guard_exit(&mut self) {
-        self.known_call_guard_exits += 1;
-    }
-
-    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
-    pub(crate) fn record_known_call_slow_call(&mut self) {
-        self.known_call_slow_calls += 1;
-        self.record_slow_path_call("jit.known_call");
-    }
-
-    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
-    pub(crate) fn record_property_load_fast_hit(&mut self) {
-        self.property_load_fast_hits += 1;
-    }
-
-    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
-    pub(crate) fn record_property_load_guard_exit(&mut self) {
-        self.property_load_guard_exits += 1;
-    }
-
-    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
-    pub(crate) fn record_property_load_layout_exit(&mut self) {
-        self.property_load_layout_exits += 1;
-    }
-
-    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
-    pub(crate) fn record_property_load_uninitialized_exit(&mut self) {
-        self.property_load_uninitialized_exits += 1;
-    }
-
-    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
-    pub(crate) fn record_property_load_slow_call(&mut self) {
-        self.property_load_slow_calls += 1;
-        self.record_slow_path_call("jit.property_load");
     }
 
     pub(crate) fn record_array_count_fast_path_hit(&mut self) {
@@ -2237,77 +2219,6 @@ impl VmCounters {
 
     pub(crate) fn record_persistent_feedback_seeded_callsites(&mut self, installed: u64) {
         self.persistent_feedback_seeded_callsites += installed;
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn record_record_lookup_fast_hit(&mut self) {
-        self.record_lookup_fast_hits += 1;
-    }
-
-    #[cfg(feature = "jit-cranelift")]
-    pub(crate) fn record_record_lookup_key_miss_exit(&mut self) {
-        self.record_lookup_key_miss_exits += 1;
-    }
-
-    #[cfg(feature = "jit-cranelift")]
-    pub(crate) fn record_record_lookup_layout_exit(&mut self) {
-        self.record_lookup_layout_exits += 1;
-    }
-
-    pub(crate) fn record_packed_fetch_fast_hit(&mut self) {
-        self.packed_fetch_fast_hits += 1;
-        self.record_array_fast_path_hit("packed_int_fetch");
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn record_packed_fetch_bounds_exit(&mut self) {
-        self.packed_fetch_bounds_exits += 1;
-        self.packed_fetch_bounds_fallbacks += 1;
-        self.record_array_fast_path_fallback("bounds");
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn record_packed_fetch_layout_exit(&mut self) {
-        self.packed_fetch_layout_exits += 1;
-        self.packed_fetch_layout_fallbacks += 1;
-        self.record_array_fast_path_fallback("layout_or_key");
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn record_jit_overflow_exit(&mut self) {
-        self.jit_overflow_exits += 1;
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn record_jit_slow_path_call(&mut self) {
-        self.jit_slow_path_calls += 1;
-        self.record_slow_path_call("jit.generic");
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn record_direct_call_hit(&mut self) {
-        self.direct_call_hits += 1;
-        self.jit_fast_path_hits += 1;
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn record_direct_call_fallback(&mut self) {
-        self.direct_call_fallbacks += 1;
-    }
-
-    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
-    pub(crate) fn record_jit_compile_cache_hit(&mut self) {
-        self.jit_compile_cache_hits += 1;
-    }
-
-    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
-    pub(crate) fn record_jit_compile_cache_miss(&mut self) {
-        self.jit_compile_cache_misses += 1;
-    }
-
-    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
-    pub(crate) fn record_jit_compile_cache_invalidation(&mut self) {
-        self.jit_compile_cache_invalidations += 1;
     }
 
     pub(crate) fn record_inline_cache(&mut self, observation: InlineCacheObservation) {
@@ -3532,6 +3443,7 @@ impl VmCounters {
             self.prepared_arg_vector_allocations_avoided,
             true,
         );
+        self.render_call_transfer_json(&mut json);
         push_string_u64_map_field(
             &mut json,
             "direct_frame_fallback_by_reason",
@@ -4554,12 +4466,9 @@ impl VmCounters {
             self.jit_fast_path_hits,
             true,
         );
-        push_field(
-            &mut json,
-            "packed_fetch_fast_hits",
-            self.packed_fetch_fast_hits,
-            true,
-        );
+        self.render_compiled_call_json(&mut json);
+        let packed_hits = self.packed_fetch_fast_hits;
+        push_field(&mut json, "packed_fetch_fast_hits", packed_hits, true);
         push_field(
             &mut json,
             "record_lookup_fast_hits",
@@ -4705,6 +4614,7 @@ impl VmCounters {
             self.jit_compile_cache_invalidations,
             true,
         );
+        self.render_process_cache_json(&mut json);
         json.push_str("  \"jit_compile_descriptors\": [");
         for (index, descriptor) in self.jit_compile_descriptors.iter().enumerate() {
             if index > 0 {
@@ -7021,6 +6931,14 @@ mod tests {
         assert!(json.contains("\"jit_compile_cache_hits\": 0"));
         assert!(json.contains("\"jit_compile_cache_misses\": 0"));
         assert!(json.contains("\"jit_compile_cache_invalidations\": 0"));
+        assert!(json.contains("\"jit_process_cache_hits\": 0"));
+        assert!(json.contains("\"jit_process_cache_misses\": 0"));
+        assert!(json.contains("\"jit_compile_waits\": 0"));
+        assert!(json.contains("\"jit_duplicate_compiles_avoided\": 0"));
+        assert!(json.contains("\"jit_code_bytes_live\": 0"));
+        assert!(json.contains("\"jit_code_bytes_retired\": 0"));
+        assert!(json.contains("\"jit_code_generations\": 0"));
+        assert!(json.contains("\"jit_evictions\": 0"));
         assert!(json.contains("\"jit_compile_descriptors\": []"));
         assert!(json.contains("\"inline_cache_observations\": 0"));
         assert!(json.contains("\"inline_cache_slots\": 0"));

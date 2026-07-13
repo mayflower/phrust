@@ -153,8 +153,11 @@ nix develop -c rg -n '\bunsafe\b' \
 
 nix develop -c rg -n '\bunsafe\b' crates/php_jit/src \
   --glob '!lib.rs' \
+  --glob '!abi.rs' \
   --glob '!helpers.rs' \
-  --glob '!cranelift_lowering.rs'
+  --glob '!cranelift_lowering.rs' \
+  --glob '!code_memory.rs' \
+  --glob '!code_manager.rs'
 ```
 
 The excluded `php_jit` files contain the feature-gated Cranelift native-call
@@ -227,8 +230,11 @@ Coverage:
 
 ## JIT ABI Boundary
 
-`crates/php_jit/src/abi.rs` defines the VM/JIT boundary for future native
-experiments. The boundary is intentionally handle-based and by-value.
+`crates/php_jit/src/abi.rs` defines the VM/JIT boundary for native
+experiments. The boundary is intentionally handle-based and by-value. Its
+versioned helper table contains one audited unsafe C function-pointer type and
+a fail-closed default dispatcher; this file is therefore part of the audited
+native boundary rather than the safe default surface.
 
 Safety constraints:
 
@@ -243,8 +249,10 @@ Safety constraints:
   copied by value.
 - Bailout/deopt, runtime-callout, region-result, and exception propagation use
   owned enums and strings. They do not extend lifetimes across the boundary.
-- The implementation uses safe Rust only. The performance layer provides no `unsafe`, no
-  executable memory, and no native execution path.
+- Raw pointers occur only in the helper-dispatch signature. The default
+  dispatcher rejects null output and non-empty null argument buffers before
+  writing one synchronous caller-owned `JitCallResult`; it does not retain
+  pointers or expose Rust value layouts.
 
 Coverage:
 

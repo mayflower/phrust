@@ -417,6 +417,28 @@ fn calls_json(counters: &VmCounters) -> Value {
         ("dense_static_call_hits", counters.dense_static_call_hits),
         ("dense_call_ic_hits", counters.dense_call_ic_hits),
         ("dense_call_ic_misses", counters.dense_call_ic_misses),
+        (
+            "direct_call_source_reads",
+            counters.direct_call_source_reads,
+        ),
+        ("direct_call_moves", counters.direct_call_moves),
+        ("direct_call_clones", counters.direct_call_clones),
+        (
+            "direct_call_owned_value_buffers",
+            counters.direct_call_owned_value_buffers,
+        ),
+        (
+            "dense_activation_transfers",
+            counters.dense_activation_transfers,
+        ),
+        (
+            "nested_vm_results_avoided",
+            counters.nested_vm_results_avoided,
+        ),
+        (
+            "recursive_dense_calls_avoided",
+            counters.recursive_dense_calls_avoided,
+        ),
     ])
     .with_map(
         "dense_call_fallback_by_reason",
@@ -897,7 +919,41 @@ fn metadata_json(counters: &VmCounters) -> Value {
 }
 
 fn native_json(counters: &VmCounters) -> Value {
-    object_from_pairs([
+    let descriptors = counters
+        .jit_compile_descriptors
+        .iter()
+        .map(|descriptor| {
+            let mut value = Map::new();
+            value.insert(
+                "function_id".to_string(),
+                Value::from(descriptor.function_id),
+            );
+            value.insert(
+                "function_name".to_string(),
+                Value::from(descriptor.function_name.clone()),
+            );
+            value.insert(
+                "ir_fingerprint".to_string(),
+                Value::from(descriptor.ir_fingerprint.clone()),
+            );
+            value.insert("code_bytes".to_string(), Value::from(descriptor.code_bytes));
+            value.insert(
+                "compile_time_nanos".to_string(),
+                Value::from(descriptor.compile_time_nanos),
+            );
+            value.insert(
+                "target_isa".to_string(),
+                Value::from(descriptor.target_isa.clone()),
+            );
+            value.insert("abi_hash".to_string(), Value::from(descriptor.abi_hash));
+            value.insert(
+                "config_hash".to_string(),
+                Value::from(descriptor.config_hash),
+            );
+            Value::Object(value)
+        })
+        .collect::<Vec<_>>();
+    let mut native = object_from_pairs([
         ("native_candidates", counters.native_candidates),
         ("native_compiled_regions", counters.native_compiled_regions),
         ("native_executions", counters.native_executions),
@@ -909,37 +965,65 @@ fn native_json(counters: &VmCounters) -> Value {
         ("jit_compile_time_nanos", counters.jit_compile_time_nanos),
         ("jit_compiled", counters.jit_compiled),
         ("jit_executed", counters.jit_executed),
+        ("copy_patch_executed", counters.copy_patch_executed),
+        (
+            "native_platform_unavailable",
+            counters.native_platform_unavailable,
+        ),
         ("jit_bailouts", counters.jit_bailouts),
         ("jit_side_exits", counters.jit_side_exits),
         ("jit_guard_failures", counters.jit_guard_failures),
+        ("jit_process_cache_hits", counters.jit_process_cache_hits),
+        (
+            "jit_process_cache_misses",
+            counters.jit_process_cache_misses,
+        ),
+        ("jit_compile_waits", counters.jit_compile_waits),
+        (
+            "jit_duplicate_compiles_avoided",
+            counters.jit_duplicate_compiles_avoided,
+        ),
+        ("jit_code_bytes_live", counters.jit_code_bytes_live),
+        ("jit_code_bytes_retired", counters.jit_code_bytes_retired),
+        ("jit_code_generations", counters.jit_code_generations),
+        ("jit_evictions", counters.jit_evictions),
         (
             "jit_tiering_budget_rejections",
             counters.jit_tiering_budget_rejections,
         ),
-    ])
-    .with_map(
-        "native_eligibility_rejections_by_reason",
-        map_to_json(
-            &counters.native_eligibility_rejections_by_reason,
-            SortDirection::Descending,
-        ),
-    )
-    .with_map(
-        "native_side_exits_by_reason",
-        map_to_json(
-            &counters.native_side_exits_by_reason,
-            SortDirection::Descending,
-        ),
-    )
-    .with_map(
-        "jit_side_exit_reasons",
-        map_to_json(&counters.jit_side_exit_reasons, SortDirection::Descending),
-    )
-    .with_map(
-        "jit_blacklist_reasons",
-        map_to_json(&counters.jit_blacklist_reasons, SortDirection::Descending),
-    )
-    .into()
+    ]);
+    native.0.insert(
+        "jit_mode".to_string(),
+        Value::from(counters.jit_mode.clone()),
+    );
+    native.0.insert(
+        "jit_compile_descriptors".to_string(),
+        Value::Array(descriptors),
+    );
+    native
+        .with_map(
+            "native_eligibility_rejections_by_reason",
+            map_to_json(
+                &counters.native_eligibility_rejections_by_reason,
+                SortDirection::Descending,
+            ),
+        )
+        .with_map(
+            "native_side_exits_by_reason",
+            map_to_json(
+                &counters.native_side_exits_by_reason,
+                SortDirection::Descending,
+            ),
+        )
+        .with_map(
+            "jit_side_exit_reasons",
+            map_to_json(&counters.jit_side_exit_reasons, SortDirection::Descending),
+        )
+        .with_map(
+            "jit_blacklist_reasons",
+            map_to_json(&counters.jit_blacklist_reasons, SortDirection::Descending),
+        )
+        .into()
 }
 
 struct JsonObject(Map<String, Value>);
@@ -1283,7 +1367,24 @@ mod tests {
             .insert("megamorphic".to_string(), 1);
         counters.quickening_megamorphic = 1;
         counters.quickening_disabled = 1;
+        counters.jit_mode = "cranelift".to_string();
         counters.jit_compile_attempts = 1;
+        counters.jit_compiled = 1;
+        counters.jit_executed = 1;
+        counters.copy_patch_executed = 0;
+        counters.native_platform_unavailable = 0;
+        counters
+            .jit_compile_descriptors
+            .push(php_vm::api::JitCompileDescriptor {
+                function_id: 7,
+                function_name: "profile_jit".to_string(),
+                ir_fingerprint: "feedface".to_string(),
+                code_bytes: 64,
+                compile_time_nanos: 100,
+                target_isa: "x64:x86_64-unknown-linux-gnu:1234".to_string(),
+                abi_hash: 42,
+                config_hash: 99,
+            });
         counters
             .value_clone_by_reason
             .insert("return_value".to_string(), 1);
@@ -1423,6 +1524,30 @@ mod tests {
         assert!(attribution.get("includes").is_some());
         assert!(attribution.get("metadata").is_some());
         assert!(attribution.get("native").is_some());
+        assert_eq!(
+            profile["attribution"]["native"]["jit_mode"],
+            Value::from("cranelift")
+        );
+        assert_eq!(
+            profile["attribution"]["native"]["copy_patch_executed"],
+            Value::from(0)
+        );
+        assert_eq!(
+            profile["attribution"]["native"]["native_platform_unavailable"],
+            Value::from(0)
+        );
+        assert_eq!(
+            profile["attribution"]["native"]["jit_compile_descriptors"][0]["target_isa"],
+            Value::from("x64:x86_64-unknown-linux-gnu:1234")
+        );
+        assert_eq!(
+            profile["attribution"]["native"]["jit_compile_descriptors"][0]["abi_hash"],
+            Value::from(42)
+        );
+        assert_eq!(
+            profile["attribution"]["native"]["jit_compile_descriptors"][0]["config_hash"],
+            Value::from(99)
+        );
         assert_eq!(
             profile["attribution"]["includes"]["include_profiles_by_path"][0]["name"],
             Value::from("/srv/app/lib.php")

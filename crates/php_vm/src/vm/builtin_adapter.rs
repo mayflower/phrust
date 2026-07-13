@@ -305,24 +305,29 @@ pub(super) fn execute_builtin_entry(
     context.set_postgres_state(&mut state.builtins.postgres);
     context.set_mb_internal_encoding_state(&mut state.builtins.mb_internal_encoding);
     context.set_mb_substitute_character_state(&mut state.builtins.mb_substitute_character);
-    let initial_session_global = if state.request.session.status()
-        == php_runtime::api::PHP_SESSION_ACTIVE
-        || state.request.session.started()
-    {
-        state.request.session.data_value()
-    } else {
-        Value::Uninitialized
-    };
-    let session_global = state
-        .globals
-        .ensure_slot("_SESSION", initial_session_global);
-    context.set_session_state(&mut state.request.session, session_global);
-    context.set_session_loader(state.request.session_loader.as_ref());
-    context.set_session_id_generator(state.request.session_id_generator.as_ref());
-    context.sync_session_state_from_global();
+    let session_handler = entry.handler_kind() == BuiltinHandlerKind::Session;
+    if session_handler {
+        let initial_session_global = if state.request.session.status()
+            == php_runtime::api::PHP_SESSION_ACTIVE
+            || state.request.session.started()
+        {
+            state.request.session.data_value()
+        } else {
+            Value::Uninitialized
+        };
+        let session_global = state
+            .globals
+            .ensure_slot("_SESSION", initial_session_global);
+        context.set_session_state(&mut state.request.session, session_global);
+        context.set_session_loader(state.request.session_loader.as_ref());
+        context.set_session_id_generator(state.request.session_id_generator.as_ref());
+        context.sync_session_state_from_global();
+    }
     let time_limit_arg = (entry.name() == "set_time_limit").then(|| args.first().cloned());
     let result = (entry.function())(&mut context, args, source_span.clone());
-    context.sync_session_state_from_global();
+    if session_handler {
+        context.sync_session_state_from_global();
+    }
     state.builtins.posix_last_error = context.posix_last_error();
     state.builtins.bcmath_scale = context.bcmath_scale();
     let mut diagnostics = context.take_diagnostics();

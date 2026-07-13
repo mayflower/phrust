@@ -124,6 +124,20 @@ pub mod api {
 /// benchmarks, and experimental tooling. They are not part of the stable
 /// execution API.
 pub mod experimental {
+    /// Process-wide Cranelift code-cache generation count for readiness gates.
+    #[must_use]
+    #[cfg(feature = "jit-cranelift")]
+    pub fn cranelift_code_cache_generation() -> u64 {
+        php_jit::cranelift_code_manager_stats().code_generations as u64
+    }
+
+    /// A non-Cranelift build has no native code-cache generation.
+    #[must_use]
+    #[cfg(not(feature = "jit-cranelift"))]
+    pub const fn cranelift_code_cache_generation() -> u64 {
+        0
+    }
+
     #[doc(hidden)]
     pub use crate::aliasing::{
         AliasState, alias_transition_key, slot_alias_state, value_alias_state,

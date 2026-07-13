@@ -11,6 +11,24 @@ use php_runtime::api::{
 #[cfg(test)]
 use std::collections::BTreeMap;
 
+/// Small result used inside the VM. Request-owned output, diagnostics, HTTP,
+/// session, trace and counters remain in shared execution state and are only
+/// attached to [`VmResult`] at an outer boundary.
+#[derive(Debug)]
+pub(super) enum FrameOutcome {
+    Return {
+        value: Option<Value>,
+        explicit: bool,
+    },
+    Throw,
+    #[allow(dead_code)]
+    Exit(i32),
+    #[allow(dead_code)]
+    Yield(Box<super::GeneratorYield>),
+    #[allow(dead_code)]
+    FiberSuspend(Box<super::FiberSuspension>),
+}
+
 /// Execution result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmResult {

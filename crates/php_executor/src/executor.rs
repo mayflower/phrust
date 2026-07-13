@@ -160,6 +160,25 @@ impl PhpExecutor {
         output
     }
 
+    /// Performs bounded native prewarming without executing application code.
+    /// Returns the number of newly adopted/compiled Cranelift entries.
+    #[must_use]
+    pub fn prewarm_compiled(&self, compiled: &CompiledPhpScript) -> u64 {
+        let vm = Vm::with_options_and_worker_state(
+            self.options.vm_options.clone(),
+            self.worker_state.clone(),
+        );
+        #[cfg(feature = "jit-cranelift")]
+        {
+            vm.prewarm_cranelift(&compiled.executable_unit())
+        }
+        #[cfg(not(feature = "jit-cranelift"))]
+        {
+            let _ = (vm, compiled);
+            0
+        }
+    }
+
     /// Compiles and executes source in one step.
     #[must_use]
     pub fn execute_source(&self, input: PhpExecutionInput) -> PhpExecutionOutput {
@@ -1001,6 +1020,48 @@ mod tests {
         let second = second.counters.expect("second counters");
         assert!(first.jit_compile_cache_misses > 0, "{first:?}");
         assert!(second.jit_compile_cache_hits > 0, "{second:?}");
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn bounded_cranelift_prewarm_populates_cache_without_executing_script() {
+        let mut options = PhpExecutorOptions::managed_fast_runtime();
+        options.vm_options.execution_format = ExecutionFormat::Auto;
+        options.vm_options.jit = JitMode::Cranelift;
+        options.vm_options.tiering.jit_eager = true;
+        options.vm_options.copy_patch_leaf_override = Some(false);
+        let executor = PhpExecutor::with_options(options);
+        let compiled = executor
+            .compile_source(PhpCompileInput {
+                source:
+                    "<?php function prewarmed(int $a): int { return $a + 1; } echo prewarmed(4);"
+                        .to_owned(),
+                source_path: "cranelift-prewarm.php".to_owned(),
+                optimization_level: Some(OptimizationLevel::O0),
+            })
+            .expect("compile prewarm fixture");
+
+        assert!(executor.prewarm_compiled(&compiled) > 0);
+        let output = executor.execute_compiled(
+            &compiled,
+            PhpRequestExecutionInput {
+                real_path: None,
+                cwd: std::env::current_dir().expect("current directory"),
+                include_roots: Vec::new(),
+                runtime_context: RuntimeContext::controlled_cli(
+                    "cranelift-prewarm.php",
+                    Vec::new(),
+                ),
+                collect_counters: true,
+                collect_profile_spans: false,
+                collect_layout_source_attribution: false,
+            },
+        );
+
+        assert_eq!(output.stdout, b"5");
+        let counters = output.counters.expect("prewarmed request counters");
+        assert!(counters.jit_compile_cache_hits > 0, "{counters:?}");
+        assert_eq!(counters.jit_compile_attempts, 0, "{counters:?}");
     }
 
     fn managed_fast_counter_source() -> &'static str {

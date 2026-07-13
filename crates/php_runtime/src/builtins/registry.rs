@@ -10,6 +10,8 @@ pub struct BuiltinEntry {
     name: &'static str,
     function: InternalFunction,
     compatibility: BuiltinCompatibility,
+    handler_kind: BuiltinHandlerKind,
+    helper_id: u32,
 }
 
 impl BuiltinEntry {
@@ -22,6 +24,8 @@ impl BuiltinEntry {
             name,
             function,
             compatibility,
+            handler_kind: BuiltinHandlerKind::Generic,
+            helper_id: 0,
         }
     }
 
@@ -42,6 +46,42 @@ impl BuiltinEntry {
     pub const fn compatibility(self) -> BuiltinCompatibility {
         self.compatibility
     }
+
+    /// Capability class used by compact VM and native call adapters.
+    #[must_use]
+    pub const fn handler_kind(self) -> BuiltinHandlerKind {
+        self.handler_kind
+    }
+
+    /// Stable name-derived helper ID exposed to native code.
+    #[must_use]
+    pub const fn helper_id(self) -> u32 {
+        self.helper_id
+    }
+
+    /// Refines generated registry metadata with an intrinsic handler class.
+    #[must_use]
+    pub const fn with_handler_kind(mut self, handler_kind: BuiltinHandlerKind) -> Self {
+        self.handler_kind = handler_kind;
+        self
+    }
+}
+
+/// Service capability required by a builtin handler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BuiltinHandlerKind {
+    Pure0,
+    Pure1,
+    Pure2,
+    Pure3,
+    BorrowedN,
+    Json,
+    Pcre,
+    Filesystem,
+    Http,
+    Session,
+    Mysql,
+    Generic,
 }
 
 /// Whether a builtin is PHP-compatible or only for local fixtures.
@@ -173,21 +213,54 @@ fn entries() -> &'static [BuiltinEntry] {
             }
             let mut entries = MODULE_SLICES
                 .iter()
-                .flat_map(|(_, entries)| entries.iter().copied())
+                .flat_map(|(module, entries)| {
+                    entries.iter().copied().map(|mut entry| {
+                        entry.handler_kind = module_handler_kind(module);
+                        entry.helper_id = stable_builtin_helper_id(entry.name);
+                        entry
+                    })
+                })
                 .collect::<Vec<_>>();
             entries.sort_unstable_by_key(|entry| entry.name);
             debug_assert!(
                 entries.windows(2).all(|pair| pair[0].name != pair[1].name),
                 "builtin registry names must be unique for binary-search lookup"
             );
+            let mut helper_ids = entries.iter().map(|entry| entry.helper_id).collect::<Vec<_>>();
+            helper_ids.sort_unstable();
+            assert!(
+                helper_ids.windows(2).all(|pair| pair[0] != pair[1]),
+                "builtin helper IDs must be collision-free"
+            );
             entries
         })
         .as_slice()
 }
 
+fn module_handler_kind(module: &str) -> BuiltinHandlerKind {
+    match module {
+        "json" => BuiltinHandlerKind::Json,
+        "pcre" => BuiltinHandlerKind::Pcre,
+        "filesystem" => BuiltinHandlerKind::Filesystem,
+        "curl" => BuiltinHandlerKind::Http,
+        "session" => BuiltinHandlerKind::Session,
+        "mysqli" => BuiltinHandlerKind::Mysql,
+        _ => BuiltinHandlerKind::Generic,
+    }
+}
+
+fn stable_builtin_helper_id(name: &str) -> u32 {
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in name.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    if hash == 0 { 1 } else { hash }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::generated;
+    use super::{BuiltinHandlerKind, BuiltinRegistry, generated};
 
     #[test]
     fn generated_registry_carries_representative_arginfo_signatures() {
@@ -206,5 +279,25 @@ mod tests {
         assert_eq!(encode.required_parameters, 1);
         assert_eq!(encode.total_parameters, 3);
         assert!(!encode.variadic);
+    }
+
+    #[test]
+    fn registry_attaches_capabilities_and_stable_helper_ids() {
+        let registry = BuiltinRegistry::new();
+        let json = registry.get("json_encode").expect("json_encode");
+        let session = registry.get("session_start").expect("session_start");
+        let strlen = registry.get("strlen").expect("strlen");
+
+        assert_eq!(json.handler_kind(), BuiltinHandlerKind::Json);
+        assert_eq!(session.handler_kind(), BuiltinHandlerKind::Session);
+        assert_eq!(strlen.handler_kind(), BuiltinHandlerKind::Generic);
+        assert_ne!(json.helper_id(), 0);
+        assert_eq!(
+            json.helper_id(),
+            BuiltinRegistry::new()
+                .get("json_encode")
+                .unwrap()
+                .helper_id()
+        );
     }
 }

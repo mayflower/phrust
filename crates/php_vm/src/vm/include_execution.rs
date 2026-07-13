@@ -138,7 +138,6 @@ impl Vm {
             }
             self.register_linked_include_path(included, linked_entry, state);
             let call = FunctionCall {
-                positional_values: None,
                 args: Vec::new(),
                 captures: Vec::new(),
                 call_span: Some(instruction_span),
@@ -945,7 +944,6 @@ impl Vm {
 
         let mut shared = shared_locals_from_current_frame(compiled, stack);
         let call = FunctionCall {
-            positional_values: None,
             args: Vec::new(),
             captures: Vec::new(),
             call_span: Some(eval_span),

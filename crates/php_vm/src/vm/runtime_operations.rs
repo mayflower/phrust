@@ -929,9 +929,7 @@ impl Vm {
         let custom = entry.arguments.iter().find_map(|id| {
             match compiled.unit().constants.get(id.index())? {
                 IrConstant::String(text) => Some(text.clone()),
-                IrConstant::StringBytes(bytes) => {
-                    Some(String::from_utf8_lossy(bytes).into_owned())
-                }
+                IrConstant::StringBytes(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
                 _ => None,
             }
         });

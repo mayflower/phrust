@@ -9486,7 +9486,7 @@ fn direct_frames_elide_argument_vectors_unless_observed() {
 }
 
 #[test]
-fn dense_direct_calls_use_inline_positional_storage() {
+fn dense_direct_calls_transfer_caller_sources_without_owned_values() {
     let source = "<?php \
             function add($a, $b) { return $a + $b; } \
             function forty_two() { return 42; } \
@@ -9511,6 +9511,43 @@ fn dense_direct_calls_use_inline_positional_storage() {
         counters.prepared_arg_vector_allocations_avoided >= 7,
         "{counters:?}"
     );
+    assert!(counters.direct_call_source_reads >= 12, "{counters:?}");
+    assert_eq!(counters.direct_call_owned_value_buffers, 0, "{counters:?}");
+}
+
+#[test]
+fn dense_direct_call_trampoline_handles_deep_php_chains() {
+    let result = execute_source_with_options(
+        "<?php function depth($n) { if ($n === 0) return 0; return 1 + depth($n - 1); } echo depth(5000);",
+        VmOptions {
+            execution_format: ExecutionFormat::Auto,
+            max_steps: 200_000,
+            collect_counters: true,
+            collect_profile_spans: false,
+            ..VmOptions::default()
+        },
+    );
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(result.output.as_bytes(), b"5000");
+    let counters = result.counters.expect("counters");
+    assert!(counters.dense_activation_transfers >= 5_000, "{counters:?}");
+    assert_eq!(
+        counters.nested_vm_results_avoided, counters.dense_activation_transfers,
+        "{counters:?}"
+    );
+    assert_eq!(
+        counters.recursive_dense_calls_avoided, counters.dense_activation_transfers,
+        "{counters:?}"
+    );
+}
+
+#[test]
+fn compact_direct_call_is_smaller_than_complex_call() {
+    assert!(
+        std::mem::size_of::<DirectCall<'static>>() < std::mem::size_of::<FunctionCall<'static>>()
+    );
+    let destination = CallDestination::OuterReturn;
+    assert_eq!(destination, CallDestination::OuterReturn);
 }
 
 #[test]
@@ -10262,6 +10299,32 @@ fn jit_int_leaf_hot_loop_executes_after_warmup() {
 
 #[cfg(feature = "jit-cranelift")]
 #[test]
+fn dense_cranelift_entry_marshals_direct_callee_slots() {
+    let source = "<?php function dense_jit_add(int $a, int $b): int { return $a + $b; } $sum = 0; for ($i = 0; $i < 16; $i++) { $sum += dense_jit_add($i, 2); } echo $sum;";
+    let result = execute_source_with_options(
+        source,
+        VmOptions {
+            collect_counters: true,
+            collect_profile_spans: false,
+            collect_layout_source_attribution: true,
+            execution_format: ExecutionFormat::Bytecode,
+            jit: JitMode::Cranelift,
+            copy_patch_leaf_override: Some(false),
+            ..VmOptions::default()
+        },
+    );
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(result.output.as_bytes(), b"152");
+    let counters = result.counters.expect("counters");
+    assert!(counters.cranelift_direct_slot_marshals > 0, "{counters:?}");
+    assert_eq!(
+        counters.cranelift_prepared_arg_materializations, 0,
+        "{counters:?}"
+    );
+}
+
+#[cfg(feature = "jit-cranelift")]
+#[test]
 fn cranelift_default_tiering_keeps_cold_function_interpreted() {
     let source = "<?php function perf_jit_add(int $a, int $b): int { return $a + $b; } echo perf_jit_add(1, 2);";
     let result = execute_source_with_options(
@@ -10406,6 +10469,34 @@ fn cranelift_inline_arithmetic_executes_native_and_counts_fast_paths() {
     assert_eq!(counters.jit_slow_path_calls, 0, "{counters:?}");
     assert!(counters.jit_code_bytes > 0, "{counters:?}");
     assert!(counters.jit_compile_time_nanos > 0, "{counters:?}");
+}
+
+#[cfg(feature = "jit-cranelift")]
+#[test]
+fn cranelift_same_unit_wrapper_stays_native_across_direct_call() {
+    let source = "<?php function perf_native_increment(int $value): int { return $value + 1; } function perf_native_wrapper(int $value): int { return perf_native_increment($value); } echo perf_native_wrapper(41);";
+    let result = execute_source_with_options(
+        source,
+        VmOptions {
+            collect_counters: true,
+            collect_profile_spans: false,
+            collect_layout_source_attribution: true,
+            jit: JitMode::Cranelift,
+            copy_patch_leaf_override: Some(false),
+            tiering: TieringOptions {
+                function_entry_threshold: 1,
+                ..TieringOptions::default()
+            },
+            ..VmOptions::default()
+        },
+    );
+
+    assert!(result.status.is_success(), "{:?}", result.status);
+    assert_eq!(result.output.as_bytes(), b"42");
+    let counters = result.counters.expect("counters");
+    assert_eq!(counters.jit_executed, 1, "{counters:?}");
+    assert_eq!(counters.compiled_to_compiled_calls, 1, "{counters:?}");
+    assert_eq!(counters.jit_bailouts, 0, "{counters:?}");
 }
 
 #[cfg(feature = "jit-cranelift")]
@@ -11054,7 +11145,7 @@ fn cranelift_helper_overflow_status_falls_back_to_interpreter() {
 
 #[cfg(feature = "jit-cranelift")]
 #[test]
-fn cranelift_type_switch_side_exits_blacklist_unstable_candidate() {
+fn cranelift_type_switch_side_exits_do_not_blacklist_from_tiny_sample() {
     let source = r#"<?php
 function perf_jit_unstable_types(int $a): int { return $a + 1; }
 echo perf_jit_unstable_types(1), "\n";
@@ -11095,8 +11186,8 @@ echo perf_jit_unstable_types(4), "\n";
     assert_eq!(counters.jit_mode, "cranelift");
     assert_eq!(counters.jit_compile_attempts, 1, "{counters:?}");
     assert_eq!(counters.jit_compiled, 1, "{counters:?}");
-    assert_eq!(counters.jit_executed, 1, "{counters:?}");
-    assert_eq!(counters.jit_fast_path_hits, 1, "{counters:?}");
+    assert_eq!(counters.jit_executed, 2, "{counters:?}");
+    assert_eq!(counters.jit_fast_path_hits, 2, "{counters:?}");
     assert_eq!(counters.jit_side_exits, 2, "{counters:?}");
     assert_eq!(counters.jit_slow_path_calls, 2, "{counters:?}");
     assert_eq!(
@@ -11104,12 +11195,8 @@ echo perf_jit_unstable_types(4), "\n";
         Some(&2),
         "{counters:?}"
     );
-    assert_eq!(counters.jit_blacklisted_regions, 1, "{counters:?}");
-    assert_eq!(
-        counters.jit_blacklist_reasons.get("too_many_side_exits"),
-        Some(&1),
-        "{counters:?}"
-    );
+    assert_eq!(counters.jit_blacklisted_regions, 0, "{counters:?}");
+    assert!(counters.jit_blacklist_reasons.is_empty(), "{counters:?}");
 }
 
 #[cfg(feature = "jit-cranelift")]
@@ -11214,6 +11301,13 @@ fn cranelift_compile_cache_reuses_same_function() {
     assert_eq!(counters.jit_compile_cache_misses, 1, "{counters:?}");
     assert_eq!(counters.jit_compile_cache_hits, 2, "{counters:?}");
     assert_eq!(counters.jit_compile_cache_invalidations, 0, "{counters:?}");
+    assert_eq!(
+        counters.jit_process_cache_hits + counters.jit_process_cache_misses,
+        1,
+        "{counters:?}"
+    );
+    assert!(counters.jit_code_bytes_live > 0, "{counters:?}");
+    assert!(counters.jit_code_generations > 0, "{counters:?}");
 }
 
 #[cfg(feature = "jit-cranelift")]
@@ -11257,7 +11351,7 @@ fn cranelift_compile_cache_rejects_changed_ir_and_abi() {
 
 #[cfg(feature = "jit-cranelift")]
 #[test]
-fn cranelift_compile_cache_invalidates_runtime_layout_mismatch() {
+fn cranelift_compile_cache_keeps_layout_independent_handle_across_epoch() {
     let mut cache = JitRuntimeState::default();
     let function = FunctionId::new(0);
     let key = JitCompileCacheKey {
@@ -11274,14 +11368,10 @@ fn cranelift_compile_cache_invalidates_runtime_layout_mismatch() {
     );
     cache.insert_compile_cache(key.clone(), handle, 1);
 
-    assert_eq!(
+    assert!(matches!(
         cache.lookup_compile_cache(&key, 2),
-        JitCompileCacheLookup::Invalidated
-    );
-    assert_eq!(
-        cache.lookup_compile_cache(&key, 2),
-        JitCompileCacheLookup::Miss
-    );
+        JitCompileCacheLookup::Hit(_)
+    ));
 }
 
 #[cfg(feature = "jit-cranelift")]
@@ -21809,6 +21899,8 @@ echo $total, "|", $last;
             >= 4,
         "{counters:?}"
     );
+    assert!(counters.dense_activation_transfers >= 4, "{counters:?}");
+    assert_eq!(counters.direct_call_owned_value_buffers, 0, "{counters:?}");
 }
 
 #[test]

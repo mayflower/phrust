@@ -22,7 +22,7 @@ pub(super) struct JitCompileCacheKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct JitCompileCacheEntry {
     pub(super) handle: php_jit::JitFunctionHandle,
-    pub(super) runtime_layout_epoch: u64,
+    pub(super) runtime_layout_epoch: Option<u64>,
 }
 
 #[cfg(feature = "jit-cranelift")]
@@ -65,6 +65,10 @@ pub(super) struct JitFunctionState {
     pub(super) compile_errors: u64,
     pub(super) abi_mismatches: u64,
     pub(super) blacklisted: bool,
+    pub(super) cooldown_until_call: u64,
+    pub(super) blacklist_epoch: u64,
+    pub(super) runtime_epoch: u64,
+    pub(super) unsupported_epoch: Option<u64>,
     #[cfg(feature = "jit-cranelift")]
     pub(super) blacklist_reason: Option<JitBlacklistReason>,
     #[cfg(feature = "jit-cranelift")]
@@ -73,7 +77,7 @@ pub(super) struct JitFunctionState {
 
 impl JitFunctionState {
     #[cfg(feature = "jit-cranelift")]
-    pub(super) fn blacklist(&mut self, reason: JitBlacklistReason) -> bool {
+    pub(super) fn blacklist_strict(&mut self, reason: JitBlacklistReason) -> bool {
         if self.blacklisted {
             return false;
         }
@@ -84,10 +88,40 @@ impl JitFunctionState {
     }
 
     #[cfg(feature = "jit-cranelift")]
+    fn cooldown(&mut self, reason: JitBlacklistReason, runtime_epoch: u64) -> bool {
+        if self.blacklisted {
+            return false;
+        }
+        self.blacklisted = true;
+        self.blacklist_reason = Some(reason);
+        self.blacklist_epoch = runtime_epoch;
+        self.cooldown_until_call = self.calls.saturating_add(JIT_TIERING_COOLDOWN_CALLS);
+        true
+    }
+
+    #[cfg(feature = "jit-cranelift")]
+    pub(super) fn allows_execution(&mut self, runtime_epoch: u64) -> bool {
+        if self.disabled {
+            return false;
+        }
+        if !self.blacklisted {
+            return true;
+        }
+        if runtime_epoch == self.blacklist_epoch && self.calls < self.cooldown_until_call {
+            return false;
+        }
+        self.blacklisted = false;
+        self.blacklist_reason = None;
+        self.side_exits = 0;
+        self.guard_failures = 0;
+        true
+    }
+
+    #[cfg(feature = "jit-cranelift")]
     pub(super) fn record_compile_error(&mut self) -> Option<JitBlacklistReason> {
         self.compile_errors = self.compile_errors.saturating_add(1);
         if self.compile_errors >= JIT_BLACKLIST_COMPILE_ERROR_THRESHOLD
-            && self.blacklist(JitBlacklistReason::CompileErrors)
+            && self.blacklist_strict(JitBlacklistReason::CompileErrors)
         {
             return Some(JitBlacklistReason::CompileErrors);
         }
@@ -98,31 +132,38 @@ impl JitFunctionState {
     pub(super) fn record_side_exit(
         &mut self,
         reason: php_jit::SideExitReason,
+        runtime_epoch: u64,
     ) -> Option<JitBlacklistReason> {
         self.side_exits = self.side_exits.saturating_add(1);
         match reason {
             php_jit::SideExitReason::AbiMismatch => {
                 self.abi_mismatches = self.abi_mismatches.saturating_add(1);
                 if self.abi_mismatches >= JIT_BLACKLIST_ABI_MISMATCH_THRESHOLD
-                    && self.blacklist(JitBlacklistReason::AbiMismatch)
+                    && self.blacklist_strict(JitBlacklistReason::AbiMismatch)
                 {
                     return Some(JitBlacklistReason::AbiMismatch);
                 }
             }
             php_jit::SideExitReason::GuardFailed => {
                 self.guard_failures = self.guard_failures.saturating_add(1);
-                if self.guard_failures >= JIT_BLACKLIST_GUARD_FAILURE_THRESHOLD
-                    && self.blacklist(JitBlacklistReason::GuardFailureRate)
-                {
-                    return Some(JitBlacklistReason::GuardFailureRate);
-                }
             }
             _ => {}
         }
-        if self.side_exits >= JIT_BLACKLIST_SIDE_EXIT_THRESHOLD
-            && self.blacklist(JitBlacklistReason::TooManySideExits)
+        if self.calls >= JIT_TIERING_MIN_EXECUTIONS && self.side_exits >= JIT_TIERING_MIN_SIDE_EXITS
         {
-            return Some(JitBlacklistReason::TooManySideExits);
+            let excessive_guard_rate = self.guard_failures >= JIT_TIERING_MIN_SIDE_EXITS
+                && self.guard_failures.saturating_mul(100)
+                    >= self.calls.saturating_mul(JIT_TIERING_MAX_EXIT_RATE_PERCENT);
+            let excessive_exit_rate = self.side_exits.saturating_mul(100)
+                >= self.calls.saturating_mul(JIT_TIERING_MAX_EXIT_RATE_PERCENT);
+            let reason = excessive_guard_rate
+                .then_some(JitBlacklistReason::GuardFailureRate)
+                .or_else(|| excessive_exit_rate.then_some(JitBlacklistReason::TooManySideExits));
+            if let Some(reason) = reason
+                && self.cooldown(reason, runtime_epoch)
+            {
+                return Some(reason);
+            }
         }
         None
     }
@@ -145,7 +186,10 @@ impl JitRuntimeState {
         let Some(entry) = self.compile_cache.get(key) else {
             return JitCompileCacheLookup::Miss;
         };
-        if entry.runtime_layout_epoch != runtime_layout_epoch {
+        if entry
+            .runtime_layout_epoch
+            .is_some_and(|compiled_epoch| compiled_epoch != runtime_layout_epoch)
+        {
             self.compile_cache.remove(key);
             return JitCompileCacheLookup::Invalidated;
         }
@@ -158,6 +202,10 @@ impl JitRuntimeState {
         handle: php_jit::JitFunctionHandle,
         runtime_layout_epoch: u64,
     ) {
+        let runtime_layout_epoch = handle
+            .property_load_metadata()
+            .is_some()
+            .then_some(runtime_layout_epoch);
         self.compile_cache.insert(
             key,
             JitCompileCacheEntry {
@@ -179,7 +227,7 @@ impl JitRuntimeState {
 pub(super) fn jit_leaf_call_shape_is_supported(
     function: &IrFunction,
     call_shape_supported: bool,
-    args: &[PreparedArg],
+    args: &JitArgumentSlots<'_>,
 ) -> bool {
     call_shape_supported
         && !function.flags.is_top_level
@@ -206,14 +254,14 @@ pub(super) fn jit_leaf_call_shape_is_supported(
                     )
                 )
         })
-        && args.iter().all(|arg| arg.reference.is_none())
+        && !args.has_reference()
 }
 
 #[cfg(feature = "jit-cranelift")]
 pub(super) fn native_leaf_rejection_reason(
     function: &IrFunction,
     call_shape_supported: bool,
-    args: &[PreparedArg],
+    args: &JitArgumentSlots<'_>,
 ) -> &'static str {
     if !call_shape_supported {
         return "call_shape";
@@ -264,8 +312,58 @@ pub(super) fn native_leaf_rejection_reason(
     }) {
         return "param_type";
     }
-    if args.iter().any(|arg| arg.reference.is_some()) {
+    if args.has_reference() {
         return "reference_arg";
     }
     "unsupported_leaf_shape"
+}
+
+#[cfg(all(test, feature = "jit-cranelift"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_exit_policy_requires_samples_and_reenters_after_cooldown() {
+        let mut state = JitFunctionState::default();
+        for call in 1..JIT_TIERING_MIN_EXECUTIONS {
+            state.calls = call;
+            assert_eq!(
+                state.record_side_exit(php_jit::SideExitReason::TypeMismatch, 7),
+                None
+            );
+            assert!(!state.blacklisted);
+        }
+
+        state.calls = JIT_TIERING_MIN_EXECUTIONS;
+        assert_eq!(
+            state.record_side_exit(php_jit::SideExitReason::TypeMismatch, 7),
+            Some(JitBlacklistReason::TooManySideExits)
+        );
+        assert!(!state.allows_execution(7));
+
+        state.calls = state.cooldown_until_call;
+        assert!(state.allows_execution(7));
+        assert!(!state.blacklisted);
+        assert_eq!(state.side_exits, 0);
+    }
+
+    #[test]
+    fn epoch_change_ends_dynamic_cooldown_but_abi_mismatch_stays_strict() {
+        let mut dynamic = JitFunctionState {
+            calls: JIT_TIERING_MIN_EXECUTIONS,
+            ..JitFunctionState::default()
+        };
+        for _ in 0..(JIT_TIERING_MIN_EXECUTIONS / 2) {
+            let _ = dynamic.record_side_exit(php_jit::SideExitReason::GuardFailed, 3);
+        }
+        assert!(dynamic.blacklisted);
+        assert!(dynamic.allows_execution(4));
+
+        let mut strict = JitFunctionState::default();
+        assert_eq!(
+            strict.record_side_exit(php_jit::SideExitReason::AbiMismatch, 3),
+            Some(JitBlacklistReason::AbiMismatch)
+        );
+        assert!(!strict.allows_execution(4));
+    }
 }

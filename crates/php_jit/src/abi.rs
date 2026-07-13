@@ -9,13 +9,183 @@ use std::num::NonZeroU64;
 use php_ir::{BlockId, FunctionId, InstrId, LocalId, RegId};
 
 /// Version for the C-compatible runtime ABI records.
-pub const JIT_RUNTIME_ABI_VERSION: u32 = 1;
+pub const JIT_RUNTIME_ABI_VERSION: u32 = 4;
 
 /// Stable ABI fingerprint for Cranelift ABI.
 ///
 /// This is updated only when a `repr(C)` boundary type changes layout or tag
 /// meaning. It is intentionally independent from Rust type names.
-pub const JIT_RUNTIME_ABI_HASH: u64 = 0x07c1_a817_0000_0001;
+pub const JIT_RUNTIME_ABI_HASH: u64 = 0x07c1_a817_0000_0004;
+
+/// Maximum number of scalar VM locals materialized by one native side exit.
+pub const JIT_DEOPT_MAX_SLOTS: usize = 64;
+
+/// Caller-owned state buffer populated before a native side exit returns.
+#[repr(C)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JitDeoptState {
+    /// Stable IR function ID that owns `continuation_id`.
+    pub function_id: u32,
+    /// Stable continuation ID in the compiled region metadata.
+    pub continuation_id: u32,
+    /// Number of addressable local slots in the compiled region.
+    pub slot_count: u32,
+    /// Reserved for append-only ABI growth; native writers must store zero.
+    pub reserved: u32,
+    /// Bit `n` is set when `slots[n]` contains a materialized value.
+    pub initialized_mask: u64,
+    /// Materialized scalar locals indexed by their VM local ID.
+    pub slots: [i64; JIT_DEOPT_MAX_SLOTS],
+}
+
+impl Default for JitDeoptState {
+    fn default() -> Self {
+        Self {
+            function_id: u32::MAX,
+            continuation_id: u32::MAX,
+            slot_count: 0,
+            reserved: 0,
+            initialized_mask: 0,
+            slots: [0; JIT_DEOPT_MAX_SLOTS],
+        }
+    }
+}
+
+/// Stable status returned by native calls and runtime helpers.
+///
+/// Native code must compare the numeric constants below. It must never depend
+/// on a Rust enum discriminant.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct JitCallStatus(pub u32);
+
+impl JitCallStatus {
+    pub const RETURN: Self = Self(0);
+    pub const THROW: Self = Self(1);
+    pub const EXIT: Self = Self(2);
+    pub const YIELD: Self = Self(3);
+    pub const FIBER_SUSPEND: Self = Self(4);
+    pub const DEOPT: Self = Self(5);
+    pub const ABI_MISMATCH: Self = Self(6);
+}
+
+/// Stable tagged value passed across the generic helper boundary.
+///
+/// `payload` is either an immediate bit pattern or an opaque VM-owned handle,
+/// as selected by `tag`. No Rust `Value` layout crosses the boundary.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitAbiSlot {
+    pub tag: u32,
+    pub flags: u32,
+    pub payload: u64,
+}
+
+/// Compact result record shared by native entries and helper dispatch.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JitCallResult {
+    pub status: JitCallStatus,
+    pub detail: u32,
+    pub value: JitAbiSlot,
+}
+
+impl Default for JitCallResult {
+    fn default() -> Self {
+        Self {
+            status: JitCallStatus::RETURN,
+            detail: 0,
+            value: JitAbiSlot::default(),
+        }
+    }
+}
+
+/// Stable helper IDs. Append-only within an ABI version.
+pub mod helper_id {
+    pub const ARRAY_LEN: u32 = 1;
+    pub const ARRAY_FETCH_INT: u32 = 2;
+    pub const STRLEN: u32 = 3;
+    pub const COUNT: u32 = 4;
+    pub const CONCAT: u32 = 5;
+    pub const RECORD_LOOKUP: u32 = 6;
+    pub const PROPERTY_LOAD: u32 = 7;
+    pub const BUILTIN_DISPATCH: u32 = 8;
+}
+
+/// One versioned helper entry point. The dispatcher validates `helper_id`,
+/// argument count, opaque handles and the ABI version before touching VM state.
+pub type JitHelperDispatch = unsafe extern "C" fn(
+    vm_context: u64,
+    helper_id: u32,
+    args: *const JitAbiSlot,
+    arg_count: u32,
+    out: *mut JitCallResult,
+) -> i32;
+
+/// Published runtime helper contract. `struct_size` permits append-only growth
+/// without generated code reading beyond the table supplied by an older VM.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct JitRuntimeHelperTable {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub abi_hash: u64,
+    pub dispatch: Option<JitHelperDispatch>,
+}
+
+impl JitRuntimeHelperTable {
+    #[must_use]
+    pub const fn new(dispatch: JitHelperDispatch) -> Self {
+        Self {
+            abi_version: JIT_RUNTIME_ABI_VERSION,
+            struct_size: std::mem::size_of::<Self>() as u32,
+            abi_hash: JIT_RUNTIME_ABI_HASH,
+            dispatch: Some(dispatch),
+        }
+    }
+}
+
+/// Default typed-deopt dispatcher used until a VM publishes service-specific
+/// opaque-slot implementations through the same table contract.
+pub unsafe extern "C" fn jit_default_helper_dispatch(
+    _vm_context: u64,
+    helper_id: u32,
+    args: *const JitAbiSlot,
+    arg_count: u32,
+    out: *mut JitCallResult,
+) -> i32 {
+    if out.is_null() || (arg_count != 0 && args.is_null()) {
+        return crate::JIT_HELPER_STATUS_FALLBACK;
+    }
+    let known = matches!(
+        helper_id,
+        helper_id::ARRAY_LEN
+            | helper_id::ARRAY_FETCH_INT
+            | helper_id::STRLEN
+            | helper_id::COUNT
+            | helper_id::CONCAT
+            | helper_id::RECORD_LOOKUP
+            | helper_id::PROPERTY_LOAD
+            | helper_id::BUILTIN_DISPATCH
+    );
+    let result = JitCallResult {
+        status: if known {
+            JitCallStatus::DEOPT
+        } else {
+            JitCallStatus::ABI_MISMATCH
+        },
+        detail: helper_id,
+        value: JitAbiSlot::default(),
+    };
+    // SAFETY: `out` was checked non-null and the ABI requires one writable
+    // result record for this synchronous call.
+    unsafe { out.write(result) };
+    if known {
+        crate::JIT_HELPER_STATUS_FALLBACK
+    } else {
+        -1
+    }
+}
 
 /// Opaque non-zero handle owned by the VM side of the ABI.
 #[repr(transparent)]
@@ -661,13 +831,39 @@ mod tests {
 
     use super::{
         JIT_RUNTIME_ABI_HASH, JIT_RUNTIME_ABI_VERSION, JitCExit, JitCExitTag, JitCFrameView,
-        JitCValue, JitCValueTag, JitFrameHandle, JitFrameView, JitOpaqueHandle, JitOpaqueValueKind,
-        JitSideExit, JitVmContextHandle, SideExitReason,
+        JitCValue, JitCValueTag, JitCallResult, JitCallStatus, JitFrameHandle, JitFrameView,
+        JitOpaqueHandle, JitOpaqueValueKind, JitSideExit, JitVmContextHandle, SideExitReason,
+        helper_id, jit_default_helper_dispatch,
     };
 
     #[test]
+    fn default_helper_dispatch_rejects_invalid_buffers_and_deopts_known_ids() {
+        // SAFETY: null-buffer cases are the explicit negative ABI contract and
+        // the positive case supplies one live caller-owned output record.
+        unsafe {
+            assert_eq!(
+                jit_default_helper_dispatch(
+                    0,
+                    helper_id::STRLEN,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut()
+                ),
+                crate::JIT_HELPER_STATUS_FALLBACK
+            );
+            let mut out = JitCallResult::default();
+            assert_eq!(
+                jit_default_helper_dispatch(0, helper_id::STRLEN, std::ptr::null(), 0, &mut out,),
+                crate::JIT_HELPER_STATUS_FALLBACK
+            );
+            assert_eq!(out.status, JitCallStatus::DEOPT);
+            assert_eq!(out.detail, helper_id::STRLEN);
+        }
+    }
+
+    #[test]
     fn c_abi_layout_is_stable() {
-        assert_eq!(JIT_RUNTIME_ABI_VERSION, 1);
+        assert_eq!(JIT_RUNTIME_ABI_VERSION, 4);
         assert_ne!(JIT_RUNTIME_ABI_HASH, 0);
         assert_eq!(size_of::<JitOpaqueHandle>(), 8);
         assert_eq!(size_of::<JitCValueTag>(), 4);

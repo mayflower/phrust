@@ -19,8 +19,9 @@ use php_ir::{
     instruction::InstructionKind,
 };
 
-/// Small fixed guard-list size for experimental performance polymorphic method and
-/// property inline caches.
+mod method_peek;
+
+/// Fixed guard-list size for experimental polymorphic method/property caches.
 pub const POLYMORPHIC_INLINE_CACHE_LIMIT: usize = 4;
 
 /// Runtime inline-cache mode.
@@ -131,8 +132,7 @@ pub struct InlineCacheStats {
     pub protocol: FallbackProtocolStats,
 }
 
-/// VM-managed builtin groups that are resolved before generic user/internal
-/// function lookup.
+/// VM-managed builtins resolved before generic user/internal function lookup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FunctionCallBuiltinKind {
     AutoloadOrSymbolIntrospection,

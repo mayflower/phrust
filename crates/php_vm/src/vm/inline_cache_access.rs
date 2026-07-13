@@ -514,6 +514,52 @@ impl Vm {
         (target, Some(observation))
     }
 
+    pub(super) fn dense_method_call_inline_cache_has_target(
+        &self,
+        id: InlineCacheId,
+        lowered_method: &str,
+        receiver_class: &str,
+        scope: Option<&str>,
+        epoch: InvalidationEpoch,
+    ) -> bool {
+        self.inline_caches
+            .borrow()
+            .peek_method_call_target_by_id(id, lowered_method, receiver_class, scope, epoch)
+            .is_some()
+    }
+
+    pub(super) fn method_call_inline_cache_has_target(
+        &self,
+        site: IrInlineCacheSite<'_>,
+        lowered_method: &str,
+        receiver_class: &str,
+        scope: Option<&str>,
+        epoch: InvalidationEpoch,
+    ) -> bool {
+        let IrInlineCacheSite {
+            compiled,
+            function,
+            block,
+            instruction,
+            ..
+        } = site;
+        self.method_call_inline_cache_enabled()
+            && self
+                .inline_caches
+                .borrow()
+                .peek_method_call_target(
+                    compiled_unit_cache_key(compiled),
+                    function,
+                    block,
+                    instruction,
+                    lowered_method,
+                    receiver_class,
+                    scope,
+                    epoch,
+                )
+                .is_some()
+    }
+
     pub(super) fn install_dense_method_call_inline_cache(
         &self,
         id: InlineCacheId,

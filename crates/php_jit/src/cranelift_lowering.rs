@@ -5,11 +5,18 @@
 //! dispatch-helper subsets. Native execution is still default-off and requires
 //! the caller to opt in explicitly.
 
+use crate::code_manager::ManagedCompileError;
+use crate::region_ir::{
+    ExecutableRegion, ExecutableRegionInstruction, ExecutableRegionInstructionKind,
+    ExecutableRegionOperand, ExecutableRegionTerminator, RegionBinaryOp, RegionCompareOpCode,
+    build_executable_region,
+};
 use crate::{
-    JIT_HELPER_STATUS_OK, JIT_HELPER_STATUS_OVERFLOW, JIT_RUNTIME_ABI_HASH, JitBackend,
-    JitBackendApi, JitBackendCompileOutcome, JitBackendCompileRequest, JitCompileStatus,
-    JitEligibility, JitFunctionHandle, JitNativeSpecialization, JitPropertyLoadMetadata,
-    analyze_jit_eligibility,
+    CraneliftCodeKey, JIT_HELPER_STATUS_OK, JIT_HELPER_STATUS_OVERFLOW, JIT_RUNTIME_ABI_HASH,
+    JitBackend, JitBackendApi, JitBackendCompileOutcome, JitBackendCompileRequest,
+    JitCompileRequest, JitCompileStatus, JitEligibility, JitFunctionHandle,
+    JitNativeSpecialization, JitPropertyLoadMetadata, ManagedJitFunction, analyze_jit_eligibility,
+    global_code_manager,
 };
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -17,19 +24,21 @@ use cranelift_codegen::ir::{
     UserFuncName, types,
 };
 use cranelift_codegen::isa::CallConv;
-use cranelift_codegen::settings::{self, Configurable};
+use cranelift_codegen::settings;
 use cranelift_codegen::verifier::verify_function;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Linkage, Module, default_libcall_names};
+use cranelift_jit::JITModule;
+use cranelift_module::{FuncId, Linkage, Module};
 use php_ir::instruction::{Terminator, TerminatorKind};
 use php_ir::{
-    BinaryOp, BlockId, CompareOp, FunctionId, Instruction, InstructionKind, IrConstant, IrFunction,
-    IrParam, IrReturnType, IrUnit, LocalId, Operand, RegId,
+    BinaryOp, BlockId, FunctionId, InstructionKind, IrConstant, IrFunction, IrParam, IrReturnType,
+    IrUnit, LocalId, Operand, RegId,
 };
 use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Instant;
+
+mod executable_region;
 
 /// Stable Cranelift lowering result.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,26 +75,64 @@ struct NativeConstantCompileResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct HelperArithmeticCandidate {
-    arity: u8,
-    fast_path_hits: u64,
-    has_control_flow: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct NativeHelperCompileResult {
+struct NativeScalarRegionCompileResult {
     handle: JitFunctionHandle,
     code_bytes: u64,
     fast_path_hits: u64,
     has_control_flow: bool,
 }
 
-fn leak_jit_module_for_handle_lifetime(module: JITModule) {
-    // Keep Cranelift-owned executable memory alive for every copied
-    // `JitFunctionHandle`. performance intentionally leaks the module instead of
-    // exposing a reclamation path that could invalidate raw function pointers.
-    let leaked_module: &'static mut JITModule = Box::leak(Box::new(module));
-    let _ = leaked_module;
+fn compile_managed_native(
+    request: &JitCompileRequest,
+    function: FunctionId,
+    specialization: &str,
+    helpers: &[(&str, usize)],
+    compile: impl FnOnce(
+        &mut JITModule,
+        &str,
+    ) -> Result<(JitFunctionHandle, u64), CraneliftLoweringError>,
+) -> Result<ManagedJitFunction, CraneliftLoweringError> {
+    let compiled_unit = request
+        .ir_fingerprint
+        .clone()
+        .unwrap_or_else(|| format!("unfingerprinted-function-{}", function.raw()));
+    let mut config_hash = if request.config_hash == 0 {
+        let identity = crate::cranelift_host_isa_identity().map_err(|error| {
+            CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_NATIVE_TARGET", error.to_string())
+        })?;
+        identity.feature_fingerprint ^ u64::from(request.opt_level)
+    } else {
+        request.config_hash
+    };
+    for (symbol, address) in helpers {
+        for byte in symbol.as_bytes().iter().chain(address.to_le_bytes().iter()) {
+            config_hash ^= u64::from(*byte);
+            config_hash = config_hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    let key = CraneliftCodeKey {
+        compiled_unit,
+        region: format!("{}:function:{}", request.region_id, function.raw()),
+        abi_hash: JIT_RUNTIME_ABI_HASH,
+        config_hash,
+        invalidation_generation: request.invalidation_generation,
+        specialization: specialization.to_owned(),
+    };
+    let manager = global_code_manager().map_err(|error| {
+        CraneliftLoweringError::new("JIT_CRANELIFT_CODE_MANAGER", error.to_string())
+    })?;
+    manager
+        .compile_once(key, helpers, compile)
+        .map_err(|error| match error {
+            ManagedCompileError::Manager(error) => {
+                CraneliftLoweringError::new("JIT_CRANELIFT_CODE_MANAGER", error.to_string())
+            }
+            ManagedCompileError::Compile(error) => error,
+        })
+}
+
+fn runtime_helper_symbol(base: &str, address: usize) -> String {
+    format!("{base}_{address:016x}")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -227,7 +274,7 @@ impl JitBackendApi for CraneliftNoExecBackend {
                 function,
                 candidate.value,
                 candidate.arity,
-                &request.compile.region_id,
+                request.compile,
             ) {
                 Ok(compiled) => {
                     let elapsed = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
@@ -264,7 +311,7 @@ impl JitBackendApi for CraneliftNoExecBackend {
                 function,
                 &candidate,
                 request.runtime_helpers.packed_array_fetch_int_slow,
-                &request.compile.region_id,
+                request.compile,
             ) {
                 Ok(compiled) => {
                     let elapsed = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
@@ -302,7 +349,7 @@ impl JitBackendApi for CraneliftNoExecBackend {
                 &candidate,
                 request.runtime_helpers.packed_array_len,
                 request.runtime_helpers.packed_array_fetch_int_slow,
-                &request.compile.region_id,
+                request.compile,
             ) {
                 Ok(compiled) => {
                     let elapsed = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
@@ -339,12 +386,7 @@ impl JitBackendApi for CraneliftNoExecBackend {
                 KnownCallKind::Count => request.runtime_helpers.known_count,
             };
             let start = Instant::now();
-            match compile_known_call_native(
-                function,
-                &candidate,
-                helper_address,
-                &request.compile.region_id,
-            ) {
+            match compile_known_call_native(function, &candidate, helper_address, request.compile) {
                 Ok(compiled) => {
                     let elapsed = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
                     return JitBackendCompileOutcome::compiled(
@@ -382,7 +424,7 @@ impl JitBackendApi for CraneliftNoExecBackend {
                 function,
                 &candidate,
                 request.runtime_helpers.string_concat,
-                &request.compile.region_id,
+                request.compile,
             ) {
                 Ok(compiled) => {
                     let elapsed = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
@@ -420,7 +462,7 @@ impl JitBackendApi for CraneliftNoExecBackend {
                 function,
                 &candidate,
                 request.runtime_helpers.record_array_lookup,
-                &request.compile.region_id,
+                request.compile,
             ) {
                 Ok(compiled) => {
                     let elapsed = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
@@ -458,7 +500,7 @@ impl JitBackendApi for CraneliftNoExecBackend {
                 function,
                 &candidate,
                 request.runtime_helpers.property_load,
-                &request.compile.region_id,
+                request.compile,
             ) {
                 Ok(compiled) => {
                     let elapsed = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
@@ -492,22 +534,19 @@ impl JitBackendApi for CraneliftNoExecBackend {
             }
         }
 
-        if let Ok(candidate) = helper_arithmetic_candidate(unit, function) {
+        if let Ok(region) = build_executable_region(unit, function) {
             let start = Instant::now();
-            match compile_helper_arithmetic_native(
+            match executable_region::compile_executable_region_native(
                 unit,
-                function,
-                candidate.arity,
-                candidate.fast_path_hits,
-                candidate.has_control_flow,
-                &request.compile.region_id,
+                &region,
+                request.compile,
             ) {
                 Ok(compiled) => {
                     let elapsed = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
                     return JitBackendCompileOutcome::compiled(
                         compiled.handle,
                         format!(
-                            "Cranelift native inline-arithmetic region `{}` function={} abi_hash={} code_bytes={} fast_path_hits={} control_flow={}",
+                            "Cranelift executable Region IR `{}` function={} abi_hash={} code_bytes={} fast_path_hits={} control_flow={}",
                             request.compile.region_id,
                             function.raw(),
                             JIT_RUNTIME_ABI_HASH,
@@ -525,7 +564,7 @@ impl JitBackendApi for CraneliftNoExecBackend {
                             reason: error.code.to_owned(),
                         },
                         format!(
-                            "Cranelift native inline-arithmetic compile rejected region `{}`: {}",
+                            "Cranelift executable Region IR compile rejected region `{}`: {}",
                             request.compile.region_id, error
                         ),
                     );
@@ -540,7 +579,7 @@ impl JitBackendApi for CraneliftNoExecBackend {
                         .to_owned(),
                 },
                 format!(
-                    "Cranelift backend verified region `{}` function={} clif_bytes={} blocks={} instructions={} native_subset=constant-return-or-inline-arithmetic",
+                    "Cranelift backend verified region `{}` function={} clif_bytes={} blocks={} instructions={} native_subset=unsupported-php-shape",
                     request.compile.region_id,
                     function.raw(),
                     result.clif.len(),
@@ -1028,144 +1067,6 @@ fn constant_operand_value(
             ),
         )),
     }
-}
-
-fn helper_arithmetic_candidate(
-    unit: &IrUnit,
-    function: FunctionId,
-) -> Result<HelperArithmeticCandidate, CraneliftLoweringError> {
-    let ir_function = unit.functions.get(function.index()).ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_MISSING_FUNCTION",
-            format!("function id {} is not present", function.raw()),
-        )
-    })?;
-    if ir_function.flags.is_top_level
-        || ir_function.flags.is_closure
-        || ir_function.flags.is_method
-        || ir_function.flags.is_generator
-        || ir_function.returns_by_ref
-        || !ir_function.captures.is_empty()
-    {
-        return Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_HELPER_SHAPE",
-            "inline-arithmetic native subset only accepts ordinary leaf functions",
-        ));
-    }
-    if !matches!(
-        ir_function.return_type.as_ref(),
-        Some(php_ir::IrReturnType::Int)
-    ) {
-        return Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_HELPER_RETURN_TYPE",
-            "inline-arithmetic native subset requires explicit int return type",
-        ));
-    }
-    let arity: u8 = ir_function.params.len().try_into().map_err(|_| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_HELPER_ARITY",
-            "inline-arithmetic native subset supports at most 255 params",
-        )
-    })?;
-    if arity > 4 {
-        return Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_HELPER_ARITY",
-            "inline-arithmetic native subset supports at most four params",
-        ));
-    }
-    for param in &ir_function.params {
-        if param.by_ref
-            || param.variadic
-            || param.default.is_some()
-            || !matches!(param.type_.as_ref(), Some(php_ir::IrReturnType::Int))
-        {
-            return Err(CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_HELPER_PARAM",
-                "inline-arithmetic native subset requires plain int params",
-            ));
-        }
-    }
-    let mut fast_path_hits = 0_u64;
-    let has_control_flow = ir_function.blocks.len() > 1;
-    for block in &ir_function.blocks {
-        for instruction in &block.instructions {
-            match &instruction.kind {
-                InstructionKind::Nop
-                | InstructionKind::LoadConst { .. }
-                | InstructionKind::Move { .. }
-                | InstructionKind::LoadLocal { .. }
-                | InstructionKind::LoadLocalQuiet { .. }
-                | InstructionKind::StoreLocal { .. }
-                | InstructionKind::Discard { .. } => {}
-                InstructionKind::Binary { op, .. } => match op {
-                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => fast_path_hits += 1,
-                    other => {
-                        return Err(CraneliftLoweringError::new(
-                            "JIT_CRANELIFT_REJECT_HELPER_BINARY",
-                            format!("binary op {other:?} is outside inline-arithmetic subset"),
-                        ));
-                    }
-                },
-                InstructionKind::Compare { op, .. } => match op {
-                    CompareOp::Equal
-                    | CompareOp::NotEqual
-                    | CompareOp::Identical
-                    | CompareOp::NotIdentical
-                    | CompareOp::Less
-                    | CompareOp::LessEqual
-                    | CompareOp::Greater
-                    | CompareOp::GreaterEqual => fast_path_hits += 1,
-                    other => {
-                        return Err(CraneliftLoweringError::new(
-                            "JIT_CRANELIFT_REJECT_HELPER_COMPARE",
-                            format!("compare op {other:?} is outside inline-arithmetic subset"),
-                        ));
-                    }
-                },
-                other => {
-                    return Err(CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_HELPER_OPCODE",
-                        format!("instruction {other:?} is outside inline-arithmetic native subset"),
-                    ));
-                }
-            }
-        }
-        match &block.terminator {
-            Some(terminator) => match &terminator.kind {
-                TerminatorKind::Jump { .. }
-                | TerminatorKind::JumpIfFalse { .. }
-                | TerminatorKind::JumpIfTrue { .. }
-                | TerminatorKind::JumpIf { .. } => {}
-                TerminatorKind::Return {
-                    value: Some(_),
-                    by_ref_local: None,
-                } => {}
-                other => {
-                    return Err(CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_HELPER_TERMINATOR",
-                        format!("terminator {other:?} is outside inline-arithmetic native subset"),
-                    ));
-                }
-            },
-            None => {
-                return Err(CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_HELPER_TERMINATOR",
-                    "inline-arithmetic native subset requires terminators",
-                ));
-            }
-        }
-    }
-    if fast_path_hits == 0 {
-        return Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_HELPER_NO_CALLS",
-            "inline-arithmetic native subset requires add, sub, mul, or compare",
-        ));
-    }
-    Ok(HelperArithmeticCandidate {
-        arity,
-        fast_path_hits,
-        has_control_flow,
-    })
 }
 
 fn packed_array_fetch_candidate(
@@ -1965,7 +1866,7 @@ fn compile_record_array_lookup_native(
     function: FunctionId,
     _candidate: &RecordArrayLookupCandidate,
     helper_address: usize,
-    region_id: &str,
+    request: &JitCompileRequest,
 ) -> Result<NativeRecordArrayLookupCompileResult, CraneliftLoweringError> {
     if helper_address == 0 {
         return Err(CraneliftLoweringError::new(
@@ -1974,135 +1875,109 @@ fn compile_record_array_lookup_native(
         ));
     }
 
-    let mut flag_builder = settings::builder();
-    flag_builder
-        .set("use_colocated_libcalls", "false")
-        .map_err(|error| {
-            CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
-        })?;
-    flag_builder.set("is_pic", "false").map_err(|error| {
-        CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
-    })?;
-    let isa_builder = cranelift_native::builder().map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
-            format!("host target is unsupported: {error}"),
-        )
-    })?;
-    let isa = isa_builder
-        .finish(settings::Flags::new(flag_builder))
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
-                format!("host ISA setup failed: {error}"),
-            )
-        })?;
-    let mut jit_builder = JITBuilder::with_isa(isa, default_libcall_names());
-    jit_builder.symbol(
-        RECORD_ARRAY_LOOKUP_HELPER_SYMBOL,
-        helper_address as *const u8,
-    );
-    let mut module = JITModule::new(jit_builder);
-    let pointer_type = module.target_config().pointer_type();
+    let helper_symbol = runtime_helper_symbol(RECORD_ARRAY_LOOKUP_HELPER_SYMBOL, helper_address);
+    let compiled = compile_managed_native(
+        request,
+        function,
+        "record-array-lookup-v1",
+        &[(helper_symbol.as_str(), helper_address)],
+        |module, name| {
+            let pointer_type = module.target_config().pointer_type();
 
-    let mut helper_signature = module.make_signature();
-    helper_signature.params.push(AbiParam::new(pointer_type));
-    helper_signature.params.push(AbiParam::new(pointer_type));
-    helper_signature.params.push(AbiParam::new(pointer_type));
-    helper_signature.returns.push(AbiParam::new(types::I32));
-    let helper = module
-        .declare_function(
-            RECORD_ARRAY_LOOKUP_HELPER_SYMBOL,
-            Linkage::Import,
-            &helper_signature,
-        )
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_DECLARE",
-                format!("failed to declare record-lookup helper import: {error}"),
-            )
-        })?;
+            let mut helper_signature = module.make_signature();
+            helper_signature.params.push(AbiParam::new(pointer_type));
+            helper_signature.params.push(AbiParam::new(pointer_type));
+            helper_signature.params.push(AbiParam::new(pointer_type));
+            helper_signature.returns.push(AbiParam::new(types::I32));
+            let helper = module
+                .declare_function(&helper_symbol, Linkage::Import, &helper_signature)
+                .map_err(|error| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DECLARE",
+                        format!("failed to declare record-lookup helper import: {error}"),
+                    )
+                })?;
 
-    let mut signature = module.make_signature();
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.returns.push(AbiParam::new(types::I32));
+            let mut signature = module.make_signature();
+            signature.params.push(AbiParam::new(pointer_type));
+            signature.params.push(AbiParam::new(pointer_type));
+            signature.params.push(AbiParam::new(pointer_type));
+            signature.returns.push(AbiParam::new(types::I32));
 
-    let name = format!(
-        "phrust_cl_record_lookup_{}_{}",
-        function.raw(),
-        sanitize_symbol_component(region_id)
-    );
-    let func_id = module
-        .declare_function(&name, Linkage::Local, &signature)
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_DECLARE",
-                format!("failed to declare native record-lookup function: {error}"),
-            )
-        })?;
-    let mut ctx = module.make_context();
-    ctx.func.signature = signature;
-    ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+            let func_id = module
+                .declare_function(name, Linkage::Local, &signature)
+                .map_err(|error| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DECLARE",
+                        format!("failed to declare native record-lookup function: {error}"),
+                    )
+                })?;
+            let mut ctx = module.make_context();
+            ctx.func.signature = signature;
+            ctx.func.name = UserFuncName::user(0, func_id.as_u32());
 
-    let mut builder_context = FunctionBuilderContext::new();
-    {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
-        let entry = builder.create_block();
-        builder.append_block_params_for_function_params(entry);
-        builder.switch_to_block(entry);
-        let params = builder.block_params(entry).to_vec();
-        let array_ptr = params[0];
-        let key_ptr = params[1];
-        let out_ptr = params[2];
-        let helper_ref = module.declare_func_in_func(helper, builder.func);
-        let call = builder
-            .ins()
-            .call(helper_ref, &[array_ptr, key_ptr, out_ptr]);
-        let status = builder.inst_results(call)[0];
-        builder.ins().return_(&[status]);
-        builder.seal_block(entry);
-        builder.finalize();
-    }
+            let mut builder_context = FunctionBuilderContext::new();
+            {
+                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
+                let entry = builder.create_block();
+                builder.append_block_params_for_function_params(entry);
+                builder.switch_to_block(entry);
+                let params = builder.block_params(entry).to_vec();
+                let array_ptr = params[0];
+                let key_ptr = params[1];
+                let out_ptr = params[2];
+                let helper_ref = module.declare_func_in_func(helper, builder.func);
+                let call = builder
+                    .ins()
+                    .call(helper_ref, &[array_ptr, key_ptr, out_ptr]);
+                let status = builder.inst_results(call)[0];
+                builder.ins().return_(&[status]);
+                builder.seal_block(entry);
+                builder.finalize();
+            }
 
-    let verifier_flags = settings::Flags::new(settings::builder());
-    verify_function(&ctx.func, &verifier_flags).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_VERIFIER",
-            format!("Cranelift verifier rejected native record-lookup IR: {error}"),
-        )
-    })?;
-    module.define_function(func_id, &mut ctx).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_DEFINE",
-            format!("failed to define native record-lookup function: {error}"),
-        )
-    })?;
-    let code_bytes = ctx
-        .compiled_code()
-        .map(|compiled| compiled.code_buffer().len() as u64)
-        .unwrap_or(0);
-    module.clear_context(&mut ctx);
-    module.finalize_definitions().map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_FINALIZE",
-            format!("failed to finalize native record-lookup function: {error}"),
-        )
-    })?;
-    let address = module.get_finalized_function(func_id) as usize;
-    leak_jit_module_for_handle_lifetime(module);
-    let handle = JitFunctionHandle::value_value_status_out_native(
-        u64::from(function.raw()) + 1,
-        region_id.to_owned(),
-        JitBackend::CraneliftExperiment,
-        address,
-        code_bytes,
-        1,
-        1,
-        JitNativeSpecialization::RecordArrayLookup,
-    );
-    Ok(NativeRecordArrayLookupCompileResult { handle, code_bytes })
+            let verifier_flags = settings::Flags::new(settings::builder());
+            verify_function(&ctx.func, &verifier_flags).map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_VERIFIER",
+                    format!("Cranelift verifier rejected native record-lookup IR: {error}"),
+                )
+            })?;
+            module.define_function(func_id, &mut ctx).map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_DEFINE",
+                    format!("failed to define native record-lookup function: {error}"),
+                )
+            })?;
+            let code_bytes = ctx
+                .compiled_code()
+                .map(|compiled| compiled.code_buffer().len() as u64)
+                .unwrap_or(0);
+            module.clear_context(&mut ctx);
+            module.finalize_definitions().map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FINALIZE",
+                    format!("failed to finalize native record-lookup function: {error}"),
+                )
+            })?;
+            let address = module.get_finalized_function(func_id) as usize;
+            let handle = JitFunctionHandle::value_value_status_out_native(
+                u64::from(function.raw()) + 1,
+                request.region_id.clone(),
+                JitBackend::CraneliftExperiment,
+                address,
+                code_bytes,
+                1,
+                1,
+                JitNativeSpecialization::RecordArrayLookup,
+            );
+            Ok((handle, code_bytes))
+        },
+    )?;
+    Ok(NativeRecordArrayLookupCompileResult {
+        handle: compiled.handle,
+        code_bytes: compiled.code_bytes,
+    })
 }
 
 fn string_concat_candidate(
@@ -2510,268 +2385,76 @@ fn compile_constant_return_native(
     function: FunctionId,
     value: i64,
     arity: u8,
-    region_id: &str,
+    request: &JitCompileRequest,
 ) -> Result<NativeConstantCompileResult, CraneliftLoweringError> {
-    let mut flag_builder = settings::builder();
-    flag_builder
-        .set("use_colocated_libcalls", "false")
-        .map_err(|error| {
-            CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
-        })?;
-    flag_builder.set("is_pic", "false").map_err(|error| {
-        CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
-    })?;
-    let isa_builder = cranelift_native::builder().map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
-            format!("host target is unsupported: {error}"),
-        )
-    })?;
-    let isa = isa_builder
-        .finish(settings::Flags::new(flag_builder))
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
-                format!("host ISA setup failed: {error}"),
-            )
-        })?;
-    let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
-    let mut signature = module.make_signature();
-    for _ in 0..arity {
-        signature.params.push(AbiParam::new(types::I64));
-    }
-    signature.returns.push(AbiParam::new(types::I64));
-
-    let name = format!(
-        "phrust_cl_const_{}_{}",
-        function.raw(),
-        sanitize_symbol_component(region_id)
-    );
-    let func_id = module
-        .declare_function(&name, Linkage::Local, &signature)
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_DECLARE",
-                format!("failed to declare native function: {error}"),
-            )
-        })?;
-    let mut ctx = module.make_context();
-    ctx.func.signature = signature;
-    ctx.func.name = UserFuncName::user(0, func_id.as_u32());
-    let mut builder_context = FunctionBuilderContext::new();
-    {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
-        let block = builder.create_block();
-        builder.append_block_params_for_function_params(block);
-        builder.switch_to_block(block);
-        builder.seal_block(block);
-        let constant = builder.ins().iconst(types::I64, value);
-        builder.ins().return_(&[constant]);
-        builder.finalize();
-    }
-    let verifier_flags = settings::Flags::new(settings::builder());
-    verify_function(&ctx.func, &verifier_flags).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_VERIFIER",
-            format!("Cranelift verifier rejected native constant-return IR: {error}"),
-        )
-    })?;
-    module.define_function(func_id, &mut ctx).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_DEFINE",
-            format!("failed to define native function: {error}"),
-        )
-    })?;
-    let code_bytes = ctx
-        .compiled_code()
-        .map(|compiled| compiled.code_buffer().len() as u64)
-        .unwrap_or(0);
-    module.clear_context(&mut ctx);
-    module.finalize_definitions().map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_FINALIZE",
-            format!("failed to finalize native function: {error}"),
-        )
-    })?;
-    let address = module.get_finalized_function(func_id) as usize;
-    leak_jit_module_for_handle_lifetime(module);
-    let handle = JitFunctionHandle::i64_native(
-        u64::from(function.raw()) + 1,
-        region_id.to_owned(),
-        JitBackend::CraneliftExperiment,
-        address,
-        arity,
-        code_bytes,
-    );
-    Ok(NativeConstantCompileResult { handle, code_bytes })
-}
-
-fn compile_helper_arithmetic_native(
-    unit: &IrUnit,
-    function: FunctionId,
-    arity: u8,
-    fast_path_hits: u64,
-    has_control_flow: bool,
-    region_id: &str,
-) -> Result<NativeHelperCompileResult, CraneliftLoweringError> {
-    let ir_function = unit.functions.get(function.index()).ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_MISSING_FUNCTION",
-            format!("function id {} is not present", function.raw()),
-        )
-    })?;
-    let mut flag_builder = settings::builder();
-    flag_builder
-        .set("use_colocated_libcalls", "false")
-        .map_err(|error| {
-            CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
-        })?;
-    flag_builder.set("is_pic", "false").map_err(|error| {
-        CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
-    })?;
-    let isa_builder = cranelift_native::builder().map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
-            format!("host target is unsupported: {error}"),
-        )
-    })?;
-    let isa = isa_builder
-        .finish(settings::Flags::new(flag_builder))
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
-                format!("host ISA setup failed: {error}"),
-            )
-        })?;
-    let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
-    let pointer_type = module.target_config().pointer_type();
-
-    let mut signature = module.make_signature();
-    for _ in 0..arity {
-        signature.params.push(AbiParam::new(types::I64));
-    }
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.returns.push(AbiParam::new(types::I32));
-
-    let name = format!(
-        "phrust_cl_helper_{}_{}",
-        function.raw(),
-        sanitize_symbol_component(region_id)
-    );
-    let func_id = module
-        .declare_function(&name, Linkage::Local, &signature)
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_DECLARE",
-                format!("failed to declare native function: {error}"),
-            )
-        })?;
-    let mut ctx = module.make_context();
-    ctx.func.signature = signature;
-    ctx.func.name = UserFuncName::user(0, func_id.as_u32());
-
-    let mut builder_context = FunctionBuilderContext::new();
-    {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
-        let blocks = create_cranelift_blocks(&mut builder, ir_function)?;
-        let entry = blocks.first().copied().ok_or_else(|| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_HELPER_CONTROL_FLOW",
-                "inline-arithmetic native subset requires at least one block",
-            )
-        })?;
-        builder.append_block_params_for_function_params(entry);
-        builder.switch_to_block(entry);
-        let params = builder.block_params(entry).to_vec();
-        let result_out = params.get(usize::from(arity)).copied().ok_or_else(|| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_HELPER_ARITY",
-                "missing native output pointer parameter",
-            )
-        })?;
-        let mut locals = BTreeMap::new();
-        for local_index in 0..ir_function.local_count {
-            locals.insert(LocalId::new(local_index), builder.declare_var(types::I64));
-        }
-        for (param, cl_value) in ir_function
-            .params
-            .iter()
-            .zip(params.iter().copied().take(usize::from(arity)))
-        {
-            let variable = local_variable(&locals, param.local)?;
-            builder.def_var(variable, cl_value);
-        }
-
-        for ir_block in &ir_function.blocks {
-            let block = cranelift_block(&blocks, ir_block.id)?;
-            builder.switch_to_block(block);
-            let mut registers = BTreeMap::new();
-            for instruction in &ir_block.instructions {
-                lower_inline_cfg_instruction(
-                    &mut builder,
-                    unit,
-                    &locals,
-                    &mut registers,
-                    instruction,
-                )?;
+    let compiled =
+        compile_managed_native(request, function, "constant-v1", &[], |module, name| {
+            let mut signature = module.make_signature();
+            for _ in 0..arity {
+                signature.params.push(AbiParam::new(types::I64));
             }
-            lower_inline_cfg_terminator(
-                &mut builder,
-                unit,
-                ir_function,
-                &blocks,
-                &locals,
-                &registers,
-                result_out,
-                ir_block.id,
-                ir_block.terminator.as_ref(),
-            )?;
-        }
-        builder.seal_all_blocks();
-        builder.finalize();
-    }
+            signature.returns.push(AbiParam::new(types::I64));
 
-    let verifier_flags = settings::Flags::new(settings::builder());
-    verify_function(&ctx.func, &verifier_flags).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_VERIFIER",
-            format!("Cranelift verifier rejected native inline-arithmetic IR: {error}"),
-        )
-    })?;
-    module.define_function(func_id, &mut ctx).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_DEFINE",
-            format!("failed to define native function: {error}"),
-        )
-    })?;
-    let code_bytes = ctx
-        .compiled_code()
-        .map(|compiled| compiled.code_buffer().len() as u64)
-        .unwrap_or(0);
-    module.clear_context(&mut ctx);
-    module.finalize_definitions().map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_FINALIZE",
-            format!("failed to finalize native function: {error}"),
-        )
-    })?;
-    let address = module.get_finalized_function(func_id) as usize;
-    leak_jit_module_for_handle_lifetime(module);
-    let handle = JitFunctionHandle::i64_status_out_native(
-        u64::from(function.raw()) + 1,
-        region_id.to_owned(),
-        JitBackend::CraneliftExperiment,
-        address,
-        arity,
-        code_bytes,
-        0,
-        fast_path_hits,
-    );
-    Ok(NativeHelperCompileResult {
-        handle,
-        code_bytes,
-        fast_path_hits,
-        has_control_flow,
+            let func_id = module
+                .declare_function(name, Linkage::Local, &signature)
+                .map_err(|error| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DECLARE",
+                        format!("failed to declare native function: {error}"),
+                    )
+                })?;
+            let mut ctx = module.make_context();
+            ctx.func.signature = signature;
+            ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+            let mut builder_context = FunctionBuilderContext::new();
+            {
+                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
+                let block = builder.create_block();
+                builder.append_block_params_for_function_params(block);
+                builder.switch_to_block(block);
+                builder.seal_block(block);
+                let constant = builder.ins().iconst(types::I64, value);
+                builder.ins().return_(&[constant]);
+                builder.finalize();
+            }
+            let verifier_flags = settings::Flags::new(settings::builder());
+            verify_function(&ctx.func, &verifier_flags).map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_VERIFIER",
+                    format!("Cranelift verifier rejected native constant-return IR: {error}"),
+                )
+            })?;
+            module.define_function(func_id, &mut ctx).map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_DEFINE",
+                    format!("failed to define native function: {error}"),
+                )
+            })?;
+            let code_bytes = ctx
+                .compiled_code()
+                .map(|compiled| compiled.code_buffer().len() as u64)
+                .unwrap_or(0);
+            module.clear_context(&mut ctx);
+            module.finalize_definitions().map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FINALIZE",
+                    format!("failed to finalize native function: {error}"),
+                )
+            })?;
+            let address = module.get_finalized_function(func_id) as usize;
+            let handle = JitFunctionHandle::i64_native(
+                u64::from(function.raw()) + 1,
+                request.region_id.clone(),
+                JitBackend::CraneliftExperiment,
+                address,
+                arity,
+                code_bytes,
+            );
+            Ok((handle, code_bytes))
+        })?;
+    Ok(NativeConstantCompileResult {
+        handle: compiled.handle,
+        code_bytes: compiled.code_bytes,
     })
 }
 
@@ -2779,7 +2462,7 @@ fn compile_packed_array_fetch_native(
     function: FunctionId,
     _candidate: &PackedArrayFetchCandidate,
     helper_address: usize,
-    region_id: &str,
+    request: &JitCompileRequest,
 ) -> Result<NativePackedArrayFetchCompileResult, CraneliftLoweringError> {
     if helper_address == 0 {
         return Err(CraneliftLoweringError::new(
@@ -2788,158 +2471,132 @@ fn compile_packed_array_fetch_native(
         ));
     }
 
-    let mut flag_builder = settings::builder();
-    flag_builder
-        .set("use_colocated_libcalls", "false")
-        .map_err(|error| {
-            CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
-        })?;
-    flag_builder.set("is_pic", "false").map_err(|error| {
-        CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
-    })?;
-    let isa_builder = cranelift_native::builder().map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
-            format!("host target is unsupported: {error}"),
-        )
-    })?;
-    let isa = isa_builder
-        .finish(settings::Flags::new(flag_builder))
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
-                format!("host ISA setup failed: {error}"),
-            )
-        })?;
-    let mut jit_builder = JITBuilder::with_isa(isa, default_libcall_names());
-    jit_builder.symbol(
-        PACKED_ARRAY_FETCH_HELPER_SYMBOL,
-        helper_address as *const u8,
-    );
-    let mut module = JITModule::new(jit_builder);
-    let pointer_type = module.target_config().pointer_type();
+    let helper_symbol = runtime_helper_symbol(PACKED_ARRAY_FETCH_HELPER_SYMBOL, helper_address);
+    let compiled = compile_managed_native(
+        request,
+        function,
+        "packed-array-fetch-v1",
+        &[(helper_symbol.as_str(), helper_address)],
+        |module, name| {
+            let pointer_type = module.target_config().pointer_type();
 
-    let mut helper_signature = module.make_signature();
-    helper_signature.params.push(AbiParam::new(pointer_type));
-    helper_signature.params.push(AbiParam::new(types::I64));
-    helper_signature.params.push(AbiParam::new(pointer_type));
-    helper_signature.returns.push(AbiParam::new(types::I32));
-    let helper_func = module
-        .declare_function(
-            PACKED_ARRAY_FETCH_HELPER_SYMBOL,
-            Linkage::Import,
-            &helper_signature,
-        )
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_DECLARE",
-                format!("failed to declare packed-array helper import: {error}"),
-            )
-        })?;
+            let mut helper_signature = module.make_signature();
+            helper_signature.params.push(AbiParam::new(pointer_type));
+            helper_signature.params.push(AbiParam::new(types::I64));
+            helper_signature.params.push(AbiParam::new(pointer_type));
+            helper_signature.returns.push(AbiParam::new(types::I32));
+            let helper_func = module
+                .declare_function(&helper_symbol, Linkage::Import, &helper_signature)
+                .map_err(|error| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DECLARE",
+                        format!("failed to declare packed-array helper import: {error}"),
+                    )
+                })?;
 
-    let mut signature = module.make_signature();
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.params.push(AbiParam::new(types::I64));
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.returns.push(AbiParam::new(types::I32));
+            let mut signature = module.make_signature();
+            signature.params.push(AbiParam::new(pointer_type));
+            signature.params.push(AbiParam::new(types::I64));
+            signature.params.push(AbiParam::new(pointer_type));
+            signature.returns.push(AbiParam::new(types::I32));
 
-    let name = format!(
-        "phrust_cl_packed_fetch_{}_{}",
-        function.raw(),
-        sanitize_symbol_component(region_id)
-    );
-    let func_id = module
-        .declare_function(&name, Linkage::Local, &signature)
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_DECLARE",
-                format!("failed to declare native packed-array fetch function: {error}"),
-            )
-        })?;
-    let mut ctx = module.make_context();
-    ctx.func.signature = signature;
-    ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+            let func_id = module
+                .declare_function(name, Linkage::Local, &signature)
+                .map_err(|error| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DECLARE",
+                        format!("failed to declare native packed-array fetch function: {error}"),
+                    )
+                })?;
+            let mut ctx = module.make_context();
+            ctx.func.signature = signature;
+            ctx.func.name = UserFuncName::user(0, func_id.as_u32());
 
-    let mut builder_context = FunctionBuilderContext::new();
-    {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
-        let entry = builder.create_block();
-        let bounds_exit = builder.create_block();
-        let helper_call = builder.create_block();
-        builder.append_block_params_for_function_params(entry);
+            let mut builder_context = FunctionBuilderContext::new();
+            {
+                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
+                let entry = builder.create_block();
+                let bounds_exit = builder.create_block();
+                let helper_call = builder.create_block();
+                builder.append_block_params_for_function_params(entry);
 
-        builder.switch_to_block(entry);
-        let params = builder.block_params(entry).to_vec();
-        let value_ptr = params[0];
-        let index = params[1];
-        let out_ptr = params[2];
-        let negative_index = builder.ins().icmp_imm(IntCC::SignedLessThan, index, 0);
-        builder
-            .ins()
-            .brif(negative_index, bounds_exit, &[], helper_call, &[]);
+                builder.switch_to_block(entry);
+                let params = builder.block_params(entry).to_vec();
+                let value_ptr = params[0];
+                let index = params[1];
+                let out_ptr = params[2];
+                let negative_index = builder.ins().icmp_imm(IntCC::SignedLessThan, index, 0);
+                builder
+                    .ins()
+                    .brif(negative_index, bounds_exit, &[], helper_call, &[]);
 
-        builder.switch_to_block(bounds_exit);
-        builder.seal_block(bounds_exit);
-        let status = builder
-            .ins()
-            .iconst(types::I32, i64::from(JIT_PACKED_ARRAY_STATUS_BOUNDS_EXIT));
-        builder.ins().return_(&[status]);
+                builder.switch_to_block(bounds_exit);
+                builder.seal_block(bounds_exit);
+                let status = builder
+                    .ins()
+                    .iconst(types::I32, i64::from(JIT_PACKED_ARRAY_STATUS_BOUNDS_EXIT));
+                builder.ins().return_(&[status]);
 
-        builder.switch_to_block(helper_call);
-        builder.seal_block(helper_call);
-        let helper_ref = module.declare_func_in_func(helper_func, builder.func);
-        let call = builder.ins().call(helper_ref, &[value_ptr, index, out_ptr]);
-        let status = builder.inst_results(call)[0];
-        builder.ins().return_(&[status]);
+                builder.switch_to_block(helper_call);
+                builder.seal_block(helper_call);
+                let helper_ref = module.declare_func_in_func(helper_func, builder.func);
+                let call = builder.ins().call(helper_ref, &[value_ptr, index, out_ptr]);
+                let status = builder.inst_results(call)[0];
+                builder.ins().return_(&[status]);
 
-        builder.seal_block(entry);
-        builder.finalize();
-    }
+                builder.seal_block(entry);
+                builder.finalize();
+            }
 
-    let verifier_flags = settings::Flags::new(settings::builder());
-    verify_function(&ctx.func, &verifier_flags).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_VERIFIER",
-            format!("Cranelift verifier rejected native packed-array fetch IR: {error}"),
-        )
-    })?;
-    module.define_function(func_id, &mut ctx).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_DEFINE",
-            format!("failed to define native packed-array fetch function: {error}"),
-        )
-    })?;
-    let code_bytes = ctx
-        .compiled_code()
-        .map(|compiled| compiled.code_buffer().len() as u64)
-        .unwrap_or(0);
-    module.clear_context(&mut ctx);
-    module.finalize_definitions().map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_FINALIZE",
-            format!("failed to finalize native packed-array fetch function: {error}"),
-        )
-    })?;
-    let address = module.get_finalized_function(func_id) as usize;
-    leak_jit_module_for_handle_lifetime(module);
-    let handle = JitFunctionHandle::value_i64_status_out_native(
-        u64::from(function.raw()) + 1,
-        region_id.to_owned(),
-        JitBackend::CraneliftExperiment,
-        address,
-        code_bytes,
-        1,
-        1,
-    );
-    Ok(NativePackedArrayFetchCompileResult { handle, code_bytes })
+            let verifier_flags = settings::Flags::new(settings::builder());
+            verify_function(&ctx.func, &verifier_flags).map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_VERIFIER",
+                    format!("Cranelift verifier rejected native packed-array fetch IR: {error}"),
+                )
+            })?;
+            module.define_function(func_id, &mut ctx).map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_DEFINE",
+                    format!("failed to define native packed-array fetch function: {error}"),
+                )
+            })?;
+            let code_bytes = ctx
+                .compiled_code()
+                .map(|compiled| compiled.code_buffer().len() as u64)
+                .unwrap_or(0);
+            module.clear_context(&mut ctx);
+            module.finalize_definitions().map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FINALIZE",
+                    format!("failed to finalize native packed-array fetch function: {error}"),
+                )
+            })?;
+            let address = module.get_finalized_function(func_id) as usize;
+            let handle = JitFunctionHandle::value_i64_status_out_native(
+                u64::from(function.raw()) + 1,
+                request.region_id.clone(),
+                JitBackend::CraneliftExperiment,
+                address,
+                code_bytes,
+                1,
+                1,
+            );
+            Ok((handle, code_bytes))
+        },
+    )?;
+    Ok(NativePackedArrayFetchCompileResult {
+        handle: compiled.handle,
+        code_bytes: compiled.code_bytes,
+    })
 }
 
 fn compile_packed_foreach_int_sum_native(
     function: FunctionId,
-    candidate: &PackedForeachIntSumCandidate,
+    _candidate: &PackedForeachIntSumCandidate,
     len_helper_address: usize,
     fetch_helper_address: usize,
-    region_id: &str,
+    request: &JitCompileRequest,
 ) -> Result<NativePackedForeachIntSumCompileResult, CraneliftLoweringError> {
     if len_helper_address == 0 || fetch_helper_address == 0 {
         return Err(CraneliftLoweringError::new(
@@ -2948,270 +2605,247 @@ fn compile_packed_foreach_int_sum_native(
         ));
     }
 
-    let mut flag_builder = settings::builder();
-    flag_builder
-        .set("use_colocated_libcalls", "false")
-        .map_err(|error| {
-            CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
-        })?;
-    flag_builder.set("is_pic", "false").map_err(|error| {
-        CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
-    })?;
-    let isa_builder = cranelift_native::builder().map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
-            format!("host target is unsupported: {error}"),
-        )
-    })?;
-    let isa = isa_builder
-        .finish(settings::Flags::new(flag_builder))
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
-                format!("host ISA setup failed: {error}"),
-            )
-        })?;
-    let mut jit_builder = JITBuilder::with_isa(isa, default_libcall_names());
-    jit_builder.symbol(
-        PACKED_ARRAY_LEN_HELPER_SYMBOL,
-        len_helper_address as *const u8,
-    );
-    jit_builder.symbol(
-        PACKED_ARRAY_FETCH_HELPER_SYMBOL,
-        fetch_helper_address as *const u8,
-    );
-    let mut module = JITModule::new(jit_builder);
-    let pointer_type = module.target_config().pointer_type();
+    let len_helper_symbol =
+        runtime_helper_symbol(PACKED_ARRAY_LEN_HELPER_SYMBOL, len_helper_address);
+    let fetch_helper_symbol =
+        runtime_helper_symbol(PACKED_ARRAY_FETCH_HELPER_SYMBOL, fetch_helper_address);
+    let compiled = compile_managed_native(
+        request,
+        function,
+        "packed-foreach-int-sum-v1",
+        &[
+            (len_helper_symbol.as_str(), len_helper_address),
+            (fetch_helper_symbol.as_str(), fetch_helper_address),
+        ],
+        |module, name| {
+            let pointer_type = module.target_config().pointer_type();
 
-    let mut len_signature = module.make_signature();
-    len_signature.params.push(AbiParam::new(pointer_type));
-    len_signature.params.push(AbiParam::new(pointer_type));
-    len_signature.returns.push(AbiParam::new(types::I32));
-    let len_helper = module
-        .declare_function(
-            PACKED_ARRAY_LEN_HELPER_SYMBOL,
-            Linkage::Import,
-            &len_signature,
-        )
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_DECLARE",
-                format!("failed to declare packed-array length helper import: {error}"),
-            )
-        })?;
+            let mut len_signature = module.make_signature();
+            len_signature.params.push(AbiParam::new(pointer_type));
+            len_signature.params.push(AbiParam::new(pointer_type));
+            len_signature.returns.push(AbiParam::new(types::I32));
+            let len_helper = module
+                .declare_function(&len_helper_symbol, Linkage::Import, &len_signature)
+                .map_err(|error| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DECLARE",
+                        format!("failed to declare packed-array length helper import: {error}"),
+                    )
+                })?;
 
-    let mut fetch_signature = module.make_signature();
-    fetch_signature.params.push(AbiParam::new(pointer_type));
-    fetch_signature.params.push(AbiParam::new(types::I64));
-    fetch_signature.params.push(AbiParam::new(pointer_type));
-    fetch_signature.returns.push(AbiParam::new(types::I32));
-    let fetch_helper = module
-        .declare_function(
-            PACKED_ARRAY_FETCH_HELPER_SYMBOL,
-            Linkage::Import,
-            &fetch_signature,
-        )
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_DECLARE",
-                format!("failed to declare packed-array fetch helper import: {error}"),
-            )
-        })?;
+            let mut fetch_signature = module.make_signature();
+            fetch_signature.params.push(AbiParam::new(pointer_type));
+            fetch_signature.params.push(AbiParam::new(types::I64));
+            fetch_signature.params.push(AbiParam::new(pointer_type));
+            fetch_signature.returns.push(AbiParam::new(types::I32));
+            let fetch_helper = module
+                .declare_function(&fetch_helper_symbol, Linkage::Import, &fetch_signature)
+                .map_err(|error| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DECLARE",
+                        format!("failed to declare packed-array fetch helper import: {error}"),
+                    )
+                })?;
 
-    let mut signature = module.make_signature();
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.returns.push(AbiParam::new(types::I32));
+            let mut signature = module.make_signature();
+            signature.params.push(AbiParam::new(pointer_type));
+            signature.params.push(AbiParam::new(pointer_type));
+            signature.returns.push(AbiParam::new(types::I32));
 
-    let name = format!(
-        "phrust_cl_packed_foreach_sum_{}_{}_{}",
-        function.raw(),
-        candidate.array_param.raw(),
-        sanitize_symbol_component(region_id)
-    );
-    let func_id = module
-        .declare_function(&name, Linkage::Local, &signature)
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_DECLARE",
-                format!("failed to declare native packed-foreach sum function: {error}"),
-            )
-        })?;
-    let mut ctx = module.make_context();
-    ctx.func.signature = signature;
-    ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+            let func_id = module
+                .declare_function(name, Linkage::Local, &signature)
+                .map_err(|error| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DECLARE",
+                        format!("failed to declare native packed-foreach sum function: {error}"),
+                    )
+                })?;
+            let mut ctx = module.make_context();
+            ctx.func.signature = signature;
+            ctx.func.name = UserFuncName::user(0, func_id.as_u32());
 
-    let mut builder_context = FunctionBuilderContext::new();
-    {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
-        let entry = builder.create_block();
-        let len_ready = builder.create_block();
-        let loop_header = builder.create_block();
-        let loop_body = builder.create_block();
-        let continue_block = builder.create_block();
-        let advance_block = builder.create_block();
-        let done_block = builder.create_block();
-        let non_zero_status = builder.create_block();
-        let remap_fetch_status = builder.create_block();
-        let overflow_exit = builder.create_block();
-        builder.append_block_params_for_function_params(entry);
-        builder.append_block_param(loop_header, types::I64);
-        builder.append_block_param(loop_header, types::I64);
-        builder.append_block_param(non_zero_status, types::I32);
-        builder.append_block_param(remap_fetch_status, types::I32);
+            let mut builder_context = FunctionBuilderContext::new();
+            {
+                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
+                let entry = builder.create_block();
+                let len_ready = builder.create_block();
+                let loop_header = builder.create_block();
+                let loop_body = builder.create_block();
+                let continue_block = builder.create_block();
+                let advance_block = builder.create_block();
+                let done_block = builder.create_block();
+                let non_zero_status = builder.create_block();
+                let remap_fetch_status = builder.create_block();
+                let overflow_exit = builder.create_block();
+                builder.append_block_params_for_function_params(entry);
+                builder.append_block_param(loop_header, types::I64);
+                builder.append_block_param(loop_header, types::I64);
+                builder.append_block_param(non_zero_status, types::I32);
+                builder.append_block_param(remap_fetch_status, types::I32);
 
-        builder.switch_to_block(entry);
-        let params = builder.block_params(entry).to_vec();
-        let value_ptr = params[0];
-        let out_ptr = params[1];
+                builder.switch_to_block(entry);
+                let params = builder.block_params(entry).to_vec();
+                let value_ptr = params[0];
+                let out_ptr = params[1];
 
-        let len_slot =
-            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
-        let element_slot =
-            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
-        let len_out = builder.ins().stack_addr(pointer_type, len_slot, 0);
-        let len_ref = module.declare_func_in_func(len_helper, builder.func);
-        let len_call = builder.ins().call(len_ref, &[value_ptr, len_out]);
-        let len_status = builder.inst_results(len_call)[0];
-        let ok_status = builder
-            .ins()
-            .iconst(types::I32, i64::from(JIT_HELPER_STATUS_OK));
-        let len_ok = builder.ins().icmp(IntCC::Equal, len_status, ok_status);
-        let len_status_args = [len_status.into()];
-        builder
-            .ins()
-            .brif(len_ok, len_ready, &[], non_zero_status, &len_status_args);
+                let len_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    8,
+                    3,
+                ));
+                let element_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    8,
+                    3,
+                ));
+                let len_out = builder.ins().stack_addr(pointer_type, len_slot, 0);
+                let len_ref = module.declare_func_in_func(len_helper, builder.func);
+                let len_call = builder.ins().call(len_ref, &[value_ptr, len_out]);
+                let len_status = builder.inst_results(len_call)[0];
+                let ok_status = builder
+                    .ins()
+                    .iconst(types::I32, i64::from(JIT_HELPER_STATUS_OK));
+                let len_ok = builder.ins().icmp(IntCC::Equal, len_status, ok_status);
+                let len_status_args = [len_status.into()];
+                builder
+                    .ins()
+                    .brif(len_ok, len_ready, &[], non_zero_status, &len_status_args);
 
-        builder.switch_to_block(len_ready);
-        builder.seal_block(len_ready);
-        let zero = builder.ins().iconst(types::I64, 0);
-        let length = builder.ins().stack_load(types::I64, len_slot, 0);
-        let initial_loop_args = [zero.into(), zero.into()];
-        builder.ins().jump(loop_header, &initial_loop_args);
+                builder.switch_to_block(len_ready);
+                builder.seal_block(len_ready);
+                let zero = builder.ins().iconst(types::I64, 0);
+                let length = builder.ins().stack_load(types::I64, len_slot, 0);
+                let initial_loop_args = [zero.into(), zero.into()];
+                builder.ins().jump(loop_header, &initial_loop_args);
 
-        builder.switch_to_block(loop_header);
-        let loop_params = builder.block_params(loop_header).to_vec();
-        let index = loop_params[0];
-        let sum = loop_params[1];
-        let done = builder
-            .ins()
-            .icmp(IntCC::UnsignedGreaterThanOrEqual, index, length);
-        builder.ins().brif(done, done_block, &[], loop_body, &[]);
+                builder.switch_to_block(loop_header);
+                let loop_params = builder.block_params(loop_header).to_vec();
+                let index = loop_params[0];
+                let sum = loop_params[1];
+                let done = builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, index, length);
+                builder.ins().brif(done, done_block, &[], loop_body, &[]);
 
-        builder.switch_to_block(loop_body);
-        let element_out = builder.ins().stack_addr(pointer_type, element_slot, 0);
-        let fetch_ref = module.declare_func_in_func(fetch_helper, builder.func);
-        let fetch_call = builder
-            .ins()
-            .call(fetch_ref, &[value_ptr, index, element_out]);
-        let fetch_status = builder.inst_results(fetch_call)[0];
-        let fetch_ok = builder.ins().icmp(IntCC::Equal, fetch_status, ok_status);
-        let fetch_status_args = [fetch_status.into()];
-        builder.ins().brif(
-            fetch_ok,
-            continue_block,
-            &[],
-            remap_fetch_status,
-            &fetch_status_args,
-        );
+                builder.switch_to_block(loop_body);
+                let element_out = builder.ins().stack_addr(pointer_type, element_slot, 0);
+                let fetch_ref = module.declare_func_in_func(fetch_helper, builder.func);
+                let fetch_call = builder
+                    .ins()
+                    .call(fetch_ref, &[value_ptr, index, element_out]);
+                let fetch_status = builder.inst_results(fetch_call)[0];
+                let fetch_ok = builder.ins().icmp(IntCC::Equal, fetch_status, ok_status);
+                let fetch_status_args = [fetch_status.into()];
+                builder.ins().brif(
+                    fetch_ok,
+                    continue_block,
+                    &[],
+                    remap_fetch_status,
+                    &fetch_status_args,
+                );
 
-        builder.switch_to_block(continue_block);
-        let element = builder.ins().stack_load(types::I64, element_slot, 0);
-        let (next_sum, overflow) = builder.ins().sadd_overflow(sum, element);
-        builder
-            .ins()
-            .brif(overflow, overflow_exit, &[], advance_block, &[]);
+                builder.switch_to_block(continue_block);
+                let element = builder.ins().stack_load(types::I64, element_slot, 0);
+                let (next_sum, overflow) = builder.ins().sadd_overflow(sum, element);
+                builder
+                    .ins()
+                    .brif(overflow, overflow_exit, &[], advance_block, &[]);
 
-        builder.switch_to_block(advance_block);
-        builder.seal_block(advance_block);
-        let one = builder.ins().iconst(types::I64, 1);
-        let next_index = builder.ins().iadd(index, one);
-        let next_loop_args = [next_index.into(), next_sum.into()];
-        builder.ins().jump(loop_header, &next_loop_args);
+                builder.switch_to_block(advance_block);
+                builder.seal_block(advance_block);
+                let one = builder.ins().iconst(types::I64, 1);
+                let next_index = builder.ins().iadd(index, one);
+                let next_loop_args = [next_index.into(), next_sum.into()];
+                builder.ins().jump(loop_header, &next_loop_args);
 
-        builder.switch_to_block(done_block);
-        builder.seal_block(done_block);
-        builder.ins().store(MemFlagsData::new(), sum, out_ptr, 0);
-        builder.ins().return_(&[ok_status]);
+                builder.switch_to_block(done_block);
+                builder.seal_block(done_block);
+                builder.ins().store(MemFlagsData::new(), sum, out_ptr, 0);
+                builder.ins().return_(&[ok_status]);
 
-        builder.switch_to_block(non_zero_status);
-        let status = builder.block_params(non_zero_status)[0];
-        builder.ins().return_(&[status]);
+                builder.switch_to_block(non_zero_status);
+                let status = builder.block_params(non_zero_status)[0];
+                builder.ins().return_(&[status]);
 
-        builder.switch_to_block(remap_fetch_status);
-        let fetch_status = builder.block_params(remap_fetch_status)[0];
-        let bounds_status = builder
-            .ins()
-            .iconst(types::I32, i64::from(JIT_PACKED_ARRAY_STATUS_BOUNDS_EXIT));
-        let is_bounds = builder
-            .ins()
-            .icmp(IntCC::Equal, fetch_status, bounds_status);
-        let layout_status = builder
-            .ins()
-            .iconst(types::I32, i64::from(JIT_PACKED_ARRAY_STATUS_LAYOUT_EXIT));
-        let remapped = builder.ins().select(is_bounds, layout_status, fetch_status);
-        builder.ins().return_(&[remapped]);
+                builder.switch_to_block(remap_fetch_status);
+                let fetch_status = builder.block_params(remap_fetch_status)[0];
+                let bounds_status = builder
+                    .ins()
+                    .iconst(types::I32, i64::from(JIT_PACKED_ARRAY_STATUS_BOUNDS_EXIT));
+                let is_bounds = builder
+                    .ins()
+                    .icmp(IntCC::Equal, fetch_status, bounds_status);
+                let layout_status = builder
+                    .ins()
+                    .iconst(types::I32, i64::from(JIT_PACKED_ARRAY_STATUS_LAYOUT_EXIT));
+                let remapped = builder.ins().select(is_bounds, layout_status, fetch_status);
+                builder.ins().return_(&[remapped]);
 
-        builder.switch_to_block(overflow_exit);
-        builder.seal_block(overflow_exit);
-        let overflow_status = builder
-            .ins()
-            .iconst(types::I32, i64::from(JIT_HELPER_STATUS_OVERFLOW));
-        builder.ins().return_(&[overflow_status]);
+                builder.switch_to_block(overflow_exit);
+                builder.seal_block(overflow_exit);
+                let overflow_status = builder
+                    .ins()
+                    .iconst(types::I32, i64::from(JIT_HELPER_STATUS_OVERFLOW));
+                builder.ins().return_(&[overflow_status]);
 
-        builder.seal_block(entry);
-        builder.seal_block(loop_header);
-        builder.seal_block(loop_body);
-        builder.seal_block(continue_block);
-        builder.seal_block(non_zero_status);
-        builder.seal_block(remap_fetch_status);
-        builder.finalize();
-    }
+                builder.seal_block(entry);
+                builder.seal_block(loop_header);
+                builder.seal_block(loop_body);
+                builder.seal_block(continue_block);
+                builder.seal_block(non_zero_status);
+                builder.seal_block(remap_fetch_status);
+                builder.finalize();
+            }
 
-    let verifier_flags = settings::Flags::new(settings::builder());
-    verify_function(&ctx.func, &verifier_flags).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_VERIFIER",
-            format!("Cranelift verifier rejected native packed-foreach sum IR: {error}"),
-        )
-    })?;
-    module.define_function(func_id, &mut ctx).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_DEFINE",
-            format!("failed to define native packed-foreach sum function: {error}"),
-        )
-    })?;
-    let code_bytes = ctx
-        .compiled_code()
-        .map(|compiled| compiled.code_buffer().len() as u64)
-        .unwrap_or(0);
-    module.clear_context(&mut ctx);
-    module.finalize_definitions().map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_FINALIZE",
-            format!("failed to finalize native packed-foreach sum function: {error}"),
-        )
-    })?;
-    let address = module.get_finalized_function(func_id) as usize;
-    leak_jit_module_for_handle_lifetime(module);
-    let handle = JitFunctionHandle::value_status_out_native(
-        u64::from(function.raw()) + 1,
-        region_id.to_owned(),
-        JitBackend::CraneliftExperiment,
-        address,
-        code_bytes,
-        0,
-        1,
-        JitNativeSpecialization::PackedForeachIntSum,
-    );
-    Ok(NativePackedForeachIntSumCompileResult { handle, code_bytes })
+            let verifier_flags = settings::Flags::new(settings::builder());
+            verify_function(&ctx.func, &verifier_flags).map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_VERIFIER",
+                    format!("Cranelift verifier rejected native packed-foreach sum IR: {error}"),
+                )
+            })?;
+            module.define_function(func_id, &mut ctx).map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_DEFINE",
+                    format!("failed to define native packed-foreach sum function: {error}"),
+                )
+            })?;
+            let code_bytes = ctx
+                .compiled_code()
+                .map(|compiled| compiled.code_buffer().len() as u64)
+                .unwrap_or(0);
+            module.clear_context(&mut ctx);
+            module.finalize_definitions().map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FINALIZE",
+                    format!("failed to finalize native packed-foreach sum function: {error}"),
+                )
+            })?;
+            let address = module.get_finalized_function(func_id) as usize;
+            let handle = JitFunctionHandle::value_status_out_native(
+                u64::from(function.raw()) + 1,
+                request.region_id.clone(),
+                JitBackend::CraneliftExperiment,
+                address,
+                code_bytes,
+                0,
+                1,
+                JitNativeSpecialization::PackedForeachIntSum,
+            );
+            Ok((handle, code_bytes))
+        },
+    )?;
+    Ok(NativePackedForeachIntSumCompileResult {
+        handle: compiled.handle,
+        code_bytes: compiled.code_bytes,
+    })
 }
 
 fn compile_known_call_native(
     function: FunctionId,
     candidate: &KnownCallCandidate,
     helper_address: usize,
-    region_id: &str,
+    request: &JitCompileRequest,
 ) -> Result<NativeKnownCallCompileResult, CraneliftLoweringError> {
     if helper_address == 0 {
         return Err(CraneliftLoweringError::new(
@@ -3220,136 +2854,112 @@ fn compile_known_call_native(
         ));
     }
 
-    let mut flag_builder = settings::builder();
-    flag_builder
-        .set("use_colocated_libcalls", "false")
-        .map_err(|error| {
-            CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
-        })?;
-    flag_builder.set("is_pic", "false").map_err(|error| {
-        CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
-    })?;
-    let isa_builder = cranelift_native::builder().map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
-            format!("host target is unsupported: {error}"),
-        )
-    })?;
-    let isa = isa_builder
-        .finish(settings::Flags::new(flag_builder))
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
-                format!("host ISA setup failed: {error}"),
-            )
-        })?;
-    let mut jit_builder = JITBuilder::with_isa(isa, default_libcall_names());
-    jit_builder.symbol(candidate.kind.helper_symbol(), helper_address as *const u8);
-    let mut module = JITModule::new(jit_builder);
-    let pointer_type = module.target_config().pointer_type();
+    let specialization = format!("known-call-{}-v1", candidate.kind.function_name());
+    let helper_symbol = runtime_helper_symbol(candidate.kind.helper_symbol(), helper_address);
+    let compiled = compile_managed_native(
+        request,
+        function,
+        &specialization,
+        &[(helper_symbol.as_str(), helper_address)],
+        |module, name| {
+            let pointer_type = module.target_config().pointer_type();
 
-    let mut helper_signature = module.make_signature();
-    helper_signature.params.push(AbiParam::new(pointer_type));
-    helper_signature.params.push(AbiParam::new(pointer_type));
-    helper_signature.returns.push(AbiParam::new(types::I32));
-    let helper = module
-        .declare_function(
-            candidate.kind.helper_symbol(),
-            Linkage::Import,
-            &helper_signature,
-        )
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_DECLARE",
-                format!("failed to declare known-call helper import: {error}"),
-            )
-        })?;
+            let mut helper_signature = module.make_signature();
+            helper_signature.params.push(AbiParam::new(pointer_type));
+            helper_signature.params.push(AbiParam::new(pointer_type));
+            helper_signature.returns.push(AbiParam::new(types::I32));
+            let helper = module
+                .declare_function(&helper_symbol, Linkage::Import, &helper_signature)
+                .map_err(|error| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DECLARE",
+                        format!("failed to declare known-call helper import: {error}"),
+                    )
+                })?;
 
-    let mut signature = module.make_signature();
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.returns.push(AbiParam::new(types::I32));
+            let mut signature = module.make_signature();
+            signature.params.push(AbiParam::new(pointer_type));
+            signature.params.push(AbiParam::new(pointer_type));
+            signature.returns.push(AbiParam::new(types::I32));
 
-    let name = format!(
-        "phrust_cl_known_call_{}_{}_{}_{}",
-        candidate.kind.function_name(),
-        function.raw(),
-        candidate.value_param.raw(),
-        sanitize_symbol_component(region_id)
-    );
-    let func_id = module
-        .declare_function(&name, Linkage::Local, &signature)
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_DECLARE",
-                format!("failed to declare native known-call function: {error}"),
-            )
-        })?;
-    let mut ctx = module.make_context();
-    ctx.func.signature = signature;
-    ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+            let func_id = module
+                .declare_function(name, Linkage::Local, &signature)
+                .map_err(|error| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DECLARE",
+                        format!("failed to declare native known-call function: {error}"),
+                    )
+                })?;
+            let mut ctx = module.make_context();
+            ctx.func.signature = signature;
+            ctx.func.name = UserFuncName::user(0, func_id.as_u32());
 
-    let mut builder_context = FunctionBuilderContext::new();
-    {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
-        let entry = builder.create_block();
-        builder.append_block_params_for_function_params(entry);
-        builder.switch_to_block(entry);
-        let params = builder.block_params(entry).to_vec();
-        let value_ptr = params[0];
-        let out_ptr = params[1];
-        let helper_ref = module.declare_func_in_func(helper, builder.func);
-        let call = builder.ins().call(helper_ref, &[value_ptr, out_ptr]);
-        let status = builder.inst_results(call)[0];
-        builder.ins().return_(&[status]);
-        builder.seal_block(entry);
-        builder.finalize();
-    }
+            let mut builder_context = FunctionBuilderContext::new();
+            {
+                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
+                let entry = builder.create_block();
+                builder.append_block_params_for_function_params(entry);
+                builder.switch_to_block(entry);
+                let params = builder.block_params(entry).to_vec();
+                let value_ptr = params[0];
+                let out_ptr = params[1];
+                let helper_ref = module.declare_func_in_func(helper, builder.func);
+                let call = builder.ins().call(helper_ref, &[value_ptr, out_ptr]);
+                let status = builder.inst_results(call)[0];
+                builder.ins().return_(&[status]);
+                builder.seal_block(entry);
+                builder.finalize();
+            }
 
-    let verifier_flags = settings::Flags::new(settings::builder());
-    verify_function(&ctx.func, &verifier_flags).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_VERIFIER",
-            format!("Cranelift verifier rejected native known-call IR: {error}"),
-        )
-    })?;
-    module.define_function(func_id, &mut ctx).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_DEFINE",
-            format!("failed to define native known-call function: {error}"),
-        )
-    })?;
-    let code_bytes = ctx
-        .compiled_code()
-        .map(|compiled| compiled.code_buffer().len() as u64)
-        .unwrap_or(0);
-    module.clear_context(&mut ctx);
-    module.finalize_definitions().map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_FINALIZE",
-            format!("failed to finalize native known-call function: {error}"),
-        )
-    })?;
-    let address = module.get_finalized_function(func_id) as usize;
-    leak_jit_module_for_handle_lifetime(module);
-    let handle = JitFunctionHandle::value_status_out_native(
-        u64::from(function.raw()) + 1,
-        region_id.to_owned(),
-        JitBackend::CraneliftExperiment,
-        address,
-        code_bytes,
-        1,
-        1,
-        candidate.kind.specialization(),
-    );
-    Ok(NativeKnownCallCompileResult { handle, code_bytes })
+            let verifier_flags = settings::Flags::new(settings::builder());
+            verify_function(&ctx.func, &verifier_flags).map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_VERIFIER",
+                    format!("Cranelift verifier rejected native known-call IR: {error}"),
+                )
+            })?;
+            module.define_function(func_id, &mut ctx).map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_DEFINE",
+                    format!("failed to define native known-call function: {error}"),
+                )
+            })?;
+            let code_bytes = ctx
+                .compiled_code()
+                .map(|compiled| compiled.code_buffer().len() as u64)
+                .unwrap_or(0);
+            module.clear_context(&mut ctx);
+            module.finalize_definitions().map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FINALIZE",
+                    format!("failed to finalize native known-call function: {error}"),
+                )
+            })?;
+            let address = module.get_finalized_function(func_id) as usize;
+            let handle = JitFunctionHandle::value_status_out_native(
+                u64::from(function.raw()) + 1,
+                request.region_id.clone(),
+                JitBackend::CraneliftExperiment,
+                address,
+                code_bytes,
+                1,
+                1,
+                candidate.kind.specialization(),
+            );
+            Ok((handle, code_bytes))
+        },
+    )?;
+    Ok(NativeKnownCallCompileResult {
+        handle: compiled.handle,
+        code_bytes: compiled.code_bytes,
+    })
 }
 
 fn compile_string_concat_native(
     function: FunctionId,
-    candidate: &StringConcatCandidate,
+    _candidate: &StringConcatCandidate,
     helper_address: usize,
-    region_id: &str,
+    request: &JitCompileRequest,
 ) -> Result<NativeStringConcatCompileResult, CraneliftLoweringError> {
     if helper_address == 0 {
         return Err(CraneliftLoweringError::new(
@@ -3358,139 +2968,114 @@ fn compile_string_concat_native(
         ));
     }
 
-    let mut flag_builder = settings::builder();
-    flag_builder
-        .set("use_colocated_libcalls", "false")
-        .map_err(|error| {
-            CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
-        })?;
-    flag_builder.set("is_pic", "false").map_err(|error| {
-        CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
-    })?;
-    let isa_builder = cranelift_native::builder().map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
-            format!("host target is unsupported: {error}"),
-        )
-    })?;
-    let isa = isa_builder
-        .finish(settings::Flags::new(flag_builder))
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
-                format!("host ISA setup failed: {error}"),
-            )
-        })?;
-    let mut jit_builder = JITBuilder::with_isa(isa, default_libcall_names());
-    jit_builder.symbol(STRING_CONCAT_HELPER_SYMBOL, helper_address as *const u8);
-    let mut module = JITModule::new(jit_builder);
-    let pointer_type = module.target_config().pointer_type();
+    let helper_symbol = runtime_helper_symbol(STRING_CONCAT_HELPER_SYMBOL, helper_address);
+    let compiled = compile_managed_native(
+        request,
+        function,
+        "string-concat-v1",
+        &[(helper_symbol.as_str(), helper_address)],
+        |module, name| {
+            let pointer_type = module.target_config().pointer_type();
 
-    let mut helper_signature = module.make_signature();
-    helper_signature.params.push(AbiParam::new(pointer_type));
-    helper_signature.params.push(AbiParam::new(pointer_type));
-    helper_signature.params.push(AbiParam::new(pointer_type));
-    helper_signature.returns.push(AbiParam::new(types::I32));
-    let helper = module
-        .declare_function(
-            STRING_CONCAT_HELPER_SYMBOL,
-            Linkage::Import,
-            &helper_signature,
-        )
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_DECLARE",
-                format!("failed to declare string-concat helper import: {error}"),
-            )
-        })?;
+            let mut helper_signature = module.make_signature();
+            helper_signature.params.push(AbiParam::new(pointer_type));
+            helper_signature.params.push(AbiParam::new(pointer_type));
+            helper_signature.params.push(AbiParam::new(pointer_type));
+            helper_signature.returns.push(AbiParam::new(types::I32));
+            let helper = module
+                .declare_function(&helper_symbol, Linkage::Import, &helper_signature)
+                .map_err(|error| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DECLARE",
+                        format!("failed to declare string-concat helper import: {error}"),
+                    )
+                })?;
 
-    let mut signature = module.make_signature();
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.returns.push(AbiParam::new(types::I32));
+            let mut signature = module.make_signature();
+            signature.params.push(AbiParam::new(pointer_type));
+            signature.params.push(AbiParam::new(pointer_type));
+            signature.params.push(AbiParam::new(pointer_type));
+            signature.returns.push(AbiParam::new(types::I32));
 
-    let name = format!(
-        "phrust_cl_string_concat_{}_{}_{}_{}",
-        function.raw(),
-        candidate.lhs_param.raw(),
-        candidate.rhs_param.raw(),
-        sanitize_symbol_component(region_id)
-    );
-    let func_id = module
-        .declare_function(&name, Linkage::Local, &signature)
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_DECLARE",
-                format!("failed to declare native string-concat function: {error}"),
-            )
-        })?;
-    let mut ctx = module.make_context();
-    ctx.func.signature = signature;
-    ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+            let func_id = module
+                .declare_function(name, Linkage::Local, &signature)
+                .map_err(|error| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DECLARE",
+                        format!("failed to declare native string-concat function: {error}"),
+                    )
+                })?;
+            let mut ctx = module.make_context();
+            ctx.func.signature = signature;
+            ctx.func.name = UserFuncName::user(0, func_id.as_u32());
 
-    let mut builder_context = FunctionBuilderContext::new();
-    {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
-        let entry = builder.create_block();
-        builder.append_block_params_for_function_params(entry);
-        builder.switch_to_block(entry);
-        let params = builder.block_params(entry).to_vec();
-        let lhs_ptr = params[0];
-        let rhs_ptr = params[1];
-        let out_ptr = params[2];
-        let helper_ref = module.declare_func_in_func(helper, builder.func);
-        let call = builder.ins().call(helper_ref, &[lhs_ptr, rhs_ptr, out_ptr]);
-        let status = builder.inst_results(call)[0];
-        builder.ins().return_(&[status]);
-        builder.seal_block(entry);
-        builder.finalize();
-    }
+            let mut builder_context = FunctionBuilderContext::new();
+            {
+                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
+                let entry = builder.create_block();
+                builder.append_block_params_for_function_params(entry);
+                builder.switch_to_block(entry);
+                let params = builder.block_params(entry).to_vec();
+                let lhs_ptr = params[0];
+                let rhs_ptr = params[1];
+                let out_ptr = params[2];
+                let helper_ref = module.declare_func_in_func(helper, builder.func);
+                let call = builder.ins().call(helper_ref, &[lhs_ptr, rhs_ptr, out_ptr]);
+                let status = builder.inst_results(call)[0];
+                builder.ins().return_(&[status]);
+                builder.seal_block(entry);
+                builder.finalize();
+            }
 
-    let verifier_flags = settings::Flags::new(settings::builder());
-    verify_function(&ctx.func, &verifier_flags).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_VERIFIER",
-            format!("Cranelift verifier rejected native string-concat IR: {error}"),
-        )
-    })?;
-    module.define_function(func_id, &mut ctx).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_DEFINE",
-            format!("failed to define native string-concat function: {error}"),
-        )
-    })?;
-    let code_bytes = ctx
-        .compiled_code()
-        .map(|compiled| compiled.code_buffer().len() as u64)
-        .unwrap_or(0);
-    module.clear_context(&mut ctx);
-    module.finalize_definitions().map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_FINALIZE",
-            format!("failed to finalize native string-concat function: {error}"),
-        )
-    })?;
-    let address = module.get_finalized_function(func_id) as usize;
-    leak_jit_module_for_handle_lifetime(module);
-    let handle = JitFunctionHandle::value_value_status_out_native(
-        u64::from(function.raw()) + 1,
-        region_id.to_owned(),
-        JitBackend::CraneliftExperiment,
-        address,
-        code_bytes,
-        1,
-        1,
-        JitNativeSpecialization::StringConcat,
-    );
-    Ok(NativeStringConcatCompileResult { handle, code_bytes })
+            let verifier_flags = settings::Flags::new(settings::builder());
+            verify_function(&ctx.func, &verifier_flags).map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_VERIFIER",
+                    format!("Cranelift verifier rejected native string-concat IR: {error}"),
+                )
+            })?;
+            module.define_function(func_id, &mut ctx).map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_DEFINE",
+                    format!("failed to define native string-concat function: {error}"),
+                )
+            })?;
+            let code_bytes = ctx
+                .compiled_code()
+                .map(|compiled| compiled.code_buffer().len() as u64)
+                .unwrap_or(0);
+            module.clear_context(&mut ctx);
+            module.finalize_definitions().map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FINALIZE",
+                    format!("failed to finalize native string-concat function: {error}"),
+                )
+            })?;
+            let address = module.get_finalized_function(func_id) as usize;
+            let handle = JitFunctionHandle::value_value_status_out_native(
+                u64::from(function.raw()) + 1,
+                request.region_id.clone(),
+                JitBackend::CraneliftExperiment,
+                address,
+                code_bytes,
+                1,
+                1,
+                JitNativeSpecialization::StringConcat,
+            );
+            Ok((handle, code_bytes))
+        },
+    )?;
+    Ok(NativeStringConcatCompileResult {
+        handle: compiled.handle,
+        code_bytes: compiled.code_bytes,
+    })
 }
 
 fn compile_property_load_native(
     function: FunctionId,
     candidate: &PropertyLoadCandidate,
     helper_address: usize,
-    region_id: &str,
+    request: &JitCompileRequest,
 ) -> Result<NativePropertyLoadCompileResult, CraneliftLoweringError> {
     if helper_address == 0 {
         return Err(CraneliftLoweringError::new(
@@ -3499,148 +3084,123 @@ fn compile_property_load_native(
         ));
     }
 
-    let mut flag_builder = settings::builder();
-    flag_builder
-        .set("use_colocated_libcalls", "false")
-        .map_err(|error| {
-            CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
-        })?;
-    flag_builder.set("is_pic", "false").map_err(|error| {
-        CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
-    })?;
-    let isa_builder = cranelift_native::builder().map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
-            format!("host target is unsupported: {error}"),
-        )
-    })?;
-    let isa = isa_builder
-        .finish(settings::Flags::new(flag_builder))
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
-                format!("host ISA setup failed: {error}"),
-            )
-        })?;
-    let mut jit_builder = JITBuilder::with_isa(isa, default_libcall_names());
-    jit_builder.symbol(PROPERTY_LOAD_HELPER_SYMBOL, helper_address as *const u8);
-    let mut module = JITModule::new(jit_builder);
-    let pointer_type = module.target_config().pointer_type();
+    let helper_symbol = runtime_helper_symbol(PROPERTY_LOAD_HELPER_SYMBOL, helper_address);
+    let compiled = compile_managed_native(
+        request,
+        function,
+        "property-load-v1",
+        &[(helper_symbol.as_str(), helper_address)],
+        |module, name| {
+            let pointer_type = module.target_config().pointer_type();
 
-    let mut helper_signature = module.make_signature();
-    helper_signature.params.push(AbiParam::new(pointer_type));
-    helper_signature.params.push(AbiParam::new(pointer_type));
-    helper_signature.params.push(AbiParam::new(pointer_type));
-    helper_signature.returns.push(AbiParam::new(types::I32));
-    let helper = module
-        .declare_function(
-            PROPERTY_LOAD_HELPER_SYMBOL,
-            Linkage::Import,
-            &helper_signature,
-        )
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_DECLARE",
-                format!("failed to declare property-load helper import: {error}"),
-            )
-        })?;
+            let mut helper_signature = module.make_signature();
+            helper_signature.params.push(AbiParam::new(pointer_type));
+            helper_signature.params.push(AbiParam::new(pointer_type));
+            helper_signature.params.push(AbiParam::new(pointer_type));
+            helper_signature.returns.push(AbiParam::new(types::I32));
+            let helper = module
+                .declare_function(&helper_symbol, Linkage::Import, &helper_signature)
+                .map_err(|error| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DECLARE",
+                        format!("failed to declare property-load helper import: {error}"),
+                    )
+                })?;
 
-    let mut signature = module.make_signature();
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.returns.push(AbiParam::new(types::I32));
+            let mut signature = module.make_signature();
+            signature.params.push(AbiParam::new(pointer_type));
+            signature.params.push(AbiParam::new(pointer_type));
+            signature.params.push(AbiParam::new(pointer_type));
+            signature.returns.push(AbiParam::new(types::I32));
 
-    let name = format!(
-        "phrust_cl_property_load_{}_{}_{}_{}",
-        function.raw(),
-        candidate.object_param.raw(),
-        candidate.metadata.property,
-        sanitize_symbol_component(region_id)
-    );
-    let func_id = module
-        .declare_function(&name, Linkage::Local, &signature)
-        .map_err(|error| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_DECLARE",
-                format!("failed to declare native property-load function: {error}"),
-            )
-        })?;
-    let mut ctx = module.make_context();
-    ctx.func.signature = signature;
-    ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+            let func_id = module
+                .declare_function(name, Linkage::Local, &signature)
+                .map_err(|error| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DECLARE",
+                        format!("failed to declare native property-load function: {error}"),
+                    )
+                })?;
+            let mut ctx = module.make_context();
+            ctx.func.signature = signature;
+            ctx.func.name = UserFuncName::user(0, func_id.as_u32());
 
-    let mut builder_context = FunctionBuilderContext::new();
-    {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
-        let entry = builder.create_block();
-        builder.append_block_params_for_function_params(entry);
-        builder.switch_to_block(entry);
-        let params = builder.block_params(entry).to_vec();
-        let object_ptr = params[0];
-        let metadata_ptr = params[1];
-        let out_ptr = params[2];
-        let helper_ref = module.declare_func_in_func(helper, builder.func);
-        let call = builder
-            .ins()
-            .call(helper_ref, &[object_ptr, metadata_ptr, out_ptr]);
-        let status = builder.inst_results(call)[0];
-        builder.ins().return_(&[status]);
-        builder.seal_block(entry);
-        builder.finalize();
-    }
+            let mut builder_context = FunctionBuilderContext::new();
+            {
+                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
+                let entry = builder.create_block();
+                builder.append_block_params_for_function_params(entry);
+                builder.switch_to_block(entry);
+                let params = builder.block_params(entry).to_vec();
+                let object_ptr = params[0];
+                let metadata_ptr = params[1];
+                let out_ptr = params[2];
+                let helper_ref = module.declare_func_in_func(helper, builder.func);
+                let call = builder
+                    .ins()
+                    .call(helper_ref, &[object_ptr, metadata_ptr, out_ptr]);
+                let status = builder.inst_results(call)[0];
+                builder.ins().return_(&[status]);
+                builder.seal_block(entry);
+                builder.finalize();
+            }
 
-    let verifier_flags = settings::Flags::new(settings::builder());
-    verify_function(&ctx.func, &verifier_flags).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_VERIFIER",
-            format!("Cranelift verifier rejected native property-load IR: {error}"),
-        )
-    })?;
-    module.define_function(func_id, &mut ctx).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_DEFINE",
-            format!("failed to define native property-load function: {error}"),
-        )
-    })?;
-    let code_bytes = ctx
-        .compiled_code()
-        .map(|compiled| compiled.code_buffer().len() as u64)
-        .unwrap_or(0);
-    module.clear_context(&mut ctx);
-    module.finalize_definitions().map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_FINALIZE",
-            format!("failed to finalize native property-load function: {error}"),
-        )
-    })?;
-    let address = module.get_finalized_function(func_id) as usize;
-    leak_jit_module_for_handle_lifetime(module);
-    let handle = JitFunctionHandle::value_metadata_status_out_native(
-        u64::from(function.raw()) + 1,
-        region_id.to_owned(),
-        JitBackend::CraneliftExperiment,
-        address,
-        code_bytes,
-        1,
-        1,
-        candidate.metadata.clone(),
-    );
-    Ok(NativePropertyLoadCompileResult { handle, code_bytes })
+            let verifier_flags = settings::Flags::new(settings::builder());
+            verify_function(&ctx.func, &verifier_flags).map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_VERIFIER",
+                    format!("Cranelift verifier rejected native property-load IR: {error}"),
+                )
+            })?;
+            module.define_function(func_id, &mut ctx).map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_DEFINE",
+                    format!("failed to define native property-load function: {error}"),
+                )
+            })?;
+            let code_bytes = ctx
+                .compiled_code()
+                .map(|compiled| compiled.code_buffer().len() as u64)
+                .unwrap_or(0);
+            module.clear_context(&mut ctx);
+            module.finalize_definitions().map_err(|error| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FINALIZE",
+                    format!("failed to finalize native property-load function: {error}"),
+                )
+            })?;
+            let address = module.get_finalized_function(func_id) as usize;
+            let handle = JitFunctionHandle::value_metadata_status_out_native(
+                u64::from(function.raw()) + 1,
+                request.region_id.clone(),
+                JitBackend::CraneliftExperiment,
+                address,
+                code_bytes,
+                1,
+                1,
+                candidate.metadata.clone(),
+            );
+            Ok((handle, code_bytes))
+        },
+    )?;
+    Ok(NativePropertyLoadCompileResult {
+        handle: compiled.handle,
+        code_bytes: compiled.code_bytes,
+    })
 }
 
-fn create_cranelift_blocks(
+fn create_region_cranelift_blocks(
     builder: &mut FunctionBuilder<'_>,
-    ir_function: &IrFunction,
+    region: &ExecutableRegion,
 ) -> Result<Vec<ir::Block>, CraneliftLoweringError> {
-    let mut blocks = Vec::with_capacity(ir_function.blocks.len());
-    for (index, ir_block) in ir_function.blocks.iter().enumerate() {
-        if ir_block.id.index() != index {
+    let mut blocks = Vec::with_capacity(region.blocks.len());
+    for (index, region_block) in region.blocks.iter().enumerate() {
+        if region_block.id.index() != index {
             return Err(CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_HELPER_CONTROL_FLOW",
+                "JIT_CRANELIFT_REJECT_REGION_CONTROL_FLOW",
                 format!(
-                    "non-dense block id {} at position {} is outside inline CFG subset",
-                    ir_block.id.raw(),
+                    "non-dense block id {} at position {} is outside executable Region IR",
+                    region_block.id.raw(),
                     index
                 ),
             ));
@@ -3660,23 +3220,6 @@ fn cranelift_block(
             format!("target block {} is outside the lowered CFG", block_id.raw()),
         )
     })
-}
-
-fn next_ir_block_id(
-    ir_function: &IrFunction,
-    current: BlockId,
-) -> Result<BlockId, CraneliftLoweringError> {
-    let next_index = current.index() + 1;
-    ir_function
-        .blocks
-        .get(next_index)
-        .map(|block| block.id)
-        .ok_or_else(|| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_HELPER_CONTROL_FLOW",
-                format!("block {} has no fallthrough successor", current.raw()),
-            )
-        })
 }
 
 fn local_variable(
@@ -3705,97 +3248,132 @@ fn use_local_variable(
     })
 }
 
-fn lower_inline_cfg_operand(
+fn lower_region_operand(
     builder: &mut FunctionBuilder<'_>,
-    unit: &IrUnit,
     locals: &BTreeMap<LocalId, Variable>,
     registers: &BTreeMap<RegId, ir::Value>,
-    operand: &Operand,
+    operand: ExecutableRegionOperand,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     match operand {
-        Operand::Register(reg) => registers.get(reg).copied().ok_or_else(|| {
+        ExecutableRegionOperand::Register(reg) => registers.get(&reg).copied().ok_or_else(|| {
             CraneliftLoweringError::new(
                 "JIT_CRANELIFT_REJECT_MISSING_REGISTER",
                 format!("register {} has not been lowered in this block", reg.raw()),
             )
         }),
-        Operand::Constant(constant) => {
-            let value = constant_value(unit, *constant)?;
-            Ok(builder.ins().iconst(types::I64, value))
-        }
-        Operand::Local(local) => use_local_variable(builder, locals, *local),
+        ExecutableRegionOperand::I64(value) => Ok(builder.ins().iconst(types::I64, value)),
+        ExecutableRegionOperand::Local(local) => use_local_variable(builder, locals, local),
     }
 }
 
-fn lower_inline_cfg_instruction(
+fn lower_region_instruction(
+    module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    unit: &IrUnit,
+    functions: &BTreeMap<FunctionId, FuncId>,
     locals: &BTreeMap<LocalId, Variable>,
     registers: &mut BTreeMap<RegId, ir::Value>,
-    instruction: &Instruction,
+    instruction: &ExecutableRegionInstruction,
+    deopt_out: ir::Value,
+    function: FunctionId,
+    local_count: u32,
+    pointer_type: ir::Type,
 ) -> Result<(), CraneliftLoweringError> {
     match &instruction.kind {
-        InstructionKind::Nop => {}
-        InstructionKind::LoadConst { dst, constant } => {
-            let value = constant_value(unit, *constant)?;
-            let cl_value = builder.ins().iconst(types::I64, value);
+        ExecutableRegionInstructionKind::Nop => {}
+        ExecutableRegionInstructionKind::Move { dst, src } => {
+            let cl_value = lower_region_operand(builder, locals, registers, *src)?;
             registers.insert(*dst, cl_value);
         }
-        InstructionKind::Move { dst, src } => {
-            let cl_value = lower_inline_cfg_operand(builder, unit, locals, registers, src)?;
-            registers.insert(*dst, cl_value);
-        }
-        InstructionKind::LoadLocal { dst, local }
-        | InstructionKind::LoadLocalQuiet { dst, local } => {
+        ExecutableRegionInstructionKind::LoadLocal { dst, local } => {
             let cl_value = use_local_variable(builder, locals, *local)?;
             registers.insert(*dst, cl_value);
         }
-        InstructionKind::StoreLocal { local, src } => {
-            let cl_value = lower_inline_cfg_operand(builder, unit, locals, registers, src)?;
+        ExecutableRegionInstructionKind::StoreLocal { local, src } => {
+            let cl_value = lower_region_operand(builder, locals, registers, *src)?;
             let variable = local_variable(locals, *local)?;
             builder.def_var(variable, cl_value);
         }
-        InstructionKind::Discard { src } => {
-            let _ = lower_inline_cfg_operand(builder, unit, locals, registers, src)?;
+        ExecutableRegionInstructionKind::Discard { src } => {
+            let _ = lower_region_operand(builder, locals, registers, *src)?;
         }
-        InstructionKind::Binary { dst, op, lhs, rhs } => {
-            let lhs = lower_inline_cfg_operand(builder, unit, locals, registers, lhs)?;
-            let rhs = lower_inline_cfg_operand(builder, unit, locals, registers, rhs)?;
-            let cl_value = lower_checked_inline_binary(builder, *op, lhs, rhs)?;
+        ExecutableRegionInstructionKind::Binary { dst, op, lhs, rhs } => {
+            let lhs = lower_region_operand(builder, locals, registers, *lhs)?;
+            let rhs = lower_region_operand(builder, locals, registers, *rhs)?;
+            let cl_value = lower_checked_region_binary(
+                builder,
+                *op,
+                lhs,
+                rhs,
+                deopt_out,
+                function,
+                local_count,
+                instruction,
+                locals,
+            )?;
             registers.insert(*dst, cl_value);
         }
-        InstructionKind::Compare { dst, op, lhs, rhs } => {
-            let lhs = lower_inline_cfg_operand(builder, unit, locals, registers, lhs)?;
-            let rhs = lower_inline_cfg_operand(builder, unit, locals, registers, rhs)?;
-            let cl_value = builder.ins().icmp(compare_intcc(*op)?, lhs, rhs);
-            registers.insert(*dst, cl_value);
-        }
-        other => {
-            return Err(CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_HELPER_OPCODE",
-                format!("instruction {other:?} is outside inline CFG native subset"),
+        ExecutableRegionInstructionKind::DirectCall { dst, target, args } => {
+            let callee = functions.get(target).copied().ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_DIRECT_CALLEE",
+                    format!("native direct callee {} was not declared", target.raw()),
+                )
+            })?;
+            let result_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                3,
             ));
+            let result_out = builder.ins().stack_addr(pointer_type, result_slot, 0);
+            let mut call_args = args
+                .iter()
+                .map(|operand| lower_region_operand(builder, locals, registers, *operand))
+                .collect::<Result<Vec<_>, _>>()?;
+            call_args.push(result_out);
+            call_args.push(deopt_out);
+            call_args.push(builder.ins().iconst(types::I32, -1));
+            call_args.push(builder.ins().iconst(pointer_type, 0));
+            let callee_ref = module.declare_func_in_func(callee, builder.func);
+            let call = builder.ins().call(callee_ref, &call_args);
+            let status = builder.inst_results(call)[0];
+            let ok = builder.create_block();
+            let side_exit = builder.create_block();
+            let is_ok =
+                builder
+                    .ins()
+                    .icmp_imm(IntCC::Equal, status, i64::from(JIT_HELPER_STATUS_OK));
+            builder.ins().brif(is_ok, ok, &[], side_exit, &[]);
+            builder.switch_to_block(side_exit);
+            builder.ins().return_(&[status]);
+            builder.switch_to_block(ok);
+            let value = builder.ins().stack_load(types::I64, result_slot, 0);
+            registers.insert(*dst, value);
+        }
+        ExecutableRegionInstructionKind::Compare { dst, op, lhs, rhs } => {
+            let lhs = lower_region_operand(builder, locals, registers, *lhs)?;
+            let rhs = lower_region_operand(builder, locals, registers, *rhs)?;
+            let cl_value = builder.ins().icmp(region_compare_intcc(*op), lhs, rhs);
+            registers.insert(*dst, cl_value);
         }
     }
     Ok(())
 }
 
-fn lower_checked_inline_binary(
+fn lower_checked_region_binary(
     builder: &mut FunctionBuilder<'_>,
-    op: BinaryOp,
+    op: RegionBinaryOp,
     lhs: ir::Value,
     rhs: ir::Value,
+    deopt_out: ir::Value,
+    function: FunctionId,
+    local_count: u32,
+    instruction: &ExecutableRegionInstruction,
+    locals: &BTreeMap<LocalId, Variable>,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     let (result, overflow) = match op {
-        BinaryOp::Add => builder.ins().sadd_overflow(lhs, rhs),
-        BinaryOp::Sub => builder.ins().ssub_overflow(lhs, rhs),
-        BinaryOp::Mul => builder.ins().smul_overflow(lhs, rhs),
-        other => {
-            return Err(CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_HELPER_BINARY",
-                format!("binary op {other:?} is outside inline CFG native subset"),
-            ));
-        }
+        RegionBinaryOp::Add => builder.ins().sadd_overflow(lhs, rhs),
+        RegionBinaryOp::Sub => builder.ins().ssub_overflow(lhs, rhs),
+        RegionBinaryOp::Mul => builder.ins().smul_overflow(lhs, rhs),
     };
     let overflow_block = builder.create_block();
     let ok_block = builder.create_block();
@@ -3803,6 +3381,38 @@ fn lower_checked_inline_binary(
         .ins()
         .brif(overflow, overflow_block, &[], ok_block, &[]);
     builder.switch_to_block(overflow_block);
+    let function_id = builder.ins().iconst(types::I32, i64::from(function.raw()));
+    builder
+        .ins()
+        .store(MemFlagsData::new(), function_id, deopt_out, 0);
+    let continuation = builder
+        .ins()
+        .iconst(types::I32, i64::from(instruction.continuation_id));
+    builder
+        .ins()
+        .store(MemFlagsData::new(), continuation, deopt_out, 4);
+    let slot_count = builder.ins().iconst(types::I32, i64::from(local_count));
+    builder
+        .ins()
+        .store(MemFlagsData::new(), slot_count, deopt_out, 8);
+    let reserved = builder.ins().iconst(types::I32, 0);
+    builder
+        .ins()
+        .store(MemFlagsData::new(), reserved, deopt_out, 12);
+    let initialized_mask = instruction.live_locals.iter().fold(0_u64, |mask, local| {
+        mask | 1_u64.checked_shl(local.raw()).unwrap_or(0)
+    });
+    let initialized_mask = builder.ins().iconst(types::I64, initialized_mask as i64);
+    builder
+        .ins()
+        .store(MemFlagsData::new(), initialized_mask, deopt_out, 16);
+    for local in &instruction.live_locals {
+        let value = use_local_variable(builder, locals, *local)?;
+        let offset = 24_i32.saturating_add((local.raw() as i32).saturating_mul(8));
+        builder
+            .ins()
+            .store(MemFlagsData::new(), value, deopt_out, offset);
+    }
     let status = builder
         .ins()
         .iconst(types::I32, i64::from(JIT_HELPER_STATUS_OVERFLOW));
@@ -3811,29 +3421,24 @@ fn lower_checked_inline_binary(
     Ok(result)
 }
 
-fn compare_intcc(op: CompareOp) -> Result<IntCC, CraneliftLoweringError> {
+fn region_compare_intcc(op: RegionCompareOpCode) -> IntCC {
     match op {
-        CompareOp::Equal | CompareOp::Identical => Ok(IntCC::Equal),
-        CompareOp::NotEqual | CompareOp::NotIdentical => Ok(IntCC::NotEqual),
-        CompareOp::Less => Ok(IntCC::SignedLessThan),
-        CompareOp::LessEqual => Ok(IntCC::SignedLessThanOrEqual),
-        CompareOp::Greater => Ok(IntCC::SignedGreaterThan),
-        CompareOp::GreaterEqual => Ok(IntCC::SignedGreaterThanOrEqual),
-        other => Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_HELPER_COMPARE",
-            format!("compare op {other:?} is outside inline CFG native subset"),
-        )),
+        RegionCompareOpCode::Equal => IntCC::Equal,
+        RegionCompareOpCode::NotEqual => IntCC::NotEqual,
+        RegionCompareOpCode::Less => IntCC::SignedLessThan,
+        RegionCompareOpCode::LessEqual => IntCC::SignedLessThanOrEqual,
+        RegionCompareOpCode::Greater => IntCC::SignedGreaterThan,
+        RegionCompareOpCode::GreaterEqual => IntCC::SignedGreaterThanOrEqual,
     }
 }
 
-fn lower_inline_cfg_condition(
+fn lower_region_condition(
     builder: &mut FunctionBuilder<'_>,
-    unit: &IrUnit,
     locals: &BTreeMap<LocalId, Variable>,
     registers: &BTreeMap<RegId, ir::Value>,
-    condition: &Operand,
+    condition: ExecutableRegionOperand,
 ) -> Result<ir::Value, CraneliftLoweringError> {
-    let value = lower_inline_cfg_operand(builder, unit, locals, registers, condition)?;
+    let value = lower_region_operand(builder, locals, registers, condition)?;
     if builder.func.dfg.value_type(value) == types::I64 {
         Ok(builder.ins().icmp_imm(IntCC::NotEqual, value, 0))
     } else {
@@ -3842,54 +3447,48 @@ fn lower_inline_cfg_condition(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lower_inline_cfg_terminator(
+fn lower_region_terminator(
     builder: &mut FunctionBuilder<'_>,
-    unit: &IrUnit,
-    ir_function: &IrFunction,
     blocks: &[ir::Block],
     locals: &BTreeMap<LocalId, Variable>,
     registers: &BTreeMap<RegId, ir::Value>,
     result_out: ir::Value,
-    current_block: BlockId,
-    terminator: Option<&Terminator>,
+    terminator: &ExecutableRegionTerminator,
 ) -> Result<(), CraneliftLoweringError> {
-    let Some(terminator) = terminator else {
-        return Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_HELPER_TERMINATOR",
-            format!("block {} has no terminator", current_block.raw()),
-        ));
-    };
-    match &terminator.kind {
-        TerminatorKind::Jump { target } => {
+    match terminator {
+        ExecutableRegionTerminator::Jump { target } => {
             builder.ins().jump(cranelift_block(blocks, *target)?, &[]);
         }
-        TerminatorKind::JumpIfFalse { condition, target } => {
-            let condition =
-                lower_inline_cfg_condition(builder, unit, locals, registers, condition)?;
+        ExecutableRegionTerminator::JumpIfFalse {
+            condition,
+            target,
+            fallthrough,
+        } => {
+            let condition = lower_region_condition(builder, locals, registers, *condition)?;
             let false_block = cranelift_block(blocks, *target)?;
-            let true_block =
-                cranelift_block(blocks, next_ir_block_id(ir_function, current_block)?)?;
+            let true_block = cranelift_block(blocks, *fallthrough)?;
             builder
                 .ins()
                 .brif(condition, true_block, &[], false_block, &[]);
         }
-        TerminatorKind::JumpIfTrue { condition, target } => {
-            let condition =
-                lower_inline_cfg_condition(builder, unit, locals, registers, condition)?;
+        ExecutableRegionTerminator::JumpIfTrue {
+            condition,
+            target,
+            fallthrough,
+        } => {
+            let condition = lower_region_condition(builder, locals, registers, *condition)?;
             let true_block = cranelift_block(blocks, *target)?;
-            let false_block =
-                cranelift_block(blocks, next_ir_block_id(ir_function, current_block)?)?;
+            let false_block = cranelift_block(blocks, *fallthrough)?;
             builder
                 .ins()
                 .brif(condition, true_block, &[], false_block, &[]);
         }
-        TerminatorKind::JumpIf {
+        ExecutableRegionTerminator::JumpIf {
             condition,
             if_true,
             if_false,
         } => {
-            let condition =
-                lower_inline_cfg_condition(builder, unit, locals, registers, condition)?;
+            let condition = lower_region_condition(builder, locals, registers, *condition)?;
             builder.ins().brif(
                 condition,
                 cranelift_block(blocks, *if_true)?,
@@ -3898,11 +3497,8 @@ fn lower_inline_cfg_terminator(
                 &[],
             );
         }
-        TerminatorKind::Return {
-            value: Some(value),
-            by_ref_local: None,
-        } => {
-            let value = lower_inline_cfg_operand(builder, unit, locals, registers, value)?;
+        ExecutableRegionTerminator::Return { value } => {
+            let value = lower_region_operand(builder, locals, registers, *value)?;
             builder
                 .ins()
                 .store(MemFlagsData::new(), value, result_out, 0);
@@ -3911,45 +3507,8 @@ fn lower_inline_cfg_terminator(
                 .iconst(types::I32, i64::from(JIT_HELPER_STATUS_OK));
             builder.ins().return_(&[status]);
         }
-        TerminatorKind::Return {
-            value: None,
-            by_ref_local: _,
-        } => {
-            return Err(CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_HELPER_RETURN",
-                "inline CFG native subset requires an integer return value",
-            ));
-        }
-        TerminatorKind::Return {
-            value: Some(_),
-            by_ref_local: Some(_),
-        } => {
-            return Err(CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_HELPER_BY_REF_RETURN",
-                "by-reference returns are outside inline CFG native subset",
-            ));
-        }
-        TerminatorKind::Exit { .. } => {
-            return Err(CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_HELPER_EXIT",
-                "exit terminators are outside inline CFG native subset",
-            ));
-        }
     }
     Ok(())
-}
-
-fn sanitize_symbol_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -3958,8 +3517,8 @@ mod tests {
         CraneliftNoExecBackend, build_trivial_add_clif_smoke, lower_function_to_cranelift,
     };
     use crate::{
-        JIT_RUNTIME_ABI_HASH, JitBackend, JitBackendApi, JitBackendCompileRequest,
-        JitCompileRequest, JitCompileStatus,
+        JIT_HELPER_STATUS_OVERFLOW, JIT_RUNTIME_ABI_HASH, JitBackend, JitBackendApi,
+        JitBackendCompileRequest, JitCompileRequest, JitCompileStatus,
     };
     use php_ir::{
         BinaryOp, FunctionFlags, FunctionId, InstructionKind, IrBuilder, IrConstant, IrParam,
@@ -4151,6 +3710,107 @@ mod tests {
     }
 
     #[test]
+    fn cranelift_backend_executes_region_ir_without_leaf_recognizer() {
+        let (unit, function) = scalar_identity_fixture();
+        let mut backend = CraneliftNoExecBackend;
+        let request = JitCompileRequest::new("cl.region.identity");
+        let outcome = backend.compile_region(&JitBackendCompileRequest {
+            compile: &request,
+            unit: Some(&unit),
+            function: Some(function),
+            allow_native_execution: true,
+            runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+        });
+
+        assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+        assert!(outcome.diagnostics[0].contains("executable Region IR"));
+        assert!(outcome.diagnostics[0].contains("fast_path_hits=0"));
+        let handle = outcome
+            .handle
+            .expect("generic scalar region should compile");
+        assert_eq!(
+            handle
+                .invoke_i64(&[73], JIT_RUNTIME_ABI_HASH)
+                .expect("generic scalar region should execute"),
+            73
+        );
+    }
+
+    #[test]
+    fn cranelift_backend_executes_multiblock_region_ir() {
+        let (unit, function) = scalar_branch_fixture();
+        let mut backend = CraneliftNoExecBackend;
+        let request = JitCompileRequest::new("cl.region.branch");
+        let outcome = backend.compile_region(&JitBackendCompileRequest {
+            compile: &request,
+            unit: Some(&unit),
+            function: Some(function),
+            allow_native_execution: true,
+            runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+        });
+
+        assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+        assert!(outcome.diagnostics[0].contains("executable Region IR"));
+        assert!(outcome.diagnostics[0].contains("control_flow=true"));
+        let handle = outcome.handle.expect("multi-block region should compile");
+        assert_eq!(
+            handle
+                .invoke_i64(&[1], JIT_RUNTIME_ABI_HASH)
+                .expect("true branch executes"),
+            11
+        );
+        assert_eq!(
+            handle
+                .invoke_i64(&[0], JIT_RUNTIME_ABI_HASH)
+                .expect("false branch executes"),
+            22
+        );
+    }
+
+    #[test]
+    fn cranelift_region_calls_same_unit_compiled_callee_directly() {
+        let (unit, function, callee) = scalar_direct_call_fixture();
+        let mut backend = CraneliftNoExecBackend;
+        let request = JitCompileRequest::new("cl.region.direct-call");
+        let outcome = backend.compile_region(&JitBackendCompileRequest {
+            compile: &request,
+            unit: Some(&unit),
+            function: Some(function),
+            allow_native_execution: true,
+            runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+        });
+
+        assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+        assert!(outcome.diagnostics[0].contains("fast_path_hits=2"));
+        let handle = outcome.handle.expect("direct-call region should compile");
+        assert_eq!(handle.helper_calls_per_invocation(), 0);
+        assert_eq!(handle.compiled_to_compiled_calls_per_invocation(), 1);
+        assert!(
+            handle
+                .region_state_metadata()
+                .expect("region metadata")
+                .continuations
+                .iter()
+                .any(|continuation| continuation.function == callee)
+        );
+        assert_eq!(
+            handle
+                .invoke_i64(&[41], JIT_RUNTIME_ABI_HASH)
+                .expect("native caller and callee should execute"),
+            42
+        );
+        let crate::JitI64InvokeOutcome::SideExit { status, state } = handle
+            .invoke_i64_with_deopt(&[i64::MAX], JIT_RUNTIME_ABI_HASH)
+            .expect("callee overflow should preserve precise state")
+        else {
+            panic!("callee overflow unexpectedly returned");
+        };
+        assert_eq!(status, JIT_HELPER_STATUS_OVERFLOW);
+        assert_eq!(state.function_id, callee.raw());
+        assert_eq!(state.slots[0], i64::MAX);
+    }
+
+    #[test]
     fn cranelift_helper_arithmetic_overflow_returns_native_status() {
         let (unit, function) = helper_overflow_fixture();
         let mut backend = CraneliftNoExecBackend;
@@ -4173,6 +3833,90 @@ mod tests {
     }
 
     #[test]
+    fn cranelift_overflow_materializes_precise_region_continuation() {
+        let (unit, function) = helper_overflow_fixture();
+        let mut backend = CraneliftNoExecBackend;
+        let request = JitCompileRequest::new("cl.region.deopt-state");
+        let outcome = backend.compile_region(&JitBackendCompileRequest {
+            compile: &request,
+            unit: Some(&unit),
+            function: Some(function),
+            allow_native_execution: true,
+            runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+        });
+
+        assert_eq!(outcome.status, JitCompileStatus::Compiled);
+        let handle = outcome.handle.expect("overflow region should compile");
+        let metadata = handle
+            .region_state_metadata()
+            .expect("executable regions publish state metadata");
+        assert!(!metadata.continuations.is_empty());
+        assert!(!metadata.native_pc_ranges.is_empty());
+        let crate::JitI64InvokeOutcome::SideExit { status, state } = handle
+            .invoke_i64_with_deopt(&[i64::MAX], JIT_RUNTIME_ABI_HASH)
+            .expect("native invocation")
+        else {
+            panic!("overflow must side-exit");
+        };
+        assert_eq!(status, crate::JIT_HELPER_STATUS_OVERFLOW);
+        assert_eq!(state.function_id, function.raw());
+        assert_eq!(state.slot_count, 1);
+        assert_eq!(state.initialized_mask & 1, 1);
+        assert_eq!(state.slots[0], i64::MAX);
+        let continuation = metadata
+            .continuations
+            .iter()
+            .find(|continuation| continuation.id == state.continuation_id)
+            .expect("side exit continuation exists");
+        assert_eq!(continuation.function, function);
+        assert_eq!(continuation.live_locals, vec![LocalId::new(0)]);
+        assert!(metadata.native_pc_ranges.iter().any(|range| {
+            range.function == function
+                && range.continuation_id == continuation.id
+                && range.end > range.start
+        }));
+    }
+
+    #[test]
+    fn cranelift_loop_enters_through_native_osr_state() {
+        let (unit, function) = scalar_loop_fixture();
+        let mut backend = CraneliftNoExecBackend;
+        let request = JitCompileRequest::new("cl.region.osr");
+        let outcome = backend.compile_region(&JitBackendCompileRequest {
+            compile: &request,
+            unit: Some(&unit),
+            function: Some(function),
+            allow_native_execution: true,
+            runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+        });
+
+        assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+        let handle = outcome.handle.expect("loop region should compile");
+        let metadata = handle.region_state_metadata().expect("state metadata");
+        let osr = metadata.osr_entries.first().expect("loop OSR entry");
+        assert_eq!(osr.live_locals, vec![LocalId::new(0), LocalId::new(1)]);
+        assert_eq!(
+            handle
+                .invoke_i64(&[3], JIT_RUNTIME_ABI_HASH)
+                .expect("normal loop entry"),
+            3
+        );
+        let mut state = crate::JitDeoptState {
+            slot_count: 2,
+            initialized_mask: 0b11,
+            ..crate::JitDeoptState::default()
+        };
+        state.slots[0] = 5;
+        state.slots[1] = 2;
+        assert_eq!(
+            handle
+                .invoke_i64_osr(&[5], osr.id, &state, JIT_RUNTIME_ABI_HASH)
+                .expect("native OSR invocation"),
+            crate::JitI64InvokeOutcome::Returned(5)
+        );
+    }
+
+    #[test]
     fn cranelift_backend_compiles_packed_array_fetch_helper_native_handle() {
         let (unit, function) = packed_array_fetch_fixture();
         let mut backend = CraneliftNoExecBackend;
@@ -4183,6 +3927,7 @@ mod tests {
             function: Some(function),
             allow_native_execution: true,
             runtime_helpers: crate::JitRuntimeHelperAddresses {
+                helper_table: 0,
                 packed_array_len: 0,
                 packed_array_fetch_int_slow: test_packed_array_fetch_helper as *const () as usize,
                 known_strlen: 0,
@@ -4228,6 +3973,7 @@ mod tests {
             function: Some(function),
             allow_native_execution: true,
             runtime_helpers: crate::JitRuntimeHelperAddresses {
+                helper_table: 0,
                 packed_array_len: test_packed_array_len_helper as *const () as usize,
                 packed_array_fetch_int_slow: test_packed_array_fetch_sequence_helper as *const ()
                     as usize,
@@ -4267,6 +4013,7 @@ mod tests {
             function: Some(function),
             allow_native_execution: true,
             runtime_helpers: crate::JitRuntimeHelperAddresses {
+                helper_table: 0,
                 packed_array_len: 0,
                 packed_array_fetch_int_slow: 0,
                 known_strlen: test_known_strlen_helper as *const () as usize,
@@ -4310,6 +4057,7 @@ mod tests {
             function: Some(function),
             allow_native_execution: true,
             runtime_helpers: crate::JitRuntimeHelperAddresses {
+                helper_table: 0,
                 packed_array_len: 0,
                 packed_array_fetch_int_slow: 0,
                 known_strlen: 0,
@@ -4542,6 +4290,265 @@ mod tests {
             span,
         );
         builder.terminate_return(function, block, Some(Operand::Register(r4)), span);
+        (builder.finish(), function)
+    }
+
+    fn scalar_identity_fixture() -> (php_ir::IrUnit, FunctionId) {
+        let mut builder = IrBuilder::new(UnitId::new(0));
+        let file = builder.add_file("tests/fixtures/performance/cranelift/region/identity.php");
+        let span = IrSpan::new(file, 0, 0);
+        let function =
+            builder.start_function("jit_scalar_identity", FunctionFlags::default(), span);
+        builder.set_entry(function);
+        builder.set_return_type(function, Some(IrReturnType::Int));
+        let local = typed_int_param(&mut builder, function, "value");
+        let block = builder.append_block(function);
+        let result = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::LoadLocal { dst: result, local },
+            span,
+        );
+        builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+        (builder.finish(), function)
+    }
+
+    fn scalar_branch_fixture() -> (php_ir::IrUnit, FunctionId) {
+        let mut builder = IrBuilder::new(UnitId::new(0));
+        let file = builder.add_file("tests/fixtures/performance/cranelift/region/branch.php");
+        let span = IrSpan::new(file, 0, 0);
+        let function = builder.start_function("jit_scalar_branch", FunctionFlags::default(), span);
+        builder.set_entry(function);
+        builder.set_return_type(function, Some(IrReturnType::Int));
+        let local = typed_int_param(&mut builder, function, "condition");
+        let entry = builder.append_block(function);
+        let if_true = builder.append_block(function);
+        let if_false = builder.append_block(function);
+        let condition = builder.alloc_register(function);
+        builder.emit(
+            function,
+            entry,
+            InstructionKind::LoadLocal {
+                dst: condition,
+                local,
+            },
+            span,
+        );
+        builder.terminate_jump_if(
+            function,
+            entry,
+            Operand::Register(condition),
+            if_true,
+            if_false,
+            span,
+        );
+        let eleven = builder.add_constant(IrConstant::Int(11));
+        let true_value = builder.alloc_register(function);
+        builder.emit_load_const(function, if_true, true_value, eleven, span);
+        builder.terminate_return(function, if_true, Some(Operand::Register(true_value)), span);
+        let twenty_two = builder.add_constant(IrConstant::Int(22));
+        let false_value = builder.alloc_register(function);
+        builder.emit_load_const(function, if_false, false_value, twenty_two, span);
+        builder.terminate_return(
+            function,
+            if_false,
+            Some(Operand::Register(false_value)),
+            span,
+        );
+        (builder.finish(), function)
+    }
+
+    fn scalar_direct_call_fixture() -> (php_ir::IrUnit, FunctionId, FunctionId) {
+        let mut builder = IrBuilder::new(UnitId::new(0));
+        let file = builder.add_file("tests/fixtures/performance/cranelift/region/direct-call.php");
+        let span = IrSpan::new(file, 0, 0);
+
+        let callee = builder.start_function("native_increment", FunctionFlags::default(), span);
+        builder.set_return_type(callee, Some(IrReturnType::Int));
+        let callee_value = typed_int_param(&mut builder, callee, "value");
+        let callee_block = builder.append_block(callee);
+        let loaded = builder.alloc_register(callee);
+        let result = builder.alloc_register(callee);
+        let one = builder.add_constant(IrConstant::Int(1));
+        builder.emit(
+            callee,
+            callee_block,
+            InstructionKind::LoadLocal {
+                dst: loaded,
+                local: callee_value,
+            },
+            span,
+        );
+        builder.emit(
+            callee,
+            callee_block,
+            InstructionKind::Binary {
+                dst: result,
+                op: BinaryOp::Add,
+                lhs: Operand::Register(loaded),
+                rhs: Operand::Constant(one),
+            },
+            span,
+        );
+        builder.terminate_return(callee, callee_block, Some(Operand::Register(result)), span);
+        builder.register_function_name("native_increment", callee);
+
+        let caller = builder.start_function("native_wrapper", FunctionFlags::default(), span);
+        builder.set_entry(caller);
+        builder.set_return_type(caller, Some(IrReturnType::Int));
+        let caller_value = typed_int_param(&mut builder, caller, "value");
+        let caller_block = builder.append_block(caller);
+        let argument = builder.alloc_register(caller);
+        let call_result = builder.alloc_register(caller);
+        builder.emit(
+            caller,
+            caller_block,
+            InstructionKind::LoadLocal {
+                dst: argument,
+                local: caller_value,
+            },
+            span,
+        );
+        builder.emit(
+            caller,
+            caller_block,
+            InstructionKind::CallFunction {
+                dst: call_result,
+                name: "native_increment".to_owned(),
+                args: vec![php_ir::instruction::IrCallArg {
+                    name: None,
+                    value: Operand::Register(argument),
+                    unpack: false,
+                    value_kind: php_ir::instruction::IrCallArgValueKind::Direct,
+                    by_ref_local: Some(caller_value),
+                    by_ref_dim: None,
+                    by_ref_property: None,
+                    by_ref_property_dim: None,
+                }],
+            },
+            span,
+        );
+        builder.terminate_return(
+            caller,
+            caller_block,
+            Some(Operand::Register(call_result)),
+            span,
+        );
+        (builder.finish(), caller, callee)
+    }
+
+    fn scalar_loop_fixture() -> (php_ir::IrUnit, FunctionId) {
+        let mut builder = IrBuilder::new(UnitId::new(0));
+        let file = builder.add_file("tests/fixtures/performance/cranelift/region/loop.php");
+        let span = IrSpan::new(file, 0, 0);
+        let function = builder.start_function("jit_scalar_loop", FunctionFlags::default(), span);
+        builder.set_entry(function);
+        builder.set_return_type(function, Some(IrReturnType::Int));
+        let limit = typed_int_param(&mut builder, function, "limit");
+        let index = builder.intern_local(function, "index");
+        let entry = builder.append_block(function);
+        let header = builder.append_block(function);
+        let body = builder.append_block(function);
+        let exit = builder.append_block(function);
+        let zero = builder.add_constant(IrConstant::Int(0));
+        builder.emit(
+            function,
+            entry,
+            InstructionKind::StoreLocal {
+                local: index,
+                src: Operand::Constant(zero),
+            },
+            span,
+        );
+        builder.terminate_jump(function, entry, header, span);
+
+        let current = builder.alloc_register(function);
+        let end = builder.alloc_register(function);
+        let condition = builder.alloc_register(function);
+        builder.emit(
+            function,
+            header,
+            InstructionKind::LoadLocal {
+                dst: current,
+                local: index,
+            },
+            span,
+        );
+        builder.emit(
+            function,
+            header,
+            InstructionKind::LoadLocal {
+                dst: end,
+                local: limit,
+            },
+            span,
+        );
+        builder.emit(
+            function,
+            header,
+            InstructionKind::Compare {
+                dst: condition,
+                op: php_ir::CompareOp::Less,
+                lhs: Operand::Register(current),
+                rhs: Operand::Register(end),
+            },
+            span,
+        );
+        builder.terminate_jump_if(
+            function,
+            header,
+            Operand::Register(condition),
+            body,
+            exit,
+            span,
+        );
+
+        let body_current = builder.alloc_register(function);
+        let incremented = builder.alloc_register(function);
+        let one = builder.add_constant(IrConstant::Int(1));
+        builder.emit(
+            function,
+            body,
+            InstructionKind::LoadLocal {
+                dst: body_current,
+                local: index,
+            },
+            span,
+        );
+        builder.emit(
+            function,
+            body,
+            InstructionKind::Binary {
+                dst: incremented,
+                op: BinaryOp::Add,
+                lhs: Operand::Register(body_current),
+                rhs: Operand::Constant(one),
+            },
+            span,
+        );
+        builder.emit(
+            function,
+            body,
+            InstructionKind::StoreLocal {
+                local: index,
+                src: Operand::Register(incremented),
+            },
+            span,
+        );
+        builder.terminate_jump(function, body, header, span);
+
+        let result = builder.alloc_register(function);
+        builder.emit(
+            function,
+            exit,
+            InstructionKind::LoadLocal {
+                dst: result,
+                local: index,
+            },
+            span,
+        );
+        builder.terminate_return(function, exit, Some(Operand::Register(result)), span);
         (builder.finish(), function)
     }
 

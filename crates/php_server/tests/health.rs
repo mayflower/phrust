@@ -535,7 +535,7 @@ fn server_request_profile_source_attribution_mode_collects_attribution() {
     .expect("write include fixture");
     fs::write(
         docroot.join("profile.php"),
-        "<?php\ninclude __DIR__ . '/lib.php';\nob_start();\n$items = ['a' => 1, 'b' => 2];\n$thing = new ProfileThing();\necho profile_helper($items) + $items['a'];\necho $thing->name();\necho strtoupper('x');\necho ob_get_clean();\n",
+        "<?php\nfunction profile_direct(int $value): int { return $value + 1; }\ninclude __DIR__ . '/lib.php';\nob_start();\n$items = ['a' => 1, 'b' => 2];\n$thing = new ProfileThing();\necho profile_helper($items) + $items['a'];\necho $thing->name();\necho strtoupper('x');\necho profile_direct(1);\necho ob_get_clean();\n",
     )
     .expect("write profile fixture");
     let profile_dir = temp_docroot();
@@ -561,7 +561,7 @@ fn server_request_profile_source_attribution_mode_collects_attribution() {
     stop_child(child);
 
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-    assert_eq!(response_body(&response), "3thingX");
+    assert_eq!(response_body(&response), "3thingX2");
     let profile_path = fs::read_dir(&profile_dir)
         .expect("read profile dir")
         .map(|entry| entry.expect("profile entry").path())
@@ -615,13 +615,26 @@ fn server_request_profile_source_attribution_mode_collects_attribution() {
         &profile["attribution"]["output"]["operation_profiles_by_family"],
         "output_buffer_builtin",
     );
-    assert_counter_profile_contains(
-        &profile["attribution"]["clones"]["value_clone_by_source_family"],
-        "call_argument_snapshot",
+    assert!(
+        profile["attribution"]["calls"]["direct_call_source_reads"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "direct caller-source binding must be visible in the request profile: {profile}"
+    );
+    assert!(
+        profile["attribution"]["calls"]["dense_activation_transfers"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "direct calls must use the iterative activation path: {profile}"
+    );
+    assert_eq!(
+        profile["attribution"]["calls"]["direct_call_owned_value_buffers"],
+        serde_json::Value::from(0),
+        "eligible direct calls must not materialize owned value buffers"
     );
     assert_counter_profile_contains(
-        &profile["attribution"]["clones"]["value_clone_by_source_family"],
-        "array_element_read",
+        &profile["attribution"]["clones"]["value_clone_by_reason"],
+        "call_argument_snapshot",
     );
 
     fs::remove_dir_all(profile_dir).expect("remove profile dir");

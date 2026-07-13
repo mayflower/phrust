@@ -3,6 +3,24 @@
 use super::prelude::*;
 
 impl Vm {
+    pub(super) fn compact_builtin_entry(&self, name: &str) -> Option<BuiltinEntry> {
+        let entry = BuiltinRegistry::new().get(name)?;
+        let Some((spec_index, spec)) = builtin_intrinsic_spec(name) else {
+            return Some(entry);
+        };
+        if !builtin_intrinsic_metadata_matches_cached(spec_index) {
+            return Some(entry);
+        }
+        let kind = match spec.exact_arity {
+            0 => BuiltinHandlerKind::Pure0,
+            1 if spec.min_arity == 1 => BuiltinHandlerKind::Pure1,
+            2 if spec.min_arity == 2 => BuiltinHandlerKind::Pure2,
+            3 if spec.min_arity == 3 => BuiltinHandlerKind::Pure3,
+            _ => BuiltinHandlerKind::BorrowedN,
+        };
+        Some(entry.with_handler_kind(kind))
+    }
+
     pub(super) fn try_execute_fast_builtin_stub(
         &self,
         name: &str,
@@ -35,7 +53,18 @@ impl Vm {
         &self,
         name: &str,
         values: &[DenseOperandRead<'_>],
-    ) -> Option<VmResult> {
+    ) -> Option<BuiltinOutcome> {
+        let entry = self.compact_builtin_entry(name)?;
+        if !matches!(
+            entry.handler_kind(),
+            BuiltinHandlerKind::Pure0
+                | BuiltinHandlerKind::Pure1
+                | BuiltinHandlerKind::Pure2
+                | BuiltinHandlerKind::Pure3
+                | BuiltinHandlerKind::BorrowedN
+        ) {
+            return None;
+        }
         let (spec_index, spec) = builtin_intrinsic_spec(name)?;
         if !builtin_intrinsic_metadata_matches_cached(spec_index)
             || values.len() < spec.min_arity
@@ -55,7 +84,7 @@ impl Vm {
             self.record_counter_internal_count_array_direct_fast_path_hit();
             self.record_counter_count_array_shape_fast_hit();
         }
-        Some(VmResult::success_no_output(Some(result)))
+        Some(BuiltinOutcome::Return(result))
     }
 
     /// Default-flags `json_encode` over scalar/array shapes, bypassing the

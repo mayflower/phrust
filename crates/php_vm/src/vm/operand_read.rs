@@ -33,6 +33,47 @@ impl DenseOperandRead<'_> {
 }
 
 impl Vm {
+    pub(super) fn read_dense_operand_at_frame(
+        &self,
+        compiled: &CompiledUnit,
+        stack: &CallStack,
+        frame_index: usize,
+        operand: DenseOperand,
+    ) -> Result<Value, String> {
+        match operand.kind {
+            DenseOperandKind::Register => {
+                let frame = stack.frames().get(frame_index).ok_or("no active frame")?;
+                let value = frame
+                    .registers
+                    .get(RegId::new(operand.index))
+                    .ok_or_else(|| format!("invalid register r{}", operand.index))?;
+                if value.is_uninitialized() {
+                    return Err(format!("read uninitialized register r{}", operand.index));
+                }
+                Ok(match value {
+                    Value::Reference(cell) => cell.get(),
+                    value => value.clone(),
+                })
+            }
+            DenseOperandKind::Local => {
+                let frame = stack.frames().get(frame_index).ok_or("no active frame")?;
+                Ok(frame
+                    .locals
+                    .get(php_ir::ids::LocalId::new(operand.index))
+                    .map_or(Value::Null, |value| match value {
+                        Value::Reference(cell) => cell.get(),
+                        value if value.is_uninitialized() => Value::Null,
+                        value => value,
+                    }))
+            }
+            DenseOperandKind::Constant => {
+                let id = ConstId::new(operand.index);
+                self.resolved_constant_value(compiled, id)
+                    .map_or_else(|| constant_value(compiled.unit(), id), Ok)
+            }
+        }
+    }
+
     pub(super) fn read_dense_operand(
         &self,
         compiled: &CompiledUnit,

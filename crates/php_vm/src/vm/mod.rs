@@ -22,12 +22,14 @@ mod class_operations;
 mod class_relations;
 mod class_validation;
 mod closure_operations;
+mod dense_activation;
 mod dense_dispatch;
 mod dense_method_dispatch;
 mod dense_pcre_support;
 mod dense_runtime_adapters;
 mod diagnostics;
 mod dim_execution_support;
+mod direct_call_binding;
 mod dispatch_contract;
 mod exception_dispatch;
 mod execution_control;
@@ -130,7 +132,7 @@ use execution_state::{
     preserved_destructor_object_ids, release_unrooted_direct_object_handle,
     release_unrooted_object_handles,
 };
-use execution_tiering::JitLeafRequest;
+use execution_tiering::{JitArgumentSlots, JitLeafRequest};
 use ext_redis::*;
 use generator_fiber::{
     FiberContinuation, FiberContinuationState, FiberResumeInput, FiberSuspension,
@@ -224,7 +226,7 @@ use jit_abi::{
     JIT_PROPERTY_LOAD_STATUS_STORAGE_EXIT, JIT_PROPERTY_LOAD_STATUS_UNINITIALIZED_EXIT,
     jit_array_fetch_int_slow_abi, jit_array_len_abi, jit_concat_string_string_fast,
     jit_count_known_abi, jit_guard_kind_for_side_exit, jit_property_load_monomorphic_fast,
-    jit_record_array_lookup_abi, jit_strlen_known_abi,
+    jit_record_array_lookup_abi, jit_runtime_helper_table, jit_strlen_known_abi,
 };
 use operand_read::{
     DenseOperandRead, operand_truthy_at_frame, read_operand, read_operand_at_frame,
@@ -250,7 +252,7 @@ use php_runtime::api::IniRegistry;
 use php_runtime::api::ResourceTable;
 use php_runtime::api::{
     ArrayKey, AttributeEntry as RuntimeAttributeEntry, AutoloadRegistry, BuiltinContext,
-    BuiltinEntry, CallableMethodTarget, CallableValue,
+    BuiltinEntry, BuiltinHandlerKind, BuiltinOutcome, CallableMethodTarget, CallableValue,
     ClassConstantEntry as RuntimeClassConstantEntry,
     ClassConstantFlags as RuntimeClassConstantFlags, ClassEntry as RuntimeClassEntry,
     ClassEnumBackingType as RuntimeClassEnumBackingType,
@@ -364,9 +366,13 @@ const SPL_RTI_BYPASS_KEY: i64 = 8;
 const SORT_FLAG_CASE: i64 = 8;
 const NORMALIZER_FORM_C: i64 = php_runtime::api::NORMALIZER_FORM_C;
 #[cfg(feature = "jit-cranelift")]
-const JIT_BLACKLIST_SIDE_EXIT_THRESHOLD: u64 = 2;
+const JIT_TIERING_MIN_EXECUTIONS: u64 = 32;
 #[cfg(feature = "jit-cranelift")]
-const JIT_BLACKLIST_GUARD_FAILURE_THRESHOLD: u64 = 2;
+const JIT_TIERING_MIN_SIDE_EXITS: u64 = 8;
+#[cfg(feature = "jit-cranelift")]
+const JIT_TIERING_MAX_EXIT_RATE_PERCENT: u64 = 50;
+#[cfg(feature = "jit-cranelift")]
+const JIT_TIERING_COOLDOWN_CALLS: u64 = 128;
 #[cfg(feature = "jit-cranelift")]
 const JIT_BLACKLIST_COMPILE_ERROR_THRESHOLD: u64 = 1;
 #[cfg(feature = "jit-cranelift")]
@@ -579,6 +585,9 @@ pub struct Vm {
     literal_pool: RefCell<LiteralPool>,
     quickening: RefCell<QuickeningTable>,
     worker_quickening_tables: WorkerQuickeningTables,
+    /// Replay-stable snapshot captured before the request quickening lease
+    /// returns its table to worker-owned adaptive state.
+    persistent_quickening_snapshot: RefCell<Vec<crate::quickening::QuickeningSiteSnapshot>>,
     /// Final invalidation epochs of the last `execute` call, stashed before
     /// request state drops so the persistent-feedback writer can stamp entries
     /// with the true observation state instead of cold-start zeros.
@@ -723,6 +732,7 @@ impl Vm {
             constructor_resolution_cache: worker_state.constructor_resolution_cache,
             quickening: RefCell::new(QuickeningTable::default()),
             worker_quickening_tables: worker_state.quickening_tables,
+            persistent_quickening_snapshot: RefCell::new(Vec::new()),
             persistent_feedback_epochs: Cell::new(None),
             persistent_feedback_entry_unit_key: Cell::new(None),
             inline_caches: worker_state.inline_caches,
@@ -761,6 +771,7 @@ impl Vm {
         self.trace.borrow_mut().clear();
         *self.literal_pool.borrow_mut() = LiteralPool::default();
         self.persistent_feedback_epochs.set(None);
+        self.persistent_quickening_snapshot.borrow_mut().clear();
         // IC slots and the entry-unit scope filter share the compiled unit's
         // stable cache identity.
         self.persistent_feedback_entry_unit_key
@@ -1125,6 +1136,8 @@ impl Vm {
         if self.options.tiering.collect_stats {
             result.tiering_stats = Some(Box::new(self.tiering.borrow().stats()));
         }
+        *self.persistent_quickening_snapshot.borrow_mut() =
+            self.quickening.borrow().export_persistent_sites();
         result.output = output;
         result
     }
@@ -1133,7 +1146,7 @@ impl Vm {
     /// for persistent feedback. Empty when quickening was disabled.
     #[must_use]
     pub fn export_persistent_quickening(&self) -> Vec<crate::quickening::QuickeningSiteSnapshot> {
-        self.quickening.borrow().export_persistent_sites()
+        self.persistent_quickening_snapshot.borrow().clone()
     }
 
     /// Final invalidation epochs of the last `execute` call, for stamping

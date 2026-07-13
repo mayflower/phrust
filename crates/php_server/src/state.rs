@@ -318,7 +318,14 @@ pub(crate) fn preload_script_cache(
     preload_file: Option<&Path>,
     strict: bool,
 ) -> Result<(), ServerError> {
+    let started = std::time::Instant::now();
+    state
+        .services
+        .metrics
+        .script_cache_ready
+        .store(1, Ordering::Release);
     let Some(preload_file) = preload_file else {
+        finish_jit_prewarm_readiness(state, 0, started.elapsed());
         return Ok(());
     };
     let contents = match std::fs::read_to_string(preload_file) {
@@ -334,9 +341,11 @@ pub(crate) fn preload_script_cache(
                 return Err(ServerError::Preload(Box::new(error)));
             }
             warn!(%error);
+            finish_jit_prewarm_readiness(state, 0, started.elapsed());
             return Ok(());
         }
     };
+    let mut prewarmed_entries = 0_u64;
     for (line_index, line) in contents.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -359,7 +368,10 @@ pub(crate) fn preload_script_cache(
                     error,
                 ))
             })
-            .and_then(|_| {
+            .and_then(|lookup| {
+                let executor = PhpExecutor::with_options(state.services.engine.executor_options());
+                prewarmed_entries =
+                    prewarmed_entries.saturating_add(executor.prewarm_compiled(&lookup.compiled));
                 preload_include_cache_entry(state, &script_path).map_err(|error| {
                     Box::new(PreloadError::include_entry(
                         preload_file,
@@ -390,7 +402,27 @@ pub(crate) fn preload_script_cache(
             }
         }
     }
+    finish_jit_prewarm_readiness(state, prewarmed_entries, started.elapsed());
     Ok(())
+}
+
+fn finish_jit_prewarm_readiness(state: &AppState, entries: u64, elapsed: Duration) {
+    let metrics = &state.services.metrics;
+    metrics
+        .jit_prewarm_entries
+        .fetch_add(entries, Ordering::Relaxed);
+    metrics.jit_prewarm_nanos.fetch_add(
+        elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
+        Ordering::Relaxed,
+    );
+    metrics.jit_code_cache_generation.store(
+        php_vm::experimental::cranelift_code_cache_generation(),
+        Ordering::Release,
+    );
+    // Compilation is synchronous and serialized by the process code manager;
+    // completing this phase therefore also proves that its queue is empty.
+    metrics.jit_compile_queue_empty.store(1, Ordering::Release);
+    metrics.jit_prewarm_complete.store(1, Ordering::Release);
 }
 
 fn preload_include_cache_entry(state: &AppState, script_path: &Path) -> Result<(), VmError> {

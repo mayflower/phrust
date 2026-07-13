@@ -41,6 +41,8 @@ DEFAULT_PHP_FPM_IMAGE = "phrust-php-fpm:8.5.7"
 DEFAULT_NGINX_IMAGE = "nginx:1.28.0-alpine"
 DEFAULT_OBSERVABLES = (("root", "/"),)
 TARGET_PHP_VERSION = "8.5.7"
+SUPPORTED_CRANELIFT_MACHINES = {"x86_64", "amd64", "aarch64", "arm64"}
+AMD64_MACHINES = {"x86_64", "amd64"}
 CLEAN_TIMING_FORBIDDEN_ENV = (
     "PHRUST_PERF_TRACE",
     "PHRUST_SERVER_PERF_TRACE_VM_COUNTERS",
@@ -145,6 +147,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("PHRUST_SERVER", "target/release/phrust-server"),
     )
     parser.add_argument(
+        "--baseline-server",
+        default=os.environ.get("PHRUST_BASELINE_SERVER", ""),
+        help="managed JIT-off server used by the AMD64 Cranelift A/B",
+    )
+    parser.add_argument(
+        "--cranelift-server",
+        default=os.environ.get("PHRUST_CRANELIFT_SERVER", ""),
+        help="lean jit-cranelift server used by the AMD64 Cranelift A/B",
+    )
+    parser.add_argument(
+        "--diagnostic-server",
+        default=os.environ.get("PHRUST_CRANELIFT_DIAGNOSTIC_SERVER", ""),
+        help="runtime-telemetry jit-cranelift server used for untimed native evidence",
+    )
+    parser.add_argument(
         "--server-source-commit",
         default=os.environ.get("PHRUST_SERVER_SOURCE_COMMIT", ""),
         help="source commit used to build the supplied Phrust server binary",
@@ -211,7 +228,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cranelift-ab",
         action="store_true",
-        help="run ARM experimental-jit across feedback and copy-patch off/on arms",
+        help=(
+            "run the host-appropriate Cranelift A/B; AMD64 compares managed JIT-off "
+            "with experimental-jit and keeps copy-patch off"
+        ),
     )
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--baseline", default="")
@@ -346,13 +366,141 @@ def run_feedback_ab(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
 
 
 def run_cranelift_ab(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
-    """Run clean and diagnostic evidence for the ARM native-tier matrix."""
+    """Run the host-appropriate clean and diagnostic Cranelift A/B."""
+    if platform.machine().lower() in AMD64_MACHINES:
+        return run_amd64_cranelift_ab(args, out_dir)
+    return run_arm_cranelift_ab(args, out_dir)
+
+
+def run_amd64_cranelift_ab(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
+    """Compare a lean managed baseline with lean Cranelift on AMD64."""
     errors = validate_configuration(args)
     if errors:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "fail",
             "mode": "cranelift-ab",
+            "architecture": "amd64",
+            "timing_eligible": False,
+            "arms": {},
+            "failures": errors,
+        }
+
+    baseline_server = args.baseline_server or args.server
+    cranelift_server = args.cranelift_server or args.server
+    diagnostic_server = args.diagnostic_server or cranelift_server
+    specs = (
+        ("managed-baseline", baseline_server, "default", False),
+        ("cranelift", cranelift_server, "experimental-jit", True),
+    )
+    arms: dict[str, dict[str, Any]] = {}
+    full_reports: dict[str, dict[str, Any]] = {}
+    failures: list[str] = []
+    for name, server, engine_preset, collect_native_evidence in specs:
+        arm_dir = out_dir / name
+        clean_dir = arm_dir / "clean"
+        clean_dir.mkdir(parents=True, exist_ok=True)
+        clean_args = copy.copy(args)
+        clean_args.cranelift_ab = False
+        clean_args.server = server
+        clean_args.engine_preset = engine_preset
+        clean_args.copy_patch = "off"
+        clean_args.mode = "clean"
+        clean_args.baseline = ""
+        clean_args.compare = ""
+        clean_args.record_baseline = ""
+        clean_args.out_dir = str(clean_dir)
+        clean_report = run(clean_args, clean_dir)
+        write_json(clean_report, clean_dir / "summary.json")
+        write_markdown(clean_report, clean_dir / "summary.md")
+        full_reports[name] = clean_report
+
+        diagnostic_report: dict[str, Any] | None = None
+        native: dict[str, Any] = {}
+        if collect_native_evidence:
+            diagnostic_dir = arm_dir / "diagnostic"
+            diagnostic_dir.mkdir(parents=True, exist_ok=True)
+            diagnostic_args = copy.copy(clean_args)
+            diagnostic_args.server = diagnostic_server
+            diagnostic_args.mode = "diagnostic"
+            diagnostic_args.out_dir = str(diagnostic_dir)
+            diagnostic_report = run(diagnostic_args, diagnostic_dir)
+            write_json(diagnostic_report, diagnostic_dir / "summary.json")
+            write_markdown(diagnostic_report, diagnostic_dir / "summary.md")
+            native = (
+                ((diagnostic_report.get("profile") or {}).get("attribution") or {}).get("native")
+                or {}
+            )
+            if native.get("copy_patch_executed", 0) != 0:
+                failures.append("AMD64 Cranelift arm credited copy-patch execution")
+
+        status = combined_status(
+            clean_report,
+            *([diagnostic_report] if diagnostic_report is not None else []),
+        )
+        arm = {
+            "status": status,
+            "engine_preset": engine_preset,
+            "persistent_feedback": clean_args.persistent_feedback,
+            "copy_patch": "off",
+            "clean_summary": rel(clean_dir / "summary.json"),
+            "diagnostic_summary": (
+                rel(arm_dir / "diagnostic" / "summary.json")
+                if diagnostic_report is not None
+                else None
+            ),
+            "phrust_identity": ((clean_report.get("engines") or {}).get("phrust") or {}).get(
+                "identity"
+            ),
+            "native_evidence": native,
+            "jit_identity": jit_identity_from_native(native),
+        }
+        arms[name] = arm
+
+    statuses = {arm["status"] for arm in arms.values()}
+    status = "fail" if failures or "fail" in statuses else "skip" if "skip" in statuses else "pass"
+    return {
+        "schema_version": 2,
+        "status": status,
+        "mode": "cranelift-ab",
+        "architecture": "amd64",
+        "timing_eligible": all(
+            report.get("timing_eligible") is True for report in full_reports.values()
+        ),
+        "copy_patch_policy": "disabled-for-all-arms",
+        "comparisons": {
+            "managed-baseline-to-cranelift": build_feedback_ab_ratios(
+                full_reports["managed-baseline"], full_reports["cranelift"]
+            )
+        },
+        "arms": arms,
+        "failures": failures,
+    }
+
+
+def jit_identity_from_native(native: dict[str, Any]) -> dict[str, Any]:
+    descriptors = native.get("jit_compile_descriptors")
+    descriptor = descriptors[0] if isinstance(descriptors, list) and descriptors else {}
+    source_abi = jit_source_abi_identity()
+    return {
+        "jit_mode": native.get("jit_mode"),
+        "target_isa_display": descriptor.get("target_isa"),
+        "config_hash": descriptor.get("config_hash"),
+        "abi_version": source_abi.get("version"),
+        "abi_hash": descriptor.get("abi_hash", source_abi.get("hash")),
+        "cranelift_version": cranelift_dependency_version(),
+    }
+
+
+def run_arm_cranelift_ab(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
+    """Run the existing feedback/copy-patch Cranelift matrix on ARM64."""
+    errors = validate_configuration(args)
+    if errors:
+        return {
+            "schema_version": 2,
+            "status": "fail",
+            "mode": "cranelift-ab",
+            "architecture": "arm64",
             "timing_eligible": False,
             "arms": {},
             "failures": errors,
@@ -412,9 +560,10 @@ def run_cranelift_ab(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     statuses = {arm["status"] for arm in arms.values()}
     status = "fail" if "fail" in statuses else "skip" if "skip" in statuses else "pass"
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": status,
         "mode": "cranelift-ab",
+        "architecture": "arm64",
         "timing_eligible": all(
             report.get("timing_eligible") is True for report in full_reports.values()
         ),
@@ -491,8 +640,12 @@ def validate_configuration(args: argparse.Namespace) -> list[str]:
         errors.append("--require-idle-host is supported only by a single clean timing arm")
     if args.require_idle_host and args.mode != "clean":
         errors.append("--require-idle-host requires --mode clean")
-    if args.cranelift_ab and platform.machine().lower() not in {"arm64", "aarch64"}:
-        errors.append("--cranelift-ab is supported only on ARM/aarch64")
+    if args.cranelift_ab and platform.machine().lower() not in SUPPORTED_CRANELIFT_MACHINES:
+        errors.append(
+            "--cranelift-ab requires x86_64/amd64 or ARM64/aarch64"
+        )
+    if args.cranelift_ab and args.phrust_url:
+        errors.append("--cranelift-ab requires managed local server binaries")
     levels = concurrency_levels(args.concurrency)
     if args.samples < 1:
         errors.append("samples must be positive")
@@ -857,7 +1010,13 @@ def resolve_phrust(args: argparse.Namespace, out_dir: Path, docroot: Path | None
         "--engine-preset",
         args.engine_preset,
     ]
-    artifacts = {"server_log": rel(log_path)}
+    preload_manifest = out_dir / "phrust-script-cache-preload.txt"
+    preload_manifest.write_text("index.php\n", encoding="utf-8")
+    command.extend(["--script-cache-preload", str(preload_manifest)])
+    artifacts = {
+        "server_log": rel(log_path),
+        "script_cache_preload": rel(preload_manifest),
+    }
     if args.mode == "diagnostic":
         profile_dir = out_dir / "request-profiles"
         trace_path = out_dir / "perf-trace.jsonl"
@@ -893,6 +1052,8 @@ def resolve_phrust(args: argparse.Namespace, out_dir: Path, docroot: Path | None
         stderr=subprocess.STDOUT,
     )
     base_url = wait_for_server(process, log)
+    target = HttpTarget("phrust", base_url, args.host_header, (process.pid,))
+    readiness = wait_for_jit_readiness(target, args.timeout_seconds, args.metrics_token)
     identity = binary_identity(server)
     identity["source_commit"] = args.server_source_commit or None
     identity["source_patch_sha256"] = args.server_source_patch_sha256 or None
@@ -904,8 +1065,9 @@ def resolve_phrust(args: argparse.Namespace, out_dir: Path, docroot: Path | None
         performance_environment if args.mode == "clean" else "diagnostic"
     )
     identity["startup_ms"] = (time.perf_counter_ns() - startup_started_ns) / 1_000_000.0
+    identity["jit_readiness"] = readiness
     return ManagedTarget(
-        HttpTarget("phrust", base_url, args.host_header, (process.pid,)),
+        target,
         command,
         identity,
         process=process,
@@ -1547,6 +1709,37 @@ def fetch_metrics(target: HttpTarget, timeout: float, token: str) -> dict[str, f
     return values
 
 
+def wait_for_jit_readiness(
+    target: HttpTarget, timeout: float, token: str
+) -> dict[str, float]:
+    deadline = time.monotonic() + timeout
+    required = (
+        "phrust_server_script_cache_ready",
+        "phrust_server_jit_prewarm_complete",
+        "phrust_server_jit_compile_queue_empty",
+    )
+    last: dict[str, float] = {}
+    while time.monotonic() < deadline:
+        try:
+            last = fetch_metrics(target, min(timeout, 2.0), token)
+        except OSError:
+            time.sleep(0.05)
+            continue
+        if all(last.get(metric) == 1.0 for metric in required):
+            return {
+                metric: last[metric]
+                for metric in (
+                    *required,
+                    "phrust_server_jit_code_cache_generation",
+                    "phrust_server_jit_prewarm_entries_total",
+                    "phrust_server_jit_prewarm_nanos_total",
+                )
+                if metric in last
+            }
+        time.sleep(0.05)
+    raise RuntimeError(f"Phrust JIT readiness did not quiesce: {last}")
+
+
 def raw_http_text(target: HttpTarget, path: str, timeout: float, headers: dict[str, str] | None) -> dict[str, Any]:
     # Reuse the standard library client but retain the body for metrics parsing.
     import http.client
@@ -1593,9 +1786,76 @@ def binary_identity(path: Path) -> dict[str, Any]:
     }
 
 
+def rust_host_triple() -> str | None:
+    verbose = command_output(["rustc", "-vV"], REPO_ROOT)
+    if verbose is None:
+        return None
+    for line in verbose.splitlines():
+        if line.startswith("host:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def cranelift_dependency_version() -> str | None:
+    lock_path = REPO_ROOT / "Cargo.lock"
+    if not lock_path.is_file():
+        return None
+    match = re.search(
+        r'\[\[package\]\]\s*\nname = "cranelift-codegen"\s*\nversion = "([^"]+)"',
+        lock_path.read_text(encoding="utf-8"),
+    )
+    return match.group(1) if match else None
+
+
+def jit_source_abi_identity() -> dict[str, int | str | None]:
+    abi_path = REPO_ROOT / "crates/php_jit/src/abi.rs"
+    if not abi_path.is_file():
+        return {"version": None, "hash": None, "hash_hex": None}
+    source = abi_path.read_text(encoding="utf-8")
+    version_match = re.search(r"JIT_RUNTIME_ABI_VERSION:\s*u32\s*=\s*(\d+)", source)
+    hash_match = re.search(
+        r"JIT_RUNTIME_ABI_HASH:\s*u64\s*=\s*(0x[0-9a-fA-F_]+)", source
+    )
+    hash_hex = hash_match.group(1).replace("_", "") if hash_match else None
+    return {
+        "version": int(version_match.group(1)) if version_match else None,
+        "hash": int(hash_hex, 16) if hash_hex else None,
+        "hash_hex": hash_hex,
+    }
+
+
+def cpu_identity() -> dict[str, Any]:
+    values: dict[str, str] = {}
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.is_file():
+        first = cpuinfo.read_text(encoding="utf-8", errors="replace").split("\n\n", 1)[0]
+        for line in first.splitlines():
+            key, separator, value = line.partition(":")
+            if separator:
+                values[key.strip().lower()] = value.strip()
+    features = sorted(
+        set((values.get("flags") or values.get("features") or "").split())
+    )
+    feature_material = "\n".join(features).encode("utf-8")
+    return {
+        "vendor": values.get("vendor_id") or values.get("cpu implementer"),
+        "model_name": values.get("model name") or platform.processor() or None,
+        "family": values.get("cpu family"),
+        "model": values.get("model"),
+        "stepping": values.get("stepping"),
+        "feature_count": len(features),
+        "feature_fingerprint_sha256": hashlib.sha256(feature_material).hexdigest(),
+    }
+
+
 def environment_identity(docroot: Path | None, database_identity: str) -> dict[str, Any]:
     return {
         "platform": sys.platform,
+        "platform_machine": platform.machine(),
+        "rust_target_triple": rust_host_triple(),
+        "cpu": cpu_identity(),
+        "cranelift_version": cranelift_dependency_version(),
+        "jit_runtime_abi": jit_source_abi_identity(),
         "logical_cpus": os.cpu_count(),
         "available_cpus": available_cpus(),
         "repository_commit": command_output(["git", "rev-parse", "HEAD"], REPO_ROOT),
@@ -1856,8 +2116,9 @@ def write_feedback_ab_markdown(report: dict[str, Any], path: Path) -> None:
 
 
 def write_cranelift_ab_markdown(report: dict[str, Any], path: Path) -> None:
+    architecture = report.get("architecture") or platform.machine().lower()
     lines = [
-        "# WordPress ARM Cranelift A/B",
+        f"# WordPress {architecture.upper()} Cranelift A/B",
         "",
         f"Status: `{report['status']}`",
         "",
@@ -1868,14 +2129,16 @@ def write_cranelift_ab_markdown(report: dict[str, Any], path: Path) -> None:
         lines.append(f"- {failure}")
     lines.extend(["", "## Arms", ""])
     for name, arm in report.get("arms", {}).items():
-        compile_evidence = arm.get("compile", {})
+        compile_evidence = arm.get("compile") or arm.get("native_evidence") or {}
+        diagnostic = arm.get("diagnostic_summary") or "not collected"
         lines.append(
             f"- `{name}`: {arm['status']}; JIT compiles "
             f"{compile_evidence.get('jit_compile_attempts', 'unavailable')}, compile ns "
             f"{compile_evidence.get('jit_compile_time_nanos', 'unavailable')}; "
-            f"clean `{arm['clean_summary']}`, diagnostic `{arm['diagnostic_summary']}`"
+            f"copy-patch `{arm.get('copy_patch', 'unavailable')}`; "
+            f"clean `{arm['clean_summary']}`, diagnostic `{diagnostic}`"
         )
-    lines.extend(["", "## Copy-patch comparisons", ""])
+    lines.extend(["", "## Comparisons", ""])
     for name, comparisons in report.get("comparisons", {}).items():
         if not comparisons:
             lines.append(f"- `{name}`: no comparable clean timing curves")
@@ -2006,10 +2269,20 @@ def self_test() -> int:
     invalid_ab = parse_args(["--mode", "diagnostic", "--feedback-ab"])
     assert "requires --mode clean" in " ".join(validate_configuration(invalid_ab))
     cranelift_ab_errors = validate_configuration(parse_args(["--cranelift-ab"]))
-    if platform.machine().lower() in {"arm64", "aarch64"}:
-        assert "requires an ARM64 host" not in " ".join(cranelift_ab_errors)
+    if platform.machine().lower() in SUPPORTED_CRANELIFT_MACHINES:
+        assert "requires x86_64/amd64 or ARM64/aarch64" not in " ".join(
+            cranelift_ab_errors
+        )
     else:
-        assert "requires an ARM64 host" in " ".join(cranelift_ab_errors)
+        assert "requires x86_64/amd64 or ARM64/aarch64" in " ".join(
+            cranelift_ab_errors
+        )
+    assert cranelift_dependency_version()
+    source_abi = jit_source_abi_identity()
+    assert source_abi["version"] == 4
+    assert source_abi["hash"] == 0x07C1_A817_0000_0004
+    host_cpu = cpu_identity()
+    assert len(host_cpu["feature_fingerprint_sha256"]) == 64
     ab_off = {
         "engines": {
             "phrust": {

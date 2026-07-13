@@ -3153,7 +3153,7 @@ fn compile_scalar_int_tailcall_leaf(
 }
 
 /// One suspension point of a return-and-resume call region: when the region
-/// returns [`JIT_HELPER_STATUS_RESUME_CALL_BASE`]` + index`, it has marshaled
+/// returns `JIT_HELPER_STATUS_RESUME_CALL_BASE + index`, it has marshaled
 /// this site's positional ABI arguments into `arg_slots` and suspended
 /// itself. The VM performs the call to `callee_name` through the normal
 /// interpreter path, writes the callee's post-coercion result into
@@ -3188,7 +3188,7 @@ pub struct CompiledResumeRegion {
     /// Number of `JitCValue` slots the caller's buffer must provide.
     pub buffer_slots: u32,
     /// Suspension points in execution order; the region returns
-    /// [`JIT_HELPER_STATUS_RESUME_CALL_BASE`]` + i` to request site `i`.
+    /// `JIT_HELPER_STATUS_RESUME_CALL_BASE + i` to request site `i`.
     pub sites: Vec<ResumeCallSite>,
 }
 

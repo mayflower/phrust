@@ -38,12 +38,6 @@ impl Vm {
         stack: &mut CallStack,
         state: &mut ExecutionState,
     ) -> VmResult {
-        // Bare positional values are a dense-executor hand-off; the rich path
-        // binds from `call.args` and would silently see a zero-arg call.
-        debug_assert!(
-            call.positional_values.is_none(),
-            "pre-bound positional values reached the rich call path"
-        );
         let unit = compiled.unit();
         let Some(function) = unit.functions.get(function_id.index()) else {
             return self.runtime_error(output, compiled, stack, "called function is missing");
@@ -342,7 +336,7 @@ impl Vm {
                 function,
                 tier: function_tier,
                 call_shape_supported: jit_call_shape_supported,
-                args: &args,
+                args: JitArgumentSlots::Prepared(&args),
             }) {
                 return VmResult::success_no_output(Some(value));
             }

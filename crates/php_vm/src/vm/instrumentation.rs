@@ -823,6 +823,19 @@ impl Vm {
     }
 
     #[cfg(feature = "jit-cranelift")]
+    pub(super) fn record_counter_jit_code_manager_event(
+        &self,
+        event: php_jit::CraneliftCodeManagerEvent,
+    ) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_jit_code_manager_event(event);
+        }
+    }
+
+    #[cfg(feature = "jit-cranelift")]
     pub(super) fn record_counter_jit_compile_cache_hit(&self) {
         if !self.options.collect_counters {
             return;
@@ -1052,6 +1065,16 @@ impl Vm {
             for _ in 0..count {
                 counters.record_jit_fast_path_hit();
             }
+        }
+    }
+
+    #[cfg_attr(not(feature = "jit-cranelift"), allow(dead_code))]
+    pub(super) fn record_counter_compiled_to_compiled_calls(&self, count: u64) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_compiled_to_compiled_calls(count);
         }
     }
 
@@ -1358,6 +1381,42 @@ impl Vm {
         }
         if let Some(counters) = self.counters.borrow_mut().as_mut() {
             counters.record_prepared_arg_vector_allocation_avoided();
+        }
+    }
+
+    pub(super) fn record_counter_direct_call_transfer(&self, moved: bool) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_direct_call_transfer(moved);
+        }
+    }
+
+    pub(super) fn record_counter_cranelift_prepared_arg_materialization(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_cranelift_prepared_arg_materialization();
+        }
+    }
+
+    pub(super) fn record_counter_cranelift_direct_slot_marshal(&self, count: usize) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_cranelift_direct_slot_marshal(count as u64);
+        }
+    }
+
+    pub(super) fn record_counter_dense_activation_transfer(&self) {
+        if !self.options.collect_counters {
+            return;
+        }
+        if let Some(counters) = self.counters.borrow_mut().as_mut() {
+            counters.record_dense_activation_transfer();
         }
     }
 

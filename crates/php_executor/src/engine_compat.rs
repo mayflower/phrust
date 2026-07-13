@@ -330,9 +330,7 @@ mod tests {
         assert_eq!(status, EXIT_PHP_ERROR);
         let stdout = String::from_utf8(stdout).expect("stdout utf8");
         assert!(
-            stdout.starts_with(
-                "\nFatal error: Type int cannot be part of an intersection type in"
-            ),
+            stdout.starts_with("\nFatal error: Type int cannot be part of an intersection type in"),
             "{stdout}"
         );
         // Rendered errors keep stderr clean so 2>&1 comparisons match the

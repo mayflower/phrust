@@ -5,9 +5,10 @@ decision record is `docs/adr/0017-cranelift-jit-experiment.md`.
 
 ## Decision Summary
 
-The project may explore Cranelift in Performance, but only as a conservative
-default-off backend for a tiny verified IR subset. The interpreter remains the
-source of truth and every JIT path must have an interpreter fallback.
+The project may explore Cranelift in Performance as a conservative default-off
+backend for verified native candidates and evolving Region IR. The interpreter
+remains the source of truth and every JIT path must have an interpreter
+fallback.
 Feature-off builds must not depend on Cranelift or executable memory.
 
 ## Why Cranelift
@@ -58,24 +59,25 @@ misses, bailouts, and skips observable.
 
 ## Code Cache Lifecycle
 
-The Performance code cache is request-local. Cache keys include IR identity,
-compiler options, target triple, feature flags, and invalidation epochs. Shared
-native-code caches, OPcache-style preloading, process-wide eviction, and
-FPM/SAPI lifecycle are out of scope.
+JIT runtime state and its compile cache persist with VM worker state. Cache keys
+include function and IR identity, ABI hash, JIT configuration hash, the exact
+host-native Cranelift ISA/feature fingerprint, and runtime-layout invalidation.
+Cranelift code ownership is process-shared and bounded by the generation-based
+code manager documented in `docs/performance/cranelift/code-manager.md`.
+Prewarming and cross-process persistence remain follow-up requirements.
 
 ## Safety and Platform Rules
 
 Default builds run with JIT disabled and must not allocate executable memory.
-Feature-on builds may compile JIT infrastructure and execute the guarded
-the int-leaf prototype through safe VM-owned code after Cranelift IR
-verification. Native machine-code execution remains blocked until a W^X or
-equivalent executable-memory policy is implemented and audited. Unsupported
-platforms must skip or fall back cleanly.
+Feature-on builds compile and execute guarded Cranelift machine code after IR
+verification. Cranelift owns executable-memory publication and W^X behavior;
+the VM crosses the native boundary only through the versioned opaque-handle
+ABI. Unsupported platforms must skip or fall back cleanly.
 
 ## Feature and CLI Policy
 
 The Cargo feature is `jit-cranelift`, default off. The CLI switch is
-`--jit=off|on`, and the runtime default is `--jit=off`. Enabling the feature
+`--jit=off|cranelift`, and the runtime default is `--jit=off`. Enabling the feature
 only makes the experiment available; eligibility, warmup/hotness, guards, and
 runtime flags still decide whether any region can attempt compilation.
 
@@ -114,9 +116,10 @@ safe integer evaluator. Supported execution covers integer constants, local
 loads/stores, moves, add/sub/mul with checked overflow, and integer return.
 Calls, arrays, objects, references, typed parameters/returns, generators,
 fibers, methods, closures, and non-integer values fall back to the interpreter.
-`jit-smoke` now compares `--jit=off` and `--jit=on` output, asserts
+`jit-smoke` compares `--jit=off` and `--jit=cranelift` output, asserts
 `jit_compile_attempts`, `jit_compiled`, `jit_executed`, and `jit_bailouts`, and
-keeps `native_machine_code_execution` false.
+records native machine-code execution, ISA/feature identity, and copy-patch
+separation. `jit-smoke-amd64` makes these assertions mandatory on AMD64 Linux.
 
 The performance layer provides the tiering policy and stats surface. The JIT remains
 default-off, feature-gated, and limited to eligible hot int-leaf functions; the
@@ -128,6 +131,8 @@ Standard JIT validation:
 
 ```bash
 nix develop -c just jit-smoke
+nix develop -c just jit-smoke-amd64
+nix develop -c just release-cranelift-amd64
 nix develop -c just safety-audit-smoke
 nix develop -c just verify-performance
 ```

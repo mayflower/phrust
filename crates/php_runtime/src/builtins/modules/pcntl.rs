@@ -602,6 +602,7 @@ const PRIO_DARWIN_BG_VALUE: i64 = 0x1000;
 const PRIO_DARWIN_THREAD_VALUE: i64 = 3;
 
 fn validate_getpriority_mode(process_id: i64, mode: i64) -> Result<(), BuiltinError> {
+    let _ = process_id;
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let allowed = [

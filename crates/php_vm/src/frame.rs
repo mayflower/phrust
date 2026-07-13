@@ -568,6 +568,27 @@ impl CallStack {
         self.frames.get_mut(index)
     }
 
+    /// Returns two distinct active frames after validating their indexes.
+    ///
+    /// Direct argument transfer uses this instead of taking raw frame pointers:
+    /// the split proves to Rust that caller and callee storage cannot alias.
+    pub fn split_frames_mut(
+        &mut self,
+        first: usize,
+        second: usize,
+    ) -> Option<(&mut Frame, &mut Frame)> {
+        if first == second || first >= self.frames.len() || second >= self.frames.len() {
+            return None;
+        }
+        if first < second {
+            let (left, right) = self.frames.split_at_mut(second);
+            Some((&mut left[first], &mut right[0]))
+        } else {
+            let (left, right) = self.frames.split_at_mut(first);
+            Some((&mut right[0], &mut left[second]))
+        }
+    }
+
     /// Returns frames from entry to current frame.
     #[must_use]
     pub fn frames(&self) -> &[Frame] {

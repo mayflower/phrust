@@ -100,6 +100,10 @@ help:
       '  just wordpress-root-tranche-gate Run strict c1-p50 performance acceptance gate' \
       '  just wordpress-root-benchmark-feedback-ab Run persistent-feedback A/B' \
       '  just wordpress-root-benchmark-cranelift Run experimental Cranelift arm' \
+      '  just release-cranelift-amd64 Build lean AMD64 Cranelift server' \
+      '  just wordpress-root-benchmark-cranelift-amd64 Run managed-vs-Cranelift AMD64 A/B' \
+      '  just wordpress-root-tranche-gate-cranelift-amd64 Run strict AMD64 Cranelift c1-p50 gate' \
+      '  just jit-smoke-amd64    Prove native Cranelift execution with copy-patch disabled' \
       '  just worker-adaptive-state-smoke Verify worker-local adaptive reuse and isolation' \
       '  just wordpress-root-diagnostics Run timing-ineligible Phrust diagnostics' \
       '  just wordpress-dense-fallback-report Summarize dense fallback attribution from latest request profile' \
@@ -1185,6 +1189,53 @@ wordpress-root-benchmark-cranelift *args:
     if [ -z "${PHRUST_WORDPRESS_PHRUST_URL:-${PHRUST_WORDPRESS_URL:-}}" ]; then cargo build --release -p php_server --bin phrust-server --no-default-features --features jit-copy-patch,jit-cranelift; fi
     PHRUST_SERVER="${PHRUST_SERVER:-${CARGO_TARGET_DIR:-target}/release/phrust-server}" scripts/performance/wordpress_root_benchmark.py --mode clean --engine-preset experimental-jit {{args}}
 
+# Lean host-native Cranelift production candidate for x86_64 Linux. Copy-patch
+# is excluded at build time by --no-default-features.
+release-cranelift-amd64:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    machine="$(uname -m)"
+    if [[ "$machine" != "x86_64" && "$machine" != "amd64" ]] || [[ "$(uname -s)" != "Linux" ]]; then
+        printf '%s\n' "[fail] release-cranelift-amd64 requires x86_64 Linux; got $machine/$(uname -s)" >&2
+        exit 1
+    fi
+    CARGO_TARGET_DIR="${PHRUST_AMD64_CRANELIFT_TARGET_DIR:-target/amd64-cranelift}" cargo build --release -p php_server --bin phrust-server --no-default-features --features jit-cranelift
+
+# Source-identical AMD64 A/B: a lean managed JIT-off binary versus a lean
+# Cranelift binary. A telemetry build is used only for untimed native evidence.
+wordpress-root-benchmark-cranelift-amd64 *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    machine="$(uname -m)"
+    if [[ "$machine" != "x86_64" && "$machine" != "amd64" ]] || [[ "$(uname -s)" != "Linux" ]]; then
+        printf '%s\n' "[fail] AMD64 Cranelift benchmark requires x86_64 Linux; got $machine/$(uname -s)" >&2
+        exit 1
+    fi
+    baseline_dir="${PHRUST_AMD64_BASELINE_TARGET_DIR:-target/amd64-baseline}"
+    cranelift_dir="${PHRUST_AMD64_CRANELIFT_TARGET_DIR:-target/amd64-cranelift}"
+    diagnostic_dir="${PHRUST_AMD64_CRANELIFT_DIAGNOSTIC_TARGET_DIR:-target/amd64-cranelift-diagnostic}"
+    CARGO_TARGET_DIR="$baseline_dir" cargo build --release -p php_server --bin phrust-server --no-default-features
+    CARGO_TARGET_DIR="$cranelift_dir" cargo build --release -p php_server --bin phrust-server --no-default-features --features jit-cranelift
+    CARGO_TARGET_DIR="$diagnostic_dir" cargo build --release -p php_server --bin phrust-server --no-default-features --features jit-cranelift,runtime-telemetry
+    source_commit="$(git rev-parse HEAD)"
+    patch_sha256="$(git diff --binary | sha256sum | cut -d' ' -f1)"
+    scripts/performance/wordpress_root_benchmark.py --mode clean --cranelift-ab --baseline-server "$baseline_dir/release/phrust-server" --cranelift-server "$cranelift_dir/release/phrust-server" --diagnostic-server "$diagnostic_dir/release/phrust-server" --server-source-commit "$source_commit" --server-source-patch-sha256 "$patch_sha256" {{args}}
+
+# Strict class-B acceptance for an already recorded managed AMD64 baseline.
+wordpress-root-tranche-gate-cranelift-amd64 baseline *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    machine="$(uname -m)"
+    if [[ "$machine" != "x86_64" && "$machine" != "amd64" ]] || [[ "$(uname -s)" != "Linux" ]]; then
+        printf '%s\n' "[fail] AMD64 Cranelift tranche gate requires x86_64 Linux; got $machine/$(uname -s)" >&2
+        exit 1
+    fi
+    cranelift_dir="${PHRUST_AMD64_CRANELIFT_TARGET_DIR:-target/amd64-cranelift}"
+    CARGO_TARGET_DIR="$cranelift_dir" cargo build --release -p php_server --bin phrust-server --no-default-features --features jit-cranelift
+    source_commit="$(git rev-parse HEAD)"
+    patch_sha256="$(git diff --binary | sha256sum | cut -d' ' -f1)"
+    PHRUST_SERVER="$cranelift_dir/release/phrust-server" scripts/performance/wordpress_root_benchmark.py --mode clean --engine-preset experimental-jit --copy-patch off --strict --baseline "{{baseline}}" --min-c1-p50-improvement-pct 3 --server-source-commit "$source_commit" --server-source-patch-sha256 "$patch_sha256" {{args}}
+
 # Isolated persistent-feedback A/B using the same lean binary and benchmark
 # contract. Both arms and their joint ratio report share one result directory.
 wordpress-root-benchmark-feedback-ab *args:
@@ -1548,6 +1599,17 @@ polymorphic-inline-cache-smoke:
 jit-smoke:
     scripts/performance/jit_smoke.sh
 
+jit-smoke-amd64:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    machine="$(uname -m)"
+    if [[ "$machine" != "x86_64" && "$machine" != "amd64" ]] || [[ "$(uname -s)" != "Linux" ]]; then
+        printf '%s\n' "[fail] jit-smoke-amd64 requires x86_64 Linux; got $machine/$(uname -s)" >&2
+        exit 1
+    fi
+    target_dir="${PHRUST_AMD64_CRANELIFT_SMOKE_TARGET_DIR:-target/amd64-cranelift-smoke}"
+    CARGO_TARGET_DIR="$target_dir" PHRUST_JIT_SMOKE_TARGET_DIR="$target_dir" PHRUST_REQUIRE_AMD64=1 PHRUST_JIT_COPY_PATCH=0 scripts/performance/jit_smoke.sh
+
 jit-cranelift-smoke:
     @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
     cargo check --workspace
@@ -1625,7 +1687,7 @@ safety-audit-smoke:
         printf '%s\n' '[fail] performance cache/JIT/adaptive surface contains Rust unsafe' >&2; \
         exit 1; \
     fi
-    @if rg -n '\bunsafe\b' crates/php_jit/src --glob '!lib.rs' --glob '!helpers.rs' --glob '!cranelift_lowering.rs' --glob '!code_memory.rs'; then \
+    @if rg -n '\bunsafe\b' crates/php_jit/src --glob '!lib.rs' --glob '!abi.rs' --glob '!helpers.rs' --glob '!cranelift_lowering.rs' --glob '!code_memory.rs' --glob '!code_manager.rs'; then \
         printf '%s\n' '[fail] performance default JIT surface contains unaudited Rust unsafe' >&2; \
         exit 1; \
     fi
