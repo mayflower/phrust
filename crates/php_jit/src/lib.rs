@@ -25,16 +25,17 @@ mod host_isa;
 pub mod region_ir;
 
 pub use abi::{
-    JIT_DEOPT_MAX_SLOTS, JIT_RUNTIME_ABI_HASH, JIT_RUNTIME_ABI_VERSION, JitAbiSlot, JitAbiValue,
-    JitBailout, JitBailoutKind, JitCExit, JitCExitTag, JitCFrameView, JitCValue, JitCValueTag,
-    JitCallResult, JitCallStatus, JitDeoptState, JitExceptionMarker, JitFrameHandle, JitFrameView,
-    JitHelperDispatch, JitNativeArgFlags, JitNativeCallArgument, JitNativeCallFrame,
-    JitNativeCallKind, JitNativeCallTarget, JitNativeControlRecord, JitNativeDestructorPoint,
-    JitNativeDispatchTrampoline, JitNativeExceptionHandler, JitNativeFrameHeader,
-    JitNativeIndirectionEntry, JitNativePcMetadata, JitNativeRootEntry, JitNativeRootKind,
-    JitOpaqueHandle, JitOpaqueValueKind, JitRegionResult, JitRuntimeCallout,
-    JitRuntimeCalloutResult, JitRuntimeHelperTable, JitSideExit, JitVmContextHandle,
-    SideExitReason, helper_id, jit_default_helper_dispatch,
+    JIT_DEOPT_MAX_REGISTERS, JIT_DEOPT_MAX_SLOTS, JIT_RUNTIME_ABI_HASH, JIT_RUNTIME_ABI_VERSION,
+    JitAbiSlot, JitAbiValue, JitBailout, JitBailoutKind, JitCExit, JitCExitTag, JitCFrameView,
+    JitCValue, JitCValueTag, JitCallResult, JitCallStatus, JitDeoptState, JitExceptionMarker,
+    JitFrameHandle, JitFrameView, JitHelperDispatch, JitNativeArgFlags, JitNativeCallArgument,
+    JitNativeCallFrame, JitNativeCallKind, JitNativeCallTarget, JitNativeControlRecord,
+    JitNativeDestructorPoint, JitNativeDispatchTrampoline, JitNativeExceptionHandler,
+    JitNativeFiberState, JitNativeFrameHeader, JitNativeGeneratorState, JitNativeIndirectionEntry,
+    JitNativePcMetadata, JitNativeResumeInputKind, JitNativeRootEntry, JitNativeRootKind,
+    JitNativeSuspendKind, JitNativeSuspensionGenerationPolicy, JitOpaqueHandle, JitOpaqueValueKind,
+    JitRegionResult, JitRuntimeCallout, JitRuntimeCalloutResult, JitRuntimeHelperTable,
+    JitSideExit, JitVmContextHandle, SideExitReason, helper_id, jit_default_helper_dispatch,
 };
 pub use backend::{NativeCompileOutcome, NativeCompileRequest, NativeCompilerApi};
 pub use code_manager::{
@@ -64,9 +65,14 @@ use std::mem;
 use std::sync::Arc;
 
 const JIT_NATIVE_HANDLER_RESUME_TAG: u32 = 0x8000_0000;
+const JIT_NATIVE_SUSPENSION_RESUME_TAG: u32 = 0x4000_0000;
 
 const fn native_handler_resume_id(block: BlockId) -> i32 {
     (JIT_NATIVE_HANDLER_RESUME_TAG | block.raw()) as i32
+}
+
+const fn native_suspension_resume_id(continuation_id: u32) -> i32 {
+    (JIT_NATIVE_SUSPENSION_RESUME_TAG | continuation_id) as i32
 }
 
 /// Stable native compiler identity embedded in code/cache metadata.
@@ -260,6 +266,18 @@ pub struct JitNativeSafepointMetadata {
     pub optimized_roots_required: bool,
 }
 
+/// Stable native entry published for one generator/fiber suspension.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JitNativeSuspensionMetadata {
+    pub function: FunctionId,
+    pub continuation_id: u32,
+    pub resume_id: i32,
+    pub kind: JitNativeSuspendKind,
+    pub span: IrSpan,
+    pub live_locals: Vec<LocalId>,
+    pub owning_generation_required: bool,
+}
+
 /// Source-level frame resolved from a native PC without interpreter frames.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JitNativeBacktraceFrame {
@@ -305,6 +323,7 @@ pub struct JitRegionStateMetadata {
     pub osr_entries: Vec<JitOsrEntryMetadata>,
     pub exception_handlers: Vec<JitExceptionHandlerMetadata>,
     pub safepoints: Vec<JitNativeSafepointMetadata>,
+    pub suspensions: Vec<JitNativeSuspensionMetadata>,
 }
 
 impl JitRegionStateMetadata {
@@ -939,6 +958,49 @@ impl JitFunctionHandle {
         }
     }
 
+    /// Resumes exactly one generated generator/fiber continuation. Scheduling,
+    /// delegated iteration, and heap-state ownership remain runtime concerns;
+    /// PHP control after the suspension executes in generated code.
+    pub fn invoke_i64_suspension_resume(
+        &self,
+        args: &[i64],
+        state: &JitDeoptState,
+        input: JitNativeResumeInputKind,
+        value: i64,
+        runtime_abi_hash: u64,
+    ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
+        let Some(metadata) = self.region_state_metadata() else {
+            return Err(JitInvokeError::MissingSuspensionEntry(
+                state.continuation_id,
+            ));
+        };
+        if !metadata
+            .suspensions
+            .iter()
+            .any(|entry| entry.continuation_id == state.continuation_id)
+        {
+            return Err(JitInvokeError::MissingSuspensionEntry(
+                state.continuation_id,
+            ));
+        }
+        let Some(entry) = self.native_entry else {
+            return Err(JitInvokeError::MissingNativeEntry);
+        };
+        if runtime_abi_hash != JIT_RUNTIME_ABI_HASH || entry.abi_hash != JIT_RUNTIME_ABI_HASH {
+            return Err(JitInvokeError::AbiHashMismatch {
+                expected: JIT_RUNTIME_ABI_HASH,
+                actual: runtime_abi_hash,
+            });
+        }
+        if args.len() != usize::from(entry.arity) {
+            return Err(JitInvokeError::ArityMismatch {
+                expected: entry.arity,
+                actual: args.len() as u8,
+            });
+        }
+        entry.invoke_i64_suspension_resume(args, state, input, value)
+    }
+
     /// Enters a compiled loop through a stable native OSR entry.
     pub fn invoke_i64_osr(
         &self,
@@ -1136,6 +1198,32 @@ impl JitNativeEntry {
             args,
             native_handler_resume_id(block),
             &state as *const _,
+        )
+    }
+
+    fn invoke_i64_suspension_resume(
+        self,
+        args: &[i64],
+        state: &JitDeoptState,
+        input: JitNativeResumeInputKind,
+        value: i64,
+    ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
+        if self.kind != JitNativeEntryKind::I64StatusOut {
+            return Err(JitInvokeError::MissingSuspensionEntry(
+                state.continuation_id,
+            ));
+        }
+        let mut resumed = state.clone();
+        resumed.control_status = if input == JitNativeResumeInputKind::THROW {
+            JitCallStatus::THROW
+        } else {
+            JitCallStatus::CONTINUE
+        };
+        resumed.control_value = value;
+        self.invoke_i64_status_out_with_resume(
+            args,
+            native_suspension_resume_id(state.continuation_id),
+            &resumed as *const _,
         )
     }
 
@@ -1398,6 +1486,8 @@ pub enum JitInvokeError {
     NativeStatus(i32),
     /// Requested OSR entry is not published by this handle.
     MissingOsrEntry(u32),
+    /// Requested generator/fiber continuation is not part of this artifact.
+    MissingSuspensionEntry(u32),
     /// Caller did not materialize every local required by the OSR entry.
     IncompleteOsrState(u32),
 }
@@ -1420,6 +1510,7 @@ impl JitInvokeError {
             Self::MissingNativeEntry
             | Self::UnsupportedArity(_)
             | Self::MissingOsrEntry(_)
+            | Self::MissingSuspensionEntry(_)
             | Self::IncompleteOsrState(_) => JitSideExit::new(SideExitReason::UnsupportedValue),
             Self::AbiHashMismatch { .. } => JitSideExit::new(SideExitReason::AbiMismatch),
             Self::ArityMismatch { .. } => JitSideExit::new(SideExitReason::TypeMismatch),

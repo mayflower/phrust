@@ -185,6 +185,24 @@ pub enum RegionNativeControl {
     },
 }
 
+/// Suspension implemented by a generated native state-machine transition.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RegionNativeSuspend {
+    GeneratorYield {
+        dst: RegId,
+        key: Option<RegionOperand>,
+        value: Option<RegionOperand>,
+    },
+    GeneratorDelegate {
+        dst: RegId,
+        source: RegionOperand,
+    },
+    FiberSuspend {
+        dst: RegId,
+        value: Option<RegionOperand>,
+    },
+}
+
 impl RegionNativeCall {
     /// Returns the fixed-arity userland callee for the allocation-free path.
     /// Every other call shape is resolved by the typed native trampoline.
@@ -254,6 +272,7 @@ pub enum RegionInstructionKind {
     },
     NativeCall(RegionNativeCall),
     NativeControl(RegionNativeControl),
+    NativeSuspend(RegionNativeSuspend),
     /// Explicit fatal produced by IR lowering; native code returns fatal status.
     RuntimeFatal {
         diagnostic_id: String,
@@ -414,6 +433,15 @@ impl RegionGraph {
         self.blocks.iter().any(|block| {
             block.instructions.iter().any(|instruction| {
                 matches!(&instruction.kind, RegionInstructionKind::NativeCall(call) if call.direct_compiled_target().is_none())
+            })
+        })
+    }
+
+    #[must_use]
+    pub fn has_native_suspensions(&self) -> bool {
+        self.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(instruction.kind, RegionInstructionKind::NativeSuspend(_))
             })
         })
     }
@@ -602,6 +630,24 @@ impl BaselineRegionBuilder {
                         class_name,
                         method,
                         args,
+                    } if class_name.eq_ignore_ascii_case("fiber")
+                        && method.eq_ignore_ascii_case("suspend")
+                        && args.len() <= 1 =>
+                    {
+                        args.first()
+                            .map(|argument| lower_operand(unit, argument.value))
+                            .transpose()
+                            .map_or(RegionInstructionKind::MissingLowering, |value| {
+                                RegionInstructionKind::NativeSuspend(
+                                    RegionNativeSuspend::FiberSuspend { dst: *dst, value },
+                                )
+                            })
+                    }
+                    InstructionKind::CallStaticMethod {
+                        dst,
+                        class_name,
+                        method,
+                        args,
                     } => RegionInstructionKind::NativeCall(RegionNativeCall {
                         result: RegionCallResult::Register(*dst),
                         target: RegionCallTarget::StaticMethod {
@@ -769,6 +815,27 @@ impl BaselineRegionBuilder {
                         class_name: class_name.clone(),
                         message: lower_operand(unit, *message).ok(),
                     }),
+                    InstructionKind::Yield { dst, key, value } => {
+                        match (
+                            key.map(|key| lower_operand(unit, key)).transpose(),
+                            value.map(|value| lower_operand(unit, value)).transpose(),
+                        ) {
+                            (Ok(key), Ok(value)) => RegionInstructionKind::NativeSuspend(
+                                RegionNativeSuspend::GeneratorYield {
+                                    dst: *dst,
+                                    key,
+                                    value,
+                                },
+                            ),
+                            _ => RegionInstructionKind::MissingLowering,
+                        }
+                    }
+                    InstructionKind::YieldFrom { dst, source } => lower_operand(unit, *source)
+                        .map_or(RegionInstructionKind::MissingLowering, |source| {
+                            RegionInstructionKind::NativeSuspend(
+                                RegionNativeSuspend::GeneratorDelegate { dst: *dst, source },
+                            )
+                        }),
                     InstructionKind::RuntimeError {
                         diagnostic_id,
                         message,
@@ -803,8 +870,6 @@ impl BaselineRegionBuilder {
                     | InstructionKind::Cast { .. }
                     | InstructionKind::Echo { .. }
                     | InstructionKind::EmitDiagnostic { .. }
-                    | InstructionKind::Yield { .. }
-                    | InstructionKind::YieldFrom { .. }
                     | InstructionKind::CloneObject { .. }
                     | InstructionKind::CloneWith { .. }
                     | InstructionKind::MakeClosure { .. }

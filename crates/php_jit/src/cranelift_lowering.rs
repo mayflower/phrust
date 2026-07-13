@@ -11,7 +11,7 @@ use crate::region_ir::build_baseline_region;
 use crate::region_ir::{
     BaselineRegionBuilder, CompileMetadata, NativeCompilerTier, RegionBinaryOp, RegionCallResult,
     RegionCallTarget, RegionCompareOpCode, RegionGraph, RegionInstruction, RegionInstructionKind,
-    RegionNativeCall, RegionNativeControl, RegionOperand, RegionTerminator,
+    RegionNativeCall, RegionNativeControl, RegionNativeSuspend, RegionOperand, RegionTerminator,
 };
 use crate::{
     CraneliftCodeKey, CraneliftCompilerIdentity, JIT_RUNTIME_ABI_HASH, JitCompileRequest,
@@ -3454,11 +3454,13 @@ fn lower_region_instruction(
     functions: &BTreeMap<FunctionId, FuncId>,
     native_call_helper: Option<FuncId>,
     blocks: &[ir::Block],
+    suspension_blocks: &BTreeMap<u32, ir::Block>,
     locals: &BTreeMap<LocalId, Variable>,
     registers: &mut BTreeMap<RegId, ir::Value>,
     instruction: &RegionInstruction,
     result_out: ir::Value,
     deopt_out: ir::Value,
+    resume_state: ir::Value,
     pending_status: Variable,
     pending_value: Variable,
     function: FunctionId,
@@ -3639,6 +3641,21 @@ fn lower_region_instruction(
                 registers.insert(*dst, value);
             }
         },
+        RegionInstructionKind::NativeSuspend(suspend) => {
+            lower_native_suspension(
+                builder,
+                suspension_blocks,
+                locals,
+                registers,
+                suspend,
+                instruction,
+                result_out,
+                deopt_out,
+                resume_state,
+                function,
+                local_count,
+            )?;
+        }
         RegionInstructionKind::Compare { dst, op, lhs, rhs } => {
             let lhs = lower_region_operand(builder, locals, registers, *lhs)?;
             let rhs = lower_region_operand(builder, locals, registers, *rhs)?;
@@ -3673,6 +3690,202 @@ fn lower_region_instruction(
             ));
         }
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_native_suspension(
+    builder: &mut FunctionBuilder<'_>,
+    suspension_blocks: &BTreeMap<u32, ir::Block>,
+    locals: &BTreeMap<LocalId, Variable>,
+    registers: &mut BTreeMap<RegId, ir::Value>,
+    suspend: &RegionNativeSuspend,
+    instruction: &RegionInstruction,
+    result_out: ir::Value,
+    state_out: ir::Value,
+    resume_state: ir::Value,
+    function: FunctionId,
+    local_count: u32,
+) -> Result<(), CraneliftLoweringError> {
+    let (dst, kind, key, yielded, delegation, status) = match suspend {
+        RegionNativeSuspend::GeneratorYield { dst, key, value } => (
+            *dst,
+            crate::JitNativeSuspendKind::GENERATOR_YIELD,
+            key.map(|key| lower_region_operand(builder, locals, registers, key))
+                .transpose()?,
+            value
+                .map(|value| lower_region_operand(builder, locals, registers, value))
+                .transpose()?
+                .unwrap_or_else(|| builder.ins().iconst(types::I64, 0)),
+            None,
+            crate::JitCallStatus::SUSPEND_GENERATOR,
+        ),
+        RegionNativeSuspend::GeneratorDelegate { dst, source } => {
+            let source = lower_region_operand(builder, locals, registers, *source)?;
+            (
+                *dst,
+                crate::JitNativeSuspendKind::GENERATOR_DELEGATE,
+                None,
+                source,
+                Some(source),
+                crate::JitCallStatus::SUSPEND_GENERATOR,
+            )
+        }
+        RegionNativeSuspend::FiberSuspend { dst, value } => (
+            *dst,
+            crate::JitNativeSuspendKind::FIBER_SUSPEND,
+            None,
+            value
+                .map(|value| lower_region_operand(builder, locals, registers, value))
+                .transpose()?
+                .unwrap_or_else(|| builder.ins().iconst(types::I64, 0)),
+            None,
+            crate::JitCallStatus::SUSPEND_FIBER,
+        ),
+    };
+    builder
+        .ins()
+        .store(MemFlagsData::new(), yielded, result_out, 0);
+    let store_i32 = |builder: &mut FunctionBuilder<'_>, offset: usize, value: u32| {
+        let value = builder.ins().iconst(types::I32, i64::from(value));
+        builder
+            .ins()
+            .store(MemFlagsData::new(), value, state_out, offset as i32);
+    };
+    store_i32(
+        builder,
+        std::mem::offset_of!(crate::JitDeoptState, function_id),
+        function.raw(),
+    );
+    store_i32(
+        builder,
+        std::mem::offset_of!(crate::JitDeoptState, continuation_id),
+        instruction.continuation_id,
+    );
+    store_i32(
+        builder,
+        std::mem::offset_of!(crate::JitDeoptState, slot_count),
+        local_count,
+    );
+    let initialized_mask = instruction.live_locals.iter().fold(0_u64, |mask, local| {
+        mask | 1_u64.checked_shl(local.raw()).unwrap_or(0)
+    });
+    let initialized = builder.ins().iconst(types::I64, initialized_mask as i64);
+    builder.ins().store(
+        MemFlagsData::new(),
+        initialized,
+        state_out,
+        std::mem::offset_of!(crate::JitDeoptState, initialized_mask) as i32,
+    );
+    for local in &instruction.live_locals {
+        let value = use_local_variable(builder, locals, *local)?;
+        let offset = std::mem::offset_of!(crate::JitDeoptState, slots)
+            .saturating_add(local.index().saturating_mul(8));
+        builder
+            .ins()
+            .store(MemFlagsData::new(), value, state_out, offset as i32);
+    }
+    let register_ids = registers.keys().copied().collect::<Vec<_>>();
+    let register_mask = register_ids.iter().fold(0_u64, |mask, register| {
+        mask | 1_u64.checked_shl(register.raw()).unwrap_or(0)
+    });
+    let mask = builder.ins().iconst(types::I64, register_mask as i64);
+    builder.ins().store(
+        MemFlagsData::new(),
+        mask,
+        state_out,
+        std::mem::offset_of!(crate::JitDeoptState, initialized_register_mask) as i32,
+    );
+    for register in &register_ids {
+        let value = registers[register];
+        let value = if builder.func.dfg.value_type(value) == types::I64 {
+            value
+        } else {
+            builder.ins().uextend(types::I64, value)
+        };
+        let offset = std::mem::offset_of!(crate::JitDeoptState, registers)
+            .saturating_add(register.index().saturating_mul(8));
+        builder
+            .ins()
+            .store(MemFlagsData::new(), value, state_out, offset as i32);
+    }
+    store_i32(
+        builder,
+        std::mem::offset_of!(crate::JitDeoptState, suspend_kind),
+        kind.0,
+    );
+    let flags = u32::from(key.is_some()) | if delegation.is_some() { 1 << 1 } else { 0 };
+    store_i32(
+        builder,
+        std::mem::offset_of!(crate::JitDeoptState, suspend_flags),
+        flags,
+    );
+    let key = key.unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+    builder.ins().store(
+        MemFlagsData::new(),
+        key,
+        state_out,
+        std::mem::offset_of!(crate::JitDeoptState, yielded_key) as i32,
+    );
+    let delegation = delegation.unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+    builder.ins().store(
+        MemFlagsData::new(),
+        delegation,
+        state_out,
+        std::mem::offset_of!(crate::JitDeoptState, delegation_handle) as i32,
+    );
+    let status_value = builder.ins().iconst(types::I32, i64::from(status.0));
+    builder.ins().return_(&[status_value]);
+
+    let resume_block = *suspension_blocks
+        .get(&instruction.continuation_id)
+        .ok_or_else(|| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_SUSPENSION_ENTRY",
+                format!(
+                    "continuation {} has no native suspension entry",
+                    instruction.continuation_id
+                ),
+            )
+        })?;
+    builder.switch_to_block(resume_block);
+    let resume_status = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        resume_state,
+        std::mem::offset_of!(crate::JitDeoptState, control_status) as i32,
+    );
+    let resume_value = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        resume_state,
+        std::mem::offset_of!(crate::JitDeoptState, control_value) as i32,
+    );
+    let resume_ok = builder.create_block();
+    let propagate = builder.create_block();
+    let is_value = builder.ins().icmp_imm(
+        IntCC::Equal,
+        resume_status,
+        i64::from(crate::JitCallStatus::CONTINUE.0),
+    );
+    builder.ins().brif(is_value, resume_ok, &[], propagate, &[]);
+    builder.switch_to_block(propagate);
+    builder
+        .ins()
+        .store(MemFlagsData::new(), resume_value, result_out, 0);
+    builder.ins().return_(&[resume_status]);
+    builder.switch_to_block(resume_ok);
+    registers.clear();
+    for register in register_ids {
+        let offset = std::mem::offset_of!(crate::JitDeoptState, registers)
+            .saturating_add(register.index().saturating_mul(8));
+        let value =
+            builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), resume_state, offset as i32);
+        registers.insert(register, value);
+    }
+    registers.insert(dst, resume_value);
     Ok(())
 }
 
@@ -4219,6 +4432,7 @@ mod tests {
         JIT_RUNTIME_ABI_HASH, JitCompileRequest, JitCompileStatus, NativeCompileRequest,
         NativeCompilerApi,
     };
+    use php_ir::instruction::{IrCallArg, IrCallArgValueKind};
     use php_ir::{
         BinaryOp, FunctionFlags, FunctionId, InstructionKind, IrBuilder, IrConstant, IrParam,
         IrReturnType, IrSpan, LocalId, Operand, UnitId,
@@ -4608,6 +4822,305 @@ mod tests {
         };
         assert_eq!(status, crate::JitCallStatus::EXIT.0 as i32);
         assert_eq!(value, 5);
+    }
+
+    #[test]
+    fn generator_yield_send_and_throw_use_native_resume_entry() {
+        let mut builder = IrBuilder::new(UnitId::new(709));
+        let file = builder.add_file("native-generator.php");
+        let span = IrSpan::new(file, 0, 30);
+        let function = builder.start_function(
+            "native_generator",
+            FunctionFlags {
+                is_generator: true,
+                ..FunctionFlags::default()
+            },
+            span,
+        );
+        builder.set_return_type(function, Some(IrReturnType::Int));
+        let entry = builder.append_block(function);
+        let key = builder.intern_constant(IrConstant::Int(3));
+        let yielded = builder.intern_constant(IrConstant::Int(9));
+        let sent = builder.alloc_register(function);
+        builder.emit(
+            function,
+            entry,
+            InstructionKind::Yield {
+                dst: sent,
+                key: Some(Operand::Constant(key)),
+                value: Some(Operand::Constant(yielded)),
+            },
+            span,
+        );
+        builder.terminate_return(function, entry, Some(Operand::Register(sent)), span);
+        let unit = builder.finish();
+        let mut backend = CraneliftNativeCompiler;
+        let outcome = backend.compile_region(&NativeCompileRequest {
+            compile: &JitCompileRequest::new("cl.native-generator"),
+            unit: Some(&unit),
+            function: Some(function),
+            runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+        });
+        assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+        let handle = outcome.handle.expect("native generator handle");
+        let crate::JitI64InvokeOutcome::SideExit {
+            status,
+            value,
+            state,
+        } = handle
+            .invoke_i64_with_deopt(&[], JIT_RUNTIME_ABI_HASH)
+            .expect("initial generator entry")
+        else {
+            panic!("generator did not suspend");
+        };
+        assert_eq!(status, crate::JitCallStatus::SUSPEND_GENERATOR.0 as i32);
+        assert_eq!(value, 9);
+        assert_eq!(state.yielded_key, 3);
+        assert_eq!(
+            state.suspend_kind,
+            crate::JitNativeSuspendKind::GENERATOR_YIELD.0
+        );
+        assert_eq!(
+            handle
+                .region_state_metadata()
+                .expect("generator metadata")
+                .suspensions
+                .len(),
+            1
+        );
+        assert_eq!(
+            handle
+                .invoke_i64_suspension_resume(
+                    &[],
+                    &state,
+                    crate::JitNativeResumeInputKind::VALUE,
+                    42,
+                    JIT_RUNTIME_ABI_HASH,
+                )
+                .expect("generator send"),
+            crate::JitI64InvokeOutcome::Returned(42)
+        );
+        let thrown = handle
+            .invoke_i64_suspension_resume(
+                &[],
+                &state,
+                crate::JitNativeResumeInputKind::THROW,
+                77,
+                JIT_RUNTIME_ABI_HASH,
+            )
+            .expect("throw into generator");
+        assert!(matches!(
+            thrown,
+            crate::JitI64InvokeOutcome::SideExit { status, value: 77, .. }
+                if status == crate::JitCallStatus::THROW.0 as i32
+        ));
+    }
+
+    #[test]
+    fn yield_from_publishes_native_delegation_state() {
+        let mut builder = IrBuilder::new(UnitId::new(710));
+        let file = builder.add_file("native-yield-from.php");
+        let span = IrSpan::new(file, 0, 30);
+        let function = builder.start_function(
+            "native_yield_from",
+            FunctionFlags {
+                is_generator: true,
+                ..FunctionFlags::default()
+            },
+            span,
+        );
+        builder.set_return_type(function, Some(IrReturnType::Int));
+        let entry = builder.append_block(function);
+        let source = builder.intern_constant(IrConstant::Int(91));
+        let result = builder.alloc_register(function);
+        builder.emit(
+            function,
+            entry,
+            InstructionKind::YieldFrom {
+                dst: result,
+                source: Operand::Constant(source),
+            },
+            span,
+        );
+        builder.terminate_return(function, entry, Some(Operand::Register(result)), span);
+        let unit = builder.finish();
+        let mut backend = CraneliftNativeCompiler;
+        let outcome = backend.compile_region(&NativeCompileRequest {
+            compile: &JitCompileRequest::new("cl.native-yield-from"),
+            unit: Some(&unit),
+            function: Some(function),
+            runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+        });
+        assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+        let handle = outcome.handle.expect("native yield-from handle");
+        let crate::JitI64InvokeOutcome::SideExit { state, .. } = handle
+            .invoke_i64_with_deopt(&[], JIT_RUNTIME_ABI_HASH)
+            .expect("delegated generator entry")
+        else {
+            panic!("yield-from did not suspend");
+        };
+        assert_eq!(state.delegation_handle, 91);
+        assert_eq!(state.suspend_flags & (1 << 1), 1 << 1);
+        assert_eq!(
+            handle
+                .invoke_i64_suspension_resume(
+                    &[],
+                    &state,
+                    crate::JitNativeResumeInputKind::VALUE,
+                    88,
+                    JIT_RUNTIME_ABI_HASH,
+                )
+                .expect("delegated return"),
+            crate::JitI64InvokeOutcome::Returned(88)
+        );
+    }
+
+    #[test]
+    fn fiber_suspend_and_resume_use_native_continuation() {
+        let mut builder = IrBuilder::new(UnitId::new(711));
+        let file = builder.add_file("native-fiber.php");
+        let span = IrSpan::new(file, 0, 30);
+        let function = builder.start_function("native_fiber", FunctionFlags::default(), span);
+        builder.set_return_type(function, Some(IrReturnType::Int));
+        let entry = builder.append_block(function);
+        let suspended = builder.intern_constant(IrConstant::Int(5));
+        let result = builder.alloc_register(function);
+        builder.emit(
+            function,
+            entry,
+            InstructionKind::CallStaticMethod {
+                dst: result,
+                class_name: "Fiber".to_owned(),
+                method: "suspend".to_owned(),
+                args: vec![IrCallArg {
+                    name: None,
+                    value: Operand::Constant(suspended),
+                    unpack: false,
+                    value_kind: IrCallArgValueKind::Direct,
+                    by_ref_local: None,
+                    by_ref_dim: None,
+                    by_ref_property: None,
+                    by_ref_property_dim: None,
+                }],
+            },
+            span,
+        );
+        builder.terminate_return(function, entry, Some(Operand::Register(result)), span);
+        let unit = builder.finish();
+        let mut backend = CraneliftNativeCompiler;
+        let outcome = backend.compile_region(&NativeCompileRequest {
+            compile: &JitCompileRequest::new("cl.native-fiber"),
+            unit: Some(&unit),
+            function: Some(function),
+            runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+        });
+        assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+        let handle = outcome.handle.expect("native fiber handle");
+        let crate::JitI64InvokeOutcome::SideExit {
+            status,
+            value,
+            state,
+        } = handle
+            .invoke_i64_with_deopt(&[], JIT_RUNTIME_ABI_HASH)
+            .expect("fiber start")
+        else {
+            panic!("fiber did not suspend");
+        };
+        assert_eq!(status, crate::JitCallStatus::SUSPEND_FIBER.0 as i32);
+        assert_eq!(value, 5);
+        assert_eq!(
+            handle
+                .invoke_i64_suspension_resume(
+                    &[],
+                    &state,
+                    crate::JitNativeResumeInputKind::VALUE,
+                    44,
+                    JIT_RUNTIME_ABI_HASH,
+                )
+                .expect("fiber resume"),
+            crate::JitI64InvokeOutcome::Returned(44)
+        );
+    }
+
+    #[test]
+    fn generator_resume_runs_compiled_finally() {
+        let mut builder = IrBuilder::new(UnitId::new(712));
+        let file = builder.add_file("generator-finally.php");
+        let span = IrSpan::new(file, 0, 40);
+        let function = builder.start_function(
+            "generator_finally",
+            FunctionFlags {
+                is_generator: true,
+                ..FunctionFlags::default()
+            },
+            span,
+        );
+        builder.set_return_type(function, Some(IrReturnType::Int));
+        let entry = builder.append_block(function);
+        let finally = builder.append_block(function);
+        let after = builder.append_block(function);
+        builder.emit(
+            function,
+            entry,
+            InstructionKind::EnterTry {
+                catch: None,
+                catch_types: Vec::new(),
+                finally: Some(finally),
+                after,
+                exception_local: None,
+            },
+            span,
+        );
+        let yielded = builder.intern_constant(IrConstant::Int(1));
+        let sent = builder.alloc_register(function);
+        builder.emit(
+            function,
+            entry,
+            InstructionKind::Yield {
+                dst: sent,
+                key: None,
+                value: Some(Operand::Constant(yielded)),
+            },
+            span,
+        );
+        builder.terminate_return(function, entry, Some(Operand::Register(sent)), span);
+        builder.emit(
+            function,
+            finally,
+            InstructionKind::EndFinally { after },
+            span,
+        );
+        builder.terminate_jump(function, finally, after, span);
+        let zero = builder.intern_constant(IrConstant::Int(0));
+        builder.terminate_return(function, after, Some(Operand::Constant(zero)), span);
+        let unit = builder.finish();
+        let mut backend = CraneliftNativeCompiler;
+        let outcome = backend.compile_region(&NativeCompileRequest {
+            compile: &JitCompileRequest::new("cl.generator-finally"),
+            unit: Some(&unit),
+            function: Some(function),
+            runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+        });
+        assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+        let handle = outcome.handle.expect("generator finally handle");
+        let crate::JitI64InvokeOutcome::SideExit { state, .. } = handle
+            .invoke_i64_with_deopt(&[], JIT_RUNTIME_ABI_HASH)
+            .expect("generator suspension")
+        else {
+            panic!("generator did not suspend");
+        };
+        assert_eq!(
+            handle
+                .invoke_i64_suspension_resume(
+                    &[],
+                    &state,
+                    crate::JitNativeResumeInputKind::VALUE,
+                    64,
+                    JIT_RUNTIME_ABI_HASH,
+                )
+                .expect("generator finally resume"),
+            crate::JitI64InvokeOutcome::Returned(64)
+        );
     }
 
     #[test]

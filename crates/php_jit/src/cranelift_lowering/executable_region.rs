@@ -206,7 +206,7 @@ fn validate_region_native_coverage(region: &RegionGraph) -> Result<(), Cranelift
             ),
         ));
     }
-    if !region.captures.is_empty() || region.flags.is_generator {
+    if !region.captures.is_empty() {
         return Err(CraneliftLoweringError::new(
             "JIT_CRANELIFT_MISSING_FUNCTION_STATE_LOWERING",
             format!(
@@ -306,6 +306,15 @@ fn define_region_graph_function(
     {
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
         let blocks = create_region_cranelift_blocks(&mut builder, region)?;
+        let suspension_blocks = region
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| {
+                matches!(instruction.kind, RegionInstructionKind::NativeSuspend(_))
+            })
+            .map(|instruction| (instruction.continuation_id, builder.create_block()))
+            .collect::<BTreeMap<_, _>>();
         let normal_entry = blocks.first().copied().ok_or_else(|| {
             CraneliftLoweringError::new(
                 "JIT_CRANELIFT_REJECT_HELPER_CONTROL_FLOW",
@@ -386,6 +395,38 @@ fn define_region_graph_function(
             builder.ins().jump(cranelift_block(&blocks, target)?, &[]);
             builder.switch_to_block(next);
         }
+        for region_block in &region.blocks {
+            for instruction in &region_block.instructions {
+                if !matches!(instruction.kind, RegionInstructionKind::NativeSuspend(_)) {
+                    continue;
+                }
+                let loader = builder.create_block();
+                let next = builder.create_block();
+                let encoded_resume =
+                    crate::native_suspension_resume_id(instruction.continuation_id);
+                let requested =
+                    builder
+                        .ins()
+                        .icmp_imm(IntCC::Equal, resume_id, i64::from(encoded_resume));
+                builder.ins().brif(requested, loader, &[], next, &[]);
+                builder.switch_to_block(loader);
+                for local in &instruction.live_locals {
+                    let offset = 24_i32.saturating_add((local.raw() as i32).saturating_mul(8));
+                    let value =
+                        builder
+                            .ins()
+                            .load(types::I64, MemFlagsData::new(), resume_state, offset);
+                    builder.def_var(local_variable(&locals, *local)?, value);
+                }
+                builder.ins().jump(
+                    *suspension_blocks
+                        .get(&instruction.continuation_id)
+                        .expect("suspension block was predeclared"),
+                    &[],
+                );
+                builder.switch_to_block(next);
+            }
+        }
         for osr_entry in region.osr_entries() {
             let loader = builder.create_block();
             let next = builder.create_block();
@@ -423,11 +464,13 @@ fn define_region_graph_function(
                     functions,
                     native_call_helper,
                     &blocks,
+                    &suspension_blocks,
                     &locals,
                     &mut registers,
                     instruction,
                     result_out,
                     deopt_out,
+                    resume_state,
                     pending_status,
                     pending_value,
                     region.function,
@@ -593,6 +636,41 @@ fn region_graph_metadata<'a>(
                                 optimized_roots_required: region.compile_metadata.tier
                                     == NativeCompilerTier::Optimizing,
                             })
+                    })
+                })
+            })
+            .collect(),
+        suspensions: regions
+            .iter()
+            .flat_map(|region| {
+                region.blocks.iter().flat_map(move |block| {
+                    block.instructions.iter().filter_map(move |instruction| {
+                        let RegionInstructionKind::NativeSuspend(suspend) = &instruction.kind
+                        else {
+                            return None;
+                        };
+                        let kind = match suspend {
+                            RegionNativeSuspend::GeneratorYield { .. } => {
+                                crate::JitNativeSuspendKind::GENERATOR_YIELD
+                            }
+                            RegionNativeSuspend::GeneratorDelegate { .. } => {
+                                crate::JitNativeSuspendKind::GENERATOR_DELEGATE
+                            }
+                            RegionNativeSuspend::FiberSuspend { .. } => {
+                                crate::JitNativeSuspendKind::FIBER_SUSPEND
+                            }
+                        };
+                        Some(crate::JitNativeSuspensionMetadata {
+                            function: region.function,
+                            continuation_id: instruction.continuation_id,
+                            resume_id: crate::native_suspension_resume_id(
+                                instruction.continuation_id,
+                            ),
+                            kind,
+                            span: instruction.span,
+                            live_locals: instruction.live_locals.clone(),
+                            owning_generation_required: true,
+                        })
                     })
                 })
             })

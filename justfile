@@ -1698,6 +1698,25 @@ cranelift-native-control:
     cargo test -p php_vm shutdown_stages_append_to_the_single_final_output_buffer
     cargo check --workspace --all-targets
 
+# Prompt 8 cutover gate: generator/fiber suspension points publish stable
+# generated resume entries and persist all live state without resume dispatch.
+cranelift-native-suspensions:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo run --quiet -p php_jit --example cranelift_native_suspension_audit
+    scripts/verify/cranelift_native_suspensions.py
+    scripts/verify/cranelift_only_stage_ratchet.py
+    cargo test -p php_jit --lib native_resume_entry
+    cargo test -p php_jit --lib native_delegation_state
+    cargo test -p php_jit --lib native_continuation
+    cargo test -p php_jit --lib generator_resume_runs_compiled_finally
+    cargo test -p php_jit --lib suspended_state_owns_generation_until_safe_transition
+    cargo test -p php_vm generator_
+    cargo test -p php_vm frame_reuse_preserves_generator_and_fiber_suspension
+    cargo test -p php_vm trace_runtime_records_fiber_suspend_snapshot
+    cargo test -p php_runtime fiber_state_transitions_are_explicit
+    cargo check --workspace --all-targets
+
 jit-cranelift-smoke:
     @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
     cargo check --workspace

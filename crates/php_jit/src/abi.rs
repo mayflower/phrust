@@ -10,16 +10,17 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use php_ir::{BlockId, FunctionId, InstrId, LocalId, RegId};
 
 /// Version for the C-compatible runtime ABI records.
-pub const JIT_RUNTIME_ABI_VERSION: u32 = 6;
+pub const JIT_RUNTIME_ABI_VERSION: u32 = 7;
 
 /// Stable ABI fingerprint for Cranelift ABI.
 ///
 /// This is updated only when a `repr(C)` boundary type changes layout or tag
 /// meaning. It is intentionally independent from Rust type names.
-pub const JIT_RUNTIME_ABI_HASH: u64 = 0x07c1_a817_0000_0006;
+pub const JIT_RUNTIME_ABI_HASH: u64 = 0x07c1_a817_0000_0007;
 
 /// Maximum number of scalar VM locals materialized by one native side exit.
 pub const JIT_DEOPT_MAX_SLOTS: usize = 64;
+pub const JIT_DEOPT_MAX_REGISTERS: usize = 64;
 
 /// Caller-owned state buffer populated before a native side exit returns.
 #[repr(C)]
@@ -41,6 +42,13 @@ pub struct JitDeoptState {
     pub control_status: JitCallStatus,
     pub control_reserved: u32,
     pub control_value: i64,
+    /// Suspension metadata used by generator/fiber native resume entries.
+    pub suspend_kind: u32,
+    pub suspend_flags: u32,
+    pub yielded_key: i64,
+    pub delegation_handle: u64,
+    pub initialized_register_mask: u64,
+    pub registers: [i64; JIT_DEOPT_MAX_REGISTERS],
 }
 
 impl Default for JitDeoptState {
@@ -55,6 +63,12 @@ impl Default for JitDeoptState {
             control_status: JitCallStatus::CONTINUE,
             control_reserved: 0,
             control_value: 0,
+            suspend_kind: 0,
+            suspend_flags: 0,
+            yielded_key: 0,
+            delegation_handle: 0,
+            initialized_register_mask: 0,
+            registers: [0; JIT_DEOPT_MAX_REGISTERS],
         }
     }
 }
@@ -195,6 +209,160 @@ impl JitNativeDestructorPoint {
     pub const FRAME_RETURN: Self = Self(3);
     pub const EXCEPTION_UNWIND: Self = Self(4);
     pub const REQUEST_SHUTDOWN: Self = Self(5);
+}
+
+/// Native suspension family stored in generator/fiber heap state.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct JitNativeSuspendKind(pub u32);
+
+impl JitNativeSuspendKind {
+    pub const GENERATOR_YIELD: Self = Self(1);
+    pub const GENERATOR_DELEGATE: Self = Self(2);
+    pub const FIBER_SUSPEND: Self = Self(3);
+}
+
+/// Input delivered to a native suspension continuation.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct JitNativeResumeInputKind(pub u32);
+
+impl JitNativeResumeInputKind {
+    pub const START: Self = Self(1);
+    pub const VALUE: Self = Self(2);
+    pub const THROW: Self = Self(3);
+}
+
+/// Native-generation ownership policy for a suspended heap object.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct JitNativeSuspensionGenerationPolicy(pub u32);
+
+impl JitNativeSuspensionGenerationPolicy {
+    pub const KEEP_OWNING_GENERATION: Self = Self(1);
+    pub const RECOMPILE_AT_SAFE_BOUNDARY: Self = Self(2);
+}
+
+/// Heap header retained by a suspended native generator.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitNativeGeneratorState {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub function_id: u32,
+    pub native_version: u32,
+    pub owning_generation: u64,
+    pub continuation_id: u32,
+    pub resume_id: u32,
+    pub lifecycle_state: u32,
+    pub generation_policy: JitNativeSuspensionGenerationPolicy,
+    pub local_slots: u64,
+    pub local_count: u32,
+    pub temporary_count: u32,
+    pub temporary_slots: u64,
+    pub yielded_key: JitAbiSlot,
+    pub yielded_value: JitAbiSlot,
+    pub delegation_state: u64,
+    pub exception_state: u64,
+    pub root_entries: u64,
+    pub root_count: u32,
+    pub flags: u32,
+}
+
+impl JitNativeGeneratorState {
+    #[must_use]
+    pub fn new(
+        function_id: u32,
+        native_version: u32,
+        owning_generation: u64,
+        continuation_id: u32,
+        resume_id: u32,
+    ) -> Self {
+        Self {
+            abi_version: JIT_RUNTIME_ABI_VERSION,
+            struct_size: std::mem::size_of::<Self>() as u32,
+            function_id,
+            native_version,
+            owning_generation,
+            continuation_id,
+            resume_id,
+            generation_policy: JitNativeSuspensionGenerationPolicy::KEEP_OWNING_GENERATION,
+            ..Self::default()
+        }
+    }
+
+    /// Changes artifact ownership only at an explicit suspension boundary.
+    pub fn transition_generation_at_suspension(
+        &mut self,
+        native_version: u32,
+        owning_generation: u64,
+        resume_id: u32,
+    ) {
+        self.native_version = native_version;
+        self.owning_generation = owning_generation;
+        self.resume_id = resume_id;
+        self.generation_policy = JitNativeSuspensionGenerationPolicy::RECOMPILE_AT_SAFE_BOUNDARY;
+    }
+}
+
+/// Heap header retained by a suspended native fiber stack.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitNativeFiberState {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub fiber_id: u64,
+    pub function_id: u32,
+    pub native_version: u32,
+    pub owning_generation: u64,
+    pub continuation_id: u32,
+    pub resume_id: u32,
+    pub lifecycle_state: u32,
+    pub generation_policy: JitNativeSuspensionGenerationPolicy,
+    pub frame_slots: u64,
+    pub frame_slot_count: u32,
+    pub frame_count: u32,
+    pub exception_state: u64,
+    pub root_entries: u64,
+    pub root_count: u32,
+    pub flags: u32,
+}
+
+impl JitNativeFiberState {
+    #[must_use]
+    pub fn new(
+        fiber_id: u64,
+        function_id: u32,
+        native_version: u32,
+        owning_generation: u64,
+        continuation_id: u32,
+        resume_id: u32,
+    ) -> Self {
+        Self {
+            abi_version: JIT_RUNTIME_ABI_VERSION,
+            struct_size: std::mem::size_of::<Self>() as u32,
+            fiber_id,
+            function_id,
+            native_version,
+            owning_generation,
+            continuation_id,
+            resume_id,
+            generation_policy: JitNativeSuspensionGenerationPolicy::KEEP_OWNING_GENERATION,
+            ..Self::default()
+        }
+    }
+
+    pub fn transition_generation_at_suspension(
+        &mut self,
+        native_version: u32,
+        owning_generation: u64,
+        resume_id: u32,
+    ) {
+        self.native_version = native_version;
+        self.owning_generation = owning_generation;
+        self.resume_id = resume_id;
+        self.generation_policy = JitNativeSuspensionGenerationPolicy::RECOMPILE_AT_SAFE_BOUNDARY;
+    }
 }
 
 /// Precise source/backtrace record associated with a generated PC range.
@@ -1141,10 +1309,11 @@ mod tests {
         JIT_RUNTIME_ABI_HASH, JIT_RUNTIME_ABI_VERSION, JitCExit, JitCExitTag, JitCFrameView,
         JitCValue, JitCValueTag, JitCallResult, JitCallStatus, JitFrameHandle, JitFrameView,
         JitNativeArgFlags, JitNativeCallArgument, JitNativeCallFrame, JitNativeCallKind,
-        JitNativeControlRecord, JitNativeExceptionHandler, JitNativeFrameHeader,
-        JitNativeIndirectionEntry, JitNativePcMetadata, JitNativeRootEntry, JitOpaqueHandle,
-        JitOpaqueValueKind, JitSideExit, JitVmContextHandle, SideExitReason, helper_id,
-        jit_default_helper_dispatch,
+        JitNativeControlRecord, JitNativeExceptionHandler, JitNativeFiberState,
+        JitNativeFrameHeader, JitNativeGeneratorState, JitNativeIndirectionEntry,
+        JitNativePcMetadata, JitNativeRootEntry, JitNativeSuspensionGenerationPolicy,
+        JitOpaqueHandle, JitOpaqueValueKind, JitSideExit, JitVmContextHandle, SideExitReason,
+        helper_id, jit_default_helper_dispatch,
     };
 
     #[test]
@@ -1174,7 +1343,7 @@ mod tests {
 
     #[test]
     fn c_abi_layout_is_stable() {
-        assert_eq!(JIT_RUNTIME_ABI_VERSION, 6);
+        assert_eq!(JIT_RUNTIME_ABI_VERSION, 7);
         assert_ne!(JIT_RUNTIME_ABI_HASH, 0);
         assert_eq!(size_of::<JitOpaqueHandle>(), 8);
         assert_eq!(size_of::<JitCValueTag>(), 4);
@@ -1192,10 +1361,34 @@ mod tests {
         assert_eq!(align_of::<JitNativeFrameHeader>(), 8);
         assert_eq!(align_of::<JitNativePcMetadata>(), 4);
         assert_eq!(align_of::<JitNativeRootEntry>(), 4);
+        assert_eq!(align_of::<JitNativeGeneratorState>(), 8);
+        assert_eq!(align_of::<JitNativeFiberState>(), 8);
         assert_eq!(
             JitNativeCallFrame::default().struct_size as usize,
             size_of::<JitNativeCallFrame>()
         );
+    }
+
+    #[test]
+    fn suspended_state_owns_generation_until_safe_transition() {
+        let mut generator = JitNativeGeneratorState::new(3, 1, 9, 7, 0x4000_0007);
+        assert_eq!(generator.abi_version, JIT_RUNTIME_ABI_VERSION);
+        assert_eq!(
+            generator.generation_policy,
+            JitNativeSuspensionGenerationPolicy::KEEP_OWNING_GENERATION
+        );
+        generator.transition_generation_at_suspension(2, 10, 0x4000_0008);
+        assert_eq!(generator.native_version, 2);
+        assert_eq!(generator.owning_generation, 10);
+        assert_eq!(
+            generator.generation_policy,
+            JitNativeSuspensionGenerationPolicy::RECOMPILE_AT_SAFE_BOUNDARY
+        );
+
+        let mut fiber = JitNativeFiberState::new(11, 3, 1, 9, 7, 0x4000_0007);
+        fiber.transition_generation_at_suspension(2, 10, 0x4000_0008);
+        assert_eq!(fiber.owning_generation, 10);
+        assert_eq!(fiber.resume_id, 0x4000_0008);
     }
 
     #[test]

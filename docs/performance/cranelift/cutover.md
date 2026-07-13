@@ -202,3 +202,37 @@ It writes `target/cranelift-only/native-control-flow.{json,md}`, validates the
 ABI and source structure, executes native catch/throw/return/exit/finally
 tests, exercises the existing PHP-visible exception/destructor/error-handler/
 shutdown/GC ordering fixtures, and checks the complete workspace graph.
+
+## Prompt 8 native generator and fiber state machines
+
+`Yield`, `YieldFrom`, and `Fiber::suspend` lower to `RegionNativeSuspend`.
+Each suspension continuation receives a stable artifact-local resume ID in the
+`0x40000000` namespace and a generated Cranelift resume block. Initial entry,
+send/resume, throw injection, return/getReturn, delegation completion, and
+finally execution therefore continue in generated control flow. The resume
+API performs one native entry invocation; it contains no Rust instruction loop
+and has no dependency on the VM's Dense, Rich, or IR continuation types.
+
+Suspension writes live locals and temporaries, yielded key/value, delegation
+identity, exception input, root metadata, function/version identity, and the
+continuation ID into ABI-stable state. `JitNativeGeneratorState` and
+`JitNativeFiberState` retain the owning native generation. Invalidation either
+keeps that generation live or calls the explicit safe-suspension transition
+that installs a new native version and resume ID. Suspension metadata is part
+of the immutable compiled handle reused by the process code cache.
+
+Runtime code remains responsible for scheduling, generator delegation, heap
+ownership, and misuse diagnostics. Generated code implements PHP control on
+both sides of every suspension.
+
+Run the gate with:
+
+```sh
+nix develop -c just cranelift-native-suspensions
+```
+
+It writes `target/cranelift-only/native-suspensions.{json,md}`, verifies state
+layout, generation ownership, native resume coverage and forbidden dispatch
+dependencies, executes focused generated yield/yield-from/send/throw/finally/
+fiber tests, runs the existing generator and fiber semantic fixtures, and
+checks all workspace targets.

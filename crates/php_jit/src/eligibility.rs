@@ -1373,12 +1373,6 @@ fn check_function_shape(
     rejected: &mut Vec<JitEligibilityReason>,
     unknown: &mut Vec<JitEligibilityReason>,
 ) {
-    if function.flags.is_generator {
-        rejected.push(JitEligibilityReason::function(
-            "JIT_ELIGIBILITY_REJECT_GENERATOR",
-            "generators are outside the performance JIT subset",
-        ));
-    }
     if function.flags.is_closure && !function.captures.is_empty() {
         rejected.push(JitEligibilityReason::function(
             "JIT_ELIGIBILITY_REJECT_CLOSURE_CAPTURE",
@@ -1553,6 +1547,15 @@ fn check_instruction(
                 id,
             ))
         }
+        InstructionKind::CallStaticMethod {
+            class_name,
+            method,
+            ..
+        } if normalize_class_name(class_name) == "fiber"
+            && method.eq_ignore_ascii_case("suspend") =>
+        {
+            check_instruction_operands(instruction, block, constants, rejected, unknown);
+        }
         InstructionKind::CallFunction { .. }
         | InstructionKind::CallMethod { .. }
         | InstructionKind::CallStaticMethod { .. }
@@ -1573,12 +1576,7 @@ fn check_instruction(
         | InstructionKind::Throw { .. }
         | InstructionKind::MakeException { .. } => {}
         InstructionKind::Yield { .. } | InstructionKind::YieldFrom { .. } => {
-            rejected.push(JitEligibilityReason::instruction(
-                "JIT_ELIGIBILITY_REJECT_GENERATOR_OPCODE",
-                "generator opcodes are outside the JIT subset",
-                block,
-                id,
-            ))
+            check_instruction_operands(instruction, block, constants, rejected, unknown);
         }
         InstructionKind::Include { .. } | InstructionKind::Eval { .. } => {
             rejected.push(JitEligibilityReason::instruction(
