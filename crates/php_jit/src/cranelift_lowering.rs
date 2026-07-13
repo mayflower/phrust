@@ -4758,6 +4758,11 @@ mod tests {
                 return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
             }
             123
+        } else if request.kind == crate::JitNativeDynamicCodeKind::EVAL {
+            if request.source.payload != 92 {
+                return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
+            }
+            321
         } else if request.kind == crate::JitNativeDynamicCodeKind::REQUIRE {
             NATIVE_DYNAMIC_EFFECTS.fetch_add(1, Ordering::SeqCst);
             i64::MAX as u64
@@ -5490,6 +5495,32 @@ mod tests {
     }
 
     #[test]
+    fn baseline_and_default_policies_both_execute_native_code() {
+        let (unit, function) = constant_return_fixture();
+        for (preset, opt_level) in [("baseline", 0), ("default", 2)] {
+            let mut compiler = CraneliftNativeCompiler;
+            let request =
+                JitCompileRequest::new(format!("cl.policy.{preset}")).with_opt_level(opt_level);
+            let outcome = compiler.compile_region(&NativeCompileRequest {
+                compile: &request,
+                unit: Some(&unit),
+                function: Some(function),
+                runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+            });
+            assert_eq!(outcome.status, JitCompileStatus::Compiled, "{preset}");
+            assert_eq!(
+                outcome
+                    .handle
+                    .expect("policy must publish native code")
+                    .invoke_i64(&[], JIT_RUNTIME_ABI_HASH)
+                    .expect("policy native entry must execute"),
+                42,
+                "{preset}",
+            );
+        }
+    }
+
+    #[test]
     fn cranelift_native_handle_copy_survives_original_handle_drop() {
         let (unit, function) = constant_return_fixture();
         let mut backend = CraneliftNativeCompiler;
@@ -5711,6 +5742,30 @@ mod tests {
                 .invoke_i64(&[], JIT_RUNTIME_ABI_HASH)
                 .expect("native include entry should execute"),
             123
+        );
+    }
+
+    #[test]
+    fn eval_executes_only_after_native_dynamic_compiler_returns_entry_result() {
+        let (unit, function) = scalar_native_eval_fixture();
+        let mut compiler = CraneliftNativeCompiler;
+        let outcome = compiler.compile_region(&NativeCompileRequest {
+            compile: &JitCompileRequest::new("cl.region.native-eval"),
+            unit: Some(&unit),
+            function: Some(function),
+            runtime_helpers: crate::JitRuntimeHelperAddresses {
+                native_dynamic_code: test_native_dynamic_code as *const () as usize,
+                ..crate::JitRuntimeHelperAddresses::default()
+            },
+        });
+        assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+        assert_eq!(
+            outcome
+                .handle
+                .expect("native eval should compile")
+                .invoke_i64(&[], JIT_RUNTIME_ABI_HASH)
+                .expect("native eval entry should execute"),
+            321,
         );
     }
 
@@ -6518,6 +6573,29 @@ mod tests {
                 dst: result,
                 kind: php_ir::instruction::IncludeKind::RequireOnce,
                 path: Operand::Constant(path),
+            },
+            span,
+        );
+        builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+        (builder.finish(), function)
+    }
+
+    fn scalar_native_eval_fixture() -> (php_ir::IrUnit, FunctionId) {
+        let mut builder = IrBuilder::new(UnitId::new(0));
+        let file = builder.add_file("native-eval.php");
+        let span = IrSpan::new(file, 0, 1);
+        let function = builder.start_function("native_eval", FunctionFlags::default(), span);
+        builder.set_entry(function);
+        builder.set_return_type(function, Some(IrReturnType::Int));
+        let block = builder.append_block(function);
+        let source = builder.add_constant(IrConstant::Int(92));
+        let result = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::Eval {
+                dst: result,
+                code: Operand::Constant(source),
             },
             span,
         );

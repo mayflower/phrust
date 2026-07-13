@@ -1058,7 +1058,7 @@ impl JitBailout {
         }
     }
 
-    /// Adds an interpreter resume point.
+    /// Adds a baseline-native resume point.
     #[must_use]
     pub const fn with_resume(mut self, block: BlockId, instruction: InstrId) -> Self {
         self.resume_block = Some(block);
@@ -1371,7 +1371,7 @@ impl JitCExit {
         Self::bailout(reason.code(), value)
     }
 
-    /// Adds an interpreter resume point.
+    /// Adds a baseline-native resume point.
     #[must_use]
     pub const fn with_resume(mut self, block: BlockId, instruction: InstrId) -> Self {
         self.resume_block = block.raw();

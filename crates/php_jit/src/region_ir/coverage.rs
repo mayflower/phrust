@@ -210,7 +210,6 @@ define_instruction_coverage! {
     InstructionKind::ForeachInitRef { .. } => ("ForeachInitRef", BaselineLoweringClass::NativeStateMachine, ALLOCATE_WRITE, true, true, true, false, true);
     InstructionKind::ForeachNextRef { .. } => ("ForeachNextRef", BaselineLoweringClass::NativeStateMachine, READ_WRITE, true, true, true, false, true);
     InstructionKind::ArrayGet { .. } => ("ArrayGet", BaselineLoweringClass::NativeStateMachine, READ, true, true, true, false, true);
-    InstructionKind::Unsupported { .. } => ("Unsupported", BaselineLoweringClass::CompileTimeFatal, PURE, false, true, false, false, false);
     InstructionKind::RuntimeError { .. } => ("RuntimeError", BaselineLoweringClass::CompileTimeFatal, CONTROL, false, true, false, false, true);
 }
 
@@ -349,7 +348,7 @@ mod tests {
 
     #[test]
     fn manifest_has_every_current_instruction_and_terminator() {
-        assert_eq!(BASELINE_INSTRUCTION_MANIFEST.len(), 102);
+        assert_eq!(BASELINE_INSTRUCTION_MANIFEST.len(), 101);
         assert_eq!(BASELINE_TERMINATOR_MANIFEST.len(), 6);
         assert_eq!(
             BASELINE_INSTRUCTION_MANIFEST

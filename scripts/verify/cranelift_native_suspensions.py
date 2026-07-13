@@ -102,7 +102,7 @@ def main() -> int:
         "execute_" + "dense|rich_" + "dispatch|execute_" + "ir|resume_" + "continuation"
     )
     if interpreter_pattern.search(lowering + metadata):
-        failures.append("native suspension path references interpreter resume dispatch")
+        failures.append("native suspension path references retired resume dispatch")
     resume_method = re.search(
         r"pub fn invoke_i64_suspension_resume\([\s\S]+?\n    }\n", metadata
     )

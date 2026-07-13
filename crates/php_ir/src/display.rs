@@ -1309,9 +1309,6 @@ fn format_instruction(kind: &InstructionKind) -> String {
             format_operand(array),
             format_operand(index)
         ),
-        InstructionKind::Unsupported { diagnostic_id } => {
-            format!("unsupported {diagnostic_id:?}")
-        }
         InstructionKind::RuntimeError {
             diagnostic_id,
             message,
@@ -1503,9 +1500,6 @@ mod tests {
             InstructionKind::Echo {
                 src: Operand::Register(RegId::new(2)),
             },
-            InstructionKind::Unsupported {
-                diagnostic_id: "E_TEST_UNSUPPORTED".to_string(),
-            },
         ];
         for (index, kind) in instructions.into_iter().enumerate() {
             block.instructions.push(Instruction {
@@ -1537,7 +1531,6 @@ mod tests {
             "unary",
             "cast",
             "echo",
-            "unsupported",
             "return",
         ] {
             assert!(text.contains(expected), "{expected} missing from {text}");

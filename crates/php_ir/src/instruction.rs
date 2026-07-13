@@ -722,8 +722,6 @@ pub enum InstructionKind {
         array: Operand,
         index: Operand,
     },
-    /// Explicit unsupported feature marker.
-    Unsupported { diagnostic_id: String },
     /// Deterministic internal runtime error for MVP runtime gaps.
     RuntimeError {
         diagnostic_id: String,

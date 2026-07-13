@@ -312,7 +312,6 @@ fn verify_instruction(
         InstructionKind::Nop
         | InstructionKind::DeclareClass { .. }
         | InstructionKind::EmitDiagnostic { .. }
-        | InstructionKind::Unsupported { .. }
         | InstructionKind::RuntimeError { .. } => {}
         InstructionKind::LoadConst { dst, constant } => {
             verify_register(*dst, function.register_count, errors);
@@ -1254,7 +1253,6 @@ fn instruction_register_uses(kind: &InstructionKind, uses: &mut Vec<RegId>) {
         | InstructionKind::UnsetLocal { .. }
         | InstructionKind::ForeachInitRef { .. }
         | InstructionKind::EmitDiagnostic { .. }
-        | InstructionKind::Unsupported { .. }
         | InstructionKind::RuntimeError { .. } => {}
         InstructionKind::RegisterConstant { value, .. } => operand_register_uses(value, uses),
         InstructionKind::Move { src, .. }
@@ -1624,7 +1622,6 @@ fn instruction_register_defs(kind: &InstructionKind, defs: &mut Vec<RegId>) {
         | InstructionKind::UnsetLocal { .. }
         | InstructionKind::UnsetDim { .. }
         | InstructionKind::EmitDiagnostic { .. }
-        | InstructionKind::Unsupported { .. }
         | InstructionKind::RuntimeError { .. } => {}
     }
 }

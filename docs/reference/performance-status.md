@@ -27,6 +27,6 @@ nix develop -c just perf-report
 ```
 
 Use [Performance methodology](../performance/methodology.md),
-[optimization gates](../performance/optimization-gates.md), and
+[native optimization gates](../performance/optimization-gates.md), and
 [performance known gaps](../performance/known-gaps.md) for the accepted
 contracts.

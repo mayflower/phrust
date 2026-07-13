@@ -298,7 +298,7 @@ pub extern "C" fn phrust_jit_i64_mul_checked(lhs: i64, rhs: i64, out: *mut i64) 
     write_checked_result(out, lhs.checked_mul(rhs))
 }
 
-/// Pure PHP integer `abs()` helper for the copy-and-patch native tier.
+/// Pure PHP integer `abs()` helper for generated native code.
 ///
 /// Writes `*out = x.abs()` and returns [`JIT_HELPER_STATUS_OK`] for every `x`
 /// except `i64::MIN`. For `i64::MIN` the magnitude does not fit in an `i64`, so

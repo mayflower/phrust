@@ -72,7 +72,7 @@ impl RuleKind {
     }
 }
 
-/// Placeholder operand constraints for future BURS/copy-and-patch selectors.
+/// Operand constraints for native rule selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuleOperandConstraint {
     /// Operand index within the selected rule.

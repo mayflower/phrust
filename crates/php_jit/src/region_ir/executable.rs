@@ -931,11 +931,6 @@ impl BaselineRegionBuilder {
                         diagnostic_id: diagnostic_id.clone(),
                         message: message.clone(),
                     },
-                    InstructionKind::Unsupported { diagnostic_id } => {
-                        RegionInstructionKind::CompileTimeFatal {
-                            diagnostic_id: diagnostic_id.clone(),
-                        }
-                    }
                     InstructionKind::FetchConst { .. }
                     | InstructionKind::RegisterConstant { .. }
                     | InstructionKind::BindReference { .. }

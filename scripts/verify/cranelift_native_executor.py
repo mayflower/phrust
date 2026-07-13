@@ -70,12 +70,6 @@ def main() -> int:
     if "contains no opcode execution loop" not in vm_lib:
         failures.append("php_vm crate documentation does not forbid opcode loops")
 
-    config = json.loads(
-        (ROOT / "scripts/verify/cranelift_only_allowlist.json").read_text(encoding="utf-8")
-    )
-    if config.get("stage") != 11 or config.get("interpreter_call_paths") != []:
-        failures.append("stage 11 must have an empty legacy call-path allowlist")
-
     if failures:
         print("native executor source gate failed:", file=sys.stderr)
         for failure in failures:

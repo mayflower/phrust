@@ -93,6 +93,7 @@ help:
       '  just cranelift-native-executor Verify the legacy executor is absent' \
       '  just cranelift-native-cache Verify restart-persistent PNA1 native artifacts' \
       '  just cranelift-native-product Verify the single native product surface' \
+      '  just cranelift-only-ratchet Enforce the final no-exceptions native architecture' \
       '  just wordpress-root-diagnostics Run timing-ineligible Phrust diagnostics' \
       '  just wordpress-clone-churn-report Summarize clone/COW attribution from latest request profile' \
       '  just wordpress-array-hotpath-report Summarize array hotpath attribution from latest request profile' \
@@ -432,6 +433,7 @@ ci-local:
     @just quality-fast
     @just ci-rust
     @PHRUST_COMBINED_RUN=1 just ci-domain-gates
+    @just cranelift-only-ratchet
     @just ci-phpt-smoke
 
 verify-frontend:
@@ -461,6 +463,7 @@ verify-runtime:
     just cranelift-native-executor
     just cranelift-native-cache
     just cranelift-native-product
+    just cranelift-only-ratchet
     just vm-smoke
     just vm-trace-smoke
     just runtime-fixtures
@@ -1286,7 +1289,7 @@ release-profile-plan:
 # request-profiling and layout counters are unavailable in these builds;
 # use the default release build for diagnosis). Measured on microbenches:
 # property reads ~11% faster, concatenation ~5%.
-release-lean:
+release-lean: cranelift-only-ratchet
     cargo build --release -p php_server --no-default-features
     cargo build --release -p php_vm_cli --bin php-vm --no-default-features
 
@@ -1445,8 +1448,6 @@ native-smoke:
 # Prompt 1 cutover gate: the retired emitter must be absent from source and all
 # product targets must build against the Cranelift feature graph.
 cranelift-only-no-alternate-emitter:
-    scripts/verify/no_""copy""_patch.py
-    scripts/verify/cranelift_only_stage_ratchet.py
     cargo check --workspace --all-targets
     cargo build -p php_vm_cli --bins --no-default-features --features runtime-telemetry
     cargo build -p php_server --bin phrust-server --no-default-features --features runtime-telemetry
@@ -1456,13 +1457,9 @@ cranelift-only-no-alternate-emitter:
 cranelift-only-mandatory:
     #!/usr/bin/env bash
     set -euo pipefail
-    scripts/verify/mandatory_cranelift.py
-    scripts/verify/no_""copy""_patch.py
-    scripts/verify/cranelift_only_stage_ratchet.py
     cargo check --workspace --all-targets
     cargo test -p php_vm native_entry
     cargo build --release -p php_server --bin phrust-server
-    scripts/verify/native_server_symbols.py "${CARGO_TARGET_DIR:-target}/release/phrust-server"
 
 # Prompt 3 cutover gate: every function starts from authoritative php_ir and
 # reaches the same baseline Region IR compiler path without candidate matching.
@@ -1470,7 +1467,6 @@ cranelift-baseline-ir-coverage:
     #!/usr/bin/env bash
     set -euo pipefail
     scripts/verify/cranelift_baseline_ir_coverage.py
-    scripts/verify/cranelift_only_stage_ratchet.py
     cargo test -p php_jit --lib
     cargo check --workspace --all-targets
 
@@ -1481,7 +1477,6 @@ cranelift-exhaustive-lowering:
     set -euo pipefail
     cargo run --quiet -p php_jit --example cranelift_instruction_coverage
     scripts/verify/cranelift_exhaustive_lowering.py
-    scripts/verify/cranelift_only_stage_ratchet.py
     cargo test -p php_jit --lib region_ir::coverage
     cargo test -p php_jit --lib runtime_error_lowers_to_native_fatal_status
     cargo check -p php_jit --all-targets
@@ -1494,7 +1489,6 @@ cranelift-typed-runtime-ops:
     cargo run --quiet -p php_jit --example cranelift_instruction_coverage
     cargo run --quiet -p php_runtime --example native_operation_audit
     scripts/verify/cranelift_typed_runtime_ops.py
-    scripts/verify/cranelift_only_stage_ratchet.py
     cargo test -p php_runtime native_ops
     cargo test -p php_jit --lib region_ir::coverage
     cargo test -p php_vm expressions_execute_
@@ -1507,7 +1501,6 @@ cranelift-native-calls:
     set -euo pipefail
     cargo run --quiet -p php_jit --example cranelift_native_call_audit
     scripts/verify/cranelift_native_calls.py
-    scripts/verify/cranelift_only_stage_ratchet.py
     cargo test -p php_jit --lib native_call
     cargo test -p php_jit --lib cranelift_region_calls_same_unit_compiled_callee_directly
     cargo test -p php_vm native_call_trampoline_requests_compile_without_interpreter_reentry
@@ -1520,7 +1513,6 @@ cranelift-native-control:
     set -euo pipefail
     cargo run --quiet -p php_jit --example cranelift_native_control_audit
     scripts/verify/cranelift_native_control.py
-    scripts/verify/cranelift_only_stage_ratchet.py
     cargo test -p php_jit --lib native_control_status_numbers_are_stable
     cargo test -p php_jit --lib compiled_finally
     cargo test -p php_jit --lib native_unwind_resumes
@@ -1539,7 +1531,6 @@ cranelift-native-suspensions:
     set -euo pipefail
     cargo run --quiet -p php_jit --example cranelift_native_suspension_audit
     scripts/verify/cranelift_native_suspensions.py
-    scripts/verify/cranelift_only_stage_ratchet.py
     cargo test -p php_jit --lib native_resume_entry
     cargo test -p php_jit --lib native_delegation_state
     cargo test -p php_jit --lib native_continuation
@@ -1558,7 +1549,6 @@ cranelift-native-dynamic-code:
     set -euo pipefail
     cargo run --quiet -p php_jit --example cranelift_native_dynamic_code_audit
     scripts/verify/cranelift_native_dynamic_code.py
-    scripts/verify/cranelift_only_stage_ratchet.py
     cargo test -p php_jit --lib dynamic_code
     cargo test -p php_jit --lib native_dynamic_code_kind_numbers_are_stable
     cargo test -p php_jit --lib include_executes_only_after_native_dynamic_compiler_returns_entry_result
@@ -1576,7 +1566,6 @@ cranelift-native-transitions:
     set -euo pipefail
     cargo run --quiet -p php_jit --example cranelift_native_transition_audit
     scripts/verify/cranelift_native_transitions.py
-    scripts/verify/cranelift_only_stage_ratchet.py
     cargo test -p php_jit --lib baseline_native_continuation_resumes_exact_instruction
     cargo test -p php_jit --lib optimized_exit_after_effect_does_not_repeat_effect_in_baseline
     cargo test -p php_jit --lib nested_callee_transition_uses_published_native_function_entry
@@ -1594,13 +1583,11 @@ cranelift-native-executor:
     #!/usr/bin/env bash
     set -euo pipefail
     scripts/verify/cranelift_native_executor.py
-    scripts/verify/cranelift_only_stage_ratchet.py
     cargo test -p php_vm --lib
     cargo test -p php_executor bounded_cranelift_prewarm_populates_cache_without_executing_script
     cargo test -p php_vm_cli legacy_executor_switches_are_rejected
     cargo check --workspace --all-targets
     cargo build --release -p php_server --bin phrust-server
-    scripts/verify/native_server_symbols.py "${CARGO_TARGET_DIR:-target}/release/phrust-server"
 
 # Prompt 12 cutover gate: a fresh process loads validated PNA1 machine code,
 # corrupt artifacts rebuild, and loader/concurrency controls remain covered.
@@ -1608,7 +1595,6 @@ cranelift-native-cache:
     #!/usr/bin/env bash
     set -euo pipefail
     scripts/verify/cranelift_native_cache.py
-    scripts/verify/cranelift_only_stage_ratchet.py
     cargo test -p php_jit --lib native_cache
     cargo test -p php_vm vm_reloads_native_artifact_without_compilation
     cargo test -p php_vm_cli native_cache_controls_parse
@@ -1621,13 +1607,25 @@ cranelift-native-product:
     set -euo pipefail
     cargo build -p php_vm_cli --bin php-vm -p php_server --bin phrust-server
     scripts/verify/native_product_surface.py
-    scripts/verify/mandatory_cranelift.py
-    scripts/verify/cranelift_only_stage_ratchet.py
     cargo test -p php_executor profiles_select_only_native_optimization_policy
     cargo test -p php_vm counter_json_contains_only_native_engine_families
     cargo test -p php_vm_cli legacy_executor_switches_are_rejected
     cargo test -p php_server native_readiness_metrics_are_machine_readable
     cargo check --workspace --all-targets
+
+# Prompt 14 architecture gate: source, Cargo graph, exhaustive lowering,
+# release binaries, help snapshots, server startup, native state machines, and
+# restart cache behavior pass with no exception list.
+cranelift-only-ratchet:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo run --quiet -p php_jit --example cranelift_instruction_coverage
+    cargo run --quiet -p php_runtime --example native_operation_audit
+    cargo build --release -p php_vm_cli --bin php-vm --no-default-features
+    cargo build --release -p php_server --bin phrust-server --no-default-features
+    scripts/verify/cranelift_only_ratchet.py \
+      --cli "${CARGO_TARGET_DIR:-target}/release/php-vm" \
+      --server "${CARGO_TARGET_DIR:-target}/release/phrust-server"
 
 dump-cranelift-clif:
     cargo run -p php_vm_cli --bin php-vm  -- dump-cranelift-clif

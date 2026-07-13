@@ -10,7 +10,6 @@ mkdir -p "$OUT_DIR"
 cargo test -p php_jit
 cargo test -p php_vm native_entry
 cargo build -p php_vm_cli --bin php-vm --no-default-features --features runtime-telemetry
-scripts/verify/mandatory_cranelift.py
 
 # Product execution has no managed fallback. This broad PHP fixture is not yet
 # covered by the cutover compiler, so setup must fail with the precise native

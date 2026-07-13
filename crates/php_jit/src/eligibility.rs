@@ -1654,7 +1654,6 @@ fn check_instruction(
         | InstructionKind::UnsetLocal { .. }
         | InstructionKind::Echo { .. }
         | InstructionKind::EmitDiagnostic { .. }
-        | InstructionKind::Unsupported { .. }
         | InstructionKind::RuntimeError { .. } => rejected.push(JitEligibilityReason::instruction(
             "JIT_ELIGIBILITY_REJECT_OBSERVABLE_OPCODE",
             "observable or dynamic VM behavior is outside the JIT subset",
