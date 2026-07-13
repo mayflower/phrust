@@ -24,7 +24,7 @@ Current ownership:
 | Area | Status | Owner |
 | --- | --- | --- |
 | Executable memory | Owned + tested | `crates/php_jit/src/code_memory.rs` (VM-owned `CodeMemory`, fail-closed `UnsupportedHost`, lifecycle/exec tests; the sole executable-mapping site). |
-| W^X policy | Owned + tested | `code_memory.rs` per-platform transitions (macOS `MAP_JIT` + `pthread_jit_write_protect_np`; other-unix RW→RX `mprotect`), documented in `docs/performance/cranelift/safety-audit.md`. |
+| W^X policy | Owned + tested | `code_memory.rs` per-platform transitions (macOS `MAP_JIT` + `pthread_jit_write_protect_np`; other-unix RW→RX `mprotect`), incorporated into ADR 0017. |
 | ABI hash | Owned | `JIT_HELPER_REGISTRY_ABI_HASH` + `repr(C)` `JitCValue`/`JitCFrameView` in `crates/php_jit/src/abi.rs`. |
 | Helper registry | Owned + tested | `crates/php_jit/src/helpers.rs` (`JIT_HELPER_SYMBOLS`: versioned ids, names, signatures, side effects, return-status). |
 | Side exits and deopt records | Owned | `abi.rs` `SideExitReason` / `JitSideExit` / `JitCExit`. |

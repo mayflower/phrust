@@ -279,7 +279,7 @@ Start with:
 - [Runtime contract](docs/runtime/contract.md)
 - [Runtime semantics contract](docs/runtime/semantics-contract.md)
 - [Performance methodology](docs/performance/methodology.md)
-- [Performance runtime](docs/performance/runtime.md)
+- [Performance contracts](docs/performance/README.md)
 - [Performance known gaps](docs/performance/known-gaps.md)
 - [PHPT runtime completion](docs/phpt/README.md)
 

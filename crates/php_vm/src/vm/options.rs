@@ -38,11 +38,11 @@ pub struct VmOptions {
     /// Select baseline or optimizing Cranelift compilation.
     pub native_optimization: NativeOptimizationPolicy,
     /// Native compilation threshold requested by frontends.
-    pub jit_threshold: u64,
+    pub native_threshold: u64,
     /// Process-local native-version blacklist policy.
-    pub jit_blacklist: JitBlacklistMode,
+    pub native_blacklist: NativeBlacklistMode,
     /// Optional diagnostic path for dumping Cranelift IR.
-    pub jit_dump_clif: Option<PathBuf>,
+    pub native_dump_clif: Option<PathBuf>,
     /// Restart-persistent native artifact cache access policy.
     pub native_cache: NativeCacheMode,
     /// Directory containing validated PNA1 native artifacts.
@@ -72,9 +72,9 @@ impl Default for VmOptions {
             collect_layout_source_attribution: false,
             inline_caches: InlineCacheMode::Off,
             native_optimization: NativeOptimizationPolicy::Baseline,
-            jit_threshold: tiering.function_entry_threshold,
-            jit_blacklist: JitBlacklistMode::On,
-            jit_dump_clif: None,
+            native_threshold: tiering.function_entry_threshold,
+            native_blacklist: NativeBlacklistMode::On,
+            native_dump_clif: None,
             native_cache: native_cache.mode,
             native_cache_dir: native_cache.directory,
             native_cache_stats: false,
@@ -108,13 +108,13 @@ impl NativeOptimizationPolicy {
 
 /// Process-local native-version blacklist switch.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum JitBlacklistMode {
+pub enum NativeBlacklistMode {
     Off,
     #[default]
     On,
 }
 
-impl JitBlacklistMode {
+impl NativeBlacklistMode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

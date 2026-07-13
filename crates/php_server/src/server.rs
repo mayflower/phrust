@@ -27,7 +27,10 @@ use std::{
     collections::BTreeMap,
     fmt,
     path::Path,
-    sync::{Arc, atomic::AtomicU64},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::{net::TcpListener, sync::Semaphore};
@@ -371,6 +374,8 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     ));
     let engine = Arc::new(ServerEngineState::new(
         engine_profile,
+        config.engine.native_cache,
+        config.engine.native_cache_dir.clone(),
         script_cache,
         include_cache,
         config.engine.perf_ablation,
@@ -446,6 +451,24 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         },
     });
     preload_script_cache(&state, script_cache_preload.as_deref(), strict_preload)?;
+    let native_isa = php_vm::api::cranelift_host_isa_identity()
+        .map_err(|error| ServerError::Io(std::io::Error::other(error)))?;
+    eprintln!(
+        "native_startup compiler=cranelift compiler_version={} runtime_abi={:016x} helper_abi={:016x} target={} cpu_features={:016x} cache_mode={} cache_path={} preset={} artifacts_loaded=0 artifacts_compiled={}",
+        php_vm::api::CRANELIFT_VERSION,
+        php_vm::api::JIT_RUNTIME_ABI_HASH,
+        php_vm::api::JIT_HELPER_REGISTRY_ABI_HASH,
+        native_isa.target_triple,
+        native_isa.feature_fingerprint,
+        state.services.engine.native_cache.as_str(),
+        state.services.engine.native_cache_dir.display(),
+        state.services.engine.engine_profile,
+        state
+            .services
+            .metrics
+            .native_prewarm_entries
+            .load(Ordering::Relaxed),
+    );
     serve_until_shutdown(listener, state, tls_acceptor, http3_endpoint).await;
     Ok(())
 }

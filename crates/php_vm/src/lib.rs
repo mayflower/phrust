@@ -27,10 +27,7 @@ pub mod api {
     pub use crate::compiled_unit::{
         CompiledClass, CompiledUnit, CompiledUnitBuildError, CompiledUnitLayoutStats,
     };
-    pub use crate::counters::{
-        BoundaryProfile, BoundaryWorkSnapshot, JitCompileDescriptor, MethodCallProfile,
-        OperationProfile, PropertyFetchProfile, VmCounters,
-    };
+    pub use crate::counters::{NativeCompileDescriptor, VmCounters};
     pub use crate::error::{VmError, VmErrorSeverity};
     pub use crate::include::{
         CacheInstanceId, CompilationDependencyRequest, CompilationDependencyResolver,
@@ -45,13 +42,17 @@ pub mod api {
     pub use crate::inline_cache::{FunctionCallSiteSnapshot, InlineCacheMode};
     pub use crate::tiering::{TieringOptions, TieringStats};
     pub use crate::vm::{
-        JitBlacklistMode, NativeOptimizationPolicy, Vm, VmOptions, VmResult, VmWorkerState,
+        NativeBlacklistMode, NativeOptimizationPolicy, Vm, VmOptions, VmResult, VmWorkerState,
     };
-    pub use php_jit::{NativeCacheMode, NativeCacheStats};
+    pub use php_jit::{
+        CRANELIFT_VERSION, CraneliftHostIsaError, CraneliftHostIsaIdentity,
+        JIT_HELPER_REGISTRY_ABI_HASH, JIT_RUNTIME_ABI_HASH, NativeCacheConfig, NativeCacheMode,
+        NativeCacheStats, cranelift_host_isa_identity,
+    };
 }
 
-/// Instrumentation and native optimization metadata used by tooling.
-pub mod experimental {
+/// Native compiler and dependency metadata used by diagnostics tooling.
+pub mod tooling {
     #[must_use]
     pub fn cranelift_code_cache_generation() -> u64 {
         php_jit::cranelift_code_manager_stats().code_generations as u64

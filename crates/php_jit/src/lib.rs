@@ -1817,10 +1817,9 @@ impl JitEngine {
         &self.stats
     }
 
-    /// Analyzes one IR function for the future JIT subset.
+    /// Analyzes one IR function for native lowering.
     ///
-    /// This does not compile or execute native code. It only records whether a
-    /// function is eligible for later experimental lowering.
+    /// This records whether a function is eligible for native lowering.
     pub fn analyze_eligibility(
         &mut self,
         unit: &IrUnit,

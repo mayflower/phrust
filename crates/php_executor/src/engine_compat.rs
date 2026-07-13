@@ -116,7 +116,7 @@ where
     )?;
     let include_loader = include_loader_for(&input)?;
     let runtime_context = runtime_context_for(&input, include_loader.as_ref());
-    let executor_options = PhpExecutorOptions::managed_fast_runtime();
+    let executor_options = PhpExecutorOptions::default_native_runtime();
     let mut vm_options = executor_options.vm_options;
     vm_options.include_loader = include_loader;
     vm_options.include_compiler = Some(std::sync::Arc::new(ExecutorIncludeCompiler::new(
@@ -375,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_entrypoint_uses_managed_fast_runtime_for_recursion() {
+    fn compatibility_entrypoint_uses_default_native_runtime_for_recursion() {
         let input = test_input(
             "<?php function f($i) { if ($i > 4) { echo 'stop'; return; } f($i + 1); } f(0);",
         );

@@ -4,7 +4,7 @@ mod jit_abi;
 mod options;
 mod result;
 
-pub use options::{JitBlacklistMode, NativeOptimizationPolicy, VmOptions};
+pub use options::{NativeBlacklistMode, NativeOptimizationPolicy, VmOptions};
 pub use result::VmResult;
 
 use crate::compiled_unit::CompiledUnit;
@@ -331,21 +331,33 @@ impl Vm {
         cache_load_time: Duration,
         native_compile_time: Duration,
     ) -> VmResult {
-        match cache {
-            Some(cache) => self.attach_native_cache_metrics(
-                result,
-                cache,
-                cache_load_time,
-                native_compile_time,
-            ),
-            None => result,
-        }
+        self.attach_native_metrics(
+            result,
+            cache.map(php_jit::NativeArtifactCache::stats),
+            cache_load_time,
+            native_compile_time,
+        )
     }
 
     fn attach_native_cache_metrics(
         &self,
-        mut result: VmResult,
+        result: VmResult,
         cache: &php_jit::NativeArtifactCache,
+        cache_load_time: Duration,
+        native_compile_time: Duration,
+    ) -> VmResult {
+        self.attach_native_metrics(
+            result,
+            Some(cache.stats()),
+            cache_load_time,
+            native_compile_time,
+        )
+    }
+
+    fn attach_native_metrics(
+        &self,
+        mut result: VmResult,
+        cache_stats: Option<php_jit::NativeCacheStats>,
         cache_load_time: Duration,
         native_compile_time: Duration,
     ) -> VmResult {
@@ -353,8 +365,33 @@ impl Vm {
             cache_load_time.as_nanos().min(u128::from(u64::MAX)) as u64;
         result.native_compile_nanos =
             native_compile_time.as_nanos().min(u128::from(u64::MAX)) as u64;
-        if self.options.native_cache_stats {
-            result.native_cache_stats = Some(Box::new(cache.stats()));
+        if self.options.native_cache_stats
+            && let Some(stats) = cache_stats
+        {
+            result.native_cache_stats = Some(Box::new(stats));
+        }
+        if self.options.collect_counters {
+            let mut counters = crate::counters::VmCounters::default();
+            let compiled = !native_compile_time.is_zero();
+            let executed = result.status.is_success();
+            counters.native_compile_attempts = u64::from(compiled);
+            counters.native_compile_successes = u64::from(compiled && executed);
+            counters.native_compile_failures = u64::from(compiled && !executed);
+            counters.native_compile_time_nanos = result.native_compile_nanos;
+            counters.native_execution_entries = u64::from(executed);
+            counters.native_region_entries = u64::from(executed);
+            counters.native_version_published = u64::from(compiled && executed);
+            if let Some(stats) = cache_stats {
+                counters.native_cache_hits = stats.hits;
+                counters.native_cache_misses = stats.misses;
+                counters.native_cache_writes = stats.writes;
+                counters.native_cache_rebuilds = stats.rebuilds;
+                counters.native_cache_invalid_artifacts = stats.invalid_artifacts;
+                counters.native_cache_compile_waits = stats.compile_waits;
+                counters.native_cache_bytes_loaded = stats.bytes_loaded;
+                counters.native_cache_bytes_written = stats.bytes_written;
+            }
+            result.counters = Some(Box::new(counters));
         }
         result
     }

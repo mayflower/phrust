@@ -992,14 +992,14 @@ impl SideExitReason {
     }
 }
 
-/// Structured side-exit metadata observed before interpreter fallback.
+/// Structured side-exit metadata observed before a native transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JitSideExit {
     /// Stable reason.
     pub reason: SideExitReason,
-    /// Optional block to resume in interpreter mode.
+    /// Optional block to resume in baseline native code.
     pub resume_block: Option<BlockId>,
-    /// Optional instruction to resume in interpreter mode.
+    /// Optional instruction to resume in baseline native code.
     pub resume_instruction: Option<InstrId>,
     /// Optional helper status or guard code.
     pub status_code: Option<i32>,
@@ -1017,7 +1017,7 @@ impl JitSideExit {
         }
     }
 
-    /// Adds an interpreter resume point.
+    /// Adds a baseline-native resume point.
     #[must_use]
     pub const fn with_resume(mut self, block: BlockId, instruction: InstrId) -> Self {
         self.resume_block = Some(block);
@@ -1038,9 +1038,9 @@ impl JitSideExit {
 pub struct JitBailout {
     /// Bailout family.
     pub kind: JitBailoutKind,
-    /// Optional block to resume in interpreter mode.
+    /// Optional block to resume in baseline native code.
     pub resume_block: Option<BlockId>,
-    /// Optional instruction to resume in interpreter mode.
+    /// Optional instruction to resume in baseline native code.
     pub resume_instruction: Option<InstrId>,
     /// Stable debug reason.
     pub reason: String,

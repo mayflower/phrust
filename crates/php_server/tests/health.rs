@@ -621,12 +621,6 @@ fn server_request_profile_source_attribution_mode_collects_attribution() {
             .is_some_and(|count| count > 0),
         "direct caller-source binding must be visible in the request profile: {profile}"
     );
-    assert!(
-        profile["attribution"]["calls"]["dense_activation_transfers"]
-            .as_u64()
-            .is_some_and(|count| count > 0),
-        "direct calls must use the iterative activation path: {profile}"
-    );
     assert_eq!(
         profile["attribution"]["calls"]["direct_call_owned_value_buffers"],
         serde_json::Value::from(0),
@@ -2233,22 +2227,6 @@ fn assert_named_profile_contains(profiles: &serde_json::Value, expected_name_fra
     assert!(
         exclusive <= inclusive,
         "profile exclusive_nanos should not exceed inclusive_nanos: {entry}"
-    );
-    assert!(
-        entry.get("inclusive_rich_instructions").is_some(),
-        "profile inclusive_rich_instructions should be present: {entry}"
-    );
-    assert!(
-        entry.get("exclusive_rich_instructions").is_some(),
-        "profile exclusive_rich_instructions should be present: {entry}"
-    );
-    assert!(
-        entry.get("inclusive_dense_instructions").is_some(),
-        "profile inclusive_dense_instructions should be present: {entry}"
-    );
-    assert!(
-        entry.get("exclusive_dense_instructions").is_some(),
-        "profile exclusive_dense_instructions should be present: {entry}"
     );
     assert!(
         entry.get("inclusive_work").is_some() && entry.get("exclusive_work").is_some(),

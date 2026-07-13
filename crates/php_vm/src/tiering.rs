@@ -20,9 +20,9 @@ pub struct TieringOptions {
     pub megamorphic_threshold: u64,
     pub blacklist_threshold: u64,
     pub recompile_candidate_threshold: u64,
-    pub jit_eager: bool,
-    pub jit_max_compile_us: u64,
-    pub jit_max_functions: u64,
+    pub native_eager: bool,
+    pub native_max_compile_us: u64,
+    pub native_max_functions: u64,
 }
 
 impl Default for TieringOptions {
@@ -38,9 +38,9 @@ impl Default for TieringOptions {
             megamorphic_threshold: 1,
             blacklist_threshold: 3,
             recompile_candidate_threshold: 4,
-            jit_eager: false,
-            jit_max_compile_us: u64::MAX,
-            jit_max_functions: u64::MAX,
+            native_eager: false,
+            native_max_compile_us: u64::MAX,
+            native_max_functions: u64::MAX,
         }
     }
 }

@@ -1,5 +1,5 @@
 use php_optimizer::OptimizationLevel;
-use php_vm::api::{InlineCacheMode, JitBlacklistMode, NativeOptimizationPolicy, TieringOptions};
+use php_vm::api::{InlineCacheMode, NativeBlacklistMode, NativeOptimizationPolicy, TieringOptions};
 use std::{fmt, str::FromStr};
 
 use crate::PhpExecutorOptions;
@@ -23,7 +23,7 @@ impl EngineProfileName {
 
     #[must_use]
     pub const fn accepted_values() -> &'static str {
-        "baseline, default, or fast"
+        "baseline or default"
     }
 
     pub fn parse(value: &str) -> Result<Self, ParseEngineProfileError> {
@@ -43,7 +43,7 @@ impl FromStr for EngineProfileName {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "baseline" => Ok(Self::Baseline),
-            "default" | "fast" => Ok(Self::Default),
+            "default" => Ok(Self::Default),
             _ => Err(ParseEngineProfileError {
                 value: value.to_string(),
             }),
@@ -85,20 +85,20 @@ impl EngineProfile {
             EngineProfileName::Baseline => {
                 vm_options.inline_caches = InlineCacheMode::Off;
                 vm_options.native_optimization = NativeOptimizationPolicy::Baseline;
-                vm_options.jit_blacklist = JitBlacklistMode::On;
+                vm_options.native_blacklist = NativeBlacklistMode::On;
                 vm_options.tiering.enabled = true;
-                vm_options.tiering.jit_eager = true;
+                vm_options.tiering.native_eager = true;
                 OptimizationLevel::O0
             }
             EngineProfileName::Default => {
                 vm_options.inline_caches = InlineCacheMode::On;
                 vm_options.native_optimization = NativeOptimizationPolicy::Optimizing;
-                vm_options.jit_blacklist = JitBlacklistMode::On;
+                vm_options.native_blacklist = NativeBlacklistMode::On;
                 vm_options.tiering = TieringOptions::default();
                 OptimizationLevel::O2
             }
         };
-        vm_options.jit_threshold = vm_options.tiering.function_entry_threshold;
+        vm_options.native_threshold = vm_options.tiering.function_entry_threshold;
         let include_optimization_level = match name {
             EngineProfileName::Default => OptimizationLevel::O0,
             EngineProfileName::Baseline => optimization_level,
@@ -120,7 +120,7 @@ impl From<EngineProfileName> for EngineProfile {
 
 impl PhpExecutorOptions {
     #[must_use]
-    pub fn managed_fast_runtime() -> Self {
+    pub fn default_native_runtime() -> Self {
         Self::for_profile(EngineProfileName::Default)
     }
 
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn profiles_select_only_native_optimization_policy() {
         let baseline = PhpExecutorOptions::baseline_oracle();
-        let optimized = PhpExecutorOptions::managed_fast_runtime();
+        let optimized = PhpExecutorOptions::default_native_runtime();
         assert_eq!(
             baseline.vm_options.native_optimization,
             NativeOptimizationPolicy::Baseline

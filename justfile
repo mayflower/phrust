@@ -87,23 +87,16 @@ help:
       '  just wordpress-root-benchmark Run clean Phrust vs PHP-FPM WordPress gate' \
       '  just wordpress-root-tranche-gate Run strict c1-p50 performance acceptance gate' \
       '  just wordpress-root-benchmark-feedback-ab Run persistent-feedback A/B' \
-      '  just wordpress-root-benchmark-cranelift Run experimental Cranelift arm' \
-      '  just release-cranelift-amd64 Build lean AMD64 Cranelift server' \
-      '  just wordpress-root-benchmark-cranelift-amd64 Run managed-vs-Cranelift AMD64 A/B' \
-      '  just wordpress-root-tranche-gate-cranelift-amd64 Run strict AMD64 Cranelift c1-p50 gate' \
-      '  just jit-smoke-amd64    Prove native Cranelift execution on AMD64' \
       '  just cranelift-only-no-alternate-emitter Prove the retired native emitter is absent' \
       '  just cranelift-native-dynamic-code Verify native include/eval/declaration compilation' \
       '  just cranelift-native-transitions Verify native-to-native guard exits and OSR' \
       '  just cranelift-native-executor Verify the legacy executor is absent' \
       '  just cranelift-native-cache Verify restart-persistent PNA1 native artifacts' \
+      '  just cranelift-native-product Verify the single native product surface' \
       '  just wordpress-root-diagnostics Run timing-ineligible Phrust diagnostics' \
       '  just wordpress-clone-churn-report Summarize clone/COW attribution from latest request profile' \
       '  just wordpress-array-hotpath-report Summarize array hotpath attribution from latest request profile' \
       '  just wordpress-call-hotpath-report Summarize call/frame attribution from latest request profile' \
-      '  just wordpress-exclusive-work-report Rank exact exclusive request work' \
-      '  just wordpress-persistent-metadata-report Summarize persistent metadata attribution from latest request profile' \
-      '  just wordpress-native-region-report Summarize native-region attribution from latest request profile' \
       '  just mysqli-integration   Run explicit live MySQLi integration gate' \
       '  just wordpress-smoke-report Generate web/db diagnostics report' \
       '' \
@@ -137,11 +130,10 @@ help:
       '  just composer-smoke       Run package-manager compatibility smoke gate' \
       '' \
       'Performance:' \
-      '  just perf-flag-matrix     Run performance flag A/B matrix' \
       '  just cache-roundtrip      Run frontend IR-cache roundtrip gate' \
       '  just optimizer-diff       Run optimizer differential gate' \
       '  just inline-cache-smoke   Run inline-cache smoke gate' \
-      '  just jit-smoke            Run mandatory native smoke gate' \
+      '  just native-smoke         Run mandatory native smoke gate' \
       '  just framework-smoke      Run offline framework-like performance smoke' \
       '  just front-controller-hotpath-smoke Run deterministic server hotpath smoke' \
       '  just app-flow-smoke      Run CI-safe app-flow engine comparison smoke' \
@@ -150,8 +142,6 @@ help:
       '  just release-benchmark-smoke Run production release performance smoke' \
       '  just pgo-benchmark-smoke  Run optional PGO performance smoke' \
       '  just bolt-benchmark-smoke Run optional Linux BOLT performance smoke' \
-      '  just fastest-engine-matrix Generate baseline/release/reference comparison matrix' \
-      '  just fastest-hotpath-report Generate fastest-engine hotpath report' \
       '  just perf-decision-baseline Generate startup/compile/execute decision baseline' \
       '  just startup-matrix      Run debug/release startup attribution matrix' \
       '  just perf-report          Generate performance report' \
@@ -470,6 +460,7 @@ verify-runtime:
     just bytecode-snapshots
     just cranelift-native-executor
     just cranelift-native-cache
+    just cranelift-native-product
     just vm-smoke
     just vm-trace-smoke
     just runtime-fixtures
@@ -481,7 +472,6 @@ verify-runtime:
     # enforcement into the crate roots; combined runs and CI's parallel
     # workspace job already clippy these crates.
     just runtime-semantics-diff
-    just vm-semantics-oracle
 
 verify-stdlib:
     @just stdlib-docs
@@ -495,15 +485,14 @@ verify-stdlib:
 
 # Correctness-focused performance gates. Sub-gates share one engine build
 # through the perf-build dependency (deduplicated within this invocation).
-# perf-flag-matrix runs via performance-regression; the release-profile and
-# report gates live in verify-performance-extended.
-verify-performance: wordpress-benchmark-self-test performance-tests performance-regression benchmark-smoke framework-smoke acceleration-matrix fastest-engine-matrix default-profile-smoke managed-fast-coverage fast-preset-smoke app-flow-smoke baseline-native-stencil-smoke mid-tier-plan-smoke cache-roundtrip optimizer-diff templates-smoke inline-cache-smoke inline-cache-lookup-benchmark-gate jit-smoke safety-audit-smoke
+# Release-profile and report gates live in verify-performance-extended.
+verify-performance: wordpress-benchmark-self-test performance-tests performance-regression benchmark-smoke framework-smoke default-profile-smoke app-flow-smoke baseline-native-stencil-smoke mid-tier-plan-smoke cache-roundtrip optimizer-diff templates-smoke inline-cache-smoke inline-cache-lookup-benchmark-gate native-smoke safety-audit-smoke
     @printf '%s\n' '[pass] performance verification complete'
 
 # Heavy release-profile and report gates, split out of verify-performance so
 # the serial local gate fits pre-push budgets; CI runs both gates in its
 # parallel matrix. Depends on benchmark-smoke for the hotpath report inputs.
-verify-performance-extended: benchmark-smoke release-benchmark-smoke callgrind-smoke hotpath-inventory fastest-hotpath-report perf-report
+verify-performance-extended: benchmark-smoke release-benchmark-smoke callgrind-smoke hotpath-inventory perf-report
     @printf '%s\n' '[pass] extended performance verification complete'
 
 verify-phpt:
@@ -1015,10 +1004,6 @@ runtime-semantics-diff *args:
     cargo build -p php_vm_cli
     scripts/runtime_semantics_diff.py {{args}}
 
-vm-semantics-oracle *args:
-    cargo build -p php_vm_cli --bin php-vm
-    scripts/vm_semantics_oracle.py {{args}}
-
 runtime-toolchain-audit:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -1151,57 +1136,6 @@ wordpress-root-benchmark *args:
     if [ -z "${PHRUST_WORDPRESS_PHRUST_URL:-${PHRUST_WORDPRESS_URL:-}}" ]; then cargo build --release -p php_server --bin phrust-server --no-default-features ; fi
     PHRUST_SERVER="${PHRUST_SERVER:-${CARGO_TARGET_DIR:-target}/release/phrust-server}" scripts/performance/wordpress_root_benchmark.py --mode clean {{args}}
 
-# Explicit Cranelift arm for the clean WordPress A/B matrix.
-wordpress-root-benchmark-cranelift *args:
-    if [ -z "${PHRUST_WORDPRESS_PHRUST_URL:-${PHRUST_WORDPRESS_URL:-}}" ]; then cargo build --release -p php_server --bin phrust-server --no-default-features ; fi
-    PHRUST_SERVER="${PHRUST_SERVER:-${CARGO_TARGET_DIR:-target}/release/phrust-server}" scripts/performance/wordpress_root_benchmark.py --mode clean --engine-preset default {{args}}
-
-# Lean host-native Cranelift production candidate for x86_64 Linux.
-release-cranelift-amd64:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    machine="$(uname -m)"
-    if [[ "$machine" != "x86_64" && "$machine" != "amd64" ]] || [[ "$(uname -s)" != "Linux" ]]; then
-        printf '%s\n' "[fail] release-cranelift-amd64 requires x86_64 Linux; got $machine/$(uname -s)" >&2
-        exit 1
-    fi
-    CARGO_TARGET_DIR="${PHRUST_AMD64_CRANELIFT_TARGET_DIR:-target/amd64-cranelift}" cargo build --release -p php_server --bin phrust-server --no-default-features
-
-# Source-identical AMD64 A/B: a lean managed JIT-off binary versus a lean
-# Cranelift binary. A telemetry build is used only for untimed native evidence.
-wordpress-root-benchmark-cranelift-amd64 *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    machine="$(uname -m)"
-    if [[ "$machine" != "x86_64" && "$machine" != "amd64" ]] || [[ "$(uname -s)" != "Linux" ]]; then
-        printf '%s\n' "[fail] AMD64 Cranelift benchmark requires x86_64 Linux; got $machine/$(uname -s)" >&2
-        exit 1
-    fi
-    baseline_dir="${PHRUST_AMD64_BASELINE_TARGET_DIR:-target/amd64-baseline}"
-    cranelift_dir="${PHRUST_AMD64_CRANELIFT_TARGET_DIR:-target/amd64-cranelift}"
-    diagnostic_dir="${PHRUST_AMD64_CRANELIFT_DIAGNOSTIC_TARGET_DIR:-target/amd64-cranelift-diagnostic}"
-    CARGO_TARGET_DIR="$baseline_dir" cargo build --release -p php_server --bin phrust-server --no-default-features
-    CARGO_TARGET_DIR="$cranelift_dir" cargo build --release -p php_server --bin phrust-server --no-default-features
-    CARGO_TARGET_DIR="$diagnostic_dir" cargo build --release -p php_server --bin phrust-server --no-default-features --features runtime-telemetry
-    source_commit="$(git rev-parse HEAD)"
-    patch_sha256="$(git diff --binary | sha256sum | cut -d' ' -f1)"
-    scripts/performance/wordpress_root_benchmark.py --mode clean --cranelift-ab --baseline-server "$baseline_dir/release/phrust-server" --cranelift-server "$cranelift_dir/release/phrust-server" --diagnostic-server "$diagnostic_dir/release/phrust-server" --server-source-commit "$source_commit" --server-source-patch-sha256 "$patch_sha256" {{args}}
-
-# Strict class-B acceptance for an already recorded managed AMD64 baseline.
-wordpress-root-tranche-gate-cranelift-amd64 baseline *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    machine="$(uname -m)"
-    if [[ "$machine" != "x86_64" && "$machine" != "amd64" ]] || [[ "$(uname -s)" != "Linux" ]]; then
-        printf '%s\n' "[fail] AMD64 Cranelift tranche gate requires x86_64 Linux; got $machine/$(uname -s)" >&2
-        exit 1
-    fi
-    cranelift_dir="${PHRUST_AMD64_CRANELIFT_TARGET_DIR:-target/amd64-cranelift}"
-    CARGO_TARGET_DIR="$cranelift_dir" cargo build --release -p php_server --bin phrust-server --no-default-features
-    source_commit="$(git rev-parse HEAD)"
-    patch_sha256="$(git diff --binary | sha256sum | cut -d' ' -f1)"
-    PHRUST_SERVER="$cranelift_dir/release/phrust-server" scripts/performance/wordpress_root_benchmark.py --mode clean --engine-preset default --strict --baseline "{{baseline}}" --min-c1-p50-improvement-pct 3 --server-source-commit "$source_commit" --server-source-patch-sha256 "$patch_sha256" {{args}}
-
 # Isolated persistent-feedback A/B using the same lean binary and benchmark
 # contract. Both arms and their joint ratio report share one result directory.
 wordpress-root-benchmark-feedback-ab *args:
@@ -1245,15 +1179,6 @@ wordpress-array-hotpath-report:
 
 wordpress-call-hotpath-report:
     scripts/performance/call_hotpath_report.py
-
-wordpress-exclusive-work-report:
-    scripts/performance/exclusive_work_report.py
-
-wordpress-persistent-metadata-report:
-    scripts/performance/persistent_metadata_report.py
-
-wordpress-native-region-report:
-    scripts/performance/native_region_report.py
 
 wordpress-real-extract-first-failure:
     scripts/wordpress/extract_failure.py --failure "${PHRUST_WORDPRESS_FIRST_FAILURE:-}"
@@ -1299,7 +1224,6 @@ perf-build:
 performance-tests:
     scripts/performance/compare_perf_json.py --self-test
     scripts/performance/hotpath_inventory.py --self-test
-    scripts/performance/fastest_hotpath_report.py --self-test
     scripts/performance/bench_matrix.py --self-test
     scripts/performance/perf_report.py --self-test
     scripts/performance/app_flow_matrix.py --self-test
@@ -1307,8 +1231,6 @@ performance-tests:
     scripts/performance/call_hotpath_report.py --self-test
     scripts/performance/clone_churn_report.py --self-test
     scripts/performance/front_controller_hotpath_smoke.py --self-test
-    scripts/performance/native_region_report.py --self-test
-    scripts/performance/persistent_metadata_report.py --self-test
     scripts/performance/wordpress_root_benchmark.py --self-test
     scripts/wordpress/root_profile.py --self-test
     scripts/performance/decision_baseline.py --self-test
@@ -1317,20 +1239,10 @@ performance-tests:
 performance-regression: perf-build
     scripts/performance_regression_smoke.sh
     scripts/performance/regression_smoke.sh
-    @just perf-flag-matrix
     @just polymorphic-inline-cache-smoke
-
-perf-flag-matrix:
-    scripts/performance/perf_flag_matrix.py
 
 default-profile-smoke: perf-build
     scripts/performance/default_profile_smoke.py
-
-managed-fast-coverage: perf-build
-    scripts/performance/managed_fast_coverage.py
-
-fast-preset-smoke: perf-build
-    scripts/performance/fast_preset_smoke.py
 
 baseline-native-stencil-smoke: perf-build
     scripts/performance/baseline_native_stencil_smoke.py
@@ -1482,20 +1394,8 @@ perf-ratchet-next-prompt:
 perf-ratchet-accept-local:
     scripts/performance/perf_ratchet.py accept-local
 
-acceleration-matrix: perf-build
-    scripts/performance/acceleration_matrix.py
-
-fastest-engine-matrix: perf-build
-    scripts/performance/fastest_engine_matrix.py
-
 hotpath-inventory:
     scripts/performance/hotpath_inventory.py target/performance/benchmark-smoke.json --json-out target/performance/hotpaths.json --markdown-out target/performance/hotpath-inventory.md
-
-fastest-hotpath-report: perf-build
-    @if [ ! -f target/performance/benchmark-smoke.json ]; then \
-        scripts/performance/bench_matrix.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm" --out target/performance/benchmark-smoke.json --repetitions "${PHRUST_PERF_BENCH_SMOKE_REPETITIONS:-1}" --warmups "${PHRUST_PERF_BENCH_SMOKE_WARMUPS:-0}" --timeout "${PHRUST_PERF_BENCH_TIMEOUT:-10.0}"; \
-    fi
-    scripts/performance/fastest_hotpath_report.py --benchmark target/performance/benchmark-smoke.json --framework target/performance/framework-smoke/summary.json --acceleration target/performance/acceleration/summary.json --json-out target/performance/fastest/hotpath-report.json --markdown-out target/performance/fastest/hotpath-report.md --summary-doc target/performance/fastest/hotpath-report.md
 
 perf-baseline:
     cargo build -p php_vm_cli --bin php-vm
@@ -1539,19 +1439,8 @@ polymorphic-inline-cache-smoke:
     cargo build -p php_vm_cli --bin php-vm
     scripts/performance/polymorphic_inline_cache_smoke.sh
 
-jit-smoke:
-    scripts/performance/jit_smoke.sh
-
-jit-smoke-amd64:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    machine="$(uname -m)"
-    if [[ "$machine" != "x86_64" && "$machine" != "amd64" ]] || [[ "$(uname -s)" != "Linux" ]]; then
-        printf '%s\n' "[fail] jit-smoke-amd64 requires x86_64 Linux; got $machine/$(uname -s)" >&2
-        exit 1
-    fi
-    target_dir="${PHRUST_AMD64_CRANELIFT_SMOKE_TARGET_DIR:-target/amd64-cranelift-smoke}"
-    CARGO_TARGET_DIR="$target_dir" PHRUST_JIT_SMOKE_TARGET_DIR="$target_dir" PHRUST_REQUIRE_AMD64=1 scripts/performance/jit_smoke.sh
+native-smoke:
+    scripts/performance/native_smoke.sh
 
 # Prompt 1 cutover gate: the retired emitter must be absent from source and all
 # product targets must build against the Cranelift feature graph.
@@ -1725,74 +1614,20 @@ cranelift-native-cache:
     cargo test -p php_vm_cli native_cache_controls_parse
     cargo check --workspace --all-targets
 
-jit-cranelift-smoke:
-    @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
-    cargo check --workspace
-    @if ! cargo tree -p php_jit --no-default-features -e features | rg 'cranelift-' >/dev/null; then \
-        printf '%s\n' '[fail] php_jit dependency tree does not include mandatory Cranelift crates' >&2; \
-        cargo tree -p php_jit --no-default-features -e features >&2; \
-        exit 1; \
-    fi
-    cargo check --workspace
-    cargo test -p php_jit
-    cargo test -p php_vm  jit_
-    cargo test -p php_vm  cranelift_
-    cargo build -p php_vm_cli --bin php-vm
-    @printf '%s\n' '[pass] mandatory Cranelift smoke passed'
-
-jit-cranelift-diff:
-    @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
-    cargo build -p php_vm_cli --bin php-vm
-    scripts/performance/cranelift/jit_diff.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm"
-
-jit-cranelift-bench-smoke:
-    @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
-    @just jit-cranelift-diff
-    cargo build -p php_vm_cli --bin php-vm
-    scripts/performance/cranelift/jit_bench_matrix.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm" --out target/performance/cranelift/bench-smoke.json --smoke
-
-jit-cranelift-report:
-    @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
-    @just jit-cranelift-diff
-    cargo build -p php_vm_cli --bin php-vm
-    scripts/performance/cranelift/jit_bench_matrix.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm" --out target/performance/cranelift/big_wins_report.json
-
-cranelift-guard-report:
-    @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
-    @just jit-cranelift-report
-    scripts/performance/cranelift/guard_failure_report.py --input target/performance/cranelift/big_wins_report.json --out target/performance/cranelift/guard-report.json --text-out target/performance/cranelift/guard-report.txt
-
-jit-cranelift-disasm:
-    @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
-    cargo build -p php_vm_cli --bin php-vm
-    scripts/performance/cranelift/disasm_dump.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm"
-
-jit-cranelift-fuzz-smoke:
-    @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
-    cargo build -p php_vm_cli --bin php-vm
-    scripts/performance/cranelift/jit_eligible_ir_fuzz_smoke.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm"
-
-jit-cranelift-poly-ic-experiment:
-    @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
-    cargo build -p php_vm_cli --bin php-vm
-    scripts/performance/cranelift/polymorphic_ic_experiment.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm"
-    @just jit-cranelift-report
-    scripts/performance/cranelift/guard_failure_report.py --input target/performance/cranelift/big_wins_report.json --out target/performance/cranelift/polymorphic-ic/guard-report.json --text-out target/performance/cranelift/polymorphic-ic/guard-report.txt --experimental-ic-report target/performance/cranelift/polymorphic-ic/report.json
-
-jit-cranelift-framework-smoke:
-    @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
-    cargo build -p php_vm_cli --bin php-vm
-    scripts/performance/cranelift/framework_smoke.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm"
-
-verify-cranelift:
-    @set +e; scripts/performance/cranelift/platform_check.py --out target/performance/cranelift/platform.json; status=$?; set -e; if [ "$status" -eq 77 ]; then exit 0; elif [ "$status" -ne 0 ]; then exit "$status"; fi
-    @just jit-cranelift-smoke
-    @just jit-cranelift-diff
-    @just jit-cranelift-bench-smoke
-    @just jit-cranelift-report
-    @just cranelift-guard-report
-    @just jit-cranelift-fuzz-smoke
-    @printf '%s\n' '[pass] Cranelift verification complete'
+# Prompt 13 cutover gate: CLI, server, presets, docs, startup identity, and
+# telemetry expose one mandatory Cranelift-native engine.
+cranelift-native-product:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -p php_vm_cli --bin php-vm -p php_server --bin phrust-server
+    scripts/verify/native_product_surface.py
+    scripts/verify/mandatory_cranelift.py
+    scripts/verify/cranelift_only_stage_ratchet.py
+    cargo test -p php_executor profiles_select_only_native_optimization_policy
+    cargo test -p php_vm counter_json_contains_only_native_engine_families
+    cargo test -p php_vm_cli legacy_executor_switches_are_rejected
+    cargo test -p php_server native_readiness_metrics_are_machine_readable
+    cargo check --workspace --all-targets
 
 dump-cranelift-clif:
     cargo run -p php_vm_cli --bin php-vm  -- dump-cranelift-clif
@@ -1806,7 +1641,7 @@ safety-audit-smoke:
         printf '%s\n' '[fail] performance default JIT surface contains unaudited Rust unsafe' >&2; \
         exit 1; \
     fi
-    @test -f docs/performance/cranelift/safety-audit.md
+    @test -f docs/adr/0017-native-execution-architecture.md
     cargo test -p php_bytecode_cache corrupt
     cargo test -p php_jit code_memory
 

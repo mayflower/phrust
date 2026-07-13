@@ -1,6 +1,5 @@
-// Audited native-tier ABI surface (docs/performance/cranelift/
-// safety-audit.md); compiled only under the JIT features, which the
-// pre-ADR-0020 CLI gate never covered.
+// Audited native ABI surface; see ADR 0017. The product compiler graph always
+// includes this module.
 use php_ir::module::normalize_class_name;
 use php_runtime::api::PhpString;
 use php_runtime::api::Value;

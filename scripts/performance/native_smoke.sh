@@ -2,7 +2,7 @@
 set -euo pipefail
 
 OUT_DIR="target/performance"
-BUILD_TARGET_DIR="${PHRUST_JIT_SMOKE_TARGET_DIR:-${CARGO_TARGET_DIR:-target}}"
+BUILD_TARGET_DIR="${PHRUST_NATIVE_SMOKE_TARGET_DIR:-${CARGO_TARGET_DIR:-target}}"
 VM="$BUILD_TARGET_DIR/debug/php-vm"
 
 mkdir -p "$OUT_DIR"
@@ -33,7 +33,7 @@ import json
 from pathlib import Path
 
 report = {
-    "gate": "jit-smoke",
+    "gate": "native-smoke",
     "status": "passed",
     "compiler": "cranelift",
     "compiler_optional": False,
@@ -41,7 +41,7 @@ report = {
     "optimizing_native_entry": "passed",
     "unsupported_lowering_fallback": False,
 }
-Path("target/performance/jit-smoke.json").write_text(
+Path("target/performance/native-smoke.json").write_text(
     json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
 )
 PY

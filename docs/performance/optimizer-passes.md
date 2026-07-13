@@ -16,7 +16,8 @@ nix develop -c target/debug/php-vm run --opt-level=2 tests/fixtures/performance/
 
 `--opt-level=0` skips the optimizer pipeline. `--opt-level=1` and
 `--opt-level=2` run the Performance pass pipeline and are tested against the
-baseline by `optimizer-diff`, `performance-regression`, and `perf-flag-matrix`.
+baseline by `optimizer-diff`, `performance-regression`, and
+`default-profile-smoke`.
 
 ## Implemented Pass Families
 

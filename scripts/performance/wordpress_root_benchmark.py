@@ -99,16 +99,6 @@ def main() -> int:
         if report["status"] == "skip" and args.strict:
             return 2
         return 0
-    if args.cranelift_ab:
-        report = run_cranelift_ab(args, out_dir)
-        write_json(report, out_dir / "summary.json")
-        write_cranelift_ab_markdown(report, out_dir / "summary.md")
-        print(f"[{report['status']}] Cranelift A/B wrote {rel(out_dir / 'summary.md')}")
-        if report["status"] == "fail":
-            return 1
-        if report["status"] == "skip" and args.strict:
-            return 2
-        return 0
     report = run(args, out_dir)
     write_json(report, out_dir / "summary.json")
     write_markdown(report, out_dir / "summary.md")
@@ -143,21 +133,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--server",
         default=os.environ.get("PHRUST_SERVER", "target/release/phrust-server"),
-    )
-    parser.add_argument(
-        "--baseline-server",
-        default=os.environ.get("PHRUST_BASELINE_SERVER", ""),
-        help="managed JIT-off server used by the AMD64 Cranelift A/B",
-    )
-    parser.add_argument(
-        "--cranelift-server",
-        default=os.environ.get("PHRUST_CRANELIFT_SERVER", ""),
-        help="lean jit-cranelift server used by the AMD64 Cranelift A/B",
-    )
-    parser.add_argument(
-        "--diagnostic-server",
-        default=os.environ.get("PHRUST_CRANELIFT_DIAGNOSTIC_SERVER", ""),
-        help="runtime-telemetry jit-cranelift server used for untimed native evidence",
     )
     parser.add_argument(
         "--server-source-commit",
@@ -202,9 +177,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--metrics-token", default=os.environ.get("PHRUST_METRICS_TOKEN", ""))
     parser.add_argument(
         "--engine-preset",
-        choices=("default", "experimental-jit"),
+        choices=("baseline", "default"),
         default="default",
-        help="Phrust execution preset; experimental-jit requires a jit-cranelift build",
+        help="Native compiler preset",
     )
     parser.add_argument(
         "--persistent-feedback",
@@ -216,13 +191,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--feedback-ab",
         action="store_true",
         help="run isolated persistent-feedback off/on arms and write one comparison report",
-    )
-    parser.add_argument(
-        "--cranelift-ab",
-        action="store_true",
-        help=(
-            "run a managed versus Cranelift A/B with separate diagnostic evidence"
-        ),
     )
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--baseline", default="")
@@ -356,126 +324,6 @@ def run_feedback_ab(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     }
 
 
-def run_cranelift_ab(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
-    """Run the host-appropriate clean and diagnostic Cranelift A/B."""
-    return run_native_cranelift_ab(args, out_dir)
-
-
-def run_native_cranelift_ab(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
-    """Compare a lean managed baseline with lean Cranelift."""
-    errors = validate_configuration(args)
-    if errors:
-        return {
-            "schema_version": 2,
-            "status": "fail",
-            "mode": "cranelift-ab",
-            "architecture": platform.machine().lower(),
-            "timing_eligible": False,
-            "arms": {},
-            "failures": errors,
-        }
-
-    baseline_server = args.baseline_server or args.server
-    cranelift_server = args.cranelift_server or args.server
-    diagnostic_server = args.diagnostic_server or cranelift_server
-    specs = (
-        ("managed-baseline", baseline_server, "default", False),
-        ("cranelift", cranelift_server, "experimental-jit", True),
-    )
-    arms: dict[str, dict[str, Any]] = {}
-    full_reports: dict[str, dict[str, Any]] = {}
-    failures: list[str] = []
-    for name, server, engine_preset, collect_native_evidence in specs:
-        arm_dir = out_dir / name
-        clean_dir = arm_dir / "clean"
-        clean_dir.mkdir(parents=True, exist_ok=True)
-        clean_args = copy.copy(args)
-        clean_args.cranelift_ab = False
-        clean_args.server = server
-        clean_args.engine_preset = engine_preset
-        clean_args.mode = "clean"
-        clean_args.baseline = ""
-        clean_args.compare = ""
-        clean_args.record_baseline = ""
-        clean_args.out_dir = str(clean_dir)
-        clean_report = run(clean_args, clean_dir)
-        write_json(clean_report, clean_dir / "summary.json")
-        write_markdown(clean_report, clean_dir / "summary.md")
-        full_reports[name] = clean_report
-
-        diagnostic_report: dict[str, Any] | None = None
-        native: dict[str, Any] = {}
-        if collect_native_evidence:
-            diagnostic_dir = arm_dir / "diagnostic"
-            diagnostic_dir.mkdir(parents=True, exist_ok=True)
-            diagnostic_args = copy.copy(clean_args)
-            diagnostic_args.server = diagnostic_server
-            diagnostic_args.mode = "diagnostic"
-            diagnostic_args.out_dir = str(diagnostic_dir)
-            diagnostic_report = run(diagnostic_args, diagnostic_dir)
-            write_json(diagnostic_report, diagnostic_dir / "summary.json")
-            write_markdown(diagnostic_report, diagnostic_dir / "summary.md")
-            native = (
-                ((diagnostic_report.get("profile") or {}).get("attribution") or {}).get("native")
-                or {}
-            )
-
-        status = combined_status(
-            clean_report,
-            *([diagnostic_report] if diagnostic_report is not None else []),
-        )
-        arm = {
-            "status": status,
-            "engine_preset": engine_preset,
-            "persistent_feedback": clean_args.persistent_feedback,
-            "clean_summary": rel(clean_dir / "summary.json"),
-            "diagnostic_summary": (
-                rel(arm_dir / "diagnostic" / "summary.json")
-                if diagnostic_report is not None
-                else None
-            ),
-            "phrust_identity": ((clean_report.get("engines") or {}).get("phrust") or {}).get(
-                "identity"
-            ),
-            "native_evidence": native,
-            "jit_identity": jit_identity_from_native(native),
-        }
-        arms[name] = arm
-
-    statuses = {arm["status"] for arm in arms.values()}
-    status = "fail" if failures or "fail" in statuses else "skip" if "skip" in statuses else "pass"
-    return {
-        "schema_version": 2,
-        "status": status,
-        "mode": "cranelift-ab",
-        "architecture": platform.machine().lower(),
-        "timing_eligible": all(
-            report.get("timing_eligible") is True for report in full_reports.values()
-        ),
-        "comparisons": {
-            "managed-baseline-to-cranelift": build_feedback_ab_ratios(
-                full_reports["managed-baseline"], full_reports["cranelift"]
-            )
-        },
-        "arms": arms,
-        "failures": failures,
-    }
-
-
-def jit_identity_from_native(native: dict[str, Any]) -> dict[str, Any]:
-    descriptors = native.get("jit_compile_descriptors")
-    descriptor = descriptors[0] if isinstance(descriptors, list) and descriptors else {}
-    source_abi = jit_source_abi_identity()
-    return {
-        "jit_mode": native.get("jit_mode"),
-        "target_isa_display": descriptor.get("target_isa"),
-        "config_hash": descriptor.get("config_hash"),
-        "abi_version": source_abi.get("version"),
-        "abi_hash": descriptor.get("abi_hash", source_abi.get("hash")),
-        "cranelift_version": cranelift_dependency_version(),
-    }
-
-
 def combined_status(*reports: dict[str, Any]) -> str:
     statuses = {report.get("status") for report in reports}
     return "fail" if "fail" in statuses else "skip" if "skip" in statuses else "pass"
@@ -526,22 +374,10 @@ def validate_configuration(args: argparse.Namespace) -> list[str]:
         errors.append("--feedback-ab requires --mode clean")
     if args.feedback_ab and (args.baseline or args.compare or args.record_baseline):
         errors.append("--feedback-ab cannot record or compare a regression baseline")
-    if args.cranelift_ab and args.mode != "clean":
-        errors.append("--cranelift-ab requires --mode clean")
-    if args.cranelift_ab and args.feedback_ab:
-        errors.append("--cranelift-ab and --feedback-ab are mutually exclusive")
-    if args.cranelift_ab and (args.baseline or args.compare or args.record_baseline):
-        errors.append("--cranelift-ab cannot record or compare a regression baseline")
-    if args.require_idle_host and (args.feedback_ab or args.cranelift_ab):
+    if args.require_idle_host and args.feedback_ab:
         errors.append("--require-idle-host is supported only by a single clean timing arm")
     if args.require_idle_host and args.mode != "clean":
         errors.append("--require-idle-host requires --mode clean")
-    if args.cranelift_ab and platform.machine().lower() not in SUPPORTED_CRANELIFT_MACHINES:
-        errors.append(
-            "--cranelift-ab requires x86_64/amd64 or ARM64/aarch64"
-        )
-    if args.cranelift_ab and args.phrust_url:
-        errors.append("--cranelift-ab requires managed local server binaries")
     levels = concurrency_levels(args.concurrency)
     if args.samples < 1:
         errors.append("samples must be positive")
@@ -948,7 +784,7 @@ def resolve_phrust(args: argparse.Namespace, out_dir: Path, docroot: Path | None
     )
     base_url = wait_for_server(process, log)
     target = HttpTarget("phrust", base_url, args.host_header, (process.pid,))
-    readiness = wait_for_jit_readiness(target, args.timeout_seconds, args.metrics_token)
+    readiness = wait_for_native_readiness(target, args.timeout_seconds, args.metrics_token)
     identity = binary_identity(server)
     identity["source_commit"] = args.server_source_commit or None
     identity["source_patch_sha256"] = args.server_source_patch_sha256 or None
@@ -959,7 +795,7 @@ def resolve_phrust(args: argparse.Namespace, out_dir: Path, docroot: Path | None
         performance_environment if args.mode == "clean" else "diagnostic"
     )
     identity["startup_ms"] = (time.perf_counter_ns() - startup_started_ns) / 1_000_000.0
-    identity["jit_readiness"] = readiness
+    identity["native_readiness"] = readiness
     return ManagedTarget(
         target,
         command,
@@ -1603,14 +1439,14 @@ def fetch_metrics(target: HttpTarget, timeout: float, token: str) -> dict[str, f
     return values
 
 
-def wait_for_jit_readiness(
+def wait_for_native_readiness(
     target: HttpTarget, timeout: float, token: str
 ) -> dict[str, float]:
     deadline = time.monotonic() + timeout
     required = (
         "phrust_server_script_cache_ready",
-        "phrust_server_jit_prewarm_complete",
-        "phrust_server_jit_compile_queue_empty",
+        "phrust_server_native_prewarm_complete",
+        "phrust_server_native_compile_queue_empty",
     )
     last: dict[str, float] = {}
     while time.monotonic() < deadline:
@@ -1624,14 +1460,14 @@ def wait_for_jit_readiness(
                 metric: last[metric]
                 for metric in (
                     *required,
-                    "phrust_server_jit_code_cache_generation",
-                    "phrust_server_jit_prewarm_entries_total",
-                    "phrust_server_jit_prewarm_nanos_total",
+                    "phrust_server_native_code_cache_generation",
+                    "phrust_server_native_prewarm_entries_total",
+                    "phrust_server_native_prewarm_nanos_total",
                 )
                 if metric in last
             }
         time.sleep(0.05)
-    raise RuntimeError(f"Phrust JIT readiness did not quiesce: {last}")
+    raise RuntimeError(f"Phrust native readiness did not quiesce: {last}")
 
 
 def raw_http_text(target: HttpTarget, path: str, timeout: float, headers: dict[str, str] | None) -> dict[str, Any]:
@@ -1701,7 +1537,7 @@ def cranelift_dependency_version() -> str | None:
     return match.group(1) if match else None
 
 
-def jit_source_abi_identity() -> dict[str, int | str | None]:
+def native_source_abi_identity() -> dict[str, int | str | None]:
     abi_path = REPO_ROOT / "crates/php_jit/src/abi.rs"
     if not abi_path.is_file():
         return {"version": None, "hash": None, "hash_hex": None}
@@ -1749,7 +1585,7 @@ def environment_identity(docroot: Path | None, database_identity: str) -> dict[s
         "rust_target_triple": rust_host_triple(),
         "cpu": cpu_identity(),
         "cranelift_version": cranelift_dependency_version(),
-        "jit_runtime_abi": jit_source_abi_identity(),
+        "native_runtime_abi": native_source_abi_identity(),
         "logical_cpus": os.cpu_count(),
         "available_cpus": available_cpus(),
         "repository_commit": command_output(["git", "rev-parse", "HEAD"], REPO_ROOT),
@@ -2009,43 +1845,6 @@ def write_feedback_ab_markdown(report: dict[str, Any], path: Path) -> None:
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
-def write_cranelift_ab_markdown(report: dict[str, Any], path: Path) -> None:
-    architecture = report.get("architecture") or platform.machine().lower()
-    lines = [
-        f"# WordPress {architecture.upper()} Cranelift A/B",
-        "",
-        f"Status: `{report['status']}`",
-        "",
-        "Clean latency and instrumented compile evidence are collected in separate runs.",
-        "",
-    ]
-    for failure in report.get("failures", []):
-        lines.append(f"- {failure}")
-    lines.extend(["", "## Arms", ""])
-    for name, arm in report.get("arms", {}).items():
-        compile_evidence = arm.get("compile") or arm.get("native_evidence") or {}
-        diagnostic = arm.get("diagnostic_summary") or "not collected"
-        lines.append(
-            f"- `{name}`: {arm['status']}; JIT compiles "
-            f"{compile_evidence.get('jit_compile_attempts', 'unavailable')}, compile ns "
-            f"{compile_evidence.get('jit_compile_time_nanos', 'unavailable')}; "
-            f"clean `{arm['clean_summary']}`, diagnostic `{diagnostic}`"
-        )
-    lines.extend(["", "## Comparisons", ""])
-    for name, comparisons in report.get("comparisons", {}).items():
-        if not comparisons:
-            lines.append(f"- `{name}`: no comparable clean timing curves")
-            continue
-        for comparison in comparisons:
-            lines.append(
-                f"- `{name}` concurrency {comparison['concurrency']}: p50 off/on "
-                f"{format_ratio(comparison['off_to_on_p50_latency'])}, p95 off/on "
-                f"{format_ratio(comparison['off_to_on_p95_latency'])}, throughput on/off "
-                f"{format_ratio(comparison['on_to_off_requests_per_second'])}"
-            )
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-
-
 def format_ratio(value: float | None) -> str:
     return "unsupported" if value is None else f"{value:.3f}x"
 
@@ -2161,19 +1960,10 @@ def self_test() -> int:
     assert not validate_configuration(diagnostic)
     invalid_ab = parse_args(["--mode", "diagnostic", "--feedback-ab"])
     assert "requires --mode clean" in " ".join(validate_configuration(invalid_ab))
-    cranelift_ab_errors = validate_configuration(parse_args(["--cranelift-ab"]))
-    if platform.machine().lower() in SUPPORTED_CRANELIFT_MACHINES:
-        assert "requires x86_64/amd64 or ARM64/aarch64" not in " ".join(
-            cranelift_ab_errors
-        )
-    else:
-        assert "requires x86_64/amd64 or ARM64/aarch64" in " ".join(
-            cranelift_ab_errors
-        )
     assert cranelift_dependency_version()
-    source_abi = jit_source_abi_identity()
-    assert source_abi["version"] == 4
-    assert source_abi["hash"] == 0x07C1_A817_0000_0004
+    source_abi = native_source_abi_identity()
+    assert source_abi["version"] == 9
+    assert source_abi["hash"] == 0x09C1_A817_0000_0009
     host_cpu = cpu_identity()
     assert len(host_cpu["feature_fingerprint_sha256"]) == 64
     ab_off = {

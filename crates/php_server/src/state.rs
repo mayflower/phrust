@@ -113,6 +113,8 @@ where
 #[derive(Clone, Debug)]
 pub(crate) struct ServerEngineState {
     pub(crate) engine_profile: EngineProfileName,
+    pub(crate) native_cache: php_vm::api::NativeCacheMode,
+    pub(crate) native_cache_dir: PathBuf,
     pub(crate) script_cache: Arc<CompiledScriptCache>,
     pub(crate) include_cache: Arc<IncludeCache>,
     pub(crate) compile_optimization_level: OptimizationLevel,
@@ -122,6 +124,8 @@ pub(crate) struct ServerEngineState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RequestExecutorCacheKey {
     engine_profile: EngineProfileName,
+    native_cache: php_vm::api::NativeCacheMode,
+    native_cache_dir: PathBuf,
     include_cache_id: CacheInstanceId,
     compile_optimization_level: OptimizationLevel,
     perf_ablation: ServerPerfAblation,
@@ -130,12 +134,14 @@ pub(crate) struct RequestExecutorCacheKey {
 impl ServerEngineState {
     pub(crate) fn new(
         engine_profile: EngineProfileName,
+        native_cache: php_vm::api::NativeCacheMode,
+        native_cache_dir: PathBuf,
         script_cache: Arc<CompiledScriptCache>,
         include_cache: Arc<IncludeCache>,
         perf_ablation: ServerPerfAblation,
     ) -> Self {
         let base_options = if engine_profile == EngineProfileName::Default {
-            PhpExecutorOptions::managed_fast_runtime()
+            PhpExecutorOptions::default_native_runtime()
         } else {
             PhpExecutorOptions::for_profile(engine_profile)
         };
@@ -146,6 +152,8 @@ impl ServerEngineState {
         };
         Self {
             engine_profile,
+            native_cache,
+            native_cache_dir,
             script_cache,
             include_cache,
             compile_optimization_level,
@@ -155,7 +163,7 @@ impl ServerEngineState {
 
     pub(crate) fn executor_options(&self) -> PhpExecutorOptions {
         let mut options = if self.engine_profile == EngineProfileName::Default {
-            PhpExecutorOptions::managed_fast_runtime()
+            PhpExecutorOptions::default_native_runtime()
         } else {
             PhpExecutorOptions::for_profile(self.engine_profile)
         };
@@ -165,6 +173,8 @@ impl ServerEngineState {
 
     fn apply_engine_overrides(&self, options: &mut PhpExecutorOptions) {
         options.include_optimization_level = self.compile_optimization_level;
+        options.vm_options.native_cache = self.native_cache;
+        options.vm_options.native_cache_dir = self.native_cache_dir.clone();
         if self.perf_ablation.disable_inline_caches {
             options.vm_options.inline_caches = InlineCacheMode::Off;
         }
@@ -190,6 +200,8 @@ impl ServerEngineState {
     pub(crate) fn request_executor_cache_key(&self) -> RequestExecutorCacheKey {
         RequestExecutorCacheKey {
             engine_profile: self.engine_profile,
+            native_cache: self.native_cache,
+            native_cache_dir: self.native_cache_dir.clone(),
             include_cache_id: self.include_cache.instance_id(),
             compile_optimization_level: self.compile_optimization_level,
             perf_ablation: self.perf_ablation.clone(),
@@ -267,7 +279,7 @@ pub(crate) fn preload_script_cache(
         .script_cache_ready
         .store(1, Ordering::Release);
     let Some(preload_file) = preload_file else {
-        finish_jit_prewarm_readiness(state, 0, started.elapsed());
+        finish_native_prewarm_readiness(state, 0, started.elapsed());
         return Ok(());
     };
     let contents = match std::fs::read_to_string(preload_file) {
@@ -283,7 +295,7 @@ pub(crate) fn preload_script_cache(
                 return Err(ServerError::Preload(Box::new(error)));
             }
             warn!(%error);
-            finish_jit_prewarm_readiness(state, 0, started.elapsed());
+            finish_native_prewarm_readiness(state, 0, started.elapsed());
             return Ok(());
         }
     };
@@ -344,27 +356,29 @@ pub(crate) fn preload_script_cache(
             }
         }
     }
-    finish_jit_prewarm_readiness(state, prewarmed_entries, started.elapsed());
+    finish_native_prewarm_readiness(state, prewarmed_entries, started.elapsed());
     Ok(())
 }
 
-fn finish_jit_prewarm_readiness(state: &AppState, entries: u64, elapsed: Duration) {
+fn finish_native_prewarm_readiness(state: &AppState, entries: u64, elapsed: Duration) {
     let metrics = &state.services.metrics;
     metrics
-        .jit_prewarm_entries
+        .native_prewarm_entries
         .fetch_add(entries, Ordering::Relaxed);
-    metrics.jit_prewarm_nanos.fetch_add(
+    metrics.native_prewarm_nanos.fetch_add(
         elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
         Ordering::Relaxed,
     );
-    metrics.jit_code_cache_generation.store(
-        php_vm::experimental::cranelift_code_cache_generation(),
+    metrics.native_code_cache_generation.store(
+        php_vm::tooling::cranelift_code_cache_generation(),
         Ordering::Release,
     );
     // Compilation is synchronous and serialized by the process code manager;
     // completing this phase therefore also proves that its queue is empty.
-    metrics.jit_compile_queue_empty.store(1, Ordering::Release);
-    metrics.jit_prewarm_complete.store(1, Ordering::Release);
+    metrics
+        .native_compile_queue_empty
+        .store(1, Ordering::Release);
+    metrics.native_prewarm_complete.store(1, Ordering::Release);
 }
 
 fn preload_include_cache_entry(state: &AppState, script_path: &Path) -> Result<(), VmError> {
@@ -395,6 +409,8 @@ mod tests {
     fn engine(include_cache: Arc<IncludeCache>) -> ServerEngineState {
         ServerEngineState::new(
             EngineProfileName::Default,
+            php_vm::api::NativeCacheMode::Off,
+            std::env::temp_dir().join("phrust-server-test-native-cache"),
             Arc::new(CompiledScriptCache::new(1)),
             include_cache,
             ServerPerfAblation::default(),

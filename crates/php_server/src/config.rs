@@ -10,7 +10,7 @@ use php_diagnostics::{
     DiagnosticSeverity, DiagnosticSuggestion,
 };
 use php_executor::EngineProfileName;
-use php_vm::api::DeploymentRootMode;
+use php_vm::api::{DeploymentRootMode, NativeCacheConfig, NativeCacheMode};
 
 use crate::routing::RequestRewriteRule;
 
@@ -77,6 +77,8 @@ pub struct RequestLimitsConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineConfig {
     pub engine_preset: EngineProfileName,
+    pub native_cache: NativeCacheMode,
+    pub native_cache_dir: PathBuf,
     /// Declared mutability of the deployment root. `dev` (default) marks the
     /// docroot as mutable, which keeps every deployment-fingerprint-gated
     /// persistent reuse blocked; `immutable` is an operator declaration for
@@ -247,6 +249,17 @@ impl ServerConfig {
             .map(|value| parse_engine_preset("engine_preset", &value))
             .transpose()?
             .unwrap_or_default();
+        let native_cache_defaults = NativeCacheConfig::default();
+        let mut native_cache = file_config
+            .string("native_cache")
+            .or_else(|| env_value("PHRUST_NATIVE_CACHE"))
+            .map(|value| parse_native_cache("native_cache", &value))
+            .transpose()?
+            .unwrap_or(native_cache_defaults.mode);
+        let mut native_cache_dir = file_config
+            .path("native_cache_dir")
+            .or_else(|| env_value("PHRUST_NATIVE_CACHE_DIR").map(PathBuf::from))
+            .unwrap_or(native_cache_defaults.directory);
         let mut deployment_mode = file_config
             .string("deployment_mode")
             .map(|value| parse_deployment_mode("deployment_mode", &value))
@@ -387,6 +400,12 @@ impl ServerConfig {
                 "--engine-preset" => {
                     engine_preset = parse_engine_preset(&arg, &required_value(&arg, &mut args)?)?;
                 }
+                "--native-cache" => {
+                    native_cache = parse_native_cache(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--native-cache-dir" => {
+                    native_cache_dir = PathBuf::from(required_value(&arg, &mut args)?);
+                }
                 "--deployment-mode" => {
                     deployment_mode =
                         parse_deployment_mode(&arg, &required_value(&arg, &mut args)?)?;
@@ -490,6 +509,8 @@ impl ServerConfig {
             },
             engine: EngineConfig {
                 engine_preset,
+                native_cache,
+                native_cache_dir,
                 deployment_mode,
                 perf_ablation,
                 script_cache_enabled,
@@ -581,6 +602,8 @@ impl ServerConfig {
             },
             engine: EngineConfig {
                 engine_preset: EngineProfileName::default(),
+                native_cache: NativeCacheConfig::default().mode,
+                native_cache_dir: NativeCacheConfig::default().directory,
                 deployment_mode: DeploymentRootMode::DevMutable,
                 perf_ablation: env_value_perf_ablation()?.unwrap_or_default(),
                 script_cache_enabled: true,
@@ -644,7 +667,9 @@ Options:\n\
   --request-timeout-ms <n>     body read timeout in milliseconds (default: 30000)\n\
   --max-execution-ms <n>       PHP execution deadline in milliseconds (default: 30000)\n\
   --disable-execution-deadline disable cooperative PHP execution deadline\n\
-  --engine-preset <name>       default optimizing native runtime, baseline native runtime, or fast alias\n\
+  --engine-preset <name>       default optimizing or baseline diagnostic native runtime\n\
+  --native-cache <mode>        off, read, write, or read-write PNA1 cache access\n\
+  --native-cache-dir <path>    directory containing validated PNA1 artifacts\n\
   --perf-ablation <list>       comma-separated disables: inline-caches, include-o2, or all\n\
   --disable-metrics-endpoint   disable GET /__phrust/metrics\n\
   --metrics-token <token>      require Authorization: Bearer token for metrics\n\
@@ -927,6 +952,12 @@ fn parse_output_format(value: &str) -> Result<DiagnosticOutputFormat, ConfigErro
 fn parse_engine_preset(flag: &str, value: &str) -> Result<EngineProfileName, ConfigError> {
     EngineProfileName::parse(value)
         .map_err(|error| ConfigError::new(format!("invalid {flag}: {error}")))
+}
+
+fn parse_native_cache(flag: &str, value: &str) -> Result<NativeCacheMode, ConfigError> {
+    value
+        .parse()
+        .map_err(|error: String| ConfigError::new(format!("invalid {flag}: {error}")))
 }
 
 fn env_value_perf_ablation() -> Result<Option<ServerPerfAblation>, ConfigError> {

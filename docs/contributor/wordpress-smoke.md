@@ -53,9 +53,8 @@ environment (`PHRUST_INCLUDE_REVALIDATE_MS`,
 `PHRUST_WORKER_SYMBOL_EPOCH`, and `PHRUST_PERSISTENT_FEEDBACK`) and rejects an
 inherited `PHRUST_PERF_ABLATION`. Use `wordpress-root-benchmark-feedback-ab` for
 the isolated persistent-feedback arms plus their joint p50/p95/throughput ratio
-report, and
-`wordpress-root-benchmark-cranelift` for the explicitly featured
-`experimental-jit` arm.
+report. Use `--engine-preset=baseline` or `--engine-preset=default` to compare
+native compiler policies; both use the same Cranelift engine.
 
 The clean report compares HTTP status, normalized headers, and body hashes. Add
 application-specific observable endpoints without changing the sampler:

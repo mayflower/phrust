@@ -69,9 +69,8 @@ Current performance entry points include:
 
 - `just benchmark-smoke`
 - `just framework-smoke`
-- `just perf-flag-matrix`
-- `just fastest-engine-matrix`
-- `just fastest-hotpath-report`
+- `just default-profile-smoke`
+- `just native-smoke`
 - `just perf-report`
 - `just rust-hotpath-bench`
 - `just callgrind-smoke`
@@ -79,22 +78,21 @@ Current performance entry points include:
 ## Risk Model
 
 - Correctness risk: optimized paths must not change PHP-visible behavior.
-- Invalidation risk: quickening, inline caches, and bytecode cache entries must
+- Invalidation risk: native code, inline caches, and cache entries must
   be invalidated by relevant source, configuration, include, autoload, function,
   class, method, and property changes.
 - Measurement risk: smoke-level measurements are useful for regressions and
   prioritization but not sufficient for broad speed claims.
 - Cache risk: bytecode-cache input is untrusted local data and must be
   fingerprinted, versioned, verified, and safely ignored on corruption.
-- JIT risk: JIT behavior is experimental, default-off, feature-gated, and
-  subject to explicit safety and fallback checks.
+- Native-code risk: generated code is subject to W^X, ABI, cache-validation,
+  transition, and safepoint checks.
 
 ## Related Docs
 
 - `docs/performance/methodology.md`
-- `docs/performance/runtime.md`
+- `docs/adr/0017-native-execution-architecture.md`
 - `docs/reference/performance-status.md`
 - `docs/performance/known-gaps.md`
 - `docs/performance/bytecode-cache.md`
-- `docs/performance/quickening-inline-caches.md`
-- `docs/performance/jit-experiment.md`
+- `docs/performance/counter-families.md`

@@ -31,11 +31,11 @@ pub(crate) struct ServerMetrics {
     pub(crate) script_cache_preload_successes: AtomicU64,
     pub(crate) script_cache_preload_failures: AtomicU64,
     pub(crate) script_cache_ready: AtomicU64,
-    pub(crate) jit_prewarm_complete: AtomicU64,
-    pub(crate) jit_compile_queue_empty: AtomicU64,
-    pub(crate) jit_code_cache_generation: AtomicU64,
-    pub(crate) jit_prewarm_entries: AtomicU64,
-    pub(crate) jit_prewarm_nanos: AtomicU64,
+    pub(crate) native_prewarm_complete: AtomicU64,
+    pub(crate) native_compile_queue_empty: AtomicU64,
+    pub(crate) native_code_cache_generation: AtomicU64,
+    pub(crate) native_prewarm_entries: AtomicU64,
+    pub(crate) native_prewarm_nanos: AtomicU64,
     pub(crate) persistent_engine_policy_reuses: AtomicU64,
     pub(crate) persistent_engine_immutable_metadata_reuses: AtomicU64,
     pub(crate) persistent_engine_misses: AtomicU64,
@@ -376,28 +376,28 @@ phrust_server_persistent_engine_feedback_template_absorptions_total {}\n",
         );
         let _ = writeln!(
             output,
-            "phrust_server_jit_prewarm_complete {}",
-            self.jit_prewarm_complete.load(Ordering::Relaxed)
+            "phrust_server_native_prewarm_complete {}",
+            self.native_prewarm_complete.load(Ordering::Relaxed)
         );
         let _ = writeln!(
             output,
-            "phrust_server_jit_compile_queue_empty {}",
-            self.jit_compile_queue_empty.load(Ordering::Relaxed)
+            "phrust_server_native_compile_queue_empty {}",
+            self.native_compile_queue_empty.load(Ordering::Relaxed)
         );
         let _ = writeln!(
             output,
-            "phrust_server_jit_code_cache_generation {}",
-            self.jit_code_cache_generation.load(Ordering::Relaxed)
+            "phrust_server_native_code_cache_generation {}",
+            self.native_code_cache_generation.load(Ordering::Relaxed)
         );
         let _ = writeln!(
             output,
-            "phrust_server_jit_prewarm_entries_total {}",
-            self.jit_prewarm_entries.load(Ordering::Relaxed)
+            "phrust_server_native_prewarm_entries_total {}",
+            self.native_prewarm_entries.load(Ordering::Relaxed)
         );
         let _ = writeln!(
             output,
-            "phrust_server_jit_prewarm_nanos_total {}",
-            self.jit_prewarm_nanos.load(Ordering::Relaxed)
+            "phrust_server_native_prewarm_nanos_total {}",
+            self.native_prewarm_nanos.load(Ordering::Relaxed)
         );
         output
     }
@@ -527,13 +527,15 @@ mod tests {
     }
 
     #[test]
-    fn jit_readiness_metrics_are_machine_readable() {
+    fn native_readiness_metrics_are_machine_readable() {
         let metrics = ServerMetrics::default();
         metrics.script_cache_ready.store(1, Ordering::Relaxed);
-        metrics.jit_prewarm_complete.store(1, Ordering::Relaxed);
-        metrics.jit_compile_queue_empty.store(1, Ordering::Relaxed);
+        metrics.native_prewarm_complete.store(1, Ordering::Relaxed);
         metrics
-            .jit_code_cache_generation
+            .native_compile_queue_empty
+            .store(1, Ordering::Relaxed);
+        metrics
+            .native_code_cache_generation
             .store(3, Ordering::Relaxed);
         let rendered = metrics.render(
             0,
@@ -544,9 +546,9 @@ mod tests {
         );
         for expected in [
             "phrust_server_script_cache_ready 1\n",
-            "phrust_server_jit_prewarm_complete 1\n",
-            "phrust_server_jit_compile_queue_empty 1\n",
-            "phrust_server_jit_code_cache_generation 3\n",
+            "phrust_server_native_prewarm_complete 1\n",
+            "phrust_server_native_compile_queue_empty 1\n",
+            "phrust_server_native_code_cache_generation 3\n",
         ] {
             assert!(rendered.contains(expected), "{expected}");
         }

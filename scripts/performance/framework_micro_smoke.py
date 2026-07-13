@@ -67,20 +67,8 @@ FOCUS_COUNTERS = [
 ]
 
 VARIANTS = {
-    "opt_off": [
-        "--opt-level=0",
-        "--quickening=off",
-        "--inline-caches=off",
-        "--bytecode-cache=off",
-        "--jit=off",
-    ],
-    "opt_on": [
-        "--opt-level=2",
-        "--quickening=on",
-        "--inline-caches=on",
-        "--bytecode-cache=off",
-        "--jit=off",
-    ],
+    "baseline": ["--engine-preset=baseline"],
+    "default": ["--engine-preset=default"],
 }
 
 

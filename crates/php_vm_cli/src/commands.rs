@@ -8,7 +8,7 @@ use php_executor::{
 };
 use php_optimizer::OptimizationLevel;
 use php_runtime::api::RuntimeContext;
-use php_vm::api::{InlineCacheMode, JitBlacklistMode, NativeCacheMode, NativeOptimizationPolicy};
+use php_vm::api::NativeCacheMode;
 use serde_json::json;
 use std::env;
 use std::fs;
@@ -108,19 +108,10 @@ struct NativeRunOptions {
     trace_includes: bool,
     counters_json: Option<PathBuf>,
     timings_json: Option<PathBuf>,
-    inline_caches: Option<InlineCacheMode>,
-    native_optimization: Option<NativeOptimizationPolicy>,
-    jit_threshold: Option<u64>,
-    jit_blacklist: Option<JitBlacklistMode>,
-    jit_dump_clif: Option<PathBuf>,
     native_cache: Option<NativeCacheMode>,
     native_cache_dir: Option<PathBuf>,
     clear_native_cache: bool,
     native_cache_stats: bool,
-    tiering_enabled: Option<bool>,
-    jit_eager: bool,
-    jit_max_compile_us: Option<u64>,
-    jit_max_functions: Option<u64>,
 }
 
 fn parse_run_options(args: &[String]) -> Result<NativeRunOptions, String> {
@@ -135,19 +126,10 @@ fn parse_run_options(args: &[String]) -> Result<NativeRunOptions, String> {
         trace_includes: false,
         counters_json: None,
         timings_json: None,
-        inline_caches: None,
-        native_optimization: None,
-        jit_threshold: None,
-        jit_blacklist: None,
-        jit_dump_clif: None,
         native_cache: None,
         native_cache_dir: None,
         clear_native_cache: false,
         native_cache_stats: false,
-        tiering_enabled: None,
-        jit_eager: false,
-        jit_max_compile_us: None,
-        jit_max_functions: None,
     };
     let mut index = 0;
     while index < args.len() {
@@ -193,36 +175,6 @@ fn parse_run_options(args: &[String]) -> Result<NativeRunOptions, String> {
             "--env" => options.env.push(parse_env(&value(name)?)?),
             "--counters-json" => options.counters_json = Some(PathBuf::from(value(name)?)),
             "--timings-json" => options.timings_json = Some(PathBuf::from(value(name)?)),
-            "--inline-caches" => {
-                options.inline_caches = Some(parse_toggle(&value(name)?).map(|enabled| {
-                    if enabled {
-                        InlineCacheMode::On
-                    } else {
-                        InlineCacheMode::Off
-                    }
-                })?);
-            }
-            "--native-optimization" => {
-                options.native_optimization = Some(match value(name)?.as_str() {
-                    "baseline" => NativeOptimizationPolicy::Baseline,
-                    "optimizing" | "optimized" => NativeOptimizationPolicy::Optimizing,
-                    other => return Err(format!("invalid native optimization `{other}`")),
-                });
-            }
-            "--jit" => match value(name)?.as_str() {
-                "cranelift" | "on" => {}
-                "off" => return Err("Cranelift is mandatory; --jit=off was removed".to_owned()),
-                other => return Err(format!("invalid --jit value `{other}`")),
-            },
-            "--jit-threshold" => options.jit_threshold = Some(parse_u64(name, &value(name)?)?),
-            "--jit-blacklist" => {
-                options.jit_blacklist = Some(if parse_toggle(&value(name)?)? {
-                    JitBlacklistMode::On
-                } else {
-                    JitBlacklistMode::Off
-                });
-            }
-            "--jit-dump-clif" => options.jit_dump_clif = Some(PathBuf::from(value(name)?)),
             "--native-cache" => {
                 options.native_cache = Some(value(name)?.parse::<NativeCacheMode>()?);
             }
@@ -231,14 +183,6 @@ fn parse_run_options(args: &[String]) -> Result<NativeRunOptions, String> {
             }
             "--clear-native-cache" => options.clear_native_cache = true,
             "--native-cache-stats" => options.native_cache_stats = true,
-            "--tiering" => options.tiering_enabled = Some(parse_toggle(&value(name)?)?),
-            "--jit-eager" => options.jit_eager = true,
-            "--jit-max-compile-us" => {
-                options.jit_max_compile_us = Some(parse_u64(name, &value(name)?)?)
-            }
-            "--jit-max-functions" => {
-                options.jit_max_functions = Some(parse_u64(name, &value(name)?)?)
-            }
             _ => return Err(format!("unsupported native run option `{arg}`")),
         }
         index += 1;
@@ -272,20 +216,6 @@ where
     vm.trace_runtime = options.trace_runtime;
     vm.trace_includes = options.trace_includes;
     vm.collect_counters = options.counters_json.is_some();
-    if let Some(mode) = options.inline_caches {
-        vm.inline_caches = mode;
-    }
-    if let Some(policy) = options.native_optimization {
-        vm.native_optimization = policy;
-    }
-    if let Some(threshold) = options.jit_threshold {
-        vm.jit_threshold = threshold;
-        vm.tiering.function_entry_threshold = threshold;
-    }
-    if let Some(mode) = options.jit_blacklist {
-        vm.jit_blacklist = mode;
-    }
-    vm.jit_dump_clif = options.jit_dump_clif;
     if let Some(mode) = options.native_cache {
         vm.native_cache = mode;
     }
@@ -308,20 +238,6 @@ where
         if options.path.is_empty() {
             return Ok(EXIT_SUCCESS);
         }
-    }
-    if let Some(enabled) = options.tiering_enabled {
-        vm.tiering.enabled = enabled;
-    }
-    if options.jit_eager {
-        vm.tiering.jit_eager = true;
-        vm.jit_threshold = 1;
-        vm.tiering.function_entry_threshold = 1;
-    }
-    if let Some(limit) = options.jit_max_compile_us {
-        vm.tiering.jit_max_compile_us = limit;
-    }
-    if let Some(limit) = options.jit_max_functions {
-        vm.tiering.jit_max_functions = limit;
     }
     let native_cache_mode = vm.native_cache;
     let native_cache_directory = vm.native_cache_dir.clone();
@@ -566,14 +482,6 @@ fn parse_opt_level(value: &str) -> Result<OptimizationLevel, String> {
     }
 }
 
-fn parse_toggle(value: &str) -> Result<bool, String> {
-    match value {
-        "1" | "on" | "true" | "yes" => Ok(true),
-        "0" | "off" | "false" | "no" => Ok(false),
-        _ => Err(format!("expected on or off, got `{value}`")),
-    }
-}
-
 fn parse_env(value: &str) -> Result<(String, String), String> {
     let (name, value) = value
         .split_once('=')
@@ -582,12 +490,6 @@ fn parse_env(value: &str) -> Result<(String, String), String> {
         return Err("--env requires a non-empty key".to_owned());
     }
     Ok((name.to_owned(), value.to_owned()))
-}
-
-fn parse_u64(name: &str, value: &str) -> Result<u64, String> {
-    value
-        .parse()
-        .map_err(|error| format!("invalid {name} value `{value}`: {error}"))
 }
 
 fn error_format_from_env() -> DiagnosticOutputFormat {
@@ -610,7 +512,7 @@ fn write_parented(path: &Path, bytes: &[u8]) -> Result<(), String> {
 fn print_usage<W: Write>(stdout: &mut W) -> Result<(), String> {
     writeln!(
         stdout,
-        "Usage:\n  php-vm run [native options] <file> [-- args...]\n  php-vm run --clear-native-cache [--native-cache-dir PATH]\n  php-vm compile <file> [--json] [--opt-level 0|1|2]\n  php-vm dump-ir <file> [--with-source]\n\nNative options:\n  --engine-preset baseline|default|fast\n  --opt-level 0|1|2\n  --native-optimization baseline|optimizing\n  --inline-caches off|on\n  --jit=cranelift\n  --jit-threshold N\n  --jit-blacklist off|on\n  --jit-dump-clif PATH\n  --native-cache off|read|write|read-write\n  --native-cache-dir PATH\n  --clear-native-cache\n  --native-cache-stats\n  --tiering off|on\n  --jit-eager\n  --jit-max-compile-us N\n  --jit-max-functions N\n  --counters-json PATH\n  --timings-json PATH\n  --trace --trace-runtime --trace-includes\n  --env KEY=VALUE"
+        "Usage:\n  php-vm run [native options] <file> [-- args...]\n  php-vm run --clear-native-cache [--native-cache-dir PATH]\n  php-vm compile <file> [--json] [--opt-level 0|1|2]\n  php-vm dump-ir <file> [--with-source]\n\nNative options:\n  --engine-preset baseline|default\n  --opt-level 0|1|2\n  --native-cache off|read|write|read-write\n  --native-cache-dir PATH\n  --clear-native-cache\n  --native-cache-stats\n  --counters-json PATH\n  --timings-json PATH\n  --trace --trace-runtime --trace-includes\n  --env KEY=VALUE"
     )
     .map_err(|error| error.to_string())
 }
@@ -621,12 +523,24 @@ mod tests {
 
     #[test]
     fn legacy_executor_switches_are_rejected() {
-        let error = parse_run_options(&[
-            "--exec-format=bytecode".to_owned(),
-            "fixture.php".to_owned(),
-        ])
-        .expect_err("removed option");
-        assert!(error.contains("unsupported native run option"));
+        for option in [
+            concat!("--exec", "-format=bytecode"),
+            concat!("--quick", "ening=on"),
+            concat!("--super", "instructions=on"),
+            concat!("--den", "se-cache=on"),
+            concat!("--", "jit=cranelift"),
+        ] {
+            let error = parse_run_options(&[option.to_owned(), "fixture.php".to_owned()])
+                .expect_err("removed option");
+            assert!(error.contains("unsupported native run option"));
+        }
+        assert!(
+            parse_run_options(&[
+                concat!("--engine-preset=", "fast").to_owned(),
+                "fixture.php".to_owned(),
+            ])
+            .is_err()
+        );
     }
 
     #[test]

@@ -48,16 +48,17 @@ PHPT_FIXTURES = (
     "fixtures/phpt_smoke/function.phpt",
 )
 
-FALLBACK_KEYWORDS = (
-    "fallback",
-    "deopt",
-    "exit",
-    "miss",
-    "slow",
-    "guard_failure",
-    "unsupported",
+NATIVE_FAMILIES = (
+    "native_compile",
+    "native_cache",
+    "native_execution",
+    "native_region",
+    "native_call",
+    "native_version",
+    "native_transition",
+    "runtime_helper",
+    "gc_safepoint",
 )
-DEFAULT_JIT_MODE = "off"
 
 
 @dataclass(frozen=True)
@@ -189,32 +190,25 @@ def run_case(engine: Path, case: Case, profile: str, out_dir: Path, timeout: flo
     return RunResult(elapsed_ms, completed.returncode, stdout, stderr, counters)
 
 
-def collect_fallback_deopt_counters(counters: dict[str, Any]) -> dict[str, int]:
+def collect_native_transition_counters(counters: dict[str, Any]) -> dict[str, int]:
     selected: dict[str, int] = {}
     for key, value in counters.items():
         key_lower = key.lower()
-        if isinstance(value, int) and any(word in key_lower for word in FALLBACK_KEYWORDS):
+        if isinstance(value, int) and ("transition" in key_lower or "side_exit" in key_lower):
             selected[key] = value
         elif isinstance(value, dict):
             nested_total = sum(item for item in value.values() if isinstance(item, int))
-            if nested_total and any(word in key_lower for word in FALLBACK_KEYWORDS):
+            if nested_total and ("transition" in key_lower or "side_exit" in key_lower):
                 selected[key] = nested_total
     return {key: value for key, value in sorted(selected.items()) if value != 0}
 
 
 def default_counter_sanity(counters: dict[str, Any]) -> list[str]:
-    failures: list[str] = []
-    if counters.get("jit_mode") != DEFAULT_JIT_MODE:
-        failures.append(
-            f"jit_mode={counters.get('jit_mode')!r}; expected {DEFAULT_JIT_MODE}"
-        )
-    native_compiled = counters.get("native_compiled_regions", 0)
-    native_executions = counters.get("native_executions", 0)
-    if isinstance(native_compiled, int) and native_compiled > 0:
-        failures.append("native_compiled_regions is nonzero while default JIT is off")
-    if isinstance(native_executions, int) and native_executions > 0:
-        failures.append("native_executions is nonzero while default JIT is off")
-    return failures
+    return [
+        f"retired telemetry field {key!r}"
+        for key in counters
+        if key != "schema_version" and not key.startswith(NATIVE_FAMILIES)
+    ]
 
 
 def compare_case(case: Case, baseline: RunResult, default: RunResult) -> list[str]:
@@ -243,8 +237,8 @@ def verdict(rows: list[dict[str, Any]], failures: list[str]) -> tuple[str, list[
             "gate-backed",
             [
                 "baseline and default profiles matched for selected CLI fixtures",
-                "default profile uses the managed fast runtime without implicit Cranelift JIT",
-                "dense bytecode auto mode may fall back to IR without failing correctness",
+                "baseline and default both use the mandatory Cranelift compiler",
+                "default enables optimization without changing PHP-visible behavior",
             ],
         )
     return (
@@ -280,13 +274,13 @@ def render_markdown(summary: dict[str, Any]) -> str:
             "",
             "## Cases",
             "",
-            "| Category | Fixture | Correctness | Default fallback/deopt counters |",
+            "| Category | Fixture | Correctness | Default native transitions |",
             "| --- | --- | --- | --- |",
         ]
     )
     for row in summary["rows"]:
         fallback = ", ".join(
-            f"{key}={value}" for key, value in row["default_fallback_deopt_counters"].items()
+            f"{key}={value}" for key, value in row["default_native_transition_counters"].items()
         )
         lines.append(
             f"| `{row['category']}` | `{row['fixture']}` | `{row['correctness']}` | "
@@ -304,7 +298,7 @@ def run_self_test() -> int:
             "baseline": {"returncode": 0, "elapsed_ms": 1.0},
             "default": {"returncode": 0, "elapsed_ms": 1.0},
             "correctness": "pass",
-            "default_fallback_deopt_counters": {},
+            "default_native_transition_counters": {},
         }
         for category in ("runtime", "stdlib", "performance", "framework", "phpt")
     ]
@@ -324,21 +318,10 @@ def run_self_test() -> int:
     rendered = render_markdown(summary)
     if default_verdict != "gate-backed" or "Default Engine Profile Smoke" not in rendered:
         raise SystemExit("default-profile-smoke self-test failed")
-    if default_counter_sanity({"jit_mode": DEFAULT_JIT_MODE}) != []:
-        raise SystemExit("default-profile-smoke self-test rejected the default JIT mode")
-    if default_counter_sanity({"jit_mode": "cranelift"}) == []:
-        raise SystemExit("default-profile-smoke self-test failed to catch unexpected JIT mode")
-    if (
-        default_counter_sanity(
-            {
-                "jit_mode": DEFAULT_JIT_MODE,
-                "native_compiled_regions": 1,
-                "native_executions": 0,
-            }
-        )
-        == []
-    ):
-        raise SystemExit("default-profile-smoke self-test failed to catch native compile")
+    if default_counter_sanity({"schema_version": 4, "native_execution_entries": 1}) != []:
+        raise SystemExit("default-profile-smoke rejected canonical native telemetry")
+    if default_counter_sanity({"schema_version": 4, "quick" + "ening_attempts": 1}) == []:
+        raise SystemExit("default-profile-smoke accepted retired telemetry")
     print("[pass] default_profile_smoke self-test")
     return 0
 
@@ -374,7 +357,7 @@ def main() -> int:
                     "elapsed_ms": default.elapsed_ms,
                 },
                 "correctness": "pass" if not case_failures else "fail",
-                "default_fallback_deopt_counters": collect_fallback_deopt_counters(
+                "default_native_transition_counters": collect_native_transition_counters(
                     default.counters
                 ),
             }

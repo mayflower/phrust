@@ -16,7 +16,7 @@ use php_vm::api::{
     CompiledUnit, DeploymentRootFingerprint, DeploymentRootMode, IncludeCache, IncludeLoader,
     InlineCacheMode, Vm, VmOptions,
 };
-use php_vm::experimental::{
+use php_vm::tooling::{
     CallReferenceMask, FunctionCallCacheTarget, FunctionCallShape, InlineCacheKind,
     InlineCacheTable, InvalidationEpoch, MethodCallCacheTarget, MethodCallGuardMetadata,
     MethodCallResolvedTarget, MethodCallShape, PropertyAssignCacheTarget,

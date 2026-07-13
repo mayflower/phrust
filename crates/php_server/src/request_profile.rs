@@ -83,24 +83,24 @@ fn request_profile_json(trace: &PerfTraceEvent, counters: Option<&VmCounters>) -
     let mut native = Map::new();
     if let Some(counters) = counters {
         native.insert(
-            "compiled_regions".to_owned(),
-            Value::from(counters.native_compiled_regions),
+            "compile_successes".to_owned(),
+            Value::from(counters.native_compile_successes),
         );
         native.insert(
-            "executions".to_owned(),
-            Value::from(counters.native_executions),
+            "execution_entries".to_owned(),
+            Value::from(counters.native_execution_entries),
         );
         native.insert(
-            "side_exits".to_owned(),
-            Value::from(counters.jit_side_exits),
+            "region_side_exits".to_owned(),
+            Value::from(counters.native_region_side_exits),
         );
         native.insert(
-            "helper_calls".to_owned(),
-            Value::from(counters.jit_helper_calls),
+            "runtime_helper_calls".to_owned(),
+            Value::from(counters.runtime_helper_calls),
         );
         native.insert(
-            "code_generations".to_owned(),
-            Value::from(counters.jit_code_generations),
+            "versions_published".to_owned(),
+            Value::from(counters.native_version_published),
         );
     }
     root.insert("native".to_owned(), Value::Object(native));

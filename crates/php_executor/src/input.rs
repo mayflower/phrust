@@ -18,7 +18,7 @@ pub struct PhpExecutorOptions {
 
 impl Default for PhpExecutorOptions {
     fn default() -> Self {
-        Self::managed_fast_runtime()
+        Self::default_native_runtime()
     }
 }
 
