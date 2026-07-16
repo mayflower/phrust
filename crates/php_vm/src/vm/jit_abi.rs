@@ -21,6 +21,7 @@ mod runtime_ops;
 mod semantic_dispatch;
 mod telemetry;
 
+pub(super) use dynamic_units::jit_native_function_resolve_abi;
 use dynamic_units::*;
 use frame_arena::NativeFrameArena;
 pub(super) use frame_arena::{jit_native_frame_alloc_abi, jit_native_frame_release_abi};

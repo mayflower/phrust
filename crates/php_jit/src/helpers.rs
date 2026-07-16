@@ -6,7 +6,7 @@ pub use php_runtime::api::JitHelperId;
 
 /// Stable ABI fingerprint for the helper-symbol registry. Bumped whenever the
 /// registry's symbol set or any helper ABI changes.
-pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4820_0000_000b;
+pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4820_0000_000c;
 
 /// Helper argument kind.
 #[repr(u32)]
@@ -432,6 +432,15 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         has_side_effects: true,
         description: "direct-call declared parameter type enforcement",
     },
+    JitHelperSymbol {
+        id: JitHelperId(47),
+        name: "phrust_jit_native_function_resolve",
+        args: NATIVE_CONTEXT_POINTERS_ARGS,
+        returns: JitHelperReturnKind::Status,
+        can_throw: true,
+        has_side_effects: true,
+        description: "compile-on-demand resolver for one statically known PHP callee",
+    },
 ];
 
 /// Looks up a helper by stable id.
@@ -459,6 +468,7 @@ pub fn resolve_helper_address(
     let helper = lookup_helper_by_id(id)?;
     match helper.name {
         "phrust_jit_native_call_dispatch" => Some(runtime.native_call_dispatch),
+        "phrust_jit_native_function_resolve" => Some(runtime.native_function_resolve),
         "phrust_native_frame_alloc" => Some(runtime.native_frame_alloc),
         "phrust_native_frame_release" => Some(runtime.native_frame_release),
         "phrust_jit_native_dynamic_code" => Some(runtime.native_dynamic_code),
@@ -542,7 +552,7 @@ mod tests {
             JIT_HELPER_SYMBOLS.first().expect("first").id,
             JitHelperId(14)
         );
-        assert_eq!(JIT_HELPER_SYMBOLS.last().expect("last").id, JitHelperId(46));
+        assert_eq!(JIT_HELPER_SYMBOLS.last().expect("last").id, JitHelperId(47));
     }
 
     #[test]

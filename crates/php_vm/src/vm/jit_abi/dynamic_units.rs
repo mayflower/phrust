@@ -1,5 +1,57 @@
 use super::*;
 
+/// Compile-on-demand boundary for a statically known PHP callee.
+///
+/// The helper resolves code only; generated code performs the native call
+/// itself through the uniform packed-argument ABI. This keeps the cold
+/// single-flight compile path in Rust while removing the full call dispatcher
+/// from every warm invocation.
+// SAFETY: audited native ABI pointer boundary; `out` is a synchronous
+// caller-owned machine-word slot checked before it is written.
+#[allow(unsafe_code)]
+pub(in crate::vm) extern "C" fn jit_native_function_resolve_abi(
+    _vm_context: u64,
+    function: u64,
+    out: *mut usize,
+) -> i32 {
+    let Some(out) = std::ptr::NonNull::new(out) else {
+        return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+    };
+    let Ok(function) = u32::try_from(function) else {
+        return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+    };
+    let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_native_context(|context| {
+            let function = php_ir::FunctionId::new(function);
+            let handle = if let Some(unit) = context.current_dynamic_unit {
+                ensure_dynamic_native_entry(context, unit, function)
+            } else {
+                ensure_native_entry(context, function)
+            }?;
+            handle.native_entry_address().ok_or_else(|| {
+                format!(
+                    "native function entry {} has no executable address",
+                    function.raw()
+                )
+            })
+        })
+    }));
+    match resolved {
+        Ok(Some(Ok(address))) if address != 0 => {
+            // SAFETY: `out` was validated above and generated code retains the
+            // stack slot for the complete synchronous helper call.
+            unsafe { out.as_ptr().write(address) };
+            0
+        }
+        Ok(Some(Err(message))) => {
+            let _ = with_native_context(|context| publish_native_call_diagnostic(context, message));
+            php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
+        }
+        Ok(None) => php_jit::JitCallStatus::COMPILE_REQUIRED.0 as i32,
+        Ok(Some(Ok(_))) | Err(_) => php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
+    }
+}
+
 pub(super) fn register_native_dynamic_unit(
     context: &mut NativeExecutionContext<'_>,
     compiled: crate::compiled_unit::CompiledUnit,

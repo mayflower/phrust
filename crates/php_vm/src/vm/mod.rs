@@ -19,11 +19,11 @@ use jit_abi::{
     jit_native_constant_fetch_abi, jit_native_dynamic_code_abi, jit_native_echo_abi,
     jit_native_exception_new_abi, jit_native_execution_poll_abi, jit_native_foreach_cleanup_abi,
     jit_native_foreach_init_abi, jit_native_foreach_next_abi, jit_native_frame_alloc_abi,
-    jit_native_frame_release_abi, jit_native_local_fetch_abi, jit_native_local_store_abi,
-    jit_native_object_clone_abi, jit_native_object_clone_with_abi, jit_native_object_new_abi,
-    jit_native_property_assign_abi, jit_native_property_fetch_abi, jit_native_reference_bind_abi,
-    jit_native_return_check_abi, jit_native_runtime_fatal_abi, jit_native_truthy_abi,
-    jit_native_unary_abi, jit_native_value_lifecycle_abi,
+    jit_native_frame_release_abi, jit_native_function_resolve_abi, jit_native_local_fetch_abi,
+    jit_native_local_store_abi, jit_native_object_clone_abi, jit_native_object_clone_with_abi,
+    jit_native_object_new_abi, jit_native_property_assign_abi, jit_native_property_fetch_abi,
+    jit_native_reference_bind_abi, jit_native_return_check_abi, jit_native_runtime_fatal_abi,
+    jit_native_truthy_abi, jit_native_unary_abi, jit_native_value_lifecycle_abi,
 };
 use php_runtime::api::{OutputBuffer, Value};
 use std::sync::Arc;
@@ -1225,6 +1225,7 @@ fn cache_image(
 fn runtime_helper_addresses() -> php_jit::JitRuntimeHelperAddresses {
     php_jit::JitRuntimeHelperAddresses {
         native_call_dispatch: jit_native_call_dispatch_abi as *const () as usize,
+        native_function_resolve: jit_native_function_resolve_abi as *const () as usize,
         native_frame_alloc: jit_native_frame_alloc_abi as *const () as usize,
         native_frame_release: jit_native_frame_release_abi as *const () as usize,
         native_dynamic_code: jit_native_dynamic_code_abi as *const () as usize,
@@ -1758,7 +1759,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn same_unit_call_uses_function_on_demand_dispatch() {
+    fn same_unit_call_resolves_on_demand_then_calls_native() {
         let worker = VmWorkerState::new(crate::tiering::TieringOptions::default());
         let result = Vm::with_options_and_worker_state(
             VmOptions {
@@ -1772,8 +1773,9 @@ mod tests {
         assert_eq!(result.return_value, Some(Value::Int(42)), "{result:#?}");
         let counters = result.counters.expect("diagnostic counters");
         assert_eq!(counters.native_call_direct, 1);
-        assert_eq!(counters.native_same_unit_direct_executed, 0);
+        assert_eq!(counters.native_same_unit_direct_executed, 1);
         assert_eq!(counters.native_call_dynamic, 0);
+        assert_eq!(counters.native_transition_count, 0);
         assert_eq!(counters.native_tail_calls, 0);
         assert!(counters.native_frame_arena_high_water_bytes > 0);
         let compile_stats = worker.native_compile_cache_stats();
@@ -1794,7 +1796,7 @@ mod tests {
         assert_eq!(result.return_value, Some(Value::Int(42)), "{result:#?}");
         let counters = result.counters.expect("diagnostic counters");
         assert_eq!(counters.native_call_direct, 1);
-        assert_eq!(counters.native_same_unit_direct_executed, 0);
+        assert_eq!(counters.native_same_unit_direct_executed, 1);
         assert_eq!(counters.native_call_dynamic, 0);
     }
 
@@ -1820,7 +1822,7 @@ mod tests {
         );
         let counters = result.counters.expect("diagnostic counters");
         assert_eq!(counters.native_call_direct, 1);
-        assert_eq!(counters.native_same_unit_direct_executed, 0);
+        assert_eq!(counters.native_same_unit_direct_executed, 1);
         assert_eq!(counters.native_call_dynamic, 0);
     }
 

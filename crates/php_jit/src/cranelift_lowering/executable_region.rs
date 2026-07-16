@@ -12,6 +12,31 @@ fn region_contains(
         .any(|instruction| predicate(&instruction.kind))
 }
 
+fn ir_function_requires_trampoline(function: &php_ir::IrFunction) -> bool {
+    function.params.iter().any(|parameter| parameter.by_ref)
+        || function.returns_by_ref
+        || function.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction.kind,
+                    php_ir::InstructionKind::EnterTry { .. }
+                        | php_ir::InstructionKind::LeaveTry
+                        | php_ir::InstructionKind::Throw { .. }
+                        | php_ir::InstructionKind::MakeClosure { .. }
+                )
+            })
+        })
+        || function.attributes.iter().any(|attribute| {
+            attribute
+                .resolved_name
+                .as_deref()
+                .or(attribute.fallback_name.as_deref())
+                .unwrap_or(&attribute.name)
+                .trim_start_matches('\\')
+                .eq_ignore_ascii_case("deprecated")
+        })
+}
+
 fn declare_value_operation(
     module: &mut JITModule,
     symbol: &str,
@@ -160,6 +185,26 @@ pub(super) fn compile_region_graph_native(
                 )
             })
     });
+    let needs_function_resolver = runtime_helpers.native_function_resolve != 0
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                let RegionInstructionKind::NativeCall(call) = kind else {
+                    return false;
+                };
+                !matches!(call.result, RegionCallResult::ReferenceLocal(_))
+                    && call
+                        .args
+                        .iter()
+                        .all(|argument| argument.name.is_none() && !argument.unpack)
+                    && call.direct_compiled_target().is_some_and(|target| {
+                        !regions.contains_key(&target)
+                            && unit
+                                .functions
+                                .get(target.index())
+                                .is_some_and(|function| !ir_function_requires_trampoline(function))
+                    })
+            })
+        });
     let needs_frame_arena = runtime_helpers.native_frame_alloc != 0
         && runtime_helpers.native_frame_release != 0
         && regions.values().any(|region| {
@@ -181,6 +226,7 @@ pub(super) fn compile_region_graph_native(
         ));
     }
     let native_call_symbol = NATIVE_CALL_DISPATCH_SYMBOL.to_owned();
+    let native_function_resolve_symbol = NATIVE_FUNCTION_RESOLVE_SYMBOL.to_owned();
     let native_dynamic_code_symbol = NATIVE_DYNAMIC_CODE_SYMBOL.to_owned();
     let needs_unary = regions.values().any(|region| {
         region_contains(region, |kind| {
@@ -268,7 +314,13 @@ pub(super) fn compile_region_graph_native(
             .params
             .iter()
             .any(|parameter| parameter.type_.is_some())
-    });
+    }) || (needs_function_resolver
+        && unit.functions.iter().any(|function| {
+            function
+                .params
+                .iter()
+                .any(|parameter| parameter.type_.is_some())
+        }));
     let _has_explicit_reference_bind = regions.values().any(|region| {
         region_contains(region, |kind| {
             matches!(
@@ -441,6 +493,12 @@ pub(super) fn compile_region_graph_native(
         imports.push((
             native_call_symbol.clone(),
             runtime_helpers.native_call_dispatch,
+        ));
+    }
+    if needs_function_resolver {
+        imports.push((
+            native_function_resolve_symbol.clone(),
+            runtime_helpers.native_function_resolve,
         ));
     }
     if needs_frame_arena {
@@ -703,6 +761,19 @@ pub(super) fn compile_region_graph_native(
             };
             let mut native_operations = NativeOperationFunctions::default();
             let pointer_type = module.target_config().pointer_type();
+            if needs_function_resolver {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.returns.push(AbiParam::new(types::I32));
+                native_operations.function_resolve = Some(declare_native_helper(
+                    module,
+                    &native_function_resolve_symbol,
+                    &signature,
+                    helper_address(&native_function_resolve_symbol),
+                )?);
+            }
             if needs_frame_arena {
                 let mut alloc_signature = module.make_signature();
                 alloc_signature.params.push(AbiParam::new(types::I64));
@@ -1045,7 +1116,7 @@ pub(super) fn compile_region_graph_native(
                         (
                             function.name.clone(),
                             function.params.clone(),
-                            true,
+                            ir_function_requires_trampoline(function),
                             function.params.len(),
                         ),
                     ))
@@ -1184,8 +1255,19 @@ pub(super) fn compile_region_graph_native(
                             .filter(|instruction| {
                                 matches!(&instruction.kind, RegionInstructionKind::NativeCall(call)
                                 if call.direct_compiled_target().is_some_and(|target| {
-                                    regions.contains_key(&target)
-                                        && !trampoline_functions.contains(&target)
+                                    (regions.contains_key(&target) || needs_function_resolver)
+                                        && function_params
+                                            .get(&target)
+                                            .is_some_and(|(_, _, requires_trampoline, _)| {
+                                                !requires_trampoline
+                                            })
+                                        && !matches!(
+                                            call.result,
+                                            RegionCallResult::ReferenceLocal(_)
+                                        )
+                                        && call.args.iter().all(|argument| {
+                                            argument.name.is_none() && !argument.unpack
+                                        })
                                         && !(call.operands.is_empty()
                                             && inline_constants.contains_key(&target))
                                 }))
@@ -1199,8 +1281,19 @@ pub(super) fn compile_region_graph_native(
                                 matches!(&instruction.kind, RegionInstructionKind::NativeCall(call)
                                 if call.argument_operand_offset == 1
                                     && call.direct_compiled_target().is_some_and(|target| {
-                                        regions.contains_key(&target)
-                                            && !trampoline_functions.contains(&target)
+                                        (regions.contains_key(&target) || needs_function_resolver)
+                                            && function_params
+                                                .get(&target)
+                                                .is_some_and(|(_, _, requires_trampoline, _)| {
+                                                    !requires_trampoline
+                                                })
+                                            && !matches!(
+                                                call.result,
+                                                RegionCallResult::ReferenceLocal(_)
+                                            )
+                                            && call.args.iter().all(|argument| {
+                                                argument.name.is_none() && !argument.unpack
+                                            })
                                     }))
                             })
                             .count() as u64,

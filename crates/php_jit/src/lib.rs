@@ -108,6 +108,8 @@ impl CraneliftCompilerIdentity {
 pub struct JitRuntimeHelperAddresses {
     /// Typed dynamic-call resolver/invoker; never an interpreter dispatcher.
     pub native_call_dispatch: usize,
+    /// Resolves or compiles one statically known PHP callee without invoking it.
+    pub native_function_resolve: usize,
     /// Allocates bounded request-local native call-frame storage.
     pub native_frame_alloc: usize,
     /// Releases the most recent request-local call-frame allocation.
@@ -853,7 +855,11 @@ impl JitFunctionHandle {
             .map(SharedJitCodeHandle::generation_id)
     }
 
-    pub(crate) fn native_entry_address(&self) -> Option<usize> {
+    /// Returns the generation-owned executable entry for native-to-native
+    /// indirection. Callers must retain this handle (or its published cell)
+    /// for the complete invocation lifetime.
+    #[must_use]
+    pub fn native_entry_address(&self) -> Option<usize> {
         self.native_entry.map(|entry| entry.address)
     }
 

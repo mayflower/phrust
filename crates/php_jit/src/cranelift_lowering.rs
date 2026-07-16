@@ -68,8 +68,15 @@ struct NativeHelper {
     function: FuncId,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum NativeDirectCallee {
+    Local(FuncId),
+    Resolved(FunctionId),
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct NativeOperationFunctions {
+    function_resolve: Option<NativeHelper>,
     frame_alloc: Option<NativeHelper>,
     frame_release: Option<NativeHelper>,
     unary: Option<NativeHelper>,
@@ -199,6 +206,7 @@ fn native_helper_import_symbol(base: &str, address: usize) -> String {
 }
 
 const NATIVE_CALL_DISPATCH_SYMBOL: &str = "phrust_jit_native_call_dispatch";
+const NATIVE_FUNCTION_RESOLVE_SYMBOL: &str = "phrust_jit_native_function_resolve";
 const NATIVE_DYNAMIC_CODE_SYMBOL: &str = "phrust_jit_native_dynamic_code";
 
 /// Mandatory Cranelift native compiler.
@@ -368,6 +376,7 @@ fn runtime_helper_abi_hash(helpers: crate::JitRuntimeHelperAddresses) -> u64 {
         ^ php_runtime::api::NATIVE_OPERATION_ABI_HASH;
     for address in [
         helpers.native_call_dispatch,
+        helpers.native_function_resolve,
         helpers.native_dynamic_code,
         helpers.native_unary,
         helpers.native_binary,
@@ -2152,7 +2161,17 @@ fn lower_region_instruction(
                 return Ok(());
             }
             let direct = direct_target
-                .and_then(|target| functions.get(&target).copied())
+                .and_then(|target| {
+                    functions
+                        .get(&target)
+                        .copied()
+                        .map(NativeDirectCallee::Local)
+                        .or_else(|| {
+                            native_operations
+                                .function_resolve
+                                .map(|_| NativeDirectCallee::Resolved(target))
+                        })
+                })
                 .map(|callee| (call.result, callee));
             let Some((destination, callee)) = direct else {
                 lower_native_call_trampoline(
@@ -2363,13 +2382,50 @@ fn lower_region_instruction(
                 builder.ins().iconst(types::I32, -1),
                 builder.ins().iconst(pointer_type, 0),
             ];
-            let callee_ref = module.declare_func_in_func(callee, builder.func);
             let expected_return_status = if call.returns_by_reference {
                 crate::JitCallStatus::RETURN_REFERENCE.0
             } else {
                 crate::JitCallStatus::RETURN.0
             };
-            let call = builder.ins().call(callee_ref, &callee_call_args);
+            let call = match callee {
+                NativeDirectCallee::Local(callee) => {
+                    let callee_ref = module.declare_func_in_func(callee, builder.func);
+                    builder.ins().call(callee_ref, &callee_call_args)
+                }
+                NativeDirectCallee::Resolved(target) => {
+                    let helper = native_operations.function_resolve.ok_or_else(|| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_NATIVE_FUNCTION_RESOLVER",
+                            "statically known callee has no compile-on-demand resolver",
+                        )
+                    })?;
+                    let address_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        u32::from(pointer_type.bytes()),
+                        3,
+                    ));
+                    let address_out = builder.ins().stack_addr(pointer_type, address_slot, 0);
+                    let vm_context = builder.ins().iconst(types::I64, 0);
+                    let function_id = builder.ins().iconst(types::I64, i64::from(target.raw()));
+                    let resolve = call_native_helper(
+                        module,
+                        builder,
+                        helper,
+                        &[vm_context, function_id, address_out],
+                    );
+                    require_native_operation_ok(
+                        builder,
+                        builder.inst_results(resolve)[0],
+                        result_out,
+                    )?;
+                    let address = builder.ins().stack_load(pointer_type, address_slot, 0);
+                    let signature = builder.func.signature.clone();
+                    let signature = builder.import_signature(signature);
+                    builder
+                        .ins()
+                        .call_indirect(signature, address, &callee_call_args)
+                }
+            };
             let status = builder.inst_results(call)[0];
             release_native_frame_storage(
                 module,
