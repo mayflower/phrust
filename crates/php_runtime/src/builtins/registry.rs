@@ -2,6 +2,7 @@
 
 use super::signatures::InternalFunction;
 use super::{generated, modules};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// Registered builtin entry.
@@ -123,6 +124,23 @@ impl BuiltinRegistry {
             .map(|index| entries[index])
     }
 
+    /// Looks up the stable helper identity persisted by native call metadata.
+    #[must_use]
+    pub fn get_by_helper_id(self, helper_id: u32) -> Option<BuiltinEntry> {
+        let entries = entries();
+        let index = HELPER_INDEX
+            .get_or_init(|| {
+                entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| (entry.helper_id, index))
+                    .collect()
+            })
+            .get(&helper_id)
+            .copied()?;
+        entries.get(index).copied()
+    }
+
     /// Returns true when a normalized name is registered.
     #[must_use]
     pub fn contains(self, name: &str) -> bool {
@@ -186,6 +204,7 @@ const MODULE_SLICES: &[(&str, &[BuiltinEntry])] = &[
 ];
 
 static BUILTINS: OnceLock<Vec<BuiltinEntry>> = OnceLock::new();
+static HELPER_INDEX: OnceLock<HashMap<u32, usize>> = OnceLock::new();
 
 fn entries() -> &'static [BuiltinEntry] {
     BUILTINS
@@ -292,6 +311,12 @@ mod tests {
         assert_eq!(session.handler_kind(), BuiltinHandlerKind::Session);
         assert_eq!(strlen.handler_kind(), BuiltinHandlerKind::Generic);
         assert_ne!(json.helper_id(), 0);
+        assert_eq!(
+            BuiltinRegistry::new()
+                .get_by_helper_id(json.helper_id())
+                .map(|entry| entry.name()),
+            Some("json_encode")
+        );
         assert_eq!(
             json.helper_id(),
             BuiltinRegistry::new()

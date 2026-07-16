@@ -62,7 +62,7 @@ The following remain explicit deferred work:
 | Native execution instrumentation | `php_vm::experimental` | Native counters, compile/cache statistics, transition metadata, and diagnostics. |
 | Known gaps | `docs/known_gaps/*.jsonl`, `scripts/known_gaps/validate.py` | One machine-readable validation path for runtime, performance, and PHPT accepted non-green gaps. |
 | Server cache | `php_executor::CompiledScriptCache` | Process-local compiled entry-script cache for HTTP requests only. |
-| Persistent native cache | `php_jit`, `php_vm`, `php_vm_cli` | Validated restart-persistent PNA1 code with symbolic helper relocation and W^X publication. |
+| Persistent native cache | `php_jit`, `php_vm`, `php_vm_cli` | Validated restart-persistent PNA2 unit bundles with symbolic helper relocation and W^X publication. |
 
 ## Remaining Duplicate Hot Spots
 

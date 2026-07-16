@@ -1,7 +1,23 @@
 use crate::persistent_metadata::PersistentMetadataStats;
 use hyper::StatusCode;
 use php_executor::IncludeCacheStats;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicU64 as RawAtomicU64, Ordering};
+
+/// Cache-line-isolated hot metric. Independent workers update different
+/// counters concurrently; keeping each counter on its own line prevents a
+/// request on one core from invalidating an unrelated counter's line.
+#[derive(Debug, Default)]
+#[repr(align(64))]
+pub(crate) struct AtomicU64(RawAtomicU64);
+
+impl Deref for AtomicU64 {
+    type Target = RawAtomicU64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct ServerMetrics {

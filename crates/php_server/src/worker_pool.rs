@@ -19,16 +19,30 @@ use std::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::warn;
 
-/// Worker stack size for native PHP frames and runtime helpers. Pinned workers
-/// use the same generous stack as the tokio workers, overridable through the
-/// same environment variable.
+const DEFAULT_PHP_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+const _: () = assert!(DEFAULT_PHP_WORKER_STACK_BYTES <= 16 * 1024 * 1024);
+
+/// Worker stack size for native spills and runtime helpers. PHP call depth is
+/// bounded independently by the VM, so pinned workers do not reserve the
+/// historical 128 MiB Tokio stack. The old variable remains a compatibility
+/// fallback for deployments that configured both pools together.
 fn php_worker_stack_bytes() -> usize {
-    const DEFAULT_PHP_WORKER_STACK_BYTES: usize = 128 * 1024 * 1024;
-    std::env::var("PHRUST_SERVER_TOKIO_WORKER_STACK_BYTES")
+    std::env::var("PHRUST_SERVER_PHP_WORKER_STACK_BYTES")
+        .or_else(|_| std::env::var("PHRUST_SERVER_TOKIO_WORKER_STACK_BYTES"))
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_PHP_WORKER_STACK_BYTES)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_PHP_WORKER_STACK_BYTES;
+
+    #[test]
+    fn default_php_worker_stack_is_bounded() {
+        assert!(std::hint::black_box(DEFAULT_PHP_WORKER_STACK_BYTES) <= 16 * 1024 * 1024);
+    }
 }
 
 /// One queued request job: a boxed closure running the synchronous request

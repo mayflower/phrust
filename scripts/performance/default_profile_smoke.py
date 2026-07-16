@@ -66,6 +66,40 @@ NATIVE_FAMILIES = (
     "runtime_helper",
     "gc_safepoint",
 )
+LINKAGE_FOOTPRINT_FIELDS = frozenset(
+    {
+        "native_artifact_header_padding_bytes",
+        "native_builtin_direct_eligible",
+        "native_builtin_direct_executed",
+        "native_code_bytes_by_function",
+        "native_code_bytes_by_unit",
+        "native_cross_unit_direct_eligible",
+        "native_cross_unit_direct_executed",
+        "native_duplicate_function_body_count",
+        "native_frame_arena_capacity_bytes",
+        "native_frame_arena_high_water_bytes",
+        "native_function_body_compile_count",
+        "native_inline_bytes_added",
+        "native_inline_calls_removed",
+        "native_inline_rejected_by_reason",
+        "native_inlined_calls",
+        "native_loaded_artifact_maps",
+        "native_loaded_artifact_registry_hits",
+        "native_loaded_entry_table_constructions",
+        "native_mapped_executable_bytes",
+        "native_metadata_bytes",
+        "native_method_monomorphic_eligible",
+        "native_method_monomorphic_executed",
+        "native_relocation_bytes",
+        "native_rodata_bytes",
+        "native_same_unit_direct_eligible",
+        "native_same_unit_direct_executed",
+        "native_stack_bytes_by_function",
+        "native_tail_calls",
+        "native_worker_stack_committed_bytes",
+        "native_worker_stack_virtual_bytes",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -214,7 +248,9 @@ def default_counter_sanity(counters: dict[str, Any]) -> list[str]:
     return [
         f"retired telemetry field {key!r}"
         for key in counters
-        if key != "schema_version" and not key.startswith(NATIVE_FAMILIES)
+        if key != "schema_version"
+        and not key.startswith(NATIVE_FAMILIES)
+        and key not in LINKAGE_FOOTPRINT_FIELDS
     ]
 
 
@@ -325,9 +361,9 @@ def run_self_test() -> int:
     rendered = render_markdown(summary)
     if default_verdict != "gate-backed" or "Default Engine Profile Smoke" not in rendered:
         raise SystemExit("default-profile-smoke self-test failed")
-    if default_counter_sanity({"schema_version": 4, "native_execution_entries": 1}) != []:
+    if default_counter_sanity({"schema_version": 11, "native_execution_entries": 1}) != []:
         raise SystemExit("default-profile-smoke rejected canonical native telemetry")
-    if default_counter_sanity({"schema_version": 4, "quick" + "ening_attempts": 1}) == []:
+    if default_counter_sanity({"schema_version": 11, "quick" + "ening_attempts": 1}) == []:
         raise SystemExit("default-profile-smoke accepted retired telemetry")
     print("[pass] default_profile_smoke self-test")
     return 0

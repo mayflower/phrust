@@ -11,6 +11,7 @@ mod call_support;
 mod diagnostics;
 mod dynamic_code;
 mod dynamic_units;
+mod frame_arena;
 mod internal_classes;
 mod native_builtins;
 mod object_support;
@@ -21,6 +22,8 @@ mod semantic_dispatch;
 mod telemetry;
 
 use dynamic_units::*;
+use frame_arena::NativeFrameArena;
+pub(super) use frame_arena::{jit_native_frame_alloc_abi, jit_native_frame_release_abi};
 
 pub(super) use call_dispatch::jit_native_call_dispatch_abi;
 use call_support::*;
@@ -39,16 +42,16 @@ use request_state::{
 };
 use root_index::{RequestRootIndex, RootMutationReason, collect_root_membership};
 pub(super) use runtime_ops::{
-    jit_native_array_fetch_abi, jit_native_array_insert_abi, jit_native_array_new_abi,
-    jit_native_array_spread_abi, jit_native_array_unset_abi, jit_native_binary_abi,
-    jit_native_cast_abi, jit_native_compare_abi, jit_native_constant_fetch_abi,
-    jit_native_echo_abi, jit_native_exception_new_abi, jit_native_execution_poll_abi,
-    jit_native_foreach_cleanup_abi, jit_native_foreach_init_abi, jit_native_foreach_next_abi,
-    jit_native_local_fetch_abi, jit_native_local_store_abi, jit_native_object_clone_abi,
-    jit_native_object_clone_with_abi, jit_native_object_new_abi, jit_native_property_assign_abi,
-    jit_native_property_fetch_abi, jit_native_reference_bind_abi, jit_native_return_check_abi,
-    jit_native_runtime_fatal_abi, jit_native_truthy_abi, jit_native_unary_abi,
-    jit_native_value_lifecycle_abi,
+    jit_native_argument_check_abi, jit_native_array_fetch_abi, jit_native_array_insert_abi,
+    jit_native_array_new_abi, jit_native_array_spread_abi, jit_native_array_unset_abi,
+    jit_native_binary_abi, jit_native_cast_abi, jit_native_compare_abi,
+    jit_native_constant_fetch_abi, jit_native_echo_abi, jit_native_exception_new_abi,
+    jit_native_execution_poll_abi, jit_native_foreach_cleanup_abi, jit_native_foreach_init_abi,
+    jit_native_foreach_next_abi, jit_native_local_fetch_abi, jit_native_local_store_abi,
+    jit_native_object_clone_abi, jit_native_object_clone_with_abi, jit_native_object_new_abi,
+    jit_native_property_assign_abi, jit_native_property_fetch_abi, jit_native_reference_bind_abi,
+    jit_native_return_check_abi, jit_native_runtime_fatal_abi, jit_native_truthy_abi,
+    jit_native_unary_abi, jit_native_value_lifecycle_abi,
 };
 use semantic_dispatch::*;
 use telemetry::NativeRuntimeTelemetry;
@@ -107,8 +110,8 @@ fn enter_native_call(name: &str) -> Result<NativeCallDepthGuard, String> {
 #[derive(Default)]
 struct NativeIncludeExports {
     functions: Vec<(String, php_ir::FunctionId)>,
-    native_entries: std::collections::BTreeMap<php_ir::FunctionId, php_jit::JitFunctionHandle>,
-    native_entry_signature_hashes: std::collections::BTreeMap<php_ir::FunctionId, u64>,
+    native_entries:
+        std::sync::Arc<std::collections::BTreeMap<php_ir::FunctionId, php_jit::JitFunctionHandle>>,
     classes: Vec<String>,
     constants: std::collections::BTreeMap<String, Value>,
     autoload_callbacks: Vec<Value>,
@@ -149,22 +152,78 @@ struct NativeDynamicFunction {
     function: php_ir::FunctionId,
 }
 
+#[derive(Clone, Copy)]
+enum NativeMethodPicTarget {
+    CurrentUnit {
+        function: php_ir::FunctionId,
+        is_static: bool,
+    },
+    DynamicUnit {
+        function: NativeDynamicFunction,
+        is_static: bool,
+    },
+}
+
+struct NativeMethodPicEntry {
+    receiver_class: std::sync::Arc<str>,
+    method: std::sync::Arc<str>,
+    class_layout_epoch: u64,
+    method_table_epoch: u64,
+    target: NativeMethodPicTarget,
+}
+
+#[derive(Default)]
+struct NativeMethodPic {
+    entries: Vec<NativeMethodPicEntry>,
+    megamorphic: bool,
+}
+
+const NATIVE_METHOD_PIC_LIMIT: usize = 4;
+
 #[derive(Clone)]
 struct NativeDynamicUnit {
     compiled: crate::compiled_unit::CompiledUnit,
-    native_entries: std::collections::BTreeMap<php_ir::FunctionId, php_jit::JitFunctionHandle>,
-    native_entry_signature_hashes: std::collections::BTreeMap<php_ir::FunctionId, u64>,
+    native_entries:
+        std::sync::Arc<std::collections::BTreeMap<php_ir::FunctionId, php_jit::JitFunctionHandle>>,
     exported_classes: std::collections::BTreeSet<String>,
 }
 
+#[derive(Clone, Copy)]
+struct ActiveNativeUnit(*const php_ir::IrUnit);
+
+impl ActiveNativeUnit {
+    fn new(compiled: &crate::compiled_unit::CompiledUnit) -> Self {
+        Self(compiled.unit() as *const php_ir::IrUnit)
+    }
+}
+
+// SAFETY: The pointed-to IR is owned by `NativeExecutionContext::compiled` or
+// by one of its `dynamic_units`. Scoped unit switches retain the prior and new
+// `CompiledUnit` handles until after this pointer is restored.
+#[allow(unsafe_code)]
+impl std::ops::Deref for ActiveNativeUnit {
+    type Target = php_ir::IrUnit;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: Established by `ActiveNativeUnit::new` and the context
+        // ownership invariant documented on this implementation.
+        unsafe { &*self.0 }
+    }
+}
+
 pub(super) struct NativeExecutionContext<'a> {
-    compiled: &'a crate::compiled_unit::CompiledUnit,
-    unit: &'a php_ir::IrUnit,
+    compiled: crate::compiled_unit::CompiledUnit,
+    unit: ActiveNativeUnit,
     unit_identity: u64,
     options: &'a super::VmOptions,
     worker_state: &'a super::VmWorkerState,
-    native_entries: std::collections::BTreeMap<php_ir::FunctionId, php_jit::JitFunctionHandle>,
+    native_entries:
+        std::sync::Arc<std::collections::BTreeMap<php_ir::FunctionId, php_jit::JitFunctionHandle>>,
     call_arguments: Vec<Vec<Value>>,
+    native_call_encoded_scratch: Vec<i64>,
+    native_call_local_scratch: Vec<i64>,
+    native_frame_arena: NativeFrameArena,
+    native_method_pics: std::collections::BTreeMap<u64, NativeMethodPic>,
     pub(super) output: php_runtime::api::OutputBuffer,
     values: Vec<Option<NativeStoredValue>>,
     value_refcounts: Vec<u32>,
@@ -219,7 +278,13 @@ pub(super) struct NativeExecutionContext<'a> {
     cwd: std::path::PathBuf,
     inherited_globals: std::collections::BTreeMap<String, Value>,
     continuation_instructions:
-        std::sync::Arc<std::collections::BTreeMap<(u32, u32), php_ir::Instruction>>,
+        std::sync::Arc<std::collections::BTreeMap<(u32, u32), std::sync::Arc<php_ir::Instruction>>>,
+    native_callsites: std::sync::Arc<
+        std::collections::BTreeMap<
+            (u32, u32),
+            std::sync::Arc<crate::compiled_unit::NativeCallSiteDescriptor>,
+        >,
+    >,
     include_child: bool,
     execution_deadline_at: Option<std::time::Instant>,
     execution_deadline_mutable: bool,
@@ -290,7 +355,9 @@ impl<'a> NativeExecutionContext<'a> {
         options: &'a super::VmOptions,
         worker_state: &'a super::VmWorkerState,
         output: php_runtime::api::OutputBuffer,
-        native_entries: std::collections::BTreeMap<php_ir::FunctionId, php_jit::JitFunctionHandle>,
+        native_entries: std::sync::Arc<
+            std::collections::BTreeMap<php_ir::FunctionId, php_jit::JitFunctionHandle>,
+        >,
     ) -> Self {
         let unit = compiled.unit();
         let inherited_globals = NATIVE_INCLUDE_GLOBALS.with(|globals| globals.borrow_mut().take());
@@ -368,14 +435,31 @@ impl<'a> NativeExecutionContext<'a> {
             .entry("STDERR".to_owned())
             .or_insert(Value::Resource(stderr));
         let continuation_instructions = compiled.prepared_continuation_instructions();
+        let native_callsites = compiled.prepared_native_callsites();
+        let native_call_argument_capacity = unit
+            .functions
+            .iter()
+            .map(|function| function.params.len() + function.captures.len() + 1)
+            .max()
+            .unwrap_or(0);
+        let native_call_local_capacity = unit
+            .functions
+            .iter()
+            .map(|function| function.locals.len())
+            .max()
+            .unwrap_or(0);
         Self {
-            compiled,
-            unit,
+            compiled: compiled.clone(),
+            unit: ActiveNativeUnit::new(compiled),
             unit_identity,
             options,
             worker_state,
             native_entries,
             call_arguments: Vec::new(),
+            native_call_encoded_scratch: Vec::with_capacity(native_call_argument_capacity),
+            native_call_local_scratch: Vec::with_capacity(native_call_local_capacity),
+            native_frame_arena: NativeFrameArena::default(),
+            native_method_pics: std::collections::BTreeMap::new(),
             output,
             values: Vec::new(),
             value_refcounts: Vec::new(),
@@ -432,6 +516,7 @@ impl<'a> NativeExecutionContext<'a> {
             cwd: options.runtime_context.cwd.clone(),
             inherited_globals,
             continuation_instructions,
+            native_callsites,
             include_child,
             execution_deadline_at: options
                 .runtime_context
@@ -469,21 +554,8 @@ impl<'a> NativeExecutionContext<'a> {
             .filter(|class| class.span.start != 0 || class.span.end != 0)
             .map(|class| class.name.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        let native_entry_signature_hashes = self
-            .native_entries
-            .keys()
-            .copied()
-            .map(|function| {
-                let signatures = visible_external_function_signatures(self, &compiled, function);
-                (
-                    function,
-                    super::external_function_signatures_hash(&signatures),
-                )
-            })
-            .collect();
         self.dynamic_units.push(NativeDynamicUnit {
             compiled: compiled.clone(),
-            native_entry_signature_hashes,
             native_entries: self.native_entries.clone(),
             exported_classes: exported_classes.clone(),
         });
@@ -774,6 +846,59 @@ impl<'a> NativeExecutionContext<'a> {
         self.external_functions
             .get(&name.to_ascii_lowercase())
             .copied()
+    }
+
+    fn can_invoke_external_in_place(&self, target: NativeDynamicFunction) -> bool {
+        self.dynamic_units.get(target.unit).is_some_and(|package| {
+            package
+                .compiled
+                .unit()
+                .functions
+                .get(target.function.index())
+                .is_some()
+        })
+    }
+
+    fn with_active_dynamic_unit<R>(
+        &mut self,
+        unit: usize,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, String> {
+        let package = self
+            .dynamic_units
+            .get(unit)
+            .cloned()
+            .ok_or_else(|| "dynamic native unit is missing".to_owned())?;
+        let compiled = package.compiled.clone();
+        let previous_compiled = std::mem::replace(&mut self.compiled, compiled.clone());
+        let previous_unit = std::mem::replace(&mut self.unit, ActiveNativeUnit::new(&compiled));
+        let previous_identity =
+            std::mem::replace(&mut self.unit_identity, compiled.cache_identity());
+        let previous_entries =
+            std::mem::replace(&mut self.native_entries, package.native_entries.clone());
+        let previous_continuations = std::mem::replace(
+            &mut self.continuation_instructions,
+            compiled.prepared_continuation_instructions(),
+        );
+        let previous_callsites = std::mem::replace(
+            &mut self.native_callsites,
+            compiled.prepared_native_callsites(),
+        );
+        let previous_dynamic_unit = self.current_dynamic_unit.replace(unit);
+
+        let result = operation(self);
+
+        if let Some(package) = self.dynamic_units.get_mut(unit) {
+            package.native_entries = self.native_entries.clone();
+        }
+        self.current_dynamic_unit = previous_dynamic_unit;
+        self.native_callsites = previous_callsites;
+        self.continuation_instructions = previous_continuations;
+        self.native_entries = previous_entries;
+        self.unit_identity = previous_identity;
+        self.unit = previous_unit;
+        self.compiled = previous_compiled;
+        Ok(result)
     }
 
     fn array_mut(&mut self, encoded: i64) -> Result<&mut php_runtime::api::PhpArray, String> {
@@ -1251,7 +1376,7 @@ impl<'a> NativeExecutionContext<'a> {
             .continuation_instructions
             .get(&(function, continuation))
         {
-            return Some(instruction);
+            return Some(instruction.as_ref());
         }
         let function = self.unit.functions.get(function as usize)?;
         let mut current = 0_u32;
@@ -1267,20 +1392,107 @@ impl<'a> NativeExecutionContext<'a> {
         None
     }
 
-    fn instruction_for_source(
+    fn prepared_native_callsite(
         &self,
         function: u32,
-        block: u32,
-        instruction: u32,
-    ) -> Option<&php_ir::Instruction> {
-        self.unit
-            .functions
-            .get(function as usize)?
-            .blocks
-            .get(block as usize)?
-            .instructions
+        continuation: u32,
+    ) -> Option<std::sync::Arc<crate::compiled_unit::NativeCallSiteDescriptor>> {
+        self.native_callsites
+            .get(&(function, continuation))
+            .cloned()
+    }
+
+    fn native_method_epochs(&self) -> (u64, u64) {
+        let dynamic_epoch = self.dynamic_units.len() as u64;
+        (
+            self.unit_identity ^ dynamic_epoch.rotate_left(17),
+            self.unit_identity.rotate_left(29) ^ dynamic_epoch,
+        )
+    }
+
+    fn lookup_native_method_pic(
+        &self,
+        descriptor: &crate::compiled_unit::NativeCallSiteDescriptor,
+        receiver_class: &str,
+        method: &str,
+    ) -> Option<NativeMethodPicTarget> {
+        let (class_layout_epoch, method_table_epoch) = self.native_method_epochs();
+        if let Some((function, is_static)) = descriptor.lookup_method_pic(
+            receiver_class,
+            method,
+            class_layout_epoch,
+            method_table_epoch,
+        ) {
+            return Some(NativeMethodPicTarget::CurrentUnit {
+                function,
+                is_static,
+            });
+        }
+        let pic = self.native_method_pics.get(&descriptor.pic_slot)?;
+        if pic.megamorphic {
+            return None;
+        }
+        pic.entries
             .iter()
-            .find(|candidate| candidate.id.raw() == instruction)
+            .find(|entry| {
+                entry.receiver_class.eq_ignore_ascii_case(receiver_class)
+                    && entry.method.eq_ignore_ascii_case(method)
+                    && entry.class_layout_epoch == class_layout_epoch
+                    && entry.method_table_epoch == method_table_epoch
+            })
+            .map(|entry| entry.target)
+    }
+
+    fn install_native_method_pic(
+        &mut self,
+        descriptor: &crate::compiled_unit::NativeCallSiteDescriptor,
+        receiver_class: &str,
+        method: &str,
+        target: NativeMethodPicTarget,
+    ) -> bool {
+        let (class_layout_epoch, method_table_epoch) = self.native_method_epochs();
+        if let NativeMethodPicTarget::CurrentUnit {
+            function,
+            is_static,
+        } = target
+        {
+            return descriptor.install_method_pic(
+                receiver_class,
+                method,
+                class_layout_epoch,
+                method_table_epoch,
+                function,
+                is_static,
+            );
+        }
+        let pic = self
+            .native_method_pics
+            .entry(descriptor.pic_slot)
+            .or_default();
+        if pic.megamorphic {
+            return false;
+        }
+        if pic.entries.iter().any(|entry| {
+            entry.receiver_class.eq_ignore_ascii_case(receiver_class)
+                && entry.method.eq_ignore_ascii_case(method)
+                && entry.class_layout_epoch == class_layout_epoch
+                && entry.method_table_epoch == method_table_epoch
+        }) {
+            return true;
+        }
+        if pic.entries.len() >= NATIVE_METHOD_PIC_LIMIT {
+            pic.entries.clear();
+            pic.megamorphic = true;
+            return false;
+        }
+        pic.entries.push(NativeMethodPicEntry {
+            receiver_class: std::sync::Arc::from(receiver_class),
+            method: std::sync::Arc::from(method),
+            class_layout_epoch,
+            method_table_epoch,
+            target,
+        });
+        true
     }
 
     fn lookup_constant(&self, name: &str) -> Result<Value, String> {
@@ -1516,19 +1728,6 @@ impl<'a> NativeExecutionContext<'a> {
             let shutdown_callbacks = self
                 .shutdown_callbacks
                 .split_off(self.inherited_shutdown_callback_count);
-            let native_entry_signature_hashes = self
-                .native_entries
-                .keys()
-                .copied()
-                .map(|function| {
-                    let signatures =
-                        visible_external_function_signatures(self, self.compiled, function);
-                    (
-                        function,
-                        super::external_function_signatures_hash(&signatures),
-                    )
-                })
-                .collect();
             let mut symbols = self.take_include_symbols();
             for class in &classes {
                 symbols.dynamic_classes.remove(&normalize_class_name(class));
@@ -1539,7 +1738,6 @@ impl<'a> NativeExecutionContext<'a> {
             NATIVE_INCLUDE_EXPORTS.with(|exports| {
                 exports.replace(Some(NativeIncludeExports {
                     functions,
-                    native_entry_signature_hashes,
                     native_entries: std::mem::take(&mut self.native_entries),
                     classes,
                     constants,
@@ -1939,7 +2137,7 @@ fn native_runtime_class_with_owner(
 
     let owner_ir_unit = |owner: Option<usize>| -> Option<&php_ir::IrUnit> {
         match owner {
-            None => Some(context.unit),
+            None => Some(&*context.unit),
             Some(unit) => context
                 .dynamic_units
                 .get(unit)
@@ -3005,112 +3203,6 @@ fn native_backtrace_frame(
     }
 }
 
-fn seed_native_child_state(
-    context: &mut NativeExecutionContext<'_>,
-    child: &mut NativeExecutionContext<'_>,
-) {
-    child.runtime_telemetry = context.runtime_telemetry.clone();
-    child.visible_function_names = NativeFunctionNameScope::child(
-        context.visible_function_names.clone(),
-        child
-            .unit
-            .function_table
-            .iter()
-            .map(|entry| entry.name.to_ascii_lowercase()),
-    );
-    child.builtin_request_state = std::mem::replace(
-        &mut context.builtin_request_state,
-        php_runtime::api::BuiltinRequestState::new(),
-    );
-    child.registered_extensions = std::mem::take(&mut context.registered_extensions);
-    child.http_response = std::mem::take(&mut context.http_response);
-    child.upload_registry = std::mem::take(&mut context.upload_registry);
-    child.session = std::mem::take(&mut context.session);
-    child.session_global = context.session_global.clone();
-    child
-        .filter_input_arrays
-        .clone_from(&context.filter_input_arrays);
-    child.dynamic_units = std::mem::take(&mut context.dynamic_units);
-    child.external_functions = std::mem::take(&mut context.external_functions);
-    child.dynamic_classes = std::mem::take(&mut context.dynamic_classes);
-    child.dynamic_constants = std::mem::take(&mut context.dynamic_constants);
-    child.static_properties = std::mem::take(&mut context.static_properties);
-    child.static_locals = std::mem::take(&mut context.static_locals);
-    child.enum_cases = std::mem::take(&mut context.enum_cases);
-    child.class_aliases = std::mem::take(&mut context.class_aliases);
-    child.autoload_in_progress = std::mem::take(&mut context.autoload_in_progress);
-    child.autoload_callbacks = std::mem::take(&mut context.autoload_callbacks)
-        .into_iter()
-        .map(|callback| native_value_with_owner_unit(callback, context.current_dynamic_unit))
-        .collect();
-    child.shutdown_callbacks = std::mem::take(&mut context.shutdown_callbacks)
-        .into_iter()
-        .map(|mut callback| {
-            callback.callable =
-                native_value_with_owner_unit(callback.callable, context.current_dynamic_unit);
-            callback
-        })
-        .collect();
-    child.destroyed_objects = std::mem::take(&mut context.destroyed_objects);
-    child.included_files = std::mem::take(&mut context.included_files);
-    child.include_path = std::mem::take(&mut context.include_path);
-    child.cwd = std::mem::take(&mut context.cwd);
-    child.inherited_globals = std::mem::take(&mut context.inherited_globals);
-    child.error_reporting = context.error_reporting;
-    child.last_error = context.last_error.take();
-    child.error_handlers = std::mem::take(&mut context.error_handlers);
-    child.exception_handlers = std::mem::take(&mut context.exception_handlers);
-    child.environment = std::mem::take(&mut context.environment);
-    child.ini_registry = std::mem::take(&mut context.ini_registry);
-    child.mysql_state.clone_from(&context.mysql_state);
-    child.lexical_scope_classes = std::mem::take(&mut context.lexical_scope_classes);
-    child.call_frames = std::mem::take(&mut context.call_frames);
-}
-
-fn merge_native_child_state(
-    context: &mut NativeExecutionContext<'_>,
-    child: &mut NativeExecutionContext<'_>,
-) {
-    context.visible_function_names = child.visible_function_names.clone();
-    context.builtin_request_state = std::mem::replace(
-        &mut child.builtin_request_state,
-        php_runtime::api::BuiltinRequestState::new(),
-    );
-    context.registered_extensions = std::mem::take(&mut child.registered_extensions);
-    context.http_response = std::mem::take(&mut child.http_response);
-    context.upload_registry = std::mem::take(&mut child.upload_registry);
-    context.session = std::mem::take(&mut child.session);
-    context.session_global = child.session_global.clone();
-    context
-        .filter_input_arrays
-        .clone_from(&child.filter_input_arrays);
-    context.dynamic_units = std::mem::take(&mut child.dynamic_units);
-    context.external_functions = std::mem::take(&mut child.external_functions);
-    context.dynamic_classes = std::mem::take(&mut child.dynamic_classes);
-    context.dynamic_constants = std::mem::take(&mut child.dynamic_constants);
-    context.static_properties = std::mem::take(&mut child.static_properties);
-    context.static_locals = std::mem::take(&mut child.static_locals);
-    context.enum_cases = std::mem::take(&mut child.enum_cases);
-    context.class_aliases = std::mem::take(&mut child.class_aliases);
-    context.autoload_in_progress = std::mem::take(&mut child.autoload_in_progress);
-    context.autoload_callbacks = std::mem::take(&mut child.autoload_callbacks);
-    context.shutdown_callbacks = std::mem::take(&mut child.shutdown_callbacks);
-    context.destroyed_objects = std::mem::take(&mut child.destroyed_objects);
-    context.included_files = std::mem::take(&mut child.included_files);
-    context.include_path = std::mem::take(&mut child.include_path);
-    context.cwd = std::mem::take(&mut child.cwd);
-    context.inherited_globals = std::mem::take(&mut child.inherited_globals);
-    context.error_reporting = child.error_reporting;
-    context.last_error = child.last_error.take();
-    context.error_handlers = std::mem::take(&mut child.error_handlers);
-    context.exception_handlers = std::mem::take(&mut child.exception_handlers);
-    context.environment = std::mem::take(&mut child.environment);
-    context.ini_registry = std::mem::take(&mut child.ini_registry);
-    context.mysql_state.clone_from(&child.mysql_state);
-    context.lexical_scope_classes = std::mem::take(&mut child.lexical_scope_classes);
-    context.call_frames = std::mem::take(&mut child.call_frames);
-}
-
 fn invoke_native_external_function(
     context: &mut NativeExecutionContext<'_>,
     target: NativeDynamicFunction,
@@ -3136,325 +3228,47 @@ fn invoke_native_external_function_with_metadata(
     called_class: Option<String>,
     strict: bool,
 ) -> Result<i64, String> {
-    let handle = ensure_dynamic_native_entry(context, target.unit, target.function)?;
-    let package = context
-        .dynamic_units
-        .get(target.unit)
-        .cloned()
-        .ok_or_else(|| "dynamic native unit is missing".to_owned())?;
-    let function = package
-        .compiled
-        .unit()
-        .functions
-        .get(target.function.index())
-        .ok_or_else(|| "dynamic native function metadata is missing".to_owned())?;
-    let values = arguments
+    let transferred_arguments = arguments
         .iter()
-        .enumerate()
-        .map(|(index, argument)| {
-            context.decode(*argument).map_err(|error| {
-                format!(
-                    "{}() native argument {} could not be decoded: {error}",
-                    function.name, index
-                )
-            })
+        .map(|argument| {
+            context
+                .decode(*argument)
+                .and_then(|value| context.encode(value))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let _depth_guard = enter_native_call(&function.name)?;
-    let instance_method = package.compiled.unit().classes.iter().any(|class| {
-        class
-            .methods
-            .iter()
-            .any(|method| method.function == target.function && !method.flags.is_static)
-    });
-    let leading = function.captures.len()
-        + usize::from(instance_method)
-        + usize::from(native_function_has_implicit_closure_this(function));
-    if values.len() < leading {
-        return Err(format!(
-            "{}() is missing its native receiver/capture arguments",
-            function.name
-        ));
-    }
-    let mut bound = values[..leading].to_vec();
-    let raw_supplied = &values[leading..];
-    let mut supplied = Vec::<(Option<String>, Value)>::new();
-    if let Some(metadata) = metadata {
-        if metadata.len() != raw_supplied.len() {
-            return Err(format!(
-                "{}() native argument metadata mismatch: expected {}, received {}",
-                function.name,
-                metadata.len(),
-                raw_supplied.len()
-            ));
+    context.with_active_dynamic_unit(target.unit, |context| {
+        let pushed_called_class = called_class.is_some();
+        if let Some(called_class) = &called_class {
+            context.called_classes.push(called_class.clone());
         }
-        for (argument, value) in metadata.iter().zip(raw_supplied) {
-            if argument.unpack {
-                let unpacked = match value {
-                    Value::Reference(reference) => reference.get(),
-                    value => value.clone(),
-                };
-                let Value::Array(array) = unpacked else {
-                    return Err("Only arrays and Traversables can be unpacked".to_owned());
-                };
-                supplied.extend(array.iter().map(|(key, value)| {
-                    let name = match key {
-                        php_runtime::api::ArrayKey::Int(_) => None,
-                        php_runtime::api::ArrayKey::String(name) => Some(name.to_string_lossy()),
-                    };
-                    (name, value.clone())
-                }));
-            } else {
-                supplied.push((argument.name.clone(), value.clone()));
+        let result = invoke_native_function_with_metadata_strict(
+            context,
+            target.function,
+            &transferred_arguments,
+            metadata,
+            strict,
+        );
+        if pushed_called_class {
+            context.called_classes.pop();
+        }
+        match result {
+            Ok(encoded) => context
+                .decode(encoded)
+                .map(|value| native_external_return_value(value, target.unit))
+                .and_then(|value| context.encode(value)),
+            Err(error) if error.starts_with("E_PHP_EXIT:") => {
+                let encoded = error
+                    .trim_start_matches("E_PHP_EXIT:")
+                    .parse::<i64>()
+                    .map_err(|_| "external native exit value is invalid".to_owned())?;
+                let encoded = context
+                    .decode(encoded)
+                    .and_then(|value| context.encode(value))?;
+                Err(format!("E_PHP_EXIT:{encoded}"))
             }
+            Err(error) => Err(error),
         }
-    } else {
-        supplied.extend(raw_supplied.iter().cloned().map(|value| (None, value)));
-    }
-    let variadic_index = function
-        .params
-        .iter()
-        .position(|parameter| parameter.variadic);
-    let fixed_count = variadic_index.unwrap_or(function.params.len());
-    let mut assigned = vec![None; fixed_count];
-    let mut variadic = php_runtime::api::PhpArray::new();
-    let mut positional = 0usize;
-    let mut saw_named = false;
-    for (name, value) in &supplied {
-        if let Some(name) = name {
-            saw_named = true;
-            if let Some(index) = function.params[..fixed_count]
-                .iter()
-                .position(|parameter| parameter.name.eq_ignore_ascii_case(name))
-            {
-                if assigned[index].replace(value.clone()).is_some() {
-                    return Err(format!(
-                        "Named parameter ${name} overwrites previous argument"
-                    ));
-                }
-            } else if variadic_index.is_some() {
-                variadic.insert(
-                    php_runtime::api::ArrayKey::String(PhpString::from_bytes(
-                        name.as_bytes().to_vec(),
-                    )),
-                    value.clone(),
-                );
-            } else {
-                return Err(format!("E_PHP_THROW:Error:Unknown named parameter ${name}"));
-            }
-        } else {
-            if saw_named {
-                return Err("Cannot use positional argument after named argument".to_owned());
-            }
-            while positional < fixed_count && assigned[positional].is_some() {
-                positional += 1;
-            }
-            if positional < fixed_count {
-                assigned[positional] = Some(value.clone());
-                positional += 1;
-            } else if variadic_index.is_some() {
-                variadic.append(value.clone());
-            }
-        }
-    }
-
-    for (index, parameter) in function.params.iter().enumerate() {
-        if parameter.variadic {
-            let mut values = php_runtime::api::PhpArray::new();
-            for (key, value) in variadic.iter() {
-                let value = parameter.type_.as_ref().map_or_else(
-                    || value.clone(),
-                    |type_| native_coerce_call_argument(value.clone(), type_, strict),
-                );
-                values.insert(key.clone(), value);
-            }
-            bound.push(Value::Array(values));
-            continue;
-        }
-        let supplied_value = assigned[index].clone();
-        let mut value = if let Some(value) = supplied_value.clone() {
-            value
-        } else if let Some(default) = &parameter.default {
-            native_runtime_constant_value(context, default)?
-        } else {
-            return Err(format!("Too few arguments to function {}()", function.name));
-        };
-        if parameter.by_ref {
-            if supplied_value.is_none() {
-                value = Value::Reference(php_runtime::api::ReferenceCell::new(value));
-            }
-            let Value::Reference(reference) = &value else {
-                return Err(format!(
-                    "E_PHP_THROW:Error:{}(): Argument #{} (${}) could not be passed by reference",
-                    function.name,
-                    index + 1,
-                    parameter.name
-                ));
-            };
-            if matches!(reference.get(), Value::Uninitialized) {
-                reference.set(Value::Null);
-            }
-        } else if let Value::Reference(reference) = value {
-            value = reference.get();
-        }
-        if let Some(type_) = &parameter.type_ {
-            let checked = match &value {
-                Value::Reference(reference) => reference.get(),
-                value => value.clone(),
-            };
-            let checked = native_coerce_call_argument(checked, type_, strict);
-            if !(native_value_matches_ir_type_in_context(context, &checked, type_)
-                || matches!(type_, php_ir::IrReturnType::Callable)
-                    && native_value_is_callable(context, &checked))
-            {
-                return Err(format!(
-                    "E_PHP_THROW:TypeError:{}(): Argument #{} (${}) must be of type {}, {} given",
-                    function.name,
-                    index + 1,
-                    parameter.name,
-                    native_ir_type_name(type_),
-                    native_value_type_name(&checked)
-                ));
-            }
-            if let Value::Reference(reference) = &value {
-                reference.set(checked);
-            } else {
-                value = checked;
-            }
-        }
-        bound.push(value);
-    }
-    let visible_arguments = supplied
-        .iter()
-        .map(|(_, value)| value.clone())
-        .collect::<Vec<_>>();
-    let mut child = NativeExecutionContext::new(
-        &package.compiled,
-        package.compiled.cache_identity(),
-        context.options,
-        context.worker_state,
-        php_runtime::api::OutputBuffer::default(),
-        package.native_entries,
-    );
-    seed_native_child_state(context, &mut child);
-    child.current_dynamic_unit = Some(target.unit);
-    if let Some(called_class) = called_class.as_ref() {
-        child.called_classes.push(called_class.clone());
-    }
-    child.call_arguments.push(visible_arguments.clone());
-    let object = instance_method
-        .then(|| values.first())
-        .flatten()
-        .and_then(|value| match value {
-            Value::Object(object) => Some(object.clone()),
-            _ => None,
-        });
-    child.call_frames.push(native_backtrace_frame(
-        &package.compiled,
-        target.function,
-        called_class.as_deref(),
-        object,
-        visible_arguments.clone(),
-    ));
-    let encoded = bound
-        .into_iter()
-        .map(|value| child.encode(value))
-        .collect::<Result<Vec<_>, _>>()?;
-    let transition_started_at = context.options.collect_counters.then(|| {
-        (
-            std::time::Instant::now(),
-            context.active_helper_child_time_nanos(),
-        )
-    });
-    let guard = activate_native_context(&mut child);
-    let outcome = handle.invoke_i64_with_native_unwind(
-        &encoded,
-        php_jit::JIT_RUNTIME_ABI_HASH,
-        |types, value| native_catch_matches(&child, types, value),
-    );
-    drop(guard);
-    if let Some((started_at, child_time_before)) = transition_started_at {
-        let nested_helper_time = context
-            .active_helper_child_time_nanos()
-            .saturating_sub(child_time_before);
-        context.record_native_transition("external_unit", started_at.elapsed(), nested_helper_time);
-    }
-    context.output.write_bytes(child.output.as_bytes());
-    let child_diagnostic_message = child
-        .diagnostic
-        .as_ref()
-        .map(|diagnostic| diagnostic.message().to_owned());
-    if let Some(diagnostic) = child.diagnostic.take() {
-        context.diagnostic = Some(diagnostic);
-    }
-    merge_native_child_state(context, &mut child);
-    match outcome {
-        Ok(php_jit::JitI64InvokeOutcome::Returned(value)) => {
-            let value = native_external_return_value(child.decode(value)?, target.unit);
-            context.encode(value)
-        }
-        Ok(php_jit::JitI64InvokeOutcome::SideExit { status, value, .. })
-            if status == php_jit::JitCallStatus::RETURN_REFERENCE.0 as i32 =>
-        {
-            let value = native_external_return_value(child.decode(value)?, target.unit);
-            context.encode(value)
-        }
-        Ok(php_jit::JitI64InvokeOutcome::SideExit {
-            status,
-            value,
-            state,
-        }) if status == php_jit::JitCallStatus::THROW.0 as i32 => {
-            let throwable = child.decode(value).map_err(|error| {
-                let continuation = child
-                    .instruction_for_continuation(state.function_id, state.continuation_id)
-                    .map(|instruction| format!(" at {:?}", instruction.kind))
-                    .unwrap_or_else(|| {
-                        format!(
-                            " at native continuation {}:{}",
-                            state.function_id, state.continuation_id
-                        )
-                    });
-                format!(
-                    "dynamic native function {} returned an undecodable throwable {value}{continuation}: {error}",
-                    function.name
-                )
-            })?;
-            context.pending_throwable = Some(native_throwable_with_frame(
-                throwable,
-                &function.name,
-                visible_arguments,
-            ));
-            Err("E_PHP_RETHROW".to_owned())
-        }
-        Ok(php_jit::JitI64InvokeOutcome::SideExit { status, value, .. })
-            if status == php_jit::JitCallStatus::EXIT.0 as i32 =>
-        {
-            let value = child.decode(value)?;
-            let value = context.encode(value)?;
-            Err(format!("E_PHP_EXIT:{value}"))
-        }
-        Ok(php_jit::JitI64InvokeOutcome::SideExit { status, state, .. }) => {
-            let continuation = child
-                .instruction_for_continuation(state.function_id, state.continuation_id)
-                .map(|instruction| format!(" at {:?}", instruction.kind))
-                .unwrap_or_else(|| {
-                    format!(
-                        " at native continuation {}:{}",
-                        state.function_id, state.continuation_id
-                    )
-                });
-            Err(format!(
-                "dynamic native function {} returned status {status}{continuation}{}",
-                function.name,
-                child_diagnostic_message
-                    .as_deref()
-                    .map_or_else(String::new, |message| format!(": {message}"))
-            ))
-        }
-        Err(error) => Err(format!(
-            "dynamic native function invocation failed: {error:?}"
-        )),
-    }
+    })?
 }
 
 fn native_external_return_value(value: Value, owner_unit: usize) -> Value {
@@ -3507,8 +3321,8 @@ fn invoke_native_method_with_trace_arguments(
         .unit
         .functions
         .get(function.index())
-        .map_or("<unknown>", |function| function.name.as_str());
-    let _depth_guard = enter_native_call(function_name)?;
+        .map_or_else(|| "<unknown>".to_owned(), |function| function.name.clone());
+    let _depth_guard = enter_native_call(&function_name)?;
     let handle = ensure_native_entry(context, function)?;
     let instance_method = context.unit.classes.iter().any(|class| {
         class
@@ -3552,7 +3366,7 @@ fn invoke_native_method_with_trace_arguments(
         |arguments| Ok(arguments.to_vec()),
     )?;
     context.call_frames.push(native_backtrace_frame(
-        context.compiled,
+        &context.compiled,
         function,
         called_class.as_deref(),
         object,
@@ -3564,6 +3378,7 @@ fn invoke_native_method_with_trace_arguments(
             context.active_helper_child_time_nanos(),
         )
     });
+    context.record_native_direct_calls(&handle);
     let outcome = handle.invoke_i64_with_native_unwind(
         arguments,
         php_jit::JIT_RUNTIME_ABI_HASH,
@@ -3651,7 +3466,7 @@ fn invoke_native_method_with_trace_arguments(
             })?;
             context.pending_throwable = Some(native_throwable_with_frame(
                 throwable,
-                function_name,
+                &function_name,
                 frame_arguments,
             ));
             Err("E_PHP_RETHROW".to_owned())
@@ -4175,6 +3990,7 @@ fn execute_native_property_instruction(
                     .methods
                     .iter()
                     .find(|method| method.name.eq_ignore_ascii_case("offsetSet"))
+                    .map(|method| method.function)
             {
                 let key = keys.first().cloned().map_or(Value::Null, |key| match key {
                     php_runtime::api::ArrayKey::Int(value) => Value::Int(value),
@@ -4192,11 +4008,9 @@ fn execute_native_property_instruction(
                     Ok(value) => value,
                     Err(error) => return Some(Err(error)),
                 };
-                if let Err(error) = invoke_native_method(
-                    context,
-                    offset_set.function,
-                    &[receiver, key, replacement_encoded],
-                ) {
+                if let Err(error) =
+                    invoke_native_method(context, offset_set, &[receiver, key, replacement_encoded])
+                {
                     return Some(Err(error));
                 }
                 return Some(context.encode(replacement));

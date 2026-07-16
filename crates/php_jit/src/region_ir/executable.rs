@@ -382,8 +382,9 @@ impl RegionNativeCall {
             .any(|(index, _)| self.argument_requires_reference_binding(index))
     }
 
-    /// Returns the fixed-arity userland callee for the allocation-free path.
-    /// Every other call shape is resolved by the typed native trampoline.
+    /// Returns a statically bound userland callee whose arguments are fully
+    /// materialized for the native callee ABI. Complex runtime binding remains
+    /// on the typed native trampoline.
     #[must_use]
     pub fn direct_compiled_target(&self) -> Option<FunctionId> {
         let RegionCallTarget::Function {
@@ -393,12 +394,16 @@ impl RegionNativeCall {
         else {
             return None;
         };
-        // Variadic calls require the native argument binder to pack trailing
-        // positional and named values into the callee's variadic array.
-        let arity_matches =
-            !self.variadic && self.direct_arity == u32::try_from(self.operands.len()).ok();
-        (!self.returns_by_reference
-            && arity_matches
+        let arity_matches = if self.variadic {
+            self.direct_arity.is_some_and(|arity| {
+                arity != 0
+                    && self.operands.len()
+                        >= usize::try_from(arity.saturating_sub(1)).unwrap_or(usize::MAX)
+            })
+        } else {
+            self.direct_arity == u32::try_from(self.operands.len()).ok()
+        };
+        (arity_matches
             && self.operands.iter().all(Option::is_some)
             && self.args.iter().all(|arg| {
                 arg.name.is_none()
@@ -1778,10 +1783,7 @@ impl BaselineRegionBuilder {
                                 .iter()
                                 .find(|entry| entry.name.eq_ignore_ascii_case(method))
                                 .filter(|entry| {
-                                    !entry.flags.is_private
-                                        && !entry.flags.is_protected
-                                        && (entry.flags.is_final
-                                            || unit.classes[class as usize].flags.is_final)
+                                    !entry.flags.is_private && !entry.flags.is_protected
                                 })
                                 .map(|entry| entry.function)
                         })

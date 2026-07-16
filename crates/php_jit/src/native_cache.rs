@@ -10,8 +10,11 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const PNA_MAGIC: [u8; 4] = *b"PNA1";
-pub const PNA_FORMAT_VERSION: u16 = 1;
+/// Current unit-bundle artifact magic. Writers emit only PNA2.
+pub const PNA_MAGIC: [u8; 4] = *b"PNA2";
+pub const PNA_FORMAT_VERSION: u16 = 2;
+const PNA1_MAGIC: [u8; 4] = *b"PNA1";
+const PNA1_FORMAT_VERSION: u16 = 1;
 const HEADER_LEN: usize = 64;
 const SECTION_RECORD_LEN: usize = 32;
 const MAX_SECTIONS: usize = 32;
@@ -332,6 +335,26 @@ struct CachedRegionMetadataEntry {
     metadata: crate::JitRegionStateMetadata,
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CachedRegionMetadataBundle {
+    format: String,
+    graphs: Vec<crate::JitRegionStateMetadata>,
+    roots: Vec<CachedRegionMetadataRoot>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CachedRegionMetadataRoot {
+    function_id: u32,
+    graph_index: u32,
+}
+
+struct DecodedRegionMetadata {
+    graphs: Vec<crate::JitRegionStateMetadata>,
+    roots: Vec<CachedRegionMetadataRoot>,
+}
+
 impl NativeArtifactImage {
     #[must_use]
     pub fn minimal(
@@ -360,7 +383,7 @@ impl NativeArtifactImage {
         }
     }
 
-    /// Builds one PNA1 image from the exact machine code retained by the
+    /// Builds one deduplicated PNA2 unit bundle from the exact machine code retained by the
     /// production Cranelift compilation records.
     ///
     /// AMD64 helper calls are routed through artifact-local trampolines. The
@@ -392,7 +415,9 @@ impl NativeArtifactImage {
         let mut internal_symbols = Vec::new();
         let mut pending_relocations = Vec::new();
         let mut helper_names = BTreeSet::new();
-        let mut cached_metadata = Vec::new();
+        let mut cached_metadata_graphs = Vec::new();
+        let mut cached_metadata_roots = Vec::new();
+        let mut cached_metadata_graph_indices = BTreeMap::<usize, u32>::new();
         let mut emitted_graphs = BTreeMap::<usize, (u64, BTreeMap<php_ir::FunctionId, u32>)>::new();
         let mut emitted_symbol_ids = BTreeSet::new();
         let mut next_symbol_id = records
@@ -420,22 +445,36 @@ impl NativeArtifactImage {
                     record.function.raw()
                 ))
             })?;
-            let mut metadata = handle.region_state_metadata().cloned().ok_or_else(|| {
-                NativeCacheError::InvalidHeader(format!(
-                    "function {} has no native state metadata",
-                    record.function.raw()
-                ))
-            })?;
-            for entry in &mut metadata.function_entries {
-                // PNA1 never persists process addresses. They are rebound to
-                // validated function entries after the RX mapping is created.
-                entry.address = 0;
-            }
-            cached_metadata.push(CachedRegionMetadataEntry {
-                function_id: record.function.raw(),
-                metadata,
-            });
             let graph_key = relocatable as *const crate::JitRelocatableCode as usize;
+            let graph_index = if let Some(index) = cached_metadata_graph_indices.get(&graph_key) {
+                *index
+            } else {
+                let mut metadata = handle.region_state_metadata().cloned().ok_or_else(|| {
+                    NativeCacheError::InvalidHeader(format!(
+                        "function {} has no native state metadata",
+                        record.function.raw()
+                    ))
+                })?;
+                for entry in &mut metadata.function_entries {
+                    // PNA artifacts never persist process addresses. They are rebound to
+                    // validated function entries after the RX mapping is created.
+                    entry.address = 0;
+                }
+                let index = u32::try_from(cached_metadata_graphs.len()).map_err(|_| {
+                    NativeCacheError::SizeLimit {
+                        what: "native metadata graph count",
+                        actual: cached_metadata_graphs.len() as u64,
+                        limit: u64::from(u32::MAX),
+                    }
+                })?;
+                cached_metadata_graphs.push(metadata);
+                cached_metadata_graph_indices.insert(graph_key, index);
+                index
+            };
+            cached_metadata_roots.push(CachedRegionMetadataRoot {
+                function_id: record.function.raw(),
+                graph_index,
+            });
             let (graph_offset, _graph_symbols) =
                 if let Some((offset, symbols)) = emitted_graphs.get(&graph_key) {
                     (*offset, symbols.clone())
@@ -598,9 +637,10 @@ impl NativeArtifactImage {
         }
         relocations.sort_by_key(|relocation| relocation.offset);
 
-        let signature_metadata = serde_json::to_vec(&CachedRegionMetadataEnvelope {
-            format: "PRM3".to_owned(),
-            entries: cached_metadata,
+        let signature_metadata = serde_json::to_vec(&CachedRegionMetadataBundle {
+            format: "PRM4".to_owned(),
+            graphs: cached_metadata_graphs,
+            roots: cached_metadata_roots,
         })
         .map_err(|error| {
             NativeCacheError::InvalidSection(format!(
@@ -631,12 +671,60 @@ fn align_vec(bytes: &mut Vec<u8>, alignment: usize) {
     bytes.resize(bytes.len().saturating_add(padding), 0);
 }
 
-fn decode_region_metadata(
-    bytes: &[u8],
-) -> Result<BTreeMap<u32, crate::JitRegionStateMetadata>, NativeCacheError> {
-    if bytes.is_empty() {
-        return Ok(BTreeMap::new());
+fn validate_cached_region_metadata(
+    metadata: &crate::JitRegionStateMetadata,
+) -> Result<(), NativeCacheError> {
+    if metadata
+        .function_entries
+        .iter()
+        .any(|function| function.address != 0)
+    {
+        return Err(NativeCacheError::InvalidSection(
+            "native state metadata contains a persisted process address".to_owned(),
+        ));
     }
+    Ok(())
+}
+
+fn decode_region_metadata(bytes: &[u8]) -> Result<DecodedRegionMetadata, NativeCacheError> {
+    if bytes.is_empty() {
+        return Ok(DecodedRegionMetadata {
+            graphs: Vec::new(),
+            roots: Vec::new(),
+        });
+    }
+    if let Ok(bundle) = serde_json::from_slice::<CachedRegionMetadataBundle>(bytes) {
+        if bundle.format != "PRM4" {
+            return Err(NativeCacheError::InvalidSection(
+                "unsupported native state metadata format".to_owned(),
+            ));
+        }
+        for metadata in &bundle.graphs {
+            validate_cached_region_metadata(metadata)?;
+        }
+        let mut functions = BTreeSet::new();
+        for root in &bundle.roots {
+            if root.graph_index as usize >= bundle.graphs.len() {
+                return Err(NativeCacheError::InvalidSection(format!(
+                    "native metadata root {} has invalid graph index {}",
+                    root.function_id, root.graph_index
+                )));
+            }
+            if !functions.insert(root.function_id) {
+                return Err(NativeCacheError::InvalidSection(format!(
+                    "duplicate native state metadata for function {}",
+                    root.function_id
+                )));
+            }
+        }
+        return Ok(DecodedRegionMetadata {
+            graphs: bundle.graphs,
+            roots: bundle.roots,
+        });
+    }
+
+    // PNA1/PRM3 is accepted for one migration window. New writers emit only
+    // the graph-deduplicated PRM4 bundle above.
     let envelope =
         serde_json::from_slice::<CachedRegionMetadataEnvelope>(bytes).map_err(|error| {
             NativeCacheError::InvalidSection(format!("invalid native state metadata: {error}"))
@@ -646,26 +734,27 @@ fn decode_region_metadata(
             "unsupported native state metadata format".to_owned(),
         ));
     }
-    let mut metadata = BTreeMap::new();
+    let mut functions = BTreeSet::new();
+    let mut graphs = Vec::with_capacity(envelope.entries.len());
+    let mut roots = Vec::with_capacity(envelope.entries.len());
     for entry in envelope.entries {
-        if entry
-            .metadata
-            .function_entries
-            .iter()
-            .any(|function| function.address != 0)
-        {
-            return Err(NativeCacheError::InvalidSection(
-                "native state metadata contains a persisted process address".to_owned(),
-            ));
-        }
-        if metadata.insert(entry.function_id, entry.metadata).is_some() {
+        validate_cached_region_metadata(&entry.metadata)?;
+        if !functions.insert(entry.function_id) {
             return Err(NativeCacheError::InvalidSection(format!(
                 "duplicate native state metadata for function {}",
                 entry.function_id
             )));
         }
+        let graph_index = u32::try_from(graphs.len()).map_err(|_| {
+            NativeCacheError::InvalidSection("too many native metadata graphs".to_owned())
+        })?;
+        graphs.push(entry.metadata);
+        roots.push(CachedRegionMetadataRoot {
+            function_id: entry.function_id,
+            graph_index,
+        });
     }
-    Ok(metadata)
+    Ok(DecodedRegionMetadata { graphs, roots })
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -716,14 +805,14 @@ impl fmt::Display for NativeCacheError {
         match self {
             Self::Io(error) => write!(f, "native cache I/O error: {error}"),
             Self::Disabled => f.write_str("native cache mode does not permit this operation"),
-            Self::InvalidHeader(detail) => write!(f, "invalid PNA1 header: {detail}"),
-            Self::InvalidSection(detail) => write!(f, "invalid PNA1 section: {detail}"),
-            Self::IdentityMismatch => f.write_str("PNA1 identity does not match this process"),
-            Self::ChecksumMismatch => f.write_str("PNA1 checksum mismatch"),
-            Self::InvalidRelocation(detail) => write!(f, "invalid PNA1 relocation: {detail}"),
-            Self::UnknownHelper(id) => write!(f, "PNA1 references unknown helper ID {id}"),
+            Self::InvalidHeader(detail) => write!(f, "invalid PNA artifact header: {detail}"),
+            Self::InvalidSection(detail) => write!(f, "invalid PNA artifact section: {detail}"),
+            Self::IdentityMismatch => f.write_str("PNA identity does not match this process"),
+            Self::ChecksumMismatch => f.write_str("PNA checksum mismatch"),
+            Self::InvalidRelocation(detail) => write!(f, "invalid PNA relocation: {detail}"),
+            Self::UnknownHelper(id) => write!(f, "PNA references unknown helper ID {id}"),
             Self::UnknownInternalSymbol(id) => {
-                write!(f, "PNA1 references unknown internal symbol {id}")
+                write!(f, "PNA references unknown internal symbol {id}")
             }
             Self::UnsafePath(detail) => write!(f, "unsafe native cache path: {detail}"),
             Self::SizeLimit {
@@ -996,7 +1085,7 @@ impl NativeArtifactCache {
 pub struct NativeLoadedArtifact {
     image: NativeArtifactImage,
     mapping: ExecutableMapping,
-    region_metadata: BTreeMap<u32, crate::JitRegionStateMetadata>,
+    region_metadata: BTreeMap<u32, std::sync::Arc<crate::JitRegionStateMetadata>>,
 }
 
 impl fmt::Debug for NativeLoadedArtifact {
@@ -1014,12 +1103,12 @@ impl NativeLoadedArtifact {
         image: NativeArtifactImage,
         resolve_helper: &impl Fn(u32) -> Option<usize>,
     ) -> Result<Self, NativeCacheError> {
-        let mut region_metadata = decode_region_metadata(&image.signature_metadata)?;
+        let mut decoded_metadata = decode_region_metadata(&image.signature_metadata)?;
         let mut mapping = ExecutableMapping::new(image.code.len())?;
         mapping.bytes_mut()[..image.code.len()].copy_from_slice(&image.code);
         apply_relocations(&mut mapping, &image, resolve_helper)?;
         mapping.make_executable()?;
-        for metadata in region_metadata.values_mut() {
+        for metadata in &mut decoded_metadata.graphs {
             for function_entry in &mut metadata.function_entries {
                 let function = image
                     .functions
@@ -1038,6 +1127,29 @@ impl NativeLoadedArtifact {
                     })?;
             }
         }
+        let graphs = decoded_metadata
+            .graphs
+            .into_iter()
+            .map(std::sync::Arc::new)
+            .collect::<Vec<_>>();
+        let mut region_metadata = BTreeMap::new();
+        for root in decoded_metadata.roots {
+            let metadata = graphs
+                .get(root.graph_index as usize)
+                .ok_or_else(|| {
+                    NativeCacheError::InvalidSection(format!(
+                        "native metadata root {} has invalid graph index {}",
+                        root.function_id, root.graph_index
+                    ))
+                })?
+                .clone();
+            if region_metadata.insert(root.function_id, metadata).is_some() {
+                return Err(NativeCacheError::InvalidSection(format!(
+                    "duplicate native state metadata for function {}",
+                    root.function_id
+                )));
+            }
+        }
         Ok(Self {
             image,
             mapping,
@@ -1053,7 +1165,9 @@ impl NativeLoadedArtifact {
     /// Returns the address-rebound state metadata for one cached root.
     #[must_use]
     pub fn region_metadata(&self, function_id: u32) -> Option<&crate::JitRegionStateMetadata> {
-        self.region_metadata.get(&function_id)
+        self.region_metadata
+            .get(&function_id)
+            .map(std::sync::Arc::as_ref)
     }
 
     pub fn entry_address(&self, function_id: u32) -> Result<usize, NativeCacheError> {
@@ -1067,6 +1181,12 @@ impl NativeLoadedArtifact {
             .mapping
             .address
             .saturating_add(function.code_offset as usize))
+    }
+
+    /// Executable bytes mapped for this validated unit bundle.
+    #[must_use]
+    pub const fn mapped_executable_bytes(&self) -> usize {
+        self.mapping.len
     }
 
     pub fn invoke_i64_status_out(&self, function_id: u32) -> Result<i64, NativeCacheError> {
@@ -1190,7 +1310,22 @@ fn encode_artifact(
     image: &NativeArtifactImage,
     config: &NativeCacheConfig,
 ) -> Result<Vec<u8>, NativeCacheError> {
+    encode_artifact_format(image, config, PNA_MAGIC, PNA_FORMAT_VERSION, true)
+}
+
+fn encode_artifact_format(
+    image: &NativeArtifactImage,
+    config: &NativeCacheConfig,
+    magic: [u8; 4],
+    version: u16,
+    compact_functions: bool,
+) -> Result<Vec<u8>, NativeCacheError> {
     validate_image(image, config)?;
+    let function_entries = if compact_functions {
+        encode_functions_v2(&image.functions)?
+    } else {
+        encode_functions_v1(&image.functions)
+    };
     let sections = vec![
         (SectionKind::Identity, image.identity.encode(), 1, 1),
         (
@@ -1207,7 +1342,7 @@ fn encode_artifact(
         ),
         (
             SectionKind::FunctionEntries,
-            encode_functions(&image.functions),
+            function_entries,
             8,
             image.functions.len() as u32,
         ),
@@ -1290,8 +1425,8 @@ fn encode_artifact(
         });
     }
     let mut out = vec![0_u8; offset];
-    out[0..4].copy_from_slice(&PNA_MAGIC);
-    out[4..6].copy_from_slice(&PNA_FORMAT_VERSION.to_le_bytes());
+    out[0..4].copy_from_slice(&magic);
+    out[4..6].copy_from_slice(&version.to_le_bytes());
     out[6..8].copy_from_slice(&(HEADER_LEN as u16).to_le_bytes());
     out[8..16].copy_from_slice(&(offset as u64).to_le_bytes());
     out[16..20].copy_from_slice(&(sections.len() as u32).to_le_bytes());
@@ -1318,14 +1453,18 @@ fn decode_artifact(
     expected: &NativeCacheIdentity,
     config: &NativeCacheConfig,
 ) -> Result<NativeArtifactImage, NativeCacheError> {
-    if bytes.len() < HEADER_LEN || bytes[0..4] != PNA_MAGIC {
+    if bytes.len() < HEADER_LEN {
         return Err(NativeCacheError::InvalidHeader(
             "bad magic or truncated header".to_owned(),
         ));
     }
-    if read_u16(bytes, 4)? != PNA_FORMAT_VERSION {
+    let magic = &bytes[0..4];
+    let version = read_u16(bytes, 4)?;
+    let supported = (magic == PNA_MAGIC && version == PNA_FORMAT_VERSION)
+        || (magic == PNA1_MAGIC && version == PNA1_FORMAT_VERSION);
+    if !supported {
         return Err(NativeCacheError::InvalidHeader(
-            "unsupported format version".to_owned(),
+            "unsupported magic/version pair".to_owned(),
         ));
     }
     if read_u16(bytes, 6)? as usize != HEADER_LEN {
@@ -1434,7 +1573,11 @@ fn decode_artifact(
     }
     let code = section(SectionKind::Code)?.0.to_vec();
     let read_only_data = section(SectionKind::ReadOnlyData)?.0.to_vec();
-    let functions = decode_functions(section(SectionKind::FunctionEntries)?)?;
+    let functions = if magic == PNA_MAGIC {
+        decode_functions_v2(section(SectionKind::FunctionEntries)?)?
+    } else {
+        decode_functions_v1(section(SectionKind::FunctionEntries)?)?
+    };
     let continuations = decode_continuations(section(SectionKind::Continuations)?)?;
     let relocations = decode_relocations(section(SectionKind::Relocations)?)?;
     let helper_imports = decode_helpers(section(SectionKind::HelperImports)?)?;
@@ -2059,7 +2202,7 @@ fn put_string(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(value.as_bytes());
 }
 
-fn encode_functions(values: &[NativeFunctionImage]) -> Vec<u8> {
+fn encode_functions_v1(values: &[NativeFunctionImage]) -> Vec<u8> {
     let mut out = Vec::new();
     for value in values {
         put_u32(&mut out, value.function_id);
@@ -2072,7 +2215,27 @@ fn encode_functions(values: &[NativeFunctionImage]) -> Vec<u8> {
     out
 }
 
-fn decode_functions(
+fn encode_functions_v2(values: &[NativeFunctionImage]) -> Result<Vec<u8>, NativeCacheError> {
+    let abi = values
+        .first()
+        .map_or(NativeFunctionAbi::PackedI64StatusOut, |value| value.abi);
+    if values.iter().any(|value| value.abi != abi) {
+        return Err(NativeCacheError::InvalidSection(
+            "PNA2 function bundle contains multiple native ABIs".to_owned(),
+        ));
+    }
+    let mut out = Vec::with_capacity(1 + values.len().saturating_mul(21));
+    out.push(abi as u8);
+    for value in values {
+        put_u32(&mut out, value.function_id);
+        put_u64(&mut out, value.code_offset);
+        put_u64(&mut out, value.code_len);
+        out.push(value.arity);
+    }
+    Ok(out)
+}
+
+fn decode_functions_v1(
     (bytes, count): (&[u8], u32),
 ) -> Result<Vec<NativeFunctionImage>, NativeCacheError> {
     let mut cursor = Cursor::new(bytes);
@@ -2089,6 +2252,25 @@ fn decode_functions(
             code_offset,
             code_len,
             arity,
+            abi,
+        });
+    }
+    cursor.finish()?;
+    Ok(values)
+}
+
+fn decode_functions_v2(
+    (bytes, count): (&[u8], u32),
+) -> Result<Vec<NativeFunctionImage>, NativeCacheError> {
+    let mut cursor = Cursor::new(bytes);
+    let abi = NativeFunctionAbi::from_raw(cursor.u8()?)?;
+    let mut values = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        values.push(NativeFunctionImage {
+            function_id: cursor.u32()?,
+            code_offset: cursor.u64()?,
+            code_len: cursor.u64()?,
+            arity: cursor.u8()?,
             abi,
         });
     }
@@ -2522,6 +2704,51 @@ mod tests {
         let loaded = second.load(&expected, |_| None).unwrap().unwrap();
         assert_eq!(loaded.invoke_i64_status_out(0).unwrap(), 42);
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pna2_writer_keeps_one_window_of_pna1_read_compatibility() {
+        let image = returning_image("pna1-compatibility");
+        let config = NativeCacheConfig::default();
+        let current = encode_artifact(&image, &config).unwrap();
+        assert_eq!(&current[..4], b"PNA2");
+        assert_eq!(read_u16(&current, 4).unwrap(), 2);
+
+        let legacy =
+            encode_artifact_format(&image, &config, PNA1_MAGIC, PNA1_FORMAT_VERSION, false)
+                .unwrap();
+        let decoded = decode_artifact(&legacy, &image.identity, &config).unwrap();
+        assert_eq!(decoded, image);
+    }
+
+    #[test]
+    fn pna2_function_entries_store_one_bundle_abi() {
+        let mut image = returning_image("compact-function-entries");
+        image.functions.push(NativeFunctionImage {
+            function_id: 1,
+            code_offset: 0,
+            code_len: image.code.len() as u64,
+            arity: 0,
+            abi: NativeFunctionAbi::I64StatusOut,
+        });
+        image.internal_symbols.push(NativeSymbol {
+            stable_id: 1,
+            code_offset: 0,
+        });
+        let encoded = encode_artifact(&image, &NativeCacheConfig::default()).unwrap();
+        let section_count = read_u32(&encoded, 16).unwrap() as usize;
+        let record = (0..section_count)
+            .map(|index| HEADER_LEN + index * SECTION_RECORD_LEN)
+            .find(|offset| {
+                read_u16(&encoded, *offset).unwrap() == SectionKind::FunctionEntries as u16
+            })
+            .unwrap();
+        assert_eq!(read_u64(&encoded, record + 16).unwrap(), 43);
+        assert_eq!(
+            decode_artifact(&encoded, &image.identity, &NativeCacheConfig::default()).unwrap(),
+            image
+        );
     }
 
     #[test]

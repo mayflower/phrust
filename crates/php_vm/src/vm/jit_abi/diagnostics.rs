@@ -317,7 +317,7 @@ pub(super) fn native_throwable_with_internal_frame(
 pub(super) fn native_throwable_with_call_source(
     context: &NativeExecutionContext<'_>,
     mut throwable: Value,
-    source: &php_ir::Instruction,
+    source_span: php_ir::IrSpan,
 ) -> Value {
     let Value::Array(exception) = &mut throwable else {
         return throwable;
@@ -336,7 +336,7 @@ pub(super) fn native_throwable_with_call_source(
     let path = context
         .unit
         .files
-        .get(source.span.file.index())
+        .get(source_span.file.index())
         .map_or("<unknown>", |file| file.path.as_str());
     frame.insert(
         php_runtime::api::ArrayKey::String(PhpString::from_bytes(b"file".to_vec())),
@@ -344,7 +344,9 @@ pub(super) fn native_throwable_with_call_source(
     );
     frame.insert(
         php_runtime::api::ArrayKey::String(PhpString::from_bytes(b"line".to_vec())),
-        Value::Int(i64::try_from(native_source_line(context, source)).unwrap_or(i64::MAX)),
+        Value::Int(
+            i64::try_from(native_source_line_for_span(context, source_span)).unwrap_or(i64::MAX),
+        ),
     );
     trace.insert(frame_key, Value::Array(frame));
     exception.insert(trace_key, Value::Array(trace));

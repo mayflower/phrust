@@ -83,7 +83,7 @@ Current performance entry points include:
   class, method, and property changes.
 - Measurement risk: smoke-level measurements are useful for regressions and
   prioritization but not sufficient for broad speed claims.
-- Cache risk: persistent PNA1 native artifacts are untrusted local data and
+- Cache risk: persistent PNA2 native artifacts are untrusted local data and
   must be fingerprinted, versioned, verified, and safely ignored on corruption.
 - Native-code risk: generated code is subject to W^X, ABI, cache-validation,
   transition, and safepoint checks.

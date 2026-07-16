@@ -97,7 +97,7 @@ help:
       '  just cranelift-native-dynamic-code Verify native include/eval/declaration compilation' \
       '  just cranelift-native-transitions Verify native-to-native guard exits and OSR' \
       '  just cranelift-native-executor Verify the legacy executor is absent' \
-      '  just cranelift-native-cache Verify restart-persistent PNA1 native artifacts' \
+      '  just cranelift-native-cache Verify restart-persistent PNA2 native artifacts' \
       '  just cranelift-native-product Verify the single native product surface' \
       '  just cranelift-only-ratchet-fast Check native architecture with incremental cutover binaries' \
       '  just cranelift-only-ratchet Enforce the final no-exceptions native architecture' \
@@ -105,6 +105,9 @@ help:
       '  just wordpress-clone-churn-report Summarize clone/COW attribution from latest request profile' \
       '  just wordpress-array-hotpath-report Summarize array hotpath attribution from latest request profile' \
       '  just wordpress-call-hotpath-report Summarize call/frame attribution from latest request profile' \
+      '  just native-linkage-report FILE Summarize direct/dynamic native call attribution' \
+      '  just native-footprint-report DIR Attribute PNA sections and optional process smaps' \
+      '  just native-linkage-tranche-report Assemble the C13 report tree' \
       '  just mysqli-integration   Run explicit live MySQLi integration gate' \
       '  just wordpress-smoke-report Generate web/db diagnostics report' \
       '' \
@@ -498,7 +501,7 @@ verify-stdlib:
 # Correctness-focused performance gates. Sub-gates share one engine build
 # through the perf-build dependency (deduplicated within this invocation).
 # Release-profile and report gates live in verify-performance-extended.
-verify-performance: wordpress-benchmark-self-test performance-tests performance-regression benchmark-smoke framework-smoke default-profile-smoke app-flow-smoke baseline-native-compile-smoke cache-roundtrip optimizer-diff native-ssa-ratchet templates-smoke inline-cache-model-tests native-smoke object-release-root-scan safety-audit-smoke
+verify-performance: native-linkage-ratchet wordpress-benchmark-self-test performance-tests performance-regression benchmark-smoke framework-smoke default-profile-smoke app-flow-smoke baseline-native-compile-smoke cache-roundtrip optimizer-diff native-ssa-ratchet templates-smoke inline-cache-model-tests native-smoke object-release-root-scan safety-audit-smoke
     @printf '%s\n' '[pass] performance verification complete'
 
 # Heavy release-profile and report gates, split out of verify-performance so
@@ -1216,6 +1219,18 @@ wordpress-array-hotpath-report:
 wordpress-call-hotpath-report:
     scripts/performance/call_hotpath_report.py
 
+native-linkage-report counters *args:
+    scripts/performance/native_linkage_report.py "{{counters}}" {{args}}
+
+native-footprint-report cache_dir *args:
+    scripts/performance/native_footprint_report.py --cache-dir "{{cache_dir}}" {{args}}
+
+native-linkage-tranche-report *args:
+    scripts/performance/native_linkage_tranche.py {{args}}
+
+native-linkage-ratchet *args:
+    scripts/verify/native_linkage_ratchet.py {{args}}
+
 wordpress-real-extract-first-failure:
     scripts/wordpress/extract_failure.py --failure "${PHRUST_WORDPRESS_FIRST_FAILURE:-}"
 
@@ -1277,7 +1292,7 @@ performance-regression: perf-build
     scripts/performance/regression_smoke.sh
 
 default-profile-smoke: perf-build
-    scripts/performance/default_profile_smoke.py
+    scripts/performance/default_profile_smoke.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm"
 
 baseline-native-compile-smoke: perf-build
     #!/usr/bin/env bash
@@ -1339,7 +1354,7 @@ bolt-benchmark-smoke:
     scripts/performance/release_profiles.py bolt
 
 framework-smoke: perf-build
-    scripts/performance/framework_micro_smoke.py
+    scripts/performance/framework_micro_smoke.py --engine "${CARGO_TARGET_DIR:-target}/debug/php-vm"
 
 front-controller-hotpath-smoke:
     cargo build -p php_server --bin phrust-server
@@ -1650,7 +1665,7 @@ cranelift-native-executor:
     # fast Prompt 14 ratchet. `ci-local` retains the final release/LTO proof.
     RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER="$PWD/scripts/development/parallel_php_vm_rustc.sh" PHRUST_RUSTC_CACHE_WRAPPER= CARGO_INCREMENTAL=1 cargo build --profile cutover -p php_server --bin phrust-server --no-default-features
 
-# Prompt 12 cutover gate: a fresh process loads validated PNA1 machine code,
+# Prompt 12 cutover gate: a fresh process loads validated PNA2 machine code,
 # corrupt artifacts rebuild, and loader/concurrency controls remain covered.
 cranelift-native-cache:
     #!/usr/bin/env bash

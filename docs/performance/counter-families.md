@@ -1,7 +1,7 @@
 # Native telemetry families
 
 The CLI and server expose one stable telemetry vocabulary for the mandatory
-native engine. Counters are opt-in and serialized with schema version 8.
+native engine. Counters are opt-in and serialized with schema version 11.
 
 | Family | Meaning |
 | --- | --- |
@@ -38,3 +38,12 @@ nix develop -c scripts/performance/native_helper_report.py \
 
 The generated JSON and Markdown stay under
 `target/post-cutover/ssa-lifetimes/`.
+
+Schema 11 also carries an explicitly audited linkage-and-footprint diagnostic
+set. It covers direct-call eligibility and execution by target class, function
+body deduplication, code/rodata/relocation/metadata bytes, loaded-artifact map
+and entry-table counts, per-function stack bounds, worker stack reservation,
+frame-arena high-water use, and bounded inlining/tail-call outcomes. These
+fields retain the names used by the linkage and footprint reports instead of
+creating product execution-mode families; additions require updating the
+native product-surface and default-profile audits' exact allowlists.

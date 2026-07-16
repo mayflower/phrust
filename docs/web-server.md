@@ -40,6 +40,13 @@ execution state is request-local and permits are released on cancellation.
 The metrics endpoint exposes admitted, queued, current, saturated, rejected,
 cancelled, and queue-timeout totals plus the cumulative `cpu_queue` phase.
 
+Pinned PHP workers reserve a 16 MiB OS-thread stack by default. Set
+`PHRUST_SERVER_PHP_WORKER_STACK_BYTES` to a positive byte count when a measured
+deployment needs a different bound. The older
+`PHRUST_SERVER_TOKIO_WORKER_STACK_BYTES` setting remains a fallback for the PHP
+pool as well as configuring Tokio workers, but the dedicated setting takes
+precedence.
+
 Prefix request rewrites are a webserver-only routing feature. Configure them
 with `--rewrite-prefix-query /api=route` or
 `rewrite_prefix_query = "/api=route"` for `phrust-server`, or set

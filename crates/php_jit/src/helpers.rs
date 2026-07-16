@@ -6,7 +6,7 @@ pub use php_runtime::api::JitHelperId;
 
 /// Stable ABI fingerprint for the helper-symbol registry. Bumped whenever the
 /// registry's symbol set or any helper ABI changes.
-pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_481f_0000_0009;
+pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4820_0000_000b;
 
 /// Helper argument kind.
 #[repr(u32)]
@@ -64,6 +64,13 @@ const NATIVE_CONTEXT_POINTERS_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::U64,
     JitHelperArgKind::U64,
 ];
+const NATIVE_FRAME_ALLOC_ARGS: &[JitHelperArgKind] = &[
+    JitHelperArgKind::VmContext,
+    JitHelperArgKind::U64,
+    JitHelperArgKind::U64,
+];
+const NATIVE_FRAME_RELEASE_ARGS: &[JitHelperArgKind] =
+    &[JitHelperArgKind::VmContext, JitHelperArgKind::U64];
 const NATIVE_OP_0_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::VmContext,
     JitHelperArgKind::I64,
@@ -398,6 +405,33 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         has_side_effects: true,
         description: "cooperative execution deadline poll",
     },
+    JitHelperSymbol {
+        id: JitHelperId(44),
+        name: "phrust_native_frame_alloc",
+        args: NATIVE_FRAME_ALLOC_ARGS,
+        returns: JitHelperReturnKind::Value,
+        can_throw: false,
+        has_side_effects: true,
+        description: "bounded request-local native frame allocation",
+    },
+    JitHelperSymbol {
+        id: JitHelperId(45),
+        name: "phrust_native_frame_release",
+        args: NATIVE_FRAME_RELEASE_ARGS,
+        returns: JitHelperReturnKind::Status,
+        can_throw: false,
+        has_side_effects: true,
+        description: "LIFO request-local native frame release",
+    },
+    JitHelperSymbol {
+        id: JitHelperId(46),
+        name: "phrust_native_argument_check",
+        args: NATIVE_OP_5_ARGS,
+        returns: JitHelperReturnKind::Status,
+        can_throw: true,
+        has_side_effects: true,
+        description: "direct-call declared parameter type enforcement",
+    },
 ];
 
 /// Looks up a helper by stable id.
@@ -425,6 +459,8 @@ pub fn resolve_helper_address(
     let helper = lookup_helper_by_id(id)?;
     match helper.name {
         "phrust_jit_native_call_dispatch" => Some(runtime.native_call_dispatch),
+        "phrust_native_frame_alloc" => Some(runtime.native_frame_alloc),
+        "phrust_native_frame_release" => Some(runtime.native_frame_release),
         "phrust_jit_native_dynamic_code" => Some(runtime.native_dynamic_code),
         "phrust_native_unary" => Some(runtime.native_unary),
         "phrust_native_binary" => Some(runtime.native_binary),
@@ -435,6 +471,7 @@ pub fn resolve_helper_address(
         "phrust_native_local_store" => Some(runtime.native_local_store),
         "phrust_native_value_lifecycle" => Some(runtime.native_value_lifecycle),
         "phrust_native_reference_bind" => Some(runtime.native_reference_bind),
+        "phrust_native_argument_check" => Some(runtime.native_argument_check),
         "phrust_native_return_check" => Some(runtime.native_return_check),
         "phrust_native_exception_new" => Some(runtime.native_exception_new),
         "phrust_native_array_new" => Some(runtime.native_array_new),
@@ -505,7 +542,7 @@ mod tests {
             JIT_HELPER_SYMBOLS.first().expect("first").id,
             JitHelperId(14)
         );
-        assert_eq!(JIT_HELPER_SYMBOLS.last().expect("last").id, JitHelperId(43));
+        assert_eq!(JIT_HELPER_SYMBOLS.last().expect("last").id, JitHelperId(46));
     }
 
     #[test]

@@ -45,7 +45,8 @@ pub use code_manager::{
 };
 pub use cranelift_lowering::{
     CraneliftClifSmokeResult, CraneliftLoweringError, CraneliftLoweringStats,
-    CraneliftNativeCompiler, build_trivial_add_clif_smoke,
+    CraneliftNativeCompiler, NativeFunctionKey, NativeFunctionTier, NativeIndirectionCell,
+    NativeIndirectionState, build_trivial_add_clif_smoke,
 };
 pub use dynamic_code::{
     DynamicCodeCacheDisposition, DynamicCodeCacheKey, DynamicCodeCompileError,
@@ -106,6 +107,10 @@ impl CraneliftCompilerIdentity {
 pub struct JitRuntimeHelperAddresses {
     /// Typed dynamic-call resolver/invoker; never an interpreter dispatcher.
     pub native_call_dispatch: usize,
+    /// Allocates bounded request-local native call-frame storage.
+    pub native_frame_alloc: usize,
+    /// Releases the most recent request-local call-frame allocation.
+    pub native_frame_release: usize,
     /// Dynamic include/eval/declaration compiler and native-entry invoker.
     pub native_dynamic_code: usize,
     /// Typed PHP unary operation over native value handles.
@@ -126,6 +131,8 @@ pub struct JitRuntimeHelperAddresses {
     pub native_value_lifecycle: usize,
     /// Creates or propagates one PHP reference cell.
     pub native_reference_bind: usize,
+    /// Enforces one declared PHP function parameter type at a direct call site.
+    pub native_argument_check: usize,
     /// Enforces one declared PHP function return type.
     pub native_return_check: usize,
     /// Materializes one throwable value for explicit native throw flow.
@@ -506,8 +513,33 @@ pub struct JitNativeFunctionEntryMetadata {
     pub function: FunctionId,
     pub address: usize,
     pub arity: u8,
+    /// Exact machine-code bytes emitted for this function body.
+    #[serde(default)]
+    pub code_bytes: u64,
+    /// Cranelift's fixed native spill/temporary frame size. PHP locals and
+    /// call frames live in the request arena and are not included here.
+    #[serde(default)]
+    pub native_stack_bytes: u32,
     /// Local slots required when this function is entered as a graph root.
     pub local_count: u32,
+    /// Statically linked calls reached by one straight-line invocation.
+    #[serde(default)]
+    pub direct_call_sites: u64,
+    /// Monomorphic instance-method subset of `direct_call_sites`.
+    #[serde(default)]
+    pub direct_method_call_sites: u64,
+    /// Calls removed by the bounded scalar-wrapper inliner.
+    #[serde(default)]
+    pub inlined_call_sites: u64,
+    /// Conservative emitted bytes attributed to bounded inlining.
+    #[serde(default)]
+    pub inline_bytes_added: u64,
+    /// Tail calls emitted for this function body.
+    #[serde(default)]
+    pub tail_call_sites: u64,
+    /// Stable rejection categories for direct calls considered by the inliner.
+    #[serde(default)]
+    pub inline_rejected_by_reason: std::collections::BTreeMap<String, u64>,
 }
 
 /// Source-level frame resolved from a native PC without interpreter frames.
@@ -552,6 +584,17 @@ pub struct JitRegionStateMetadata {
     pub native_version: u32,
     /// Statically linked native call sites in this compiled call graph.
     pub compiled_to_compiled_call_sites: u64,
+    /// Monomorphic instance-method subset of compiled native calls.
+    #[serde(default)]
+    pub compiled_to_compiled_method_call_sites: u64,
+    #[serde(default)]
+    pub inlined_call_sites: u64,
+    #[serde(default)]
+    pub inline_bytes_added: u64,
+    #[serde(default)]
+    pub tail_call_sites: u64,
+    #[serde(default)]
+    pub inline_rejected_by_reason: std::collections::BTreeMap<String, u64>,
     pub continuations: Vec<JitContinuationMetadata>,
     pub native_pc_ranges: Vec<JitNativePcRange>,
     pub osr_entries: Vec<JitOsrEntryMetadata>,
@@ -871,6 +914,39 @@ impl JitFunctionHandle {
             .unwrap_or(0)
     }
 
+    /// Monomorphic method calls executed by one successful invocation.
+    #[must_use]
+    pub fn compiled_method_calls_per_invocation(&self) -> u64 {
+        self.region_state_metadata
+            .as_ref()
+            .map(|metadata| metadata.compiled_to_compiled_method_call_sites)
+            .unwrap_or(0)
+    }
+
+    /// Calls removed by bounded native inlining per invocation.
+    #[must_use]
+    pub fn inlined_calls_per_invocation(&self) -> u64 {
+        self.region_state_metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.inlined_call_sites)
+    }
+
+    /// Conservative code bytes added by bounded native inlining.
+    #[must_use]
+    pub fn inline_bytes_added_per_invocation(&self) -> u64 {
+        self.region_state_metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.inline_bytes_added)
+    }
+
+    /// Tail calls emitted per invocation.
+    #[must_use]
+    pub fn tail_calls_per_invocation(&self) -> u64 {
+        self.region_state_metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.tail_call_sites)
+    }
+
     /// Returns precise continuation and native-PC metadata for executable regions.
     #[must_use]
     pub fn region_state_metadata(&self) -> Option<&JitRegionStateMetadata> {
@@ -900,6 +976,13 @@ impl JitFunctionHandle {
 
         let mut root_metadata = metadata.as_ref().clone();
         root_metadata.local_count = function_entry.local_count;
+        root_metadata.compiled_to_compiled_call_sites = function_entry.direct_call_sites;
+        root_metadata.compiled_to_compiled_method_call_sites =
+            function_entry.direct_method_call_sites;
+        root_metadata.inlined_call_sites = function_entry.inlined_call_sites;
+        root_metadata.inline_bytes_added = function_entry.inline_bytes_added;
+        root_metadata.tail_call_sites = function_entry.tail_call_sites;
+        root_metadata.inline_rejected_by_reason = function_entry.inline_rejected_by_reason.clone();
         let mut handle = self.clone();
         handle.id = u64::from(function.raw()) + 1;
         handle.region_id = format!("{}.entry.{}", self.region_id, function.raw());
@@ -2111,6 +2194,50 @@ mod tests {
                 .invoke_i64(&[], crate::JIT_RUNTIME_ABI_HASH)
                 .unwrap(),
             4
+        );
+    }
+
+    #[test]
+    fn compile_large_unit_emits_one_body_set_per_generation() {
+        let mut builder = IrBuilder::new(UnitId::new(45));
+        let file = builder.add_file("large-unit.php");
+        let span = IrSpan::new(file, 0, 8);
+        let constant = builder.intern_constant(IrConstant::Int(7));
+        for index in 0..24 {
+            let function =
+                builder.start_function(format!("function_{index}"), FunctionFlags::default(), span);
+            builder.set_return_type(function, Some(IrReturnType::Int));
+            let block = builder.append_block(function);
+            let result = builder.alloc_register(function);
+            builder.emit(
+                function,
+                block,
+                InstructionKind::LoadConst {
+                    dst: result,
+                    constant,
+                },
+                span,
+            );
+            builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+            builder.register_function_name(format!("function_{index}"), function);
+            if index == 0 {
+                builder.set_entry(function);
+            }
+        }
+        let unit = builder.finish();
+        let mut engine = JitEngine::new();
+        let records = engine
+            .compile_unit(&unit, JitCompileRequest::new("large-whole-unit"))
+            .expect("unit compile records");
+
+        assert_eq!(records.len(), 24);
+        assert_eq!(engine.stats().compile_requests, 1);
+        assert!(records.iter().all(|record| record.result.handle.is_some()));
+        assert!(records[0].result.handle.as_ref().unwrap().code_bytes() > 0);
+        assert!(
+            records[1..]
+                .iter()
+                .all(|record| record.result.handle.as_ref().unwrap().code_bytes() == 0)
         );
     }
 

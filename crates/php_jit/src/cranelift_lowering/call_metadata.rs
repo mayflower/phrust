@@ -50,6 +50,24 @@ pub(super) fn stable_call_symbol_hash(name: &str) -> u64 {
     })
 }
 
+pub(super) fn stable_builtin_helper_id(target: &RegionCallTarget) -> Option<u32> {
+    let RegionCallTarget::Function {
+        name,
+        function: None,
+    } = target
+    else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\').to_ascii_lowercase();
+    if normalized.contains('\\') {
+        return None;
+    }
+    php_runtime::api::BuiltinRegistry::new()
+        .get(&normalized)
+        .map(php_runtime::api::BuiltinEntry::helper_id)
+        .filter(|helper_id| *helper_id != 0)
+}
+
 pub(super) fn native_argument_flags(argument: &php_ir::instruction::IrCallArg) -> u32 {
     let mut flags = crate::JitNativeArgFlags::default();
     if argument.name.is_some() {

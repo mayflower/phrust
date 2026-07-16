@@ -1,22 +1,6 @@
+use super::module_layout::whole_unit_function_order;
 use super::*;
 use std::collections::BTreeSet;
-
-// Each unit function is also published as its own native entry. Large source
-// units therefore compile one root per module instead of reproducing the same
-// transitive bodies dozens of times. Small units retain bounded native-to-
-// native direct-call graphs. Calls beyond the selected bound use the typed
-// native trampoline rather than rebuilding a transitive call graph.
-const SMALL_UNIT_MAX_LOCAL_CALL_GRAPH_FUNCTIONS: usize = 4;
-const LARGE_UNIT_FUNCTION_THRESHOLD: usize = 16;
-const MAX_LOCAL_CALLEE_REGISTERS: u32 = 1024;
-
-const fn max_local_call_graph_functions(unit_function_count: usize) -> usize {
-    if unit_function_count > LARGE_UNIT_FUNCTION_THRESHOLD {
-        1
-    } else {
-        SMALL_UNIT_MAX_LOCAL_CALL_GRAPH_FUNCTIONS
-    }
-}
 
 fn region_contains(
     region: &RegionGraph,
@@ -115,30 +99,22 @@ pub(super) fn compile_region_graph_native(
     let mut trampoline_functions = regions
         .iter()
         .filter_map(|(function, region)| {
-            (!region.exception_regions.is_empty()
-                || region
-                    .params
-                    .iter()
-                    .any(|parameter| parameter.type_.is_some())
-                || region.params.iter().any(|parameter| parameter.by_ref)
-                || region_contains(region, |kind| {
-                    matches!(
-                        kind,
-                        RegionInstructionKind::NativeControl(RegionNativeControl::Throw { .. })
-                            | RegionInstructionKind::NativeDynamicCode(
-                                RegionNativeDynamicCode::MakeClosure { .. }
-                            )
+            (region_contains(region, |kind| {
+                matches!(
+                    kind,
+                    RegionInstructionKind::NativeDynamicCode(
+                        RegionNativeDynamicCode::MakeClosure { .. }
                     )
-                })
-                || region.attributes.iter().any(|attribute| {
-                    attribute
-                        .resolved_name
-                        .as_deref()
-                        .or(attribute.fallback_name.as_deref())
-                        .unwrap_or(&attribute.name)
-                        .trim_start_matches('\\')
-                        .eq_ignore_ascii_case("deprecated")
-                }))
+                )
+            }) || region.attributes.iter().any(|attribute| {
+                attribute
+                    .resolved_name
+                    .as_deref()
+                    .or(attribute.fallback_name.as_deref())
+                    .unwrap_or(&attribute.name)
+                    .trim_start_matches('\\')
+                    .eq_ignore_ascii_case("deprecated")
+            }))
             .then_some(*function)
         })
         .collect::<BTreeSet<_>>();
@@ -173,6 +149,13 @@ pub(super) fn compile_region_graph_native(
                 )
             })
     });
+    let needs_frame_arena = runtime_helpers.native_frame_alloc != 0
+        && runtime_helpers.native_frame_release != 0
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(_))
+            })
+        });
     if needs_call_trampoline && runtime_helpers.native_call_dispatch == 0 {
         return Err(CraneliftLoweringError::new(
             "JIT_CRANELIFT_REJECT_NATIVE_CALL_TRAMPOLINE",
@@ -269,6 +252,12 @@ pub(super) fn compile_region_graph_native(
     // lowering cannot accidentally make an otherwise supported function
     // uncompilable.
     let needs_reference_bind = true;
+    let needs_argument_check = regions.values().any(|region| {
+        region
+            .params
+            .iter()
+            .any(|parameter| parameter.type_.is_some())
+    });
     let _has_explicit_reference_bind = regions.values().any(|region| {
         region_contains(region, |kind| {
             matches!(
@@ -443,6 +432,16 @@ pub(super) fn compile_region_graph_native(
             runtime_helpers.native_call_dispatch,
         ));
     }
+    if needs_frame_arena {
+        imports.push((
+            "phrust_native_frame_alloc".to_owned(),
+            runtime_helpers.native_frame_alloc,
+        ));
+        imports.push((
+            "phrust_native_frame_release".to_owned(),
+            runtime_helpers.native_frame_release,
+        ));
+    }
     if needs_dynamic_code {
         imports.push((
             native_dynamic_code_symbol.clone(),
@@ -503,6 +502,12 @@ pub(super) fn compile_region_graph_native(
             runtime_helpers.native_reference_bind,
             test_native_reference_bind_fallback as *const () as usize,
             "phrust_native_reference_bind",
+        ),
+        (
+            needs_argument_check,
+            runtime_helpers.native_argument_check,
+            test_native_argument_check_fallback as *const () as usize,
+            "phrust_native_argument_check",
         ),
         (
             needs_return_check,
@@ -687,6 +692,29 @@ pub(super) fn compile_region_graph_native(
             };
             let mut native_operations = NativeOperationFunctions::default();
             let pointer_type = module.target_config().pointer_type();
+            if needs_frame_arena {
+                let mut alloc_signature = module.make_signature();
+                alloc_signature.params.push(AbiParam::new(types::I64));
+                alloc_signature.params.push(AbiParam::new(types::I64));
+                alloc_signature.params.push(AbiParam::new(types::I64));
+                alloc_signature.returns.push(AbiParam::new(pointer_type));
+                native_operations.frame_alloc = Some(declare_native_helper(
+                    module,
+                    "phrust_native_frame_alloc",
+                    &alloc_signature,
+                    helper_address("phrust_native_frame_alloc"),
+                )?);
+                let mut release_signature = module.make_signature();
+                release_signature.params.push(AbiParam::new(types::I64));
+                release_signature.params.push(AbiParam::new(pointer_type));
+                release_signature.returns.push(AbiParam::new(types::I32));
+                native_operations.frame_release = Some(declare_native_helper(
+                    module,
+                    "phrust_native_frame_release",
+                    &release_signature,
+                    helper_address("phrust_native_frame_release"),
+                )?);
+            }
             if needs_unary {
                 native_operations.unary = Some(declare_value_operation(
                     module,
@@ -761,6 +789,14 @@ pub(super) fn compile_region_graph_native(
                     "phrust_native_reference_bind",
                     3,
                     helper_address("phrust_native_reference_bind"),
+                )?);
+            }
+            if needs_argument_check {
+                native_operations.argument_check = Some(declare_value_operation(
+                    module,
+                    "phrust_native_argument_check",
+                    5,
+                    helper_address("phrust_native_argument_check"),
                 )?);
             }
             if needs_return_check {
@@ -957,12 +993,30 @@ pub(super) fn compile_region_graph_native(
                     })?;
                 functions.insert(candidate.function, func_id);
             }
+            let inline_constants = regions
+                .iter()
+                .filter_map(|(function, region)| {
+                    bounded_inline_constant_return(region).map(|value| (*function, value))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let tail_forwards = regions
+                .values()
+                .flat_map(|candidate| {
+                    candidate.blocks.iter().filter_map(|block| {
+                        let (continuation, target) =
+                            bounded_tail_forward_target(candidate, block, &regions)?;
+                        (!trampoline_functions.contains(&target))
+                            .then_some(((candidate.function, continuation), target))
+                    })
+                })
+                .collect::<BTreeMap<_, _>>();
 
             let mut code_bytes = 0_u64;
             let mut native_pc_ranges = Vec::new();
             let mut relocatable_bytes = Vec::new();
             let mut relocatable_functions = Vec::new();
             let mut relocatable_relocations = Vec::new();
+            let mut function_code_metrics = BTreeMap::new();
             // Keep parameter metadata for every function in the source unit,
             // including callees deliberately omitted from a bounded local
             // call graph. The typed trampoline still needs the declared
@@ -1033,6 +1087,8 @@ pub(super) fn compile_region_graph_native(
                     &unit.constants,
                     func_id,
                     &functions,
+                    &inline_constants,
+                    &tail_forwards,
                     &function_params,
                     native_call_helper,
                     native_dynamic_code_helper,
@@ -1052,6 +1108,10 @@ pub(super) fn compile_region_graph_native(
                 relocatable_bytes.resize(relocatable_bytes.len().saturating_add(padding), 0);
                 let code_offset = relocatable_bytes.len() as u64;
                 let candidate_bytes = defined.code.len() as u64;
+                function_code_metrics.insert(
+                    candidate.function,
+                    (candidate_bytes, defined.native_stack_bytes),
+                );
                 relocatable_bytes.extend_from_slice(&defined.code);
                 for relocation in &mut defined.relocations {
                     relocation.offset = relocation.offset.saturating_add(code_offset);
@@ -1096,18 +1156,80 @@ pub(super) fn compile_region_graph_native(
             let function_entries = regions
                 .values()
                 .map(|candidate| {
+                    let (function_code_bytes, native_stack_bytes) =
+                        function_code_metrics[&candidate.function];
                     Ok(crate::JitNativeFunctionEntryMetadata {
                         function: candidate.function,
                         address: module.get_finalized_function(functions[&candidate.function])
                             as usize,
                         arity: region_arity(candidate)?,
+                        code_bytes: function_code_bytes,
+                        native_stack_bytes,
                         local_count: candidate.local_count,
+                        direct_call_sites: candidate
+                            .blocks
+                            .iter()
+                            .flat_map(|block| &block.instructions)
+                            .filter(|instruction| {
+                                matches!(&instruction.kind, RegionInstructionKind::NativeCall(call)
+                                if call.direct_compiled_target().is_some_and(|target| {
+                                    regions.contains_key(&target)
+                                        && !trampoline_functions.contains(&target)
+                                        && !(call.operands.is_empty()
+                                            && inline_constants.contains_key(&target))
+                                }))
+                            })
+                            .count() as u64,
+                        direct_method_call_sites: candidate
+                            .blocks
+                            .iter()
+                            .flat_map(|block| &block.instructions)
+                            .filter(|instruction| {
+                                matches!(&instruction.kind, RegionInstructionKind::NativeCall(call)
+                                if call.argument_operand_offset == 1
+                                    && call.direct_compiled_target().is_some_and(|target| {
+                                        regions.contains_key(&target)
+                                            && !trampoline_functions.contains(&target)
+                                    }))
+                            })
+                            .count() as u64,
+                        inlined_call_sites: candidate
+                            .blocks
+                            .iter()
+                            .flat_map(|block| &block.instructions)
+                            .filter(|instruction| {
+                                matches!(&instruction.kind, RegionInstructionKind::NativeCall(call)
+                                if call.operands.is_empty()
+                                    && call.direct_compiled_target().is_some_and(|target| {
+                                        inline_constants.contains_key(&target)
+                                    }))
+                            })
+                            .count() as u64,
+                        inline_bytes_added: candidate
+                            .blocks
+                            .iter()
+                            .flat_map(|block| &block.instructions)
+                            .filter(|instruction| {
+                                matches!(&instruction.kind, RegionInstructionKind::NativeCall(call)
+                                if call.operands.is_empty()
+                                    && call.direct_compiled_target().is_some_and(|target| {
+                                        inline_constants.contains_key(&target)
+                                    }))
+                            })
+                            .count() as u64
+                            * 8,
+                        tail_call_sites: tail_forwards
+                            .keys()
+                            .filter(|(function, _)| *function == candidate.function)
+                            .count() as u64,
+                        inline_rejected_by_reason: inline_rejection_counts(candidate, &regions),
                     })
                 })
                 .collect::<Result<Vec<_>, CraneliftLoweringError>>()?;
             let root = functions[&function];
             let address = module.get_finalized_function(root) as usize;
             let region_state_metadata = region_graph_metadata(
+                function,
                 region.local_count,
                 regions.values(),
                 native_pc_ranges,
@@ -1147,35 +1269,24 @@ fn collect_region_graphs(
     unit: &IrUnit,
     root: &RegionGraph,
 ) -> Result<BTreeMap<FunctionId, RegionGraph>, CraneliftLoweringError> {
-    let max_functions = max_local_call_graph_functions(unit.functions.len());
     let mut regions = BTreeMap::new();
-    regions.insert(root.function, root.clone());
-    let mut pending = root.direct_callees();
-    pending.extend(dynamic_class_body_functions(unit, root));
-    while let Some(function) = pending.pop() {
-        if regions.contains_key(&function) {
-            continue;
-        }
-        if regions.len() >= max_functions {
-            continue;
-        }
-        let region = BaselineRegionBuilder::build(unit, function, &root.compile_metadata).map_err(
-            |error| {
-                CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_DIRECT_CALLEE",
-                    format!(
-                        "direct callee {} is not executable: {error}",
-                        function.raw()
-                    ),
-                )
-            },
-        )?;
+    for function in whole_unit_function_order(unit, root.function) {
+        let region = if function == root.function {
+            root.clone()
+        } else {
+            BaselineRegionBuilder::build(unit, function, &root.compile_metadata).map_err(
+                |error| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_UNIT_FUNCTION",
+                        format!(
+                            "unit function {} is not executable: {error}",
+                            function.raw()
+                        ),
+                    )
+                },
+            )?
+        };
         validate_region_native_coverage(&region)?;
-        if region.register_count > MAX_LOCAL_CALLEE_REGISTERS {
-            continue;
-        }
-        pending.extend(region.direct_callees());
-        pending.extend(dynamic_class_body_functions(unit, &region));
         regions.insert(function, region);
     }
     for region in regions.values() {
@@ -1184,33 +1295,6 @@ fn collect_region_graphs(
         })?;
     }
     Ok(regions)
-}
-
-fn dynamic_class_body_functions(unit: &IrUnit, region: &RegionGraph) -> Vec<FunctionId> {
-    let declared = region
-        .blocks
-        .iter()
-        .flat_map(|block| &block.instructions)
-        .filter_map(|instruction| {
-            let RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::DeclareClass {
-                name,
-            }) = &instruction.kind
-            else {
-                return None;
-            };
-            Some(name)
-        });
-    let mut functions = std::collections::BTreeSet::new();
-    for name in declared {
-        if let Some(class) = unit
-            .classes
-            .iter()
-            .find(|class| class.name.eq_ignore_ascii_case(name))
-        {
-            functions.extend(class.methods.iter().map(|method| method.function));
-        }
-    }
-    functions.into_iter().collect()
 }
 
 fn validate_region_native_coverage(region: &RegionGraph) -> Result<(), CraneliftLoweringError> {
@@ -1349,6 +1433,190 @@ fn region_register_types(region: &RegionGraph) -> BTreeMap<RegId, ir::Type> {
         .collect()
 }
 
+/// Deliberately tiny first inlining tier. It handles only a stable zero-arity
+/// function whose complete body returns one scalar constant. This preserves a
+/// hard code-growth bound and cannot recursively inline a call graph.
+fn bounded_inline_constant_return(region: &RegionGraph) -> Option<RegionOperand> {
+    if !region.params.is_empty()
+        || region.return_type.is_some()
+        || region.flags.is_method
+        || region.flags.is_closure
+        || region.flags.is_generator
+        || region.blocks.len() != 1
+    {
+        return None;
+    }
+    let block = &region.blocks[0];
+    let RegionTerminator::Return {
+        value,
+        finally: None,
+    } = block.terminator
+    else {
+        return None;
+    };
+    match block.instructions.as_slice() {
+        [] if matches!(value, RegionOperand::I64(_) | RegionOperand::Constant(_)) => Some(value),
+        [
+            RegionInstruction {
+                kind: RegionInstructionKind::Move { dst, src },
+                ..
+            },
+        ] if value == RegionOperand::Register(*dst)
+            && matches!(src, RegionOperand::I64(_) | RegionOperand::Constant(_)) =>
+        {
+            Some(*src)
+        }
+        _ => None,
+    }
+}
+
+fn bounded_inline_rejection(region: &RegionGraph) -> &'static str {
+    if !region.params.is_empty() {
+        "arguments"
+    } else if region.flags.is_method || region.flags.is_closure {
+        "receiver-or-closure-environment"
+    } else if region.flags.is_generator {
+        "suspension"
+    } else if region.return_type.is_some() {
+        "return-type-check"
+    } else if region.blocks.len() != 1 {
+        "control-flow-complexity"
+    } else {
+        "not-constant-wrapper"
+    }
+}
+
+fn inline_rejection_counts(
+    caller: &RegionGraph,
+    regions: &BTreeMap<FunctionId, RegionGraph>,
+) -> BTreeMap<String, u64> {
+    let mut reasons = BTreeMap::new();
+    for call in caller
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::NativeCall(call) => Some(call),
+            _ => None,
+        })
+    {
+        let Some(target) = call.direct_compiled_target() else {
+            continue;
+        };
+        let Some(callee) = regions.get(&target) else {
+            continue;
+        };
+        if call.operands.is_empty() && bounded_inline_constant_return(callee).is_some() {
+            continue;
+        }
+        let reason = if call.operands.is_empty() {
+            bounded_inline_rejection(callee)
+        } else {
+            "arguments-or-receiver"
+        };
+        let count = reasons.entry(reason.to_owned()).or_insert(0_u64);
+        *count = count.saturating_add(1);
+    }
+    reasons
+}
+
+/// Selects the deliberately small tail-call subset whose callee can consume
+/// the caller's packed argument buffer directly. This avoids allocating a
+/// second arena frame and transfers the caller's argument ownership exactly
+/// once. More general tail calls need an owned-frame transfer protocol.
+fn bounded_tail_forward_target(
+    region: &RegionGraph,
+    block: &crate::region_ir::RegionBlock,
+    regions: &BTreeMap<FunctionId, RegionGraph>,
+) -> Option<(u32, FunctionId)> {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (region, block, regions);
+        return None;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let RegionTerminator::Return {
+            value: RegionOperand::Register(returned),
+            finally: None,
+        } = &block.terminator
+        else {
+            return None;
+        };
+        let (last, prefix) = block.instructions.split_last()?;
+        let RegionInstructionKind::NativeCall(call) = &last.kind else {
+            return None;
+        };
+        let RegionCallResult::Register(destination) = call.result else {
+            return None;
+        };
+        let target = call.direct_compiled_target()?;
+        let callee = regions.get(&target)?;
+        if destination != *returned
+            || target == region.function
+            || call.argument_operand_offset != 0
+            || call.variadic
+            || call.returns_by_reference
+            || region.returns_by_ref
+            || callee.returns_by_ref
+            || region.params != callee.params
+            || region.return_type != callee.return_type
+            || !region.exception_regions.is_empty()
+            || !callee.exception_regions.is_empty()
+            || region.flags.is_generator
+            || region.flags.is_closure
+            || region.flags.is_method
+            || callee.flags.is_generator
+            || callee.flags.is_closure
+            || callee.flags.is_method
+            || prefix.len() != region.parameter_locals.len()
+            || call.operands.len() != region.parameter_locals.len()
+            || !callee
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .all(|instruction| {
+                    matches!(
+                        instruction.kind,
+                        RegionInstructionKind::Nop
+                            | RegionInstructionKind::Move { .. }
+                            | RegionInstructionKind::LoadLocal { .. }
+                    )
+                })
+        {
+            return None;
+        }
+        for (((instruction, local), operand), parameter) in prefix
+            .iter()
+            .zip(&region.parameter_locals)
+            .zip(&call.operands)
+            .zip(&call.args)
+        {
+            let RegionInstructionKind::LoadLocal {
+                dst,
+                local: loaded,
+                quiet: false,
+            } = &instruction.kind
+            else {
+                return None;
+            };
+            if *loaded != *local
+                || *operand != Some(RegionOperand::Register(*dst))
+                || parameter.name.is_some()
+                || parameter.unpack
+                || parameter.by_ref_local.is_some()
+                || parameter.by_ref_dim.is_some()
+                || parameter.by_ref_property.is_some()
+                || parameter.by_ref_property_dim.is_some()
+            {
+                return None;
+            }
+        }
+        Some((last.continuation_id, target))
+    }
+}
+
 fn region_graph_signature(
     module: &JITModule,
     region: &RegionGraph,
@@ -1356,6 +1624,14 @@ fn region_graph_signature(
     region_arity(region)?;
     let pointer_type = module.target_config().pointer_type();
     let mut signature = module.make_signature();
+    // Cranelift's x86-64 tail convention preserves the platform argument ABI
+    // while enabling `return_call`. Other supported hosts reserve different
+    // argument registers for that convention, so they retain the host ABI and
+    // the bounded transform stays disabled there.
+    #[cfg(target_arch = "x86_64")]
+    {
+        signature.call_conv = CallConv::Tail;
+    }
     // Region arguments use a packed pointer so PHP functions are not limited
     // by a host-language list of monomorphic FFI signatures.
     signature.params.push(AbiParam::new(pointer_type));
@@ -1372,7 +1648,10 @@ struct DefinedRegionFunction {
     alignment: u64,
     relocations: Vec<crate::JitRelocatableRelocation>,
     native_pc_ranges: Vec<crate::JitNativePcRange>,
+    native_stack_bytes: u32,
 }
+
+const MAX_NATIVE_SPILL_FRAME_BYTES: u32 = 1024 * 1024;
 
 fn supported_relocation_kind(kind: Reloc) -> Option<crate::JitRelocatableKind> {
     match kind {
@@ -1480,6 +1759,8 @@ fn define_region_graph_function(
     constants: &[IrConstant],
     func_id: FuncId,
     functions: &BTreeMap<FunctionId, FuncId>,
+    inline_constants: &BTreeMap<FunctionId, RegionOperand>,
+    tail_forwards: &BTreeMap<(FunctionId, u32), FunctionId>,
     function_params: &BTreeMap<FunctionId, NativeFunctionMetadata>,
     native_call_helper: Option<NativeHelper>,
     native_dynamic_code_helper: Option<NativeHelper>,
@@ -1827,10 +2108,22 @@ fn define_region_graph_function(
                 builder.set_srcloc(ir::SourceLoc::new(
                     instruction.continuation_id.saturating_add(1),
                 ));
+                if let Some(target) = tail_forwards
+                    .get(&(region.function, instruction.continuation_id))
+                    .and_then(|target| functions.get(target))
+                {
+                    let callee = module.declare_func_in_func(*target, builder.func);
+                    builder.ins().return_call(
+                        callee,
+                        &[arguments, result_out, deopt_out, resume_id, resume_state],
+                    );
+                    continue;
+                }
                 lower_region_instruction(
                     module,
                     &mut builder,
                     functions,
+                    inline_constants,
                     function_params,
                     native_call_helper,
                     native_dynamic_code_helper,
@@ -1904,6 +2197,19 @@ fn define_region_graph_function(
             "Cranelift returned no compiled machine-code buffer",
         )
     })?;
+    let native_stack_bytes = compiled
+        .buffer
+        .frame_layout()
+        .map_or(0, |layout| layout.frame_to_fp_offset);
+    if native_stack_bytes > MAX_NATIVE_SPILL_FRAME_BYTES {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_NATIVE_STACK_LIMIT",
+            format!(
+                "function {} requires {native_stack_bytes} native stack bytes; limit is {MAX_NATIVE_SPILL_FRAME_BYTES}",
+                region.function_name
+            ),
+        ));
+    }
     let code = compiled.code_buffer().to_vec();
     let alignment = u64::from(compiled.buffer.alignment)
         .max(module.isa().function_alignment().minimum as u64)
@@ -1940,10 +2246,12 @@ fn define_region_graph_function(
         alignment,
         relocations,
         native_pc_ranges,
+        native_stack_bytes,
     })
 }
 
 fn region_graph_metadata<'a>(
+    root: FunctionId,
     root_local_count: u32,
     regions: impl Iterator<Item = &'a RegionGraph>,
     native_pc_ranges: Vec<crate::JitNativePcRange>,
@@ -1991,6 +2299,26 @@ fn region_graph_metadata<'a>(
                 })
         })
         .collect();
+    let root_direct_call_sites = function_entries
+        .iter()
+        .find(|entry| entry.function == root)
+        .map_or(0, |entry| entry.direct_call_sites);
+    let root_direct_method_call_sites = function_entries
+        .iter()
+        .find(|entry| entry.function == root)
+        .map_or(0, |entry| entry.direct_method_call_sites);
+    let root_inlining = function_entries
+        .iter()
+        .find(|entry| entry.function == root)
+        .map(|entry| {
+            (
+                entry.inlined_call_sites,
+                entry.inline_bytes_added,
+                entry.tail_call_sites,
+                entry.inline_rejected_by_reason.clone(),
+            )
+        })
+        .unwrap_or_default();
     crate::JitRegionStateMetadata {
         local_count: root_local_count,
         compiler_tier: regions
@@ -2002,23 +2330,12 @@ fn region_graph_metadata<'a>(
                 region.compile_metadata.tier == NativeCompilerTier::Optimizing
             }),
         ),
-        compiled_to_compiled_call_sites: regions
-            .iter()
-            .flat_map(|region| &region.blocks)
-            .flat_map(|block| &block.instructions)
-            .filter(|instruction| {
-                matches!(
-                    instruction.kind,
-                    RegionInstructionKind::NativeCall(RegionNativeCall {
-                        target: RegionCallTarget::Function {
-                            function: Some(_),
-                            ..
-                        },
-                        ..
-                    })
-                )
-            })
-            .count() as u64,
+        compiled_to_compiled_call_sites: root_direct_call_sites,
+        compiled_to_compiled_method_call_sites: root_direct_method_call_sites,
+        inlined_call_sites: root_inlining.0,
+        inline_bytes_added: root_inlining.1,
+        tail_call_sites: root_inlining.2,
+        inline_rejected_by_reason: root_inlining.3,
         continuations,
         native_pc_ranges,
         osr_entries,
@@ -2209,12 +2526,6 @@ fn region_graph_metadata<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::max_local_call_graph_functions;
-
-    #[test]
-    fn large_units_publish_one_root_per_native_module() {
-        assert_eq!(max_local_call_graph_functions(16), 4);
-        assert_eq!(max_local_call_graph_functions(17), 1);
-        assert_eq!(max_local_call_graph_functions(128), 1);
-    }
+    // Module-layout invariants are tested in `module_layout`; executable tests
+    // exercise the resulting multi-function publication and invocation path.
 }

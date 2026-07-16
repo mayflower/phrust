@@ -7,7 +7,7 @@ Performance does not add production shared memory code.
 
 | Option | Scope | Benefits | Risks |
 | --- | --- | --- | --- |
-| PNA1 native artifact cache | Existing process-restart boundary | Reuses validated native code, simple inspection, no shared mutable memory | Filesystem latency, target/ABI coupling, dependency invalidation still conservative |
+| PNA2 native unit-bundle cache | Existing process-restart boundary | Reuses validated deduplicated native code, simple inspection, no shared mutable memory | Filesystem latency, target/ABI coupling, dependency invalidation still conservative |
 | Memory-mapped file | Future cache reader over immutable cache files | Kernel page cache sharing, lower copy overhead, simple read-only mapping model | File truncation races, platform-specific mmap semantics, needs strict header/version checks |
 | Process-local cache | In-memory cache inside one long-lived worker | Fastest simple lookup, no cross-process synchronization | Duplication across workers, request isolation concerns, daemon lifecycle invalidation required |
 | Shared memory cache | Future SAPI/FPM/daemon shared arena | Cross-worker reuse, potential preload support | Hardest security model, stale dependency risk, permissions, crash recovery, ABI/version compatibility |
@@ -41,7 +41,7 @@ must include:
 
 ## Recommendation
 
-Future runtime research should prototype immutable mmap reads over the PNA1
+Future runtime research should prototype immutable mmap reads over the PNA2
 format before attempting mutable shared memory. PHPT runtime or a dedicated SAPI
 layer can evaluate a shared arena after daemon lifecycle, preload semantics,
 and dependency invalidation are specified.

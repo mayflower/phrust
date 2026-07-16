@@ -248,6 +248,12 @@ impl NativeRuntimeTelemetry {
             self.function_time_nanos[index] =
                 self.function_time_nanos[index].saturating_add(exclusive);
         }
+        let inclusive_time = self
+            .counters
+            .runtime_helper_inclusive_time_nanos_by_id
+            .entry(helper_id.to_owned())
+            .or_default();
+        *inclusive_time = inclusive_time.saturating_add(elapsed);
         if let Some(parent) = self.helper_timing_stack.last_mut() {
             parent.child_time_nanos = parent.child_time_nanos.saturating_add(elapsed);
         }
@@ -309,6 +315,13 @@ impl NativeExecutionContext<'_> {
                 .saturating_add(registers);
             counters.native_ownership_moves = counters.native_ownership_moves.saturating_add(moves);
         }
+        counters.native_frame_arena_capacity_bytes =
+            self.native_frame_arena.capacity_bytes() as u64;
+        counters.native_frame_arena_high_water_bytes =
+            self.native_frame_arena.high_water_bytes() as u64;
+        let (stack_virtual, stack_committed) = current_php_worker_stack_bytes();
+        counters.native_worker_stack_virtual_bytes = stack_virtual;
+        counters.native_worker_stack_committed_bytes = stack_committed;
         counters
     }
 
@@ -377,6 +390,111 @@ impl NativeExecutionContext<'_> {
             .collect()
     }
 
+    pub(in crate::vm) fn record_native_direct_calls(&self, handle: &php_jit::JitFunctionHandle) {
+        if !self.options.collect_counters {
+            return;
+        }
+        let calls = handle.compiled_to_compiled_calls_per_invocation();
+        let method_calls = handle.compiled_method_calls_per_invocation();
+        let inlined_calls = handle.inlined_calls_per_invocation();
+        let stable_calls = calls.saturating_add(inlined_calls);
+        let mut telemetry = self.runtime_telemetry.borrow_mut();
+        if let Some(metadata) = handle.region_state_metadata() {
+            let mut unit_code_bytes = 0_u64;
+            for entry in &metadata.function_entries {
+                let key = format!("{}:{}", self.unit_identity, entry.function.raw());
+                telemetry
+                    .counters
+                    .native_code_bytes_by_function
+                    .insert(key.clone(), entry.code_bytes);
+                telemetry
+                    .counters
+                    .native_stack_bytes_by_function
+                    .insert(key, u64::from(entry.native_stack_bytes));
+                unit_code_bytes = unit_code_bytes.saturating_add(entry.code_bytes);
+            }
+            telemetry
+                .counters
+                .native_code_bytes_by_unit
+                .insert(self.unit_identity.to_string(), unit_code_bytes);
+        }
+        telemetry.counters.native_call_direct = telemetry
+            .counters
+            .native_call_direct
+            .saturating_add(stable_calls);
+        telemetry.counters.native_callsite_total = telemetry
+            .counters
+            .native_callsite_total
+            .saturating_add(stable_calls);
+        telemetry.counters.native_same_unit_direct_eligible = telemetry
+            .counters
+            .native_same_unit_direct_eligible
+            .saturating_add(stable_calls);
+        telemetry.counters.native_same_unit_direct_executed = telemetry
+            .counters
+            .native_same_unit_direct_executed
+            .saturating_add(stable_calls);
+        telemetry.counters.native_method_monomorphic_eligible = telemetry
+            .counters
+            .native_method_monomorphic_eligible
+            .saturating_add(method_calls);
+        telemetry.counters.native_method_monomorphic_executed = telemetry
+            .counters
+            .native_method_monomorphic_executed
+            .saturating_add(method_calls);
+        telemetry.counters.native_inlined_calls = telemetry
+            .counters
+            .native_inlined_calls
+            .saturating_add(inlined_calls);
+        telemetry.counters.native_inline_calls_removed = telemetry
+            .counters
+            .native_inline_calls_removed
+            .saturating_add(inlined_calls);
+        telemetry.counters.native_inline_bytes_added = telemetry
+            .counters
+            .native_inline_bytes_added
+            .saturating_add(handle.inline_bytes_added_per_invocation());
+        telemetry.counters.native_tail_calls = telemetry
+            .counters
+            .native_tail_calls
+            .saturating_add(handle.tail_calls_per_invocation());
+        if let Some(metadata) = handle.region_state_metadata() {
+            merge_counter_map(
+                &mut telemetry.counters.native_inline_rejected_by_reason,
+                &metadata.inline_rejected_by_reason,
+            );
+        }
+    }
+
+    pub(super) fn record_native_method_pic(&self, executed: bool) {
+        if !self.options.collect_counters {
+            return;
+        }
+        let mut telemetry = self.runtime_telemetry.borrow_mut();
+        telemetry.counters.native_method_monomorphic_eligible = telemetry
+            .counters
+            .native_method_monomorphic_eligible
+            .saturating_add(1);
+        if !executed {
+            return;
+        }
+        telemetry.counters.native_method_monomorphic_executed = telemetry
+            .counters
+            .native_method_monomorphic_executed
+            .saturating_add(1);
+        telemetry.counters.native_call_dynamic =
+            telemetry.counters.native_call_dynamic.saturating_sub(1);
+        telemetry.counters.native_call_direct =
+            telemetry.counters.native_call_direct.saturating_add(1);
+        if let Some(count) = telemetry
+            .counters
+            .native_call_dynamic_by_reason
+            .get_mut("method polymorphism")
+        {
+            *count = count.saturating_sub(1);
+        }
+    }
+
     pub(super) fn merge_nested_runtime_counters(
         &self,
         nested: &crate::counters::VmCounters,
@@ -399,6 +517,51 @@ impl NativeExecutionContext<'_> {
         counters.native_call_dynamic = counters
             .native_call_dynamic
             .saturating_add(nested.native_call_dynamic);
+        counters.native_callsite_total = counters
+            .native_callsite_total
+            .saturating_add(nested.native_callsite_total);
+        counters.native_same_unit_direct_eligible = counters
+            .native_same_unit_direct_eligible
+            .saturating_add(nested.native_same_unit_direct_eligible);
+        counters.native_same_unit_direct_executed = counters
+            .native_same_unit_direct_executed
+            .saturating_add(nested.native_same_unit_direct_executed);
+        counters.native_cross_unit_direct_eligible = counters
+            .native_cross_unit_direct_eligible
+            .saturating_add(nested.native_cross_unit_direct_eligible);
+        counters.native_cross_unit_direct_executed = counters
+            .native_cross_unit_direct_executed
+            .saturating_add(nested.native_cross_unit_direct_executed);
+        counters.native_method_monomorphic_eligible = counters
+            .native_method_monomorphic_eligible
+            .saturating_add(nested.native_method_monomorphic_eligible);
+        counters.native_method_monomorphic_executed = counters
+            .native_method_monomorphic_executed
+            .saturating_add(nested.native_method_monomorphic_executed);
+        counters.native_builtin_direct_eligible = counters
+            .native_builtin_direct_eligible
+            .saturating_add(nested.native_builtin_direct_eligible);
+        counters.native_builtin_direct_executed = counters
+            .native_builtin_direct_executed
+            .saturating_add(nested.native_builtin_direct_executed);
+        counters.native_call_argument_allocation_bytes = counters
+            .native_call_argument_allocation_bytes
+            .saturating_add(nested.native_call_argument_allocation_bytes);
+        counters.native_call_frame_bytes = counters
+            .native_call_frame_bytes
+            .saturating_add(nested.native_call_frame_bytes);
+        counters.native_inlined_calls = counters
+            .native_inlined_calls
+            .saturating_add(nested.native_inlined_calls);
+        counters.native_inline_bytes_added = counters
+            .native_inline_bytes_added
+            .saturating_add(nested.native_inline_bytes_added);
+        counters.native_inline_calls_removed = counters
+            .native_inline_calls_removed
+            .saturating_add(nested.native_inline_calls_removed);
+        counters.native_tail_calls = counters
+            .native_tail_calls
+            .saturating_add(nested.native_tail_calls);
         counters.native_transition_count = counters
             .native_transition_count
             .saturating_add(nested.native_transition_count);
@@ -459,8 +622,44 @@ impl NativeExecutionContext<'_> {
             &nested.native_transition_by_reason,
         );
         merge_counter_map(
+            &mut counters.native_call_dynamic_by_reason,
+            &nested.native_call_dynamic_by_reason,
+        );
+        merge_gauge_map_max(
+            &mut counters.native_code_bytes_by_function,
+            &nested.native_code_bytes_by_function,
+        );
+        merge_gauge_map_max(
+            &mut counters.native_code_bytes_by_unit,
+            &nested.native_code_bytes_by_unit,
+        );
+        merge_gauge_map_max(
+            &mut counters.native_stack_bytes_by_function,
+            &nested.native_stack_bytes_by_function,
+        );
+        merge_counter_map(
+            &mut counters.native_inline_rejected_by_reason,
+            &nested.native_inline_rejected_by_reason,
+        );
+        merge_counter_map(
+            &mut counters.native_callsite_calls_by_id,
+            &nested.native_callsite_calls_by_id,
+        );
+        merge_counter_map(
+            &mut counters.native_callsite_inclusive_time_nanos_by_id,
+            &nested.native_callsite_inclusive_time_nanos_by_id,
+        );
+        merge_counter_map(
+            &mut counters.native_callsite_exclusive_time_nanos_by_id,
+            &nested.native_callsite_exclusive_time_nanos_by_id,
+        );
+        merge_counter_map(
             &mut counters.native_transition_time_nanos_by_reason,
             &nested.native_transition_time_nanos_by_reason,
+        );
+        merge_counter_map(
+            &mut counters.runtime_helper_inclusive_time_nanos_by_id,
+            &nested.runtime_helper_inclusive_time_nanos_by_id,
         );
         for (name, value) in &nested.runtime_helper_calls_by_id {
             let index = helper_index(name);
@@ -536,6 +735,36 @@ impl NativeExecutionContext<'_> {
             .helper_timing_stack
             .last()
             .map_or(0, |frame| frame.child_time_nanos)
+    }
+
+    pub(super) fn record_native_callsite_timing(
+        &self,
+        function: u32,
+        block: u32,
+        instruction: u32,
+        inclusive_nanos: u64,
+        child_nanos: u64,
+    ) {
+        let id = format!("{function}:{block}:{instruction}");
+        let mut telemetry = self.runtime_telemetry.borrow_mut();
+        let calls = telemetry
+            .counters
+            .native_callsite_calls_by_id
+            .entry(id.clone())
+            .or_default();
+        *calls = calls.saturating_add(1);
+        let inclusive = telemetry
+            .counters
+            .native_callsite_inclusive_time_nanos_by_id
+            .entry(id.clone())
+            .or_default();
+        *inclusive = inclusive.saturating_add(inclusive_nanos);
+        let exclusive = telemetry
+            .counters
+            .native_callsite_exclusive_time_nanos_by_id
+            .entry(id)
+            .or_default();
+        *exclusive = exclusive.saturating_add(inclusive_nanos.saturating_sub(child_nanos));
     }
 
     pub(super) fn record_object_release_root_check(&self, fast_path: bool) {
@@ -736,6 +965,44 @@ fn merge_named_scratch<const N: usize>(
     }
 }
 
+fn current_php_worker_stack_bytes() -> (u64, u64) {
+    let current = std::thread::current();
+    if !current
+        .name()
+        .is_some_and(|name| name.starts_with("php-worker-"))
+    {
+        return (0, 0);
+    }
+    let virtual_bytes = std::env::var("PHRUST_SERVER_PHP_WORKER_STACK_BYTES")
+        .or_else(|_| std::env::var("PHRUST_SERVER_TOKIO_WORKER_STACK_BYTES"))
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16 * 1024 * 1024);
+    #[cfg(target_os = "linux")]
+    let committed_bytes = std::fs::read_to_string("/proc/thread-self/smaps")
+        .ok()
+        .and_then(|smaps| {
+            let mut stack = false;
+            for line in smaps.lines() {
+                if line.contains('-') && line.contains(' ') {
+                    stack = line.ends_with("[stack]");
+                } else if stack
+                    && let Some(value) = line.strip_prefix("Rss:")
+                    && let Some(kib) = value.split_whitespace().next()
+                    && let Ok(kib) = kib.parse::<u64>()
+                {
+                    return Some(kib.saturating_mul(1024));
+                }
+            }
+            None
+        })
+        .unwrap_or(0);
+    #[cfg(not(target_os = "linux"))]
+    let committed_bytes = 0;
+    (virtual_bytes, committed_bytes)
+}
+
 fn merge_counter_map(
     target: &mut std::collections::BTreeMap<String, u64>,
     source: &std::collections::BTreeMap<String, u64>,
@@ -743,5 +1010,15 @@ fn merge_counter_map(
     for (name, value) in source {
         let entry = target.entry(name.clone()).or_default();
         *entry = entry.saturating_add(*value);
+    }
+}
+
+fn merge_gauge_map_max(
+    target: &mut std::collections::BTreeMap<String, u64>,
+    source: &std::collections::BTreeMap<String, u64>,
+) {
+    for (name, value) in source {
+        let entry = target.entry(name.clone()).or_default();
+        *entry = (*entry).max(*value);
     }
 }

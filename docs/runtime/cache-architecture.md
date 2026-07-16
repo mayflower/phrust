@@ -6,7 +6,7 @@ status, diagnostics, request side effects, or fixture behavior.
 
 ## Persistent Native Artifact Cache
 
-The PNA1 disk cache is owned by `php_jit` and configured by `php_vm_cli` with
+The PNA2 disk cache is owned by `php_jit` and configured by `php_vm_cli` with
 `php-vm run --native-cache=...`. It stores validated Cranelift machine code and
 symbolic relocations so another process can publish executable entries without
 recompiling unchanged IR.
@@ -20,7 +20,7 @@ unreadable, oversized, or incompatible artifacts are rejected and rebuilt.
 
 The native cache validates at least these dimensions:
 
-- PNA1 schema and checksum;
+- PNA2 unit-bundle schema and checksum;
 - source/IR and native compile-policy identities;
 - compiler version, target triple, and CPU feature identity;
 - runtime and helper ABI versions and hashes;
@@ -38,7 +38,7 @@ The server cache is a process-local, in-memory compiled-script cache owned by
 `php_executor::CompiledScriptCache` and consumed by `php_server`. It exists only
 to reuse immutable compiled entry scripts across HTTP requests in the current
 server process. It does not persist these object graphs across process restarts
-and is independent of the PNA1 machine-code cache.
+and is independent of the PNA2 machine-code cache.
 
 The server cache key records the invalidation dimensions available at
 entry-script compile time:

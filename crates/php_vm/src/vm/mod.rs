@@ -12,13 +12,14 @@ pub use result::VmResult;
 
 use crate::compiled_unit::CompiledUnit;
 use jit_abi::{
-    NativeExecutionContext, activate_native_context, jit_native_array_fetch_abi,
-    jit_native_array_insert_abi, jit_native_array_new_abi, jit_native_array_spread_abi,
-    jit_native_array_unset_abi, jit_native_binary_abi, jit_native_call_dispatch_abi,
-    jit_native_cast_abi, jit_native_compare_abi, jit_native_constant_fetch_abi,
-    jit_native_dynamic_code_abi, jit_native_echo_abi, jit_native_exception_new_abi,
-    jit_native_execution_poll_abi, jit_native_foreach_cleanup_abi, jit_native_foreach_init_abi,
-    jit_native_foreach_next_abi, jit_native_local_fetch_abi, jit_native_local_store_abi,
+    NativeExecutionContext, activate_native_context, jit_native_argument_check_abi,
+    jit_native_array_fetch_abi, jit_native_array_insert_abi, jit_native_array_new_abi,
+    jit_native_array_spread_abi, jit_native_array_unset_abi, jit_native_binary_abi,
+    jit_native_call_dispatch_abi, jit_native_cast_abi, jit_native_compare_abi,
+    jit_native_constant_fetch_abi, jit_native_dynamic_code_abi, jit_native_echo_abi,
+    jit_native_exception_new_abi, jit_native_execution_poll_abi, jit_native_foreach_cleanup_abi,
+    jit_native_foreach_init_abi, jit_native_foreach_next_abi, jit_native_frame_alloc_abi,
+    jit_native_frame_release_abi, jit_native_local_fetch_abi, jit_native_local_store_abi,
     jit_native_object_clone_abi, jit_native_object_clone_with_abi, jit_native_object_new_abi,
     jit_native_property_assign_abi, jit_native_property_fetch_abi, jit_native_reference_bind_abi,
     jit_native_return_check_abi, jit_native_runtime_fatal_abi, jit_native_truthy_abi,
@@ -125,9 +126,25 @@ fn validate_native_class_table(unit: &php_ir::IrUnit) -> Result<(), String> {
 }
 
 /// Process-owned state shared by native request coordinators.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct VmWorkerState {
     native_compiles: Arc<native_compile_cache::NativeCompileCache>,
+    loaded_native_units: Arc<native_compile_cache::LoadedNativeUnitRegistry>,
+}
+
+static PROCESS_LOADED_NATIVE_UNITS: std::sync::OnceLock<
+    Arc<native_compile_cache::LoadedNativeUnitRegistry>,
+> = std::sync::OnceLock::new();
+
+impl Default for VmWorkerState {
+    fn default() -> Self {
+        Self {
+            native_compiles: Arc::new(native_compile_cache::NativeCompileCache::default()),
+            loaded_native_units: Arc::clone(PROCESS_LOADED_NATIVE_UNITS.get_or_init(|| {
+                Arc::new(native_compile_cache::LoadedNativeUnitRegistry::default())
+            })),
+        }
+    }
 }
 
 impl VmWorkerState {
@@ -136,10 +153,31 @@ impl VmWorkerState {
         Self::default()
     }
 
+    #[cfg(test)]
+    fn isolated_for_restart_test() -> Self {
+        Self {
+            native_compiles: Arc::new(native_compile_cache::NativeCompileCache::default()),
+            loaded_native_units: Arc::new(native_compile_cache::LoadedNativeUnitRegistry::default()),
+        }
+    }
+
     /// Returns worker-stable native compile-record cache counters.
     #[must_use]
     pub fn native_compile_cache_stats(&self) -> NativeCompileCacheStats {
         self.native_compiles.stats()
+    }
+
+    fn get_or_load_native_unit(
+        &self,
+        identity: &php_jit::NativeCacheIdentity,
+        load: impl FnOnce() -> Result<Option<php_jit::NativeLoadedArtifact>, php_jit::NativeCacheError>,
+    ) -> Result<Option<Arc<native_compile_cache::LoadedNativeUnit>>, php_jit::NativeCacheError>
+    {
+        self.loaded_native_units.get_or_load(identity, load)
+    }
+
+    fn loaded_native_unit_stats(&self) -> native_compile_cache::LoadedNativeUnitRegistryStats {
+        self.loaded_native_units.stats()
     }
 
     fn compile_native(
@@ -391,37 +429,36 @@ impl Vm {
         if let (Some(cache), Some(identity)) = (&cache, &cache_identity) {
             if cache.config().mode.can_write() {
                 let cache_started = Instant::now();
-                let result = cache.get_or_compile(identity, resolve_native_cache_helper, || {
-                    let compile_started = Instant::now();
-                    let (records, disposition) = match self
-                        .compile_native_with_external_function_signatures(
-                            &unit,
-                            entry,
-                            external_signatures,
-                        ) {
-                        Ok(records) => records,
-                        Err(error) => {
-                            native_compile_time += compile_started.elapsed();
-                            cached_compile_error = Some(error.clone());
-                            return Err(php_jit::NativeCacheError::InvalidHeader(error));
-                        }
-                    };
-                    if disposition.compiled() {
-                        native_compile_time += compile_started.elapsed();
-                    }
-                    let image = cache_image(identity.clone(), entry, &records);
-                    cached_compile_records = Some(records);
-                    image
+                let result = self.worker_state.get_or_load_native_unit(identity, || {
+                    cache
+                        .get_or_compile(identity, resolve_native_cache_helper, || {
+                            let compile_started = Instant::now();
+                            let (records, disposition) = match self
+                                .compile_native_with_external_function_signatures(
+                                    &unit,
+                                    entry,
+                                    external_signatures,
+                                ) {
+                                Ok(records) => records,
+                                Err(error) => {
+                                    native_compile_time += compile_started.elapsed();
+                                    cached_compile_error = Some(error.clone());
+                                    return Err(php_jit::NativeCacheError::InvalidHeader(error));
+                                }
+                            };
+                            if disposition.compiled() {
+                                native_compile_time += compile_started.elapsed();
+                            }
+                            let image = cache_image(identity.clone(), entry, &records);
+                            cached_compile_records = Some(records);
+                            image
+                        })
+                        .map(|(artifact, _)| Some(artifact))
                 });
                 cache_load_time += cache_started.elapsed().saturating_sub(native_compile_time);
                 let cache_error = match result {
-                    Ok((artifact, _)) => {
-                        let result = self.execute_cached_entry(
-                            &unit,
-                            std::sync::Arc::new(artifact),
-                            entry,
-                            output,
-                        );
+                    Ok(Some(loaded)) => {
+                        let result = self.execute_cached_entry(&unit, loaded, entry, output);
                         return self.attach_native_cache_metrics(
                             result,
                             cache,
@@ -430,6 +467,9 @@ impl Vm {
                             worker_cache_before,
                         );
                     }
+                    Ok(None) => php_jit::NativeCacheError::InvalidHeader(
+                        "native cache write produced no loaded unit".to_owned(),
+                    ),
                     Err(error) => error,
                 };
                 if let Some(error) = cached_compile_error {
@@ -456,15 +496,12 @@ impl Vm {
                 );
             } else if cache.config().mode.can_read() {
                 let cache_started = Instant::now();
-                let loaded = cache.load(identity, resolve_native_cache_helper);
+                let loaded = self.worker_state.get_or_load_native_unit(identity, || {
+                    cache.load(identity, resolve_native_cache_helper)
+                });
                 cache_load_time += cache_started.elapsed();
-                if let Ok(Some(artifact)) = loaded {
-                    let result = self.execute_cached_entry(
-                        &unit,
-                        std::sync::Arc::new(artifact),
-                        entry,
-                        output,
-                    );
+                if let Ok(Some(loaded)) = loaded {
+                    let result = self.execute_cached_entry(&unit, loaded, entry, output);
                     return self.attach_native_cache_metrics(
                         result,
                         cache,
@@ -573,6 +610,7 @@ impl Vm {
                     .map(|handle| (record.function, handle))
             })
             .collect();
+        let native_entries = Arc::new(native_entries);
         let mut context = NativeExecutionContext::new(
             &unit,
             unit.cache_identity(),
@@ -584,6 +622,7 @@ impl Vm {
         context.install_root_dynamic_unit(unit.clone());
         let native_execution_started_at =
             self.options.collect_counters.then(std::time::Instant::now);
+        context.record_native_direct_calls(handle);
         let guard = activate_native_context(&mut context);
         let outcome = handle.invoke_i64_with_native_unwind(
             &[],
@@ -873,6 +912,16 @@ impl Vm {
             counters.native_region_entries =
                 counters.native_region_entries.max(u64::from(executed));
             counters.native_version_published = worker_cache.insertions;
+            let code_stats = php_jit::cranelift_code_manager_stats();
+            counters.native_function_body_compile_count = code_stats.function_body_compile_count;
+            counters.native_duplicate_function_body_count =
+                code_stats.duplicate_function_publications;
+            let loaded_stats = self.worker_state.loaded_native_unit_stats();
+            counters.native_loaded_artifact_registry_hits = loaded_stats.hits;
+            counters.native_loaded_artifact_maps = loaded_stats.maps;
+            counters.native_loaded_entry_table_constructions =
+                loaded_stats.entry_table_constructions;
+            counters.native_mapped_executable_bytes = loaded_stats.mapped_executable_bytes;
             if let Some(stats) = cache_stats {
                 counters.native_cache_hits = stats.hits;
                 counters.native_cache_misses = stats.misses;
@@ -1155,6 +1204,8 @@ fn cache_image(
 fn runtime_helper_addresses() -> php_jit::JitRuntimeHelperAddresses {
     php_jit::JitRuntimeHelperAddresses {
         native_call_dispatch: jit_native_call_dispatch_abi as *const () as usize,
+        native_frame_alloc: jit_native_frame_alloc_abi as *const () as usize,
+        native_frame_release: jit_native_frame_release_abi as *const () as usize,
         native_dynamic_code: jit_native_dynamic_code_abi as *const () as usize,
         native_unary: jit_native_unary_abi as *const () as usize,
         native_binary: jit_native_binary_abi as *const () as usize,
@@ -1165,6 +1216,7 @@ fn runtime_helper_addresses() -> php_jit::JitRuntimeHelperAddresses {
         native_local_store: jit_native_local_store_abi as *const () as usize,
         native_value_lifecycle: jit_native_value_lifecycle_abi as *const () as usize,
         native_reference_bind: jit_native_reference_bind_abi as *const () as usize,
+        native_argument_check: jit_native_argument_check_abi as *const () as usize,
         native_return_check: jit_native_return_check_abi as *const () as usize,
         native_exception_new: jit_native_exception_new_abi as *const () as usize,
         native_array_new: jit_native_array_new_abi as *const () as usize,
@@ -1199,8 +1251,8 @@ mod tests {
     use super::*;
     use php_ir::builder::IrBuilder;
     use php_ir::{
-        ClassEntry, ClassFlags, ClassId, FunctionFlags, InstructionKind, IrConstant, IrReturnType,
-        IrSpan, Operand, UnitId,
+        ClassEntry, ClassFlags, ClassId, ClassMethodEntry, ClassMethodFlags, FunctionFlags,
+        InstructionKind, IrConstant, IrParam, IrReturnType, IrSpan, Operand, UnitId,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1236,6 +1288,515 @@ mod tests {
         builder.terminate_jump(function, block, block, span);
         builder.set_entry(function);
         CompiledUnit::new(builder.finish())
+    }
+
+    fn direct_call_unit() -> CompiledUnit {
+        let mut builder = IrBuilder::new(UnitId::new(993));
+        let file = builder.add_file("native-direct-counter.php");
+        let span = IrSpan::new(file, 0, 24);
+        let constant = builder.intern_constant(IrConstant::Int(42));
+        let callee = builder.start_function("callee", FunctionFlags::default(), span);
+        builder.set_return_type(callee, Some(IrReturnType::Int));
+        let callee_block = builder.append_block(callee);
+        let value = builder.alloc_register(callee);
+        builder.emit(
+            callee,
+            callee_block,
+            InstructionKind::LoadConst {
+                dst: value,
+                constant,
+            },
+            span,
+        );
+        builder.terminate_return(callee, callee_block, Some(Operand::Register(value)), span);
+        builder.register_function_name("callee", callee);
+
+        let entry = builder.start_function("main", FunctionFlags::default(), span);
+        builder.set_return_type(entry, Some(IrReturnType::Int));
+        let entry_block = builder.append_block(entry);
+        let result = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::CallFunction {
+                dst: result,
+                name: "callee".to_owned(),
+                args: Vec::new(),
+            },
+            span,
+        );
+        builder.terminate_return(entry, entry_block, Some(Operand::Register(result)), span);
+        builder.set_entry(entry);
+        CompiledUnit::new(builder.finish())
+    }
+
+    fn typed_direct_call_unit(strict_types: bool) -> CompiledUnit {
+        let mut builder = IrBuilder::new(UnitId::new(998));
+        let file = builder.add_file("native-typed-direct.php");
+        builder.set_file_strict_types(file, strict_types);
+        builder.set_strict_types(strict_types);
+        let span = IrSpan::new(file, 0, 32);
+        let callee = builder.start_function("typed_callee", FunctionFlags::default(), span);
+        builder.set_return_type(callee, Some(IrReturnType::Int));
+        let parameter = builder.intern_local(callee, "value");
+        builder.push_param(
+            callee,
+            IrParam {
+                name: "value".to_owned(),
+                local: parameter,
+                required: true,
+                default: None,
+                type_: Some(IrReturnType::Int),
+                by_ref: false,
+                variadic: false,
+                attributes: Vec::new(),
+            },
+        );
+        let callee_block = builder.append_block(callee);
+        let value = builder.alloc_register(callee);
+        builder.emit(
+            callee,
+            callee_block,
+            InstructionKind::LoadLocal {
+                dst: value,
+                local: parameter,
+            },
+            span,
+        );
+        builder.terminate_return(callee, callee_block, Some(Operand::Register(value)), span);
+        builder.register_function_name("typed_callee", callee);
+
+        let argument = builder.intern_constant(IrConstant::String("42".to_owned()));
+        let entry = builder.start_function("main", FunctionFlags::default(), span);
+        builder.set_return_type(entry, Some(IrReturnType::Int));
+        let entry_block = builder.append_block(entry);
+        let result = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::CallFunction {
+                dst: result,
+                name: "typed_callee".to_owned(),
+                args: vec![php_ir::instruction::IrCallArg {
+                    name: None,
+                    value: Operand::Constant(argument),
+                    unpack: false,
+                    value_kind: php_ir::instruction::IrCallArgValueKind::Direct,
+                    by_ref_local: None,
+                    by_ref_dim: None,
+                    by_ref_property: None,
+                    by_ref_property_dim: None,
+                }],
+            },
+            span,
+        );
+        builder.terminate_return(entry, entry_block, Some(Operand::Register(result)), span);
+        builder.set_entry(entry);
+        CompiledUnit::new(builder.finish())
+    }
+
+    fn direct_builtin_unit() -> CompiledUnit {
+        let mut builder = IrBuilder::new(UnitId::new(994));
+        let file = builder.add_file("native-direct-builtin.php");
+        let span = IrSpan::new(file, 0, 32);
+        let string = builder.intern_constant(IrConstant::String("phrust".to_owned()));
+        let function = builder.start_function("main", FunctionFlags::default(), span);
+        builder.set_return_type(function, Some(IrReturnType::Int));
+        let block = builder.append_block(function);
+        let result = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::CallFunction {
+                dst: result,
+                name: "strlen".to_owned(),
+                args: vec![php_ir::instruction::IrCallArg {
+                    name: None,
+                    value: Operand::Constant(string),
+                    unpack: false,
+                    value_kind: php_ir::instruction::IrCallArgValueKind::Direct,
+                    by_ref_local: None,
+                    by_ref_dim: None,
+                    by_ref_property: None,
+                    by_ref_property_dim: None,
+                }],
+            },
+            span,
+        );
+        builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+        builder.set_entry(function);
+        CompiledUnit::new(builder.finish())
+    }
+
+    fn bounded_inline_unit() -> CompiledUnit {
+        let mut builder = IrBuilder::new(UnitId::new(997));
+        let file = builder.add_file("native-inline-constant.php");
+        let span = IrSpan::new(file, 0, 32);
+        let constant = builder.intern_constant(IrConstant::Int(19));
+        let callee = builder.start_function("constant_wrapper", FunctionFlags::default(), span);
+        let callee_block = builder.append_block(callee);
+        let value = builder.alloc_register(callee);
+        builder.emit(
+            callee,
+            callee_block,
+            InstructionKind::LoadConst {
+                dst: value,
+                constant,
+            },
+            span,
+        );
+        builder.terminate_return(callee, callee_block, Some(Operand::Register(value)), span);
+        builder.register_function_name("constant_wrapper", callee);
+
+        let main = builder.start_function("main", FunctionFlags::default(), span);
+        let main_block = builder.append_block(main);
+        let result = builder.alloc_register(main);
+        builder.emit(
+            main,
+            main_block,
+            InstructionKind::CallFunction {
+                dst: result,
+                name: "constant_wrapper".to_owned(),
+                args: Vec::new(),
+            },
+            span,
+        );
+        builder.terminate_return(main, main_block, Some(Operand::Register(result)), span);
+        builder.set_entry(main);
+        CompiledUnit::new(builder.finish())
+    }
+
+    fn unbounded_recursive_unit() -> CompiledUnit {
+        let mut builder = IrBuilder::new(UnitId::new(995));
+        let file = builder.add_file("native-frame-depth.php");
+        let span = IrSpan::new(file, 0, 32);
+        let function = builder.start_function("recurse", FunctionFlags::default(), span);
+        builder.register_function_name("recurse", function);
+        let block = builder.append_block(function);
+        let result = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::CallFunction {
+                dst: result,
+                name: "recurse".to_owned(),
+                args: Vec::new(),
+            },
+            span,
+        );
+        builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+        builder.set_entry(function);
+        CompiledUnit::new(builder.finish())
+    }
+
+    fn polymorphic_method_pic_unit() -> CompiledUnit {
+        let mut builder = IrBuilder::new(UnitId::new(996));
+        let file = builder.add_file("native-method-pic.php");
+        let span = IrSpan::new(file, 0, 64);
+        let seven = builder.intern_constant(IrConstant::Int(7));
+
+        let method = builder.start_function(
+            "Widget::value",
+            FunctionFlags {
+                is_method: true,
+                ..FunctionFlags::default()
+            },
+            span,
+        );
+        builder.intern_local(method, "this");
+        builder.set_return_type(method, Some(IrReturnType::Int));
+        let method_block = builder.append_block(method);
+        let method_value = builder.alloc_register(method);
+        builder.emit(
+            method,
+            method_block,
+            InstructionKind::LoadConst {
+                dst: method_value,
+                constant: seven,
+            },
+            span,
+        );
+        builder.terminate_return(
+            method,
+            method_block,
+            Some(Operand::Register(method_value)),
+            span,
+        );
+
+        let factory = builder.start_function("make_widget", FunctionFlags::default(), span);
+        let factory_block = builder.append_block(factory);
+        let object = builder.alloc_register(factory);
+        builder.emit(
+            factory,
+            factory_block,
+            InstructionKind::NewObject {
+                dst: object,
+                display_class_name: "Widget".to_owned(),
+                class_name: "widget".to_owned(),
+                args: Vec::new(),
+            },
+            span,
+        );
+        builder.terminate_return(
+            factory,
+            factory_block,
+            Some(Operand::Register(object)),
+            span,
+        );
+        builder.register_function_name("make_widget", factory);
+
+        let call_value = builder.start_function("call_value", FunctionFlags::default(), span);
+        builder.set_return_type(call_value, Some(IrReturnType::Int));
+        let receiver_local = builder.intern_local(call_value, "receiver");
+        builder.push_required_param(call_value, "receiver", receiver_local);
+        let call_value_block = builder.append_block(call_value);
+        let receiver_value = builder.alloc_register(call_value);
+        builder.emit(
+            call_value,
+            call_value_block,
+            InstructionKind::LoadLocal {
+                dst: receiver_value,
+                local: receiver_local,
+            },
+            span,
+        );
+        let call_value_result = builder.alloc_register(call_value);
+        builder.emit(
+            call_value,
+            call_value_block,
+            InstructionKind::CallMethod {
+                dst: call_value_result,
+                object: Operand::Register(receiver_value),
+                method: "value".to_owned(),
+                args: Vec::new(),
+            },
+            span,
+        );
+        builder.terminate_return(
+            call_value,
+            call_value_block,
+            Some(Operand::Register(call_value_result)),
+            span,
+        );
+        builder.register_function_name("call_value", call_value);
+
+        let main = builder.start_function("main", FunctionFlags::default(), span);
+        builder.set_return_type(main, Some(IrReturnType::Int));
+        let main_block = builder.append_block(main);
+        let receiver = builder.alloc_register(main);
+        builder.emit(
+            main,
+            main_block,
+            InstructionKind::CallFunction {
+                dst: receiver,
+                name: "make_widget".to_owned(),
+                args: Vec::new(),
+            },
+            span,
+        );
+        let first = builder.alloc_register(main);
+        builder.emit(
+            main,
+            main_block,
+            InstructionKind::CallFunction {
+                dst: first,
+                name: "call_value".to_owned(),
+                args: vec![php_ir::instruction::IrCallArg {
+                    name: None,
+                    value: Operand::Register(receiver),
+                    unpack: false,
+                    value_kind: php_ir::instruction::IrCallArgValueKind::Direct,
+                    by_ref_local: None,
+                    by_ref_dim: None,
+                    by_ref_property: None,
+                    by_ref_property_dim: None,
+                }],
+            },
+            span,
+        );
+        let second = builder.alloc_register(main);
+        builder.emit(
+            main,
+            main_block,
+            InstructionKind::CallFunction {
+                dst: second,
+                name: "call_value".to_owned(),
+                args: vec![php_ir::instruction::IrCallArg {
+                    name: None,
+                    value: Operand::Register(receiver),
+                    unpack: false,
+                    value_kind: php_ir::instruction::IrCallArgValueKind::Direct,
+                    by_ref_local: None,
+                    by_ref_dim: None,
+                    by_ref_property: None,
+                    by_ref_property_dim: None,
+                }],
+            },
+            span,
+        );
+        builder.terminate_return(main, main_block, Some(Operand::Register(second)), span);
+        builder.push_class(ClassEntry {
+            id: ClassId::new(0),
+            name: "widget".to_owned(),
+            display_name: "Widget".to_owned(),
+            parent: None,
+            parent_display_name: None,
+            interfaces: Vec::new(),
+            methods: vec![ClassMethodEntry {
+                name: "value".to_owned(),
+                origin_class: "widget".to_owned(),
+                function: method,
+                flags: ClassMethodFlags {
+                    has_body: true,
+                    ..ClassMethodFlags::default()
+                },
+                attributes: Vec::new(),
+            }],
+            properties: Vec::new(),
+            constants: Vec::new(),
+            enum_cases: Vec::new(),
+            attributes: Vec::new(),
+            enum_backing_type: None,
+            constructor: None,
+            flags: ClassFlags::default(),
+            span,
+        });
+        builder.set_entry(main);
+        CompiledUnit::new(builder.finish())
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn direct_call_counter_is_nonzero_without_dynamic_dispatch() {
+        let result = Vm::with_options(VmOptions {
+            collect_counters: true,
+            ..VmOptions::default()
+        })
+        .execute(direct_call_unit());
+
+        assert_eq!(result.return_value, Some(Value::Int(42)), "{result:#?}");
+        let counters = result.counters.expect("diagnostic counters");
+        assert_eq!(counters.native_call_direct, 1);
+        assert_eq!(counters.native_same_unit_direct_executed, 1);
+        assert_eq!(counters.native_call_dynamic, 0);
+        assert_eq!(counters.native_tail_calls, 1);
+        assert_eq!(counters.native_frame_arena_high_water_bytes, 0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn typed_direct_call_coerces_without_dynamic_dispatch() {
+        let result = Vm::with_options(VmOptions {
+            collect_counters: true,
+            ..VmOptions::default()
+        })
+        .execute(typed_direct_call_unit(false));
+
+        assert_eq!(result.return_value, Some(Value::Int(42)), "{result:#?}");
+        let counters = result.counters.expect("diagnostic counters");
+        assert_eq!(counters.native_call_direct, 1);
+        assert_eq!(counters.native_same_unit_direct_executed, 1);
+        assert_eq!(counters.native_call_dynamic, 0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn typed_direct_call_throws_without_dynamic_dispatch() {
+        let result = Vm::with_options(VmOptions {
+            collect_counters: true,
+            ..VmOptions::default()
+        })
+        .execute(typed_direct_call_unit(true));
+
+        assert_eq!(
+            result.status.exit_status(),
+            php_runtime::api::ExitStatus::Fatal,
+            "{result:#?}"
+        );
+        assert!(
+            String::from_utf8_lossy(result.output.as_bytes()).contains(
+                "Uncaught TypeError: typed_callee(): Argument #1 ($value) must be of type int, string given"
+            ),
+            "{result:#?}"
+        );
+        let counters = result.counters.expect("diagnostic counters");
+        assert_eq!(counters.native_call_direct, 1);
+        assert_eq!(counters.native_same_unit_direct_executed, 1);
+        assert_eq!(counters.native_call_dynamic, 0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn stable_builtin_uses_helper_id_without_generic_dynamic_count() {
+        let result = Vm::with_options(VmOptions {
+            collect_counters: true,
+            ..VmOptions::default()
+        })
+        .execute(direct_builtin_unit());
+
+        assert_eq!(result.return_value, Some(Value::Int(6)), "{result:#?}");
+        let counters = result.counters.expect("diagnostic counters");
+        assert_eq!(counters.native_call_direct, 1);
+        assert_eq!(counters.native_builtin_direct_eligible, 1);
+        assert_eq!(counters.native_builtin_direct_executed, 1);
+        assert_eq!(counters.native_call_dynamic, 0);
+        assert_eq!(counters.native_call_argument_allocation_bytes, 0);
+        assert!(counters.native_frame_arena_high_water_bytes > 0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn bounded_constant_wrapper_inlining_removes_native_call() {
+        let result = Vm::with_options(VmOptions {
+            collect_counters: true,
+            ..VmOptions::default()
+        })
+        .execute(bounded_inline_unit());
+
+        assert_eq!(result.return_value, Some(Value::Int(19)), "{result:#?}");
+        let counters = result.counters.expect("diagnostic counters");
+        assert_eq!(counters.native_inlined_calls, 1);
+        assert_eq!(counters.native_inline_calls_removed, 1);
+        assert_eq!(counters.native_call_direct, 1);
+        assert_eq!(counters.native_call_dynamic, 0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn warmed_method_pic_reclassifies_stable_call_as_direct() {
+        let vm = Vm::with_options(VmOptions {
+            collect_counters: true,
+            ..VmOptions::default()
+        });
+        let unit = polymorphic_method_pic_unit();
+        let result = vm.execute(unit.clone());
+
+        assert_eq!(result.return_value, Some(Value::Int(7)), "{result:#?}");
+        let counters = result.counters.expect("diagnostic counters");
+        assert!(counters.native_method_monomorphic_eligible >= 2);
+        assert!(counters.native_method_monomorphic_executed >= 1);
+        assert!(counters.native_call_direct >= 2);
+
+        // The descriptor is compiled-unit metadata shared across requests.
+        // Both calls in the second request should therefore hit the persistent
+        // monomorphic entry rather than warming another request-local table.
+        let warm = vm.execute(unit);
+        assert_eq!(warm.return_value, Some(Value::Int(7)), "{warm:#?}");
+        let warm_counters = warm.counters.expect("diagnostic counters");
+        assert!(warm_counters.native_method_monomorphic_executed >= 2);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn deep_direct_recursion_hits_php_frame_limit_without_stack_abort() {
+        let result = Vm::new().execute(unbounded_recursive_unit());
+
+        assert!(!result.status.is_success(), "{result:#?}");
+        assert_eq!(
+            result.diagnostics.first().map(|diagnostic| diagnostic.id()),
+            Some("E_PHP_VM_NATIVE_FRAME_LIMIT"),
+            "{result:#?}"
+        );
     }
 
     #[test]
@@ -1366,12 +1927,15 @@ mod tests {
                 .as_nanos()
         ));
         let unit = returning_unit(42);
-        let first = Vm::with_options(VmOptions {
-            native_cache: php_jit::NativeCacheMode::ReadWrite,
-            native_cache_dir: directory.clone(),
-            native_cache_stats: true,
-            ..VmOptions::default()
-        })
+        let first = Vm::with_options_and_worker_state(
+            VmOptions {
+                native_cache: php_jit::NativeCacheMode::ReadWrite,
+                native_cache_dir: directory.clone(),
+                native_cache_stats: true,
+                ..VmOptions::default()
+            },
+            VmWorkerState::isolated_for_restart_test(),
+        )
         .execute(unit.clone());
         assert_eq!(
             first.return_value,
@@ -1380,12 +1944,15 @@ mod tests {
         );
         assert_eq!(first.native_cache_stats.unwrap().writes, 1);
 
-        let second = Vm::with_options(VmOptions {
-            native_cache: php_jit::NativeCacheMode::Read,
-            native_cache_dir: directory.clone(),
-            native_cache_stats: true,
-            ..VmOptions::default()
-        })
+        let second = Vm::with_options_and_worker_state(
+            VmOptions {
+                native_cache: php_jit::NativeCacheMode::Read,
+                native_cache_dir: directory.clone(),
+                native_cache_stats: true,
+                ..VmOptions::default()
+            },
+            VmWorkerState::isolated_for_restart_test(),
+        )
         .execute(unit);
         assert_eq!(
             second.return_value,
@@ -1394,6 +1961,51 @@ mod tests {
         );
         assert_eq!(second.native_cache_stats.unwrap().hits, 1);
         assert_eq!(second.native_compile_nanos, 0);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn worker_registry_reuses_loaded_artifact_without_remapping_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "phrust-vm-loaded-unit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let worker = VmWorkerState::new(crate::tiering::TieringOptions::default());
+        let before = worker.loaded_native_unit_stats();
+        let unit = returning_unit(91);
+        let options = VmOptions {
+            native_cache: php_jit::NativeCacheMode::ReadWrite,
+            native_cache_dir: directory.clone(),
+            ..VmOptions::default()
+        };
+        let first = Vm::with_options_and_worker_state(options.clone(), worker.clone())
+            .execute(unit.clone());
+        assert_eq!(first.return_value, Some(Value::Int(91)), "{first:#?}");
+
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|extension| extension == "pna") {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+
+        let second = Vm::with_options_and_worker_state(options, worker.clone()).execute(unit);
+        assert_eq!(second.return_value, Some(Value::Int(91)), "{second:#?}");
+        assert_eq!(second.native_compile_nanos, 0);
+        let loaded = worker.loaded_native_unit_stats();
+        assert_eq!(loaded.maps.saturating_sub(before.maps), 1);
+        assert_eq!(
+            loaded
+                .entry_table_constructions
+                .saturating_sub(before.entry_table_constructions),
+            1
+        );
+        assert_eq!(loaded.hits.saturating_sub(before.hits), 1);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1411,22 +2023,28 @@ mod tests {
         let mut ir = returning_unit(91).unit().clone();
         ir.functions[ir.entry.index()].return_type = None;
         let unit = CompiledUnit::from(ir);
-        let first = Vm::with_options(VmOptions {
-            native_cache: php_jit::NativeCacheMode::ReadWrite,
-            native_cache_dir: directory.clone(),
-            native_cache_stats: true,
-            ..VmOptions::default()
-        })
+        let first = Vm::with_options_and_worker_state(
+            VmOptions {
+                native_cache: php_jit::NativeCacheMode::ReadWrite,
+                native_cache_dir: directory.clone(),
+                native_cache_stats: true,
+                ..VmOptions::default()
+            },
+            VmWorkerState::isolated_for_restart_test(),
+        )
         .execute(unit.clone());
         assert_eq!(first.return_value, Some(Value::Int(91)), "{first:#?}");
         assert_eq!(first.native_cache_stats.unwrap().writes, 1);
 
-        let second = Vm::with_options(VmOptions {
-            native_cache: php_jit::NativeCacheMode::Read,
-            native_cache_dir: directory.clone(),
-            native_cache_stats: true,
-            ..VmOptions::default()
-        })
+        let second = Vm::with_options_and_worker_state(
+            VmOptions {
+                native_cache: php_jit::NativeCacheMode::Read,
+                native_cache_dir: directory.clone(),
+                native_cache_stats: true,
+                ..VmOptions::default()
+            },
+            VmWorkerState::isolated_for_restart_test(),
+        )
         .execute(unit);
         assert_eq!(second.return_value, Some(Value::Int(91)), "{second:#?}");
         assert_eq!(second.native_cache_stats.unwrap().hits, 1);

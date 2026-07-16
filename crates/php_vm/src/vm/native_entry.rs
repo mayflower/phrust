@@ -11,33 +11,11 @@ impl Vm {
     pub(super) fn execute_cached_entry(
         &self,
         unit: &CompiledUnit,
-        artifact: Arc<php_jit::NativeLoadedArtifact>,
+        loaded: Arc<super::native_compile_cache::LoadedNativeUnit>,
         entry: php_ir::FunctionId,
         output: OutputBuffer,
     ) -> VmResult {
-        let native_entries = artifact
-            .image()
-            .functions
-            .iter()
-            .map(|function| {
-                let function_id = php_ir::FunctionId::new(function.function_id);
-                php_jit::JitFunctionHandle::from_cached_artifact(
-                    artifact.clone(),
-                    function_id,
-                    artifact.region_metadata(function.function_id).cloned(),
-                )
-                .map(|handle| (function_id, handle))
-            })
-            .collect::<Result<std::collections::BTreeMap<_, _>, _>>();
-        let native_entries = match native_entries {
-            Ok(entries) => entries,
-            Err(error) => {
-                return VmResult::compile_error(
-                    output,
-                    format!("E_NATIVE_CACHE_ENTRY: cached handle publication failed: {error}"),
-                );
-            }
-        };
+        let native_entries = Arc::clone(loaded.native_entries());
         let Some(handle) = native_entries.get(&entry).cloned() else {
             return VmResult::compile_error(
                 output,
@@ -58,6 +36,7 @@ impl Vm {
         context.install_root_dynamic_unit(unit.clone());
         let native_execution_started_at =
             self.options.collect_counters.then(std::time::Instant::now);
+        context.record_native_direct_calls(&handle);
         let guard = activate_native_context(&mut context);
         let invocation = handle.invoke_i64_with_native_unwind(
             &[],

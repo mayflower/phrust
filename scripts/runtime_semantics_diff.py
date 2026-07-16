@@ -104,12 +104,16 @@ def main() -> int:
 
 
 def parse_args() -> argparse.Namespace:
+    cargo_target = Path(os.environ.get("CARGO_TARGET_DIR", "target"))
     parser = argparse.ArgumentParser(
         description="Run PHP runtime-semantics fixtures against REFERENCE_PHP and php_vm_cli."
     )
     parser.add_argument("--fixtures", default="fixtures/runtime_semantics", help="runtime-semantics fixture root")
     parser.add_argument("--out", default="target/runtime-semantics/diff", help="output directory")
-    parser.add_argument("--rust-vm", default=os.environ.get("PHP_VM_CLI", "target/debug/php-vm"))
+    parser.add_argument(
+        "--rust-vm",
+        default=os.environ.get("PHP_VM_CLI", str(cargo_target / "debug" / "php-vm")),
+    )
     parser.add_argument("--file", action="append", default=[], help="single PHP file to compare")
     parser.add_argument("--dir", action="append", default=[], help="directory of PHP files")
     parser.add_argument(
@@ -383,7 +387,17 @@ def run_rust(fixture: Fixture, rust_vm: Path) -> dict:
         if fixture.args:
             command.extend(["--", *fixture.args])
         return run_process(command, fixture.path, None)
-    command = ["cargo", "run", "-p", "php_vm_cli", "--", "run", str(fixture.path)]
+    command = [
+        "cargo",
+        "run",
+        "-p",
+        "php_vm_cli",
+        "--bin",
+        "php-vm",
+        "--",
+        "run",
+        str(fixture.path),
+    ]
     if fixture.args:
         command.extend(["--", *fixture.args])
     return run_process(command, fixture.path, None)

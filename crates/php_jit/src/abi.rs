@@ -571,6 +571,13 @@ impl Default for JitNativeCallFrame {
     }
 }
 
+impl JitNativeCallFrame {
+    pub const FLAG_STRICT_TYPES: u32 = 1 << 0;
+    pub const FLAG_RETURN_REFERENCE: u32 = 1 << 1;
+    pub const FLAG_DIRECT_BUILTIN: u32 = 1 << 2;
+    pub const FLAG_DIRECT_EXTERNAL: u32 = 1 << 3;
+}
+
 /// Dynamic call resolver/invoker. It may compile and retry a native entry, but
 /// it must never invoke a bytecode or IR interpreter.
 pub type JitNativeDispatchTrampoline = unsafe extern "C" fn(

@@ -565,7 +565,7 @@ pub(super) fn execute_native_dynamic_callable(
                         .owner_unit
                         .and_then(|unit| context.dynamic_units.get(unit))
                         .map(|package| package.compiled.unit())
-                        .unwrap_or(context.unit)
+                        .unwrap_or(&*context.unit)
                         .functions
                         .get(function.index())
                         .is_some_and(native_function_has_implicit_closure_this);
@@ -609,7 +609,7 @@ pub(super) fn execute_native_dynamic_callable(
                             context
                                 .dynamic_units
                                 .get(unit)
-                                .is_some_and(|package| package.compiled.ptr_eq(context.compiled))
+                                .is_some_and(|package| package.compiled.ptr_eq(&context.compiled))
                         });
                     if generator_owner_is_current && native_function_is_generator(context, function)
                     {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify restart-persistent PNA1 machine-code cache behavior."""
+"""Verify restart-persistent PNA2 machine-code cache behavior."""
 
 from __future__ import annotations
 
@@ -50,9 +50,9 @@ def main() -> None:
         artifacts = list(cache_dir.glob("*.pna"))
         require(first.get("compiled") is True, "first process did not compile")
         require(first.get("value") == 42, "first native execution returned wrong value")
-        require(first.get("event") == "written", "first process did not atomically write PNA1")
+        require(first.get("event") == "written", "first process did not atomically write PNA2")
         require(len(artifacts) == 1, "first process did not create exactly one artifact")
-        require(artifacts[0].read_bytes().startswith(b"PNA1"), "artifact is not PNA1")
+        require(artifacts[0].read_bytes().startswith(b"PNA2"), "artifact is not PNA2")
 
         second = run_probe(cache_dir)
         require(second.get("compiled") is False, "fresh second process recompiled unchanged IR")
@@ -101,7 +101,7 @@ def main() -> None:
         json.dumps(
             {
                 "schema_version": 1,
-                "cache": "PNA1",
+                "cache": "PNA2",
                 "second_process_hit": True,
                 "unchanged_recompiled": False,
                 "corruption_rebuilt": True,

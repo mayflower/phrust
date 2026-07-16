@@ -122,6 +122,7 @@ fn execute_native_include(
         .unit
         .functions
         .get(request.caller_function_id as usize)
+        .cloned()
         .ok_or_else(|| "native include caller function is missing".to_owned())?;
     let mut inherited_globals = std::mem::take(&mut context.inherited_globals);
     if request.caller_frame != 0 {
@@ -270,6 +271,7 @@ fn execute_native_eval(
         .unit
         .functions
         .get(request.caller_function_id as usize)
+        .cloned()
         .ok_or_else(|| "native eval caller function is missing".to_owned())?;
     let caller_instruction =
         context.instruction_for_continuation(request.caller_function_id, request.continuation_id);

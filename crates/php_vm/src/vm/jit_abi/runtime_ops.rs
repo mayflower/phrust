@@ -747,9 +747,9 @@ pub(in crate::vm) extern "C" fn jit_native_local_fetch_abi(
             let path = usize::try_from(file)
                 .ok()
                 .and_then(|index| context.unit.files.get(index))
-                .map_or("<unknown>", |file| file.path.as_str());
+                .map_or_else(|| "<unknown>".to_owned(), |file| file.path.clone());
             let line = usize::try_from(start).ok().map_or(1, |start| {
-                std::fs::read(path).ok().map_or(1, |bytes| {
+                std::fs::read(&path).ok().map_or(1, |bytes| {
                     bytes
                         .iter()
                         .take(start)
@@ -759,7 +759,7 @@ pub(in crate::vm) extern "C" fn jit_native_local_fetch_abi(
                 })
             });
             let message = format!("Undefined variable ${name}");
-            context.record_last_error(2, &message, path, line);
+            context.record_last_error(2, &message, &path, line);
             context
                 .output
                 .write_bytes(format!("\nWarning: {message} in {path} on line {line}\n"));
@@ -794,6 +794,7 @@ pub(in crate::vm) extern "C" fn jit_native_local_store_abi(
         let Some(function) = usize::try_from(function)
             .ok()
             .and_then(|index| context.unit.functions.get(index))
+            .cloned()
         else {
             context.record_local_store_reason("unknown");
             return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
@@ -1406,6 +1407,127 @@ pub(in crate::vm) extern "C" fn jit_native_return_check_abi(
             return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
         }
         if write_native_value(out, encoded) {
+            0
+        } else {
+            php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
+        }
+    })
+    .unwrap_or(php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32)
+}
+
+pub(in crate::vm) extern "C" fn jit_native_argument_check_abi(
+    _vm_context: u64,
+    op: u32,
+    encoded: i64,
+    target_function: i64,
+    parameter_flags: i64,
+    caller_function: i64,
+    continuation: i64,
+    out: *mut i64,
+) -> i32 {
+    if op != 0 {
+        return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
+    }
+    with_native_context_for("argument_check", |context| {
+        let Ok(target_index) = usize::try_from(target_function) else {
+            return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
+        };
+        let requested_index = (parameter_flags as u64 & u64::from(u32::MAX)) as usize;
+        let strict = parameter_flags as u64 & (1_u64 << 32) != 0;
+        let Some((parameter, function_name, target_span)) =
+            context.unit.functions.get(target_index).and_then(|target| {
+                target
+                    .params
+                    .get(requested_index)
+                    .or_else(|| target.params.last().filter(|parameter| parameter.variadic))
+                    .cloned()
+                    .map(|parameter| (parameter, target.name.clone(), target.span))
+            })
+        else {
+            return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
+        };
+        let Some(type_) = parameter.type_ else {
+            return if write_native_value(out, encoded) {
+                0
+            } else {
+                php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
+            };
+        };
+        let source = u32::try_from(caller_function)
+            .ok()
+            .zip(u32::try_from(continuation).ok())
+            .and_then(|(function, continuation)| {
+                context
+                    .instruction_for_continuation(function, continuation)
+                    .cloned()
+            });
+        let Ok(value) = context.decode(encoded) else {
+            return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+        };
+        let trace_argument = match &value {
+            Value::Reference(reference) => reference.get(),
+            value => value.clone(),
+        };
+        let (checked, reference) = if parameter.by_ref {
+            let Value::Reference(reference) = value else {
+                return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
+            };
+            if matches!(reference.get(), Value::Uninitialized) {
+                reference.set(Value::Null);
+            }
+            (
+                native_coerce_call_argument(reference.get(), &type_, strict),
+                Some(reference),
+            )
+        } else {
+            let value = match value {
+                Value::Reference(reference) => reference.get(),
+                value => value,
+            };
+            (native_coerce_call_argument(value, &type_, strict), None)
+        };
+        if !(native_value_matches_ir_type_in_context(context, &checked, &type_)
+            || matches!(type_, php_ir::IrReturnType::Callable)
+                && native_value_is_callable(context, &checked))
+        {
+            let message = format!(
+                "{}(): Argument #{} (${}) must be of type {}, {} given",
+                function_name,
+                requested_index + 1,
+                parameter.name,
+                native_ir_type_name(&type_),
+                native_value_type_name(&checked)
+            );
+            let throwable = encode_native_throwable_at(context, "TypeError", &message, target_span)
+                .and_then(|encoded| context.decode(encoded))
+                .map(|throwable| {
+                    native_throwable_with_frame(throwable, &function_name, vec![trace_argument])
+                })
+                .map(|throwable| {
+                    if let Some(source) = &source {
+                        native_throwable_with_call_source(context, throwable, source.span)
+                    } else {
+                        throwable
+                    }
+                })
+                .and_then(|throwable| context.encode(throwable));
+            return match throwable {
+                Ok(encoded) if write_native_value(out, encoded) => {
+                    php_jit::JitCallStatus::THROW.0 as i32
+                }
+                _ => php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
+            };
+        }
+        let checked = if let Some(reference) = reference {
+            reference.set(checked);
+            encoded
+        } else {
+            match context.encode(checked) {
+                Ok(value) => value,
+                Err(_) => return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
+            }
+        };
+        if write_native_value(out, checked) {
             0
         } else {
             php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32

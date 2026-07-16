@@ -1,6 +1,6 @@
 //! Process-wide, bounded ownership for Cranelift executable code.
 
-use crate::JitFunctionHandle;
+use crate::{JitFunctionHandle, NativeFunctionKey, NativeFunctionTier, NativeIndirectionCell};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
 use cranelift_module::default_libcall_names;
@@ -100,6 +100,8 @@ struct CodeManagerMetrics {
     compile_waits: AtomicU64,
     duplicate_compiles_avoided: AtomicU64,
     compile_count: AtomicU64,
+    function_body_compile_count: AtomicU64,
+    duplicate_function_publications: AtomicU64,
     bytes_live: AtomicUsize,
     bytes_retired: AtomicUsize,
     generations_live: AtomicUsize,
@@ -115,6 +117,8 @@ impl Default for CodeManagerMetrics {
             compile_waits: AtomicU64::new(0),
             duplicate_compiles_avoided: AtomicU64::new(0),
             compile_count: AtomicU64::new(0),
+            function_body_compile_count: AtomicU64::new(0),
+            duplicate_function_publications: AtomicU64::new(0),
             bytes_live: AtomicUsize::new(0),
             bytes_retired: AtomicUsize::new(0),
             generations_live: AtomicUsize::new(0),
@@ -132,6 +136,9 @@ pub struct CraneliftCodeManagerStats {
     pub compile_waits: u64,
     pub duplicate_compiles_avoided: u64,
     pub compile_count: u64,
+    pub function_body_compile_count: u64,
+    pub duplicate_function_publications: u64,
+    pub function_cells: usize,
     pub code_bytes_live: usize,
     pub code_bytes_retired: usize,
     pub code_generations: usize,
@@ -320,6 +327,8 @@ struct ManagerState {
     active: Arc<CodeGeneration>,
     generations: VecDeque<Arc<CodeGeneration>>,
     cache: HashMap<CraneliftCodeKey, JitFunctionHandle>,
+    function_cells: HashMap<NativeFunctionKey, Arc<NativeIndirectionCell>>,
+    function_publications: HashMap<NativeFunctionKey, JitFunctionHandle>,
 }
 
 /// Process-level compiler owner and bounded code-generation cache.
@@ -359,6 +368,8 @@ impl CraneliftCodeManager {
                 active: Arc::clone(&active),
                 generations: VecDeque::from([active]),
                 cache: HashMap::new(),
+                function_cells: HashMap::new(),
+                function_publications: HashMap::new(),
             }),
             helpers,
             metrics,
@@ -378,6 +389,9 @@ impl CraneliftCodeManager {
             .map_err(|error| CraneliftCodeManagerError::Flags(error.to_string()))?;
         flags
             .set("is_pic", "false")
+            .map_err(|error| CraneliftCodeManagerError::Flags(error.to_string()))?;
+        flags
+            .set("preserve_frame_pointers", "true")
             .map_err(|error| CraneliftCodeManagerError::Flags(error.to_string()))?;
         let isa = cranelift_native::builder()
             .map_err(|error| CraneliftCodeManagerError::NativeTarget(error.to_string()))?
@@ -527,6 +541,7 @@ impl CraneliftCodeManager {
             entry,
             metadata,
         ));
+        self.publish_function_entries(&mut state, &key, &handle);
         state.cache.insert(key, handle.clone());
 
         if generation.bytes.load(Ordering::Relaxed) >= self.generation_limit {
@@ -573,6 +588,19 @@ impl CraneliftCodeManager {
             state
                 .cache
                 .retain(|_, handle| handle.code_generation_id() != Some(retired_id));
+            let retired_keys = state
+                .function_publications
+                .iter()
+                .filter_map(|(key, handle)| {
+                    (handle.code_generation_id() == Some(retired_id)).then_some(key.clone())
+                })
+                .collect::<Vec<_>>();
+            for key in retired_keys {
+                if let Some(cell) = state.function_cells.remove(&key) {
+                    cell.retire();
+                }
+                state.function_publications.remove(&key);
+            }
             self.metrics
                 .bytes_retired
                 .fetch_add(retired_bytes, Ordering::Relaxed);
@@ -580,15 +608,83 @@ impl CraneliftCodeManager {
         }
     }
 
+    fn publish_function_entries(
+        &self,
+        state: &mut ManagerState,
+        code_key: &CraneliftCodeKey,
+        handle: &JitFunctionHandle,
+    ) {
+        let Some(metadata) = handle.region_state_metadata() else {
+            return;
+        };
+        let tier = if code_key.compiler_tier == "optimizing" {
+            NativeFunctionTier::Optimized
+        } else {
+            NativeFunctionTier::Baseline
+        };
+        let entries = metadata.function_entries.clone();
+        self.metrics
+            .function_body_compile_count
+            .fetch_add(entries.len() as u64, Ordering::Relaxed);
+        for entry in entries {
+            let signature_hash = code_key.abi_hash
+                ^ u64::from(entry.arity).rotate_left(17)
+                ^ u64::from(entry.local_count).rotate_left(33);
+            let key = NativeFunctionKey {
+                deployment_unit: code_key.compiled_unit.clone(),
+                function_id: entry.function.raw(),
+                signature_hash,
+                compiler_tier: code_key.compiler_tier.clone(),
+                version: code_key.specialization.clone(),
+                invalidation_generation: code_key.invalidation_generation,
+            };
+            let cell = state
+                .function_cells
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(NativeIndirectionCell::new(key.clone())))
+                .clone();
+            if state.function_publications.contains_key(&key) {
+                self.metrics
+                    .duplicate_function_publications
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            let publication = handle
+                .clone_for_function_entry(entry.function)
+                .unwrap_or_else(|| handle.clone());
+            cell.publish(tier, code_key.invalidation_generation, entry.address);
+            state.function_publications.insert(key, publication);
+        }
+    }
+
+    /// Returns a stable cell and its generation-owning publication handle.
+    /// Callers retain the handle for at least as long as they may invoke the
+    /// resolved address.
+    #[must_use]
+    pub fn published_function(
+        &self,
+        key: &NativeFunctionKey,
+    ) -> Option<(Arc<NativeIndirectionCell>, JitFunctionHandle)> {
+        let state = self.state.lock().ok()?;
+        Some((
+            Arc::clone(state.function_cells.get(key)?),
+            state.function_publications.get(key)?.clone(),
+        ))
+    }
+
     /// Returns an atomic snapshot without blocking compilation.
     #[must_use]
     pub fn stats(&self) -> CraneliftCodeManagerStats {
-        let eviction_candidates = self
+        let state_snapshot = self
             .state
             .try_lock()
             .ok()
-            .map(|state| state.generations.len().saturating_sub(1))
-            .unwrap_or(0);
+            .map(|state| {
+                (
+                    state.generations.len().saturating_sub(1),
+                    state.function_cells.len(),
+                )
+            })
+            .unwrap_or((0, 0));
         CraneliftCodeManagerStats {
             process_cache_hits: self.metrics.process_cache_hits.load(Ordering::Relaxed),
             process_cache_misses: self.metrics.process_cache_misses.load(Ordering::Relaxed),
@@ -598,12 +694,21 @@ impl CraneliftCodeManager {
                 .duplicate_compiles_avoided
                 .load(Ordering::Relaxed),
             compile_count: self.metrics.compile_count.load(Ordering::Relaxed),
+            function_body_compile_count: self
+                .metrics
+                .function_body_compile_count
+                .load(Ordering::Relaxed),
+            duplicate_function_publications: self
+                .metrics
+                .duplicate_function_publications
+                .load(Ordering::Relaxed),
+            function_cells: state_snapshot.1,
             code_bytes_live: self.metrics.bytes_live.load(Ordering::Relaxed),
             code_bytes_retired: self.metrics.bytes_retired.load(Ordering::Relaxed),
             code_generations: self.metrics.generations_live.load(Ordering::Relaxed),
             active_handles: self.metrics.active_handles.load(Ordering::Relaxed),
             evictions: self.metrics.evictions.load(Ordering::Relaxed),
-            eviction_candidates,
+            eviction_candidates: state_snapshot.0,
         }
     }
 }

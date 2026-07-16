@@ -50,6 +50,7 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         "phrust_jit_native_call_dispatch" | "phrust_jit_native_dynamic_code" => {
             Some(owned(NONE, false))
         }
+        "phrust_native_frame_alloc" | "phrust_native_frame_release" => Some(none(NONE)),
         "phrust_native_unary"
         | "phrust_native_cast"
         | "phrust_native_local_fetch"
@@ -68,6 +69,7 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         | "phrust_native_property_fetch"
         | "phrust_native_array_insert" => Some(owned(BORROW_3, true)),
         "phrust_native_property_assign" => Some(owned(BORROW_2, true)),
+        "phrust_native_argument_check" => Some(owned(BORROW_1, true)),
         "phrust_native_array_new" | "phrust_native_object_new" | "phrust_native_exception_new" => {
             Some(owned(NONE, false))
         }

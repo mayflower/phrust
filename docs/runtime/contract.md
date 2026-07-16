@@ -30,7 +30,7 @@ source-map metadata.
   boundary and publish before first execution.
 - Generator and fiber suspension persists native continuation identity and live
   state; resume does not dispatch PHP instructions in Rust.
-- Eligible native entries may be loaded from a validated PNA1 artifact. The
+- Eligible native entries may be loaded from a validated PNA2 artifact. The
   cache never changes language semantics and never supplies a second executor.
 
 ## Runtime ownership

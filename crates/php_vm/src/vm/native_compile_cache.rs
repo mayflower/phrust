@@ -9,11 +9,129 @@
 
 use php_ir::FunctionId;
 use php_jit::JitUnitCompileRecord;
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 const DEFAULT_NATIVE_COMPILE_CACHE_ENTRIES: usize = 4_096;
+const DEFAULT_LOADED_NATIVE_UNIT_ENTRIES: usize = 4_096;
+
+/// Immutable cached artifact publication shared by every request in a process.
+#[derive(Debug)]
+pub(super) struct LoadedNativeUnit {
+    _artifact: Arc<php_jit::NativeLoadedArtifact>,
+    native_entries: Arc<BTreeMap<FunctionId, php_jit::JitFunctionHandle>>,
+}
+
+impl LoadedNativeUnit {
+    fn new(artifact: php_jit::NativeLoadedArtifact) -> Result<Self, php_jit::NativeCacheError> {
+        let artifact = Arc::new(artifact);
+        let native_entries = artifact
+            .image()
+            .functions
+            .iter()
+            .map(|function| {
+                let function_id = FunctionId::new(function.function_id);
+                php_jit::JitFunctionHandle::from_cached_artifact(
+                    Arc::clone(&artifact),
+                    function_id,
+                    artifact.region_metadata(function.function_id).cloned(),
+                )
+                .map(|handle| (function_id, handle))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Ok(Self {
+            _artifact: artifact,
+            native_entries: Arc::new(native_entries),
+        })
+    }
+
+    pub(super) fn native_entries(&self) -> &Arc<BTreeMap<FunctionId, php_jit::JitFunctionHandle>> {
+        &self.native_entries
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct LoadedNativeUnitRegistry {
+    units: RwLock<BTreeMap<String, Arc<LoadedNativeUnit>>>,
+    hits: AtomicU64,
+    maps: AtomicU64,
+    entry_table_constructions: AtomicU64,
+    mapped_executable_bytes: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct LoadedNativeUnitRegistryStats {
+    pub(super) hits: u64,
+    pub(super) maps: u64,
+    pub(super) entry_table_constructions: u64,
+    pub(super) mapped_executable_bytes: u64,
+}
+
+impl LoadedNativeUnitRegistry {
+    /// Loads, validates, maps, and publishes one artifact identity at most once.
+    pub(super) fn get_or_load(
+        &self,
+        identity: &php_jit::NativeCacheIdentity,
+        load: impl FnOnce() -> Result<Option<php_jit::NativeLoadedArtifact>, php_jit::NativeCacheError>,
+    ) -> Result<Option<Arc<LoadedNativeUnit>>, php_jit::NativeCacheError> {
+        let key = identity.cache_key();
+        if let Some(unit) = read_unpoisoned(&self.units).get(&key).cloned() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(unit));
+        }
+        // Serialize only the cold publication path. Recheck after acquiring
+        // the writer so concurrent cold requests cannot map the same identity
+        // twice; every warm request takes only a shared read lock.
+        let mut units = write_unpoisoned(&self.units);
+        if let Some(unit) = units.get(&key) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(Arc::clone(unit)));
+        }
+        let Some(artifact) = load()? else {
+            return Ok(None);
+        };
+        let unit = Arc::new(LoadedNativeUnit::new(artifact)?);
+        self.maps.fetch_add(1, Ordering::Relaxed);
+        self.entry_table_constructions
+            .fetch_add(1, Ordering::Relaxed);
+        self.mapped_executable_bytes.fetch_add(
+            unit._artifact.mapped_executable_bytes() as u64,
+            Ordering::Relaxed,
+        );
+        while units.len() >= DEFAULT_LOADED_NATIVE_UNIT_ENTRIES {
+            let Some(retired) = units
+                .iter()
+                .find_map(|(key, unit)| (Arc::strong_count(unit) == 1).then(|| key.clone()))
+            else {
+                break;
+            };
+            units.remove(&retired);
+        }
+        units.insert(key, Arc::clone(&unit));
+        Ok(Some(unit))
+    }
+
+    pub(super) fn stats(&self) -> LoadedNativeUnitRegistryStats {
+        LoadedNativeUnitRegistryStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            maps: self.maps.load(Ordering::Relaxed),
+            entry_table_constructions: self.entry_table_constructions.load(Ordering::Relaxed),
+            mapped_executable_bytes: self.mapped_executable_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn read_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn write_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct NativeCompileCacheKey {

@@ -2505,6 +2505,7 @@ dependencies = [
 name = "php_vm"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "php_diagnostics",
  "php_extensions",
  "php_ir",

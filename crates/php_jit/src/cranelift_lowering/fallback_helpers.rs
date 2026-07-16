@@ -205,6 +205,26 @@ pub(super) extern "C" fn test_native_reference_bind_fallback(
 
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
+pub(super) extern "C" fn test_native_argument_check_fallback(
+    _context: u64,
+    _op: u32,
+    value: i64,
+    _target_function: i64,
+    _parameter_flags: i64,
+    _caller_function: i64,
+    _continuation: i64,
+    out: *mut i64,
+) -> i32 {
+    if out.is_null() {
+        crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+    } else {
+        unsafe { out.write(value) };
+        0
+    }
+}
+
+// SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
+#[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_return_check_fallback(
     _context: u64,
     _op: u32,

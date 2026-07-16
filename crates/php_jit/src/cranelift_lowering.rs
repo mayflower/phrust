@@ -36,8 +36,14 @@ mod call_metadata;
 mod dynamic_code;
 mod executable_region;
 mod fallback_helpers;
+mod module_layout;
+mod native_linkage;
 mod terminators;
 mod value_lowering;
+
+pub use native_linkage::{
+    NativeFunctionKey, NativeFunctionTier, NativeIndirectionCell, NativeIndirectionState,
+};
 
 use call_metadata::*;
 use dynamic_code::*;
@@ -60,6 +66,8 @@ struct NativeHelper {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct NativeOperationFunctions {
+    frame_alloc: Option<NativeHelper>,
+    frame_release: Option<NativeHelper>,
     unary: Option<NativeHelper>,
     binary: Option<NativeHelper>,
     compare: Option<NativeHelper>,
@@ -69,6 +77,7 @@ struct NativeOperationFunctions {
     local_store: Option<NativeHelper>,
     value_lifecycle: Option<NativeHelper>,
     reference_bind: Option<NativeHelper>,
+    argument_check: Option<NativeHelper>,
     return_check: Option<NativeHelper>,
     exception_new: Option<NativeHelper>,
     array_new: Option<NativeHelper>,
@@ -307,6 +316,7 @@ fn runtime_helper_abi_hash(helpers: crate::JitRuntimeHelperAddresses) -> u64 {
         helpers.native_local_store,
         helpers.native_value_lifecycle,
         helpers.native_reference_bind,
+        helpers.native_argument_check,
         helpers.native_return_check,
         helpers.native_exception_new,
         helpers.native_array_new,
@@ -584,6 +594,60 @@ fn require_native_operation_ok(
     builder.ins().return_(&[status]);
     builder.switch_to_block(ok);
     Ok(())
+}
+
+fn allocate_native_frame_storage(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    operations: NativeOperationFunctions,
+    bytes: u32,
+    alignment_log2: u8,
+    result_out: ir::Value,
+) -> ir::Value {
+    let pointer_type = module.target_config().pointer_type();
+    let Some(helper) = operations.frame_alloc else {
+        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            bytes,
+            alignment_log2,
+        ));
+        return builder.ins().stack_addr(pointer_type, slot, 0);
+    };
+    let context = builder.ins().iconst(types::I64, 0);
+    let bytes = builder.ins().iconst(types::I64, i64::from(bytes));
+    let alignment = builder.ins().iconst(types::I64, 1_i64 << alignment_log2);
+    let call = call_native_helper(module, builder, helper, &[context, bytes, alignment]);
+    let pointer = builder.inst_results(call)[0];
+    let allocated = builder.create_block();
+    let failed = builder.create_block();
+    let non_null = builder.ins().icmp_imm(IntCC::NotEqual, pointer, 0);
+    builder.ins().brif(non_null, allocated, &[], failed, &[]);
+    builder.switch_to_block(failed);
+    let empty = builder.ins().iconst(types::I64, 0);
+    builder
+        .ins()
+        .store(MemFlagsData::new(), empty, result_out, 0);
+    let status = builder
+        .ins()
+        .iconst(types::I32, i64::from(crate::JitCallStatus::RUNTIME_ERROR.0));
+    builder.ins().return_(&[status]);
+    builder.switch_to_block(allocated);
+    pointer
+}
+
+fn release_native_frame_storage(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    operations: NativeOperationFunctions,
+    pointer: ir::Value,
+    result_out: ir::Value,
+) -> Result<(), CraneliftLoweringError> {
+    let Some(helper) = operations.frame_release else {
+        return Ok(());
+    };
+    let context = builder.ins().iconst(types::I64, 0);
+    let call = call_native_helper(module, builder, helper, &[context, pointer]);
+    require_native_operation_ok(builder, builder.inst_results(call)[0], result_out)
 }
 
 fn require_native_value_operation_ok(
@@ -1130,6 +1194,7 @@ fn lower_region_instruction(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     functions: &BTreeMap<FunctionId, FuncId>,
+    inline_constants: &BTreeMap<FunctionId, RegionOperand>,
     function_params: &BTreeMap<FunctionId, NativeFunctionMetadata>,
     native_call_helper: Option<NativeHelper>,
     native_dynamic_code_helper: Option<NativeHelper>,
@@ -1991,13 +2056,30 @@ fn lower_region_instruction(
             define_region_register(builder, register_variables, registers, *dst, value)?;
         }
         RegionInstructionKind::NativeCall(call) => {
-            let direct_target = call.direct_compiled_target().filter(|target| {
-                function_params
-                    .get(target)
-                    .is_some_and(|(_, params, has_handlers, _)| {
-                        !has_handlers && params.iter().all(|parameter| parameter.type_.is_none())
-                    })
-            });
+            let direct_target = call.direct_compiled_target();
+            if call.operands.is_empty()
+                && let Some(target) = direct_target
+                && let Some(value) = inline_constants.get(&target).copied()
+            {
+                let value = lower_region_operand(builder, locals, registers, value)?;
+                match call.result {
+                    RegionCallResult::Register(destination) => define_region_register(
+                        builder,
+                        register_variables,
+                        registers,
+                        destination,
+                        value,
+                    )?,
+                    RegionCallResult::Discard => {}
+                    RegionCallResult::ReferenceLocal(_) => {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_INLINE_REFERENCE_RESULT",
+                            "bounded scalar inlining cannot produce a reference result",
+                        ));
+                    }
+                }
+                return Ok(());
+            }
             let direct = direct_target
                 .and_then(|target| functions.get(&target).copied())
                 .map(|callee| (call.result, callee));
@@ -2006,6 +2088,7 @@ fn lower_region_instruction(
                     module,
                     builder,
                     native_call_helper,
+                    native_operations,
                     native_operations.reference_bind,
                     native_operations.value_lifecycle,
                     value_flow,
@@ -2031,8 +2114,7 @@ fn lower_region_instruction(
                 3,
             ));
             let callee_result_out = builder.ins().stack_addr(pointer_type, result_slot, 0);
-            let mut call_args = Vec::with_capacity(call.operands.len());
-            let mut consumed_call_arguments = Vec::new();
+            let mut prepared_call_args = Vec::with_capacity(call.operands.len());
             let direct_target = call
                 .direct_compiled_target()
                 .expect("direct target was resolved above");
@@ -2074,6 +2156,42 @@ fn lower_region_instruction(
                         result_out,
                     )?;
                 }
+                if let Some(visible_index) = index.checked_sub(call.argument_operand_offset)
+                    && callee_params
+                        .get(visible_index)
+                        .or_else(|| callee_params.last().filter(|parameter| parameter.variadic))
+                        .is_some_and(|parameter| parameter.type_.is_some())
+                {
+                    let target = builder
+                        .ins()
+                        .iconst(types::I64, i64::from(direct_target.raw()));
+                    let parameter_flags =
+                        (visible_index as u64) | (u64::from(call.caller_strict_types) << 32);
+                    let parameter_flags = builder.ins().iconst(types::I64, parameter_flags as i64);
+                    let caller = builder.ins().iconst(types::I64, i64::from(function.raw()));
+                    let continuation = builder
+                        .ins()
+                        .iconst(types::I64, i64::from(instruction.continuation_id));
+                    value = lower_native_value_operation_with_state(
+                        module,
+                        builder,
+                        native_operations.argument_check,
+                        0,
+                        &[value, target, parameter_flags, caller, continuation],
+                        result_out,
+                        deopt_out,
+                        function,
+                        local_count,
+                        instruction,
+                        locals,
+                        native_version,
+                    )?;
+                }
+                prepared_call_args.push(value);
+            }
+            let mut call_args = Vec::with_capacity(prepared_call_args.len());
+            let mut consumed_call_arguments = Vec::new();
+            for (index, mut value) in prepared_call_args.into_iter().enumerate() {
                 value = lower_native_value_operation(
                     module,
                     builder,
@@ -2146,15 +2264,19 @@ fn lower_region_instruction(
                         "direct native call argument storage exceeds the native stack-slot ABI",
                     )
                 })?;
-            let argument_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
+            let arguments = allocate_native_frame_storage(
+                module,
+                builder,
+                native_operations,
                 packed_size,
                 3,
-            ));
+                result_out,
+            );
             for (index, value) in call_args.iter().copied().enumerate() {
-                builder.ins().stack_store(
+                builder.ins().store(
+                    MemFlagsData::new(),
                     value,
-                    argument_slot,
+                    arguments,
                     i32::try_from(index.saturating_mul(8)).map_err(|_| {
                         CraneliftLoweringError::new(
                             "JIT_CRANELIFT_NATIVE_CALL_ARITY",
@@ -2163,7 +2285,6 @@ fn lower_region_instruction(
                     })?,
                 );
             }
-            let arguments = builder.ins().stack_addr(pointer_type, argument_slot, 0);
             let callee_call_args = [
                 arguments,
                 callee_result_out,
@@ -2179,6 +2300,13 @@ fn lower_region_instruction(
             };
             let call = builder.ins().call(callee_ref, &callee_call_args);
             let status = builder.inst_results(call)[0];
+            release_native_frame_storage(
+                module,
+                builder,
+                native_operations,
+                arguments,
+                result_out,
+            )?;
             let ok = builder.create_block();
             let side_exit = builder.create_block();
             let is_ok =
@@ -3623,6 +3751,7 @@ fn lower_native_call_trampoline(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     native_call_helper: Option<NativeHelper>,
+    native_frame_operations: NativeOperationFunctions,
     native_reference_bind_helper: Option<NativeHelper>,
     native_value_lifecycle_helper: Option<NativeHelper>,
     value_flow: &ExecutableValueFlow,
@@ -3691,12 +3820,14 @@ fn lower_native_call_trampoline(
                 "native call argument table exceeds stack-slot limits",
             )
         })?;
-        let slot = builder.create_sized_stack_slot(StackSlotData::new(
-            StackSlotKind::ExplicitSlot,
+        let pointer = allocate_native_frame_storage(
+            module,
+            builder,
+            native_frame_operations,
             bytes,
             3,
-        ));
-        let pointer = builder.ins().stack_addr(pointer_type, slot, 0);
+            result_out,
+        );
         for index in 0..argument_count {
             let argument = index
                 .checked_sub(call.argument_operand_offset)
@@ -3849,12 +3980,14 @@ fn lower_native_call_trampoline(
                     "native call local table exceeds stack-slot limits",
                 )
             })?;
-        let slot = builder.create_sized_stack_slot(StackSlotData::new(
-            StackSlotKind::ExplicitSlot,
+        let pointer = allocate_native_frame_storage(
+            module,
+            builder,
+            native_frame_operations,
             bytes,
             3,
-        ));
-        let pointer = builder.ins().stack_addr(pointer_type, slot, 0);
+            result_out,
+        );
         for index in 0..published_local_count {
             let base = i32::try_from(index as usize * local_slot_size).unwrap_or(i32::MAX);
             let tag = builder.ins().iconst(types::I32, 3);
@@ -3878,12 +4011,14 @@ fn lower_native_call_trampoline(
                 "native call frame exceeds stack-slot limits",
             )
         })?;
-    let frame_slot = builder.create_sized_stack_slot(StackSlotData::new(
-        StackSlotKind::ExplicitSlot,
+    let frame_ptr = allocate_native_frame_storage(
+        module,
+        builder,
+        native_frame_operations,
         frame_size,
         3,
-    ));
-    let frame_ptr = builder.ins().stack_addr(pointer_type, frame_slot, 0);
+        result_out,
+    );
     let zero = builder.ins().iconst(types::I64, 0);
     for offset in (0..frame_size).step_by(8) {
         builder.ins().store(
@@ -3957,8 +4092,29 @@ fn lower_native_call_trampoline(
         std::mem::offset_of!(crate::JitNativeCallFrame, argument_count),
         u32::try_from(argument_count).unwrap_or(u32::MAX),
     );
-    let frame_flags =
-        u32::from(call.caller_strict_types) | if call.returns_by_reference { 1 << 1 } else { 0 };
+    let direct_builtin_helper = stable_builtin_helper_id(&call.target);
+    let direct_external = direct_builtin_helper.is_none()
+        && matches!(&call.target, RegionCallTarget::Function { name, function: None }
+        if function_params.values().any(|(candidate, ..)| {
+            candidate.trim_start_matches('\\').eq_ignore_ascii_case(name.trim_start_matches('\\'))
+        }));
+    let frame_flags = if call.caller_strict_types {
+        crate::JitNativeCallFrame::FLAG_STRICT_TYPES
+    } else {
+        0
+    } | if call.returns_by_reference {
+        crate::JitNativeCallFrame::FLAG_RETURN_REFERENCE
+    } else {
+        0
+    } | if direct_builtin_helper.is_some() {
+        crate::JitNativeCallFrame::FLAG_DIRECT_BUILTIN
+    } else {
+        0
+    } | if direct_external {
+        crate::JitNativeCallFrame::FLAG_DIRECT_EXTERNAL
+    } else {
+        0
+    };
     store_i32(
         builder,
         std::mem::offset_of!(crate::JitNativeCallFrame, flags),
@@ -4001,7 +4157,7 @@ fn lower_native_call_trampoline(
     store_i32(
         builder,
         target_offset + std::mem::offset_of!(crate::JitNativeCallTarget, function_id),
-        target_function,
+        direct_builtin_helper.unwrap_or(target_function),
     );
     for (offset, value) in [
         (
@@ -4059,6 +4215,31 @@ fn lower_native_call_trampoline(
     builder
         .ins()
         .store(MemFlagsData::new(), control_value, result_out, 0);
+    release_native_frame_storage(
+        module,
+        builder,
+        native_frame_operations,
+        frame_ptr,
+        result_out,
+    )?;
+    if published_local_count != 0 {
+        release_native_frame_storage(
+            module,
+            builder,
+            native_frame_operations,
+            local_slots_ptr,
+            result_out,
+        )?;
+    }
+    if argument_count != 0 {
+        release_native_frame_storage(
+            module,
+            builder,
+            native_frame_operations,
+            arguments_ptr,
+            result_out,
+        )?;
+    }
     builder.ins().return_(&[status]);
     builder.switch_to_block(ok);
     for (local, (original, flag_offsets)) in speculative_local_bindings {
@@ -4137,6 +4318,31 @@ fn lower_native_call_trampoline(
         )?;
     }
     let value = builder.ins().stack_load(types::I64, out_slot, 16);
+    release_native_frame_storage(
+        module,
+        builder,
+        native_frame_operations,
+        frame_ptr,
+        result_out,
+    )?;
+    if published_local_count != 0 {
+        release_native_frame_storage(
+            module,
+            builder,
+            native_frame_operations,
+            local_slots_ptr,
+            result_out,
+        )?;
+    }
+    if argument_count != 0 {
+        release_native_frame_storage(
+            module,
+            builder,
+            native_frame_operations,
+            arguments_ptr,
+            result_out,
+        )?;
+    }
     match call.result {
         RegionCallResult::Register(register) => {
             define_region_register(builder, register_variables, registers, register, value)?;

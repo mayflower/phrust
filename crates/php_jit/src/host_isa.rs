@@ -68,6 +68,11 @@ fn build_cranelift_host_isa_identity() -> Result<CraneliftHostIsaIdentity, Crane
     flag_builder.set("is_pic", "false").map_err(|error| {
         CraneliftHostIsaError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
     })?;
+    flag_builder
+        .set("preserve_frame_pointers", "true")
+        .map_err(|error| {
+            CraneliftHostIsaError::new("JIT_CRANELIFT_REJECT_FLAGS", error.to_string())
+        })?;
     let isa_builder = cranelift_native::builder().map_err(|error| {
         CraneliftHostIsaError::new(
             "JIT_CRANELIFT_REJECT_NATIVE_TARGET",
