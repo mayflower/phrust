@@ -45,8 +45,9 @@ pub use code_manager::{
 };
 pub use cranelift_lowering::{
     CraneliftClifSmokeResult, CraneliftLoweringError, CraneliftLoweringStats,
-    CraneliftNativeCompiler, NativeFunctionKey, NativeFunctionTier, NativeIndirectionCell,
-    NativeIndirectionState, build_trivial_add_clif_smoke,
+    CraneliftNativeCompiler, NativeCompilePlan, NativeFunctionKey, NativeFunctionTier,
+    NativeIndirectionCell, NativeIndirectionState, build_trivial_add_clif_smoke,
+    native_function_key,
 };
 pub use dynamic_code::{
     DynamicCodeCacheDisposition, DynamicCodeCacheKey, DynamicCodeCompileError,
@@ -955,11 +956,9 @@ impl JitFunctionHandle {
 
     /// Clones this graph handle with another function entry as its root.
     ///
-    /// Executable Region graphs can contain a root plus directly reachable
-    /// callees. Reusing those already-published entries avoids compiling the
-    /// same call graph again for every function in a declaration-heavy unit.
-    /// The clone retains the owning generation and full continuation metadata,
-    /// but selects the callee's address, arity, and root-local layout.
+    /// A production function artifact has one PHP-function root. This helper
+    /// also supports validated offline or fragment bundles with multiple
+    /// internal entries while retaining their owning generation.
     #[must_use]
     pub fn clone_for_function_entry(&self, function: FunctionId) -> Option<Self> {
         let metadata = self.region_state_metadata.as_ref()?;
@@ -1861,7 +1860,8 @@ impl JitEngine {
         self.compile_function_with_backend(unit, function, request, &mut backend)
     }
 
-    /// Compiles every known function body before an IR unit is executable.
+    /// Offline/precompile API that requests every known body separately.
+    /// Production execution must use [`Self::compile_function`] on demand.
     pub fn compile_unit(
         &mut self,
         unit: &IrUnit,
@@ -1870,7 +1870,7 @@ impl JitEngine {
         self.compile_unit_with_runtime_helpers(unit, request, JitRuntimeHelperAddresses::default())
     }
 
-    /// Compiles every body with the runtime helper table used by native code.
+    /// Offline/precompile API that emits one independent compile group per body.
     pub fn compile_unit_with_runtime_helpers(
         &mut self,
         unit: &IrUnit,
@@ -2115,7 +2115,27 @@ mod tests {
     }
 
     #[test]
-    fn compile_unit_reuses_entries_from_an_already_compiled_call_graph() {
+    fn compile_function_does_not_publish_same_unit_callee_body() {
+        extern "C" fn trampoline(
+            _vm_context: u64,
+            _frame: *mut crate::JitNativeCallFrame,
+            out: *mut crate::JitCallResult,
+        ) -> i32 {
+            // SAFETY: The generated call owns the synchronous result record.
+            unsafe {
+                out.write(crate::JitCallResult {
+                    status: crate::JitCallStatus::RETURN,
+                    detail: 0,
+                    value: crate::JitAbiSlot {
+                        tag: 3,
+                        flags: 0,
+                        payload: 4,
+                    },
+                });
+            }
+            crate::JitCallStatus::RETURN.0 as i32
+        }
+
         let mut builder = IrBuilder::new(UnitId::new(44));
         let file = builder.add_file("unit.php");
         let span = IrSpan::new(file, 0, 8);
@@ -2170,35 +2190,64 @@ mod tests {
         builder.register_function_name("declared_later", declared);
         builder.set_entry(entry);
         let unit = builder.finish();
-        let mut engine = JitEngine::new();
-        let records = engine
-            .compile_unit(&unit, JitCompileRequest::new("whole-unit"))
-            .expect("unit compile records");
-
-        assert_eq!(records.len(), 2);
-        assert!(
-            records.iter().all(|record| {
-                matches!(record.result.status, crate::JitCompileStatus::Compiled)
-                    && record.result.handle.is_some()
-            }),
-            "{records:#?}"
+        let mut failed_engine = JitEngine::new();
+        let failed = failed_engine
+            .compile_function(
+                &unit,
+                entry,
+                JitCompileRequest::new("function-on-demand-failure"),
+            )
+            .expect("rejected compile result");
+        assert!(matches!(
+            failed.status,
+            crate::JitCompileStatus::Rejected { .. }
+        ));
+        let deployment = crate::stable_ir_fingerprint(&unit);
+        let entry_function = &unit.functions[entry.index()];
+        let entry_key = crate::native_function_key(
+            deployment,
+            entry.raw(),
+            entry_function.params.len(),
+            entry_function.local_count,
+            false,
+            0,
         );
+        let manager = crate::global_code_manager().expect("code manager");
+        let cell = manager
+            .function_cell(&entry_key)
+            .expect("declared entry cell");
+        assert_eq!(cell.state(), crate::NativeIndirectionState::Unpublished);
+        assert!(manager.published_function(&entry_key).is_none());
+
+        let mut engine = JitEngine::new();
+        let result = engine
+            .compile_function_with_runtime_helpers(
+                &unit,
+                entry,
+                JitCompileRequest::new("function-on-demand"),
+                crate::JitRuntimeHelperAddresses {
+                    native_call_dispatch: trampoline as *const () as usize,
+                    ..crate::JitRuntimeHelperAddresses::default()
+                },
+            )
+            .expect("entry compile result");
+
+        assert!(matches!(result.status, crate::JitCompileStatus::Compiled));
         assert_eq!(engine.stats().compile_requests, 1);
-        assert_eq!(records[1].result.handle.as_ref().unwrap().code_bytes(), 0);
+        let handle = result.handle.as_ref().expect("entry handle");
+        assert_eq!(cell.state(), crate::NativeIndirectionState::Published);
+        let metadata = handle.region_state_metadata().expect("entry metadata");
+        assert_eq!(metadata.function_entries.len(), 1);
+        assert_eq!(metadata.function_entries[0].function, entry);
+        assert_eq!(handle.relocatable_code().unwrap().functions.len(), 1);
         assert_eq!(
-            records[1]
-                .result
-                .handle
-                .as_ref()
-                .unwrap()
-                .invoke_i64(&[], crate::JIT_RUNTIME_ABI_HASH)
-                .unwrap(),
+            handle.invoke_i64(&[], crate::JIT_RUNTIME_ABI_HASH).unwrap(),
             4
         );
     }
 
     #[test]
-    fn compile_large_unit_emits_one_body_set_per_generation() {
+    fn offline_compile_unit_keeps_every_compile_group_function_scoped() {
         let mut builder = IrBuilder::new(UnitId::new(45));
         let file = builder.add_file("large-unit.php");
         let span = IrSpan::new(file, 0, 8);
@@ -2231,14 +2280,16 @@ mod tests {
             .expect("unit compile records");
 
         assert_eq!(records.len(), 24);
-        assert_eq!(engine.stats().compile_requests, 1);
+        assert_eq!(engine.stats().compile_requests, 24);
         assert!(records.iter().all(|record| record.result.handle.is_some()));
-        assert!(records[0].result.handle.as_ref().unwrap().code_bytes() > 0);
-        assert!(
-            records[1..]
-                .iter()
-                .all(|record| record.result.handle.as_ref().unwrap().code_bytes() == 0)
-        );
+        assert!(records.iter().all(|record| {
+            let handle = record.result.handle.as_ref().unwrap();
+            handle.code_bytes() > 0
+                && handle.region_state_metadata().is_some_and(|metadata| {
+                    metadata.function_entries.len() == 1
+                        && metadata.function_entries[0].function == record.function
+                })
+        }));
     }
 
     #[test]

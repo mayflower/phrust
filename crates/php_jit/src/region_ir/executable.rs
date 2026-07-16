@@ -1061,6 +1061,8 @@ impl BaselineRegionBuilder {
             let mut known_closure_locals = BTreeMap::<LocalId, KnownClosure>::new();
             let mut known_object_registers = BTreeMap::<RegId, u32>::new();
             let mut known_object_locals = BTreeMap::<LocalId, u32>::new();
+            let mut exact_object_registers = BTreeSet::<RegId>::new();
+            let mut exact_object_locals = BTreeSet::<LocalId>::new();
             if let Some((class, false)) = method_class
                 && unit
                     .classes
@@ -1071,6 +1073,7 @@ impl BaselineRegionBuilder {
                 // exact only when the declaring class cannot be extended;
                 // otherwise a direct call would bypass virtual overrides.
                 known_object_locals.insert(LocalId::new(0), class);
+                exact_object_locals.insert(LocalId::new(0));
             }
             let mut known_exception_classes = BTreeMap::<RegId, String>::new();
             let active_exception = exception_regions
@@ -1112,6 +1115,11 @@ impl BaselineRegionBuilder {
                         {
                             known_object_registers.insert(*dst, *class);
                         }
+                        if let Operand::Register(register) = src
+                            && exact_object_registers.contains(register)
+                        {
+                            exact_object_registers.insert(*dst);
+                        }
                     }
                     InstructionKind::LoadLocal { dst, local }
                     | InstructionKind::LoadLocalQuiet { dst, local } => {
@@ -1123,6 +1131,9 @@ impl BaselineRegionBuilder {
                         }
                         if let Some(class) = known_object_locals.get(local) {
                             known_object_registers.insert(*dst, *class);
+                        }
+                        if exact_object_locals.contains(local) {
+                            exact_object_registers.insert(*dst);
                         }
                     }
                     InstructionKind::StoreLocal { local, src } => {
@@ -1146,6 +1157,13 @@ impl BaselineRegionBuilder {
                             known_object_locals.insert(*local, *class);
                         } else {
                             known_object_locals.remove(local);
+                        }
+                        if let Operand::Register(register) = src
+                            && exact_object_registers.contains(register)
+                        {
+                            exact_object_locals.insert(*local);
+                        } else {
+                            exact_object_locals.remove(local);
                         }
                     }
                     InstructionKind::ResolveCallable {
@@ -1463,6 +1481,7 @@ impl BaselineRegionBuilder {
                         }
                         if let Some((class_index, _)) = find_class(unit, class_name) {
                             known_object_registers.insert(*dst, class_index);
+                            exact_object_registers.insert(*dst);
                         }
                     }
                     _ => {}
@@ -1785,13 +1804,23 @@ impl BaselineRegionBuilder {
                         args,
                     } => known_object_class(*object, &known_object_registers)
                         .and_then(|class| {
-                            unit.classes
-                                .get(class as usize)?
+                            let class = unit.classes.get(class as usize)?;
+                            let class_is_final = class.flags.is_final;
+                            let receiver_is_exact = matches!(
+                                object,
+                                Operand::Register(register)
+                                    if exact_object_registers.contains(register)
+                            );
+                            class
                                 .methods
                                 .iter()
                                 .find(|entry| entry.name.eq_ignore_ascii_case(method))
                                 .filter(|entry| {
-                                    !entry.flags.is_private && !entry.flags.is_protected
+                                    !entry.flags.is_private
+                                        && !entry.flags.is_protected
+                                        && (receiver_is_exact
+                                            || class_is_final
+                                            || entry.flags.is_final)
                                 })
                                 .map(|entry| entry.function)
                         })

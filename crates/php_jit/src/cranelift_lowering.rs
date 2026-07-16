@@ -41,8 +41,11 @@ mod native_linkage;
 mod terminators;
 mod value_lowering;
 
+pub use module_layout::NativeCompilePlan;
+use native_linkage::BASELINE_FUNCTION_SPECIALIZATION;
 pub use native_linkage::{
     NativeFunctionKey, NativeFunctionTier, NativeIndirectionCell, NativeIndirectionState,
+    native_function_key,
 };
 
 use call_metadata::*;
@@ -57,6 +60,7 @@ struct NativeScalarRegionCompileResult {
     code_bytes: u64,
     fast_path_hits: u64,
     has_control_flow: bool,
+    plan: NativeCompilePlan,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -230,6 +234,44 @@ fn compile_authoritative_region(request: &NativeCompileRequest<'_>) -> NativeCom
             );
         }
     };
+    let deployment_unit = request
+        .compile
+        .ir_fingerprint
+        .clone()
+        .unwrap_or_else(|| crate::stable_ir_fingerprint(unit));
+    let declarations = unit
+        .functions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, function)| {
+            Some(native_function_key(
+                deployment_unit.clone(),
+                u32::try_from(index).ok()?,
+                function.params.len(),
+                function.local_count,
+                request.compile.opt_level != 0,
+                request.compile.invalidation_generation,
+            ))
+        });
+    let manager = match global_code_manager() {
+        Ok(manager) => manager,
+        Err(error) => {
+            return NativeCompileOutcome::skipped(
+                JitCompileStatus::Rejected {
+                    reason: "JIT_CRANELIFT_CODE_MANAGER".to_owned(),
+                },
+                error.to_string(),
+            );
+        }
+    };
+    if let Err(error) = manager.declare_function_cells(declarations) {
+        return NativeCompileOutcome::skipped(
+            JitCompileStatus::Rejected {
+                reason: "JIT_CRANELIFT_DECLARE_NATIVE_UNIT".to_owned(),
+            },
+            error.to_string(),
+        );
+    }
     let metadata = CompileMetadata {
         ir_fingerprint: request
             .compile
@@ -264,10 +306,24 @@ fn compile_authoritative_region(request: &NativeCompileRequest<'_>) -> NativeCom
             );
         }
     };
+    let plan = NativeCompilePlan::for_region(&region);
+    if plan.function != function {
+        return NativeCompileOutcome::skipped(
+            JitCompileStatus::Rejected {
+                reason: "JIT_CRANELIFT_REJECT_COMPILE_PLAN_ROOT".to_owned(),
+            },
+            format!(
+                "native compile plan root {} does not match requested function {}",
+                plan.function.raw(),
+                function.raw()
+            ),
+        );
+    }
     let start = Instant::now();
     match executable_region::compile_region_graph_native(
         unit,
         &region,
+        plan,
         request.runtime_helpers,
         request.compile,
     ) {
@@ -276,13 +332,19 @@ fn compile_authoritative_region(request: &NativeCompileRequest<'_>) -> NativeCom
             NativeCompileOutcome::compiled(
                 compiled.handle,
                 format!(
-                    "Cranelift baseline Region IR `{}` function={} abi_hash={} code_bytes={} fast_path_hits={} control_flow={}",
+                    "Cranelift baseline Region IR `{}` function={} abi_hash={} code_bytes={} fast_path_hits={} control_flow={} plan_ir_instructions={} plan_php_blocks={} plan_estimated_clif_blocks={} plan_virtual_values={} plan_safepoints={} plan_live_sum={}",
                     request.compile.region_id,
                     function.raw(),
                     JIT_RUNTIME_ABI_HASH,
                     compiled.code_bytes,
                     compiled.fast_path_hits,
-                    compiled.has_control_flow
+                    compiled.has_control_flow,
+                    compiled.plan.ir_instructions,
+                    compiled.plan.php_cfg_blocks,
+                    compiled.plan.estimated_clif_blocks,
+                    compiled.plan.virtual_values,
+                    compiled.plan.safepoint_count,
+                    compiled.plan.safepoint_live_set_sum,
                 ),
                 compiled.code_bytes,
                 elapsed.max(1),
@@ -939,7 +1001,7 @@ fn lower_direct_reference_argument(
                 module,
                 builder,
                 helper,
-                1,
+                native_dim_operation(1, function, instruction.continuation_id),
                 &[reference, key, zero],
                 result_out,
             )?;
@@ -1009,7 +1071,7 @@ fn lower_direct_reference_argument(
                 module,
                 builder,
                 helper,
-                1,
+                native_dim_operation(1, function, instruction.continuation_id),
                 &[reference, key, zero],
                 result_out,
             )?;
@@ -1413,7 +1475,7 @@ fn lower_region_instruction(
                 module,
                 builder,
                 native_operations.reference_bind,
-                1,
+                native_dim_operation(1, function, instruction.continuation_id),
                 &[
                     nested,
                     *keys
@@ -1429,7 +1491,7 @@ fn lower_region_instruction(
                     module,
                     builder,
                     native_operations.array_insert,
-                    0,
+                    native_dim_operation(0, function, instruction.continuation_id),
                     &[arrays[index], keys[index], updated],
                     result_out,
                 )?;
@@ -1500,7 +1562,7 @@ fn lower_region_instruction(
                     module,
                     builder,
                     native_operations.array_fetch,
-                    0,
+                    native_dim_operation(1, function, instruction.continuation_id),
                     &[nested, *key],
                     result_out,
                 )?;
@@ -1519,7 +1581,7 @@ fn lower_region_instruction(
                 module,
                 builder,
                 native_operations.array_insert,
-                u32::from(*append),
+                native_dim_operation(u32::from(*append), function, instruction.continuation_id),
                 &[nested, target_key, reference],
                 result_out,
             )?;
@@ -1528,7 +1590,7 @@ fn lower_region_instruction(
                     module,
                     builder,
                     native_operations.array_insert,
-                    0,
+                    native_dim_operation(0, function, instruction.continuation_id),
                     &[arrays[index], keys[index], updated],
                     result_out,
                 )?;
@@ -1641,7 +1703,7 @@ fn lower_region_instruction(
                     module,
                     builder,
                     native_operations.reference_bind,
-                    1,
+                    native_dim_operation(1, function, instruction.continuation_id),
                     &[reference, key, zero],
                     result_out,
                 )?;
@@ -1714,7 +1776,7 @@ fn lower_region_instruction(
                     module,
                     builder,
                     native_operations.array_fetch,
-                    0,
+                    native_dim_operation(1, function, instruction.continuation_id),
                     &[nested, *key],
                     result_out,
                 )?;
@@ -1736,7 +1798,7 @@ fn lower_region_instruction(
                 module,
                 builder,
                 native_operations.array_insert,
-                u32::from(*append),
+                native_dim_operation(u32::from(*append), function, instruction.continuation_id),
                 &[nested, target_key, reference],
                 result_out,
             )?;
@@ -1745,7 +1807,7 @@ fn lower_region_instruction(
                     module,
                     builder,
                     native_operations.array_insert,
-                    0,
+                    native_dim_operation(0, function, instruction.continuation_id),
                     &[arrays[index], keys[index], updated],
                     result_out,
                 )?;
@@ -1838,7 +1900,7 @@ fn lower_region_instruction(
                         module,
                         builder,
                         native_operations.array_fetch,
-                        0,
+                        native_dim_operation(1, function, instruction.continuation_id),
                         &[nested, *key],
                         result_out,
                     )?;
@@ -1855,7 +1917,7 @@ fn lower_region_instruction(
                     module,
                     builder,
                     native_operations.array_insert,
-                    u32::from(*append),
+                    native_dim_operation(u32::from(*append), function, instruction.continuation_id),
                     &[nested, target_key, reference],
                     result_out,
                 )?;
@@ -1864,7 +1926,7 @@ fn lower_region_instruction(
                         module,
                         builder,
                         native_operations.array_insert,
-                        0,
+                        native_dim_operation(0, function, instruction.continuation_id),
                         &[arrays[index], keys[index], updated],
                         result_out,
                     )?;
@@ -2056,8 +2118,22 @@ fn lower_region_instruction(
             define_region_register(builder, register_variables, registers, *dst, value)?;
         }
         RegionInstructionKind::NativeCall(call) => {
-            let direct_target = call.direct_compiled_target();
+            let direct_target = call
+                .direct_compiled_target()
+                .filter(|_| {
+                    !matches!(call.result, RegionCallResult::ReferenceLocal(_))
+                        && call
+                            .args
+                            .iter()
+                            .all(|argument| argument.name.is_none() && !argument.unpack)
+                })
+                .filter(|target| {
+                    function_params
+                        .get(target)
+                        .is_some_and(|(_, _, has_handlers, _)| !has_handlers)
+                });
             if call.operands.is_empty()
+                && !matches!(call.result, RegionCallResult::ReferenceLocal(_))
                 && let Some(target) = direct_target
                 && let Some(value) = inline_constants.get(&target).copied()
             {
@@ -2071,12 +2147,7 @@ fn lower_region_instruction(
                         value,
                     )?,
                     RegionCallResult::Discard => {}
-                    RegionCallResult::ReferenceLocal(_) => {
-                        return Err(CraneliftLoweringError::new(
-                            "JIT_CRANELIFT_INLINE_REFERENCE_RESULT",
-                            "bounded scalar inlining cannot produce a reference result",
-                        ));
-                    }
+                    RegionCallResult::ReferenceLocal(_) => unreachable!("filtered above"),
                 }
                 return Ok(());
             }
@@ -3068,7 +3139,7 @@ fn lower_region_instruction(
                     module,
                     builder,
                     native_operations.array_fetch,
-                    0,
+                    native_dim_operation(1, function, instruction.continuation_id),
                     &[nested, *key],
                     result_out,
                 )?;
@@ -3082,7 +3153,7 @@ fn lower_region_instruction(
                 module,
                 builder,
                 native_operations.array_insert,
-                1,
+                native_dim_operation(1, function, instruction.continuation_id),
                 &[nested, key, value],
                 result_out,
             )?;
@@ -3091,7 +3162,7 @@ fn lower_region_instruction(
                     module,
                     builder,
                     native_operations.array_insert,
-                    0,
+                    native_dim_operation(0, function, instruction.continuation_id),
                     &[arrays[index], keys[index], updated],
                     result_out,
                 )?;

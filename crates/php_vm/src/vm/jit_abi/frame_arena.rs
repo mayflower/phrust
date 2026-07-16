@@ -43,6 +43,7 @@ impl std::fmt::Debug for FrameChunkStorage {
 
 #[cfg(unix)]
 impl FrameChunkStorage {
+    // SAFETY: this item owns and bounds every raw mapping operation it performs.
     #[allow(unsafe_code)]
     fn new(usable_len: usize) -> Result<Self, String> {
         // SAFETY: `sysconf` has no memory-safety preconditions.
@@ -105,6 +106,7 @@ impl FrameChunkStorage {
         self.usable_len
     }
 
+    // SAFETY: offset bounds are checked by the arena before pointer arithmetic.
     #[allow(unsafe_code)]
     fn pointer_at(&mut self, offset: usize) -> *mut u8 {
         debug_assert!(offset < self.usable_len);
@@ -121,6 +123,7 @@ impl FrameChunkStorage {
 
 #[cfg(unix)]
 impl Drop for FrameChunkStorage {
+    // SAFETY: this item releases the mapping uniquely owned by the storage value.
     #[allow(unsafe_code)]
     fn drop(&mut self) {
         // SAFETY: This instance uniquely owns the complete mapping.
@@ -278,6 +281,7 @@ impl NativeFrameArena {
     }
 }
 
+// SAFETY: this ABI boundary returns an opaque integer address without dereferencing it.
 #[allow(unsafe_code)]
 pub(in crate::vm) extern "C" fn jit_native_frame_alloc_abi(
     _vm_context: u64,
@@ -353,6 +357,7 @@ mod tests {
 
     #[test]
     #[cfg(all(unix, not(miri)))]
+    // SAFETY: this test confines its deliberate guard-page access to a child process.
     #[allow(unsafe_code)]
     fn guarded_chunk_faults_on_first_byte_past_the_usable_range() {
         let chunk = FrameChunkStorage::new(FRAME_ARENA_CHUNK_BYTES).unwrap();

@@ -1158,6 +1158,12 @@ pub(in crate::vm) extern "C" fn jit_native_reference_bind_abi(
     reserved: i64,
     out: *mut i64,
 ) -> i32 {
+    let raw_op = op;
+    let op = if raw_op & 0x8000_0000 != 0 {
+        raw_op & 1
+    } else {
+        raw_op
+    };
     if op > 5 {
         return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
     }
@@ -1288,10 +1294,33 @@ pub(in crate::vm) extern "C" fn jit_native_reference_bind_abi(
             };
         }
         if op == 1 {
+            let source = if raw_op & 0x8000_0000 != 0 {
+                let function = (raw_op >> 1) & 0x3ff;
+                let continuation = (raw_op >> 11) & 0x0f_ffff;
+                context
+                    .instruction_for_continuation(function, continuation)
+                    .cloned()
+            } else {
+                None
+            };
             let Ok(key) = context.decode(key) else {
                 return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
             };
             let key = dereference_native_dimension_value(key);
+            let Ok(target) = context.decode(encoded) else {
+                return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+            };
+            if emit_native_dimension_conversion_diagnostic(
+                context,
+                &target,
+                &key,
+                source.as_ref(),
+                NativeDimensionOperation::Reference,
+            )
+            .is_err()
+            {
+                return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+            }
             let Some(key) = php_runtime::api::ArrayKey::from_value(&key) else {
                 return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
             };
@@ -1647,7 +1676,15 @@ pub(in crate::vm) extern "C" fn jit_native_array_insert_abi(
             let Ok(target) = context.decode(array) else {
                 return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
             };
-            if emit_native_float_offset_warning(context, &target, &key, source.as_ref()).is_err() {
+            if emit_native_dimension_conversion_diagnostic(
+                context,
+                &target,
+                &key,
+                source.as_ref(),
+                NativeDimensionOperation::Insert,
+            )
+            .is_err()
+            {
                 return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
             }
             let Some(key) = php_runtime::api::ArrayKey::from_value(&key) else {
@@ -2669,7 +2706,15 @@ pub(in crate::vm) extern "C" fn jit_native_array_fetch_abi(
             };
             array = reference.get();
         }
-        if emit_native_float_offset_warning(context, &array, &key, source.as_ref()).is_err() {
+        if emit_native_dimension_conversion_diagnostic(
+            context,
+            &array,
+            &key,
+            source.as_ref(),
+            NativeDimensionOperation::Fetch { quiet: quiet == 1 },
+        )
+        .is_err()
+        {
             return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
         }
         let Some(key) = php_runtime::api::ArrayKey::from_value(&key) else {
@@ -2866,7 +2911,15 @@ pub(in crate::vm) extern "C" fn jit_native_array_unset_abi(
         let Ok(target) = context.decode(array) else {
             return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
         };
-        if emit_native_float_offset_warning(context, &target, &key, source.as_ref()).is_err() {
+        if emit_native_dimension_conversion_diagnostic(
+            context,
+            &target,
+            &key,
+            source.as_ref(),
+            NativeDimensionOperation::Unset,
+        )
+        .is_err()
+        {
             return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
         }
         let Some(key) = php_runtime::api::ArrayKey::from_value(&key) else {

@@ -14,6 +14,7 @@ pub(super) fn register_native_dynamic_unit(
     let NativeIncludeExports {
         functions,
         native_entries,
+        native_entry_signature_hashes,
         classes,
         constants,
         autoload_callbacks,
@@ -49,6 +50,7 @@ pub(super) fn register_native_dynamic_unit(
     context.dynamic_units.push(NativeDynamicUnit {
         compiled,
         native_entries,
+        native_entry_signature_hashes,
         exported_classes,
     });
     for (name, function) in functions {
@@ -183,6 +185,52 @@ pub(super) fn ensure_native_entry(
         .get(&function)
         .cloned()
         .ok_or_else(|| format!("native function entry {} was not published", function.raw()))
+}
+
+pub(super) fn ensure_dynamic_native_entry(
+    context: &mut NativeExecutionContext<'_>,
+    unit: usize,
+    function: php_ir::FunctionId,
+) -> Result<php_jit::JitFunctionHandle, String> {
+    let package = context
+        .dynamic_units
+        .get(unit)
+        .ok_or_else(|| "dynamic native unit is missing".to_owned())?;
+    let compiled = package.compiled.clone();
+    let external_signatures = visible_external_function_signatures(context, &compiled, function);
+    let signature_hash = super::super::external_function_signatures_hash(&external_signatures);
+    if package.native_entry_signature_hashes.get(&function) == Some(&signature_hash)
+        && let Some(handle) = package.native_entries.get(&function)
+    {
+        return Ok(handle.clone());
+    }
+    let (records, _) = context.worker_state.compile_native(
+        &compiled,
+        function,
+        context.options,
+        &external_signatures,
+    )?;
+    let entries = native_entries_from_records(&records)?;
+    let package = context
+        .dynamic_units
+        .get_mut(unit)
+        .ok_or_else(|| "dynamic native unit disappeared during compilation".to_owned())?;
+    for compiled_function in entries.keys() {
+        package
+            .native_entry_signature_hashes
+            .insert(*compiled_function, signature_hash);
+    }
+    std::sync::Arc::make_mut(&mut package.native_entries).extend(entries);
+    package
+        .native_entries
+        .get(&function)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "dynamic native function entry {} was not published",
+                function.raw()
+            )
+        })
 }
 
 pub(super) fn visible_external_function_signatures(

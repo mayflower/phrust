@@ -11,6 +11,26 @@ use md5::{Digest, Md5};
 use php_lexer::{LexerConfig, SymbolKind, TokenKind, TokenName, lex_all};
 use sha1::Sha1;
 
+fn pack_u16_bytes(code: u8, value: i64) -> [u8; 2] {
+    match code {
+        b'n' => (value as u16).to_be_bytes(),
+        b'v' => (value as u16).to_le_bytes(),
+        _ => unreachable!("checked pack format"),
+    }
+}
+
+fn unpack_u16_value(code: u8, bytes: &[u8]) -> i64 {
+    let [first, second] = bytes else {
+        unreachable!("checked unpack width");
+    };
+    let bytes = [*first, *second];
+    match code {
+        b'n' => i64::from(u16::from_be_bytes(bytes)),
+        b'v' => i64::from(u16::from_le_bytes(bytes)),
+        _ => unreachable!("checked unpack format"),
+    }
+}
+
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new(
         "base64_decode",

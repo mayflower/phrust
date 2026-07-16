@@ -5,37 +5,38 @@ sits above Region IR construction and Cranelift emission, so a warm request can
 reuse already-published native handles without rebuilding the same function
 graph.
 
-The cache has two independently bounded LRU segments:
-
-- primary entries are keys that execution explicitly requested;
-- aliases are the additional function entries published by the same compiled
-  graph.
-
-Keeping the segments separate prevents a large PHP application from filling
-the cache with graph aliases and evicting every include-entry key needed by the
-next request. An alias hit is promoted to the primary segment. Both segments
-remain bounded by the configured entry capacity.
+Every cache key names exactly one PHP function, tier, external-signature set,
+and immutable unit identity. A successful record set must contain exactly that
+function. Foreign function records are rejected before publication and are
+never installed as aliases. Concurrent misses for one key use single-flight;
+process-wide compiler parallelism and its bounded queue are configured with
+`PHRUST_NATIVE_COMPILE_PARALLELISM` and
+`PHRUST_NATIVE_COMPILE_QUEUE_LIMIT`.
 
 Validate the policy with:
 
 ```bash
-nix develop -c cargo test -p php_vm native_compile_cache --lib
+nix develop -c just function-on-demand-gate
 ```
 
-## Restart-persistent PNA2 unit bundles
+## Restart-persistent PNA2 function artifacts
 
 When `--native-cache` permits reads or writes, every executable IR unit is a
-cache candidate, including declaration-heavy include/eval units. The same
+cache candidate, including entries of declaration-heavy include/eval units. The same
 Cranelift lowering that publishes the process-local entry retains actual code
-bytes and symbolic relocations before `JITModule` finalization. PNA2 stores one
-deduplicated bundle per unit identity:
+bytes and symbolic relocations before `JITModule` finalization. The cache
+identity includes the requested function, and PNA2 stores only that function's
+current native artifact:
 
-- all native function entries in the unit;
+- the requested PHP function entry and its future internal fragments;
 - code bytes and internal-symbol relocations;
 - stable helper IDs and names, never helper process addresses;
 - deterministic `PRM4` state metadata for exceptions, native continuations, OSR,
-  generators, and fibers. Each shared function graph is serialized once and
-  root entries refer to it by a compact index.
+  generators, and fibers.
+
+Dormant functions and methods contribute no code, relocations, metadata, or
+cache bytes. Unit-level data is declaration metadata; it does not imply native
+body compilation.
 
 Writers emit only PNA2. The loader accepts PNA1 for one migration window using
 the same strict checksum, section, identity, relocation, and W^X validation;
@@ -56,12 +57,13 @@ direct-call ratio as a WordPress result.
 The tranche builder records unavailable WordPress/RSS inputs as unmeasured with
 an exact reason; structural gates never substitute for performance results.
 
-Same-unit calls with fully materialized positional arguments call the compiled
-callee symbol directly, including callees with declared parameter types. A
-versioned `phrust_native_argument_check` helper applies call-site strictness,
-weak scalar coercion, callable checks, by-reference write-back, and catchable
-`TypeError` publication before the direct branch. Named/unpacked arguments and
-other runtime-bound shapes remain on the typed call dispatcher.
+Baseline same-unit userland calls use the typed native dispatcher and the
+callee's generation-checked indirection cell. An unpublished cell enters the
+single-flight compiler, publishes only after complete validation, and retries
+the native call. Parameter strictness, coercion, references, and catchable
+`TypeError` behavior therefore remain on the existing typed call contract.
+Direct or guarded linking may be added only by a later optimizing recompile;
+it must never widen baseline compilation.
 
 Published functions from include/eval units execute through a scoped active-unit
 view on the existing request context. The view swaps immutable unit metadata,
@@ -72,14 +74,9 @@ are materialized before restoring the caller unit. This removes the former
 nested `NativeExecutionContext` and state-move/merge path for successful
 cross-unit calls.
 
-On x86-64, an exact forwarding wrapper with the same parameter and return
-contract as a side-effect-free leaf callee reuses its incoming packed argument
-buffer and emits Cranelift `return_call`. The subset excludes methods,
-closures, generators, references, variadics, handlers, and callees with
-observable operations; broader tail calls require an explicit owned arena-frame
-transfer protocol. Native code preserves frame pointers because Cranelift's
-x86-64 tail-call lowering currently requires them. Other architectures retain
-their platform ABI and do not advertise tail calls.
+Function-on-demand baseline compilation does not form same-unit tail-call or
+inlining groups. Fragment-local tail calls belong to the bounded-fragment
+compiler and must not pull another PHP function into the artifact.
 
 On AMD64, helper calls target an artifact-local `movabs`/`jmp` trampoline. The
 loader resolves the trampoline immediate through the current versioned helper

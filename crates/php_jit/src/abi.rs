@@ -10,13 +10,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use php_ir::{FunctionId, LocalId, RegId};
 
 /// Version for the C-compatible runtime ABI records.
-pub const JIT_RUNTIME_ABI_VERSION: u32 = 19;
+pub const JIT_RUNTIME_ABI_VERSION: u32 = 20;
 
 /// Stable ABI fingerprint for Cranelift ABI.
 ///
 /// This is updated only when a `repr(C)` boundary type changes layout or tag
 /// meaning. It is intentionally independent from Rust type names.
-pub const JIT_RUNTIME_ABI_HASH: u64 = 0x0dc1_a819_0000_0029;
+pub const JIT_RUNTIME_ABI_HASH: u64 = 0x0dc1_a820_0000_002a;
 
 /// Maximum number of scalar VM locals materialized by one native side exit.
 pub const JIT_DEOPT_MAX_SLOTS: usize = 256;
@@ -1377,7 +1377,7 @@ mod tests {
 
     #[test]
     fn c_abi_layout_is_stable() {
-        assert_eq!(JIT_RUNTIME_ABI_VERSION, 19);
+        assert_eq!(JIT_RUNTIME_ABI_VERSION, 20);
         assert_ne!(JIT_RUNTIME_ABI_HASH, 0);
         assert_eq!(size_of::<JitOpaqueHandle>(), 8);
         assert_eq!(size_of::<JitCValueTag>(), 4);

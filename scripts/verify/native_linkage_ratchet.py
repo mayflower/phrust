@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Structural ratchet for stable native linkage and unit-bundle footprint."""
+"""Structural ratchet for function-on-demand linkage and native footprint."""
 
 from __future__ import annotations
 
@@ -54,8 +54,18 @@ def main() -> int:
 
     require(
         failures,
-        "whole_unit_function_order" in lowering and "whole_unit_function_order" in layout,
-        "unit compilation no longer uses the whole-unit body order",
+        "whole_unit_function_order" not in lowering
+        and "whole_unit_function_order" not in layout
+        and "BTreeMap::from([(root.function, root.clone())])" in lowering,
+        "production compilation can admit PHP bodies beyond the requested function",
+    )
+    require(
+        failures,
+        "pub struct NativeCompilePlan" in layout
+        and "NativeCompilePlan::for_region(&region)" in text(
+            "crates/php_jit/src/cranelift_lowering.rs"
+        ),
+        "the mandatory pre-Cranelift function compile plan is missing",
     )
     require(
         failures,
@@ -75,8 +85,10 @@ def main() -> int:
     )
     require(
         failures,
-        'PNA_MAGIC: [u8; 4] = *b"PNA2"' in cache,
-        "native cache writer is not the PNA2 unit-bundle schema",
+        'PNA_MAGIC: [u8; 4] = *b"PNA2"' in cache
+        and "compiled-source-v2-" in text("crates/php_vm/src/vm/mod.rs")
+        and "-function-{}" in text("crates/php_vm/src/vm/mod.rs"),
+        "native cache identity is not scoped to one PHP function artifact",
     )
     require(
         failures,
@@ -111,8 +123,9 @@ def main() -> int:
     )
     require(
         failures,
-        "direct_call_counter_is_nonzero_without_dynamic_dispatch" in vm_tests,
-        "linkage smoke does not ratchet non-zero direct-call telemetry",
+        "same_unit_call_uses_function_on_demand_dispatch" in vm_tests
+        and "counters.native_same_unit_direct_executed, 0" in vm_tests,
+        "same-unit baseline calls can bypass function-on-demand dispatch",
     )
     require(
         failures,
@@ -144,16 +157,24 @@ def main() -> int:
     )
     require(
         failures,
-        "bounded_inline_constant_return" in lowering
-        and "bounded_constant_wrapper_inlining_removes_native_call" in vm_tests,
-        "bounded native inlining is not ratcheted",
+        "baseline_does_not_inline_or_widen_for_constant_wrapper" in vm_tests
+        and "counters.native_inlined_calls, 0" in vm_tests
+        and "counters.native_inline_calls_removed, 0" in vm_tests,
+        "baseline compilation can inline and widen its compile group",
     )
     require(
         failures,
-        "bounded_tail_forward_target" in lowering
-        and ".return_call(" in lowering
-        and "counters.native_tail_calls, 1" in vm_tests,
-        "bounded native tail-call lowering is not ratcheted",
+        "counters.native_tail_calls, 0" in vm_tests,
+        "baseline function-on-demand smoke can form a same-unit tail call",
+    )
+    require(
+        failures,
+        "E_NATIVE_COMPILE_BREADTH" in vm_cache
+        and "records.len() == 1" in vm_cache
+        and "concurrent_same_key_compiles_once" in vm_cache
+        and "PHRUST_NATIVE_COMPILE_PARALLELISM" in vm_cache
+        and "PHRUST_NATIVE_COMPILE_QUEUE_LIMIT" in vm_cache,
+        "compile breadth, single-flight, or process compile limits are missing",
     )
     require(
         failures,
@@ -184,7 +205,18 @@ def main() -> int:
             require(
                 failures,
                 counter(document, "native_call_direct") > 0,
-                "linkage smoke recorded zero direct calls",
+                "linkage smoke recorded zero resolved native calls",
+            )
+            require(
+                failures,
+                counter(document, "native_same_unit_direct_executed") == 0,
+                "baseline linkage smoke bypassed the function Cell",
+            )
+            require(
+                failures,
+                counter(document, "native_inlined_calls") == 0
+                and counter(document, "native_tail_calls") == 0,
+                "baseline linkage smoke widened through inlining or tail calls",
             )
             require(
                 failures,

@@ -603,21 +603,23 @@ fn classify_locals(region: &RegionGraph) -> BTreeMap<LocalId, LocalStorageClass>
                 RegionInstructionKind::BindReference { target, source } => {
                     references.extend([*target, *source]);
                 }
-                RegionInstructionKind::BindReferenceDim { target, array, .. }
-                | RegionInstructionKind::BindReferenceFromPropertyDim {
-                    target,
-                    object: RegionOperand::Local(array),
-                    ..
-                } => {
+                RegionInstructionKind::BindReferenceDim { target, array, .. } => {
                     references.extend([*target, *array]);
                 }
-                RegionInstructionKind::BindReferenceIntoDim { array, source, .. }
-                | RegionInstructionKind::BindReferenceDimFromProperty {
-                    array,
-                    object: RegionOperand::Local(source),
-                    ..
-                } => {
+                RegionInstructionKind::BindReferenceFromPropertyDim { target, object, .. } => {
+                    references.insert(*target);
+                    if let RegionOperand::Local(object) = object {
+                        references.insert(*object);
+                    }
+                }
+                RegionInstructionKind::BindReferenceIntoDim { array, source, .. } => {
                     references.extend([*array, *source]);
+                }
+                RegionInstructionKind::BindReferenceDimFromProperty { array, object, .. } => {
+                    references.insert(*array);
+                    if let RegionOperand::Local(object) = object {
+                        references.insert(*object);
+                    }
                 }
                 RegionInstructionKind::BindReferenceProperty { source, .. }
                 | RegionInstructionKind::BindReferenceStaticProperty { source }
@@ -625,7 +627,6 @@ fn classify_locals(region: &RegionGraph) -> BTreeMap<LocalId, LocalStorageClass>
                     references.insert(*source);
                 }
                 RegionInstructionKind::BindReferenceFromProperty { target, .. }
-                | RegionInstructionKind::BindReferenceFromPropertyDim { target, .. }
                 | RegionInstructionKind::InitStaticLocal { local: target, .. }
                 | RegionInstructionKind::ForeachNextRef {
                     value_local: target,

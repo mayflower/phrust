@@ -3,19 +3,99 @@
 //! The lower Cranelift code manager deduplicates machine-code emission, but its
 //! key is reached only after authoritative Region IR has been rebuilt. Server
 //! workers retain these immutable compile records so warm requests can reuse
-//! the published handles without repeating that frontend work. Requested
-//! compile keys and graph-derived function aliases use separate bounded LRU
-//! segments: alias churn must never evict every next-request entry key.
+//! the published handles without repeating that frontend work. Every entry
+//! owns exactly one requested PHP function; foreign aliases are rejected.
 
 use php_ir::FunctionId;
 use php_jit::JitUnitCompileRecord;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{
+    Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 use std::time::Instant;
 
 const DEFAULT_NATIVE_COMPILE_CACHE_ENTRIES: usize = 4_096;
 const DEFAULT_LOADED_NATIVE_UNIT_ENTRIES: usize = 4_096;
+const DEFAULT_NATIVE_COMPILE_PARALLELISM: usize = 1;
+const DEFAULT_NATIVE_COMPILE_QUEUE_LIMIT: usize = 64;
+
+#[derive(Debug, Default)]
+struct CompileLimitState {
+    active: usize,
+    queued: usize,
+}
+
+#[derive(Debug)]
+struct ProcessCompileLimiter {
+    maximum_parallel: usize,
+    maximum_queue: usize,
+    state: Mutex<CompileLimitState>,
+    ready: Condvar,
+}
+
+impl ProcessCompileLimiter {
+    fn from_environment() -> Self {
+        let configured = |name: &str, fallback: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(fallback)
+        };
+        Self {
+            maximum_parallel: configured(
+                "PHRUST_NATIVE_COMPILE_PARALLELISM",
+                DEFAULT_NATIVE_COMPILE_PARALLELISM,
+            ),
+            maximum_queue: configured(
+                "PHRUST_NATIVE_COMPILE_QUEUE_LIMIT",
+                DEFAULT_NATIVE_COMPILE_QUEUE_LIMIT,
+            ),
+            state: Mutex::new(CompileLimitState::default()),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> Result<ProcessCompilePermit<'_>, String> {
+        let mut state = lock_unpoisoned(&self.state);
+        if state.active >= self.maximum_parallel {
+            if state.queued >= self.maximum_queue {
+                return Err(format!(
+                    "E_NATIVE_COMPILE_QUEUE_FULL: active={} queued={} limit={}",
+                    state.active, state.queued, self.maximum_queue
+                ));
+            }
+            state.queued = state.queued.saturating_add(1);
+            while state.active >= self.maximum_parallel {
+                state = self
+                    .ready
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            state.queued = state.queued.saturating_sub(1);
+        }
+        state.active = state.active.saturating_add(1);
+        Ok(ProcessCompilePermit { limiter: self })
+    }
+}
+
+struct ProcessCompilePermit<'a> {
+    limiter: &'a ProcessCompileLimiter,
+}
+
+impl Drop for ProcessCompilePermit<'_> {
+    fn drop(&mut self) {
+        let mut state = lock_unpoisoned(&self.limiter.state);
+        state.active = state.active.saturating_sub(1);
+        self.limiter.ready.notify_one();
+    }
+}
+
+fn process_compile_limiter() -> &'static ProcessCompileLimiter {
+    static LIMITER: OnceLock<ProcessCompileLimiter> = OnceLock::new();
+    LIMITER.get_or_init(ProcessCompileLimiter::from_environment)
+}
 
 /// Immutable cached artifact publication shared by every request in a process.
 #[derive(Debug)]
@@ -251,9 +331,8 @@ impl CompileWait {
 struct NativeCompileCacheState {
     primary_entries: HashMap<NativeCompileCacheKey, Arc<[JitUnitCompileRecord]>>,
     primary_lru: VecDeque<NativeCompileCacheKey>,
-    alias_entries: HashMap<NativeCompileCacheKey, Arc<[JitUnitCompileRecord]>>,
-    alias_lru: VecDeque<NativeCompileCacheKey>,
     in_flight: HashMap<NativeCompileCacheKey, Arc<CompileWait>>,
+    permanent_failures: HashMap<NativeCompileCacheKey, String>,
     metrics: NativeCompileCacheMetrics,
 }
 
@@ -289,12 +368,8 @@ impl NativeCompileCache {
                 touch_lru(&mut state.primary_lru, key);
                 return Ok((records, NativeCompileCacheDisposition::Hit));
             }
-            if let Some(records) = state.alias_entries.remove(&key) {
-                state.metrics.hits = state.metrics.hits.saturating_add(1);
-                remove_lru(&mut state.alias_lru, key);
-                insert_primary(&mut state, key, Arc::clone(&records));
-                evict_primary_entries(&mut state, self.capacity);
-                return Ok((records, NativeCompileCacheDisposition::Hit));
+            if let Some(error) = state.permanent_failures.get(&key) {
+                return Err(error.clone());
             }
             if let Some(wait) = state.in_flight.get(&key).cloned() {
                 state.metrics.hits = state.metrics.hits.saturating_add(1);
@@ -315,7 +390,24 @@ impl NativeCompileCache {
         }
 
         let compile_started = Instant::now();
-        let result = compile().map(Arc::<[JitUnitCompileRecord]>::from);
+        let result = process_compile_limiter()
+            .acquire()
+            .and_then(|_permit| compile())
+            .and_then(|records| {
+                if records.len() == 1 && records[0].function.raw() == key.function {
+                    Ok(records)
+                } else {
+                    Err(format!(
+                        "E_NATIVE_COMPILE_BREADTH: compile_miss({}) produced functions {:?}",
+                        key.function,
+                        records
+                            .iter()
+                            .map(|record| record.function.raw())
+                            .collect::<Vec<_>>()
+                    ))
+                }
+            })
+            .map(Arc::<[JitUnitCompileRecord]>::from);
         let compile_time_nanos = compile_started
             .elapsed()
             .as_nanos()
@@ -328,29 +420,16 @@ impl NativeCompileCache {
                 .compile_time_nanos
                 .saturating_add(compile_time_nanos);
             if let Ok(records) = &result {
-                let aliases = records
-                    .iter()
-                    .map(|record| NativeCompileCacheKey {
-                        unit_cache_identity: key.unit_cache_identity,
-                        function: record.function.raw(),
-                        optimizing: key.optimizing,
-                        external_signatures_hash: key.external_signatures_hash,
-                    })
-                    .collect::<Vec<_>>();
                 insert_primary(&mut state, key, Arc::clone(records));
-                for alias in aliases {
-                    if alias != key
-                        && !state.in_flight.contains_key(&alias)
-                        && !state.primary_entries.contains_key(&alias)
-                    {
-                        insert_alias(&mut state, alias, Arc::clone(records));
-                    }
-                }
                 state.metrics.insertions = state.metrics.insertions.saturating_add(1);
                 evict_primary_entries(&mut state, self.capacity);
-                evict_alias_entries(&mut state, self.capacity);
             } else {
                 state.metrics.compile_failures = state.metrics.compile_failures.saturating_add(1);
+                if let Err(error) = &result
+                    && permanent_compile_failure(error)
+                {
+                    state.permanent_failures.insert(key, error.clone());
+                }
             }
             wait
         };
@@ -363,10 +442,7 @@ impl NativeCompileCache {
     pub(super) fn stats(&self) -> NativeCompileCacheStats {
         let state = lock_unpoisoned(&self.state);
         NativeCompileCacheStats {
-            entries: state
-                .primary_entries
-                .len()
-                .saturating_add(state.alias_entries.len()),
+            entries: state.primary_entries.len(),
             hits: state.metrics.hits,
             misses: state.metrics.misses,
             insertions: state.metrics.insertions,
@@ -376,6 +452,12 @@ impl NativeCompileCache {
             compile_time_nanos: state.metrics.compile_time_nanos,
         }
     }
+}
+
+fn permanent_compile_failure(error: &str) -> bool {
+    !error.starts_with("E_NATIVE_COMPILE_QUEUE_FULL:")
+        && !error.contains("Cranelift code limit is exhausted")
+        && !error.contains("allocation failed")
 }
 
 fn touch_lru(lru: &mut VecDeque<NativeCompileCacheKey>, key: NativeCompileCacheKey) {
@@ -394,19 +476,8 @@ fn insert_primary(
     key: NativeCompileCacheKey,
     records: Arc<[JitUnitCompileRecord]>,
 ) {
-    state.alias_entries.remove(&key);
-    remove_lru(&mut state.alias_lru, key);
     state.primary_entries.insert(key, records);
     touch_lru(&mut state.primary_lru, key);
-}
-
-fn insert_alias(
-    state: &mut NativeCompileCacheState,
-    key: NativeCompileCacheKey,
-    records: Arc<[JitUnitCompileRecord]>,
-) {
-    state.alias_entries.insert(key, records);
-    touch_lru(&mut state.alias_lru, key);
 }
 
 fn evict_primary_entries(state: &mut NativeCompileCacheState, capacity: usize) {
@@ -415,17 +486,6 @@ fn evict_primary_entries(state: &mut NativeCompileCacheState, capacity: usize) {
             break;
         };
         if state.primary_entries.remove(&evicted).is_some() {
-            state.metrics.evictions = state.metrics.evictions.saturating_add(1);
-        }
-    }
-}
-
-fn evict_alias_entries(state: &mut NativeCompileCacheState, capacity: usize) {
-    while state.alias_entries.len() > capacity {
-        let Some(evicted) = state.alias_lru.pop_front() else {
-            break;
-        };
-        if state.alias_entries.remove(&evicted).is_some() {
             state.metrics.evictions = state.metrics.evictions.saturating_add(1);
         }
     }
@@ -465,7 +525,7 @@ mod tests {
     #[test]
     fn cache_is_bounded_and_uses_lru_eviction() {
         let cache = NativeCompileCache::new(2);
-        let compile = || Ok(Vec::new());
+        let compile = || Ok(vec![record(0)]);
         cache.get_or_compile(key(1), compile).unwrap();
         cache.get_or_compile(key(2), compile).unwrap();
         cache.get_or_compile(key(1), compile).unwrap();
@@ -484,8 +544,8 @@ mod tests {
     fn concurrent_same_key_compiles_once() {
         let cache = Arc::new(NativeCompileCache::new(2));
         let compiles = Arc::new(AtomicUsize::new(0));
-        let barrier = Arc::new(std::sync::Barrier::new(2));
-        let handles = (0..2)
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
             .map(|_| {
                 let cache = Arc::clone(&cache);
                 let compiles = Arc::clone(&compiles);
@@ -496,7 +556,7 @@ mod tests {
                         .get_or_compile(key(1), || {
                             compiles.fetch_add(1, Ordering::Relaxed);
                             thread::sleep(Duration::from_millis(25));
-                            Ok(Vec::new())
+                            Ok(vec![record(0)])
                         })
                         .unwrap()
                         .1
@@ -511,45 +571,48 @@ mod tests {
         assert_eq!(compiles.load(Ordering::Relaxed), 1);
         assert!(dispositions.contains(&NativeCompileCacheDisposition::Miss));
         assert!(dispositions.contains(&NativeCompileCacheDisposition::Wait));
-        assert_eq!(cache.stats().compile_waits, 1);
+        assert_eq!(
+            dispositions
+                .iter()
+                .filter(|disposition| **disposition == NativeCompileCacheDisposition::Wait)
+                .count(),
+            7
+        );
+        assert_eq!(cache.stats().compile_waits, 7);
     }
 
     #[test]
-    fn one_region_record_set_publishes_all_function_aliases() {
+    fn compile_breadth_violation_is_rejected_and_cached() {
         let cache = NativeCompileCache::new(8);
-        let (records, first) = cache
+        let first = cache
             .get_or_compile(key(7), || Ok(vec![record(0), record(3)]))
-            .unwrap();
-        let alias_key = NativeCompileCacheKey::new(7, FunctionId::new(3), false, 0);
-        let (alias_records, second) = cache
-            .get_or_compile(alias_key, || panic!("published alias recompiled"))
-            .unwrap();
+            .unwrap_err();
+        let second = cache
+            .get_or_compile(key(7), || panic!("permanent breadth failure recompiled"))
+            .unwrap_err();
 
-        assert_eq!(first, NativeCompileCacheDisposition::Miss);
-        assert_eq!(second, NativeCompileCacheDisposition::Hit);
-        assert!(Arc::ptr_eq(&records, &alias_records));
-        assert_eq!(cache.stats().entries, 2);
+        assert!(first.starts_with("E_NATIVE_COMPILE_BREADTH:"));
+        assert_eq!(first, second);
+        assert_eq!(cache.stats().entries, 0);
+        assert_eq!(cache.stats().compile_failures, 1);
     }
 
     #[test]
-    fn alias_churn_does_not_evict_requested_compile_keys() {
+    fn different_functions_require_independent_compile_groups() {
         let cache = NativeCompileCache::new(2);
         cache
-            .get_or_compile(key(1), || {
-                Ok(vec![record(0), record(1), record(2), record(3)])
-            })
+            .get_or_compile(key(1), || Ok(vec![record(0)]))
             .unwrap();
+        let function_three = NativeCompileCacheKey::new(1, FunctionId::new(3), false, 0);
         cache
-            .get_or_compile(key(2), || {
-                Ok(vec![record(0), record(1), record(2), record(3)])
-            })
+            .get_or_compile(function_three, || Ok(vec![record(3)]))
             .unwrap();
 
         let (_, disposition) = cache
-            .get_or_compile(key(1), || panic!("alias churn evicted a requested key"))
+            .get_or_compile(key(1), || panic!("requested function recompiled"))
             .unwrap();
 
         assert_eq!(disposition, NativeCompileCacheDisposition::Hit);
-        assert_eq!(cache.stats().entries, 4);
+        assert_eq!(cache.stats().entries, 2);
     }
 }

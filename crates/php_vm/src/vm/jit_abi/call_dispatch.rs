@@ -372,7 +372,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 return execute_native_semantic_operation(
                     context,
                     operation,
-                    &instruction,
+                    instruction,
                     &encoded,
                     frame.function_id,
                 );
@@ -406,8 +406,19 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 && frame.target.function_id != u32::MAX
             {
                 let function = php_ir::FunctionId::new(frame.target.function_id);
+                let visible_arguments = encoded
+                    .get(descriptor.argument_operand_offset..)
+                    .ok_or_else(|| {
+                        "E_PHP_VM_NATIVE_CALLSITE_MISMATCH: argument operand offset is stale"
+                            .to_owned()
+                    })?;
+                let invocation_arguments = if descriptor.target_function.is_some() {
+                    encoded.as_slice()
+                } else {
+                    visible_arguments
+                };
                 if native_function_is_generator(context, function) {
-                    let arguments = encoded
+                    let arguments = invocation_arguments
                         .iter()
                         .map(|value| context.decode(*value))
                         .collect::<Result<Vec<_>, _>>()?;
@@ -416,18 +427,18 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                         arguments,
                     )));
                 }
-                let metadata = match descriptor.kind {
-                    crate::compiled_unit::NativeCallSiteKind::Callable
-                    | crate::compiled_unit::NativeCallSiteKind::Closure => {
+                let metadata = match instruction.kind {
+                    php_ir::InstructionKind::CallCallable { .. }
+                    | php_ir::InstructionKind::CallClosure { .. } => {
                         Some(descriptor.arguments.as_ref())
                     }
-                    crate::compiled_unit::NativeCallSiteKind::Pipe => None,
+                    php_ir::InstructionKind::Pipe { .. } => None,
                     _ => None,
                 };
                 return invoke_native_function_with_metadata_strict(
                     context,
                     function,
-                    &encoded,
+                    invocation_arguments,
                     metadata,
                     context.unit.strict_types_for_span(descriptor.span),
                 );
@@ -1360,7 +1371,6 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 ));
             }
             if !direct_builtin
-                && !direct_external
                 && let Some(function_id) = context.function_id(name.as_ref())
             {
                 emit_native_deprecated_call(context, function_id, instruction);
@@ -1648,6 +1658,11 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                     value,
                 )
             }
+            Some(Err(message)) if message == NATIVE_RUNTIME_ERROR_MARKER => (
+                php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
+                php_jit::JitCallStatus::RUNTIME_ERROR,
+                None,
+            ),
             Some(Err(message)) => {
                 let _ =
                     with_native_context(|context| publish_native_call_diagnostic(context, message));

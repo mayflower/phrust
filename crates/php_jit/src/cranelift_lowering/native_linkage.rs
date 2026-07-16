@@ -2,6 +2,35 @@
 
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
+pub(crate) const BASELINE_FUNCTION_SPECIALIZATION: &str = "executable-region-v2";
+
+/// Constructs the exact symbolic publication key used by declaration and
+/// machine-code publication.
+#[must_use]
+pub fn native_function_key(
+    deployment_unit: impl Into<String>,
+    function_id: u32,
+    arity: usize,
+    local_count: u32,
+    optimizing: bool,
+    invalidation_generation: u64,
+) -> NativeFunctionKey {
+    NativeFunctionKey {
+        deployment_unit: deployment_unit.into(),
+        function_id,
+        signature_hash: crate::JIT_RUNTIME_ABI_HASH
+            ^ u64::try_from(arity).unwrap_or(u64::MAX).rotate_left(17)
+            ^ u64::from(local_count).rotate_left(33),
+        compiler_tier: if optimizing {
+            "optimizing".to_owned()
+        } else {
+            "baseline".to_owned()
+        },
+        version: BASELINE_FUNCTION_SPECIALIZATION.to_owned(),
+        invalidation_generation,
+    }
+}
+
 /// Complete symbolic identity for one published PHP native function version.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct NativeFunctionKey {
@@ -136,5 +165,14 @@ mod tests {
         assert_eq!(cell.resolve(11, 4), None);
         cell.retire();
         assert_eq!(cell.resolve(11, 3), None);
+    }
+
+    #[test]
+    fn symbolic_key_is_stable_for_declaration_and_publication() {
+        let key = native_function_key("unit-a", 7, 2, 5, false, 3);
+        assert_eq!(key.function_id, 7);
+        assert_eq!(key.compiler_tier, "baseline");
+        assert_eq!(key.version, BASELINE_FUNCTION_SPECIALIZATION);
+        assert_ne!(key.signature_hash, 0);
     }
 }

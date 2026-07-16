@@ -142,6 +142,7 @@ help:
       '  just composer-smoke       Run package-manager compatibility smoke gate' \
       '' \
       'Performance:' \
+      '  just function-on-demand-gate Enforce one-PHP-function compile breadth' \
       '  just cache-roundtrip      Run native artifact/cache roundtrip gates' \
       '  just optimizer-diff       Run optimizer differential gate' \
       '  just native-ssa-ratchet   Enforce executable SSA and lifetime lowering' \
@@ -501,7 +502,7 @@ verify-stdlib:
 # Correctness-focused performance gates. Sub-gates share one engine build
 # through the perf-build dependency (deduplicated within this invocation).
 # Release-profile and report gates live in verify-performance-extended.
-verify-performance: native-linkage-ratchet wordpress-benchmark-self-test performance-tests performance-regression benchmark-smoke framework-smoke default-profile-smoke app-flow-smoke baseline-native-compile-smoke cache-roundtrip optimizer-diff native-ssa-ratchet templates-smoke inline-cache-model-tests native-smoke object-release-root-scan safety-audit-smoke
+verify-performance: native-linkage-ratchet wordpress-benchmark-self-test performance-tests performance-regression benchmark-smoke framework-smoke default-profile-smoke app-flow-smoke baseline-native-compile-smoke function-on-demand-gate cache-roundtrip optimizer-diff native-ssa-ratchet templates-smoke inline-cache-model-tests native-smoke object-release-root-scan safety-audit-smoke
     @printf '%s\n' '[pass] performance verification complete'
 
 # Heavy release-profile and report gates, split out of verify-performance so
@@ -1466,6 +1467,9 @@ perf-compare:
 cache-roundtrip:
     @just dependency-units-smoke
     cargo test -p php_jit --lib native_cache
+
+function-on-demand-gate:
+    scripts/performance/function_on_demand_gate.sh
 
 dependency-units-smoke:
     cargo test -p php_vm dependency_units::

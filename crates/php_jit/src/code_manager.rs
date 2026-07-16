@@ -9,10 +9,9 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, TryLockError};
 
-// Whole-unit baseline publication intentionally compiles dormant declarations
-// before a source unit becomes executable. A complete WordPress install keeps
-// slightly more than 256 MiB of generated code live during one request, so the
-// process owner needs headroom while remaining strictly bounded.
+// Function-on-demand publication keeps dormant declarations code-free. The
+// process owner remains bounded because distinct requested functions may stay
+// live across many source units and requests.
 const DEFAULT_CODE_LIMIT: usize = 512 * 1024 * 1024;
 const DEFAULT_GENERATION_LIMIT: usize = 16 * 1024 * 1024;
 const GENERATION_ARENA_RESERVE: usize = 32 * 1024 * 1024;
@@ -459,6 +458,37 @@ impl CraneliftCodeManager {
         Ok(())
     }
 
+    /// Declares symbolic PHP functions without compiling or publishing code.
+    /// Repeated declarations of the exact key reuse the stable cell.
+    pub fn declare_function_cells(
+        &self,
+        keys: impl IntoIterator<Item = NativeFunctionKey>,
+    ) -> Result<Vec<Arc<NativeIndirectionCell>>, CraneliftCodeManagerError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CraneliftCodeManagerError::Poisoned("state"))?;
+        Ok(keys
+            .into_iter()
+            .map(|key| {
+                state
+                    .function_cells
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(NativeIndirectionCell::new(key)))
+                    .clone()
+            })
+            .collect())
+    }
+
+    /// Returns a declared cell whether or not machine code is published.
+    #[must_use]
+    pub fn function_cell(&self, key: &NativeFunctionKey) -> Option<Arc<NativeIndirectionCell>> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.function_cells.get(key).cloned())
+    }
+
     /// Compiles and publishes exactly once for `key`, serializing Cranelift mutation.
     pub(crate) fn compile_once<E>(
         &self,
@@ -627,17 +657,14 @@ impl CraneliftCodeManager {
             .function_body_compile_count
             .fetch_add(entries.len() as u64, Ordering::Relaxed);
         for entry in entries {
-            let signature_hash = code_key.abi_hash
-                ^ u64::from(entry.arity).rotate_left(17)
-                ^ u64::from(entry.local_count).rotate_left(33);
-            let key = NativeFunctionKey {
-                deployment_unit: code_key.compiled_unit.clone(),
-                function_id: entry.function.raw(),
-                signature_hash,
-                compiler_tier: code_key.compiler_tier.clone(),
-                version: code_key.specialization.clone(),
-                invalidation_generation: code_key.invalidation_generation,
-            };
+            let key = crate::native_function_key(
+                code_key.compiled_unit.clone(),
+                entry.function.raw(),
+                entry.arity as usize,
+                entry.local_count,
+                code_key.compiler_tier == "optimizing",
+                code_key.invalidation_generation,
+            );
             let cell = state
                 .function_cells
                 .entry(key.clone())

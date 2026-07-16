@@ -1,4 +1,3 @@
-use super::module_layout::whole_unit_function_order;
 use super::*;
 use std::collections::BTreeSet;
 
@@ -61,11 +60,12 @@ fn declare_native_helper(
 pub(super) fn compile_region_graph_native(
     unit: &IrUnit,
     region: &RegionGraph,
+    plan: NativeCompilePlan,
     runtime_helpers: crate::JitRuntimeHelperAddresses,
     request: &JitCompileRequest,
 ) -> Result<NativeScalarRegionCompileResult, CraneliftLoweringError> {
     validate_region_native_coverage(region)?;
-    let mut regions = collect_region_graphs(unit, region)?;
+    let mut regions = collect_region_graphs(region)?;
     for candidate in regions.values_mut() {
         if candidate.compile_metadata.tier == NativeCompilerTier::Optimizing {
             let _ = crate::region_ir::opt::optimize_executable_region(candidate);
@@ -99,22 +99,27 @@ pub(super) fn compile_region_graph_native(
     let mut trampoline_functions = regions
         .iter()
         .filter_map(|(function, region)| {
-            (region_contains(region, |kind| {
-                matches!(
-                    kind,
-                    RegionInstructionKind::NativeDynamicCode(
-                        RegionNativeDynamicCode::MakeClosure { .. }
+            (!region.exception_regions.is_empty()
+                || region.params.iter().any(|parameter| parameter.by_ref)
+                || region.returns_by_ref
+                || region_contains(region, |kind| {
+                    matches!(
+                        kind,
+                        RegionInstructionKind::NativeControl(RegionNativeControl::Throw { .. })
+                            | RegionInstructionKind::NativeDynamicCode(
+                                RegionNativeDynamicCode::MakeClosure { .. }
+                            )
                     )
-                )
-            }) || region.attributes.iter().any(|attribute| {
-                attribute
-                    .resolved_name
-                    .as_deref()
-                    .or(attribute.fallback_name.as_deref())
-                    .unwrap_or(&attribute.name)
-                    .trim_start_matches('\\')
-                    .eq_ignore_ascii_case("deprecated")
-            }))
+                })
+                || region.attributes.iter().any(|attribute| {
+                    attribute
+                        .resolved_name
+                        .as_deref()
+                        .or(attribute.fallback_name.as_deref())
+                        .unwrap_or(&attribute.name)
+                        .trim_start_matches('\\')
+                        .eq_ignore_ascii_case("deprecated")
+                }))
             .then_some(*function)
         })
         .collect::<BTreeSet<_>>();
@@ -142,10 +147,16 @@ pub(super) fn compile_region_graph_native(
                 .iter()
                 .any(|callee| !regions.contains_key(callee))
             || region_contains(region, |kind| {
-                matches!(kind, RegionInstructionKind::NativeCall(call) if
-                    call.direct_compiled_target().is_some_and(|target| {
-                        trampoline_functions.contains(&target)
-                    })
+                matches!(
+                    kind,
+                    RegionInstructionKind::NativeCall(call)
+                        if matches!(call.result, RegionCallResult::ReferenceLocal(_))
+                            || call.args.iter().any(|argument| {
+                                argument.name.is_some() || argument.unpack
+                            })
+                            || call.direct_compiled_target().is_some_and(|target| {
+                                trampoline_functions.contains(&target)
+                            })
                 )
             })
     });
@@ -649,7 +660,7 @@ pub(super) fn compile_region_graph_native(
     let compiled = compile_managed_native(
         request,
         function,
-        "executable-region-v2",
+        BASELINE_FUNCTION_SPECIALIZATION,
         &import_refs,
         |module, name| {
             let helper_address = |symbol: &str| {
@@ -1262,34 +1273,16 @@ pub(super) fn compile_region_graph_native(
         code_bytes: compiled.code_bytes,
         fast_path_hits,
         has_control_flow,
+        plan,
     })
 }
 
 fn collect_region_graphs(
-    unit: &IrUnit,
     root: &RegionGraph,
 ) -> Result<BTreeMap<FunctionId, RegionGraph>, CraneliftLoweringError> {
-    let mut regions = BTreeMap::new();
-    for function in whole_unit_function_order(unit, root.function) {
-        let region = if function == root.function {
-            root.clone()
-        } else {
-            BaselineRegionBuilder::build(unit, function, &root.compile_metadata).map_err(
-                |error| {
-                    CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_UNIT_FUNCTION",
-                        format!(
-                            "unit function {} is not executable: {error}",
-                            function.raw()
-                        ),
-                    )
-                },
-            )?
-        };
-        validate_region_native_coverage(&region)?;
-        regions.insert(function, region);
-    }
+    let regions = BTreeMap::from([(root.function, root.clone())]);
     for region in regions.values() {
+        validate_region_native_coverage(region)?;
         region.verify().map_err(|error| {
             CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_REGION_VERIFY", error.to_string())
         })?;

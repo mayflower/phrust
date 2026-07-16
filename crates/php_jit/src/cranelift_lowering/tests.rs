@@ -111,6 +111,11 @@ extern "C" fn test_array_insert(
     _value: i64,
     out: *mut i64,
 ) -> i32 {
+    let append = if append & 0x8000_0000 != 0 {
+        append & 1
+    } else {
+        append
+    };
     if append != 1 || out.is_null() {
         return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
@@ -1531,7 +1536,29 @@ fn cranelift_backend_executes_multiblock_region_ir() {
 }
 
 #[test]
-fn cranelift_region_calls_same_unit_compiled_callee_directly() {
+fn function_scoped_compile_routes_same_unit_callee_through_trampoline() {
+    extern "C" fn trampoline(
+        _vm_context: u64,
+        frame: *mut crate::JitNativeCallFrame,
+        out: *mut crate::JitCallResult,
+    ) -> i32 {
+        assert!(!frame.is_null());
+        assert!(!out.is_null());
+        // SAFETY: The generated call owns both records synchronously.
+        unsafe {
+            out.write(crate::JitCallResult {
+                status: crate::JitCallStatus::RETURN,
+                detail: 0,
+                value: crate::JitAbiSlot {
+                    tag: 3,
+                    flags: 0,
+                    payload: 42,
+                },
+            });
+        }
+        crate::JitCallStatus::RETURN.0 as i32
+    }
+
     let (unit, function, callee) = scalar_direct_call_fixture();
     let mut backend = CraneliftNativeCompiler;
     let request = JitCompileRequest::new("cl.region.direct-call");
@@ -1539,37 +1566,37 @@ fn cranelift_region_calls_same_unit_compiled_callee_directly() {
         compile: &request,
         unit: Some(&unit),
         function: Some(function),
-        runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_call_dispatch: trampoline as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
     });
 
     assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    assert!(outcome.diagnostics[0].contains("fast_path_hits=2"));
+    assert!(outcome.diagnostics[0].contains("plan_php_blocks="));
     let handle = outcome.handle.expect("direct-call region should compile");
-    assert_eq!(handle.helper_calls_per_invocation(), 0);
-    assert_eq!(handle.compiled_to_compiled_calls_per_invocation(), 1);
+    assert_eq!(handle.compiled_to_compiled_calls_per_invocation(), 0);
+    let metadata = handle.region_state_metadata().expect("region metadata");
+    assert_eq!(metadata.function_entries.len(), 1);
+    assert_eq!(metadata.function_entries[0].function, function);
     assert!(
-        handle
-            .region_state_metadata()
-            .expect("region metadata")
+        metadata
             .continuations
             .iter()
-            .any(|continuation| continuation.function == callee)
+            .all(|entry| entry.function == function)
+    );
+    assert!(
+        metadata
+            .continuations
+            .iter()
+            .all(|entry| entry.function != callee)
     );
     assert_eq!(
         handle
             .invoke_i64(&[41], JIT_RUNTIME_ABI_HASH)
-            .expect("native caller and callee should execute"),
+            .expect("native caller should dispatch the callee"),
         42
     );
-    let crate::JitI64InvokeOutcome::SideExit { status, state, .. } = handle
-        .invoke_i64_with_deopt(&[i64::MAX], JIT_RUNTIME_ABI_HASH)
-        .expect("callee overflow should preserve precise state")
-    else {
-        panic!("callee overflow unexpectedly returned");
-    };
-    assert_eq!(status, crate::JitCallStatus::RECOMPILE_REQUESTED.0 as i32);
-    assert_eq!(state.function_id, callee.raw());
-    assert_eq!(state.slots[0], i64::MAX);
 }
 
 #[test]
@@ -1924,18 +1951,26 @@ fn baseline_native_continuation_resumes_exact_instruction() {
 }
 
 #[test]
-fn nested_callee_transition_uses_published_native_function_entry() {
-    let (unit, root, callee) = scalar_direct_call_fixture();
+fn function_scoped_compile_publishes_only_requested_transition_metadata() {
+    let (unit, _root, callee) = scalar_direct_call_fixture();
     let mut backend = CraneliftNativeCompiler;
     let outcome = backend.compile_region(&NativeCompileRequest {
-        compile: &JitCompileRequest::new("cl.native-transition.nested"),
+        compile: &JitCompileRequest::new("cl.native-transition.single-function"),
         unit: Some(&unit),
-        function: Some(root),
+        function: Some(callee),
         runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
     });
     assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("compiled call graph");
+    let handle = outcome.handle.expect("compiled function");
     let metadata = handle.region_state_metadata().expect("transition metadata");
+    assert_eq!(metadata.function_entries.len(), 1);
+    assert_eq!(metadata.function_entries[0].function, callee);
+    assert!(
+        metadata
+            .continuations
+            .iter()
+            .all(|entry| entry.function == callee)
+    );
     let transition = metadata
         .native_transitions
         .iter()

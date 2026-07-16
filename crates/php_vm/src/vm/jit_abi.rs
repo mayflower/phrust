@@ -31,7 +31,8 @@ use diagnostics::*;
 pub(super) use dynamic_code::jit_native_dynamic_code_abi;
 use internal_classes::*;
 use native_builtins::{
-    emit_native_deprecated_call, emit_native_float_offset_warning, emit_native_php_diagnostic,
+    NativeDimensionOperation, emit_native_deprecated_call,
+    emit_native_dimension_conversion_diagnostic, emit_native_php_diagnostic,
     emit_native_php_warning, execute_native_builtin, native_source_line,
     native_source_line_for_span, native_string,
 };
@@ -85,6 +86,7 @@ static NATIVE_TEMPNAM_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic
 // WordPress metadata and hook dispatch). Keep a deterministic native-stack
 // guard, but leave enough headroom for those non-recursive call chains.
 const NATIVE_CALL_DEPTH_LIMIT: usize = 256;
+const NATIVE_RUNTIME_ERROR_MARKER: &str = "E_PHP_NATIVE_RUNTIME_ERROR";
 
 struct NativeCallDepthGuard;
 
@@ -112,6 +114,7 @@ struct NativeIncludeExports {
     functions: Vec<(String, php_ir::FunctionId)>,
     native_entries:
         std::sync::Arc<std::collections::BTreeMap<php_ir::FunctionId, php_jit::JitFunctionHandle>>,
+    native_entry_signature_hashes: std::collections::BTreeMap<php_ir::FunctionId, u64>,
     classes: Vec<String>,
     constants: std::collections::BTreeMap<String, Value>,
     autoload_callbacks: Vec<Value>,
@@ -185,6 +188,7 @@ struct NativeDynamicUnit {
     compiled: crate::compiled_unit::CompiledUnit,
     native_entries:
         std::sync::Arc<std::collections::BTreeMap<php_ir::FunctionId, php_jit::JitFunctionHandle>>,
+    native_entry_signature_hashes: std::collections::BTreeMap<php_ir::FunctionId, u64>,
     exported_classes: std::collections::BTreeSet<String>,
 }
 
@@ -554,9 +558,22 @@ impl<'a> NativeExecutionContext<'a> {
             .filter(|class| class.span.start != 0 || class.span.end != 0)
             .map(|class| class.name.clone())
             .collect::<std::collections::BTreeSet<_>>();
+        let native_entry_signature_hashes = self
+            .native_entries
+            .keys()
+            .copied()
+            .map(|function| {
+                let signatures = visible_external_function_signatures(self, &compiled, function);
+                (
+                    function,
+                    super::external_function_signatures_hash(&signatures),
+                )
+            })
+            .collect();
         self.dynamic_units.push(NativeDynamicUnit {
             compiled: compiled.clone(),
             native_entries: self.native_entries.clone(),
+            native_entry_signature_hashes,
             exported_classes: exported_classes.clone(),
         });
         for entry in &compiled.unit().function_table {
@@ -1728,6 +1745,19 @@ impl<'a> NativeExecutionContext<'a> {
             let shutdown_callbacks = self
                 .shutdown_callbacks
                 .split_off(self.inherited_shutdown_callback_count);
+            let native_entry_signature_hashes = self
+                .native_entries
+                .keys()
+                .copied()
+                .map(|function| {
+                    let signatures =
+                        visible_external_function_signatures(self, &self.compiled, function);
+                    (
+                        function,
+                        super::external_function_signatures_hash(&signatures),
+                    )
+                })
+                .collect();
             let mut symbols = self.take_include_symbols();
             for class in &classes {
                 symbols.dynamic_classes.remove(&normalize_class_name(class));
@@ -1739,6 +1769,7 @@ impl<'a> NativeExecutionContext<'a> {
                 exports.replace(Some(NativeIncludeExports {
                     functions,
                     native_entries: std::mem::take(&mut self.native_entries),
+                    native_entry_signature_hashes,
                     classes,
                     constants,
                     autoload_callbacks,
@@ -2843,13 +2874,33 @@ fn execute_native_static_property(
             Value::Bool(!native_property_truthy(&result))
         }
         php_ir::InstructionKind::IssetStaticPropertyDim { dims, .. } => {
-            let value = native_static_property_dim_value(context, result, arguments, dims.len());
+            let value = match native_dimension_path_value(
+                context,
+                Some(result),
+                arguments,
+                dims.len(),
+                instruction,
+                NativeDimensionOperation::Fetch { quiet: true },
+            ) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error)),
+            };
             Value::Bool(
                 value.is_some_and(|value| !matches!(value, Value::Null | Value::Uninitialized)),
             )
         }
         php_ir::InstructionKind::EmptyStaticPropertyDim { dims, .. } => {
-            let value = native_static_property_dim_value(context, result, arguments, dims.len());
+            let value = match native_dimension_path_value(
+                context,
+                Some(result),
+                arguments,
+                dims.len(),
+                instruction,
+                NativeDimensionOperation::Fetch { quiet: true },
+            ) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error)),
+            };
             Value::Bool(value.is_none_or(|value| !native_property_truthy(&value)))
         }
         php_ir::InstructionKind::UnsetStaticPropertyDim { dims, .. } => {
@@ -2890,30 +2941,52 @@ fn execute_native_static_property(
     Some(context.encode(result))
 }
 
-fn native_static_property_dim_value(
-    context: &NativeExecutionContext<'_>,
-    mut value: Value,
+fn native_dimension_path_value(
+    context: &mut NativeExecutionContext<'_>,
+    mut value: Option<Value>,
     arguments: &[i64],
     dimension_count: usize,
-) -> Option<Value> {
+    source: &php_ir::Instruction,
+    operation: NativeDimensionOperation,
+) -> Result<Option<Value>, String> {
     if arguments.len() != dimension_count {
-        return None;
+        return Ok(None);
     }
     for encoded in arguments {
+        let Some(mut target) = value else {
+            return Ok(None);
+        };
+        while let Value::Reference(reference) = target {
+            target = reference.get();
+        }
+        let mut key = context.decode(*encoded)?;
+        while let Value::Reference(reference) = key {
+            key = reference.get();
+        }
+        emit_native_dimension_conversion_diagnostic(
+            context,
+            &target,
+            &key,
+            Some(source),
+            operation,
+        )?;
+        let Some(key) = php_runtime::api::ArrayKey::from_value(&key) else {
+            return Ok(None);
+        };
+        value = match target {
+            Value::Array(array) => array.get(&key).cloned(),
+            Value::Object(object) => native_simple_xml_dimension(&object, &key),
+            _ => None,
+        };
+    }
+    if let Some(mut value) = value {
         while let Value::Reference(reference) = value {
             value = reference.get();
         }
-        let key = context.decode(*encoded).ok()?;
-        let key = php_runtime::api::ArrayKey::from_value(&key)?;
-        value = match value {
-            Value::Array(array) => array.get(&key).cloned()?,
-            _ => return None,
-        };
+        Ok(Some(value))
+    } else {
+        Ok(None)
     }
-    while let Value::Reference(reference) = value {
-        value = reference.get();
-    }
-    Some(value)
 }
 
 fn native_property_truthy(value: &Value) -> bool {
@@ -3228,6 +3301,7 @@ fn invoke_native_external_function_with_metadata(
     called_class: Option<String>,
     strict: bool,
 ) -> Result<i64, String> {
+    ensure_dynamic_native_entry(context, target.unit, target.function)?;
     let transferred_arguments = arguments
         .iter()
         .map(|argument| {
@@ -3475,6 +3549,14 @@ fn invoke_native_method_with_trace_arguments(
             if status == php_jit::JitCallStatus::EXIT.0 as i32 =>
         {
             Err(format!("E_PHP_EXIT:{value}"))
+        }
+        Ok(php_jit::JitI64InvokeOutcome::SideExit { status, .. })
+            if status == php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32 =>
+        {
+            // The callee has already published the PHP diagnostic in the
+            // shared execution context. Preserve that diagnostic and carry
+            // the status through the call trampoline unchanged.
+            Err(NATIVE_RUNTIME_ERROR_MARKER.to_owned())
         }
         Ok(php_jit::JitI64InvokeOutcome::SideExit {
             status,
@@ -3803,33 +3885,17 @@ fn execute_native_property_instruction(
                 | InstructionKind::EmptyDynamicPropertyDim { .. } => 2,
                 _ => 1,
             };
-            let keys = arguments
-                .iter()
-                .skip(key_offset)
-                .take(dims.len())
-                .map(|key| {
-                    context
-                        .decode(*key)
-                        .ok()
-                        .and_then(|key| php_runtime::api::ArrayKey::from_value(&key))
-                })
-                .collect::<Option<Vec<_>>>();
-            let Some(keys) = keys else {
-                return Some(Err("property dimension key is invalid".to_owned()));
+            let value = match native_dimension_path_value(
+                context,
+                object.get_property(&property),
+                &arguments[key_offset..],
+                dims.len(),
+                instruction,
+                NativeDimensionOperation::Fetch { quiet: true },
+            ) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error)),
             };
-            let mut value = object.get_property(&property);
-            for key in keys {
-                value = match value {
-                    Some(Value::Reference(reference)) => match reference.get() {
-                        Value::Array(array) => array.get(&key).cloned(),
-                        Value::Object(object) => native_simple_xml_dimension(&object, &key),
-                        _ => None,
-                    },
-                    Some(Value::Array(array)) => array.get(&key).cloned(),
-                    Some(Value::Object(object)) => native_simple_xml_dimension(&object, &key),
-                    _ => None,
-                };
-            }
             if matches!(
                 instruction.kind,
                 InstructionKind::IssetPropertyDim { .. }

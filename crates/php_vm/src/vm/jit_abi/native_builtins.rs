@@ -427,18 +427,52 @@ pub(super) fn emit_native_php_diagnostic(
         }
         _ => "Warning",
     };
-    let prefix = if leading_newline { "\n" } else { "" };
-    context.output.write_bytes(format!(
-        "{prefix}{label}: {message} in {path} on line {line}\n"
+    let html = matches!(
+        context.options.runtime_context.request_mode,
+        php_runtime::api::RuntimeRequestMode::Http(_)
+    );
+    context.output.write_bytes(format_native_php_diagnostic(
+        label,
+        message,
+        &path,
+        line,
+        leading_newline,
+        html,
     ));
     Ok(())
 }
 
-pub(super) fn emit_native_float_offset_warning(
+pub(super) fn format_native_php_diagnostic(
+    label: &str,
+    message: &str,
+    path: &str,
+    line: usize,
+    leading_newline: bool,
+    html: bool,
+) -> String {
+    if html {
+        let prefix = if leading_newline { "<br />\n" } else { "" };
+        format!("{prefix}<b>{label}</b>:  {message} in <b>{path}</b> on line <b>{line}</b><br />\n")
+    } else {
+        let prefix = if leading_newline { "\n" } else { "" };
+        format!("{prefix}{label}: {message} in {path} on line {line}\n")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NativeDimensionOperation {
+    Fetch { quiet: bool },
+    Insert,
+    Reference,
+    Unset,
+}
+
+pub(super) fn emit_native_dimension_conversion_diagnostic(
     context: &mut NativeExecutionContext<'_>,
     target: &Value,
     key: &Value,
     source: Option<&php_ir::Instruction>,
+    operation: NativeDimensionOperation,
 ) -> Result<(), String> {
     let Some(source) = source else {
         return Ok(());
@@ -457,24 +491,62 @@ pub(super) fn emit_native_float_offset_warning(
             _ => break,
         }
     }
-    let Value::Float(key) = key else {
-        return Ok(());
-    };
-    let key = key.to_f64();
-    if matches!(target, Value::String(_)) {
-        emit_native_php_warning(context, 2, "String offset cast occurred", source)
-    } else if matches!(target, Value::Array(_)) && key.is_finite() && key.fract() != 0.0 {
-        emit_native_php_warning(
-            context,
-            8192,
-            &format!(
-                "Implicit conversion from float {} to int loses precision",
-                native_php_float_label(key)
-            ),
-            source,
-        )
-    } else {
-        Ok(())
+    match key {
+        Value::Null | Value::Uninitialized => {
+            let array_target = matches!(target, Value::Array(_))
+                || matches!(target, Value::Null | Value::Uninitialized)
+                    && matches!(
+                        operation,
+                        NativeDimensionOperation::Insert | NativeDimensionOperation::Reference
+                    );
+            if array_target && !matches!(operation, NativeDimensionOperation::Unset) {
+                emit_native_php_warning(
+                    context,
+                    php_runtime::api::PHP_E_DEPRECATED,
+                    "Using null as an array offset is deprecated, use an empty string instead",
+                    source,
+                )
+            } else if matches!(target, Value::String(_))
+                && !matches!(
+                    operation,
+                    NativeDimensionOperation::Fetch { quiet: true }
+                        | NativeDimensionOperation::Unset
+                )
+            {
+                emit_native_php_warning(
+                    context,
+                    php_runtime::api::PHP_E_WARNING,
+                    "String offset cast occurred",
+                    source,
+                )
+            } else {
+                Ok(())
+            }
+        }
+        Value::Float(key) => {
+            let key = key.to_f64();
+            if matches!(target, Value::String(_)) {
+                emit_native_php_warning(
+                    context,
+                    php_runtime::api::PHP_E_WARNING,
+                    "String offset cast occurred",
+                    source,
+                )
+            } else if matches!(target, Value::Array(_)) && key.is_finite() && key.fract() != 0.0 {
+                emit_native_php_warning(
+                    context,
+                    php_runtime::api::PHP_E_DEPRECATED,
+                    &format!(
+                        "Implicit conversion from float {} to int loses precision",
+                        native_php_float_label(key)
+                    ),
+                    source,
+                )
+            } else {
+                Ok(())
+            }
+        }
+        _ => Ok(()),
     }
 }
 

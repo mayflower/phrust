@@ -14,6 +14,7 @@ use php_phpt_tools::expect::{ExpectationKind, match_expectation};
 use php_phpt_tools::phpt::{PhptDocument, PhptSection, parse_phpt};
 
 pub(crate) mod baseline;
+mod fingerprint;
 pub(crate) mod generate;
 pub(crate) mod index;
 mod json;
@@ -24,6 +25,7 @@ pub(crate) mod symbol_index;
 pub(crate) mod triage;
 pub(crate) mod verify;
 
+use fingerprint::{normalize_repository_paths, normalize_work_directory_paths};
 use json::*;
 
 const DEFAULT_MANIFEST: &str = "tests/phpt/manifests/php-src-hashes.jsonl";
@@ -4367,51 +4369,8 @@ fn failure_fingerprint(result: &PhptRunResult) -> String {
 
 fn normalize_failure_detail_for_fingerprint(detail: &str) -> String {
     let mut normalized = detail.to_string();
-    // Harness diagnostics for binary PHPT inputs include the checkout root.
-    // Normalize stable repository-relative paths before hashing so sibling
-    // worktrees produce the same BORK fingerprint.
-    for marker in ["/third_party/php-src/", "/tests/phpt/generated/"] {
-        let mut search_from = 0;
-        while let Some(relative_start) = normalized[search_from..].find(marker) {
-            let marker_start = search_from + relative_start;
-            let prefix_start = normalized[..marker_start]
-                .rfind(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '=' | '"' | '`'))
-                .map(|index| index + 1)
-                .unwrap_or(0);
-            normalized.replace_range(prefix_start..marker_start, "<repo>");
-            search_from = prefix_start + "<repo>".len() + marker.len();
-        }
-    }
-    // PHPT_WORK_DIR is configurable. Keep the conventional `phpt-work`
-    // prefix recognizable when callers use an isolated sibling such as
-    // `phpt-work-one-worker`; otherwise the run directory leaks into every
-    // failure fingerprint and makes an unchanged failure look new.
-    for marker in ["/target/phpt-work", "target/phpt-work"] {
-        while let Some(marker_start) = normalized.find(marker) {
-            let prefix_start = normalized[..marker_start]
-                .rfind(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '=' | '"' | '`'))
-                .map(|index| index + 1)
-                .unwrap_or(0);
-            let Some(test_php_offset) = normalized[marker_start..].find("test.php") else {
-                break;
-            };
-            let end = marker_start + test_php_offset + "test.php".len();
-            normalized.replace_range(prefix_start..end, "<phpt-test.php>");
-        }
-    }
-    for marker in ["/target/phpt-work", "target/phpt-work"] {
-        while let Some(marker_start) = normalized.find(marker) {
-            let prefix_start = normalized[..marker_start]
-                .rfind(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '=' | '"' | '`'))
-                .map(|index| index + 1)
-                .unwrap_or(0);
-            let end = normalized[marker_start..]
-                .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '"' | '`'))
-                .map(|offset| marker_start + offset)
-                .unwrap_or(normalized.len());
-            normalized.replace_range(prefix_start..end, "<phpt-work-path>");
-        }
-    }
+    normalize_repository_paths(&mut normalized);
+    normalize_work_directory_paths(&mut normalized);
     let thread_marker = "thread 'main' (";
     while let Some(start) = normalized.find(thread_marker) {
         let digits_start = start + thread_marker.len();

@@ -1,4 +1,34 @@
+use super::native_builtins::format_native_php_diagnostic;
 use super::{jit_native_call_dispatch_abi, jit_native_dynamic_code_abi, native_backtrace_frame};
+
+#[test]
+fn native_php_diagnostics_match_cli_and_http_rendering() {
+    let cli = format_native_php_diagnostic(
+        "Deprecated",
+        "Using null as an array offset is deprecated, use an empty string instead",
+        "/srv/index.php",
+        17,
+        true,
+        false,
+    );
+    assert_eq!(
+        cli,
+        "\nDeprecated: Using null as an array offset is deprecated, use an empty string instead in /srv/index.php on line 17\n"
+    );
+
+    let http = format_native_php_diagnostic(
+        "Deprecated",
+        "Using null as an array offset is deprecated, use an empty string instead",
+        "/srv/index.php",
+        17,
+        true,
+        true,
+    );
+    assert_eq!(
+        http,
+        "<br />\n<b>Deprecated</b>:  Using null as an array offset is deprecated, use an empty string instead in <b>/srv/index.php</b> on line <b>17</b><br />\n"
+    );
+}
 
 #[test]
 fn native_call_trampoline_requests_compile_without_interpreter_reentry() {

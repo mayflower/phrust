@@ -193,7 +193,7 @@ fn hoist_loop_invariants(region: &mut RegionGraph, report: &mut ExecutableOptRep
             continue;
         };
         let classes = infer_register_classes(region);
-        let definitions = register_definition_blocks(region);
+        let (definitions, multiply_defined) = register_definition_blocks(region);
         let mut invariant = definitions
             .iter()
             .filter_map(|(register, block)| (!loop_blocks.contains(block)).then_some(*register))
@@ -209,7 +209,8 @@ fn hoist_loop_invariants(region: &mut RegionGraph, report: &mut ExecutableOptRep
                     let Some(result) = scalar_result_register(&instruction.kind, &classes) else {
                         continue;
                     };
-                    if invariant.contains(&result)
+                    if multiply_defined.contains(&result)
+                        || invariant.contains(&result)
                         || !instruction
                             .register_uses()
                             .iter()
@@ -315,16 +316,28 @@ fn infer_register_classes(
     classes
 }
 
-fn register_definition_blocks(region: &RegionGraph) -> BTreeMap<php_ir::RegId, php_ir::BlockId> {
-    region
-        .blocks
-        .iter()
-        .flat_map(|block| {
-            block.instructions.iter().filter_map(move |instruction| {
-                instruction_result_register(&instruction.kind).map(|register| (register, block.id))
-            })
-        })
-        .collect()
+fn register_definition_blocks(
+    region: &RegionGraph,
+) -> (
+    BTreeMap<php_ir::RegId, php_ir::BlockId>,
+    BTreeSet<php_ir::RegId>,
+) {
+    let mut definitions = BTreeMap::new();
+    let mut multiply_defined = BTreeSet::new();
+    for block in &region.blocks {
+        for instruction in &block.instructions {
+            let Some(register) = instruction_result_register(&instruction.kind) else {
+                continue;
+            };
+            if definitions.insert(register, block.id).is_some() {
+                multiply_defined.insert(register);
+            }
+        }
+    }
+    for register in &multiply_defined {
+        definitions.remove(register);
+    }
+    (definitions, multiply_defined)
 }
 
 fn scalar_result_register(

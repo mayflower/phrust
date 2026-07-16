@@ -193,6 +193,19 @@ impl VmWorkerState {
         ),
         String,
     > {
+        let function_metadata = unit
+            .unit()
+            .functions
+            .get(function.index())
+            .ok_or_else(|| format!("native function {} is missing", function.raw()))?;
+        let function_key = php_jit::native_function_key(
+            unit.prepared_ir_fingerprint().to_owned(),
+            function.raw(),
+            function_metadata.params.len(),
+            function_metadata.local_count,
+            options.native_optimization.is_optimizing(),
+            0,
+        );
         let external_signatures_hash = external_function_signatures_hash(external_signatures);
         let key = native_compile_cache::NativeCompileCacheKey::new(
             unit.cache_identity(),
@@ -201,6 +214,28 @@ impl VmWorkerState {
             external_signatures_hash,
         );
         self.native_compiles.get_or_compile(key, || {
+            if let Ok(manager) = php_jit::global_code_manager()
+                && let Some((cell, handle)) = manager.published_function(&function_key)
+                && cell
+                    .resolve(
+                        function_key.signature_hash,
+                        function_key.invalidation_generation,
+                    )
+                    .is_some()
+            {
+                return Ok(vec![php_jit::JitUnitCompileRecord {
+                    function,
+                    result: php_jit::JitCompileResult {
+                        status: php_jit::JitCompileStatus::Compiled,
+                        handle: Some(handle),
+                        diagnostics: vec![format!(
+                            "native function {} resolved through its published indirection cell",
+                            function.raw()
+                        )],
+                        stats: php_jit::JitStats::default(),
+                    },
+                }]);
+            }
             compile_native_function_graph(
                 unit.unit(),
                 function,
@@ -339,33 +374,14 @@ impl Vm {
         } else {
             0
         });
-        let (function, function_name, result) = if selected_function.is_some() {
-            let result = compiler
-                .compile_function_with_runtime_helpers(
-                    unit.unit(),
-                    function,
-                    request,
-                    runtime_helper_addresses(),
-                )
-                .map_err(|error| error.to_string())?;
-            (function, function_name, result)
-        } else {
-            let records = compiler
-                .compile_unit_with_runtime_helpers(unit.unit(), request, runtime_helper_addresses())
-                .map_err(|error| error.to_string())?;
-            let record = records
-                .iter()
-                .find(|record| !matches!(record.result.status, php_jit::JitCompileStatus::Compiled))
-                .or_else(|| records.iter().find(|record| record.function == function))
-                .ok_or_else(|| "native compile probe produced no function record".to_owned())?;
-            let function_name = unit
-                .unit()
-                .functions
-                .get(record.function.index())
-                .map_or("<missing>", |function| function.name.as_str())
-                .to_owned();
-            (record.function, function_name, record.result.clone())
-        };
+        let result = compiler
+            .compile_function_with_runtime_helpers(
+                unit.unit(),
+                function,
+                request,
+                runtime_helper_addresses(),
+            )
+            .map_err(|error| error.to_string())?;
         Ok(NativeCompileProbeReport {
             function,
             function_name,
@@ -373,8 +389,8 @@ impl Vm {
         })
     }
 
-    /// Compile every function from authoritative IR and enter the published
-    /// Cranelift entry. There is no alternate execution engine.
+    /// Compile the entry function from authoritative IR and enter it. Other
+    /// declared functions compile through native dispatch on first execution.
     #[must_use]
     pub fn execute(&self, unit: impl Into<CompiledUnit>) -> VmResult {
         self.execute_with_external_function_signatures(unit, &[])
@@ -422,7 +438,7 @@ impl Vm {
         };
         let cache_identity = cache
             .as_ref()
-            .and_then(|_| native_cache_identity(&unit, &self.options).ok());
+            .and_then(|_| native_cache_identity(&unit, entry, &self.options).ok());
         let mut cached_compile_records = None;
         let mut cached_compile_error = None;
 
@@ -953,9 +969,10 @@ pub(super) fn compile_native_function_graph(
         .name
         .clone();
     let mut compiler = php_jit::JitEngine::new();
-    compiler
-        .compile_unit_with_runtime_helpers(
+    let result = compiler
+        .compile_function_with_runtime_helpers(
             unit,
+            function,
             php_jit::JitCompileRequest::new(format!("unit.{}", unit.id.raw()))
                 .with_function_name(function_name)
                 .with_ir_fingerprint(ir_fingerprint)
@@ -968,7 +985,8 @@ pub(super) fn compile_native_function_graph(
                 }),
             runtime_helper_addresses(),
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(vec![php_jit::JitUnitCompileRecord { function, result }])
 }
 
 fn native_exception_fields(value: Value) -> Option<(String, String, String)> {
@@ -1158,21 +1176,24 @@ fn native_trace_argument(value: &Value) -> String {
 }
 
 fn native_cache_candidate(unit: &php_ir::IrUnit, entry: php_ir::FunctionId) -> bool {
-    // Relocation-aware PNA1 images retain every compiled function, helper
-    // import, and state-metadata record. Declaration-heavy include units are
-    // therefore first-class cache candidates instead of being forced through
-    // a helper-free leaf allowlist.
+    // Each persistent image is rooted at exactly one PHP function. Dormant
+    // declarations never contribute code, relocations, or cache bytes.
     unit.functions.get(entry.index()).is_some()
 }
 
 fn native_cache_identity(
     unit: &CompiledUnit,
+    function: php_ir::FunctionId,
     options: &VmOptions,
 ) -> Result<php_jit::NativeCacheIdentity, php_jit::CraneliftHostIsaError> {
     let isa = php_jit::cranelift_host_isa_identity()?;
     let optimization_tier = options.native_optimization.as_str().to_owned();
     Ok(php_jit::NativeCacheIdentity {
-        source_hash: format!("compiled-source-v1-{:016x}", unit.artifact_identity()),
+        source_hash: format!(
+            "compiled-source-v2-{:016x}-function-{}",
+            unit.artifact_identity(),
+            function.raw()
+        ),
         ir_hash: unit.prepared_ir_fingerprint().to_owned(),
         dependency_graph_hash: unit.prepared_dependency_identity().to_owned(),
         build_id: option_env!("PHRUST_BUILD_ID")
@@ -1276,6 +1297,37 @@ mod tests {
         );
         builder.terminate_return(function, block, Some(Operand::Register(register)), span);
         builder.set_entry(function);
+        CompiledUnit::new(builder.finish())
+    }
+
+    fn declaration_heavy_unit() -> CompiledUnit {
+        let mut builder = IrBuilder::new(UnitId::new(9_901));
+        let file = builder.add_file("function-on-demand-breadth.php");
+        let span = IrSpan::new(file, 0, 32);
+        let constant = builder.intern_constant(IrConstant::Int(17));
+        for index in 0..121 {
+            let function = builder.start_function(
+                format!("breadth_function_{index}"),
+                FunctionFlags::default(),
+                span,
+            );
+            builder.set_return_type(function, Some(IrReturnType::Int));
+            let block = builder.append_block(function);
+            let value = builder.alloc_register(function);
+            builder.emit(
+                function,
+                block,
+                InstructionKind::LoadConst {
+                    dst: value,
+                    constant,
+                },
+                span,
+            );
+            builder.terminate_return(function, block, Some(Operand::Register(value)), span);
+            if index == 0 {
+                builder.set_entry(function);
+            }
+        }
         CompiledUnit::new(builder.finish())
     }
 
@@ -1387,6 +1439,45 @@ mod tests {
                     by_ref_property: None,
                     by_ref_property_dim: None,
                 }],
+            },
+            span,
+        );
+        builder.terminate_return(entry, entry_block, Some(Operand::Register(result)), span);
+        builder.set_entry(entry);
+        CompiledUnit::new(builder.finish())
+    }
+
+    fn invalid_return_type_on_demand_unit() -> CompiledUnit {
+        let mut builder = IrBuilder::new(UnitId::new(9_999));
+        let file = builder.add_file("native-return-type-on-demand.php");
+        let span = IrSpan::new(file, 0, 48);
+        let invalid = builder.intern_constant(IrConstant::Array(Vec::new()));
+        let callee = builder.start_function("invalid_return", FunctionFlags::default(), span);
+        builder.set_return_type(callee, Some(IrReturnType::String));
+        let callee_block = builder.append_block(callee);
+        let value = builder.alloc_register(callee);
+        builder.emit(
+            callee,
+            callee_block,
+            InstructionKind::LoadConst {
+                dst: value,
+                constant: invalid,
+            },
+            span,
+        );
+        builder.terminate_return(callee, callee_block, Some(Operand::Register(value)), span);
+        builder.register_function_name("invalid_return", callee);
+
+        let entry = builder.start_function("main", FunctionFlags::default(), span);
+        let entry_block = builder.append_block(entry);
+        let result = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::CallFunction {
+                dst: result,
+                name: "invalid_return".to_owned(),
+                args: Vec::new(),
             },
             span,
         );
@@ -1667,25 +1758,33 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn direct_call_counter_is_nonzero_without_dynamic_dispatch() {
-        let result = Vm::with_options(VmOptions {
-            collect_counters: true,
-            ..VmOptions::default()
-        })
+    fn same_unit_call_uses_function_on_demand_dispatch() {
+        let worker = VmWorkerState::new(crate::tiering::TieringOptions::default());
+        let result = Vm::with_options_and_worker_state(
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+            worker.clone(),
+        )
         .execute(direct_call_unit());
 
         assert_eq!(result.return_value, Some(Value::Int(42)), "{result:#?}");
         let counters = result.counters.expect("diagnostic counters");
         assert_eq!(counters.native_call_direct, 1);
-        assert_eq!(counters.native_same_unit_direct_executed, 1);
+        assert_eq!(counters.native_same_unit_direct_executed, 0);
         assert_eq!(counters.native_call_dynamic, 0);
-        assert_eq!(counters.native_tail_calls, 1);
-        assert_eq!(counters.native_frame_arena_high_water_bytes, 0);
+        assert_eq!(counters.native_tail_calls, 0);
+        assert!(counters.native_frame_arena_high_water_bytes > 0);
+        let compile_stats = worker.native_compile_cache_stats();
+        assert_eq!(compile_stats.entries, 2);
+        assert_eq!(compile_stats.misses, 2);
+        assert_eq!(compile_stats.insertions, 2);
     }
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn typed_direct_call_coerces_without_dynamic_dispatch() {
+    fn typed_function_on_demand_call_preserves_coercion() {
         let result = Vm::with_options(VmOptions {
             collect_counters: true,
             ..VmOptions::default()
@@ -1695,13 +1794,13 @@ mod tests {
         assert_eq!(result.return_value, Some(Value::Int(42)), "{result:#?}");
         let counters = result.counters.expect("diagnostic counters");
         assert_eq!(counters.native_call_direct, 1);
-        assert_eq!(counters.native_same_unit_direct_executed, 1);
+        assert_eq!(counters.native_same_unit_direct_executed, 0);
         assert_eq!(counters.native_call_dynamic, 0);
     }
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn typed_direct_call_throws_without_dynamic_dispatch() {
+    fn typed_function_on_demand_call_preserves_throw() {
         let result = Vm::with_options(VmOptions {
             collect_counters: true,
             ..VmOptions::default()
@@ -1721,8 +1820,30 @@ mod tests {
         );
         let counters = result.counters.expect("diagnostic counters");
         assert_eq!(counters.native_call_direct, 1);
-        assert_eq!(counters.native_same_unit_direct_executed, 1);
+        assert_eq!(counters.native_same_unit_direct_executed, 0);
         assert_eq!(counters.native_call_dynamic, 0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn function_on_demand_call_preserves_runtime_diagnostic() {
+        let result = Vm::new().execute(invalid_return_type_on_demand_unit());
+
+        assert_eq!(
+            result.status.exit_status(),
+            php_runtime::api::ExitStatus::RuntimeError,
+            "{result:#?}"
+        );
+        assert_eq!(
+            result.diagnostics.first().map(|diagnostic| diagnostic.id()),
+            Some("E_PHP_VM_RETURN_TYPE_MISMATCH"),
+            "{result:#?}"
+        );
+        assert!(
+            result.status.message().is_some_and(|message| message
+                .contains("invalid_return(): Return value must be of type string, array returned")),
+            "{result:#?}"
+        );
     }
 
     #[test]
@@ -1746,7 +1867,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn bounded_constant_wrapper_inlining_removes_native_call() {
+    fn baseline_does_not_inline_or_widen_for_constant_wrapper() {
         let result = Vm::with_options(VmOptions {
             collect_counters: true,
             ..VmOptions::default()
@@ -1755,8 +1876,8 @@ mod tests {
 
         assert_eq!(result.return_value, Some(Value::Int(19)), "{result:#?}");
         let counters = result.counters.expect("diagnostic counters");
-        assert_eq!(counters.native_inlined_calls, 1);
-        assert_eq!(counters.native_inline_calls_removed, 1);
+        assert_eq!(counters.native_inlined_calls, 0);
+        assert_eq!(counters.native_inline_calls_removed, 0);
         assert_eq!(counters.native_call_direct, 1);
         assert_eq!(counters.native_call_dynamic, 0);
     }
@@ -1913,6 +2034,43 @@ mod tests {
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 3);
         assert_eq!(stats.insertions, 3);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn loading_declaration_heavy_unit_compiles_only_entry_and_declares_other_cells() {
+        let worker = VmWorkerState::new(crate::tiering::TieringOptions::default());
+        let unit = declaration_heavy_unit();
+        let result = Vm::with_options_and_worker_state(VmOptions::default(), worker.clone())
+            .execute(unit.clone());
+
+        assert_eq!(result.return_value, Some(Value::Int(17)), "{result:#?}");
+        let stats = worker.native_compile_cache_stats();
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.insertions, 1);
+
+        let manager = php_jit::global_code_manager().expect("global code manager");
+        let mut published = 0;
+        let mut unpublished = 0;
+        for (index, function) in unit.unit().functions.iter().enumerate() {
+            let key = php_jit::native_function_key(
+                unit.prepared_ir_fingerprint().to_owned(),
+                index as u32,
+                function.params.len(),
+                function.local_count,
+                false,
+                0,
+            );
+            let cell = manager.function_cell(&key).expect("declared function cell");
+            match cell.state() {
+                php_jit::NativeIndirectionState::Published => published += 1,
+                php_jit::NativeIndirectionState::Unpublished => unpublished += 1,
+                php_jit::NativeIndirectionState::Retired => panic!("fresh cell was retired"),
+            }
+        }
+        assert_eq!(published, 1);
+        assert_eq!(unpublished, 120);
     }
 
     #[test]
