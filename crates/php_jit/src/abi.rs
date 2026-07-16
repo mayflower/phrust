@@ -51,7 +51,10 @@ pub struct JitDeoptState {
     pub suspend_flags: u32,
     pub yielded_key: i64,
     pub delegation_handle: u64,
+    /// Dense initialization mask for sparse register snapshot slots.
     pub initialized_register_mask: u64,
+    /// Sparse register values in the semantic order published by transition
+    /// or suspension metadata, not indexed by global `RegId`.
     pub registers: [i64; JIT_DEOPT_MAX_REGISTERS],
 }
 

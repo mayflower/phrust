@@ -1100,9 +1100,18 @@ impl JitFunctionHandle {
             .live_locals
             .iter()
             .all(|local| state.local_initialized(*local));
-        let registers_complete = transition.live_registers.iter().all(|register| {
-            state.initialized_register_mask & (1_u64.checked_shl(register.raw()).unwrap_or(0)) != 0
-        });
+        let registers_complete =
+            transition
+                .live_registers
+                .iter()
+                .enumerate()
+                .all(|(snapshot_slot, _)| {
+                    state.initialized_register_mask
+                        & (1_u64
+                            .checked_shl(u32::try_from(snapshot_slot).unwrap_or(u32::MAX))
+                            .unwrap_or(0))
+                        != 0
+                });
         if !locals_complete || !registers_complete {
             return Err(JitInvokeError::IncompleteNativeTransition(
                 state.continuation_id,

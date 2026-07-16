@@ -829,15 +829,25 @@ fn publish_native_register_state(
     builder: &mut FunctionBuilder<'_>,
     state_out: ir::Value,
     registers: &BTreeMap<RegId, Variable>,
+    live_registers: &[RegId],
 ) {
-    let encodable_registers = registers
+    let encodable_registers = live_registers
         .iter()
-        .filter(|(register, _)| register.index() < crate::JIT_DEOPT_MAX_REGISTERS);
-    let initialized_mask = encodable_registers
-        .clone()
-        .fold(0_u64, |mask, (register, _)| {
-            mask | 1_u64.checked_shl(register.raw()).unwrap_or(0)
+        .take(crate::JIT_DEOPT_MAX_REGISTERS)
+        .filter_map(|register| {
+            registers
+                .get(register)
+                .map(|variable| (*register, *variable))
         });
+    let initialized_count = encodable_registers.clone().count();
+    let initialized_mask = if initialized_count >= u64::BITS as usize {
+        u64::MAX
+    } else {
+        1_u64
+            .checked_shl(u32::try_from(initialized_count).unwrap_or(u32::MAX))
+            .unwrap_or(0)
+            .saturating_sub(1)
+    };
     let initialized = builder.ins().iconst(types::I64, initialized_mask as i64);
     builder.ins().store(
         MemFlagsData::new(),
@@ -845,15 +855,15 @@ fn publish_native_register_state(
         state_out,
         std::mem::offset_of!(crate::JitDeoptState, initialized_register_mask) as i32,
     );
-    for (register, variable) in encodable_registers {
-        let value = builder.use_var(*variable);
+    for (snapshot_slot, (_register, variable)) in encodable_registers.enumerate() {
+        let value = builder.use_var(variable);
         let value = if builder.func.dfg.value_type(value) == types::I64 {
             value
         } else {
             builder.ins().uextend(types::I64, value)
         };
         let offset = std::mem::offset_of!(crate::JitDeoptState, registers)
-            .saturating_add(register.index().saturating_mul(8));
+            .saturating_add(snapshot_slot.saturating_mul(8));
         builder
             .ins()
             .store(MemFlagsData::new(), value, state_out, offset as i32);
@@ -1113,6 +1123,7 @@ fn lower_native_binary_operation(
     instruction: &RegionInstruction,
     locals: &BTreeMap<LocalId, Variable>,
     registers: &BTreeMap<RegId, Variable>,
+    live_registers: &[RegId],
     native_version: u32,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     let helper = helper.ok_or_else(|| {
@@ -1153,7 +1164,7 @@ fn lower_native_binary_operation(
         locals,
         native_version,
     )?;
-    publish_native_register_state(builder, deopt_out, registers);
+    publish_native_register_state(builder, deopt_out, registers, live_registers);
     builder
         .ins()
         .store(MemFlagsData::new(), value, result_out, 0);
@@ -1277,6 +1288,7 @@ fn lower_region_instruction(
     registers: &mut BTreeMap<RegId, Variable>,
     source_block: BlockId,
     instruction: &RegionInstruction,
+    transition_live_registers: &[RegId],
     constants: &[IrConstant],
     value_flow: &ExecutableValueFlow,
     result_out: ir::Value,
@@ -1962,7 +1974,7 @@ fn lower_region_instruction(
                 locals,
                 native_version,
             )?;
-            publish_native_register_state(builder, deopt_out, registers);
+            publish_native_register_state(builder, deopt_out, registers, transition_live_registers);
             let source_value = use_local_variable(builder, locals, *source)?;
             let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
             let instruction_id = builder.ins().iconst(
@@ -2056,6 +2068,7 @@ fn lower_region_instruction(
                     instruction,
                     locals,
                     registers,
+                    transition_live_registers,
                     native_version,
                 )?
             } else if native_operations.binary.is_some() {
@@ -2073,6 +2086,7 @@ fn lower_region_instruction(
                     instruction,
                     locals,
                     registers,
+                    transition_live_registers,
                     native_version,
                 )?
             } else {
@@ -2189,6 +2203,7 @@ fn lower_region_instruction(
                     call,
                     source_block,
                     instruction,
+                    transition_live_registers,
                     result_out,
                     deopt_out,
                     function,
@@ -2672,6 +2687,7 @@ fn lower_region_instruction(
                 locals,
                 register_variables,
                 registers,
+                transition_live_registers,
                 suspend,
                 instruction,
                 result_out,
@@ -2800,7 +2816,7 @@ fn lower_region_instruction(
                 locals,
                 native_version,
             )?;
-            publish_native_register_state(builder, deopt_out, registers);
+            publish_native_register_state(builder, deopt_out, registers, transition_live_registers);
             let object = lower_region_operand(builder, locals, registers, *object)?;
             let function = builder.ins().iconst(types::I64, i64::from(function.raw()));
             let instruction_id = builder.ins().iconst(
@@ -2827,7 +2843,7 @@ fn lower_region_instruction(
                 locals,
                 native_version,
             )?;
-            publish_native_register_state(builder, deopt_out, registers);
+            publish_native_register_state(builder, deopt_out, registers, transition_live_registers);
             let class_name = lower_region_operand(builder, locals, registers, *class_name)?;
             let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
             let instruction_id = builder.ins().iconst(
@@ -2854,7 +2870,7 @@ fn lower_region_instruction(
                 locals,
                 native_version,
             )?;
-            publish_native_register_state(builder, deopt_out, registers);
+            publish_native_register_state(builder, deopt_out, registers, transition_live_registers);
             let object = lower_region_operand(builder, locals, registers, *object)?;
             let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
             let instruction_id = builder.ins().iconst(
@@ -2881,7 +2897,7 @@ fn lower_region_instruction(
                 locals,
                 native_version,
             )?;
-            publish_native_register_state(builder, deopt_out, registers);
+            publish_native_register_state(builder, deopt_out, registers, transition_live_registers);
             let object = lower_region_operand(builder, locals, registers, *object)?;
             let value = lower_region_operand(builder, locals, registers, *value)?;
             let function = builder.ins().iconst(types::I64, i64::from(function.raw()));
@@ -3073,7 +3089,7 @@ fn lower_region_instruction(
                 locals,
                 native_version,
             )?;
-            publish_native_register_state(builder, deopt_out, registers);
+            publish_native_register_state(builder, deopt_out, registers, transition_live_registers);
             let current = use_local_variable(builder, locals, *local)?;
             let local_fact = value_flow.local_fact(*local);
             let direct_array_local = value_flow.local_storage(*local).is_promoted()
@@ -3688,6 +3704,7 @@ fn lower_native_suspension(
     locals: &BTreeMap<LocalId, Variable>,
     register_variables: &BTreeMap<RegId, Variable>,
     registers: &mut BTreeMap<RegId, Variable>,
+    live_registers: &[RegId],
     suspend: &RegionNativeSuspend,
     instruction: &RegionInstruction,
     result_out: ir::Value,
@@ -3765,14 +3782,20 @@ fn lower_native_suspension(
             .ins()
             .store(MemFlagsData::new(), value, state_out, offset as i32);
     }
-    let register_ids = registers
-        .keys()
-        .filter(|register| register.index() < crate::JIT_DEOPT_MAX_REGISTERS)
+    let register_ids = live_registers
+        .iter()
+        .filter(|register| registers.contains_key(register))
+        .take(crate::JIT_DEOPT_MAX_REGISTERS)
         .copied()
         .collect::<Vec<_>>();
-    let register_mask = register_ids.iter().fold(0_u64, |mask, register| {
-        mask | 1_u64.checked_shl(register.raw()).unwrap_or(0)
-    });
+    let register_mask = if register_ids.len() >= u64::BITS as usize {
+        u64::MAX
+    } else {
+        1_u64
+            .checked_shl(u32::try_from(register_ids.len()).unwrap_or(u32::MAX))
+            .unwrap_or(0)
+            .saturating_sub(1)
+    };
     let mask = builder.ins().iconst(types::I64, register_mask as i64);
     builder.ins().store(
         MemFlagsData::new(),
@@ -3780,7 +3803,7 @@ fn lower_native_suspension(
         state_out,
         std::mem::offset_of!(crate::JitDeoptState, initialized_register_mask) as i32,
     );
-    for register in &register_ids {
+    for (snapshot_slot, register) in register_ids.iter().enumerate() {
         let value = builder.use_var(registers[register]);
         let value = if builder.func.dfg.value_type(value) == types::I64 {
             value
@@ -3788,7 +3811,7 @@ fn lower_native_suspension(
             builder.ins().uextend(types::I64, value)
         };
         let offset = std::mem::offset_of!(crate::JitDeoptState, registers)
-            .saturating_add(register.index().saturating_mul(8));
+            .saturating_add(snapshot_slot.saturating_mul(8));
         builder
             .ins()
             .store(MemFlagsData::new(), value, state_out, offset as i32);
@@ -3860,9 +3883,9 @@ fn lower_native_suspension(
     builder.ins().return_(&[resume_status]);
     builder.switch_to_block(resume_ok);
     registers.clear();
-    for register in register_ids {
+    for (snapshot_slot, register) in register_ids.into_iter().enumerate() {
         let offset = std::mem::offset_of!(crate::JitDeoptState, registers)
-            .saturating_add(register.index().saturating_mul(8));
+            .saturating_add(snapshot_slot.saturating_mul(8));
         let value =
             builder
                 .ins()
@@ -3889,6 +3912,7 @@ fn lower_native_call_trampoline(
     call: &RegionNativeCall,
     source_block: BlockId,
     instruction: &RegionInstruction,
+    transition_live_registers: &[RegId],
     result_out: ir::Value,
     deopt_out: ir::Value,
     function: FunctionId,
@@ -4345,7 +4369,7 @@ fn lower_native_call_trampoline(
         locals,
         native_version,
     )?;
-    publish_native_register_state(builder, deopt_out, registers);
+    publish_native_register_state(builder, deopt_out, registers, transition_live_registers);
     let control_value = builder.ins().stack_load(types::I64, out_slot, 16);
     builder
         .ins()
@@ -4505,6 +4529,7 @@ fn lower_checked_region_binary(
     instruction: &RegionInstruction,
     locals: &BTreeMap<LocalId, Variable>,
     registers: &BTreeMap<RegId, Variable>,
+    live_registers: &[RegId],
     native_version: u32,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     let (result, overflow) = match op {
@@ -4545,6 +4570,7 @@ fn lower_checked_region_binary(
                 instruction,
                 locals,
                 registers,
+                live_registers,
                 native_version,
             )?;
             builder.ins().jump(merge_block, &[slow.into()]);
@@ -4600,6 +4626,7 @@ fn lower_checked_region_binary(
         instruction,
         locals,
         registers,
+        live_registers,
         native_version,
     )?;
     let slow_args = [slow.into()];

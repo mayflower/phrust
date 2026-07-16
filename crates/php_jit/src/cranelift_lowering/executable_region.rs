@@ -12,6 +12,99 @@ fn region_contains(
         .any(|instruction| predicate(&instruction.kind))
 }
 
+fn native_transition_successors(terminator: &RegionTerminator) -> Vec<BlockId> {
+    match terminator {
+        RegionTerminator::Jump { target } => vec![*target],
+        RegionTerminator::JumpIfFalse {
+            target,
+            fallthrough,
+            ..
+        }
+        | RegionTerminator::JumpIfTrue {
+            target,
+            fallthrough,
+            ..
+        } => vec![*target, *fallthrough],
+        RegionTerminator::JumpIf {
+            if_true, if_false, ..
+        } => vec![*if_true, *if_false],
+        RegionTerminator::Return { .. }
+        | RegionTerminator::ReturnReference { .. }
+        | RegionTerminator::Exit { .. } => Vec::new(),
+    }
+}
+
+fn instruction_has_native_transition(instruction: &RegionInstruction) -> bool {
+    // The current optimizing tier can request a baseline retry only from a
+    // checked/native binary operation. Throw/exit/call failures resume at
+    // handler blocks or propagate terminally and therefore do not need an
+    // instruction-entry loader.
+    matches!(instruction.kind, RegionInstructionKind::Binary { .. })
+}
+
+fn instruction_has_sparse_snapshot(instruction: &RegionInstruction) -> bool {
+    instruction_has_native_transition(instruction)
+        || matches!(instruction.kind, RegionInstructionKind::NativeSuspend(_))
+}
+
+/// Classical SSA live-in sets for the small set of actual native transition
+/// safepoints. This deliberately does not equate "defined earlier" with
+/// "live now": doing so creates cumulative register prefixes and quadratic
+/// Cranelift move/alias pressure in large PHP functions.
+fn native_transition_register_liveness(region: &RegionGraph) -> BTreeMap<u32, Vec<RegId>> {
+    let block_indices = region
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.id, index))
+        .collect::<BTreeMap<_, _>>();
+    let mut live_in = vec![BTreeSet::<RegId>::new(); region.blocks.len()];
+    loop {
+        let mut changed = false;
+        for (index, block) in region.blocks.iter().enumerate().rev() {
+            let mut live = native_transition_successors(&block.terminator)
+                .into_iter()
+                .filter_map(|successor| block_indices.get(&successor).copied())
+                .flat_map(|successor| live_in[successor].iter().copied())
+                .collect::<BTreeSet<_>>();
+            live.extend(block.terminator.register_uses());
+            for instruction in block.instructions.iter().rev() {
+                if let Some(defined) = region_instruction_result_register(&instruction.kind) {
+                    live.remove(&defined);
+                }
+                live.extend(instruction.register_uses());
+            }
+            if live != live_in[index] {
+                live_in[index] = live;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut safepoints = BTreeMap::new();
+    for block in &region.blocks {
+        let mut live = native_transition_successors(&block.terminator)
+            .into_iter()
+            .filter_map(|successor| block_indices.get(&successor).copied())
+            .flat_map(|successor| live_in[successor].iter().copied())
+            .collect::<BTreeSet<_>>();
+        live.extend(block.terminator.register_uses());
+        for instruction in block.instructions.iter().rev() {
+            if let Some(defined) = region_instruction_result_register(&instruction.kind) {
+                live.remove(&defined);
+            }
+            live.extend(instruction.register_uses());
+            if instruction_has_sparse_snapshot(instruction) {
+                safepoints.insert(instruction.continuation_id, live.iter().copied().collect());
+            }
+        }
+    }
+    safepoints
+}
+
 fn ir_function_requires_trampoline(function: &php_ir::IrFunction) -> bool {
     function.params.iter().any(|parameter| parameter.by_ref)
         || function.returns_by_ref
@@ -1111,13 +1204,16 @@ pub(super) fn compile_region_graph_native(
                 .enumerate()
                 .filter_map(|(index, function)| {
                     let function_id = u32::try_from(index).ok().map(FunctionId::new)?;
+                    let native_arity =
+                        crate::region_ir::native_function_parameter_locals(unit, function_id)?
+                            .len();
                     Some((
                         function_id,
                         (
                             function.name.clone(),
                             function.params.clone(),
                             ir_function_requires_trampoline(function),
-                            function.params.len(),
+                            native_arity,
                         ),
                     ))
                 })
@@ -1909,6 +2005,7 @@ fn define_region_graph_function(
             locals.insert(LocalId::new(local_index), builder.declare_var(types::I64));
         }
         let register_types = region_register_types(region);
+        let transition_register_liveness = native_transition_register_liveness(region);
         let register_variables = (0..region.register_count)
             .map(|index| {
                 let register = RegId::new(index);
@@ -2070,11 +2167,11 @@ fn define_region_graph_function(
             }
         }
         for region_block in &region.blocks {
-            let mut live_registers = Vec::new();
             for instruction in &region_block.instructions {
-                if live_registers
-                    .iter()
-                    .all(|register: &RegId| register.index() < crate::JIT_DEOPT_MAX_REGISTERS)
+                if let Some(live_registers) = transition_register_liveness
+                    .get(&instruction.continuation_id)
+                    .filter(|_| instruction_has_native_transition(instruction))
+                    .filter(|registers| registers.len() <= crate::JIT_DEOPT_MAX_REGISTERS)
                 {
                     let loader = builder.create_block();
                     let next = builder.create_block();
@@ -2111,11 +2208,11 @@ fn define_region_graph_function(
                         );
                         builder.def_var(local_variable(&locals, *local)?, value);
                     }
-                    for register in &live_registers {
+                    for (snapshot_slot, register) in live_registers.iter().enumerate() {
                         let variable = register_variables[register];
                         let type_ = register_types.get(register).copied().unwrap_or(types::I64);
                         let offset = std::mem::offset_of!(crate::JitDeoptState, registers)
-                            .saturating_add(register.index().saturating_mul(8));
+                            .saturating_add(snapshot_slot.saturating_mul(8));
                         let value = builder.ins().load(
                             types::I64,
                             MemFlagsData::new(),
@@ -2133,9 +2230,6 @@ fn define_region_graph_function(
                         .ins()
                         .jump(instruction_blocks[&instruction.continuation_id], &[]);
                     builder.switch_to_block(next);
-                }
-                if let Some(register) = region_instruction_result_register(&instruction.kind) {
-                    live_registers.push(register);
                 }
             }
         }
@@ -2221,6 +2315,10 @@ fn define_region_graph_function(
                     &mut registers,
                     region_block.id,
                     instruction,
+                    transition_register_liveness
+                        .get(&instruction.continuation_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
                     constants,
                     &value_flow,
                     result_out,
@@ -2571,39 +2669,36 @@ fn region_graph_metadata<'a>(
         native_transitions: regions
             .iter()
             .flat_map(|region| {
-                region.blocks.iter().flat_map(move |block| {
-                    let mut live_registers = Vec::new();
-                    block.instructions.iter().filter_map(move |instruction| {
-                        // `define_region_graph_function` emits a transition
-                        // loader only while every live register fits the
-                        // fixed native deopt-state mask. Publishing metadata
-                        // for later instructions would advertise a nonexistent
-                        // entry and quadratically clone an unbounded register
-                        // prefix in declaration-heavy generated functions.
-                        let publishable = live_registers.iter().all(|register: &RegId| {
-                            register.index() < crate::JIT_DEOPT_MAX_REGISTERS
-                        });
-                        let result_register = region_instruction_result_register(&instruction.kind);
-                        let transition = publishable.then(|| crate::JitNativeTransitionMetadata {
-                            function: region.function,
-                            native_version: u32::from(
-                                region.compile_metadata.tier == NativeCompilerTier::Optimizing,
-                            ),
-                            continuation_id: instruction.continuation_id,
-                            resume_id: crate::native_transition_resume_id(
-                                instruction.continuation_id,
-                            ),
-                            span: instruction.span,
-                            live_locals: instruction.live_locals.clone(),
-                            live_registers: live_registers.clone(),
-                            result_register,
-                        });
-                        if let Some(register) = result_register {
-                            live_registers.push(register);
+                let liveness = native_transition_register_liveness(region);
+                region
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.instructions)
+                    .filter_map(|instruction| {
+                        if !instruction_has_native_transition(instruction) {
+                            return None;
                         }
-                        transition
+                        let live_registers = liveness.get(&instruction.continuation_id)?;
+                        (live_registers.len() <= crate::JIT_DEOPT_MAX_REGISTERS).then(|| {
+                            crate::JitNativeTransitionMetadata {
+                                function: region.function,
+                                native_version: u32::from(
+                                    region.compile_metadata.tier == NativeCompilerTier::Optimizing,
+                                ),
+                                continuation_id: instruction.continuation_id,
+                                resume_id: crate::native_transition_resume_id(
+                                    instruction.continuation_id,
+                                ),
+                                span: instruction.span,
+                                live_locals: instruction.live_locals.clone(),
+                                live_registers: live_registers.clone(),
+                                result_register: region_instruction_result_register(
+                                    &instruction.kind,
+                                ),
+                            }
+                        })
                     })
-                })
+                    .collect::<Vec<_>>()
             })
             .collect(),
         function_entries,

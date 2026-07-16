@@ -961,6 +961,54 @@ fn closure_requires_implicit_this(unit: &IrUnit, closure_function: FunctionId) -
             .any(|capture| capture.local == LocalId::new(0))
 }
 
+fn native_method_class(unit: &IrUnit, function: FunctionId) -> Option<(u32, bool)> {
+    unit.classes.iter().enumerate().find_map(|(class, entry)| {
+        let is_static = entry
+            .methods
+            .iter()
+            .find(|method| method.function == function)
+            .map(|method| method.flags.is_static)
+            .or_else(|| {
+                entry
+                    .properties
+                    .iter()
+                    .any(|property| {
+                        property.hooks.get == Some(function) || property.hooks.set == Some(function)
+                    })
+                    .then_some(false)
+            })?;
+        u32::try_from(class).ok().map(|class| (class, is_static))
+    })
+}
+
+/// Returns the exact packed native-entry locals for a PHP function.
+///
+/// Declared PHP parameters are only one part of the native ABI: instance
+/// methods and bound closures prepend an implicit `$this`, while closures
+/// prepend their captured locals. Function-on-demand metadata must use this
+/// same list before the callee RegionGraph exists, otherwise the caller and
+/// the eventually compiled entry disagree about the packed frame shape.
+pub(crate) fn native_function_parameter_locals(
+    unit: &IrUnit,
+    function: FunctionId,
+) -> Option<Vec<LocalId>> {
+    let ir_function = unit.functions.get(function.index())?;
+    let method_class = native_method_class(unit, function);
+    let has_implicit_receiver = if ir_function.flags.is_method {
+        method_class.is_some_and(|(_, is_static)| !is_static)
+    } else {
+        closure_requires_implicit_this(unit, function)
+    };
+    Some(
+        has_implicit_receiver
+            .then_some(LocalId::new(0))
+            .into_iter()
+            .chain(ir_function.captures.iter().map(|capture| capture.local))
+            .chain(ir_function.params.iter().map(|parameter| parameter.local))
+            .collect(),
+    )
+}
+
 fn omitted_defaults_require_runtime_binding(
     target: &php_ir::IrFunction,
     supplied_arguments: usize,
@@ -1033,24 +1081,7 @@ impl BaselineRegionBuilder {
         let mut region_locals = ir_function.locals.clone();
         let mut region_register_count = ir_function.register_count;
         let exception_regions = collect_exception_regions(ir_function);
-        let method_class = unit.classes.iter().enumerate().find_map(|(class, entry)| {
-            let method = entry
-                .methods
-                .iter()
-                .find(|method| method.function == function)
-                .map(|method| method.flags.is_static)
-                .or_else(|| {
-                    entry
-                        .properties
-                        .iter()
-                        .any(|property| {
-                            property.hooks.get == Some(function)
-                                || property.hooks.set == Some(function)
-                        })
-                        .then_some(false)
-                })?;
-            u32::try_from(class).ok().map(|class| (class, method))
-        });
+        let method_class = native_method_class(unit, function);
         for (block_index, block) in ir_function.blocks.iter().enumerate() {
             let mut instructions = Vec::with_capacity(block.instructions.len());
             let mut known_register_strings = BTreeMap::<RegId, String>::new();
@@ -3408,32 +3439,8 @@ impl BaselineRegionBuilder {
             declarations: declaration_metadata(unit, function),
             exception_regions,
             compile_metadata: runtime_metadata.clone(),
-            parameter_locals: ir_function
-                .flags
-                .is_method
-                .then_some(true)
-                .or_else(|| {
-                    (ir_function.flags.is_closure
-                        && !ir_function.flags.is_static
-                        && ir_function
-                            .locals
-                            .first()
-                            .is_some_and(|name| name == "this")
-                        && !ir_function
-                            .captures
-                            .iter()
-                            .any(|capture| capture.local == LocalId::new(0)))
-                    .then_some(false)
-                })
-                .map(|_| LocalId::new(0))
-                .into_iter()
-                .filter(|_| {
-                    !ir_function.flags.is_method
-                        || method_class.is_some_and(|(_, is_static)| !is_static)
-                })
-                .chain(ir_function.captures.iter().map(|capture| capture.local))
-                .chain(ir_function.params.iter().map(|param| param.local))
-                .collect(),
+            parameter_locals: native_function_parameter_locals(unit, function)
+                .expect("RegionGraph function must belong to its source unit"),
             local_count: region_local_count,
             register_count: region_register_count,
             blocks,

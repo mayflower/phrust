@@ -1845,8 +1845,9 @@ fn native_side_exit_bounds_published_registers_to_abi_capacity() {
         panic!("overflow unexpectedly returned");
     };
     assert_eq!(status, crate::JitCallStatus::RECOMPILE_REQUESTED.0 as i32);
-    assert_eq!(state.initialized_register_mask, u64::MAX);
-    assert_eq!(state.registers[63], 63);
+    assert_eq!(state.initialized_register_mask, 0b11);
+    assert_eq!(state.registers[0], i64::MAX);
+    assert_eq!(state.registers[1], 1);
 }
 
 #[test]
@@ -1938,9 +1939,9 @@ fn baseline_native_continuation_resumes_exact_instruction() {
         state.mark_local_initialized(*local);
         state.slots[local.index()] = 41;
     }
-    for (index, register) in transition.live_registers.iter().enumerate() {
-        state.initialized_register_mask |= 1_u64 << register.raw();
-        state.registers[register.index()] = if index == 0 { 41 } else { 1 };
+    for (snapshot_slot, _register) in transition.live_registers.iter().enumerate() {
+        state.initialized_register_mask |= 1_u64 << snapshot_slot;
+        state.registers[snapshot_slot] = if snapshot_slot == 0 { 41 } else { 1 };
     }
     assert_eq!(
         handle
@@ -1986,9 +1987,9 @@ fn function_scoped_compile_publishes_only_requested_transition_metadata() {
         state.mark_local_initialized(*local);
         state.slots[local.index()] = 41;
     }
-    for register in &transition.live_registers {
-        state.initialized_register_mask |= 1_u64 << register.raw();
-        state.registers[register.index()] = 41;
+    for (snapshot_slot, _register) in transition.live_registers.iter().enumerate() {
+        state.initialized_register_mask |= 1_u64 << snapshot_slot;
+        state.registers[snapshot_slot] = 41;
     }
     assert_eq!(
         handle

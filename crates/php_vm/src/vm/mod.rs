@@ -1383,6 +1383,92 @@ mod tests {
         CompiledUnit::new(builder.finish())
     }
 
+    fn direct_method_on_demand_unit() -> CompiledUnit {
+        let mut builder = IrBuilder::new(UnitId::new(9_931));
+        let file = builder.add_file("native-direct-method.php");
+        let span = IrSpan::new(file, 0, 32);
+        let constant = builder.intern_constant(IrConstant::Int(42));
+        let method = builder.start_function(
+            "Widget::value",
+            FunctionFlags {
+                is_method: true,
+                ..FunctionFlags::default()
+            },
+            span,
+        );
+        builder.intern_local(method, "this");
+        builder.set_return_type(method, Some(IrReturnType::Int));
+        let method_block = builder.append_block(method);
+        let value = builder.alloc_register(method);
+        builder.emit(
+            method,
+            method_block,
+            InstructionKind::LoadConst {
+                dst: value,
+                constant,
+            },
+            span,
+        );
+        builder.terminate_return(method, method_block, Some(Operand::Register(value)), span);
+        builder.push_class(ClassEntry {
+            id: ClassId::new(0),
+            name: "widget".to_owned(),
+            display_name: "Widget".to_owned(),
+            parent: None,
+            parent_display_name: None,
+            interfaces: Vec::new(),
+            methods: vec![ClassMethodEntry {
+                name: "value".to_owned(),
+                origin_class: "widget".to_owned(),
+                function: method,
+                flags: ClassMethodFlags {
+                    has_body: true,
+                    ..ClassMethodFlags::default()
+                },
+                attributes: Vec::new(),
+            }],
+            properties: Vec::new(),
+            constants: Vec::new(),
+            enum_cases: Vec::new(),
+            attributes: Vec::new(),
+            enum_backing_type: None,
+            constructor: None,
+            flags: ClassFlags::default(),
+            span,
+        });
+
+        let entry = builder.start_function("main", FunctionFlags::default(), span);
+        builder.set_return_type(entry, Some(IrReturnType::Int));
+        let entry_block = builder.append_block(entry);
+        let object = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::NewObject {
+                dst: object,
+                display_class_name: "Widget".to_owned(),
+                class_name: "widget".to_owned(),
+                args: Vec::new(),
+            },
+            span,
+        );
+        let result = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::CallMethod {
+                dst: result,
+                object: Operand::Register(object),
+                method: "value".to_owned(),
+                args: Vec::new(),
+            },
+            span,
+        );
+        builder.terminate_return(entry, entry_block, Some(Operand::Register(result)), span);
+        builder.set_entry(entry);
+        CompiledUnit::new(builder.finish())
+    }
+
     fn typed_direct_call_unit(strict_types: bool) -> CompiledUnit {
         let mut builder = IrBuilder::new(UnitId::new(998));
         let file = builder.add_file("native-typed-direct.php");
@@ -1778,6 +1864,31 @@ mod tests {
         assert_eq!(counters.native_transition_count, 0);
         assert_eq!(counters.native_tail_calls, 0);
         assert!(counters.native_frame_arena_high_water_bytes > 0);
+        let compile_stats = worker.native_compile_cache_stats();
+        assert_eq!(compile_stats.entries, 2);
+        assert_eq!(compile_stats.misses, 2);
+        assert_eq!(compile_stats.insertions, 2);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn instance_method_resolver_uses_exact_packed_entry_arity() {
+        let worker = VmWorkerState::new(crate::tiering::TieringOptions::default());
+        let result = Vm::with_options_and_worker_state(
+            VmOptions {
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+            worker.clone(),
+        )
+        .execute(direct_method_on_demand_unit());
+
+        assert_eq!(result.return_value, Some(Value::Int(42)), "{result:#?}");
+        let counters = result.counters.expect("diagnostic counters");
+        assert_eq!(counters.native_call_direct, 1);
+        assert_eq!(counters.native_same_unit_direct_executed, 1);
+        assert_eq!(counters.native_call_dynamic, 0);
+        assert_eq!(counters.native_transition_count, 0);
         let compile_stats = worker.native_compile_cache_stats();
         assert_eq!(compile_stats.entries, 2);
         assert_eq!(compile_stats.misses, 2);

@@ -12,6 +12,8 @@ cargo test -p php_vm --lib \
 cargo test -p php_vm --lib \
   same_unit_call_resolves_on_demand_then_calls_native
 cargo test -p php_vm --lib \
+  instance_method_resolver_uses_exact_packed_entry_arity
+cargo test -p php_vm --lib \
   vm::native_compile_cache::tests::concurrent_same_key_compiles_once
 cargo test -p php_vm --lib \
   vm::native_compile_cache::tests::compile_breadth_violation_is_rejected_and_cached
