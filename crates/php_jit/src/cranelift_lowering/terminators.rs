@@ -7,7 +7,7 @@ fn lower_region_condition(
     locals: &BTreeMap<LocalId, Variable>,
     registers: &BTreeMap<RegId, Variable>,
     native_operations: NativeOperationFunctions,
-    result_out: ir::Value,
+    _result_out: ir::Value,
     condition: RegionOperand,
     constants: &[IrConstant],
     value_flow: &ExecutableValueFlow,
@@ -38,7 +38,11 @@ fn lower_region_condition(
             .stack_addr(module.target_config().pointer_type(), slot, 0);
         let context = builder.ins().iconst(types::I64, 0);
         let call = call_native_helper(module, builder, helper, &[context, value, out]);
-        require_native_operation_ok(builder, builder.inst_results(call)[0], result_out)?;
+        require_native_operation_ok(
+            builder,
+            builder.inst_results(call)[0],
+            helper.terminal_exit()?,
+        )?;
         let truthy = builder.ins().stack_load(types::I64, slot, 0);
         Ok(builder.ins().icmp_imm(IntCC::NotEqual, truthy, 0))
     } else if builder.func.dfg.value_type(value) == types::I64 {
@@ -51,7 +55,7 @@ fn lower_region_condition(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn lower_region_terminator(
     builder: &mut FunctionBuilder<'_>,
-    blocks: &[ir::Block],
+    blocks: &BTreeMap<BlockId, ir::Block>,
     locals: &BTreeMap<LocalId, Variable>,
     registers: &BTreeMap<RegId, Variable>,
     result_out: ir::Value,
@@ -224,7 +228,7 @@ pub(super) fn lower_region_terminator(
 #[allow(clippy::too_many_arguments)]
 fn lower_region_frame_exit(
     builder: &mut FunctionBuilder<'_>,
-    blocks: &[ir::Block],
+    blocks: &BTreeMap<BlockId, ir::Block>,
     locals: &BTreeMap<LocalId, Variable>,
     result_out: ir::Value,
     pending_status: Variable,

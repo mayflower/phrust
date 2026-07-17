@@ -1,5 +1,19 @@
 use super::*;
 
+pub(super) fn dereference_native_callable_value(mut value: Value) -> Value {
+    // References are transparent when PHP resolves a callable, including the
+    // target and method slots of a two-element callable array. Peel a bounded
+    // chain because foreach and by-reference argument binding can wrap the
+    // same callable more than once.
+    for _ in 0..64 {
+        match value {
+            Value::Reference(reference) => value = reference.get(),
+            value => return value,
+        }
+    }
+    value
+}
+
 pub(super) fn stable_native_symbol_hash(name: &str) -> u64 {
     name.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(byte.to_ascii_lowercase())).wrapping_mul(0x0000_0100_0000_01b3)
@@ -611,8 +625,7 @@ pub(super) fn execute_native_dynamic_callable(
         return Some(Err("callable operand is missing".to_owned()));
     };
     let callee = match context.decode(*callee) {
-        Ok(Value::Reference(reference)) => reference.get(),
-        Ok(value) => value,
+        Ok(value) => dereference_native_callable_value(value),
         Err(error) => return Some(Err(error)),
     };
     let metadata = match &instruction.kind {
@@ -777,10 +790,12 @@ pub(super) fn execute_native_dynamic_callable(
                 let target = array
                     .get(&php_runtime::api::ArrayKey::Int(0))
                     .cloned()
+                    .map(dereference_native_callable_value)
                     .ok_or_else(|| "callable array target is missing".to_owned())?;
                 let method = array
                     .get(&php_runtime::api::ArrayKey::Int(1))
                     .cloned()
+                    .map(dereference_native_callable_value)
                     .ok_or_else(|| "callable array method is missing".to_owned())?;
                 let Value::String(method) = method else {
                     return Err("callable array method must be a string".to_owned());

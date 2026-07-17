@@ -5,8 +5,9 @@ use crate::{
 };
 use php_ir::instruction::{IrCallArg, IrCallArgValueKind};
 use php_ir::{
-    BinaryOp, FunctionFlags, FunctionId, InstructionKind, IrBuilder, IrConstant, IrParam,
-    IrReturnType, IrSpan, LocalId, Operand, UnitId,
+    BinaryOp, ClassEntry, ClassFlags, ClassId, ClassMethodEntry, ClassMethodFlags, FunctionFlags,
+    FunctionId, InstructionKind, IrBuilder, IrConstant, IrParam, IrReturnType, IrSpan, LocalId,
+    Operand, UnitId,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1851,7 +1852,7 @@ fn native_side_exit_bounds_published_registers_to_abi_capacity() {
 }
 
 #[test]
-fn native_resume_loader_code_is_bounded_by_abi_register_capacity() {
+fn ordinary_instructions_do_not_create_resume_or_clif_entry_blocks() {
     let mut builder = IrBuilder::new(UnitId::new(710));
     let file = builder.add_file("native-resume-loader-capacity.php");
     let span = IrSpan::new(file, 0, 80);
@@ -1883,17 +1884,26 @@ fn native_resume_loader_code_is_bounded_by_abi_register_capacity() {
     let handle = outcome
         .handle
         .expect("large-register region should compile");
+    let clif_blocks = outcome.diagnostics[0]
+        .split_ascii_whitespace()
+        .find_map(|field| field.strip_prefix("clif_blocks="))
+        .and_then(|value| value.parse::<usize>().ok())
+        .expect("compile diagnostic must report the actual CLIF block count");
     assert!(
-        handle.code_bytes() < 600_000,
-        "resume loader code grew beyond the ABI-bounded budget: {} bytes",
+        clif_blocks <= 4,
+        "a straight-line function may add bounded entry/return plumbing, not one block per instruction: {clif_blocks} blocks"
+    );
+    assert!(
+        handle.code_bytes() < 64_000,
+        "straight-line code grew beyond the instruction-block-free budget: {} bytes",
         handle.code_bytes()
     );
     let metadata = handle
         .region_state_metadata()
         .expect("resume loader metadata");
     assert!(
-        metadata.native_transitions.len() <= crate::JIT_DEOPT_MAX_REGISTERS + 1,
-        "metadata must not advertise transitions after the bounded loader stops"
+        metadata.native_transitions.is_empty(),
+        "pure constant loads must not advertise native resume transitions"
     );
     assert!(
         metadata.native_transitions.iter().all(|transition| {
@@ -1905,6 +1915,182 @@ fn native_resume_loader_code_is_bounded_by_abi_register_capacity() {
         Ok(511),
         "bounded resume metadata must not change normal native execution"
     );
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn oversized_php_cfg_compiles_as_bounded_direct_native_fragments() {
+    let mut builder = IrBuilder::new(UnitId::new(711));
+    let file = builder.add_file("native-fragments.php");
+    let span = IrSpan::new(file, 0, 80);
+    let function = builder.start_function("native_fragments", FunctionFlags::default(), span);
+    builder.set_entry(function);
+    builder.set_return_type(function, Some(IrReturnType::Int));
+    let blocks = (0..300)
+        .map(|_| builder.append_block(function))
+        .collect::<Vec<_>>();
+    for (index, block) in blocks.iter().copied().enumerate() {
+        let constant = builder.add_constant(IrConstant::Int(index as i64));
+        let value = builder.alloc_register(function);
+        builder.emit_load_const(function, block, value, constant, span);
+        if let Some(next) = blocks.get(index + 1).copied() {
+            builder.terminate_jump(function, block, next, span);
+        } else {
+            builder.terminate_return(function, block, Some(Operand::Register(value)), span);
+        }
+    }
+    let unit = builder.finish();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.region.bounded-fragments"),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    assert!(
+        outcome.diagnostics[0].contains("plan_fragments=2"),
+        "{outcome:?}"
+    );
+    let handle = outcome.handle.expect("fragmented function handle");
+    assert_eq!(handle.invoke_i64(&[], JIT_RUNTIME_ABI_HASH), Ok(299));
+    let metadata = handle.region_state_metadata().expect("fragment metadata");
+    assert_eq!(metadata.function_entries.len(), 1);
+    assert_eq!(metadata.function_entries[0].function, function);
+    let relocatable = handle.relocatable_code().expect("fragment artifact");
+    assert_eq!(relocatable.root, function);
+    assert_eq!(relocatable.functions.len(), 3);
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn implicit_method_receiver_survives_native_fragment_boundary() {
+    let mut builder = IrBuilder::new(UnitId::new(713));
+    let file = builder.add_file("native-method-fragments.php");
+    let span = IrSpan::new(file, 0, 80);
+    let function = builder.start_function(
+        "Fixture::receiver",
+        FunctionFlags {
+            is_method: true,
+            ..FunctionFlags::default()
+        },
+        span,
+    );
+    builder.set_entry(function);
+    builder.set_return_type(function, Some(IrReturnType::Int));
+    let this = builder.intern_local(function, "this");
+    let blocks = (0..300)
+        .map(|_| builder.append_block(function))
+        .collect::<Vec<_>>();
+    for (index, block) in blocks.iter().copied().enumerate() {
+        if let Some(next) = blocks.get(index + 1).copied() {
+            builder.terminate_jump(function, block, next, span);
+        } else {
+            let receiver = builder.alloc_register(function);
+            builder.emit(
+                function,
+                block,
+                InstructionKind::LoadLocal {
+                    dst: receiver,
+                    local: this,
+                },
+                span,
+            );
+            builder.terminate_return(function, block, Some(Operand::Register(receiver)), span);
+        }
+    }
+    builder.push_class(ClassEntry {
+        id: ClassId::new(0),
+        name: "fixture".to_owned(),
+        display_name: "Fixture".to_owned(),
+        parent: None,
+        parent_display_name: None,
+        interfaces: Vec::new(),
+        methods: vec![ClassMethodEntry {
+            name: "receiver".to_owned(),
+            origin_class: "fixture".to_owned(),
+            function,
+            flags: ClassMethodFlags {
+                has_body: true,
+                ..ClassMethodFlags::default()
+            },
+            attributes: Vec::new(),
+        }],
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor: None,
+        flags: ClassFlags::default(),
+        span,
+    });
+    let unit = builder.finish();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.region.fragment-method-receiver").with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    assert!(
+        outcome.diagnostics[0].contains("plan_fragments=2"),
+        "{outcome:?}"
+    );
+    let handle = outcome.handle.expect("fragmented method handle");
+    assert_eq!(handle.invoke_i64(&[73], JIT_RUNTIME_ABI_HASH), Ok(73));
+    assert_eq!(
+        handle
+            .region_state_metadata()
+            .expect("fragment metadata")
+            .compiler_tier,
+        crate::region_ir::NativeCompilerTier::Baseline
+    );
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn cross_fragment_backedge_does_not_alias_osr_entry_zero() {
+    let mut builder = IrBuilder::new(UnitId::new(712));
+    let file = builder.add_file("native-fragment-backedge.php");
+    let span = IrSpan::new(file, 0, 80);
+    let function =
+        builder.start_function("native_fragment_backedge", FunctionFlags::default(), span);
+    builder.set_entry(function);
+    builder.set_return_type(function, Some(IrReturnType::Int));
+    let blocks = (0..300)
+        .map(|_| builder.append_block(function))
+        .collect::<Vec<_>>();
+    builder.terminate_jump(function, blocks[0], blocks[299], span);
+    for (index, block) in blocks.iter().copied().enumerate().skip(1).take(298) {
+        let constant = builder.add_constant(IrConstant::Int(if index == 1 { 42 } else { 0 }));
+        let value = builder.alloc_register(function);
+        builder.emit_load_const(function, block, value, constant, span);
+        builder.terminate_return(function, block, Some(Operand::Register(value)), span);
+    }
+    builder.terminate_jump(function, blocks[299], blocks[1], span);
+    let unit = builder.finish();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.region.fragment-backedge"),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    assert!(
+        outcome.diagnostics[0].contains("plan_fragments=2"),
+        "{outcome:?}"
+    );
+    let handle = outcome.handle.expect("fragmented backedge handle");
+    assert_eq!(handle.invoke_i64(&[], JIT_RUNTIME_ABI_HASH), Ok(42));
+    let osr = handle
+        .region_state_metadata()
+        .and_then(|metadata| metadata.osr_entries.first())
+        .expect("backedge must publish an OSR entry");
+    assert_eq!(osr.id, 0);
+    assert_eq!(osr.block, blocks[1]);
 }
 
 #[test]

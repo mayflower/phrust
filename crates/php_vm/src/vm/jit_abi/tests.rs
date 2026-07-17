@@ -1,5 +1,22 @@
 use super::native_builtins::format_native_php_diagnostic;
-use super::{jit_native_call_dispatch_abi, jit_native_dynamic_code_abi, native_backtrace_frame};
+use super::{
+    dereference_native_callable_value, jit_native_call_dispatch_abi, jit_native_dynamic_code_abi,
+    native_backtrace_frame,
+};
+
+#[test]
+fn callable_resolution_dereferences_nested_php_references() {
+    let inner = php_runtime::api::ReferenceCell::new(php_runtime::api::Value::String(
+        php_runtime::api::PhpString::from_bytes(b"Fixture::run".to_vec()),
+    ));
+    let outer = php_runtime::api::ReferenceCell::new(php_runtime::api::Value::Reference(inner));
+    let value = dereference_native_callable_value(php_runtime::api::Value::Reference(outer));
+
+    assert!(matches!(
+        value,
+        php_runtime::api::Value::String(name) if name.as_bytes() == b"Fixture::run"
+    ));
+}
 
 #[test]
 fn native_php_diagnostics_match_cli_and_http_rendering() {

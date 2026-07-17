@@ -1,6 +1,259 @@
 use super::*;
 use std::collections::BTreeSet;
 
+#[derive(Clone, Debug)]
+struct NativeFragmentLayout {
+    id: u32,
+    blocks: BTreeSet<BlockId>,
+    normal_entries: BTreeSet<BlockId>,
+    external_targets: BTreeSet<BlockId>,
+}
+
+#[derive(Clone, Debug)]
+struct NativeFunctionFragmentLayout {
+    fragments: Vec<NativeFragmentLayout>,
+    block_owner: BTreeMap<BlockId, u32>,
+    resume_owner: BTreeMap<i32, u32>,
+}
+
+#[derive(Clone, Copy)]
+struct NativeFragmentDefinition<'a> {
+    layout: &'a NativeFunctionFragmentLayout,
+    fragment: &'a NativeFragmentLayout,
+    functions: &'a BTreeMap<u32, FuncId>,
+}
+
+fn native_fragment_frame_bytes(region: &RegionGraph) -> Result<u32, CraneliftLoweringError> {
+    let slots = u64::from(region.local_count)
+        .saturating_add(u64::from(region.register_count))
+        .saturating_add(8);
+    let bytes = slots.saturating_mul(8);
+    let bytes = u32::try_from(bytes).map_err(|_| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_FRAGMENT_FRAME_SIZE",
+            format!("native fragment frame requires {bytes} bytes"),
+        )
+    })?;
+    if bytes > MAX_NATIVE_SPILL_FRAME_BYTES {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_FRAGMENT_FRAME_LIMIT",
+            format!(
+                "native fragment frame requires {bytes} bytes; limit is {MAX_NATIVE_SPILL_FRAME_BYTES}"
+            ),
+        ));
+    }
+    Ok(bytes.max(16))
+}
+
+fn native_fragment_local_offset(local: LocalId) -> i32 {
+    i32::try_from(local.index().saturating_mul(8)).unwrap_or(i32::MAX)
+}
+
+fn native_fragment_register_offset(region: &RegionGraph, register: RegId) -> i32 {
+    i32::try_from(
+        (region.local_count as usize)
+            .saturating_add(register.index())
+            .saturating_mul(8),
+    )
+    .unwrap_or(i32::MAX)
+}
+
+fn native_fragment_pending_status_offset(region: &RegionGraph) -> i32 {
+    i32::try_from(
+        (region.local_count as usize)
+            .saturating_add(region.register_count as usize)
+            .saturating_mul(8),
+    )
+    .unwrap_or(i32::MAX)
+}
+
+fn native_fragment_pending_value_offset(region: &RegionGraph) -> i32 {
+    native_fragment_pending_status_offset(region).saturating_add(8)
+}
+
+fn native_fragment_entry_id_offset(region: &RegionGraph) -> i32 {
+    native_fragment_pending_value_offset(region).saturating_add(8)
+}
+
+fn native_fragment_arguments_offset(region: &RegionGraph) -> i32 {
+    native_fragment_entry_id_offset(region).saturating_add(8)
+}
+
+fn native_fragment_result_out_offset(region: &RegionGraph) -> i32 {
+    native_fragment_arguments_offset(region).saturating_add(8)
+}
+
+fn native_fragment_deopt_out_offset(region: &RegionGraph) -> i32 {
+    native_fragment_result_out_offset(region).saturating_add(8)
+}
+
+fn native_fragment_resume_id_offset(region: &RegionGraph) -> i32 {
+    native_fragment_deopt_out_offset(region).saturating_add(8)
+}
+
+fn native_fragment_resume_state_offset(region: &RegionGraph) -> i32 {
+    native_fragment_resume_id_offset(region).saturating_add(8)
+}
+
+fn region_control_targets(block: &crate::region_ir::RegionBlock) -> BTreeSet<BlockId> {
+    let mut targets = native_transition_successors(&block.terminator)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    match block.terminator {
+        RegionTerminator::Return { finally, .. }
+        | RegionTerminator::ReturnReference { finally, .. }
+        | RegionTerminator::Exit { finally, .. } => {
+            targets.extend(finally);
+        }
+        RegionTerminator::Jump { .. }
+        | RegionTerminator::JumpIfFalse { .. }
+        | RegionTerminator::JumpIfTrue { .. }
+        | RegionTerminator::JumpIf { .. } => {}
+    }
+    for instruction in &block.instructions {
+        if let RegionInstructionKind::NativeControl(control) = &instruction.kind {
+            match control {
+                RegionNativeControl::EndFinally {
+                    after,
+                    outer_finally,
+                } => {
+                    targets.insert(*after);
+                    targets.extend(*outer_finally);
+                }
+                RegionNativeControl::Throw { catch, finally, .. } => {
+                    targets.extend(*catch);
+                    targets.extend(*finally);
+                }
+                RegionNativeControl::EnterTry { .. }
+                | RegionNativeControl::LeaveTry
+                | RegionNativeControl::MakeException { .. } => {}
+            }
+        }
+    }
+    targets
+}
+
+impl NativeFunctionFragmentLayout {
+    fn for_plan(
+        region: &RegionGraph,
+        plan: &NativeCompilePlan,
+    ) -> Result<Self, CraneliftLoweringError> {
+        let mut block_owner = BTreeMap::new();
+        for fragment in &plan.fragments {
+            for block in &fragment.blocks {
+                if block_owner.insert(*block, fragment.id).is_some() {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_FRAGMENT_DUPLICATE_BLOCK",
+                        format!("Region block {} occurs in multiple fragments", block.raw()),
+                    ));
+                }
+            }
+        }
+        if block_owner.len() != region.blocks.len() {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_FRAGMENT_INCOMPLETE_PLAN",
+                format!(
+                    "fragment plan owns {} of {} Region blocks",
+                    block_owner.len(),
+                    region.blocks.len()
+                ),
+            ));
+        }
+        let mut fragments = plan
+            .fragments
+            .iter()
+            .map(|fragment| NativeFragmentLayout {
+                id: fragment.id,
+                blocks: fragment.blocks.iter().copied().collect(),
+                normal_entries: BTreeSet::new(),
+                external_targets: BTreeSet::new(),
+            })
+            .collect::<Vec<_>>();
+        if let Some(owner) = block_owner.get(&BlockId::new(0)).copied() {
+            fragments[owner as usize]
+                .normal_entries
+                .insert(BlockId::new(0));
+        }
+        for block in &region.blocks {
+            let source_owner = block_owner[&block.id];
+            for target in region_control_targets(block) {
+                let target_owner = block_owner.get(&target).copied().ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_FRAGMENT_UNKNOWN_TARGET",
+                        format!(
+                            "Region block {} targets missing block {}",
+                            block.id.raw(),
+                            target.raw()
+                        ),
+                    )
+                })?;
+                if source_owner != target_owner {
+                    fragments[source_owner as usize]
+                        .external_targets
+                        .insert(target);
+                    fragments[target_owner as usize]
+                        .normal_entries
+                        .insert(target);
+                }
+            }
+        }
+
+        let transition_liveness = native_transition_register_liveness(region);
+        let mut resume_owner = BTreeMap::new();
+        let mut insert_resume = |resume_id: i32, block: BlockId| {
+            let owner = block_owner[&block];
+            match resume_owner.insert(resume_id, owner) {
+                Some(previous) if previous != owner => Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_FRAGMENT_RESUME_COLLISION",
+                    format!("resume id {resume_id} belongs to fragments {previous} and {owner}"),
+                )),
+                _ => Ok(()),
+            }
+        };
+        for handler in &region.exception_regions {
+            for target in [handler.catch, handler.finally].into_iter().flatten() {
+                insert_resume(crate::native_handler_resume_id(target), target)?;
+            }
+        }
+        for block in &region.blocks {
+            for instruction in &block.instructions {
+                if matches!(instruction.kind, RegionInstructionKind::NativeSuspend(_)) {
+                    insert_resume(
+                        crate::native_suspension_resume_id(instruction.continuation_id),
+                        block.id,
+                    )?;
+                }
+                if instruction_has_native_transition(instruction)
+                    && transition_liveness
+                        .get(&instruction.continuation_id)
+                        .is_some_and(|live| live.len() <= crate::JIT_DEOPT_MAX_REGISTERS)
+                {
+                    insert_resume(
+                        crate::native_transition_resume_id(instruction.continuation_id),
+                        block.id,
+                    )?;
+                }
+            }
+        }
+        for osr in region.osr_entries() {
+            insert_resume(
+                i32::try_from(osr.id).map_err(|_| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_FRAGMENT_OSR_ID",
+                        format!("OSR id {} does not fit the native resume ABI", osr.id),
+                    )
+                })?,
+                osr.block,
+            )?;
+        }
+        Ok(Self {
+            fragments,
+            block_owner,
+            resume_owner,
+        })
+    }
+}
+
 fn region_contains(
     region: &RegionGraph,
     predicate: impl Fn(&RegionInstructionKind) -> bool,
@@ -51,7 +304,7 @@ fn instruction_has_sparse_snapshot(instruction: &RegionInstruction) -> bool {
 /// safepoints. This deliberately does not equate "defined earlier" with
 /// "live now": doing so creates cumulative register prefixes and quadratic
 /// Cranelift move/alias pressure in large PHP functions.
-fn native_transition_register_liveness(region: &RegionGraph) -> BTreeMap<u32, Vec<RegId>> {
+fn native_register_live_in(region: &RegionGraph) -> BTreeMap<BlockId, BTreeSet<RegId>> {
     let block_indices = region
         .blocks
         .iter()
@@ -83,13 +336,23 @@ fn native_transition_register_liveness(region: &RegionGraph) -> BTreeMap<u32, Ve
             break;
         }
     }
+    region
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.id, live_in[index].clone()))
+        .collect()
+}
+
+fn native_transition_register_liveness(region: &RegionGraph) -> BTreeMap<u32, Vec<RegId>> {
+    let block_live_in = native_register_live_in(region);
 
     let mut safepoints = BTreeMap::new();
     for block in &region.blocks {
         let mut live = native_transition_successors(&block.terminator)
             .into_iter()
-            .filter_map(|successor| block_indices.get(&successor).copied())
-            .flat_map(|successor| live_in[successor].iter().copied())
+            .filter_map(|successor| block_live_in.get(&successor))
+            .flat_map(|registers| registers.iter().copied())
             .collect::<BTreeSet<_>>();
         live.extend(block.terminator.register_uses());
         for instruction in block.instructions.iter().rev() {
@@ -154,7 +417,10 @@ fn declare_value_operation(
                 format!("failed to declare {symbol}: {error}"),
             )
         })?;
-    Ok(NativeHelper { function })
+    Ok(NativeHelper {
+        function,
+        terminal_exit: None,
+    })
 }
 
 fn declare_native_helper(
@@ -172,7 +438,10 @@ fn declare_native_helper(
                 format!("failed to declare {symbol}: {error}"),
             )
         })?;
-    Ok(NativeHelper { function })
+    Ok(NativeHelper {
+        function,
+        terminal_exit: None,
+    })
 }
 
 pub(super) fn compile_region_graph_native(
@@ -186,9 +455,39 @@ pub(super) fn compile_region_graph_native(
     let mut regions = collect_region_graphs(region)?;
     for candidate in regions.values_mut() {
         if candidate.compile_metadata.tier == NativeCompilerTier::Optimizing {
-            let _ = crate::region_ir::opt::optimize_executable_region(candidate);
+            if !plan.permits_whole_region_optimization() {
+                // Executable SSA and value-flow promotion currently operate on
+                // a complete RegionGraph. Applying them before fragmentation
+                // lets promoted locals cross fragment ABIs without a frame
+                // slot; a semantically atomic one-block region can also be far
+                // too large for safe whole-region optimization. Keep every
+                // over-budget function on the bounded baseline form until
+                // optimization is planned independently inside each fragment.
+                candidate.compile_metadata.tier = NativeCompilerTier::Baseline;
+            } else {
+                let _ = crate::region_ir::opt::optimize_executable_region(candidate);
+            }
         }
     }
+    if let Some(fragment) = plan
+        .fragments
+        .iter()
+        .find(|fragment| !fragment.is_within_budget())
+    {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_FRAGMENT_BUDGET",
+            format!(
+                "fragment {} exceeds the pre-Cranelift budget: blocks={} instructions={} estimated_clif_blocks={}",
+                fragment.id,
+                fragment.blocks.len(),
+                fragment.ir_instructions,
+                fragment.estimated_clif_blocks
+            ),
+        ));
+    }
+    let fragment_layout = (plan.fragments.len() > 1)
+        .then(|| NativeFunctionFragmentLayout::for_plan(region, &plan))
+        .transpose()?;
     let ssa_metrics = regions
         .values()
         .filter(|candidate| candidate.compile_metadata.tier == NativeCompilerTier::Optimizing)
@@ -808,6 +1107,7 @@ pub(super) fn compile_region_graph_native(
         .iter()
         .map(|(name, address)| (name.as_str(), *address))
         .collect::<Vec<_>>();
+    let compiled_clif_blocks = std::cell::Cell::new(None);
     let compiled = compile_managed_native(
         request,
         function,
@@ -1168,6 +1468,39 @@ pub(super) fn compile_region_graph_native(
                     })?;
                 functions.insert(candidate.function, func_id);
             }
+            let mut fragment_functions = BTreeMap::<u32, FuncId>::new();
+            let mut fragment_symbols = BTreeMap::<u32, FunctionId>::new();
+            if let Some(layout) = &fragment_layout {
+                let synthetic_base = u32::try_from(unit.functions.len()).map_err(|_| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_FRAGMENT_SYMBOL_LIMIT",
+                        "source unit function count does not fit the fragment symbol space",
+                    )
+                })?;
+                for fragment in &layout.fragments {
+                    let synthetic = FunctionId::new(
+                        synthetic_base.checked_add(fragment.id).ok_or_else(|| {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_FRAGMENT_SYMBOL_LIMIT",
+                                "native fragment symbol id overflowed",
+                            )
+                        })?,
+                    );
+                    let symbol = format!("{name}.fragment.{}", fragment.id);
+                    let signature = region_fragment_signature(module, region)?;
+                    let func_id = module
+                        .declare_function(&symbol, Linkage::Local, &signature)
+                        .map_err(|error| {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_DECLARE_FRAGMENT",
+                                format!("failed to declare native fragment {symbol}: {error}"),
+                            )
+                        })?;
+                    fragment_functions.insert(fragment.id, func_id);
+                    fragment_symbols.insert(fragment.id, synthetic);
+                    functions.insert(synthetic, func_id);
+                }
+            }
             let inline_constants = regions
                 .iter()
                 .filter_map(|(function, region)| {
@@ -1187,6 +1520,7 @@ pub(super) fn compile_region_graph_native(
                 .collect::<BTreeMap<_, _>>();
 
             let mut code_bytes = 0_u64;
+            let mut clif_blocks = 0_usize;
             let mut native_pc_ranges = Vec::new();
             let mut relocatable_bytes = Vec::new();
             let mut relocatable_functions = Vec::new();
@@ -1257,21 +1591,11 @@ pub(super) fn compile_region_graph_native(
                     ),
                 )
             }));
-            for candidate in regions.values() {
-                let func_id = functions[&candidate.function];
-                let mut defined = define_region_graph_function(
-                    module,
-                    candidate,
-                    &unit.constants,
-                    func_id,
-                    &functions,
-                    &inline_constants,
-                    &tail_forwards,
-                    &function_params,
-                    native_call_helper,
-                    native_dynamic_code_helper,
-                    native_operations,
-                )?;
+            let mut append_defined = |symbol: FunctionId,
+                                      arity: u8,
+                                      local_count: u32,
+                                      mut defined: DefinedRegionFunction|
+             -> Result<(u64, u32), CraneliftLoweringError> {
                 let alignment = usize::try_from(defined.alignment).map_err(|_| {
                     CraneliftLoweringError::new(
                         "JIT_CRANELIFT_REJECT_CACHE_ALIGNMENT",
@@ -1286,24 +1610,96 @@ pub(super) fn compile_region_graph_native(
                 relocatable_bytes.resize(relocatable_bytes.len().saturating_add(padding), 0);
                 let code_offset = relocatable_bytes.len() as u64;
                 let candidate_bytes = defined.code.len() as u64;
-                function_code_metrics.insert(
-                    candidate.function,
-                    (candidate_bytes, defined.native_stack_bytes),
-                );
+                clif_blocks = clif_blocks.saturating_add(defined.clif_blocks);
                 relocatable_bytes.extend_from_slice(&defined.code);
                 for relocation in &mut defined.relocations {
                     relocation.offset = relocation.offset.saturating_add(code_offset);
                 }
                 relocatable_relocations.append(&mut defined.relocations);
                 relocatable_functions.push(crate::JitRelocatableFunction {
-                    function: candidate.function,
+                    function: symbol,
                     code_offset,
                     code_len: candidate_bytes,
-                    arity: region_arity(candidate)?,
-                    local_count: candidate.local_count,
+                    arity,
+                    local_count,
                 });
                 code_bytes = code_bytes.saturating_add(candidate_bytes);
                 native_pc_ranges.append(&mut defined.native_pc_ranges);
+                Ok((candidate_bytes, defined.native_stack_bytes))
+            };
+            for candidate in regions.values() {
+                if let Some(layout) = &fragment_layout {
+                    let mut function_bytes = 0_u64;
+                    let mut maximum_stack = 0_u32;
+                    for fragment in &layout.fragments {
+                        let defined = define_region_graph_function(
+                            module,
+                            candidate,
+                            &unit.constants,
+                            fragment_functions[&fragment.id],
+                            &functions,
+                            &inline_constants,
+                            &tail_forwards,
+                            &function_params,
+                            native_call_helper,
+                            native_dynamic_code_helper,
+                            native_operations,
+                            Some(NativeFragmentDefinition {
+                                layout,
+                                fragment,
+                                functions: &fragment_functions,
+                            }),
+                        )?;
+                        let (bytes, stack) = append_defined(
+                            fragment_symbols[&fragment.id],
+                            0,
+                            candidate.local_count,
+                            defined,
+                        )?;
+                        function_bytes = function_bytes.saturating_add(bytes);
+                        maximum_stack = maximum_stack.max(stack);
+                    }
+                    let wrapper = define_region_fragment_wrapper(
+                        module,
+                        candidate,
+                        functions[&candidate.function],
+                        &fragment_functions,
+                        layout,
+                        &functions,
+                    )?;
+                    let (bytes, stack) = append_defined(
+                        candidate.function,
+                        region_arity(candidate)?,
+                        candidate.local_count,
+                        wrapper,
+                    )?;
+                    function_bytes = function_bytes.saturating_add(bytes);
+                    maximum_stack = maximum_stack.max(stack);
+                    function_code_metrics
+                        .insert(candidate.function, (function_bytes, maximum_stack));
+                } else {
+                    let defined = define_region_graph_function(
+                        module,
+                        candidate,
+                        &unit.constants,
+                        functions[&candidate.function],
+                        &functions,
+                        &inline_constants,
+                        &tail_forwards,
+                        &function_params,
+                        native_call_helper,
+                        native_dynamic_code_helper,
+                        native_operations,
+                        None,
+                    )?;
+                    let metrics = append_defined(
+                        candidate.function,
+                        region_arity(candidate)?,
+                        candidate.local_count,
+                        defined,
+                    )?;
+                    function_code_metrics.insert(candidate.function, metrics);
+                }
             }
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 module
@@ -1452,6 +1848,7 @@ pub(super) fn compile_region_graph_native(
                 functions: relocatable_functions,
                 relocations: relocatable_relocations,
             });
+            compiled_clif_blocks.set(Some(clif_blocks));
             Ok((handle, code_bytes))
         },
     )?;
@@ -1460,6 +1857,7 @@ pub(super) fn compile_region_graph_native(
     Ok(NativeScalarRegionCompileResult {
         handle,
         code_bytes: compiled.code_bytes,
+        clif_blocks: compiled_clif_blocks.get(),
         fast_path_hits,
         has_control_flow,
         plan,
@@ -1804,22 +2202,20 @@ fn region_graph_signature(
     region: &RegionGraph,
 ) -> Result<Signature, CraneliftLoweringError> {
     region_arity(region)?;
+    Ok(native_php_entry_signature(module))
+}
+
+fn region_fragment_signature(
+    module: &JITModule,
+    region: &RegionGraph,
+) -> Result<Signature, CraneliftLoweringError> {
+    region_arity(region)?;
     let pointer_type = module.target_config().pointer_type();
     let mut signature = module.make_signature();
-    // Cranelift's x86-64 tail convention preserves the platform argument ABI
-    // while enabling `return_call`. Other supported hosts reserve different
-    // argument registers for that convention, so they retain the host ABI and
-    // the bounded transform stays disabled there.
     #[cfg(target_arch = "x86_64")]
     {
         signature.call_conv = CallConv::Tail;
     }
-    // Region arguments use a packed pointer so PHP functions are not limited
-    // by a host-language list of monomorphic FFI signatures.
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.params.push(AbiParam::new(types::I32));
     signature.params.push(AbiParam::new(pointer_type));
     signature.returns.push(AbiParam::new(types::I32));
     Ok(signature)
@@ -1827,6 +2223,7 @@ fn region_graph_signature(
 
 struct DefinedRegionFunction {
     code: Vec<u8>,
+    clif_blocks: usize,
     alignment: u64,
     relocations: Vec<crate::JitRelocatableRelocation>,
     native_pc_ranges: Vec<crate::JitNativePcRange>,
@@ -1834,6 +2231,205 @@ struct DefinedRegionFunction {
 }
 
 const MAX_NATIVE_SPILL_FRAME_BYTES: u32 = 1024 * 1024;
+
+fn define_region_fragment_wrapper(
+    module: &mut JITModule,
+    region: &RegionGraph,
+    func_id: FuncId,
+    fragment_functions: &BTreeMap<u32, FuncId>,
+    layout: &NativeFunctionFragmentLayout,
+    relocation_functions: &BTreeMap<FunctionId, FuncId>,
+) -> Result<DefinedRegionFunction, CraneliftLoweringError> {
+    let pointer_type = module.target_config().pointer_type();
+    let mut ctx = module.make_context();
+    ctx.func.signature = region_graph_signature(module, region)?;
+    ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+    let mut builder_context = FunctionBuilderContext::new();
+    {
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        let params = builder.block_params(entry).to_vec();
+        let arguments = params[0];
+        let result_out = params[1];
+        let deopt_out = params[2];
+        let resume_id = params[3];
+        let resume_state = params[4];
+        let frame_bytes = native_fragment_frame_bytes(region)?;
+        let frame_slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            frame_bytes,
+            3,
+        ));
+        let frame = builder.ins().stack_addr(pointer_type, frame_slot, 0);
+        let uninitialized = builder.ins().iconst(
+            types::I64,
+            crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED),
+        );
+        for local in 0..region.local_count {
+            builder.ins().store(
+                MemFlagsData::new(),
+                uninitialized,
+                frame,
+                native_fragment_local_offset(LocalId::new(local)),
+            );
+        }
+        for (index, local) in region.parameter_locals.iter().enumerate() {
+            let value = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                arguments,
+                i32::try_from(index.saturating_mul(8)).map_err(|_| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_FRAGMENT_ARITY",
+                        "fragment wrapper argument offset does not fit the native ABI",
+                    )
+                })?,
+            );
+            builder.ins().store(
+                MemFlagsData::new(),
+                value,
+                frame,
+                native_fragment_local_offset(*local),
+            );
+        }
+        let continue_status = builder
+            .ins()
+            .iconst(types::I32, i64::from(crate::JitCallStatus::CONTINUE.0));
+        let empty = builder.ins().iconst(types::I64, 0);
+        builder.ins().store(
+            MemFlagsData::new(),
+            continue_status,
+            frame,
+            native_fragment_pending_status_offset(region),
+        );
+        builder.ins().store(
+            MemFlagsData::new(),
+            empty,
+            frame,
+            native_fragment_pending_value_offset(region),
+        );
+        for (value, offset) in [
+            (arguments, native_fragment_arguments_offset(region)),
+            (result_out, native_fragment_result_out_offset(region)),
+            (deopt_out, native_fragment_deopt_out_offset(region)),
+            (resume_state, native_fragment_resume_state_offset(region)),
+        ] {
+            builder
+                .ins()
+                .store(MemFlagsData::new(), value, frame, offset);
+        }
+        builder.ins().store(
+            MemFlagsData::new(),
+            resume_id,
+            frame,
+            native_fragment_resume_id_offset(region),
+        );
+
+        let call_blocks = layout
+            .fragments
+            .iter()
+            .map(|fragment| (fragment.id, builder.create_block()))
+            .collect::<BTreeMap<_, _>>();
+        for (encoded_resume, fragment_id) in &layout.resume_owner {
+            let next = builder.create_block();
+            let matches =
+                builder
+                    .ins()
+                    .icmp_imm(IntCC::Equal, resume_id, i64::from(*encoded_resume));
+            builder
+                .ins()
+                .brif(matches, call_blocks[fragment_id], &[], next, &[]);
+            builder.switch_to_block(next);
+        }
+        let root_fragment = layout.block_owner[&BlockId::new(0)];
+        builder.ins().jump(call_blocks[&root_fragment], &[]);
+
+        for fragment in &layout.fragments {
+            builder.switch_to_block(call_blocks[&fragment.id]);
+            let callee =
+                module.declare_func_in_func(fragment_functions[&fragment.id], builder.func);
+            let entry_block = fragment
+                .normal_entries
+                .iter()
+                .next()
+                .copied()
+                .unwrap_or(BlockId::new(0));
+            let entry_id = builder
+                .ins()
+                .iconst(types::I32, i64::from(entry_block.raw()));
+            builder.ins().store(
+                MemFlagsData::new(),
+                entry_id,
+                frame,
+                native_fragment_entry_id_offset(region),
+            );
+            let call = builder.ins().call(callee, &[frame]);
+            let status = builder.inst_results(call)[0];
+            builder.ins().return_(&[status]);
+        }
+        builder.seal_all_blocks();
+        builder.finalize();
+    }
+    let verifier_flags = settings::Flags::new(settings::builder());
+    verify_function(&ctx.func, &verifier_flags).map_err(|error| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_FRAGMENT_WRAPPER",
+            format!("Cranelift verifier rejected fragment wrapper: {error}"),
+        )
+    })?;
+    let clif_blocks = ctx.func.layout.blocks().count();
+    module.define_function(func_id, &mut ctx).map_err(|error| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_FRAGMENT_WRAPPER",
+            format!("failed to define native fragment wrapper: {error}"),
+        )
+    })?;
+    let compiled = ctx.compiled_code().ok_or_else(|| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_FRAGMENT_WRAPPER",
+            "Cranelift returned no fragment-wrapper machine code",
+        )
+    })?;
+    let native_stack_bytes = compiled
+        .buffer
+        .frame_layout()
+        .map_or(0, |frame| frame.frame_to_fp_offset);
+    if native_stack_bytes > MAX_NATIVE_SPILL_FRAME_BYTES {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_FRAGMENT_WRAPPER_STACK_LIMIT",
+            format!(
+                "fragment wrapper requires {native_stack_bytes} native stack bytes; limit is {MAX_NATIVE_SPILL_FRAME_BYTES}"
+            ),
+        ));
+    }
+    let code = compiled.code_buffer().to_vec();
+    let alignment = u64::from(compiled.buffer.alignment)
+        .max(module.isa().function_alignment().minimum as u64)
+        .max(module.isa().symbol_alignment());
+    let relocations = compiled
+        .buffer
+        .relocs()
+        .iter()
+        .map(|relocation| {
+            capture_relocation(
+                module,
+                ModuleReloc::from_mach_reloc(relocation, &ctx.func, func_id),
+                relocation_functions,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    module.clear_context(&mut ctx);
+    Ok(DefinedRegionFunction {
+        code,
+        clif_blocks,
+        alignment,
+        relocations,
+        native_pc_ranges: Vec::new(),
+        native_stack_bytes,
+    })
+}
 
 fn supported_relocation_kind(kind: Reloc) -> Option<crate::JitRelocatableKind> {
     match kind {
@@ -1947,6 +2543,7 @@ fn define_region_graph_function(
     native_call_helper: Option<NativeHelper>,
     native_dynamic_code_helper: Option<NativeHelper>,
     native_operations: NativeOperationFunctions,
+    fragment: Option<NativeFragmentDefinition<'_>>,
 ) -> Result<DefinedRegionFunction, CraneliftLoweringError> {
     let value_flow = if region.compile_metadata.tier == NativeCompilerTier::Optimizing {
         let flow = crate::region_ir::analyze_executable_value_flow(region, constants);
@@ -1959,25 +2556,46 @@ fn define_region_graph_function(
     };
     let pointer_type = module.target_config().pointer_type();
     let mut ctx = module.make_context();
-    ctx.func.signature = region_graph_signature(module, region)?;
+    ctx.func.signature = if fragment.is_some() {
+        region_fragment_signature(module, region)?
+    } else {
+        region_graph_signature(module, region)?
+    };
     ctx.func.name = UserFuncName::user(0, func_id.as_u32());
     let mut builder_context = FunctionBuilderContext::new();
     {
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
-        let blocks = create_region_cranelift_blocks(&mut builder, region)?;
-        let instruction_blocks = region
+        let owned_blocks = region
             .blocks
+            .iter()
+            .filter(|block| {
+                fragment.is_none_or(|fragment| fragment.fragment.blocks.contains(&block.id))
+            })
+            .collect::<Vec<_>>();
+        let blocks = if let Some(fragment) = fragment {
+            fragment
+                .fragment
+                .blocks
+                .iter()
+                .chain(&fragment.fragment.external_targets)
+                .map(|block| (*block, builder.create_block()))
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            create_region_cranelift_blocks(&mut builder, region)?
+        };
+        // Only true resumable native transitions need an instruction-entry
+        // block. Ordinary Region instructions are lowered directly into their
+        // PHP CFG block (or the continuation block created by a fallible
+        // helper). Creating an entry block for every instruction turns a
+        // large but ordinary PHP function into a pathological Cranelift CFG
+        // before regalloc2 sees it.
+        let transition_blocks = owned_blocks
             .iter()
             .flat_map(|block| &block.instructions)
+            .filter(|instruction| instruction_has_native_transition(instruction))
             .map(|instruction| (instruction.continuation_id, builder.create_block()))
             .collect::<BTreeMap<_, _>>();
-        let terminator_blocks = region
-            .blocks
-            .iter()
-            .map(|block| (block.id, builder.create_block()))
-            .collect::<BTreeMap<_, _>>();
-        let suspension_blocks = region
-            .blocks
+        let suspension_blocks = owned_blocks
             .iter()
             .flat_map(|block| &block.instructions)
             .filter(|instruction| {
@@ -1985,7 +2603,10 @@ fn define_region_graph_function(
             })
             .map(|instruction| (instruction.continuation_id, builder.create_block()))
             .collect::<BTreeMap<_, _>>();
-        let normal_entry = blocks.first().copied().ok_or_else(|| {
+        let terminal_exit = builder.create_block();
+        builder.append_block_param(terminal_exit, types::I32);
+        builder.append_block_param(terminal_exit, types::I64);
+        let normal_entry = blocks.values().next().copied().ok_or_else(|| {
             CraneliftLoweringError::new(
                 "JIT_CRANELIFT_REJECT_HELPER_CONTROL_FLOW",
                 "executable region requires at least one block",
@@ -1995,16 +2616,65 @@ fn define_region_graph_function(
         builder.append_block_params_for_function_params(native_entry);
         builder.switch_to_block(native_entry);
         let params = builder.block_params(native_entry).to_vec();
-        let arguments = params[0];
-        let result_out = params[1];
-        let deopt_out = params[2];
-        let resume_id = params[3];
-        let resume_state = params[4];
+        let fragment_frame = fragment.map(|_| params[0]);
+        let (arguments, result_out, deopt_out, resume_id, resume_state, fragment_entry_id) =
+            if let Some(frame) = fragment_frame {
+                let arguments = builder.ins().load(
+                    pointer_type,
+                    MemFlagsData::new(),
+                    frame,
+                    native_fragment_arguments_offset(region),
+                );
+                let result_out = builder.ins().load(
+                    pointer_type,
+                    MemFlagsData::new(),
+                    frame,
+                    native_fragment_result_out_offset(region),
+                );
+                let deopt_out = builder.ins().load(
+                    pointer_type,
+                    MemFlagsData::new(),
+                    frame,
+                    native_fragment_deopt_out_offset(region),
+                );
+                let resume_id = builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    frame,
+                    native_fragment_resume_id_offset(region),
+                );
+                let resume_state = builder.ins().load(
+                    pointer_type,
+                    MemFlagsData::new(),
+                    frame,
+                    native_fragment_resume_state_offset(region),
+                );
+                let entry_id = builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    frame,
+                    native_fragment_entry_id_offset(region),
+                );
+                (
+                    arguments,
+                    result_out,
+                    deopt_out,
+                    resume_id,
+                    resume_state,
+                    Some(entry_id),
+                )
+            } else {
+                (params[0], params[1], params[2], params[3], params[4], None)
+            };
+        let native_operations = native_operations.with_terminal_exit(NativeTerminalExit {
+            block: terminal_exit,
+        });
         let mut locals = BTreeMap::new();
         for local_index in 0..region.local_count {
             locals.insert(LocalId::new(local_index), builder.declare_var(types::I64));
         }
         let register_types = region_register_types(region);
+        let register_live_in = native_register_live_in(region);
         let transition_register_liveness = native_transition_register_liveness(region);
         let register_variables = (0..region.register_count)
             .map(|index| {
@@ -2023,6 +2693,22 @@ fn define_region_graph_function(
             u32::from(region.compile_metadata.tier == NativeCompilerTier::Optimizing);
         builder.def_var(pending_status, continue_status);
         builder.def_var(pending_value, empty_value);
+        if let Some(frame) = fragment_frame {
+            let status = builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                frame,
+                native_fragment_pending_status_offset(region),
+            );
+            let value = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                frame,
+                native_fragment_pending_value_offset(region),
+            );
+            builder.def_var(pending_status, status);
+            builder.def_var(pending_value, value);
+        }
         let uninitialized_value = builder.ins().iconst(
             types::I64,
             crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED),
@@ -2030,25 +2716,30 @@ fn define_region_graph_function(
         for variable in locals.values().copied() {
             builder.def_var(variable, uninitialized_value);
         }
-        for (index, param) in region.parameter_locals.iter().enumerate() {
-            let value = builder.ins().load(
-                types::I64,
-                MemFlagsData::new(),
-                arguments,
-                i32::try_from(index.saturating_mul(8)).map_err(|_| {
-                    CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_REGION_ARITY",
-                        "packed region argument offset does not fit the native ABI",
-                    )
-                })?,
-            );
-            builder.def_var(local_variable(&locals, *param)?, value);
+        if fragment.is_none() {
+            for (index, param) in region.parameter_locals.iter().enumerate() {
+                let value = builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    arguments,
+                    i32::try_from(index.saturating_mul(8)).map_err(|_| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_REGION_ARITY",
+                            "packed region argument offset does not fit the native ABI",
+                        )
+                    })?,
+                );
+                builder.def_var(local_variable(&locals, *param)?, value);
+            }
         }
         let handler_resume_blocks = region
             .exception_regions
             .iter()
             .flat_map(|handler| [handler.catch, handler.finally])
             .flatten()
+            .filter(|target| {
+                fragment.is_none_or(|fragment| fragment.fragment.blocks.contains(target))
+            })
             .collect::<std::collections::BTreeSet<_>>();
         let handler_exception_locals = region
             .exception_regions
@@ -2117,7 +2808,7 @@ fn define_region_graph_function(
             builder.ins().jump(cranelift_block(&blocks, target)?, &[]);
             builder.switch_to_block(next);
         }
-        for region_block in &region.blocks {
+        for region_block in &owned_blocks {
             for instruction in &region_block.instructions {
                 if !matches!(instruction.kind, RegionInstructionKind::NativeSuspend(_)) {
                     continue;
@@ -2166,7 +2857,7 @@ fn define_region_graph_function(
                 builder.switch_to_block(next);
             }
         }
-        for region_block in &region.blocks {
+        for region_block in &owned_blocks {
             for instruction in &region_block.instructions {
                 if let Some(live_registers) = transition_register_liveness
                     .get(&instruction.continuation_id)
@@ -2228,12 +2919,14 @@ fn define_region_graph_function(
                     }
                     builder
                         .ins()
-                        .jump(instruction_blocks[&instruction.continuation_id], &[]);
+                        .jump(transition_blocks[&instruction.continuation_id], &[]);
                     builder.switch_to_block(next);
                 }
             }
         }
-        for osr_entry in region.osr_entries() {
+        for osr_entry in region.osr_entries().into_iter().filter(|entry| {
+            fragment.is_none_or(|fragment| fragment.fragment.blocks.contains(&entry.block))
+        }) {
             let loader = builder.create_block();
             let next = builder.create_block();
             let requested =
@@ -2258,15 +2951,77 @@ fn define_region_graph_function(
                 .jump(cranelift_block(&blocks, osr_entry.block)?, &[]);
             builder.switch_to_block(next);
         }
-        builder.ins().jump(normal_entry, &[]);
+        if let Some(fragment) = fragment {
+            let frame = fragment_frame.expect("fragment signature has a native frame");
+            let entry_id = fragment_entry_id.expect("fragment signature has an entry id");
+            for entry in &fragment.fragment.normal_entries {
+                let loader = builder.create_block();
+                let next = builder.create_block();
+                let requested =
+                    builder
+                        .ins()
+                        .icmp_imm(IntCC::Equal, entry_id, i64::from(entry.raw()));
+                builder.ins().brif(requested, loader, &[], next, &[]);
+                builder.switch_to_block(loader);
+                let entry_block = region.blocks.get(entry.index()).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_FRAGMENT_ENTRY",
+                        format!("fragment entry block {} is missing", entry.raw()),
+                    )
+                })?;
+                let mut entry_locals = entry_block
+                    .entry_state_locals
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                if entry.raw() == 0 {
+                    entry_locals.extend(region.parameter_locals.iter().copied());
+                }
+                for local in entry_locals {
+                    let value = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::new(),
+                        frame,
+                        native_fragment_local_offset(local),
+                    );
+                    builder.def_var(local_variable(&locals, local)?, value);
+                }
+                for register in register_live_in.get(entry).into_iter().flatten() {
+                    let type_ = register_types.get(register).copied().unwrap_or(types::I64);
+                    let value = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::new(),
+                        frame,
+                        native_fragment_register_offset(region, *register),
+                    );
+                    let value = if type_ == types::I64 {
+                        value
+                    } else {
+                        builder.ins().ireduce(type_, value)
+                    };
+                    builder.def_var(register_variables[register], value);
+                }
+                builder.ins().jump(cranelift_block(&blocks, *entry)?, &[]);
+                builder.switch_to_block(next);
+            }
+            let invalid = builder
+                .ins()
+                .iconst(types::I32, i64::from(crate::JitCallStatus::RUNTIME_ERROR.0));
+            builder.ins().return_(&[invalid]);
+        } else {
+            builder.ins().jump(normal_entry, &[]);
+        }
 
         let loop_headers = region
             .osr_entries()
             .into_iter()
+            .filter(|entry| {
+                fragment.is_none_or(|fragment| fragment.fragment.blocks.contains(&entry.block))
+            })
             .map(|entry| entry.block)
             .collect::<BTreeSet<_>>();
 
-        for region_block in &region.blocks {
+        for region_block in &owned_blocks {
             let mut registers = register_variables.clone();
             builder.switch_to_block(cranelift_block(&blocks, region_block.id)?);
             if loop_headers.contains(&region_block.id)
@@ -2275,16 +3030,16 @@ fn define_region_graph_function(
                 let context = builder.ins().iconst(types::I64, 0);
                 let call = call_native_helper(module, &mut builder, helper, &[context]);
                 let status = builder.inst_results(call)[0];
-                require_native_operation_ok(&mut builder, status, result_out)?;
+                require_native_operation_ok(&mut builder, status, helper.terminal_exit()?)?;
             }
-            let first = region_block
-                .instructions
-                .first()
-                .map(|instruction| instruction_blocks[&instruction.continuation_id])
-                .unwrap_or(terminator_blocks[&region_block.id]);
-            builder.ins().jump(first, &[]);
-            for (index, instruction) in region_block.instructions.iter().enumerate() {
-                builder.switch_to_block(instruction_blocks[&instruction.continuation_id]);
+            let mut terminated = false;
+            for instruction in &region_block.instructions {
+                if let Some(transition_block) =
+                    transition_blocks.get(&instruction.continuation_id).copied()
+                {
+                    builder.ins().jump(transition_block, &[]);
+                    builder.switch_to_block(transition_block);
+                }
                 builder.set_srcloc(ir::SourceLoc::new(
                     instruction.continuation_id.saturating_add(1),
                 ));
@@ -2297,7 +3052,8 @@ fn define_region_graph_function(
                         callee,
                         &[arguments, result_out, deopt_out, resume_id, resume_state],
                     );
-                    continue;
+                    terminated = true;
+                    break;
                 }
                 lower_region_instruction(
                     module,
@@ -2331,14 +3087,14 @@ fn define_region_graph_function(
                     native_version,
                     pointer_type,
                 )?;
-                let next = region_block
-                    .instructions
-                    .get(index + 1)
-                    .map(|next| instruction_blocks[&next.continuation_id])
-                    .unwrap_or(terminator_blocks[&region_block.id]);
-                builder.ins().jump(next, &[]);
+                if matches!(instruction.kind, RegionInstructionKind::RuntimeFatal { .. }) {
+                    terminated = true;
+                    break;
+                }
             }
-            builder.switch_to_block(terminator_blocks[&region_block.id]);
+            if terminated {
+                continue;
+            }
             builder.set_srcloc(ir::SourceLoc::new(
                 region_block.terminator_continuation_id.saturating_add(1),
             ));
@@ -2359,6 +3115,90 @@ fn define_region_graph_function(
                 &value_flow,
             )?;
         }
+        if let Some(fragment) = fragment {
+            let frame = fragment_frame.expect("fragment signature has a native frame");
+            for target in &fragment.fragment.external_targets {
+                builder.switch_to_block(cranelift_block(&blocks, *target)?);
+                let target_block = region.blocks.get(target.index()).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_FRAGMENT_EXIT_TARGET",
+                        format!("fragment exit target {} is missing", target.raw()),
+                    )
+                })?;
+                for local in &target_block.entry_state_locals {
+                    let value = use_local_variable(&mut builder, &locals, *local)?;
+                    builder.ins().store(
+                        MemFlagsData::new(),
+                        value,
+                        frame,
+                        native_fragment_local_offset(*local),
+                    );
+                }
+                for register in register_live_in.get(target).into_iter().flatten() {
+                    let value = builder.try_use_var(register_variables[register]).map_err(|error| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_FRAGMENT_LIVE_REGISTER",
+                            format!(
+                                "fragment {} cannot materialize live register {} for block {}: {error}",
+                                fragment.fragment.id,
+                                register.raw(),
+                                target.raw()
+                            ),
+                        )
+                    })?;
+                    let value = if builder.func.dfg.value_type(value) == types::I64 {
+                        value
+                    } else {
+                        builder.ins().uextend(types::I64, value)
+                    };
+                    builder.ins().store(
+                        MemFlagsData::new(),
+                        value,
+                        frame,
+                        native_fragment_register_offset(region, *register),
+                    );
+                }
+                let status = builder.use_var(pending_status);
+                let value = builder.use_var(pending_value);
+                builder.ins().store(
+                    MemFlagsData::new(),
+                    status,
+                    frame,
+                    native_fragment_pending_status_offset(region),
+                );
+                builder.ins().store(
+                    MemFlagsData::new(),
+                    value,
+                    frame,
+                    native_fragment_pending_value_offset(region),
+                );
+                let target_fragment = fragment.layout.block_owner[target];
+                let callee =
+                    module.declare_func_in_func(fragment.functions[&target_fragment], builder.func);
+                let no_resume = builder.ins().iconst(types::I32, -1);
+                let entry = builder.ins().iconst(types::I32, i64::from(target.raw()));
+                builder.ins().store(
+                    MemFlagsData::new(),
+                    entry,
+                    frame,
+                    native_fragment_entry_id_offset(region),
+                );
+                builder.ins().store(
+                    MemFlagsData::new(),
+                    no_resume,
+                    frame,
+                    native_fragment_resume_id_offset(region),
+                );
+                builder.ins().return_call(callee, &[frame]);
+            }
+        }
+        builder.switch_to_block(terminal_exit);
+        let terminal_status = builder.block_params(terminal_exit)[0];
+        let terminal_value = builder.block_params(terminal_exit)[1];
+        builder
+            .ins()
+            .store(MemFlagsData::new(), terminal_value, result_out, 0);
+        builder.ins().return_(&[terminal_status]);
         builder.seal_all_blocks();
         builder.finalize();
     }
@@ -2369,6 +3209,7 @@ fn define_region_graph_function(
             format!("Cranelift verifier rejected executable Region IR: {error}"),
         )
     })?;
+    let clif_blocks = ctx.func.layout.blocks().count();
     module.define_function(func_id, &mut ctx).map_err(|error| {
         CraneliftLoweringError::new(
             "JIT_CRANELIFT_REJECT_DEFINE",
@@ -2427,6 +3268,7 @@ fn define_region_graph_function(
     module.clear_context(&mut ctx);
     Ok(DefinedRegionFunction {
         code,
+        clif_blocks,
         alignment,
         relocations,
         native_pc_ranges,

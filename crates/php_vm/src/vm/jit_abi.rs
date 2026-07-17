@@ -4748,7 +4748,7 @@ fn execute_native_acquire_callable(
         return Some(Err("callable value is missing".to_owned()));
     };
     let value = match context.decode(*value) {
-        Ok(value) => value,
+        Ok(value) => dereference_native_callable_value(value),
         Err(error) => return Some(Err(error)),
     };
     let callable = match value {
@@ -4765,10 +4765,12 @@ fn execute_native_acquire_callable(
             let target = array
                 .get(&php_runtime::api::ArrayKey::Int(0))
                 .cloned()
+                .map(dereference_native_callable_value)
                 .ok_or_else(|| "callable array target is missing".to_owned());
             let method = array
                 .get(&php_runtime::api::ArrayKey::Int(1))
                 .cloned()
+                .map(dereference_native_callable_value)
                 .ok_or_else(|| "callable array method is missing".to_owned());
             let (target, method) = match (target, method) {
                 (Ok(target), Ok(Value::String(method))) => (target, method.to_string_lossy()),

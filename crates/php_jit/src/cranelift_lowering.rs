@@ -58,14 +58,39 @@ use value_lowering::{encode_native_bool, lower_direct_cast, lower_direct_compare
 struct NativeScalarRegionCompileResult {
     handle: JitFunctionHandle,
     code_bytes: u64,
+    clif_blocks: Option<usize>,
     fast_path_hits: u64,
     has_control_flow: bool,
     plan: NativeCompilePlan,
 }
 
 #[derive(Clone, Copy, Debug)]
+struct NativeTerminalExit {
+    block: ir::Block,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct NativeHelper {
     function: FuncId,
+    terminal_exit: Option<NativeTerminalExit>,
+}
+
+impl NativeHelper {
+    fn with_terminal_exit(self, terminal_exit: NativeTerminalExit) -> Self {
+        Self {
+            terminal_exit: Some(terminal_exit),
+            ..self
+        }
+    }
+
+    fn terminal_exit(self) -> Result<NativeTerminalExit, CraneliftLoweringError> {
+        self.terminal_exit.ok_or_else(|| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_COLD_EXIT",
+                "fallible native helper has no function-local terminal exit",
+            )
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -110,6 +135,51 @@ struct NativeOperationFunctions {
     execution_poll: Option<NativeHelper>,
 }
 
+impl NativeOperationFunctions {
+    fn with_terminal_exit(mut self, terminal_exit: NativeTerminalExit) -> Self {
+        macro_rules! bind {
+            ($($field:ident),+ $(,)?) => {
+                $(self.$field = self.$field.map(|helper| helper.with_terminal_exit(terminal_exit));)+
+            };
+        }
+        bind!(
+            function_resolve,
+            frame_alloc,
+            frame_release,
+            unary,
+            binary,
+            compare,
+            cast,
+            echo,
+            local_fetch,
+            local_store,
+            value_lifecycle,
+            reference_bind,
+            argument_check,
+            return_check,
+            exception_new,
+            array_new,
+            object_new,
+            property_fetch,
+            property_assign,
+            object_clone,
+            object_clone_with,
+            array_insert,
+            array_fetch,
+            array_unset,
+            array_spread,
+            foreach_init,
+            foreach_next,
+            foreach_cleanup,
+            constant_fetch,
+            truthy,
+            runtime_fatal,
+            execution_poll,
+        );
+        self
+    }
+}
+
 fn call_native_helper(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
@@ -118,6 +188,22 @@ fn call_native_helper(
 ) -> ir::Inst {
     let callee = module.declare_func_in_func(helper.function, builder.func);
     builder.ins().call(callee, arguments)
+}
+
+fn native_php_entry_signature(module: &JITModule) -> Signature {
+    let pointer_type = module.target_config().pointer_type();
+    let mut signature = module.make_signature();
+    #[cfg(target_arch = "x86_64")]
+    {
+        signature.call_conv = CallConv::Tail;
+    }
+    signature.params.push(AbiParam::new(pointer_type));
+    signature.params.push(AbiParam::new(pointer_type));
+    signature.params.push(AbiParam::new(pointer_type));
+    signature.params.push(AbiParam::new(types::I32));
+    signature.params.push(AbiParam::new(pointer_type));
+    signature.returns.push(AbiParam::new(types::I32));
+    signature
 }
 
 fn compile_managed_native(
@@ -340,11 +426,14 @@ fn compile_authoritative_region(request: &NativeCompileRequest<'_>) -> NativeCom
             NativeCompileOutcome::compiled(
                 compiled.handle,
                 format!(
-                    "Cranelift baseline Region IR `{}` function={} abi_hash={} code_bytes={} fast_path_hits={} control_flow={} plan_ir_instructions={} plan_php_blocks={} plan_estimated_clif_blocks={} plan_virtual_values={} plan_safepoints={} plan_live_sum={}",
+                    "Cranelift baseline Region IR `{}` function={} abi_hash={} code_bytes={} clif_blocks={} fast_path_hits={} control_flow={} plan_ir_instructions={} plan_php_blocks={} plan_estimated_clif_blocks={} plan_virtual_values={} plan_safepoints={} plan_live_sum={} plan_fragments={} plan_max_fragment_blocks={} plan_max_fragment_instructions={} plan_max_fragment_estimated_clif_blocks={}",
                     request.compile.region_id,
                     function.raw(),
                     JIT_RUNTIME_ABI_HASH,
                     compiled.code_bytes,
+                    compiled
+                        .clif_blocks
+                        .map_or_else(|| "cached".to_owned(), |blocks| blocks.to_string()),
                     compiled.fast_path_hits,
                     compiled.has_control_flow,
                     compiled.plan.ir_instructions,
@@ -353,6 +442,28 @@ fn compile_authoritative_region(request: &NativeCompileRequest<'_>) -> NativeCom
                     compiled.plan.virtual_values,
                     compiled.plan.safepoint_count,
                     compiled.plan.safepoint_live_set_sum,
+                    compiled.plan.fragments.len(),
+                    compiled
+                        .plan
+                        .fragments
+                        .iter()
+                        .map(|fragment| fragment.blocks.len())
+                        .max()
+                        .unwrap_or(0),
+                    compiled
+                        .plan
+                        .fragments
+                        .iter()
+                        .map(|fragment| fragment.ir_instructions)
+                        .max()
+                        .unwrap_or(0),
+                    compiled
+                        .plan
+                        .fragments
+                        .iter()
+                        .map(|fragment| fragment.estimated_clif_blocks)
+                        .max()
+                        .unwrap_or(0),
                 ),
                 compiled.code_bytes,
                 elapsed.max(1),
@@ -511,8 +622,8 @@ pub fn build_trivial_add_clif_smoke() -> Result<CraneliftClifSmokeResult, Cranel
 fn create_region_cranelift_blocks(
     builder: &mut FunctionBuilder<'_>,
     region: &RegionGraph,
-) -> Result<Vec<ir::Block>, CraneliftLoweringError> {
-    let mut blocks = Vec::with_capacity(region.blocks.len());
+) -> Result<BTreeMap<BlockId, ir::Block>, CraneliftLoweringError> {
+    let mut blocks = BTreeMap::new();
     for (index, region_block) in region.blocks.iter().enumerate() {
         if region_block.id.index() != index {
             return Err(CraneliftLoweringError::new(
@@ -524,16 +635,16 @@ fn create_region_cranelift_blocks(
                 ),
             ));
         }
-        blocks.push(builder.create_block());
+        blocks.insert(region_block.id, builder.create_block());
     }
     Ok(blocks)
 }
 
 fn cranelift_block(
-    blocks: &[ir::Block],
+    blocks: &BTreeMap<BlockId, ir::Block>,
     block_id: BlockId,
 ) -> Result<ir::Block, CraneliftLoweringError> {
-    blocks.get(block_id.index()).copied().ok_or_else(|| {
+    blocks.get(&block_id).copied().ok_or_else(|| {
         CraneliftLoweringError::new(
             "JIT_CRANELIFT_REJECT_HELPER_CONTROL_FLOW",
             format!("target block {} is outside the lowered CFG", block_id.raw()),
@@ -651,18 +762,18 @@ fn define_region_register(
 fn require_native_operation_ok(
     builder: &mut FunctionBuilder<'_>,
     status: ir::Value,
-    result_out: ir::Value,
+    terminal_exit: NativeTerminalExit,
 ) -> Result<(), CraneliftLoweringError> {
     let ok = builder.create_block();
-    let failed = builder.create_block();
     let is_ok = builder.ins().icmp_imm(IntCC::Equal, status, 0);
-    builder.ins().brif(is_ok, ok, &[], failed, &[]);
-    builder.switch_to_block(failed);
     let empty = builder.ins().iconst(types::I64, 0);
-    builder
-        .ins()
-        .store(MemFlagsData::new(), empty, result_out, 0);
-    builder.ins().return_(&[status]);
+    builder.ins().brif(
+        is_ok,
+        ok,
+        &[],
+        terminal_exit.block,
+        &[status.into(), empty.into()],
+    );
     builder.switch_to_block(ok);
     Ok(())
 }
@@ -673,7 +784,7 @@ fn allocate_native_frame_storage(
     operations: NativeOperationFunctions,
     bytes: u32,
     alignment_log2: u8,
-    result_out: ir::Value,
+    _result_out: ir::Value,
 ) -> ir::Value {
     let pointer_type = module.target_config().pointer_type();
     let Some(helper) = operations.frame_alloc else {
@@ -690,18 +801,21 @@ fn allocate_native_frame_storage(
     let call = call_native_helper(module, builder, helper, &[context, bytes, alignment]);
     let pointer = builder.inst_results(call)[0];
     let allocated = builder.create_block();
-    let failed = builder.create_block();
     let non_null = builder.ins().icmp_imm(IntCC::NotEqual, pointer, 0);
-    builder.ins().brif(non_null, allocated, &[], failed, &[]);
-    builder.switch_to_block(failed);
     let empty = builder.ins().iconst(types::I64, 0);
-    builder
-        .ins()
-        .store(MemFlagsData::new(), empty, result_out, 0);
     let status = builder
         .ins()
         .iconst(types::I32, i64::from(crate::JitCallStatus::RUNTIME_ERROR.0));
-    builder.ins().return_(&[status]);
+    let terminal_exit = helper
+        .terminal_exit
+        .expect("function-local frame allocator must have a terminal exit");
+    builder.ins().brif(
+        non_null,
+        allocated,
+        &[],
+        terminal_exit.block,
+        &[status.into(), empty.into()],
+    );
     builder.switch_to_block(allocated);
     pointer
 }
@@ -711,31 +825,35 @@ fn release_native_frame_storage(
     builder: &mut FunctionBuilder<'_>,
     operations: NativeOperationFunctions,
     pointer: ir::Value,
-    result_out: ir::Value,
+    _result_out: ir::Value,
 ) -> Result<(), CraneliftLoweringError> {
     let Some(helper) = operations.frame_release else {
         return Ok(());
     };
     let context = builder.ins().iconst(types::I64, 0);
     let call = call_native_helper(module, builder, helper, &[context, pointer]);
-    require_native_operation_ok(builder, builder.inst_results(call)[0], result_out)
+    require_native_operation_ok(
+        builder,
+        builder.inst_results(call)[0],
+        helper.terminal_exit()?,
+    )
 }
 
 fn require_native_value_operation_ok(
     builder: &mut FunctionBuilder<'_>,
     status: ir::Value,
-    result_out: ir::Value,
+    terminal_exit: NativeTerminalExit,
     value: ir::Value,
 ) -> Result<(), CraneliftLoweringError> {
     let ok = builder.create_block();
-    let failed = builder.create_block();
     let is_ok = builder.ins().icmp_imm(IntCC::Equal, status, 0);
-    builder.ins().brif(is_ok, ok, &[], failed, &[]);
-    builder.switch_to_block(failed);
-    builder
-        .ins()
-        .store(MemFlagsData::new(), value, result_out, 0);
-    builder.ins().return_(&[status]);
+    builder.ins().brif(
+        is_ok,
+        ok,
+        &[],
+        terminal_exit.block,
+        &[status.into(), value.into()],
+    );
     builder.switch_to_block(ok);
     Ok(())
 }
@@ -876,7 +994,7 @@ fn lower_native_value_operation(
     helper: Option<NativeHelper>,
     opcode: u32,
     operands: &[ir::Value],
-    result_out: ir::Value,
+    _result_out: ir::Value,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     let helper = helper.ok_or_else(|| {
         CraneliftLoweringError::new(
@@ -896,7 +1014,12 @@ fn lower_native_value_operation(
     args.push(out);
     let call = call_native_helper(module, builder, helper, &args);
     let value = builder.ins().stack_load(types::I64, slot, 0);
-    require_native_value_operation_ok(builder, builder.inst_results(call)[0], result_out, value)?;
+    require_native_value_operation_ok(
+        builder,
+        builder.inst_results(call)[0],
+        helper.terminal_exit()?,
+        value,
+    )?;
     Ok(value)
 }
 
@@ -1282,7 +1405,7 @@ fn lower_region_instruction(
     native_dynamic_code_helper: Option<NativeHelper>,
     native_operations: NativeOperationFunctions,
     register_variables: &BTreeMap<RegId, Variable>,
-    blocks: &[ir::Block],
+    blocks: &BTreeMap<BlockId, ir::Block>,
     suspension_blocks: &BTreeMap<u32, ir::Block>,
     locals: &BTreeMap<LocalId, Variable>,
     registers: &mut BTreeMap<RegId, Variable>,
@@ -2431,10 +2554,10 @@ fn lower_region_instruction(
                     require_native_operation_ok(
                         builder,
                         builder.inst_results(resolve)[0],
-                        result_out,
+                        helper.terminal_exit()?,
                     )?;
                     let address = builder.ins().stack_load(pointer_type, address_slot, 0);
-                    let signature = builder.func.signature.clone();
+                    let signature = native_php_entry_signature(module);
                     let signature = builder.import_signature(signature);
                     builder
                         .ins()
@@ -2782,7 +2905,11 @@ fn lower_region_instruction(
             })?;
             let context = builder.ins().iconst(types::I64, 0);
             let call = call_native_helper(module, builder, helper, &[context, src]);
-            require_native_operation_ok(builder, builder.inst_results(call)[0], result_out)?;
+            require_native_operation_ok(
+                builder,
+                builder.inst_results(call)[0],
+                helper.terminal_exit()?,
+            )?;
         }
         RegionInstructionKind::NewArray { dst } => {
             let value = lower_native_value_operation(
@@ -3564,7 +3691,11 @@ fn lower_region_instruction(
                 helper,
                 &[context, iterator_value, key_out, value_out, has_out],
             );
-            require_native_operation_ok(builder, builder.inst_results(call)[0], result_out)?;
+            require_native_operation_ok(
+                builder,
+                builder.inst_results(call)[0],
+                helper.terminal_exit()?,
+            )?;
             let has = builder.ins().stack_load(types::I64, has_slot, 0);
             let next_value = builder.ins().stack_load(types::I64, value_slot, 0);
             define_region_register(builder, register_variables, registers, *has_value, has)?;
@@ -3589,7 +3720,11 @@ fn lower_region_instruction(
             )?;
             let context = builder.ins().iconst(types::I64, 0);
             let call = call_native_helper(module, builder, helper, &[context, iterator]);
-            require_native_operation_ok(builder, builder.inst_results(call)[0], result_out)?;
+            require_native_operation_ok(
+                builder,
+                builder.inst_results(call)[0],
+                helper.terminal_exit()?,
+            )?;
         }
         RegionInstructionKind::ForeachNextRef {
             has_value,
@@ -3634,7 +3769,11 @@ fn lower_region_instruction(
                 helper,
                 &[context, iterator_value, key_out, value_out, has_out],
             );
-            require_native_operation_ok(builder, builder.inst_results(call)[0], result_out)?;
+            require_native_operation_ok(
+                builder,
+                builder.inst_results(call)[0],
+                helper.terminal_exit()?,
+            )?;
             let has = builder.ins().stack_load(types::I64, has_slot, 0);
             let next_value = builder.ins().stack_load(types::I64, value_slot, 0);
             define_region_register(builder, register_variables, registers, *has_value, has)?;

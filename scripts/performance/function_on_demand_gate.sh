@@ -7,6 +7,16 @@ set -euo pipefail
 # concurrent callers compile the same key more than once.
 cargo test -p php_jit --lib \
   compile_function_does_not_publish_same_unit_callee_body
+cargo test -p php_jit --lib \
+  ordinary_instructions_do_not_create_resume_or_clif_entry_blocks
+cargo test -p php_jit --lib \
+  oversized_php_cfg_compiles_as_bounded_direct_native_fragments
+cargo test -p php_jit --lib \
+  implicit_method_receiver_survives_native_fragment_boundary
+cargo test -p php_jit --lib \
+  cross_fragment_backedge_does_not_alias_osr_entry_zero
+cargo test -p php_jit --lib \
+  fragment_state_keeps_path_dependent_local_separate_from_snapshot_liveness
 cargo test -p php_vm --lib \
   loading_declaration_heavy_unit_compiles_only_entry_and_declares_other_cells
 cargo test -p php_vm --lib \
@@ -17,6 +27,8 @@ cargo test -p php_vm --lib \
   vm::native_compile_cache::tests::concurrent_same_key_compiles_once
 cargo test -p php_vm --lib \
   vm::native_compile_cache::tests::compile_breadth_violation_is_rejected_and_cached
+cargo test -p php_vm --lib \
+  callable_resolution_dereferences_nested_php_references
 cargo test -p php_server --lib \
   worker_pool::tests::serial_requests_reuse_the_warm_worker
 cargo test -p php_server --lib \
