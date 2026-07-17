@@ -15,7 +15,7 @@ use php_ir::instruction::{IrCallArg, IrCallArgValueKind};
 use php_ir::{
     BinaryOp, ClassEntry, ClassFlags, ClassId, ClassMethodEntry, ClassMethodFlags, FunctionFlags,
     FunctionId, InstructionKind, IrBuilder, IrConstant, IrParam, IrReturnType, IrSpan, LocalId,
-    Operand, UnitId,
+    Operand, RegId, UnitId,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1659,11 +1659,58 @@ fn function_scoped_compile_routes_same_unit_callee_through_trampoline() {
             .iter()
             .all(|entry| entry.function != callee)
     );
+    assert!(
+        metadata.native_transitions.is_empty(),
+        "ordinary calls must not add native resume transitions"
+    );
     assert_eq!(
         handle
             .invoke_i64(&[41], JIT_RUNTIME_ABI_HASH)
             .expect("native caller should dispatch the callee"),
         42
+    );
+}
+
+#[test]
+fn function_scoped_compile_resumes_only_statically_suspending_calls() {
+    extern "C" fn trampoline(
+        _vm_context: u64,
+        _frame: *mut crate::JitNativeCallFrame,
+        _out: *mut crate::JitCallResult,
+    ) -> i32 {
+        crate::JitCallStatus::RETURN.0 as i32
+    }
+
+    let (unit, function, callee) = suspending_direct_call_fixture();
+    let mut backend = CraneliftNativeCompiler;
+    let request = JitCompileRequest::new("cl.region.suspending-direct-call");
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &request,
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_call_dispatch: trampoline as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome
+        .handle
+        .expect("suspending direct-call region should compile");
+    let metadata = handle.region_state_metadata().expect("region metadata");
+    assert_eq!(metadata.native_transitions.len(), 1);
+    assert_eq!(metadata.native_transitions[0].function, function);
+    assert_eq!(
+        metadata.native_transitions[0].result_register,
+        Some(RegId::new(0))
+    );
+    assert!(
+        metadata
+            .native_transitions
+            .iter()
+            .all(|transition| transition.function != callee),
+        "function-on-demand compilation must not pull the callee into the artifact"
     );
 }
 
@@ -2593,6 +2640,85 @@ fn scalar_direct_call_fixture() -> (php_ir::IrUnit, FunctionId, FunctionId) {
                 by_ref_property: None,
                 by_ref_property_dim: None,
             }],
+        },
+        span,
+    );
+    builder.terminate_return(
+        caller,
+        caller_block,
+        Some(Operand::Register(call_result)),
+        span,
+    );
+    (builder.finish(), caller, callee)
+}
+
+fn suspending_direct_call_fixture() -> (php_ir::IrUnit, FunctionId, FunctionId) {
+    let mut builder = IrBuilder::new(UnitId::new(713));
+    let file = builder.add_file("native-nested-fiber.php");
+    let span = IrSpan::new(file, 0, 30);
+
+    let leaf = builder.start_function("suspend_in_leaf", FunctionFlags::default(), span);
+    builder.set_return_type(leaf, Some(IrReturnType::Int));
+    let leaf_block = builder.append_block(leaf);
+    let suspended = builder.intern_constant(IrConstant::Int(5));
+    let resumed = builder.alloc_register(leaf);
+    builder.emit(
+        leaf,
+        leaf_block,
+        InstructionKind::CallStaticMethod {
+            dst: resumed,
+            class_name: "Fiber".to_owned(),
+            method: "suspend".to_owned(),
+            args: vec![IrCallArg {
+                name: None,
+                value: Operand::Constant(suspended),
+                unpack: false,
+                value_kind: IrCallArgValueKind::Direct,
+                by_ref_local: None,
+                by_ref_dim: None,
+                by_ref_property: None,
+                by_ref_property_dim: None,
+            }],
+        },
+        span,
+    );
+    builder.terminate_return(leaf, leaf_block, Some(Operand::Register(resumed)), span);
+    builder.register_function_name("suspend_in_leaf", leaf);
+
+    let callee = builder.start_function("suspend_in_helper", FunctionFlags::default(), span);
+    builder.set_return_type(callee, Some(IrReturnType::Int));
+    let callee_block = builder.append_block(callee);
+    let leaf_result = builder.alloc_register(callee);
+    builder.emit(
+        callee,
+        callee_block,
+        InstructionKind::CallFunction {
+            dst: leaf_result,
+            name: "suspend_in_leaf".to_owned(),
+            args: Vec::new(),
+        },
+        span,
+    );
+    builder.terminate_return(
+        callee,
+        callee_block,
+        Some(Operand::Register(leaf_result)),
+        span,
+    );
+    builder.register_function_name("suspend_in_helper", callee);
+
+    let caller = builder.start_function("native_fiber_caller", FunctionFlags::default(), span);
+    builder.set_entry(caller);
+    builder.set_return_type(caller, Some(IrReturnType::Int));
+    let caller_block = builder.append_block(caller);
+    let call_result = builder.alloc_register(caller);
+    builder.emit(
+        caller,
+        caller_block,
+        InstructionKind::CallFunction {
+            dst: call_result,
+            name: "suspend_in_helper".to_owned(),
+            args: Vec::new(),
         },
         span,
     );

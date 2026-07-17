@@ -6,8 +6,8 @@ use super::*;
 /// itself through the uniform packed-argument ABI. This keeps the cold
 /// single-flight compile path in Rust while removing the full call dispatcher
 /// from every warm invocation.
-// SAFETY: audited native ABI pointer boundary; `out` is a synchronous
-// caller-owned machine-word slot checked before it is written.
+// `out` is a synchronous caller-owned machine-word slot.
+// SAFETY: the item validates the pointer before writing through it.
 #[allow(unsafe_code)]
 pub(in crate::vm) extern "C" fn jit_native_function_resolve_abi(
     _vm_context: u64,

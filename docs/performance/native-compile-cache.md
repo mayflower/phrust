@@ -13,6 +13,10 @@ process-wide compiler parallelism and its bounded queue are configured with
 `PHRUST_NATIVE_COMPILE_PARALLELISM` and
 `PHRUST_NATIVE_COMPILE_QUEUE_LIMIT`.
 
+The source-integrity wiring check follows this production contract: the VM
+must enter function-scoped compilation and must not require the offline
+whole-unit compile helper to remain in the VM module.
+
 Validate the policy with:
 
 ```bash
@@ -89,6 +93,10 @@ generated resume loaders. Do not publish entries after that bound: besides
 advertising a nonexistent transition, cloning an ever-growing register prefix
 turns metadata construction and serialization quadratic for generated
 declaration units.
+
+Nested Fiber-call replay is the narrow exception: a call gets a transition
+only when its statically known target can transitively reach `Fiber::suspend`.
+Ordinary calls remain transition-free and retain their existing native CFG.
 
 Focused restart checks:
 

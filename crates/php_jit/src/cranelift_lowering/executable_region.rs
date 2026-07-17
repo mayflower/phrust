@@ -23,6 +23,13 @@ struct NativeFragmentDefinition<'a> {
     functions: &'a BTreeMap<u32, FuncId>,
 }
 
+#[derive(Clone, Copy)]
+struct NativeFragmentWrapperDefinition<'a> {
+    functions: &'a BTreeMap<u32, FuncId>,
+    layout: &'a NativeFunctionFragmentLayout,
+    relocation_functions: &'a BTreeMap<FunctionId, FuncId>,
+}
+
 fn native_fragment_frame_bytes(region: &RegionGraph) -> Result<u32, CraneliftLoweringError> {
     let slots = u64::from(region.local_count)
         .saturating_add(u64::from(region.register_count))
@@ -137,6 +144,7 @@ impl NativeFunctionFragmentLayout {
     fn for_plan(
         region: &RegionGraph,
         plan: &NativeCompilePlan,
+        suspending_functions: &BTreeSet<FunctionId>,
     ) -> Result<Self, CraneliftLoweringError> {
         let mut block_owner = BTreeMap::new();
         for fragment in &plan.fragments {
@@ -198,7 +206,7 @@ impl NativeFunctionFragmentLayout {
             }
         }
 
-        let transition_liveness = native_transition_register_liveness(region);
+        let transition_liveness = native_transition_register_liveness(region, suspending_functions);
         let mut resume_owner = BTreeMap::new();
         let mut insert_resume = |resume_id: i32, block: BlockId| {
             let owner = block_owner[&block];
@@ -223,7 +231,7 @@ impl NativeFunctionFragmentLayout {
                         block.id,
                     )?;
                 }
-                if instruction_has_native_transition(instruction)
+                if instruction_has_native_transition(instruction, suspending_functions)
                     && transition_liveness
                         .get(&instruction.continuation_id)
                         .is_some_and(|live| live.len() <= crate::JIT_DEOPT_MAX_REGISTERS)
@@ -287,17 +295,156 @@ fn native_transition_successors(terminator: &RegionTerminator) -> Vec<BlockId> {
     }
 }
 
-fn instruction_has_native_transition(instruction: &RegionInstruction) -> bool {
-    // The current optimizing tier can request a baseline retry only from a
-    // checked/native binary operation. Throw/exit/call failures resume at
-    // handler blocks or propagate terminally and therefore do not need an
-    // instruction-entry loader.
-    matches!(instruction.kind, RegionInstructionKind::Binary { .. })
+fn native_call_target(call: &RegionNativeCall) -> Option<FunctionId> {
+    let RegionCallTarget::Function {
+        function: Some(function),
+        ..
+    } = call.target
+    else {
+        return None;
+    };
+    Some(function)
 }
 
-fn instruction_has_sparse_snapshot(instruction: &RegionInstruction) -> bool {
-    instruction_has_native_transition(instruction)
+fn instruction_has_native_transition(
+    instruction: &RegionInstruction,
+    suspending_functions: &BTreeSet<FunctionId>,
+) -> bool {
+    // Checked/native binary operations can request a baseline retry. A call
+    // needs an instruction-entry loader only when its statically known target
+    // can reach Fiber::suspend: the VM resumes the caller after the nested
+    // fiber completes by replaying that call against its completed-call slot.
+    // Keeping every other call out of this set preserves the bounded native
+    // CFG and metadata shape for ordinary PHP code.
+    matches!(instruction.kind, RegionInstructionKind::Binary { .. })
+        || matches!(
+            &instruction.kind,
+            RegionInstructionKind::NativeCall(call)
+                if native_call_target(call)
+                    .is_some_and(|target| suspending_functions.contains(&target))
+        )
+}
+
+fn instruction_has_sparse_snapshot(
+    instruction: &RegionInstruction,
+    suspending_functions: &BTreeSet<FunctionId>,
+) -> bool {
+    instruction_has_native_transition(instruction, suspending_functions)
         || matches!(instruction.kind, RegionInstructionKind::NativeSuspend(_))
+}
+
+fn statically_called_function(
+    unit: &IrUnit,
+    instruction: &php_ir::InstructionKind,
+) -> Option<FunctionId> {
+    match instruction {
+        php_ir::InstructionKind::CallFunction { name, .. } => unit
+            .function_table
+            .iter()
+            .find(|entry| entry.name == *name)
+            .map(|entry| entry.function),
+        php_ir::InstructionKind::CallStaticMethod {
+            class_name, method, ..
+        } if !class_name.eq_ignore_ascii_case("fiber") => {
+            unit.classes
+                .iter()
+                .find(|class| class.name.eq_ignore_ascii_case(class_name))
+                .and_then(|class| {
+                    class.methods.iter().find(|entry| {
+                        entry.name.eq_ignore_ascii_case(method) && entry.flags.is_static
+                    })
+                })
+                .map(|entry| entry.function)
+        }
+        _ => None,
+    }
+}
+
+/// Returns only functions reachable from this native region's statically
+/// identified call targets that can transitively reach `Fiber::suspend`.
+/// This is deliberately narrower than "contains a call": ordinary calls keep
+/// the exact transition-free native shape used by the function-on-demand tier.
+fn suspending_functions_for_region(unit: &IrUnit, region: &RegionGraph) -> BTreeSet<FunctionId> {
+    let roots = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| {
+            let RegionInstructionKind::NativeCall(call) = &instruction.kind else {
+                return None;
+            };
+            native_call_target(call)
+        })
+        .collect::<BTreeSet<_>>();
+    if roots.is_empty() {
+        return BTreeSet::new();
+    }
+
+    let mut reachable = roots;
+    let mut pending = reachable.iter().copied().collect::<Vec<_>>();
+    let mut callees = BTreeMap::<FunctionId, BTreeSet<FunctionId>>::new();
+    while let Some(function) = pending.pop() {
+        let Some(ir_function) = unit.functions.get(function.index()) else {
+            continue;
+        };
+        let function_callees = ir_function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| statically_called_function(unit, &instruction.kind))
+            .collect::<BTreeSet<_>>();
+        for callee in &function_callees {
+            if reachable.insert(*callee) {
+                pending.push(*callee);
+            }
+        }
+        callees.insert(function, function_callees);
+    }
+
+    let mut suspending = reachable
+        .iter()
+        .copied()
+        .filter(|function| {
+            unit.functions
+                .get(function.index())
+                .is_some_and(|function| {
+                    !function.flags.is_top_level
+                        && function
+                            .blocks
+                            .iter()
+                            .flat_map(|block| &block.instructions)
+                            .any(|instruction| {
+                                matches!(
+                                    &instruction.kind,
+                                    php_ir::InstructionKind::CallStaticMethod {
+                                        class_name,
+                                        method,
+                                        args,
+                                        ..
+                                    } if class_name.eq_ignore_ascii_case("fiber")
+                                        && method.eq_ignore_ascii_case("suspend")
+                                        && args.len() <= 1
+                                )
+                            })
+                })
+        })
+        .collect::<BTreeSet<_>>();
+
+    loop {
+        let callers = callees
+            .iter()
+            .filter_map(|(caller, targets)| {
+                (!suspending.contains(caller)
+                    && targets.iter().any(|target| suspending.contains(target)))
+                .then_some(*caller)
+            })
+            .collect::<Vec<_>>();
+        if callers.is_empty() {
+            break;
+        }
+        suspending.extend(callers);
+    }
+    suspending
 }
 
 /// Classical SSA live-in sets for the small set of actual native transition
@@ -344,7 +491,10 @@ fn native_register_live_in(region: &RegionGraph) -> BTreeMap<BlockId, BTreeSet<R
         .collect()
 }
 
-fn native_transition_register_liveness(region: &RegionGraph) -> BTreeMap<u32, Vec<RegId>> {
+fn native_transition_register_liveness(
+    region: &RegionGraph,
+    suspending_functions: &BTreeSet<FunctionId>,
+) -> BTreeMap<u32, Vec<RegId>> {
     let block_live_in = native_register_live_in(region);
 
     let mut safepoints = BTreeMap::new();
@@ -360,7 +510,7 @@ fn native_transition_register_liveness(region: &RegionGraph) -> BTreeMap<u32, Ve
                 live.remove(&defined);
             }
             live.extend(instruction.register_uses());
-            if instruction_has_sparse_snapshot(instruction) {
+            if instruction_has_sparse_snapshot(instruction, suspending_functions) {
                 safepoints.insert(instruction.continuation_id, live.iter().copied().collect());
             }
         }
@@ -452,6 +602,7 @@ pub(super) fn compile_region_graph_native(
     request: &JitCompileRequest,
 ) -> Result<NativeScalarRegionCompileResult, CraneliftLoweringError> {
     validate_region_native_coverage(region)?;
+    let suspending_functions = suspending_functions_for_region(unit, region);
     let mut regions = collect_region_graphs(region)?;
     for candidate in regions.values_mut() {
         if candidate.compile_metadata.tier == NativeCompilerTier::Optimizing {
@@ -486,7 +637,7 @@ pub(super) fn compile_region_graph_native(
         ));
     }
     let fragment_layout = (plan.fragments.len() > 1)
-        .then(|| NativeFunctionFragmentLayout::for_plan(region, &plan))
+        .then(|| NativeFunctionFragmentLayout::for_plan(region, &plan, &suspending_functions))
         .transpose()?;
     let ssa_metrics = regions
         .values()
@@ -1665,6 +1816,7 @@ pub(super) fn compile_region_graph_native(
                             native_call_helper,
                             native_dynamic_code_helper,
                             native_operations,
+                            &suspending_functions,
                             Some(NativeFragmentDefinition {
                                 layout,
                                 fragment,
@@ -1686,9 +1838,11 @@ pub(super) fn compile_region_graph_native(
                         builder_context,
                         candidate,
                         functions[&candidate.function],
-                        &fragment_functions,
-                        layout,
-                        &functions,
+                        NativeFragmentWrapperDefinition {
+                            functions: &fragment_functions,
+                            layout,
+                            relocation_functions: &functions,
+                        },
                     )?;
                     let (bytes, stack) = append_defined(
                         candidate.function,
@@ -1715,6 +1869,7 @@ pub(super) fn compile_region_graph_native(
                         native_call_helper,
                         native_dynamic_code_helper,
                         native_operations,
+                        &suspending_functions,
                         None,
                     )?;
                     let metrics = append_defined(
@@ -1855,6 +2010,7 @@ pub(super) fn compile_region_graph_native(
                 regions.values(),
                 native_pc_ranges,
                 function_entries,
+                &suspending_functions,
             );
             let mut handle = JitFunctionHandle::i64_status_out_native(
                 u64::from(function.raw()) + 1,
@@ -2326,9 +2482,7 @@ fn define_region_fragment_wrapper(
     builder_context: &mut FunctionBuilderContext,
     region: &RegionGraph,
     func_id: FuncId,
-    fragment_functions: &BTreeMap<u32, FuncId>,
-    layout: &NativeFunctionFragmentLayout,
-    relocation_functions: &BTreeMap<FunctionId, FuncId>,
+    definition: NativeFragmentWrapperDefinition<'_>,
 ) -> Result<DefinedRegionFunction, CraneliftLoweringError> {
     let pointer_type = module.target_config().pointer_type();
     ctx.func.signature = region_graph_signature(module, region)?;
@@ -2415,25 +2569,26 @@ fn define_region_fragment_wrapper(
             native_fragment_resume_id_offset(region),
         );
 
-        let call_blocks = layout
+        let call_blocks = definition
+            .layout
             .fragments
             .iter()
             .map(|fragment| (fragment.id, builder.create_block()))
             .collect::<BTreeMap<_, _>>();
         let root_entry = builder.create_block();
         let mut resume_switch = Switch::new();
-        for (encoded_resume, fragment_id) in &layout.resume_owner {
+        for (encoded_resume, fragment_id) in &definition.layout.resume_owner {
             resume_switch.set_entry(u128::from(*encoded_resume as u32), call_blocks[fragment_id]);
         }
         resume_switch.emit(&mut builder, resume_id, root_entry);
         builder.switch_to_block(root_entry);
-        let root_fragment = layout.block_owner[&BlockId::new(0)];
+        let root_fragment = definition.layout.block_owner[&BlockId::new(0)];
         builder.ins().jump(call_blocks[&root_fragment], &[]);
 
-        for fragment in &layout.fragments {
+        for fragment in &definition.layout.fragments {
             builder.switch_to_block(call_blocks[&fragment.id]);
             let callee =
-                module.declare_func_in_func(fragment_functions[&fragment.id], builder.func);
+                module.declare_func_in_func(definition.functions[&fragment.id], builder.func);
             let entry_block = fragment
                 .normal_entries
                 .iter()
@@ -2501,7 +2656,7 @@ fn define_region_fragment_wrapper(
             capture_relocation(
                 module,
                 ModuleReloc::from_mach_reloc(relocation, &ctx.func, func_id),
-                relocation_functions,
+                definition.relocation_functions,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2631,6 +2786,7 @@ fn define_region_graph_function(
     native_call_helper: Option<NativeHelper>,
     native_dynamic_code_helper: Option<NativeHelper>,
     native_operations: NativeOperationFunctions,
+    suspending_functions: &BTreeSet<FunctionId>,
     fragment: Option<NativeFragmentDefinition<'_>>,
 ) -> Result<DefinedRegionFunction, CraneliftLoweringError> {
     let value_flow = if region.compile_metadata.tier == NativeCompilerTier::Optimizing {
@@ -2678,7 +2834,9 @@ fn define_region_graph_function(
         let transition_blocks = owned_blocks
             .iter()
             .flat_map(|block| &block.instructions)
-            .filter(|instruction| instruction_has_native_transition(instruction))
+            .filter(|instruction| {
+                instruction_has_native_transition(instruction, suspending_functions)
+            })
             .map(|instruction| (instruction.continuation_id, builder.create_block()))
             .collect::<BTreeMap<_, _>>();
         let suspension_blocks = owned_blocks
@@ -2762,7 +2920,8 @@ fn define_region_graph_function(
         }
         let register_types = region_register_types(region);
         let register_live_in = native_register_live_in(region);
-        let transition_register_liveness = native_transition_register_liveness(region);
+        let transition_register_liveness =
+            native_transition_register_liveness(region, suspending_functions);
         let register_variables = (0..region.register_count)
             .map(|index| {
                 let register = RegId::new(index);
@@ -2858,7 +3017,7 @@ fn define_region_graph_function(
                 transition_register_liveness
                     .get(&instruction.continuation_id)
                     .is_some_and(|registers| {
-                        instruction_has_native_transition(instruction)
+                        instruction_has_native_transition(instruction, suspending_functions)
                             && registers.len() <= crate::JIT_DEOPT_MAX_REGISTERS
                     })
             })
@@ -2900,7 +3059,7 @@ fn define_region_graph_function(
             );
         }
         for (id, loader) in &osr_resume_loaders {
-            resume_switch.set_entry(u128::from(*id as u32), *loader);
+            resume_switch.set_entry(u128::from(*id), *loader);
         }
         if let Some(resume_default) = resume_default {
             resume_switch.emit(&mut builder, resume_id, resume_default);
@@ -2998,7 +3157,9 @@ fn define_region_graph_function(
             for instruction in &region_block.instructions {
                 if let Some(live_registers) = transition_register_liveness
                     .get(&instruction.continuation_id)
-                    .filter(|_| instruction_has_native_transition(instruction))
+                    .filter(|_| {
+                        instruction_has_native_transition(instruction, suspending_functions)
+                    })
                     .filter(|registers| registers.len() <= crate::JIT_DEOPT_MAX_REGISTERS)
                 {
                     let loader = transition_resume_loaders[&instruction.continuation_id];
@@ -3417,6 +3578,7 @@ fn region_graph_metadata<'a>(
     regions: impl Iterator<Item = &'a RegionGraph>,
     native_pc_ranges: Vec<crate::JitNativePcRange>,
     function_entries: Vec<crate::JitNativeFunctionEntryMetadata>,
+    suspending_functions: &BTreeSet<FunctionId>,
 ) -> crate::JitRegionStateMetadata {
     let regions = regions.collect::<Vec<_>>();
     let continuations = regions
@@ -3646,13 +3808,13 @@ fn region_graph_metadata<'a>(
         native_transitions: regions
             .iter()
             .flat_map(|region| {
-                let liveness = native_transition_register_liveness(region);
+                let liveness = native_transition_register_liveness(region, suspending_functions);
                 region
                     .blocks
                     .iter()
                     .flat_map(|block| &block.instructions)
                     .filter_map(|instruction| {
-                        if !instruction_has_native_transition(instruction) {
+                        if !instruction_has_native_transition(instruction, suspending_functions) {
                             return None;
                         }
                         let live_registers = liveness.get(&instruction.continuation_id)?;

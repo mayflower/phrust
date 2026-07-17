@@ -2526,7 +2526,7 @@ fn lower_region_instruction(
                     })?;
                     let address_slot = builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
-                        u32::from(pointer_type.bytes()),
+                        pointer_type.bytes(),
                         3,
                     ));
                     let address_out = builder.ins().stack_addr(pointer_type, address_slot, 0);
