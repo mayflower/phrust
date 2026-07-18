@@ -2430,6 +2430,40 @@ fn large_constant_array_literal_lowers_to_one_constant_load() {
 }
 
 #[test]
+fn deeply_populated_constant_array_uses_total_shape_for_compaction() {
+    let nested = |prefix: &str| {
+        (0..64)
+            .map(|index| format!("\"{prefix}-{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let frontend = analyze_source(&format!(
+        "<?php function values() {{ return [[{}], [{}]]; }}",
+        nested("left"),
+        nested("right"),
+    ));
+    let result = lower_frontend_result(&frontend, LoweringOptions::default());
+
+    assert!(result.verification.is_ok(), "{:#?}", result.verification);
+    assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+    let function = result
+        .unit
+        .functions
+        .iter()
+        .find(|function| function.name == "values")
+        .expect("values function");
+    assert_eq!(function.register_count, 1);
+    assert!(function.blocks.iter().all(|block| {
+        block.instructions.iter().all(|instruction| {
+            !matches!(
+                instruction.kind,
+                InstructionKind::NewArray { .. } | InstructionKind::ArrayInsert { .. }
+            )
+        })
+    }));
+}
+
+#[test]
 fn locals_lower_pre_and_post_increment_with_distinct_return_registers() {
     let frontend = analyze_source("<?php $a = 1; echo $a++; echo ++$a;");
     let result = lower_frontend_result(&frontend, LoweringOptions::default());

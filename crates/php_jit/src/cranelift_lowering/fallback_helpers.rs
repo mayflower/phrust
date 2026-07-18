@@ -1,11 +1,6 @@
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
-pub(super) extern "C" fn test_native_unary_fallback(
-    _context: u64,
-    op: u32,
-    src: i64,
-    out: *mut i64,
-) -> i32 {
+pub(super) extern "C" fn test_native_unary_fallback(op: u32, src: i64, out: *mut i64) -> i32 {
     if out.is_null() {
         return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
@@ -27,7 +22,6 @@ pub(super) extern "C" fn test_native_unary_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_binary_fallback(
-    _context: u64,
     op: u32,
     lhs: i64,
     rhs: i64,
@@ -57,7 +51,6 @@ pub(super) extern "C" fn test_native_binary_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_compare_fallback(
-    _context: u64,
     op: u32,
     lhs: i64,
     rhs: i64,
@@ -87,12 +80,7 @@ pub(super) extern "C" fn test_native_compare_fallback(
 
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
-pub(super) extern "C" fn test_native_cast_fallback(
-    _context: u64,
-    op: u32,
-    src: i64,
-    out: *mut i64,
-) -> i32 {
+pub(super) extern "C" fn test_native_cast_fallback(op: u32, src: i64, out: *mut i64) -> i32 {
     if out.is_null() {
         return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
@@ -106,12 +94,11 @@ pub(super) extern "C" fn test_native_cast_fallback(
     0
 }
 
-pub(super) extern "C" fn test_native_echo_fallback(_context: u64, _src: i64) -> i32 {
+pub(super) extern "C" fn test_native_echo_fallback(_src: i64) -> i32 {
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
 pub(super) extern "C" fn test_native_local_fetch_fallback(
-    _context: u64,
     _op: u32,
     value: i64,
     _function: i64,
@@ -130,7 +117,6 @@ pub(super) extern "C" fn test_native_local_fetch_fallback(
 }
 
 pub(super) extern "C" fn test_native_exception_new_fallback(
-    _context: u64,
     _op: u32,
     message: i64,
     _function: i64,
@@ -149,7 +135,6 @@ pub(super) extern "C" fn test_native_exception_new_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_local_store_fallback(
-    _context: u64,
     _op: u32,
     _current: i64,
     value: i64,
@@ -168,7 +153,6 @@ pub(super) extern "C" fn test_native_local_store_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_value_lifecycle_fallback(
-    _context: u64,
     op: u32,
     value: i64,
     out: *mut i64,
@@ -188,7 +172,6 @@ pub(super) extern "C" fn test_native_value_lifecycle_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_reference_bind_fallback(
-    _context: u64,
     _op: u32,
     value: i64,
     _key: i64,
@@ -206,7 +189,6 @@ pub(super) extern "C" fn test_native_reference_bind_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_argument_check_fallback(
-    _context: u64,
     _op: u32,
     value: i64,
     _target_function: i64,
@@ -226,7 +208,6 @@ pub(super) extern "C" fn test_native_argument_check_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_return_check_fallback(
-    _context: u64,
     _op: u32,
     value: i64,
     _function: i64,
@@ -240,24 +221,15 @@ pub(super) extern "C" fn test_native_return_check_fallback(
     }
 }
 
-pub(super) extern "C" fn test_native_array_new_fallback(
-    _context: u64,
-    _op: u32,
-    _out: *mut i64,
-) -> i32 {
+pub(super) extern "C" fn test_native_array_new_fallback(_op: u32, _out: *mut i64) -> i32 {
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
-pub(super) extern "C" fn test_native_object_new_fallback(
-    _context: u64,
-    _op: u32,
-    _out: *mut i64,
-) -> i32 {
+pub(super) extern "C" fn test_native_object_new_fallback(_op: u32, _out: *mut i64) -> i32 {
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
 pub(super) extern "C" fn test_native_property_fetch_fallback(
-    _context: u64,
     _op: u32,
     _object: i64,
     _function: i64,
@@ -268,7 +240,6 @@ pub(super) extern "C" fn test_native_property_fetch_fallback(
 }
 
 pub(super) extern "C" fn test_native_property_assign_fallback(
-    _context: u64,
     _op: u32,
     _object: i64,
     _value: i64,
@@ -282,7 +253,6 @@ pub(super) extern "C" fn test_native_property_assign_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_object_clone_fallback(
-    _context: u64,
     _op: u32,
     object: i64,
     out: *mut i64,
@@ -298,7 +268,6 @@ pub(super) extern "C" fn test_native_object_clone_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_object_clone_with_fallback(
-    _context: u64,
     _op: u32,
     object: i64,
     _replacements: i64,
@@ -313,7 +282,6 @@ pub(super) extern "C" fn test_native_object_clone_with_fallback(
 }
 
 pub(super) extern "C" fn test_native_array_insert_fallback(
-    _context: u64,
     _op: u32,
     _array: i64,
     _key: i64,
@@ -324,7 +292,6 @@ pub(super) extern "C" fn test_native_array_insert_fallback(
 }
 
 pub(super) extern "C" fn test_native_array_fetch_fallback(
-    _context: u64,
     _op: u32,
     _array: i64,
     _key: i64,
@@ -334,7 +301,6 @@ pub(super) extern "C" fn test_native_array_fetch_fallback(
 }
 
 pub(super) extern "C" fn test_native_array_unset_fallback(
-    _context: u64,
     _op: u32,
     _array: i64,
     _key: i64,
@@ -344,7 +310,6 @@ pub(super) extern "C" fn test_native_array_unset_fallback(
 }
 
 pub(super) extern "C" fn test_native_array_spread_fallback(
-    _context: u64,
     _op: u32,
     _array: i64,
     _source: i64,
@@ -354,7 +319,6 @@ pub(super) extern "C" fn test_native_array_spread_fallback(
 }
 
 pub(super) extern "C" fn test_native_foreach_init_fallback(
-    _context: u64,
     _op: u32,
     _source: i64,
     _function: i64,
@@ -365,7 +329,6 @@ pub(super) extern "C" fn test_native_foreach_init_fallback(
 }
 
 pub(super) extern "C" fn test_native_foreach_next_fallback(
-    _context: u64,
     _iterator: i64,
     _key_out: *mut i64,
     _value_out: *mut i64,
@@ -374,15 +337,11 @@ pub(super) extern "C" fn test_native_foreach_next_fallback(
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
-pub(super) extern "C" fn test_native_foreach_cleanup_fallback(
-    _context: u64,
-    _iterator: i64,
-) -> i32 {
+pub(super) extern "C" fn test_native_foreach_cleanup_fallback(_iterator: i64) -> i32 {
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
 pub(super) extern "C" fn test_native_constant_fetch_fallback(
-    _context: u64,
     _op: u32,
     _function: i64,
     _instruction: i64,
@@ -393,11 +352,7 @@ pub(super) extern "C" fn test_native_constant_fetch_fallback(
 
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
-pub(super) extern "C" fn test_native_truthy_fallback(
-    _context: u64,
-    src: i64,
-    out: *mut i64,
-) -> i32 {
+pub(super) extern "C" fn test_native_truthy_fallback(src: i64, out: *mut i64) -> i32 {
     if out.is_null() {
         return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
@@ -406,10 +361,7 @@ pub(super) extern "C" fn test_native_truthy_fallback(
     0
 }
 
-// SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
-#[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_type_predicate_fallback(
-    _context: u64,
     _op: u32,
     _src: i64,
     out: *mut i64,
@@ -418,16 +370,13 @@ pub(super) extern "C" fn test_native_type_predicate_fallback(
         return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
     // SAFETY: Cranelift owns this synchronous stack output slot.
-    unsafe {
-        out.write(crate::jit_encode_constant(crate::JIT_VALUE_FALSE));
-    }
+    unsafe { out.write(crate::jit_encode_constant(crate::JIT_VALUE_FALSE)) };
     0
 }
 
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_stable_length_fallback(
-    _context: u64,
     _op: u32,
     _value: i64,
     _function: i64,
@@ -438,13 +387,12 @@ pub(super) extern "C" fn test_native_stable_length_fallback(
 }
 
 pub(super) extern "C" fn test_native_runtime_fatal_fallback(
-    _context: u64,
     _function: u32,
     _instruction: u32,
 ) -> i32 {
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
-pub(super) extern "C" fn test_native_execution_poll_fallback(_context: u64) -> i32 {
+pub(super) extern "C" fn test_native_execution_poll_fallback() -> i32 {
     0
 }

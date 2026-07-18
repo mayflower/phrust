@@ -2,7 +2,8 @@
 
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
-pub(crate) const BASELINE_FUNCTION_SPECIALIZATION: &str = "executable-region-v2";
+pub(crate) const BASELINE_FUNCTION_SPECIALIZATION: &str = "streaming-baseline-v7-borrowed-locals";
+pub(crate) const OPTIMIZING_FUNCTION_SPECIALIZATION: &str = "ssa-optimizing-v1";
 
 /// Constructs the exact symbolic publication key used by declaration and
 /// machine-code publication.
@@ -26,7 +27,12 @@ pub fn native_function_key(
         } else {
             "baseline".to_owned()
         },
-        version: BASELINE_FUNCTION_SPECIALIZATION.to_owned(),
+        version: if optimizing {
+            OPTIMIZING_FUNCTION_SPECIALIZATION
+        } else {
+            BASELINE_FUNCTION_SPECIALIZATION
+        }
+        .to_owned(),
         invalidation_generation,
     }
 }

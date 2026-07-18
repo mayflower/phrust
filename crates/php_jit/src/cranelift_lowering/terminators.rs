@@ -4,8 +4,8 @@ use super::*;
 fn lower_region_condition(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    locals: &BTreeMap<LocalId, Variable>,
-    registers: &BTreeMap<RegId, Variable>,
+    locals: &NativeLocalMap,
+    registers: &NativeRegisterMap,
     native_operations: NativeOperationFunctions,
     _result_out: ir::Value,
     condition: RegionOperand,
@@ -39,45 +39,55 @@ fn lower_region_condition(
     }
 }
 
-/// Unknown values still have a stable native slot encoding. Handle the exact
-/// null/bool/int lanes directly and enter the typed PHP slow path only for a
-/// runtime handle or a non-reserved constant-pool handle.
+/// Resolve the stable null/bool/int lanes without crossing the runtime ABI.
+/// Runtime handles and opaque constant-pool handles retain the typed helper
+/// slow path.
 pub(super) fn lower_guarded_unknown_condition(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     helper: NativeHelper,
     value: ir::Value,
 ) -> Result<ir::Value, CraneliftLoweringError> {
-    let classify = builder.create_block();
-    let reserved = builder.create_block();
-    let integer = builder.create_block();
+    if !helper.inline_runtime_view {
+        let slot =
+            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let out = builder
+            .ins()
+            .stack_addr(module.target_config().pointer_type(), slot, 0);
+        let call = call_native_helper(module, builder, helper, &[value, out]);
+        require_native_operation_ok(
+            builder,
+            builder.inst_results(call)[0],
+            helper.terminal_exit()?,
+        )?;
+        let truthy = builder.ins().stack_load(types::I64, slot, 0);
+        return Ok(builder.ins().icmp_imm(IntCC::NotEqual, truthy, 0));
+    }
     let slow = builder.create_block();
     let merge = builder.create_block();
-    builder.append_block_param(reserved, types::I8);
     builder.append_block_param(merge, types::I8);
 
-    let true_value = crate::jit_encode_constant(crate::JIT_VALUE_TRUE);
-    let false_value = crate::jit_encode_constant(crate::JIT_VALUE_FALSE);
-    let null_value = crate::jit_encode_constant(u32::MAX);
-    let uninitialized_value = crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED);
-    let is_true = builder.ins().icmp_imm(IntCC::Equal, value, true_value);
-    let is_false = builder.ins().icmp_imm(IntCC::Equal, value, false_value);
-    let is_null = builder.ins().icmp_imm(IntCC::Equal, value, null_value);
-    let is_uninitialized = builder
+    let is_true = builder.ins().icmp_imm(
+        IntCC::Equal,
+        value,
+        crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
+    );
+    let is_false = builder.ins().icmp_imm(
+        IntCC::Equal,
+        value,
+        crate::jit_encode_constant(crate::JIT_VALUE_FALSE),
+    );
+    let is_null = builder
         .ins()
-        .icmp_imm(IntCC::Equal, value, uninitialized_value);
+        .icmp_imm(IntCC::Equal, value, crate::jit_encode_constant(u32::MAX));
+    let is_uninitialized = builder.ins().icmp_imm(
+        IntCC::Equal,
+        value,
+        crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED),
+    );
     let is_false_lane = builder.ins().bor(is_false, is_null);
     let is_false_lane = builder.ins().bor(is_false_lane, is_uninitialized);
     let is_reserved = builder.ins().bor(is_true, is_false_lane);
-    builder
-        .ins()
-        .brif(is_reserved, reserved, &[is_true.into()], classify, &[]);
-
-    builder.switch_to_block(reserved);
-    let reserved_truthy = builder.block_params(reserved)[0];
-    builder.ins().jump(merge, &[reserved_truthy.into()]);
-
-    builder.switch_to_block(classify);
     let tag = builder
         .ins()
         .band_imm(value, crate::JIT_VALUE_TAG_MASK as i64);
@@ -88,12 +98,14 @@ pub(super) fn lower_guarded_unknown_condition(
         builder
             .ins()
             .icmp_imm(IntCC::Equal, tag, crate::JIT_VALUE_CONSTANT_TAG as i64);
-    let needs_slow_path = builder.ins().bor(is_runtime, is_constant);
-    builder.ins().brif(needs_slow_path, slow, &[], integer, &[]);
-
-    builder.switch_to_block(integer);
+    let is_not_reserved = builder.ins().icmp_imm(IntCC::Equal, is_reserved, 0);
+    let is_opaque_constant = builder.ins().band(is_constant, is_not_reserved);
+    let needs_slow_path = builder.ins().bor(is_runtime, is_opaque_constant);
     let integer_truthy = builder.ins().icmp_imm(IntCC::NotEqual, value, 0);
-    builder.ins().jump(merge, &[integer_truthy.into()]);
+    let direct_truthy = builder.ins().select(is_reserved, is_true, integer_truthy);
+    builder
+        .ins()
+        .brif(needs_slow_path, slow, &[], merge, &[direct_truthy.into()]);
 
     builder.switch_to_block(slow);
     let slot =
@@ -101,8 +113,7 @@ pub(super) fn lower_guarded_unknown_condition(
     let out = builder
         .ins()
         .stack_addr(module.target_config().pointer_type(), slot, 0);
-    let context = builder.ins().iconst(types::I64, 0);
-    let call = call_native_helper(module, builder, helper, &[context, value, out]);
+    let call = call_native_helper(module, builder, helper, &[value, out]);
     require_native_operation_ok(
         builder,
         builder.inst_results(call)[0],
@@ -120,8 +131,8 @@ pub(super) fn lower_guarded_unknown_condition(
 pub(super) fn lower_region_terminator(
     builder: &mut FunctionBuilder<'_>,
     blocks: &BTreeMap<BlockId, ir::Block>,
-    locals: &BTreeMap<LocalId, Variable>,
-    registers: &BTreeMap<RegId, Variable>,
+    locals: &NativeLocalMap,
+    registers: &NativeRegisterMap,
     result_out: ir::Value,
     pending_status: Variable,
     pending_value: Variable,
@@ -293,7 +304,7 @@ pub(super) fn lower_region_terminator(
 fn lower_region_frame_exit(
     builder: &mut FunctionBuilder<'_>,
     blocks: &BTreeMap<BlockId, ir::Block>,
-    locals: &BTreeMap<LocalId, Variable>,
+    locals: &NativeLocalMap,
     result_out: ir::Value,
     pending_status: Variable,
     pending_value: Variable,
@@ -330,19 +341,19 @@ fn lower_region_frame_exit(
 pub(super) fn lower_owned_frame_locals(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    locals: &BTreeMap<LocalId, Variable>,
+    locals: &NativeLocalMap,
     native_operations: NativeOperationFunctions,
     value_flow: &ExecutableValueFlow,
     function: FunctionId,
     result_out: ir::Value,
 ) -> Result<(), CraneliftLoweringError> {
-    for (local, variable) in locals {
+    for local in locals.keys() {
         let fact = value_flow.local_fact(*local);
         if value_flow.releases_local_at_frame_exit(*local)
             && fact.has_runtime_lifecycle()
             && fact.ownership == SsaOwnership::Owned
         {
-            let value = builder.use_var(*variable);
+            let value = use_local_variable(builder, locals, *local)?;
             let _ = lower_native_value_operation(
                 module,
                 builder,

@@ -121,9 +121,9 @@ def main() -> int:
                 "promoted array mutation can regress to local fetch/store helpers",
             ),
             (
-                "flow.verify_ownership(region)",
+                "verify_ownership(region)",
                 executable,
-                "optimizing code generation does not run the ownership verifier",
+                "native code generation does not run the ownership verifier",
             ),
             (
                 "ownership_verifier_rejects_use_after_forced_move",

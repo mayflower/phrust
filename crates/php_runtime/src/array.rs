@@ -1115,10 +1115,14 @@ impl ArrayStorage {
         crate::layout_stats::record_record_storage_array();
         crate::layout_stats::record_record_shape_promotion();
         let storage_id = self.storage_id();
+        let reserved_values = match self {
+            Self::Packed(storage) => storage.values.capacity(),
+            Self::Record(_) | Self::Mixed(_) => 0,
+        };
         *self = Self::Record(RecordArrayStorage {
             storage_id,
             shape: record_shape_for(&[], None),
-            values: Vec::new(),
+            values: Vec::with_capacity(reserved_values),
             next_append_key: self.next_append_key(),
             internal_pointer: self.internal_pointer(),
             mutation_epoch: self.mutation_epoch(),
@@ -1471,10 +1475,19 @@ impl PhpArray {
     /// Creates an empty array.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_capacity(0)
+    }
+
+    /// Creates an empty array with storage reserved for at least `capacity`
+    /// values. The reservation survives promotion to string-key record
+    /// storage, which avoids repeated reallocations when a caller knows the
+    /// final associative-array size.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
             storage: Rc::new(ArrayStorage::Packed(PackedArrayStorage {
                 storage_id: next_array_storage_id(),
-                values: Vec::new(),
+                values: Vec::with_capacity(capacity),
                 next_append_key: None,
                 internal_pointer: None,
                 mutation_epoch: 0,

@@ -98,6 +98,7 @@ help:
       '  just cranelift-native-transitions Verify native-to-native guard exits and OSR' \
       '  just cranelift-native-executor Verify the legacy executor is absent' \
       '  just cranelift-native-cache Verify restart-persistent PNA2 native artifacts' \
+      '  just native-fast-baseline-acceptance Aggregate Prompt A8 recovery evidence' \
       '  just cranelift-native-product Verify the single native product surface' \
       '  just cranelift-only-ratchet-fast Check native architecture with incremental cutover binaries' \
       '  just cranelift-only-ratchet Enforce the final no-exceptions native architecture' \
@@ -504,7 +505,7 @@ verify-stdlib:
 # Correctness-focused performance gates. Sub-gates share one engine build
 # through the perf-build dependency (deduplicated within this invocation).
 # Release-profile and report gates live in verify-performance-extended.
-verify-performance: native-linkage-ratchet wordpress-benchmark-self-test performance-tests performance-regression benchmark-smoke framework-smoke default-profile-smoke app-flow-smoke baseline-native-compile-smoke function-on-demand-gate cache-roundtrip optimizer-diff native-ssa-ratchet native-hotpath-ratchet reference-scalar-view reference-dimension-operand templates-smoke inline-cache-model-tests native-smoke object-release-root-scan safety-audit-smoke
+verify-performance: native-fast-baseline-ratchet native-linkage-ratchet wordpress-benchmark-self-test fast-baseline-acceptance-self-test performance-tests performance-regression benchmark-smoke framework-smoke default-profile-smoke app-flow-smoke baseline-native-compile-smoke function-on-demand-gate cache-roundtrip optimizer-diff native-ssa-ratchet native-hotpath-ratchet reference-scalar-view reference-dimension-operand templates-smoke inline-cache-model-tests native-smoke object-release-root-scan safety-audit-smoke
     @printf '%s\n' '[pass] performance verification complete'
 
 # Heavy release-profile and report gates, split out of verify-performance so
@@ -1523,6 +1524,55 @@ polymorphic-inline-cache-smoke:
 
 native-smoke:
     scripts/performance/native_smoke.sh
+
+native-baseline-cfg-ratchet *args:
+    scripts/verify/native_baseline_cfg_ratchet.py {{args}}
+
+native-fast-baseline-ratchet *args:
+    scripts/verify/native_fast_baseline_ratchet.py {{args}}
+    cargo test -p php_jit ordinary_instructions_do_not_create_resume_or_clif_entry_blocks
+    cargo test -p php_jit oversized_php_cfg_compiles_as_bounded_direct_native_fragments
+
+native-compile-breakthrough-baseline:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    wordpress_dir="${PHRUST_WORDPRESS_DIR:-target/wordpress-cutover}"
+    source_file="$wordpress_dir/wp-includes/class-wp-query.php"
+    if [[ ! -f "$source_file" ]]; then
+      printf '%s\n' "native compile breakthrough: missing WordPress input $source_file" >&2
+      exit 1
+    fi
+    cargo build --profile profiling -p php_vm_cli --bin php-vm
+    label="${PHRUST_BREAKTHROUGH_LABEL:-after}"
+    scripts/performance/native_compile_report.py \
+      --php-vm "${CARGO_TARGET_DIR:-target}/profiling/php-vm" \
+      --file "$source_file" \
+      --function 'WP_Query::get_posts' \
+      --out target/breakthrough/fast-baseline \
+      --label "$label" \
+      --max-ms 500 \
+      --max-rss-delta-mib 200 \
+      --max-code-bytes 1048576
+    scripts/performance/native_compile_distribution.py \
+      --php-vm "${CARGO_TARGET_DIR:-target}/profiling/php-vm" \
+      --file "$source_file" \
+      --out target/breakthrough/fast-baseline \
+      --function 'WP_Query::init' \
+      --function 'WP_Query::set' \
+      --function 'WP_Query::get' \
+      --function 'WP_Query::rewind_posts' \
+      --function 'WP_Query::have_posts' \
+      --function 'WP_Query::is_archive' \
+      --function 'WP_Query::is_attachment' \
+      --function 'WP_Query::is_comments_popup'
+    scripts/verify/native_fast_baseline_ratchet.py \
+      --report target/breakthrough/fast-baseline/after.json
+
+fast-baseline-acceptance-self-test:
+    scripts/performance/fast_baseline_acceptance.py --self-test
+
+native-fast-baseline-acceptance *args:
+    scripts/performance/fast_baseline_acceptance.py {{args}}
 
 object-release-root-scan:
     scripts/performance/object_release_root_scan.sh

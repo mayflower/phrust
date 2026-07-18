@@ -6,7 +6,7 @@ pub use php_runtime::api::JitHelperId;
 
 /// Stable ABI fingerprint for the helper-symbol registry. Bumped whenever the
 /// registry's symbol set or any helper ABI changes.
-pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4920_0000_000e;
+pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4820_0000_000e;
 
 /// Helper argument kind.
 #[repr(u32)]
@@ -57,8 +57,7 @@ pub struct JitHelperSymbol {
     pub description: &'static str,
 }
 
-const CONTEXT_VALUE_ARGS: &[JitHelperArgKind] =
-    &[JitHelperArgKind::VmContext, JitHelperArgKind::Value];
+const CONTEXT_VALUE_ARGS: &[JitHelperArgKind] = &[JitHelperArgKind::Value];
 const NATIVE_CONTEXT_POINTERS_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::VmContext,
     JitHelperArgKind::U64,
@@ -71,26 +70,19 @@ const NATIVE_FRAME_ALLOC_ARGS: &[JitHelperArgKind] = &[
 ];
 const NATIVE_FRAME_RELEASE_ARGS: &[JitHelperArgKind] =
     &[JitHelperArgKind::VmContext, JitHelperArgKind::U64];
-const NATIVE_OP_0_ARGS: &[JitHelperArgKind] = &[
-    JitHelperArgKind::VmContext,
-    JitHelperArgKind::I64,
-    JitHelperArgKind::U64,
-];
+const NATIVE_OP_0_ARGS: &[JitHelperArgKind] = &[JitHelperArgKind::I64, JitHelperArgKind::U64];
 const NATIVE_OP_1_ARGS: &[JitHelperArgKind] = &[
-    JitHelperArgKind::VmContext,
     JitHelperArgKind::I64,
     JitHelperArgKind::Value,
     JitHelperArgKind::U64,
 ];
 const NATIVE_OP_2_ARGS: &[JitHelperArgKind] = &[
-    JitHelperArgKind::VmContext,
     JitHelperArgKind::I64,
     JitHelperArgKind::Value,
     JitHelperArgKind::Value,
     JitHelperArgKind::U64,
 ];
 const NATIVE_OP_3_ARGS: &[JitHelperArgKind] = &[
-    JitHelperArgKind::VmContext,
     JitHelperArgKind::I64,
     JitHelperArgKind::Value,
     JitHelperArgKind::Value,
@@ -98,7 +90,6 @@ const NATIVE_OP_3_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::U64,
 ];
 const NATIVE_OP_4_ARGS: &[JitHelperArgKind] = &[
-    JitHelperArgKind::VmContext,
     JitHelperArgKind::I64,
     JitHelperArgKind::Value,
     JitHelperArgKind::Value,
@@ -107,7 +98,6 @@ const NATIVE_OP_4_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::U64,
 ];
 const NATIVE_OP_5_ARGS: &[JitHelperArgKind] = &[
-    JitHelperArgKind::VmContext,
     JitHelperArgKind::I64,
     JitHelperArgKind::Value,
     JitHelperArgKind::Value,
@@ -116,13 +106,9 @@ const NATIVE_OP_5_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::Value,
     JitHelperArgKind::U64,
 ];
-const NATIVE_CONTEXT_VALUE_OUT_ARGS: &[JitHelperArgKind] = &[
-    JitHelperArgKind::VmContext,
-    JitHelperArgKind::Value,
-    JitHelperArgKind::U64,
-];
+const NATIVE_CONTEXT_VALUE_OUT_ARGS: &[JitHelperArgKind] =
+    &[JitHelperArgKind::Value, JitHelperArgKind::U64];
 const NATIVE_CONTEXT_VALUE_OUT_3_ARGS: &[JitHelperArgKind] = &[
-    JitHelperArgKind::VmContext,
     JitHelperArgKind::Value,
     JitHelperArgKind::U64,
     JitHelperArgKind::U64,
@@ -386,11 +372,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
     JitHelperSymbol {
         id: JitHelperId(42),
         name: "phrust_native_runtime_fatal",
-        args: &[
-            JitHelperArgKind::VmContext,
-            JitHelperArgKind::I64,
-            JitHelperArgKind::I64,
-        ],
+        args: &[JitHelperArgKind::I64, JitHelperArgKind::I64],
         returns: JitHelperReturnKind::Status,
         can_throw: false,
         has_side_effects: true,
@@ -399,7 +381,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
     JitHelperSymbol {
         id: JitHelperId(43),
         name: "phrust_native_execution_poll",
-        args: &[JitHelperArgKind::VmContext],
+        args: &[],
         returns: JitHelperReturnKind::Status,
         can_throw: true,
         has_side_effects: true,
@@ -446,9 +428,9 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         name: "phrust_native_type_predicate",
         args: NATIVE_OP_1_ARGS,
         returns: JitHelperReturnKind::Status,
-        can_throw: true,
+        can_throw: false,
         has_side_effects: false,
-        description: "stable PHP builtin type predicate slow path",
+        description: "direct PHP type predicate",
     },
     JitHelperSymbol {
         id: JitHelperId(49),

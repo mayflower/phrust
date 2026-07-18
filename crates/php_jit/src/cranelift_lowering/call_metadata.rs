@@ -83,11 +83,13 @@ pub(super) fn stable_builtin_type_predicate(target: &RegionCallTarget) -> Option
     match normalized.as_str() {
         "is_null" => Some(0),
         "is_bool" => Some(1),
+        "is_int" | "is_integer" | "is_long" => Some(2),
         "is_float" | "is_double" | "is_real" => Some(3),
         "is_string" => Some(4),
         "is_array" => Some(5),
         "is_object" => Some(6),
         "is_resource" => Some(7),
+        "is_scalar" => Some(8),
         _ => None,
     }
 }

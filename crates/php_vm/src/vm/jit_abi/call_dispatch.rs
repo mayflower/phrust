@@ -202,7 +202,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 )
             }
         };
-        let mut callsite_descriptor = None;
+        let mut callsite_span = None;
         let outcome = with_native_context(|context| {
             let descriptor =
                 context.prepared_native_callsite(frame.function_id, frame.continuation_id);
@@ -212,7 +212,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                     frame.function_id, frame.source_block_id, frame.source_instruction_id,
                 ));
             };
-            callsite_descriptor = Some(std::sync::Arc::clone(&descriptor));
+            callsite_span = Some(descriptor.span);
             let instruction = descriptor.semantic_instruction();
             if descriptor.function_id != frame.function_id
                 || descriptor.continuation_id != frame.continuation_id
@@ -238,92 +238,47 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 frame.flags & php_jit::JitNativeCallFrame::FLAG_DIRECT_BUILTIN != 0;
             let direct_external =
                 frame.flags & php_jit::JitNativeCallFrame::FLAG_DIRECT_EXTERNAL != 0;
-            let semantic_operation = semantic_operation_from_frame(frame)?;
-            if semantic_operation == Some(php_jit::region_ir::RegionSemanticOperationId::BindGlobal)
-            {
-                let helper_id = "semantic_bind_global";
-                let started_at = context
-                    .options
-                    .collect_counters
-                    .then(std::time::Instant::now);
-                if context.options.collect_counters {
-                    let mut telemetry = context.runtime_telemetry.borrow_mut();
-                    telemetry.counters.native_callsite_total =
-                        telemetry.counters.native_callsite_total.saturating_add(1);
-                    telemetry.counters.native_call_frame_bytes = telemetry
-                        .counters
-                        .native_call_frame_bytes
-                        .saturating_add(std::mem::size_of::<php_jit::JitNativeCallFrame>() as u64);
-                    drop(telemetry);
-                    context.enter_runtime_helper(helper_id);
-                }
-                let outcome = execute_native_bind_global(context, instruction).unwrap_or_else(|| {
-                    Err(format!(
-                        "JIT_NATIVE_SEMANTIC_SOURCE_MISMATCH: operation={} function={} instruction={}",
-                        php_jit::region_ir::RegionSemanticOperationId::BindGlobal.raw(),
-                        frame.function_id,
-                        instruction.id.raw()
-                    ))
-                });
-                if context.options.collect_counters {
-                    let inclusive_nanos = started_at
-                        .map(|started_at| {
-                            started_at.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
-                        })
-                        .unwrap_or(0);
-                    context.record_native_callsite_timing(
-                        frame.function_id,
-                        frame.source_block_id,
-                        frame.source_instruction_id,
-                        inclusive_nanos,
-                        context.active_helper_child_time_nanos(),
-                    );
-                    context.exit_runtime_helper(helper_id);
-                }
-                return outcome;
-            }
-            let direct_external_in_place = matches!(
-                descriptor.kind,
-                crate::compiled_unit::NativeCallSiteKind::Function
-            ) && descriptor
-                .target_symbol
-                .as_deref()
-                .and_then(|name| context.external_function(name))
-                .is_some_and(|target| context.can_invoke_external_in_place(target));
+            let semantic_operation = if direct_builtin {
+                None
+            } else {
+                semantic_operation_from_frame(frame)?
+            };
+            let direct_external_in_place = !direct_builtin
+                && matches!(
+                    descriptor.kind,
+                    crate::compiled_unit::NativeCallSiteKind::Function
+                )
+                && descriptor
+                    .target_symbol
+                    .as_deref()
+                    .and_then(|name| context.external_function(name))
+                    .is_some_and(|target| context.can_invoke_external_in_place(target));
             let mut encoded = std::mem::take(&mut context.native_call_encoded_scratch);
-            let mut local_values = std::mem::take(&mut context.native_call_local_scratch);
             let encoded_capacity_before = encoded.capacity();
-            let local_capacity_before = local_values.capacity();
             encoded.clear();
             encoded.extend(
                 arguments
                     .iter()
                     .map(|argument| argument.value.payload as i64),
             );
-            local_values.clear();
-            if frame.local_count != 0 {
+            let empty_local_values = [];
+            let local_values: &[php_jit::JitAbiSlot] = if frame.local_count == 0 {
+                &empty_local_values
+            } else {
                 // SAFETY: ABI validation above proves a non-null caller-owned
-                // local table with `local_count` live entries.
-                local_values.extend(
-                    unsafe {
-                        std::slice::from_raw_parts(
-                            frame.local_slots as *const php_jit::JitAbiSlot,
-                            frame.local_count as usize,
-                        )
-                    }
-                    .iter()
-                    .map(|slot| slot.payload as i64),
-                );
-            }
+                // local table with `local_count` live entries. The generated
+                // caller stays suspended for this synchronous dispatch.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        frame.local_slots as *const php_jit::JitAbiSlot,
+                        frame.local_count as usize,
+                    )
+                }
+            };
             if context.options.collect_counters {
                 let allocated_bytes = encoded
                     .capacity()
                     .saturating_sub(encoded_capacity_before)
-                    .saturating_add(
-                        local_values
-                            .capacity()
-                            .saturating_sub(local_capacity_before),
-                    )
                     .saturating_mul(std::mem::size_of::<i64>());
                 let mut telemetry = context.runtime_telemetry.borrow_mut();
                 if direct_builtin {
@@ -355,7 +310,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                         .counters
                         .native_cross_unit_direct_eligible
                         .saturating_add(1);
-                } else if semantic_operation.is_none() {
+                } else {
                     telemetry.counters.native_call_dynamic =
                         telemetry.counters.native_call_dynamic.saturating_add(1);
                 }
@@ -371,7 +326,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                             + std::mem::size_of_val(arguments)) as u64,
                     );
                 drop(telemetry);
-                if !direct_builtin && !direct_external_in_place && semantic_operation.is_none() {
+                if !direct_builtin && !direct_external_in_place {
                     let dynamic_reason =
                         native_dynamic_call_reason(context, frame, &descriptor, arguments);
                     let mut telemetry = context.runtime_telemetry.borrow_mut();
@@ -379,45 +334,6 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                         .counters
                         .native_call_dynamic_by_reason
                         .entry(dynamic_reason.to_owned())
-                        .or_default();
-                    *count = count.saturating_add(1);
-                    let target = descriptor.target_symbol.as_ref().map_or_else(
-                        || match (descriptor.kind, semantic_operation) {
-                            (
-                                crate::compiled_unit::NativeCallSiteKind::Semantic,
-                                Some(operation),
-                            ) => {
-                                format!("<semantic:{operation:?}>")
-                            }
-                            (crate::compiled_unit::NativeCallSiteKind::Closure, _) => {
-                                "<closure>".to_owned()
-                            }
-                            (crate::compiled_unit::NativeCallSiteKind::Callable, _) => {
-                                "<callable>".to_owned()
-                            }
-                            (crate::compiled_unit::NativeCallSiteKind::Pipe, _) => {
-                                "<pipe>".to_owned()
-                            }
-                            (crate::compiled_unit::NativeCallSiteKind::DynamicConstructor, _) => {
-                                "<dynamic-constructor>".to_owned()
-                            }
-                            (crate::compiled_unit::NativeCallSiteKind::Semantic, _) => {
-                                "<semantic:unknown>".to_owned()
-                            }
-                            (crate::compiled_unit::NativeCallSiteKind::Function, _)
-                            | (crate::compiled_unit::NativeCallSiteKind::Method, _)
-                            | (crate::compiled_unit::NativeCallSiteKind::StaticMethod, _)
-                            | (crate::compiled_unit::NativeCallSiteKind::Constructor, _) => {
-                                "<unknown>".to_owned()
-                            }
-                        },
-                        |target| target.to_string(),
-                    );
-                    let target = target.to_ascii_lowercase();
-                    let count = telemetry
-                        .counters
-                        .native_call_dynamic_by_target
-                        .entry(target)
                         .or_default();
                     *count = count.saturating_add(1);
                 }
@@ -429,7 +345,6 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
             } else {
                 call_dispatch_helper_id(&descriptor)
             };
-            let instruction_kind = format!("{:?}", instruction.kind);
             if context.options.collect_counters {
                 context.enter_runtime_helper(helper_id);
             }
@@ -437,7 +352,6 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 .options
                 .collect_counters
                 .then(std::time::Instant::now);
-            let mut observed_builtin_name = None;
             let outcome = (|| {
             let completed_nested_fiber_matches = context
                 .completed_nested_fiber_call
@@ -449,6 +363,31 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 && let Some((_, _, value)) = context.completed_nested_fiber_call.take()
             {
                 return Ok(value);
+            }
+            if direct_builtin {
+                let entry = descriptor
+                    .direct_builtin
+                    .filter(|builtin| builtin.entry.helper_id() == frame.target.function_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "E_PHP_VM_UNRESOLVED_CALLABLE: builtin helper {} is not published",
+                            frame.target.function_id
+                        )
+                    })?;
+                let expanded = bind_native_builtin_arguments(
+                    context,
+                    entry.entry.name(),
+                    &encoded,
+                    Some(descriptor.arguments.as_ref()),
+                )?;
+                return execute_native_builtin(
+                    context,
+                    entry.entry.name(),
+                    &expanded,
+                    instruction,
+                    Some((frame.function_id, local_values)),
+                    Some(entry),
+                );
             }
             if let Some(operation) = semantic_operation {
                 return execute_native_semantic_operation(
@@ -604,13 +543,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                     frame.function_id,
                 )?;
                 let normalized = normalize_class_name(&display_class_name);
-                if let Some(class) = context
-                    .unit
-                    .classes
-                    .iter()
-                    .find(|class| class.name == normalized)
-                    .cloned()
-                {
+                if let Some(class) = native_active_class_handle(context, &normalized) {
                     let mut parent = class.parent.clone();
                     let mut throwable_parent = false;
                     let mut visited = std::collections::BTreeSet::new();
@@ -670,11 +603,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                         &class,
                         instruction,
                     )?;
-                    let runtime_class = native_runtime_class(context, &class)?;
-                    let object = php_runtime::api::ObjectRef::new_with_display_name(
-                        &runtime_class,
-                        class.display_name,
-                    );
+                    let object = new_native_object(context, None, &class)?;
                     return context.encode(Value::Object(object));
                 }
                 if !native_external_class_exists(context, &display_class_name)
@@ -697,18 +626,16 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                     }
                     context.autoload_in_progress.remove(&normalized);
                 }
-                if let Some(parent) = native_external_class_ref(context, &display_class_name)
-                    .and_then(|(_, class)| {
-                        class
-                            .parent_display_name
-                            .as_ref()
-                            .or(class.parent.as_ref())
-                            .cloned()
-                    })
+                if let Some((_, class)) =
+                    native_external_class_handle(context, &display_class_name)
                 {
+                    if let Some(parent) = class
+                        .parent_display_name
+                        .clone()
+                        .or_else(|| class.parent.clone())
+                    {
                         native_autoload_class(context, &parent, instruction)?;
-                }
-                if native_external_class_exists(context, &display_class_name) {
+                    }
                     return create_native_external_object(
                         context,
                         &display_class_name,
@@ -1599,28 +1526,13 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                     "E_PHP_VM_UNRESOLVED_CALLABLE: published cross-unit target {name} is unavailable"
                 ));
             }
-            let direct_builtin_entry = direct_builtin
-                .then(|| {
-                    php_runtime::api::BuiltinRegistry::new()
-                        .get_by_helper_id(frame.target.function_id)
-                        .ok_or_else(|| {
-                            format!(
-                                "E_PHP_VM_UNRESOLVED_CALLABLE: builtin helper {} is not published",
-                                frame.target.function_id
-                            )
-                        })
-                })
-                .transpose()?;
-            let builtin_name = if let Some(entry) = direct_builtin_entry {
-                entry.name()
-            } else if php_std::arginfo::function_metadata_indexed(name.as_ref()).is_some() {
+            let builtin_name = if php_std::arginfo::function_metadata_indexed(name.as_ref())
+                .is_some()
+            {
                 name.as_ref()
             } else {
                 name.rsplit('\\').next().unwrap_or(name.as_ref())
             };
-            if direct_builtin {
-                observed_builtin_name = Some(builtin_name.to_owned());
-            }
             let expanded =
                 bind_native_builtin_arguments(context, builtin_name, &encoded, metadata)?;
             execute_native_builtin(
@@ -1628,12 +1540,13 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 builtin_name,
                 &expanded,
                 instruction,
-                Some((frame.function_id, &local_values)),
+                Some((frame.function_id, local_values)),
+                None,
             )
             })()
             .map_err(|message| {
                 if message.starts_with("native runtime value ") {
-                    format!("{message} while executing {instruction_kind}")
+                    format!("{message} while executing {:?}", instruction.kind)
                 } else {
                     message
                 }
@@ -1651,27 +1564,10 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                     inclusive_nanos,
                     context.active_helper_child_time_nanos(),
                 );
-                if let Some(name) = observed_builtin_name.as_deref() {
-                    let mut telemetry = context.runtime_telemetry.borrow_mut();
-                    let calls = telemetry
-                        .counters
-                        .native_builtin_calls_by_name
-                        .entry(name.to_owned())
-                        .or_default();
-                    *calls = calls.saturating_add(1);
-                    let nanos = telemetry
-                        .counters
-                        .native_builtin_time_nanos_by_name
-                        .entry(name.to_owned())
-                        .or_default();
-                    *nanos = nanos.saturating_add(inclusive_nanos);
-                }
                 context.exit_runtime_helper(helper_id);
             }
             encoded.clear();
-            local_values.clear();
             context.native_call_encoded_scratch = encoded;
-            context.native_call_local_scratch = local_values;
             outcome
         });
         match outcome {
@@ -1684,7 +1580,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 (status.0 as i32, status, Some(value))
             }
             Some(Err(message)) if message == "E_PHP_RETHROW" => {
-                let source_span = callsite_descriptor.as_ref().map(|source| source.span);
+                let source_span = callsite_span;
                 let value = with_native_context(|context| {
                     let mut throwable = context.take_pending_throwable()?;
                     if let Some(source_span) = source_span {
@@ -1703,18 +1599,18 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
             Some(Err(message)) if message.starts_with("E_PHP_THROW:") => {
                 let payload = message.trim_start_matches("E_PHP_THROW:");
                 let (class, message) = payload.split_once(':').unwrap_or(("Error", payload));
-                let source_span = callsite_descriptor.as_ref().map(|source| source.span);
+                let source_span = callsite_span;
                 let value = with_native_context(|context| {
                     let target = (frame.target.function_id != u32::MAX)
                         .then(|| php_ir::FunctionId::new(frame.target.function_id))
                         .and_then(|function| context.unit.functions.get(function.index()))
-                        .cloned();
+                        .map(|function| (function.span, function.name.clone()));
                     if class.eq_ignore_ascii_case("TypeError")
                         && message.contains("Argument #")
-                        && let Some(target) = target
+                        && let Some((target_span, target_name)) = target
                     {
                         let encoded =
-                            encode_native_throwable_at(context, class, message, target.span)
+                            encode_native_throwable_at(context, class, message, target_span)
                                 .ok()?;
                         let throwable = context.decode(encoded).ok()?;
                         let arguments = arguments
@@ -1723,7 +1619,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                             .collect::<Result<Vec<_>, _>>()
                             .ok()?;
                         let mut throwable =
-                            native_throwable_with_frame(throwable, &target.name, arguments);
+                            native_throwable_with_frame(throwable, &target_name, arguments);
                         if let Some(source_span) = source_span {
                             throwable =
                                 native_throwable_with_call_source(context, throwable, source_span);

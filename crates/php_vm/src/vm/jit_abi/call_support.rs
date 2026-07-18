@@ -71,27 +71,25 @@ pub(super) fn invoke_native_function_with_metadata_strict(
     metadata: Option<&[php_ir::instruction::IrCallArg]>,
     strict: bool,
 ) -> Result<i64, String> {
-    let target = context
-        .unit
-        .functions
-        .get(function.index())
-        .cloned()
-        .ok_or_else(|| format!("native function {} is missing", function.raw()))?;
-    let _depth_guard = enter_native_call(&target.name)?;
-    let instance_method = context.unit.classes.iter().find_map(|class| {
-        class
-            .methods
-            .iter()
-            .find(|method| method.function == function)
-            .map(|method| !method.flags.is_static)
-    });
-    let leading = target.captures.len()
-        + usize::from(instance_method.unwrap_or(false))
-        + usize::from(native_function_has_implicit_closure_this(&target));
+    let target_metadata = context
+        .compiled
+        .prepared_native_function_metadata(function)
+        .ok_or_else(|| {
+            format!(
+                "native function {} has no prepared metadata",
+                function.raw()
+            )
+        })?;
+    let target_name = Arc::clone(&target_metadata.name);
+    let target_params = Arc::clone(&target_metadata.params);
+    let _depth_guard = enter_native_call(&target_name)?;
+    let leading = target_metadata.capture_count
+        + usize::from(target_metadata.instance_method)
+        + usize::from(target_metadata.implicit_closure_this);
     if arguments.len() < leading {
         return Err(format!(
             "{}() is missing its native receiver/capture arguments",
-            target.name
+            target_name
         ));
     }
     // The callee frame owns its implicit receiver and captured locals just as
@@ -109,73 +107,53 @@ pub(super) fn invoke_native_function_with_metadata_strict(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let raw_supplied = &arguments[leading..];
-    let mut supplied = Vec::<(Option<String>, i64)>::new();
-    if let Some(metadata) = metadata {
-        for (argument, value) in metadata.iter().zip(raw_supplied) {
-            if argument.unpack {
-                let Value::Array(array) = context.decode(*value)? else {
-                    return Err("Only arrays and Traversables can be unpacked".to_owned());
-                };
-                supplied.extend(
-                    array
-                        .iter()
-                        .map(|(key, value)| {
-                            let name = match key {
-                                php_runtime::api::ArrayKey::Int(_) => None,
-                                php_runtime::api::ArrayKey::String(name) => {
-                                    Some(name.to_string_lossy())
-                                }
-                            };
-                            context.encode(value.clone()).map(|value| (name, value))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                );
-            } else {
-                supplied.push((argument.name.clone(), *value));
-            }
-        }
-    } else {
-        supplied.extend(raw_supplied.iter().copied().map(|value| (None, value)));
-    }
-    let variadic_index = target
-        .params
+    let variadic_index = target_params
         .iter()
         .position(|parameter| parameter.variadic);
-    let fixed_count = variadic_index.unwrap_or(target.params.len());
+    let fixed_count = variadic_index.unwrap_or(target_params.len());
+    let positional_only = metadata.is_none_or(|arguments| {
+        arguments.len() == raw_supplied.len()
+            && arguments
+                .iter()
+                .all(|argument| argument.name.is_none() && !argument.unpack)
+    });
+    if positional_only
+        && variadic_index.is_none()
+        && raw_supplied.len() >= fixed_count
+        && target_params
+            .iter()
+            .all(|parameter| !parameter.by_ref && parameter.type_.is_none())
+        && raw_supplied[..fixed_count]
+            .iter()
+            .all(|argument| context.php_handle_is_reference(*argument) == Some(false))
+    {
+        bound.extend_from_slice(&raw_supplied[..fixed_count]);
+        let visible_arguments = raw_supplied
+            .iter()
+            .copied()
+            .collect::<request_state::NativeTraceArguments>();
+        let root_arguments = raw_supplied
+            .iter()
+            .map(|value| context.decode(*value))
+            .collect::<Result<Vec<_>, _>>()?;
+        context.push_call_arguments(root_arguments);
+        let result = invoke_native_method_with_prepared_trace_arguments(
+            context,
+            function,
+            &bound,
+            Some(visible_arguments),
+            Some(target_metadata),
+        );
+        context.pop_call_arguments();
+        return result;
+    }
     let mut assigned = vec![None; fixed_count];
     let mut variadic = php_runtime::api::PhpArray::new();
     let mut visible_extra = Vec::new();
     let mut positional = 0usize;
     let mut saw_named = false;
-    for (name, value) in &supplied {
-        if let Some(name) = name {
-            saw_named = true;
-            if let Some(index) = target.params[..fixed_count]
-                .iter()
-                .position(|parameter| parameter.name.eq_ignore_ascii_case(name))
-            {
-                if assigned[index].replace(*value).is_some() {
-                    return Err(format!(
-                        "Named parameter ${name} overwrites previous argument"
-                    ));
-                }
-            } else if variadic_index.is_some() {
-                variadic.insert(
-                    php_runtime::api::ArrayKey::String(PhpString::from_bytes(
-                        name.as_bytes().to_vec(),
-                    )),
-                    context.decode(*value)?,
-                );
-            } else {
-                return Err(format!("E_PHP_THROW:Error:Unknown named parameter ${name}"));
-            }
-        } else {
-            if saw_named {
-                return Err("Cannot use positional argument after named argument".to_owned());
-            }
-            while positional < fixed_count && assigned[positional].is_some() {
-                positional += 1;
-            }
+    if positional_only {
+        for value in raw_supplied {
             if positional < fixed_count {
                 assigned[positional] = Some(*value);
                 positional += 1;
@@ -186,8 +164,75 @@ pub(super) fn invoke_native_function_with_metadata_strict(
                 visible_extra.push(*value);
             }
         }
+    } else {
+        let mut supplied = Vec::<(Option<String>, i64)>::new();
+        if let Some(metadata) = metadata {
+            for (argument, value) in metadata.iter().zip(raw_supplied) {
+                if argument.unpack {
+                    let Value::Array(array) = context.decode(*value)? else {
+                        return Err("Only arrays and Traversables can be unpacked".to_owned());
+                    };
+                    supplied.extend(
+                        array
+                            .iter()
+                            .map(|(key, value)| {
+                                let name = match key {
+                                    php_runtime::api::ArrayKey::Int(_) => None,
+                                    php_runtime::api::ArrayKey::String(name) => {
+                                        Some(name.to_string_lossy())
+                                    }
+                                };
+                                context.encode(value.clone()).map(|value| (name, value))
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    );
+                } else {
+                    supplied.push((argument.name.clone(), *value));
+                }
+            }
+        }
+        for (name, value) in &supplied {
+            if let Some(name) = name {
+                saw_named = true;
+                if let Some(index) = target_params[..fixed_count]
+                    .iter()
+                    .position(|parameter| parameter.name.eq_ignore_ascii_case(name))
+                {
+                    if assigned[index].replace(*value).is_some() {
+                        return Err(format!(
+                            "Named parameter ${name} overwrites previous argument"
+                        ));
+                    }
+                } else if variadic_index.is_some() {
+                    variadic.insert(
+                        php_runtime::api::ArrayKey::String(PhpString::from_bytes(
+                            name.as_bytes().to_vec(),
+                        )),
+                        context.decode(*value)?,
+                    );
+                } else {
+                    return Err(format!("E_PHP_THROW:Error:Unknown named parameter ${name}"));
+                }
+            } else {
+                if saw_named {
+                    return Err("Cannot use positional argument after named argument".to_owned());
+                }
+                while positional < fixed_count && assigned[positional].is_some() {
+                    positional += 1;
+                }
+                if positional < fixed_count {
+                    assigned[positional] = Some(*value);
+                    positional += 1;
+                } else if variadic_index.is_some() {
+                    variadic.append(context.decode(*value)?);
+                    visible_extra.push(*value);
+                } else {
+                    visible_extra.push(*value);
+                }
+            }
+        }
     }
-    for (index, parameter) in target.params.iter().enumerate() {
+    for (index, parameter) in target_params.iter().enumerate() {
         if parameter.variadic {
             let mut values = php_runtime::api::PhpArray::new();
             for (key, value) in variadic.iter() {
@@ -209,7 +254,7 @@ pub(super) fn invoke_native_function_with_metadata_strict(
                     _ => {
                         return Err(format!(
                             "E_PHP_THROW:Error:{}(): Argument #{} (${}) could not be passed by reference",
-                            target.name,
+                            target_name,
                             index + 1,
                             parameter.name
                         ));
@@ -225,7 +270,7 @@ pub(super) fn invoke_native_function_with_metadata_strict(
                     {
                         return Err(format!(
                             "E_PHP_THROW:TypeError:{}(): Argument #{} (${}) must be of type {}, {} given",
-                            target.name,
+                            target_name,
                             index + 1,
                             parameter.name,
                             native_ir_type_name(type_),
@@ -248,7 +293,7 @@ pub(super) fn invoke_native_function_with_metadata_strict(
                     {
                         return Err(format!(
                             "E_PHP_THROW:TypeError:{}(): Argument #{} (${}) must be of type {}, {} given",
-                            target.name,
+                            target_name,
                             index + 1,
                             parameter.name,
                             native_ir_type_name(type_),
@@ -267,21 +312,28 @@ pub(super) fn invoke_native_function_with_metadata_strict(
             };
             bound.push(context.encode(value)?);
         } else {
-            return Err(format!("Too few arguments to function {}()", target.name));
+            return Err(format!("Too few arguments to function {target_name}()"));
         }
     }
     let visible_arguments = assigned
         .iter()
         .flatten()
         .chain(&visible_extra)
+        .copied()
+        .collect::<request_state::NativeTraceArguments>();
+    let root_arguments = assigned
+        .iter()
+        .flatten()
+        .chain(&visible_extra)
         .map(|value| context.decode(*value))
         .collect::<Result<Vec<_>, _>>()?;
-    context.push_call_arguments(visible_arguments.clone());
-    let result = invoke_native_method_with_trace_arguments(
+    context.push_call_arguments(root_arguments);
+    let result = invoke_native_method_with_prepared_trace_arguments(
         context,
         function,
         &bound,
-        Some(&visible_arguments),
+        Some(visible_arguments),
+        Some(target_metadata),
     );
     context.pop_call_arguments();
     result
@@ -391,7 +443,7 @@ pub(super) fn invoke_native_named_callable(
         name.rsplit('\\').next().unwrap_or(name)
     };
     let expanded = bind_native_builtin_arguments(context, builtin_name, arguments, metadata)?;
-    execute_native_builtin(context, builtin_name, &expanded, instruction, None)
+    execute_native_builtin(context, builtin_name, &expanded, instruction, None, None)
 }
 
 pub(super) fn expand_native_unpack_arguments(
@@ -471,12 +523,22 @@ pub(super) fn native_builtin_default_value(
     }
 }
 
-pub(super) fn bind_native_builtin_arguments(
+pub(super) fn native_builtin_arguments_require_binding(
+    metadata: Option<&[php_ir::instruction::IrCallArg]>,
+) -> bool {
+    metadata.is_some_and(|arguments| {
+        arguments
+            .iter()
+            .any(|argument| argument.name.is_some() || argument.unpack)
+    })
+}
+
+pub(super) fn bind_native_builtin_arguments<'a>(
     context: &mut NativeExecutionContext<'_>,
     name: &str,
-    arguments: &[i64],
+    arguments: &'a [i64],
     metadata: Option<&[php_ir::instruction::IrCallArg]>,
-) -> Result<Vec<i64>, String> {
+) -> Result<std::borrow::Cow<'a, [i64]>, String> {
     if native_builtins::native_builtin_is_unavailable_target_function(name)
         || (name.eq_ignore_ascii_case("print")
             && metadata
@@ -486,11 +548,18 @@ pub(super) fn bind_native_builtin_arguments(
             "E_PHP_THROW:Error:Call to undefined function {name}()"
         ));
     }
+    if !native_builtin_arguments_require_binding(metadata) {
+        return Ok(std::borrow::Cow::Borrowed(arguments));
+    }
     let Some(call_metadata) = metadata else {
-        return Ok(arguments.to_vec());
+        return Ok(std::borrow::Cow::Borrowed(arguments));
     };
     if !call_metadata.iter().any(|argument| argument.name.is_some()) {
-        return expand_native_unpack_arguments(context, arguments, metadata);
+        if !call_metadata.iter().any(|argument| argument.unpack) {
+            return Ok(std::borrow::Cow::Borrowed(arguments));
+        }
+        return expand_native_unpack_arguments(context, arguments, metadata)
+            .map(std::borrow::Cow::Owned);
     }
     let function = php_std::arginfo::function_metadata_indexed(name)
         .ok_or_else(|| format!("builtin {name} has no argument metadata"))?;
@@ -529,7 +598,7 @@ pub(super) fn bind_native_builtin_arguments(
             return Err(format!("Missing required argument ${}", parameter.name));
         }
     }
-    Ok(bound)
+    Ok(std::borrow::Cow::Owned(bound))
 }
 
 pub(super) fn invoke_native_bound_method(
@@ -883,12 +952,7 @@ pub(super) fn execute_native_dynamic_constructor(
             return create_native_external_object(context, &class_name, arguments, instruction);
         }
 
-        let class = context
-            .unit
-            .classes
-            .iter()
-            .find(|class| class.name == normalize_class_name(&class_name))
-            .cloned()
+        let class = native_active_class_handle(context, &class_name)
             .ok_or_else(|| format!("E_PHP_VM_UNKNOWN_CLASS: Class {class_name} not found"))?;
         if class.flags.is_abstract
             || class.flags.is_interface
@@ -901,11 +965,7 @@ pub(super) fn execute_native_dynamic_constructor(
             ));
         }
         native_prepare_runtime_class_constants(context, None, &class, instruction)?;
-        let runtime_class = native_runtime_class(context, &class)?;
-        let object = php_runtime::api::ObjectRef::new_with_display_name(
-            &runtime_class,
-            class.display_name.clone(),
-        );
+        let object = new_native_object(context, None, &class)?;
         let receiver = context.encode(Value::Object(object))?;
         if let Some(constructor) = native_method_in_hierarchy(context, &class.name, "__construct") {
             let mut constructor_arguments = Vec::with_capacity(arguments.len() + 1);
@@ -1329,9 +1389,20 @@ pub(super) fn invoke_native_callable_value_from(
     for argument in arguments {
         encoded.push(context.encode(argument.clone())?);
     }
+    invoke_native_encoded_callable_value_from(context, &encoded, source, metadata, caller_function)
+}
+
+pub(super) fn invoke_native_encoded_callable_value_from(
+    context: &mut NativeExecutionContext<'_>,
+    encoded: &[i64],
+    source: &php_ir::Instruction,
+    metadata: Option<Vec<php_ir::instruction::IrCallArg>>,
+    caller_function: Option<u32>,
+) -> Result<i64, String> {
     let metadata = metadata.unwrap_or_else(|| {
-        arguments
+        encoded
             .iter()
+            .skip(1)
             .map(|_| php_ir::instruction::IrCallArg {
                 name: None,
                 value: php_ir::Operand::Register(php_ir::RegId::new(0)),

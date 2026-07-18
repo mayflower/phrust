@@ -121,6 +121,25 @@ impl<'a> BuiltinFilesystemContext<'a> {
             stream_context_state_slot: None,
         }
     }
+
+    fn borrowed(
+        cwd: &'a mut PathBuf,
+        include_path: Arc<Vec<PathBuf>>,
+        filesystem: FilesystemCapabilities,
+        resources: Option<&'a mut ResourceTable>,
+    ) -> Self {
+        Self {
+            cwd: PathBuf::new(),
+            cwd_slot: Some(cwd),
+            include_path,
+            filesystem,
+            resources,
+            filesystem_state: FilesystemRuntimeState::default(),
+            filesystem_state_slot: None,
+            stream_context_state: StreamContextState::default(),
+            stream_context_state_slot: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -148,7 +167,11 @@ pub(in crate::builtins) struct BuiltinExtensionState<'a> {
     gettext_state_slot: Option<&'a mut GettextState>,
     shmop_state: ShmopState,
     shmop_state_slot: Option<&'a mut ShmopState>,
-    readline_state: ReadlineState,
+    // Readline's pristine state owns a populated metadata BTreeMap. Most PHP
+    // requests never call readline, and VM-backed contexts immediately bind
+    // the request-owned state, so construct the fallback lazily instead of
+    // allocating and dropping it at every unrelated builtin boundary.
+    readline_state: Option<ReadlineState>,
     readline_state_slot: Option<&'a mut ReadlineState>,
     sysvmsg_state: SysvMessageQueueState,
     sysvmsg_state_slot: Option<&'a mut SysvMessageQueueState>,
@@ -208,7 +231,7 @@ impl<'a> Default for BuiltinExtensionState<'a> {
             gettext_state_slot: None,
             shmop_state: ShmopState::default(),
             shmop_state_slot: None,
-            readline_state: ReadlineState::default(),
+            readline_state: None,
             readline_state_slot: None,
             sysvmsg_state: SysvMessageQueueState::default(),
             sysvmsg_state_slot: None,
@@ -372,6 +395,44 @@ impl<'a> BuiltinContext<'a> {
         }
     }
 
+    /// Creates a builtin call view that borrows the VM's request-owned core
+    /// state directly. Unlike the general constructors this does not clone a
+    /// cwd/include-path or allocate fallback timezone and environment values
+    /// that are immediately shadowed by request slots.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_borrowed_runtime_request_state(
+        output: &'a mut OutputBuffer,
+        cwd: &'a mut PathBuf,
+        include_path: Arc<Vec<PathBuf>>,
+        filesystem: FilesystemCapabilities,
+        resources: Option<&'a mut ResourceTable>,
+        request_state: &'a mut BuiltinRequestState,
+        ini: &'a mut IniRegistry,
+        default_timezone: &'a mut String,
+        env: Arc<Vec<(String, String)>>,
+    ) -> Self {
+        Self {
+            io: BuiltinIoContext::new(output),
+            filesystem: BuiltinFilesystemContext::borrowed(
+                cwd,
+                include_path,
+                filesystem,
+                resources,
+            ),
+            http: BuiltinHttpContext::default(),
+            request_state: BuiltinRequestStateAccess::Borrowed(request_state),
+            extensions: BuiltinExtensionState::default(),
+            sessions: BuiltinSessionContext::default(),
+            ini: IniRegistry::default(),
+            ini_slot: Some(ini),
+            default_timezone: String::new(),
+            default_timezone_slot: Some(default_timezone),
+            env,
+            network_requests_enabled: false,
+        }
+    }
+
     /// Sets deterministic request-local environment entries. Pre-sorted
     /// tables (the common case: the VM keeps its request env sorted) are
     /// shared without copying.
@@ -385,6 +446,16 @@ impl<'a> BuiltinContext<'a> {
         let mut owned = env.as_ref().clone();
         owned.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
         self.env = Arc::new(owned);
+    }
+
+    /// Sets environment entries whose owner already maintains the stable
+    /// `(name, value)` order. This avoids revalidating the complete table at
+    /// every builtin boundary while retaining the same shared representation.
+    pub fn set_sorted_env_entries(&mut self, env: Arc<Vec<(String, String)>>) {
+        debug_assert!(env.windows(2).all(|pair| {
+            pair[0].0 <= pair[1].0 && !(pair[0].0 == pair[1].0 && pair[0].1 > pair[1].1)
+        }));
+        self.env = env;
     }
 
     /// Reads a deterministic request-local environment value.
@@ -814,7 +885,10 @@ impl<'a> BuiltinContext<'a> {
     pub fn readline_state(&mut self) -> &mut ReadlineState {
         match self.extensions.readline_state_slot.as_deref_mut() {
             Some(state) => state,
-            None => &mut self.extensions.readline_state,
+            None => self
+                .extensions
+                .readline_state
+                .get_or_insert_with(ReadlineState::default),
         }
     }
 
@@ -1171,6 +1245,22 @@ mod tests {
     };
     use crate::pcre;
     use std::path::PathBuf;
+    use std::sync::Arc;
+
+    #[test]
+    fn pre_sorted_environment_is_shared_without_revalidation_or_copy() {
+        let mut output = OutputBuffer::new();
+        let mut context = BuiltinContext::new(&mut output);
+        let env = Arc::new(vec![
+            ("ALPHA".to_owned(), "first".to_owned()),
+            ("ZED".to_owned(), "last".to_owned()),
+        ]);
+
+        context.set_sorted_env_entries(Arc::clone(&env));
+
+        assert!(Arc::ptr_eq(&context.env, &env));
+        assert_eq!(context.env_value("ZED"), Some("last"));
+    }
 
     #[test]
     fn json_last_error_state_updates_and_reads_from_extension_state() {

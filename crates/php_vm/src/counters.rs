@@ -129,7 +129,7 @@ impl VmCounters {
         format!(
             concat!(
                 "{{\n",
-                "  \"schema_version\": 11,\n",
+                "  \"schema_version\": 12,\n",
                 "  \"native_compile_attempts\": {},\n",
                 "  \"native_compile_successes\": {},\n",
                 "  \"native_compile_failures\": {},\n",
@@ -399,7 +399,7 @@ mod tests {
             .insert("native_\"binary\"".to_owned(), 17);
 
         let parsed: serde_json::Value = serde_json::from_str(&counters.to_json()).unwrap();
-        assert_eq!(parsed["schema_version"], 11);
+        assert_eq!(parsed["schema_version"], 12);
         assert_eq!(parsed["runtime_helper_calls_by_id"]["native_\"binary\""], 2);
         assert_eq!(
             parsed["runtime_helper_time_nanos_by_id"]["native_\"binary\""],

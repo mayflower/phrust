@@ -18,6 +18,72 @@ const DEFAULT_GENERATION_LIMIT: usize = 16 * 1024 * 1024;
 const GENERATION_ARENA_RESERVE: usize = 32 * 1024 * 1024;
 const DEFAULT_MAX_CONCURRENT_COMPILES: usize = 1;
 const DEFAULT_MAX_COMPILE_QUEUE: usize = 64;
+const DEFAULT_MAX_COMPILE_COST_TOKENS: usize = 100_000;
+const QUALITY_REGALLOC_COST_THRESHOLD: usize = 50_000;
+
+/// Scheduler class for bounded native compiler work.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum NativeCompilePriority {
+    RequestCriticalBaseline,
+    BackgroundOptimizing,
+    CacheMaintenance,
+}
+
+impl NativeCompilePriority {
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Structural admission estimate for one compile group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeCompileAdmission {
+    pub(crate) priority: NativeCompilePriority,
+    pub(crate) cost_tokens: usize,
+}
+
+impl NativeCompileAdmission {
+    pub(crate) const fn request_critical(cost_tokens: usize) -> Self {
+        Self {
+            priority: NativeCompilePriority::RequestCriticalBaseline,
+            cost_tokens,
+        }
+    }
+
+    pub(crate) const fn background_optimizing(cost_tokens: usize) -> Self {
+        Self {
+            priority: NativeCompilePriority::BackgroundOptimizing,
+            cost_tokens,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn cache_maintenance(cost_tokens: usize) -> Self {
+        Self {
+            priority: NativeCompilePriority::CacheMaintenance,
+            cost_tokens,
+        }
+    }
+
+    const fn normalized(self) -> Self {
+        Self {
+            priority: self.priority,
+            cost_tokens: if self.cost_tokens == 0 {
+                1
+            } else if self.cost_tokens > DEFAULT_MAX_COMPILE_COST_TOKENS {
+                DEFAULT_MAX_COMPILE_COST_TOKENS
+            } else {
+                self.cost_tokens
+            },
+        }
+    }
+}
+
+impl Default for NativeCompileAdmission {
+    fn default() -> Self {
+        Self::request_critical(1)
+    }
+}
 
 /// Stable process-cache identity for one compiled specialization.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -158,6 +224,8 @@ pub struct CraneliftCodeManagerStats {
     pub eviction_candidates: usize,
     pub active_compiles: usize,
     pub queued_compiles: usize,
+    pub active_compile_cost_tokens: usize,
+    pub queued_compile_cost_tokens: usize,
     pub compile_queue_rejections: u64,
 }
 
@@ -176,9 +244,35 @@ pub struct CraneliftCodeManagerEvent {
 
 struct CodeGeneration {
     id: u64,
+    regalloc: NativeRegallocMode,
     compiler: Mutex<GenerationCompiler>,
     bytes: AtomicUsize,
     metrics: Arc<CodeManagerMetrics>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeRegallocMode {
+    Fast,
+    Quality,
+}
+
+const fn regalloc_mode_for_admission(admission: NativeCompileAdmission) -> NativeRegallocMode {
+    match admission.priority {
+        // Small request-critical groups favor linear compile time. Large
+        // groups remain quality-allocated because the single-pass allocator
+        // can more than double their emitted spill code even after structural
+        // fragmentation, violating the function artifact ceiling.
+        NativeCompilePriority::RequestCriticalBaseline
+            if admission.cost_tokens < QUALITY_REGALLOC_COST_THRESHOLD =>
+        {
+            NativeRegallocMode::Fast
+        }
+        NativeCompilePriority::RequestCriticalBaseline => NativeRegallocMode::Quality,
+        // Optimizing work is admitted separately and may spend allocation
+        // time on machine-code quality without delaying a cold request.
+        NativeCompilePriority::BackgroundOptimizing => NativeRegallocMode::Quality,
+        NativeCompilePriority::CacheMaintenance => NativeRegallocMode::Fast,
+    }
 }
 
 struct GenerationCompiler {
@@ -192,6 +286,7 @@ impl fmt::Debug for CodeGeneration {
         formatter
             .debug_struct("CodeGeneration")
             .field("id", &self.id)
+            .field("regalloc", &self.regalloc)
             .field("bytes", &self.bytes.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
@@ -352,7 +447,8 @@ impl std::error::Error for CraneliftCodeManagerError {}
 
 struct ManagerState {
     next_generation: u64,
-    active: Arc<CodeGeneration>,
+    active_fast: Arc<CodeGeneration>,
+    active_quality: Arc<CodeGeneration>,
     generations: VecDeque<Arc<CodeGeneration>>,
     cache: HashMap<CraneliftCodeKey, JitFunctionHandle>,
     function_cells: HashMap<NativeFunctionKey, Arc<NativeIndirectionCell>>,
@@ -365,6 +461,9 @@ struct ManagerState {
 struct CompilerState {
     active: usize,
     queued: usize,
+    active_cost_tokens: usize,
+    queued_cost_tokens: usize,
+    queued_by_priority: [usize; 3],
 }
 
 /// Process-level compiler owner and bounded code-generation cache.
@@ -381,13 +480,15 @@ pub struct CraneliftCodeManager {
 
 struct CompilerPermit<'a> {
     manager: &'a CraneliftCodeManager,
+    cost_tokens: usize,
 }
 
 impl Drop for CompilerPermit<'_> {
     fn drop(&mut self) {
         if let Ok(mut state) = self.manager.compiler_state.lock() {
             state.active = state.active.saturating_sub(1);
-            self.manager.compiler_changed.notify_one();
+            state.active_cost_tokens = state.active_cost_tokens.saturating_sub(self.cost_tokens);
+            self.manager.compiler_changed.notify_all();
         }
     }
 }
@@ -413,12 +514,15 @@ impl CraneliftCodeManager {
         let generation_limit = generation_limit.max(1).min(code_limit);
         let helpers = Arc::new(RwLock::new(HashMap::new()));
         let metrics = Arc::new(CodeManagerMetrics::default());
-        let active = Self::new_generation(1, &helpers, &metrics)?;
+        let active_fast = Self::new_generation(1, &helpers, &metrics, NativeRegallocMode::Fast)?;
+        let active_quality =
+            Self::new_generation(2, &helpers, &metrics, NativeRegallocMode::Quality)?;
         Ok(Self {
             state: Mutex::new(ManagerState {
-                next_generation: 2,
-                active: Arc::clone(&active),
-                generations: VecDeque::from([active]),
+                next_generation: 3,
+                active_fast: Arc::clone(&active_fast),
+                active_quality: Arc::clone(&active_quality),
+                generations: VecDeque::from([active_fast, active_quality]),
                 cache: HashMap::new(),
                 function_cells: HashMap::new(),
                 function_publications: HashMap::new(),
@@ -439,6 +543,7 @@ impl CraneliftCodeManager {
         id: u64,
         helpers: &Arc<RwLock<HashMap<String, usize>>>,
         metrics: &Arc<CodeManagerMetrics>,
+        regalloc: NativeRegallocMode,
     ) -> Result<Arc<CodeGeneration>, CraneliftCodeManagerError> {
         let mut flags = settings::builder();
         flags
@@ -449,6 +554,31 @@ impl CraneliftCodeManager {
             .map_err(|error| CraneliftCodeManagerError::Flags(error.to_string()))?;
         flags
             .set("preserve_frame_pointers", "true")
+            .map_err(|error| CraneliftCodeManagerError::Flags(error.to_string()))?;
+        // The request-critical baseline is deliberately a translation tier.
+        // Its emitted control/state shape is compacted before Cranelift, so
+        // backend optimization would only add cold latency to every fragment.
+        flags
+            .set("opt_level", "none")
+            .map_err(|error| CraneliftCodeManagerError::Flags(error.to_string()))?;
+        // Most request-critical functions are tiny and favor linear-time
+        // allocation. Structurally large groups have already been fragmented
+        // and admitted under hard bounds; spending more allocator work there
+        // avoids pathological spill code without taxing every cold compile.
+        flags
+            .set(
+                "regalloc_algorithm",
+                match regalloc {
+                    NativeRegallocMode::Fast => "single_pass",
+                    NativeRegallocMode::Quality => "backtracking",
+                },
+            )
+            .map_err(|error| CraneliftCodeManagerError::Flags(error.to_string()))?;
+        // Lowering performs one explicit verifier pass immediately before the
+        // structural admission check. Disable the duplicate verifier inside
+        // `Context::compile` so each small baseline fragment is verified once.
+        flags
+            .set("enable_verifier", "false")
             .map_err(|error| CraneliftCodeManagerError::Flags(error.to_string()))?;
         let isa = cranelift_native::builder()
             .map_err(|error| CraneliftCodeManagerError::NativeTarget(error.to_string()))?
@@ -481,6 +611,7 @@ impl CraneliftCodeManager {
         let context = module.make_context();
         Ok(Arc::new(CodeGeneration {
             id,
+            regalloc,
             compiler: Mutex::new(GenerationCompiler {
                 module: Some(module),
                 context,
@@ -491,14 +622,29 @@ impl CraneliftCodeManager {
         }))
     }
 
-    fn acquire_compiler(&self) -> Result<CompilerPermit<'_>, CraneliftCodeManagerError> {
+    fn acquire_compiler(
+        &self,
+        admission: NativeCompileAdmission,
+    ) -> Result<CompilerPermit<'_>, CraneliftCodeManagerError> {
+        let admission = admission.normalized();
         let mut state = self
             .compiler_state
             .lock()
             .map_err(|_| CraneliftCodeManagerError::Poisoned("compiler scheduler"))?;
-        if state.active < DEFAULT_MAX_CONCURRENT_COMPILES {
+        if state.active < DEFAULT_MAX_CONCURRENT_COMPILES
+            && state
+                .active_cost_tokens
+                .saturating_add(admission.cost_tokens)
+                <= DEFAULT_MAX_COMPILE_COST_TOKENS
+        {
             state.active = state.active.saturating_add(1);
-            return Ok(CompilerPermit { manager: self });
+            state.active_cost_tokens = state
+                .active_cost_tokens
+                .saturating_add(admission.cost_tokens);
+            return Ok(CompilerPermit {
+                manager: self,
+                cost_tokens: admission.cost_tokens,
+            });
         }
         if state.queued >= DEFAULT_MAX_COMPILE_QUEUE {
             self.metrics
@@ -509,15 +655,40 @@ impl CraneliftCodeManager {
             });
         }
         state.queued = state.queued.saturating_add(1);
+        state.queued_cost_tokens = state
+            .queued_cost_tokens
+            .saturating_add(admission.cost_tokens);
+        state.queued_by_priority[admission.priority.index()] =
+            state.queued_by_priority[admission.priority.index()].saturating_add(1);
         loop {
             state = self
                 .compiler_changed
                 .wait(state)
                 .map_err(|_| CraneliftCodeManagerError::Poisoned("compiler scheduler"))?;
-            if state.active < DEFAULT_MAX_CONCURRENT_COMPILES {
+            let higher_priority_waiting = state.queued_by_priority[..admission.priority.index()]
+                .iter()
+                .any(|queued| *queued != 0);
+            if !higher_priority_waiting
+                && state.active < DEFAULT_MAX_CONCURRENT_COMPILES
+                && state
+                    .active_cost_tokens
+                    .saturating_add(admission.cost_tokens)
+                    <= DEFAULT_MAX_COMPILE_COST_TOKENS
+            {
                 state.queued = state.queued.saturating_sub(1);
+                state.queued_cost_tokens = state
+                    .queued_cost_tokens
+                    .saturating_sub(admission.cost_tokens);
+                state.queued_by_priority[admission.priority.index()] =
+                    state.queued_by_priority[admission.priority.index()].saturating_sub(1);
                 state.active = state.active.saturating_add(1);
-                return Ok(CompilerPermit { manager: self });
+                state.active_cost_tokens = state
+                    .active_cost_tokens
+                    .saturating_add(admission.cost_tokens);
+                return Ok(CompilerPermit {
+                    manager: self,
+                    cost_tokens: admission.cost_tokens,
+                });
             }
         }
     }
@@ -609,10 +780,36 @@ impl CraneliftCodeManager {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn compile_once_with_scratch<E>(
         &self,
         key: CraneliftCodeKey,
         function_key: Option<NativeFunctionKey>,
+        helpers: &[(&str, usize)],
+        compile: impl FnOnce(
+            &mut JITModule,
+            &mut cranelift_codegen::Context,
+            &mut FunctionBuilderContext,
+            &str,
+        ) -> Result<(JitFunctionHandle, u64), E>,
+    ) -> Result<ManagedJitFunction, ManagedCompileError<E>>
+    where
+        E: fmt::Display,
+    {
+        self.compile_once_with_scratch_admission(
+            key,
+            function_key,
+            NativeCompileAdmission::default(),
+            helpers,
+            compile,
+        )
+    }
+
+    pub(crate) fn compile_once_with_scratch_admission<E>(
+        &self,
+        key: CraneliftCodeKey,
+        function_key: Option<NativeFunctionKey>,
+        admission: NativeCompileAdmission,
         helpers: &[(&str, usize)],
         compile: impl FnOnce(
             &mut JITModule,
@@ -696,7 +893,11 @@ impl CraneliftCodeManager {
                             },
                         ));
                     }
-                    break (Arc::clone(&state.active), evictions_before, function_cell);
+                    let generation = match regalloc_mode_for_admission(admission) {
+                        NativeRegallocMode::Fast => Arc::clone(&state.active_fast),
+                        NativeRegallocMode::Quality => Arc::clone(&state.active_quality),
+                    };
+                    break (generation, evictions_before, function_cell);
                 }
                 waited = true;
                 self.metrics.compile_waits.fetch_add(1, Ordering::Relaxed);
@@ -706,7 +907,7 @@ impl CraneliftCodeManager {
             }
         };
         let symbol = key.symbol();
-        let compiler_permit = match self.acquire_compiler() {
+        let compiler_permit = match self.acquire_compiler(admission) {
             Ok(permit) => permit,
             Err(error) => {
                 if let Some(cell) = &function_cell {
@@ -781,15 +982,20 @@ impl CraneliftCodeManager {
         let mut state = self.state.lock().map_err(|_| {
             ManagedCompileError::Manager(CraneliftCodeManagerError::Poisoned("state"))
         })?;
-        self.publish_function_entries(&mut state, &key, &handle);
+        self.publish_function_entries(&mut state, &key, function_key.as_ref(), &handle);
         state.cache.insert(key.clone(), handle.clone());
         state.compile_failures.remove(&key);
 
         if generation.bytes.load(Ordering::Relaxed) >= self.generation_limit {
             let id = state.next_generation;
             state.next_generation = state.next_generation.saturating_add(1);
-            if let Ok(next) = Self::new_generation(id, &self.helpers, &self.metrics) {
-                state.active = Arc::clone(&next);
+            if let Ok(next) =
+                Self::new_generation(id, &self.helpers, &self.metrics, generation.regalloc)
+            {
+                match generation.regalloc {
+                    NativeRegallocMode::Fast => state.active_fast = Arc::clone(&next),
+                    NativeRegallocMode::Quality => state.active_quality = Arc::clone(&next),
+                }
                 state.generations.push_back(next);
                 self.evict_retired_generations(&mut state);
             }
@@ -820,15 +1026,17 @@ impl CraneliftCodeManager {
 
     fn evict_retired_generations(&self, state: &mut ManagerState) {
         while self.metrics.bytes_live.load(Ordering::Relaxed) >= self.code_limit
-            && state.generations.len() > 1
+            && state.generations.len() > 2
         {
-            let Some(generation) = state.generations.pop_front() else {
+            let Some(index) = state.generations.iter().position(|generation| {
+                generation.id != state.active_fast.id && generation.id != state.active_quality.id
+            }) else {
                 break;
             };
-            if generation.id == state.active.id {
-                state.generations.push_front(generation);
-                break;
-            }
+            let generation = state
+                .generations
+                .remove(index)
+                .expect("located retired generation must remain present");
             let retired_id = generation.id;
             let retired_bytes = generation.bytes.load(Ordering::Relaxed);
             state
@@ -858,6 +1066,7 @@ impl CraneliftCodeManager {
         &self,
         state: &mut ManagerState,
         code_key: &CraneliftCodeKey,
+        root_function_key: Option<&NativeFunctionKey>,
         handle: &JitFunctionHandle,
     ) {
         let Some(metadata) = handle.region_state_metadata() else {
@@ -878,8 +1087,16 @@ impl CraneliftCodeManager {
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);
         }
         for entry in entries {
+            // Machine-code cache identity is function-scoped, while linkage
+            // cells share the deployment namespace of their source unit.
+            // Never derive a cell key from `code_key.compiled_unit`: doing so
+            // would publish into a second, unreachable function namespace.
+            let deployment_unit = root_function_key.map_or_else(
+                || code_key.compiled_unit.clone(),
+                |key| key.deployment_unit.clone(),
+            );
             let key = crate::native_function_key(
-                code_key.compiled_unit.clone(),
+                deployment_unit,
                 entry.function.raw(),
                 entry.arity as usize,
                 entry.local_count,
@@ -928,7 +1145,7 @@ impl CraneliftCodeManager {
             .ok()
             .map(|state| {
                 (
-                    state.generations.len().saturating_sub(1),
+                    state.generations.len().saturating_sub(2),
                     state.function_cells.len(),
                 )
             })
@@ -937,8 +1154,15 @@ impl CraneliftCodeManager {
             .compiler_state
             .try_lock()
             .ok()
-            .map(|state| (state.active, state.queued))
-            .unwrap_or((0, 0));
+            .map(|state| {
+                (
+                    state.active,
+                    state.queued,
+                    state.active_cost_tokens,
+                    state.queued_cost_tokens,
+                )
+            })
+            .unwrap_or((0, 0, 0, 0));
         CraneliftCodeManagerStats {
             process_cache_hits: self.metrics.process_cache_hits.load(Ordering::Relaxed),
             process_cache_misses: self.metrics.process_cache_misses.load(Ordering::Relaxed),
@@ -969,6 +1193,8 @@ impl CraneliftCodeManager {
             eviction_candidates: state_snapshot.0,
             active_compiles: compiler_snapshot.0,
             queued_compiles: compiler_snapshot.1,
+            active_compile_cost_tokens: compiler_snapshot.2,
+            queued_compile_cost_tokens: compiler_snapshot.3,
             compile_queue_rejections: self
                 .metrics
                 .compile_queue_rejections
@@ -1007,7 +1233,8 @@ pub fn cranelift_code_manager_stats() -> CraneliftCodeManagerStats {
 mod tests {
     use super::{
         CraneliftCodeCacheDisposition, CraneliftCodeKey, CraneliftCodeManager,
-        CraneliftCodeManagerError, ManagedCompileError,
+        CraneliftCodeManagerError, ManagedCompileError, NativeCompileAdmission, NativeRegallocMode,
+        regalloc_mode_for_admission,
     };
     use crate::{
         CraneliftCompilerIdentity, JIT_RUNTIME_ABI_HASH, JitFunctionHandle, NativeFunctionKey,
@@ -1044,6 +1271,26 @@ mod tests {
         assert_send::<cranelift_jit::JITModule>();
         assert_send_sync::<CraneliftCodeManager>();
         assert_send_sync::<JitFunctionHandle>();
+    }
+
+    #[test]
+    fn compiler_tier_selects_regalloc_policy_independent_of_group_cost() {
+        assert_eq!(
+            regalloc_mode_for_admission(NativeCompileAdmission::request_critical(100_000)),
+            NativeRegallocMode::Quality
+        );
+        assert_eq!(
+            regalloc_mode_for_admission(NativeCompileAdmission::request_critical(1)),
+            NativeRegallocMode::Fast
+        );
+        assert_eq!(
+            regalloc_mode_for_admission(NativeCompileAdmission::background_optimizing(1)),
+            NativeRegallocMode::Quality
+        );
+        assert_eq!(
+            regalloc_mode_for_admission(NativeCompileAdmission::cache_maintenance(100_000)),
+            NativeRegallocMode::Fast
+        );
     }
 
     fn compile_constant(
@@ -1110,7 +1357,7 @@ mod tests {
         }
         let stats = manager.stats();
         assert_eq!(stats.compile_count, 128);
-        assert_eq!(stats.code_generations, 1);
+        assert_eq!(stats.code_generations, 2);
         assert!(stats.code_bytes_live < 1024 * 1024);
     }
 

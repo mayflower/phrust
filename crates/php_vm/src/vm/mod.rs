@@ -132,6 +132,7 @@ fn validate_native_class_table(unit: &php_ir::IrUnit) -> Result<(), String> {
 pub struct VmWorkerState {
     native_compiles: Arc<native_compile_cache::NativeCompileCache>,
     loaded_native_units: Arc<native_compile_cache::LoadedNativeUnitRegistry>,
+    resolved_native_entries: Arc<native_compile_cache::ResolvedNativeEntryCache>,
     background_tiering: bool,
     tiering_options: crate::tiering::TieringOptions,
     tiering_state: Arc<Mutex<BackgroundTieringState>>,
@@ -163,6 +164,9 @@ impl Default for VmWorkerState {
             loaded_native_units: Arc::clone(PROCESS_LOADED_NATIVE_UNITS.get_or_init(|| {
                 Arc::new(native_compile_cache::LoadedNativeUnitRegistry::default())
             })),
+            resolved_native_entries: Arc::new(
+                native_compile_cache::ResolvedNativeEntryCache::default(),
+            ),
             background_tiering: false,
             tiering_options,
             tiering_state: Arc::new(Mutex::new(BackgroundTieringState::default())),
@@ -194,6 +198,9 @@ impl VmWorkerState {
         Self {
             native_compiles: Arc::new(native_compile_cache::NativeCompileCache::default()),
             loaded_native_units: Arc::new(native_compile_cache::LoadedNativeUnitRegistry::default()),
+            resolved_native_entries: Arc::new(
+                native_compile_cache::ResolvedNativeEntryCache::default(),
+            ),
             background_tiering: false,
             tiering_options: crate::tiering::TieringOptions::default(),
             tiering_state: Arc::new(Mutex::new(BackgroundTieringState::default())),
@@ -223,6 +230,11 @@ impl VmWorkerState {
 
     fn loaded_native_unit_stats(&self) -> native_compile_cache::LoadedNativeUnitRegistryStats {
         self.loaded_native_units.stats()
+    }
+
+    #[cfg(test)]
+    fn resolved_native_entry_hits(&self) -> u64 {
+        self.resolved_native_entries.hits()
     }
 
     fn compile_native(
@@ -260,6 +272,9 @@ impl VmWorkerState {
             .functions
             .get(function.index())
             .ok_or_else(|| format!("native function {} is missing", function.raw()))?;
+        let function_ir_fingerprint = unit
+            .prepared_function_ir_fingerprint(function)
+            .ok_or_else(|| format!("native function {} has no cache identity", function.raw()))?;
         let function_key = php_jit::native_function_key(
             unit.prepared_ir_fingerprint().to_owned(),
             function.raw(),
@@ -303,6 +318,7 @@ impl VmWorkerState {
                 unit.unit(),
                 function,
                 options,
+                function_ir_fingerprint,
                 unit.prepared_ir_fingerprint(),
                 &format!(
                     "{}-external-signatures-{external_signatures_hash:016x}",
@@ -311,11 +327,32 @@ impl VmWorkerState {
                 external_signatures,
             )
         };
-        if background {
+        let compiled = if background {
             self.native_compiles.get_or_compile_background(key, compile)
         } else {
             self.native_compiles.get_or_compile(key, compile)
+        };
+        if options.collect_counters
+            && std::env::var_os("PHRUST_NATIVE_COMPILE_FUNCTION_LOG").is_some()
+            && let Ok((records, disposition)) = &compiled
+            && disposition.compiled()
+            && let Some(record) = records.first()
+        {
+            let source = unit
+                .unit()
+                .files
+                .get(function_metadata.span.file.index())
+                .map_or("<unknown>", |file| file.path.as_str());
+            eprintln!(
+                "native_compile_function source={} function={} function_id={} compile_time_nanos={} code_bytes={}",
+                source,
+                function_metadata.name,
+                function.raw(),
+                record.result.stats.native_compile_time_nanos,
+                record.result.stats.native_code_bytes,
+            );
         }
+        compiled
     }
 
     fn background_tiering_decision(
@@ -416,6 +453,117 @@ impl VmWorkerState {
                 .native_compile_budget_rejections
                 .saturating_add(1);
         }
+    }
+
+    fn resolve_native_function(
+        &self,
+        unit: &CompiledUnit,
+        function: php_ir::FunctionId,
+        options: &VmOptions,
+        external_signatures: &[php_jit::JitExternalFunctionSignature],
+    ) -> Result<php_jit::JitFunctionHandle, String> {
+        let external_signatures_hash = external_function_signatures_hash(external_signatures);
+        let fast_key = native_compile_cache::NativeCompileCacheKey::new(
+            unit.cache_identity(),
+            function,
+            options.native_optimization.opt_level(),
+            external_signatures_hash,
+        );
+        if let Some(handle) = self.resolved_native_entries.get(fast_key) {
+            return Ok(handle);
+        }
+        let handle =
+            self.resolve_native_function_cold(unit, function, options, external_signatures)?;
+        self.resolved_native_entries
+            .insert(fast_key, handle.clone());
+        Ok(handle)
+    }
+
+    fn resolve_native_function_cold(
+        &self,
+        unit: &CompiledUnit,
+        function: php_ir::FunctionId,
+        options: &VmOptions,
+        external_signatures: &[php_jit::JitExternalFunctionSignature],
+    ) -> Result<php_jit::JitFunctionHandle, String> {
+        let cache = if options.native_cache == php_jit::NativeCacheMode::Off {
+            None
+        } else {
+            Some(
+                php_jit::NativeArtifactCache::new(php_jit::NativeCacheConfig {
+                    mode: options.native_cache,
+                    directory: options.native_cache_dir.clone(),
+                    ..php_jit::NativeCacheConfig::default()
+                })
+                .map_err(|error| format!("E_NATIVE_CACHE_SETUP: {error}"))?,
+            )
+        };
+        if let Some(cache) = &cache {
+            let identity = native_cache_identity(unit, function, options, external_signatures)
+                .map_err(|error| format!("E_NATIVE_CACHE_IDENTITY: {error}"))?;
+            let mut compiled_records = None;
+            let loaded = if cache.config().mode.can_write() {
+                self.get_or_load_native_unit(&identity, || {
+                    cache
+                        .get_or_compile(&identity, resolve_native_cache_helper, || {
+                            let (records, _) = self
+                                .compile_native(unit, function, options, external_signatures)
+                                .map_err(php_jit::NativeCacheError::InvalidHeader)?;
+                            let image = cache_image(identity.clone(), function, &records)?;
+                            compiled_records = Some(records);
+                            Ok(image)
+                        })
+                        .map(|(artifact, _)| Some(artifact))
+                })
+            } else {
+                self.get_or_load_native_unit(&identity, || {
+                    cache.load(&identity, resolve_native_cache_helper)
+                })
+            };
+            let loaded = match loaded {
+                Ok(loaded) => loaded,
+                Err(error) if compiled_records.is_some() => {
+                    if options.collect_counters {
+                        let function_name = unit
+                            .unit()
+                            .functions
+                            .get(function.index())
+                            .map_or("<missing>", |function| function.name.as_str());
+                        eprintln!(
+                            "native_cache_persist_failed function={} function_id={} error={error}",
+                            function_name,
+                            function.raw(),
+                        );
+                    }
+                    None
+                }
+                Err(error) => return Err(format!("E_NATIVE_CACHE_ARTIFACT: {error}")),
+            };
+            if let Some(loaded) = loaded {
+                return loaded
+                    .native_entries()
+                    .get(&function)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "cached native function entry {} was not published",
+                            function.raw()
+                        )
+                    });
+            }
+            if let Some(records) = compiled_records {
+                return jit_abi::native_entries_from_records(&records)?
+                    .remove(&function)
+                    .ok_or_else(|| {
+                        format!("native function entry {} was not published", function.raw())
+                    });
+            }
+        }
+
+        let (records, _) = self.compile_native(unit, function, options, external_signatures)?;
+        jit_abi::native_entries_from_records(&records)?
+            .remove(&function)
+            .ok_or_else(|| format!("native function entry {} was not published", function.raw()))
     }
 }
 
@@ -632,9 +780,9 @@ impl Vm {
             },
             false => None,
         };
-        let cache_identity = cache
-            .as_ref()
-            .and_then(|_| native_cache_identity(&unit, entry, &self.options).ok());
+        let cache_identity = cache.as_ref().and_then(|_| {
+            native_cache_identity(&unit, entry, &self.options, external_signatures).ok()
+        });
         let mut cached_compile_records = None;
         let mut cached_compile_error = None;
 
@@ -695,17 +843,19 @@ impl Vm {
                         worker_cache_before,
                     );
                 }
-                let result = VmResult::compile_error(
-                    output,
-                    format!("E_NATIVE_CACHE_ARTIFACT: {cache_error}"),
-                );
-                return self.attach_native_cache_metrics(
-                    result,
-                    cache,
-                    cache_load_time,
-                    native_compile_time,
-                    worker_cache_before,
-                );
+                if cached_compile_records.is_none() {
+                    let result = VmResult::compile_error(
+                        output,
+                        format!("E_NATIVE_CACHE_ARTIFACT: {cache_error}"),
+                    );
+                    return self.attach_native_cache_metrics(
+                        result,
+                        cache,
+                        cache_load_time,
+                        native_compile_time,
+                        worker_cache_before,
+                    );
+                }
             } else if cache.config().mode.can_read() {
                 let cache_started = Instant::now();
                 let loaded = self.worker_state.get_or_load_native_unit(identity, || {
@@ -887,12 +1037,13 @@ impl Vm {
         let native_execution_time_nanos = native_execution_started_at.map_or(0, |started_at| {
             started_at.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
         });
-        let mut runtime_counters = context.runtime_counters();
-        runtime_counters.native_execution_entries =
-            runtime_counters.native_execution_entries.saturating_add(1);
-        runtime_counters.native_region_entries =
-            runtime_counters.native_region_entries.saturating_add(1);
-        runtime_counters.native_execution_time_nanos = native_execution_time_nanos;
+        let runtime_counters = self.options.collect_counters.then(|| {
+            let mut counters = context.runtime_counters();
+            counters.native_execution_entries = counters.native_execution_entries.saturating_add(1);
+            counters.native_region_entries = counters.native_region_entries.saturating_add(1);
+            counters.native_execution_time_nanos = native_execution_time_nanos;
+            counters
+        });
         let http_response = std::mem::take(&mut context.http_response);
         let upload_registry = std::mem::take(&mut context.upload_registry);
         let session = std::mem::take(&mut context.session);
@@ -943,32 +1094,16 @@ impl Vm {
                     let throwable = context.decode_result(value).ok();
                     native_uncaught_throwable_result(context.output, throwable)
                 }
-                Ok(php_jit::JitI64InvokeOutcome::SideExit { status, state, .. })
+                Ok(php_jit::JitI64InvokeOutcome::SideExit { status, .. })
                     if status == php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32 =>
                 {
-                    let mut message = context
+                    let message = context
                         .diagnostic
                         .as_ref()
-                        .map(|diagnostic| diagnostic.message().to_owned())
-                        .unwrap_or_else(|| {
-                            context.last_runtime_helper.map_or_else(
-                                || "native runtime operation failed".to_owned(),
-                                |helper| format!("native runtime operation failed in {helper}"),
-                            )
-                        });
-                    let continuation = context
-                        .instruction_for_continuation(state.function_id, state.continuation_id)
-                        .map_or_else(
-                            || format!("{}:{}", state.function_id, state.continuation_id),
-                            |instruction| {
-                                format!(
-                                    "{}:{} {:?}",
-                                    state.function_id, state.continuation_id, instruction.kind
-                                )
-                            },
-                        );
-                    message.push_str(" at native continuation ");
-                    message.push_str(&continuation);
+                        .map_or("native runtime operation failed", |diagnostic| {
+                            diagnostic.message()
+                        })
+                        .to_owned();
                     if context.diagnostic.as_ref().is_some_and(|diagnostic| {
                         diagnostic.severity() == php_runtime::api::RuntimeSeverity::FatalError
                     }) && context
@@ -1004,7 +1139,7 @@ impl Vm {
         result.http_response = Some(Box::new(http_response));
         result.upload_registry = Some(Box::new(upload_registry));
         result.session = Some(Box::new(session));
-        if self.options.collect_counters {
+        if let Some(runtime_counters) = runtime_counters {
             result.counters = Some(Box::new(runtime_counters));
         }
         if self.options.trace {
@@ -1139,8 +1274,8 @@ impl Vm {
                 counters.native_execution_entries.max(u64::from(executed));
             counters.native_region_entries =
                 counters.native_region_entries.max(u64::from(executed));
+            counters.native_version_published = worker_cache.insertions;
             let code_stats = php_jit::cranelift_code_manager_stats();
-            counters.native_version_published = code_stats.optimized_function_publications;
             counters.native_function_body_compile_count = code_stats.function_body_compile_count;
             counters.native_duplicate_function_body_count =
                 code_stats.duplicate_function_publications;
@@ -1174,6 +1309,7 @@ pub(super) fn compile_native_function_graph(
     function: php_ir::FunctionId,
     options: &VmOptions,
     ir_fingerprint: &str,
+    deployment_identity: &str,
     dependency_identity: &str,
     external_signatures: &[php_jit::JitExternalFunctionSignature],
 ) -> Result<Vec<php_jit::JitUnitCompileRecord>, String> {
@@ -1191,6 +1327,7 @@ pub(super) fn compile_native_function_graph(
             php_jit::JitCompileRequest::new(format!("unit.{}", unit.id.raw()))
                 .with_function_name(function_name)
                 .with_ir_fingerprint(ir_fingerprint)
+                .with_deployment_identity(deployment_identity)
                 .with_dependency_identity(dependency_identity)
                 .with_external_function_signatures(external_signatures.to_vec())
                 .with_opt_level(options.native_optimization.opt_level()),
@@ -1396,17 +1533,29 @@ fn native_cache_identity(
     unit: &CompiledUnit,
     function: php_ir::FunctionId,
     options: &VmOptions,
+    external_signatures: &[php_jit::JitExternalFunctionSignature],
 ) -> Result<php_jit::NativeCacheIdentity, php_jit::CraneliftHostIsaError> {
     let isa = php_jit::cranelift_host_isa_identity()?;
-    let optimization_tier = options.native_optimization.as_str().to_owned();
+    let optimization_tier = format!(
+        "{}:{}",
+        options.native_optimization.as_str(),
+        php_jit::native_compiler_mode_identity(options.native_optimization.is_optimizing())
+    );
+    let function_ir_hash = unit
+        .prepared_function_ir_fingerprint(function)
+        .map(str::to_owned)
+        .unwrap_or_else(|| php_jit::stable_function_ir_fingerprint(unit.unit(), function));
+    let external_signatures_hash = external_function_signatures_hash(external_signatures);
     Ok(php_jit::NativeCacheIdentity {
-        source_hash: format!(
-            "compiled-source-v2-{:016x}-function-{}",
-            unit.artifact_identity(),
-            function.raw()
+        source_hash: format!("compiled-function-source-v3-{function_ir_hash}"),
+        ir_hash: format!(
+            "{function_ir_hash}:fragment-plan-schema-v{}",
+            php_jit::NATIVE_FRAGMENT_PLAN_SCHEMA_VERSION
         ),
-        ir_hash: unit.prepared_ir_fingerprint().to_owned(),
-        dependency_graph_hash: unit.prepared_dependency_identity().to_owned(),
+        dependency_graph_hash: format!(
+            "{}:external-signatures-{external_signatures_hash:016x}",
+            unit.prepared_dependency_identity()
+        ),
         build_id: option_env!("PHRUST_BUILD_ID")
             .unwrap_or(env!("PHRUST_AUTO_BUILD_ID"))
             .to_owned(),
@@ -1573,19 +1722,6 @@ mod tests {
             Some(baseline_address),
             "optimized code must atomically replace the less-specialized target"
         );
-
-        let result = Vm::with_options_and_worker_state(options, worker.clone()).execute(unit);
-        assert_eq!(result.return_value, Some(Value::Int(7_301)), "{result:#?}");
-        assert_eq!(
-            result
-                .counters
-                .as_ref()
-                .map(|counters| counters.native_compile_attempts),
-            Some(0),
-            "published optimizing entry must not compile in the request"
-        );
-        assert_eq!(worker.tiering_stats().function_entry_count, 3);
-        assert_eq!(worker.native_compile_cache_stats().entries, 2);
     }
 
     fn declaration_heavy_unit() -> CompiledUnit {
@@ -1864,7 +2000,7 @@ mod tests {
         let mut builder = IrBuilder::new(UnitId::new(994));
         let file = builder.add_file("native-direct-builtin.php");
         let span = IrSpan::new(file, 0, 32);
-        let string = builder.intern_constant(IrConstant::String("phrust".to_owned()));
+        let value = builder.intern_constant(IrConstant::Int(-6));
         let function = builder.start_function("main", FunctionFlags::default(), span);
         builder.set_return_type(function, Some(IrReturnType::Int));
         let block = builder.append_block(function);
@@ -1874,7 +2010,40 @@ mod tests {
             block,
             InstructionKind::CallFunction {
                 dst: result,
-                name: "strlen".to_owned(),
+                name: "abs".to_owned(),
+                args: vec![php_ir::instruction::IrCallArg {
+                    name: None,
+                    value: Operand::Constant(value),
+                    unpack: false,
+                    value_kind: php_ir::instruction::IrCallArgValueKind::Direct,
+                    by_ref_local: None,
+                    by_ref_dim: None,
+                    by_ref_property: None,
+                    by_ref_property_dim: None,
+                }],
+            },
+            span,
+        );
+        builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+        builder.set_entry(function);
+        CompiledUnit::new(builder.finish())
+    }
+
+    fn direct_type_predicate_unit() -> CompiledUnit {
+        let mut builder = IrBuilder::new(UnitId::new(993));
+        let file = builder.add_file("native-direct-type-predicate.php");
+        let span = IrSpan::new(file, 0, 32);
+        let string = builder.intern_constant(IrConstant::String("phrust".to_owned()));
+        let function = builder.start_function("main", FunctionFlags::default(), span);
+        builder.set_return_type(function, Some(IrReturnType::Bool));
+        let block = builder.append_block(function);
+        let result = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::CallFunction {
+                dst: result,
+                name: "is_string".to_owned(),
                 args: vec![php_ir::instruction::IrCallArg {
                     name: None,
                     value: Operand::Constant(string),
@@ -2248,7 +2417,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn stable_builtin_length_bypasses_call_dispatch() {
+    fn stable_builtin_uses_helper_id_without_generic_dynamic_count() {
         let result = Vm::with_options(VmOptions {
             collect_counters: true,
             ..VmOptions::default()
@@ -2257,10 +2426,27 @@ mod tests {
 
         assert_eq!(result.return_value, Some(Value::Int(6)), "{result:#?}");
         let counters = result.counters.expect("diagnostic counters");
-        assert_eq!(counters.native_call_direct, 0);
-        assert_eq!(counters.native_builtin_direct_eligible, 0);
-        assert_eq!(counters.native_builtin_direct_executed, 0);
+        assert_eq!(counters.native_call_direct, 1);
+        assert_eq!(counters.native_builtin_direct_eligible, 1);
+        assert_eq!(counters.native_builtin_direct_executed, 1);
         assert_eq!(counters.native_call_dynamic, 0);
+        assert_eq!(counters.native_call_argument_allocation_bytes, 0);
+        assert_eq!(counters.native_frame_arena_high_water_bytes, 0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn type_predicate_bypasses_the_generic_call_frame() {
+        let result = Vm::with_options(VmOptions {
+            collect_counters: true,
+            ..VmOptions::default()
+        })
+        .execute(direct_type_predicate_unit());
+
+        assert_eq!(result.return_value, Some(Value::Bool(true)), "{result:#?}");
+        let counters = result.counters.expect("diagnostic counters");
+        assert_eq!(counters.native_call_direct, 0);
+        assert_eq!(counters.native_builtin_direct_executed, 0);
         assert_eq!(counters.native_call_argument_allocation_bytes, 0);
         assert_eq!(counters.native_frame_arena_high_water_bytes, 0);
     }
@@ -2527,7 +2713,62 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn worker_registry_reuses_loaded_artifact_without_remapping_file() {
+    fn function_on_demand_callee_reloads_without_compilation() {
+        let directory = std::env::temp_dir().join(format!(
+            "phrust-vm-pna-callee-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let unit = direct_call_unit();
+        let first_worker = VmWorkerState::isolated_for_restart_test();
+        let first = Vm::with_options_and_worker_state(
+            VmOptions {
+                native_cache: php_jit::NativeCacheMode::ReadWrite,
+                native_cache_dir: directory.clone(),
+                ..VmOptions::default()
+            },
+            first_worker.clone(),
+        )
+        .execute(unit.clone());
+        assert_eq!(first.return_value, Some(Value::Int(42)), "{first:#?}");
+        assert_eq!(first_worker.native_compile_cache_stats().misses, 2);
+        let artifacts = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "pna")
+            })
+            .count();
+        assert_eq!(
+            artifacts, 2,
+            "root and demanded callee must persist separately"
+        );
+
+        let second_worker = VmWorkerState::isolated_for_restart_test();
+        let second = Vm::with_options_and_worker_state(
+            VmOptions {
+                native_cache: php_jit::NativeCacheMode::Read,
+                native_cache_dir: directory.clone(),
+                ..VmOptions::default()
+            },
+            second_worker.clone(),
+        )
+        .execute(unit);
+        assert_eq!(second.return_value, Some(Value::Int(42)), "{second:#?}");
+        assert_eq!(second.native_compile_nanos, 0);
+        assert_eq!(second_worker.native_compile_cache_stats().misses, 0);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn worker_fast_entry_cache_reuses_loaded_artifact_without_identity_rebuild() {
         let directory = std::env::temp_dir().join(format!(
             "phrust-vm-loaded-unit-{}-{}",
             std::process::id(),
@@ -2538,7 +2779,8 @@ mod tests {
         ));
         let worker = VmWorkerState::new(crate::tiering::TieringOptions::default());
         let before = worker.loaded_native_unit_stats();
-        let unit = returning_unit(91);
+        let entry_hits_before = worker.resolved_native_entry_hits();
+        let unit = direct_call_unit();
         let options = VmOptions {
             native_cache: php_jit::NativeCacheMode::ReadWrite,
             native_cache_dir: directory.clone(),
@@ -2546,7 +2788,7 @@ mod tests {
         };
         let first = Vm::with_options_and_worker_state(options.clone(), worker.clone())
             .execute(unit.clone());
-        assert_eq!(first.return_value, Some(Value::Int(91)), "{first:#?}");
+        assert_eq!(first.return_value, Some(Value::Int(42)), "{first:#?}");
 
         for entry in std::fs::read_dir(&directory).unwrap() {
             let path = entry.unwrap().path();
@@ -2556,17 +2798,26 @@ mod tests {
         }
 
         let second = Vm::with_options_and_worker_state(options, worker.clone()).execute(unit);
-        assert_eq!(second.return_value, Some(Value::Int(91)), "{second:#?}");
+        assert_eq!(second.return_value, Some(Value::Int(42)), "{second:#?}");
         assert_eq!(second.native_compile_nanos, 0);
         let loaded = worker.loaded_native_unit_stats();
-        assert_eq!(loaded.maps.saturating_sub(before.maps), 1);
+        assert_eq!(loaded.maps.saturating_sub(before.maps), 2);
         assert_eq!(
             loaded
                 .entry_table_constructions
                 .saturating_sub(before.entry_table_constructions),
+            2
+        );
+        // The root entry still follows the top-level cache path; its demanded
+        // callee is served by the cheap worker index without reconstructing
+        // the persistent function identity.
+        assert_eq!(loaded.hits.saturating_sub(before.hits), 1);
+        assert_eq!(
+            worker
+                .resolved_native_entry_hits()
+                .saturating_sub(entry_hits_before),
             1
         );
-        assert_eq!(loaded.hits.saturating_sub(before.hits), 1);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

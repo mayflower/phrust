@@ -334,8 +334,15 @@ pub(crate) fn preload_script_cache(
                     .services
                     .engine
                     .executor(state.services.engine.executor_options());
-                prewarmed_entries =
-                    prewarmed_entries.saturating_add(executor.prewarm_compiled(&lookup.compiled));
+                // A restart-persistent read cache is the authoritative cold
+                // native source. Compiling the entry during script preload
+                // defeats restart reuse and makes startup report a compile
+                // before the first request can map the exact function
+                // artifact. Script/CST preload remains useful independently.
+                if !state.services.engine.native_cache.can_read() {
+                    prewarmed_entries = prewarmed_entries
+                        .saturating_add(executor.prewarm_compiled(&lookup.compiled));
+                }
                 preload_include_cache_entry(state, &script_path).map_err(|error| {
                     Box::new(PreloadError::include_entry(
                         preload_file,

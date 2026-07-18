@@ -1,7 +1,7 @@
 use super::NativeExecutionContext;
 
-const HELPER_OTHER: usize = 39;
-const HELPER_NAMES: [&str; 40] = [
+const HELPER_OTHER: usize = 48;
+const HELPER_NAMES: [&str; 49] = [
     "execution_poll",
     "unary",
     "binary",
@@ -10,6 +10,7 @@ const HELPER_NAMES: [&str; 40] = [
     "echo",
     "local_fetch",
     "local_store",
+    "argument_check",
     "value_retain",
     "value_release",
     "reference_bind",
@@ -30,8 +31,6 @@ const HELPER_NAMES: [&str; 40] = [
     "foreach_cleanup",
     "constant_fetch",
     "truthy",
-    "type_predicate",
-    "stable_length",
     "runtime_fatal",
     "dynamic_code",
     "call_function",
@@ -40,6 +39,16 @@ const HELPER_NAMES: [&str; 40] = [
     "call_callable",
     "call_constructor",
     "call_runtime_intrinsic",
+    "call_builtin_direct",
+    "semantic_static_property",
+    "semantic_class_constant",
+    "semantic_object_class_name",
+    "semantic_instanceof",
+    "semantic_resolve_callable",
+    "semantic_acquire_callable",
+    "semantic_property",
+    "semantic_bind_global",
+    "semantic_bound_closure_class",
     "native_transition",
     "other",
 ];
@@ -92,7 +101,7 @@ const ROOT_REASONS: [&str; 10] = [
     "rooted_container",
     "call_arguments",
 ];
-const IR_OPERATIONS: [&str; 42] = [
+const IR_OPERATIONS: [&str; 36] = [
     "unary_plus",
     "unary_minus",
     "unary_not",
@@ -129,12 +138,6 @@ const IR_OPERATIONS: [&str; 42] = [
     "store_local",
     "value_lifecycle",
     "truthy",
-    "reference_bind_value",
-    "reference_bind_dimension",
-    "reference_bind_static_local",
-    "reference_bind_property",
-    "reference_publish_local",
-    "reference_bind_static_property",
 ];
 const SLOW_PATH_REASONS: [&str; 8] = [
     "numeric_or_coercion",
@@ -161,7 +164,6 @@ pub(super) struct NativeRuntimeTelemetry {
     helper_time_nanos: [u64; HELPER_NAMES.len()],
     local_reads: [u64; LOCAL_REASONS.len()],
     local_stores: [u64; LOCAL_REASONS.len()],
-    reference_read_classes: [u64; VALUE_CLASSES.len()],
     truthy_classes: [u64; VALUE_CLASSES.len()],
     retains: [u64; LIFECYCLE_REASONS.len()],
     releases: [u64; LIFECYCLE_REASONS.len()],
@@ -182,7 +184,6 @@ impl Default for NativeRuntimeTelemetry {
             helper_time_nanos: [0; HELPER_NAMES.len()],
             local_reads: [0; LOCAL_REASONS.len()],
             local_stores: [0; LOCAL_REASONS.len()],
-            reference_read_classes: [0; VALUE_CLASSES.len()],
             truthy_classes: [0; VALUE_CLASSES.len()],
             retains: [0; LIFECYCLE_REASONS.len()],
             releases: [0; LIFECYCLE_REASONS.len()],
@@ -273,6 +274,10 @@ impl NativeRuntimeTelemetry {
 
 impl NativeExecutionContext<'_> {
     pub(in crate::vm) fn runtime_counters(&self) -> crate::counters::VmCounters {
+        debug_assert!(
+            self.options.collect_counters,
+            "runtime counter materialization must stay off the uninstrumented execution path"
+        );
         let telemetry = self.runtime_telemetry.borrow();
         let mut counters = telemetry.counters.clone();
         counters.runtime_helper_calls_by_id = HELPER_NAMES
@@ -299,8 +304,6 @@ impl NativeExecutionContext<'_> {
             named_counters(&LOCAL_REASONS, telemetry.local_reads);
         counters.runtime_helper_local_store_by_reason =
             named_counters(&LOCAL_REASONS, telemetry.local_stores);
-        counters.runtime_helper_reference_read_by_value_class =
-            named_counters(&VALUE_CLASSES, telemetry.reference_read_classes);
         counters.runtime_helper_truthy_by_value_class =
             named_counters(&VALUE_CLASSES, telemetry.truthy_classes);
         counters.runtime_helper_retain_by_reason =
@@ -349,11 +352,9 @@ impl NativeExecutionContext<'_> {
             self.native_frame_arena.capacity_bytes() as u64;
         counters.native_frame_arena_high_water_bytes =
             self.native_frame_arena.high_water_bytes() as u64;
-        if self.options.collect_counters {
-            let (stack_virtual, stack_committed) = current_php_worker_stack_bytes();
-            counters.native_worker_stack_virtual_bytes = stack_virtual;
-            counters.native_worker_stack_committed_bytes = stack_committed;
-        }
+        let (stack_virtual, stack_committed) = current_php_worker_stack_bytes();
+        counters.native_worker_stack_virtual_bytes = stack_virtual;
+        counters.native_worker_stack_committed_bytes = stack_committed;
         counters
     }
 
@@ -576,14 +577,6 @@ impl NativeExecutionContext<'_> {
         counters.native_builtin_direct_executed = counters
             .native_builtin_direct_executed
             .saturating_add(nested.native_builtin_direct_executed);
-        merge_counter_map(
-            &mut counters.native_builtin_calls_by_name,
-            &nested.native_builtin_calls_by_name,
-        );
-        merge_counter_map(
-            &mut counters.native_builtin_time_nanos_by_name,
-            &nested.native_builtin_time_nanos_by_name,
-        );
         counters.native_call_argument_allocation_bytes = counters
             .native_call_argument_allocation_bytes
             .saturating_add(nested.native_call_argument_allocation_bytes);
@@ -623,12 +616,6 @@ impl NativeExecutionContext<'_> {
         counters.runtime_helper_release_to_zero = counters
             .runtime_helper_release_to_zero
             .saturating_add(nested.runtime_helper_release_to_zero);
-        counters.native_value_encodes = counters
-            .native_value_encodes
-            .saturating_add(nested.native_value_encodes);
-        counters.native_value_decodes = counters
-            .native_value_decodes
-            .saturating_add(nested.native_value_decodes);
         counters.native_value_table_allocations = counters
             .native_value_table_allocations
             .saturating_add(nested.native_value_table_allocations);
@@ -670,10 +657,6 @@ impl NativeExecutionContext<'_> {
         merge_counter_map(
             &mut counters.native_call_dynamic_by_reason,
             &nested.native_call_dynamic_by_reason,
-        );
-        merge_counter_map(
-            &mut counters.native_call_dynamic_by_target,
-            &nested.native_call_dynamic_by_target,
         );
         merge_gauge_map_max(
             &mut counters.native_code_bytes_by_function,
@@ -747,11 +730,6 @@ impl NativeExecutionContext<'_> {
             &mut telemetry.local_stores,
             &LOCAL_REASONS,
             &nested.runtime_helper_local_store_by_reason,
-        );
-        merge_named_scratch(
-            &mut telemetry.reference_read_classes,
-            &VALUE_CLASSES,
-            &nested.runtime_helper_reference_read_by_value_class,
         );
         merge_named_scratch(
             &mut telemetry.truthy_classes,
@@ -862,17 +840,6 @@ impl NativeExecutionContext<'_> {
         );
     }
 
-    pub(super) fn record_reference_read_class(&self, class: &'static str) {
-        if !self.options.collect_counters {
-            return;
-        }
-        record_scratch(
-            &mut self.runtime_telemetry.borrow_mut().reference_read_classes,
-            &VALUE_CLASSES,
-            class,
-        );
-    }
-
     pub(super) fn record_truthy_class(&self, class: &'static str) {
         if !self.options.collect_counters {
             return;
@@ -937,22 +904,6 @@ impl NativeExecutionContext<'_> {
                 .counters
                 .native_value_table_high_water
                 .max(high_water as u64);
-        }
-    }
-
-    pub(super) fn record_value_encode(&self) {
-        if self.options.collect_counters {
-            let mut telemetry = self.runtime_telemetry.borrow_mut();
-            telemetry.counters.native_value_encodes =
-                telemetry.counters.native_value_encodes.saturating_add(1);
-        }
-    }
-
-    pub(super) fn record_value_decode(&self) {
-        if self.options.collect_counters {
-            let mut telemetry = self.runtime_telemetry.borrow_mut();
-            telemetry.counters.native_value_decodes =
-                telemetry.counters.native_value_decodes.saturating_add(1);
         }
     }
 

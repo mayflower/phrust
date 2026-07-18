@@ -442,20 +442,72 @@ impl RegionInstruction {
                 uses.push(register);
             }
         };
-        match self.kind {
+        match &self.kind {
             RegionInstructionKind::Move { src, .. }
             | RegionInstructionKind::Unary { src, .. }
             | RegionInstructionKind::Cast { src, .. }
             | RegionInstructionKind::Discard { src }
-            | RegionInstructionKind::Echo { src } => push(src),
+            | RegionInstructionKind::Echo { src } => push(*src),
             RegionInstructionKind::Binary { lhs, rhs, .. }
             | RegionInstructionKind::Compare { lhs, rhs, .. } => {
-                push(lhs);
-                push(rhs);
+                push(*lhs);
+                push(*rhs);
+            }
+            RegionInstructionKind::NativeCall(call) => {
+                for operand in call.operands.iter().flatten() {
+                    push(*operand);
+                }
+                let mut push_ir = |operand: Operand| {
+                    if let Operand::Register(register) = operand {
+                        uses.push(register);
+                    }
+                };
+                for argument in &call.args {
+                    push_ir(argument.value);
+                    if let Some(dimension) = &argument.by_ref_dim {
+                        for dimension in &dimension.dims {
+                            push_ir(*dimension);
+                        }
+                    }
+                    if let Some(property) = &argument.by_ref_property {
+                        push_ir(property.object);
+                    }
+                    if let Some(property) = &argument.by_ref_property_dim {
+                        push_ir(property.object);
+                        for dimension in &property.dims {
+                            push_ir(*dimension);
+                        }
+                    }
+                }
             }
             _ => php_ir::instruction_register_uses(&self.source_kind, &mut uses),
         }
+        uses.sort_unstable();
+        uses.dedup();
         uses
+    }
+
+    /// Returns registers materialized or updated by this instruction. This is
+    /// the baseline planner's definition set; it deliberately follows the
+    /// executable operation while retaining the authoritative source defs for
+    /// forms that have not been rewritten.
+    #[must_use]
+    pub fn register_definitions(&self) -> Vec<RegId> {
+        let mut definitions = Vec::new();
+        php_ir::instruction_register_defs(&self.source_kind, &mut definitions);
+        match &self.kind {
+            RegionInstructionKind::ArrayInsert { array, .. }
+            | RegionInstructionKind::ArraySpread { array, .. } => definitions.push(*array),
+            RegionInstructionKind::ForeachNext { key, value, .. } => {
+                definitions.extend(*key);
+                definitions.push(*value);
+            }
+            RegionInstructionKind::ForeachNextRef { key, .. } => definitions.extend(*key),
+            _ => {}
+        }
+        definitions.sort_unstable();
+        definitions.dedup();
+        definitions
     }
 }
 
@@ -3740,19 +3792,84 @@ fn declaration_metadata(unit: &IrUnit, function: FunctionId) -> RegionDeclaratio
     }
 }
 
-fn populate_live_locals(blocks: &mut [RegionBlock], params: &[LocalId]) {
-    let mut candidates = params.iter().copied().collect::<BTreeSet<_>>();
-    let mut definitions = Vec::with_capacity(blocks.len());
-    let mut predecessors = vec![Vec::<usize>::new(); blocks.len()];
-    for block in blocks.iter() {
-        let mut defs = BTreeSet::new();
-        for instruction in &block.instructions {
-            if let Some(local) = native_local_state_definition(&instruction.kind) {
-                defs.insert(local);
-                candidates.insert(local);
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalBitSet {
+    words: Vec<u64>,
+}
+
+impl LocalBitSet {
+    fn empty(word_count: usize) -> Self {
+        Self {
+            words: vec![0; word_count],
+        }
+    }
+
+    fn insert(&mut self, local: LocalId) {
+        let index = local.index();
+        self.words[index / u64::BITS as usize] |= 1_u64 << (index % u64::BITS as usize);
+    }
+
+    fn union_with(&mut self, other: &Self) {
+        for (word, other) in self.words.iter_mut().zip(&other.words) {
+            *word |= *other;
+        }
+    }
+
+    fn intersect_with_out(&mut self, incoming: &Self, definitions: &Self) {
+        for ((word, incoming), definitions) in self
+            .words
+            .iter_mut()
+            .zip(&incoming.words)
+            .zip(&definitions.words)
+        {
+            *word &= *incoming | *definitions;
+        }
+    }
+
+    fn replace_with_out(&mut self, incoming: &Self, definitions: &Self) {
+        for ((word, incoming), definitions) in self
+            .words
+            .iter_mut()
+            .zip(&incoming.words)
+            .zip(&definitions.words)
+        {
+            *word = *incoming | *definitions;
+        }
+    }
+
+    fn to_locals(&self) -> Vec<LocalId> {
+        let mut locals = Vec::new();
+        for (word_index, word) in self.words.iter().copied().enumerate() {
+            let mut remaining = word;
+            while remaining != 0 {
+                let bit = remaining.trailing_zeros() as usize;
+                let index = u32::try_from(word_index * u64::BITS as usize + bit)
+                    .expect("local bitset index derives from LocalId");
+                locals.push(LocalId::new(index));
+                remaining &= remaining - 1;
             }
         }
-        definitions.push(defs);
+        locals
+    }
+}
+
+fn populate_live_locals(blocks: &mut [RegionBlock], params: &[LocalId]) {
+    let mut definition_ids = Vec::with_capacity(blocks.len());
+    let mut predecessors = vec![Vec::<usize>::new(); blocks.len()];
+    let mut local_count = params
+        .iter()
+        .map(|local| local.index().saturating_add(1))
+        .max()
+        .unwrap_or(0);
+    for block in blocks.iter() {
+        let mut defs = Vec::new();
+        for instruction in &block.instructions {
+            if let Some(local) = native_local_state_definition(&instruction.kind) {
+                defs.push(local);
+                local_count = local_count.max(local.index().saturating_add(1));
+            }
+        }
+        definition_ids.push(defs);
         for target in block.terminator.targets() {
             if let Some(target_predecessors) = predecessors.get_mut(target.index()) {
                 target_predecessors.push(block.id.index());
@@ -3760,31 +3877,40 @@ fn populate_live_locals(blocks: &mut [RegionBlock], params: &[LocalId]) {
         }
     }
 
-    let entry = params.iter().copied().collect::<BTreeSet<_>>();
+    let word_count = local_count.div_ceil(u64::BITS as usize);
+    let mut candidates = LocalBitSet::empty(word_count);
+    let mut definitions = Vec::with_capacity(blocks.len());
+    for defs in definition_ids {
+        let mut definition = LocalBitSet::empty(word_count);
+        for local in defs {
+            definition.insert(local);
+            candidates.insert(local);
+        }
+        definitions.push(definition);
+    }
+    let mut entry = LocalBitSet::empty(word_count);
+    for local in params {
+        entry.insert(*local);
+        candidates.insert(*local);
+    }
     let mut initialized_in = vec![candidates.clone(); blocks.len()];
     if let Some(first) = initialized_in.first_mut() {
         *first = entry.clone();
     }
+    let mut incoming = LocalBitSet::empty(word_count);
     loop {
-        let initialized_out = initialized_in
-            .iter()
-            .zip(&definitions)
-            .map(|(incoming, defs)| incoming.union(defs).copied().collect::<BTreeSet<_>>())
-            .collect::<Vec<_>>();
         let mut changed = false;
         for block_index in 1..blocks.len() {
             let Some((first, rest)) = predecessors[block_index].split_first() else {
                 continue;
             };
-            let mut incoming = initialized_out[*first].clone();
+            incoming.replace_with_out(&initialized_in[*first], &definitions[*first]);
             for predecessor in rest {
-                incoming = incoming
-                    .intersection(&initialized_out[*predecessor])
-                    .copied()
-                    .collect();
+                incoming
+                    .intersect_with_out(&initialized_in[*predecessor], &definitions[*predecessor]);
             }
             if initialized_in[block_index] != incoming {
-                initialized_in[block_index] = incoming;
+                initialized_in[block_index].clone_from(&incoming);
                 changed = true;
             }
         }
@@ -3793,24 +3919,20 @@ fn populate_live_locals(blocks: &mut [RegionBlock], params: &[LocalId]) {
         }
     }
 
-    let mut materialized_in = vec![BTreeSet::<LocalId>::new(); blocks.len()];
+    let mut materialized_in = vec![LocalBitSet::empty(word_count); blocks.len()];
     if let Some(first) = materialized_in.first_mut() {
         *first = entry.clone();
     }
     loop {
-        let materialized_out = materialized_in
-            .iter()
-            .zip(&definitions)
-            .map(|(incoming, defs)| incoming.union(defs).copied().collect::<BTreeSet<_>>())
-            .collect::<Vec<_>>();
         let mut changed = false;
         for block_index in 1..blocks.len() {
-            let incoming = predecessors[block_index]
-                .iter()
-                .flat_map(|predecessor| materialized_out[*predecessor].iter().copied())
-                .collect::<BTreeSet<_>>();
+            incoming.words.fill(0);
+            for predecessor in &predecessors[block_index] {
+                incoming.union_with(&materialized_in[*predecessor]);
+                incoming.union_with(&definitions[*predecessor]);
+            }
             if materialized_in[block_index] != incoming {
-                materialized_in[block_index] = incoming;
+                materialized_in[block_index].clone_from(&incoming);
                 changed = true;
             }
         }
@@ -3824,17 +3946,17 @@ fn populate_live_locals(blocks: &mut [RegionBlock], params: &[LocalId]) {
     {
         let mut initialized = incoming;
         let mut materialized = state_incoming;
-        block.entry_live_locals = initialized.iter().copied().collect();
-        block.entry_state_locals = materialized.iter().copied().collect();
+        block.entry_live_locals = initialized.to_locals();
+        block.entry_state_locals = materialized.to_locals();
         for instruction in &mut block.instructions {
-            instruction.live_locals = initialized.iter().copied().collect();
+            instruction.live_locals = initialized.to_locals();
             if let Some(local) = native_local_state_definition(&instruction.kind) {
                 initialized.insert(local);
                 materialized.insert(local);
             }
         }
-        block.terminator_live_locals = initialized.into_iter().collect();
-        block.terminator_state_locals = materialized.into_iter().collect();
+        block.terminator_live_locals = initialized.to_locals();
+        block.terminator_state_locals = materialized.to_locals();
     }
 }
 

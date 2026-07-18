@@ -51,9 +51,9 @@ pub use code_manager::{
 };
 pub use cranelift_lowering::{
     CraneliftClifSmokeResult, CraneliftLoweringError, CraneliftLoweringStats,
-    CraneliftNativeCompiler, NativeCompilePlan, NativeFunctionKey, NativeFunctionTier,
-    NativeIndirectionCell, NativeIndirectionState, build_trivial_add_clif_smoke,
-    native_function_key,
+    CraneliftNativeCompiler, NATIVE_FRAGMENT_PLAN_SCHEMA_VERSION, NativeCompilePlan,
+    NativeFunctionKey, NativeFunctionTier, NativeIndirectionCell, NativeIndirectionState,
+    build_trivial_add_clif_smoke, native_compiler_mode_identity, native_function_key,
 };
 pub use dynamic_code::{
     DynamicCodeCacheDisposition, DynamicCodeCacheKey, DynamicCodeCompileError,
@@ -176,7 +176,7 @@ pub struct JitRuntimeHelperAddresses {
     pub native_constant_fetch: usize,
     /// Typed PHP truthiness operation used by native branches.
     pub native_truthy: usize,
-    /// Stable builtin PHP type-predicate slow path.
+    /// Direct, non-allocating PHP type-predicate operation.
     pub native_type_predicate: usize,
     /// Typed `strlen`/array `count` slow path for stable value views.
     pub native_stable_length: usize,
@@ -186,11 +186,28 @@ pub struct JitRuntimeHelperAddresses {
     pub native_execution_poll: usize,
 }
 
+/// Type predicates that generated baseline code may invoke without building a
+/// generic PHP call frame. Numeric values are part of the runtime-helper ABI.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JitNativeTypePredicate {
+    Int = 1,
+    Float = 2,
+    String = 3,
+    Bool = 4,
+    Null = 5,
+    Array = 6,
+    Object = 7,
+    Resource = 8,
+    Scalar = 9,
+    Iterable = 10,
+}
+
 /// Stable high-bit namespace for immutable IR constant handles.
 pub const JIT_VALUE_CONSTANT_TAG: u64 = 0x7ff1_0000_0000_0000;
 /// Stable high-bit namespace for request-owned runtime value handles.
 pub const JIT_VALUE_RUNTIME_TAG: u64 = 0x7ff2_0000_0000_0000;
-/// Stable high-bit namespace for request-owned reference-cell handles.
+/// Stable high-bit namespace for request-owned reference handles.
 pub const JIT_VALUE_RUNTIME_REFERENCE_TAG: u64 = 0x7ff2_0001_0000_0000;
 /// Stable high-bit namespace for request-owned array handles.
 pub const JIT_VALUE_RUNTIME_ARRAY_TAG: u64 = 0x7ff2_0002_0000_0000;
@@ -198,12 +215,12 @@ pub const JIT_VALUE_RUNTIME_ARRAY_TAG: u64 = 0x7ff2_0002_0000_0000;
 pub const JIT_VALUE_RUNTIME_OBJECT_TAG: u64 = 0x7ff2_0003_0000_0000;
 /// Stable high-bit namespace for request-owned string handles.
 pub const JIT_VALUE_RUNTIME_STRING_TAG: u64 = 0x7ff2_0004_0000_0000;
-/// Stable high-bit namespace for request-owned boxed float values.
+/// Stable high-bit namespace for request-owned float handles.
 pub const JIT_VALUE_RUNTIME_FLOAT_TAG: u64 = 0x7ff2_0005_0000_0000;
-/// Stable high-bit namespace for request-owned callable handles.
-pub const JIT_VALUE_RUNTIME_CALLABLE_TAG: u64 = 0x7ff2_0006_0000_0000;
 /// Stable high-bit namespace for request-owned resource handles.
-pub const JIT_VALUE_RUNTIME_RESOURCE_TAG: u64 = 0x7ff2_0007_0000_0000;
+pub const JIT_VALUE_RUNTIME_RESOURCE_TAG: u64 = 0x7ff2_0006_0000_0000;
+/// Stable high-bit namespace for request-owned callable handles.
+pub const JIT_VALUE_RUNTIME_CALLABLE_TAG: u64 = 0x7ff2_0007_0000_0000;
 /// Stable high-bit namespace for request-owned generator handles.
 pub const JIT_VALUE_RUNTIME_GENERATOR_TAG: u64 = 0x7ff2_0008_0000_0000;
 /// Stable high-bit namespace for request-owned fiber handles.
@@ -220,6 +237,14 @@ pub const JIT_VALUE_UNINITIALIZED: u32 = u32::MAX - 1;
 pub const JIT_VALUE_FALSE: u32 = u32::MAX - 2;
 /// Reserved immutable handle for PHP `true`.
 pub const JIT_VALUE_TRUE: u32 = u32::MAX - 3;
+/// Local-fetch helper flag for an ordinary non-global slot whose immediate
+/// values can bypass request-context decoding.
+pub const JIT_LOCAL_FETCH_PLAIN_LOCAL: u32 = 1 << 1;
+/// Local-store helper flag for an ordinary non-global slot. The runtime still
+/// checks both handles for PHP references before using the plain replacement
+/// path.
+pub const JIT_LOCAL_STORE_PLAIN_LOCAL: u32 = 1;
+pub const JIT_LOCAL_STORE_MOVE_INPUT: u32 = 2;
 
 /// Encodes one IR constant identity in an i64 native slot.
 #[must_use]
@@ -296,8 +321,15 @@ pub struct JitCompileRequest {
     pub region_id: String,
     /// Optional PHP function or method name for reports.
     pub function_name: Option<String>,
-    /// Optional stable IR fingerprint when available.
+    /// Optional stable fingerprint of the requested function IR.
     pub ir_fingerprint: Option<String>,
+    /// Stable identity of the source unit used to address linkage cells.
+    ///
+    /// This is deliberately separate from `ir_fingerprint`: changing an
+    /// unrelated function must invalidate neither this function's code cache
+    /// nor its single-flight compile key, while every declaration in one unit
+    /// must still agree on the same indirection-cell namespace.
+    pub deployment_identity: Option<String>,
     /// Optimization level active when the request was made.
     pub opt_level: u8,
     /// Effective runtime/compiler configuration hash for process-cache identity.
@@ -318,6 +350,7 @@ impl JitCompileRequest {
             region_id: region_id.into(),
             function_name: None,
             ir_fingerprint: None,
+            deployment_identity: None,
             opt_level: 0,
             config_hash: 0,
             invalidation_generation: 0,
@@ -347,6 +380,13 @@ impl JitCompileRequest {
     #[must_use]
     pub fn with_ir_fingerprint(mut self, ir_fingerprint: impl Into<String>) -> Self {
         self.ir_fingerprint = Some(ir_fingerprint.into());
+        self
+    }
+
+    /// Adds the source-unit identity used by native linkage cells.
+    #[must_use]
+    pub fn with_deployment_identity(mut self, identity: impl Into<String>) -> Self {
+        self.deployment_identity = Some(identity.into());
         self
     }
 
@@ -556,6 +596,11 @@ pub struct JitNativeTransitionMetadata {
     pub span: IrSpan,
     pub live_locals: Vec<LocalId>,
     pub live_registers: Vec<php_ir::RegId>,
+    /// Baseline streaming-frame slot for each dense public snapshot register.
+    /// Empty for optimizing/legacy artifacts whose resume loaders consume the
+    /// dense snapshot directly.
+    #[serde(default)]
+    pub register_frame_slots: Vec<u8>,
     pub result_register: Option<php_ir::RegId>,
 }
 
@@ -1161,7 +1206,13 @@ impl JitFunctionHandle {
                             .unwrap_or(0))
                         != 0
                 });
-        if !locals_complete || !registers_complete {
+        let frame_layout_complete = transition.register_frame_slots.is_empty()
+            || (transition.register_frame_slots.len() == transition.live_registers.len()
+                && transition
+                    .register_frame_slots
+                    .iter()
+                    .all(|slot| usize::from(*slot) < JIT_DEOPT_MAX_REGISTERS));
+        if !locals_complete || !registers_complete || !frame_layout_complete {
             return Err(JitInvokeError::IncompleteNativeTransition(
                 state.continuation_id,
             ));
@@ -1179,10 +1230,24 @@ impl JitFunctionHandle {
         entry.address = function_entry.address;
         entry.arity = function_entry.arity;
         let args = vec![0_i64; usize::from(function_entry.arity)];
+        let normalized_state = (!transition.register_frame_slots.is_empty()).then(|| {
+            let mut normalized = state.clone();
+            normalized.initialized_register_mask = 0;
+            normalized.registers.fill(0);
+            for (source_slot, target_slot) in
+                transition.register_frame_slots.iter().copied().enumerate()
+            {
+                let target_slot = usize::from(target_slot);
+                normalized.registers[target_slot] = state.registers[source_slot];
+                normalized.initialized_register_mask |= 1_u64 << target_slot;
+            }
+            normalized
+        });
+        let resume_state = normalized_state.as_ref().unwrap_or(state);
         entry.invoke_i64_status_out_with_resume(
             &args,
             transition.resume_id,
-            state as *const JitNativeTransitionState,
+            resume_state as *const JitNativeTransitionState,
         )
     }
 
@@ -1944,9 +2009,10 @@ impl JitEngine {
         if request.region_id.is_empty() {
             return Err(JitError::EmptyRegionId);
         }
-        if request.ir_fingerprint.is_none() {
-            request.ir_fingerprint = Some(stable_ir_fingerprint(unit));
-        }
+        let deployment_identity = request
+            .deployment_identity
+            .get_or_insert_with(|| stable_ir_fingerprint(unit))
+            .clone();
         if request.dependency_identity.is_none() {
             request.dependency_identity = Some(stable_dependency_identity(unit));
         }
@@ -1960,6 +2026,9 @@ impl JitEngine {
             let mut function_request = request.clone();
             function_request.region_id = format!("{base_region}.function.{index}");
             function_request.function_name = Some(function.name.clone());
+            function_request.ir_fingerprint =
+                Some(stable_function_ir_fingerprint(unit, function_id));
+            function_request.deployment_identity = Some(deployment_identity.clone());
             let result = self.compile_function_with_runtime_helpers(
                 unit,
                 function_id,
@@ -2023,7 +2092,10 @@ impl JitEngine {
         runtime_helpers: JitRuntimeHelperAddresses,
     ) -> Result<JitCompileResult, JitError> {
         if request.ir_fingerprint.is_none() {
-            request.ir_fingerprint = Some(stable_ir_fingerprint(unit));
+            request.ir_fingerprint = Some(stable_function_ir_fingerprint(unit, function));
+        }
+        if request.deployment_identity.is_none() {
+            request.deployment_identity = Some(stable_ir_fingerprint(unit));
         }
         if request.dependency_identity.is_none() {
             request.dependency_identity = Some(stable_dependency_identity(unit));
@@ -2061,9 +2133,18 @@ impl JitEngine {
         &mut self,
         unit: &IrUnit,
         function: FunctionId,
-        request: JitCompileRequest,
+        mut request: JitCompileRequest,
         backend: &mut B,
     ) -> Result<JitCompileResult, JitError> {
+        if request.ir_fingerprint.is_none() {
+            request.ir_fingerprint = Some(stable_function_ir_fingerprint(unit, function));
+        }
+        if request.deployment_identity.is_none() {
+            request.deployment_identity = Some(stable_ir_fingerprint(unit));
+        }
+        if request.dependency_identity.is_none() {
+            request.dependency_identity = Some(stable_dependency_identity(unit));
+        }
         self.compile_inner(
             request,
             Some(unit),
@@ -2122,30 +2203,150 @@ pub fn stable_ir_fingerprint(unit: &IrUnit) -> String {
     format!(
         "php-ir-v{}-{:016x}",
         unit.version,
-        stable_text_hash(&format!("{unit:?}"))
+        stable_format_hash(format_args!("{unit:?}"))
     )
+}
+
+struct FunctionDeclarations<'unit>(&'unit [php_ir::IrFunction]);
+
+impl fmt::Debug for FunctionDeclarations<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_list()
+            .entries(self.0.iter().map(|function| {
+                (
+                    &function.name,
+                    &function.params,
+                    function.flags,
+                    &function.return_type,
+                    function.returns_by_ref,
+                    &function.captures,
+                    &function.attributes,
+                )
+            }))
+            .finish()
+    }
+}
+
+/// Stable identity for one requested PHP function and its semantic inputs.
+/// Unrelated function bodies are deliberately excluded so a function-on-demand
+/// artifact survives edits elsewhere in the source unit. Declaration shapes,
+/// class metadata, and the declaring file's strict-types mode remain included
+/// because they can change call lowering without changing the requested body.
+#[must_use]
+pub fn stable_function_ir_fingerprint(unit: &IrUnit, function: FunctionId) -> String {
+    let Some(body) = unit.functions.get(function.index()) else {
+        return format!("php-function-ir-v2-missing-{}", function.raw());
+    };
+    stable_function_ir_fingerprint_with_context(
+        unit,
+        function,
+        body,
+        stable_function_ir_fingerprint_context(unit),
+    )
+}
+
+/// Shared semantic identity used by function-scoped IR fingerprints.
+///
+/// Preparing this once lets function-on-demand callers hash only the requested
+/// body instead of formatting every dormant body in the source unit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StableFunctionIrFingerprintContext(u64);
+
+/// Hashes the unit-wide semantic tables shared by function-scoped identities.
+#[must_use]
+pub fn stable_function_ir_fingerprint_context(unit: &IrUnit) -> StableFunctionIrFingerprintContext {
+    StableFunctionIrFingerprintContext(stable_function_semantic_context_hash(unit))
+}
+
+/// Computes one function identity with an already prepared semantic context.
+#[must_use]
+pub fn stable_function_ir_fingerprint_in_context(
+    unit: &IrUnit,
+    function: FunctionId,
+    context: StableFunctionIrFingerprintContext,
+) -> String {
+    let Some(body) = unit.functions.get(function.index()) else {
+        return format!("php-function-ir-v2-missing-{}", function.raw());
+    };
+    stable_function_ir_fingerprint_with_context(unit, function, body, context)
+}
+
+/// Computes every function-scoped cache identity while hashing shared semantic
+/// tables only once. This is the production path for a prepared source unit.
+#[must_use]
+pub fn stable_function_ir_fingerprints(unit: &IrUnit) -> Vec<String> {
+    let semantic_context = stable_function_ir_fingerprint_context(unit);
+    unit.functions
+        .iter()
+        .enumerate()
+        .map(|(index, body)| {
+            let function = FunctionId::new(u32::try_from(index).unwrap_or(u32::MAX));
+            stable_function_ir_fingerprint_with_context(unit, function, body, semantic_context)
+        })
+        .collect()
+}
+
+fn stable_function_semantic_context_hash(unit: &IrUnit) -> u64 {
+    // Constant IDs are unit-relative and are embedded in the function body.
+    // Include the immutable table until php_ir exposes a canonical reachable-
+    // constant walk. Calls may be specialized from declaration and class
+    // metadata, so hash those tables while projecting every foreign function
+    // down to its body-free declaration shape.
+    let declarations = FunctionDeclarations(&unit.functions);
+    stable_format_hash(format_args!(
+        "constants={:?};declarations={declarations:?};function_table={:?};\
+         constant_table={:?};classes={:?}",
+        unit.constants, unit.function_table, unit.constant_table, unit.classes,
+    ))
+}
+
+fn stable_function_ir_fingerprint_with_context(
+    unit: &IrUnit,
+    function: FunctionId,
+    body: &php_ir::IrFunction,
+    semantic_context: StableFunctionIrFingerprintContext,
+) -> String {
+    let semantic_context = semantic_context.0;
+    let identity = stable_format_hash(format_args!(
+        "function={body:?};semantic_context={semantic_context:016x};strict_types={}",
+        unit.strict_types_for_function(function),
+    ));
+    format!("php-function-ir-v2-{identity:016x}")
 }
 
 /// Stable dependency-graph fingerprint used by native cache identities.
 #[must_use]
 pub fn stable_dependency_identity(unit: &IrUnit) -> String {
-    let dependencies = format!(
+    let dependencies = stable_format_hash(format_args!(
         "{:?}:{:?}:{:?}",
         unit.files, unit.linked_file_entries, unit.linked_entry_autoload_declarations
-    );
-    format!(
-        "php-dependencies-v1-{:016x}",
-        stable_text_hash(&dependencies)
-    )
+    ));
+    format!("php-dependencies-v1-{dependencies:016x}")
 }
 
-fn stable_text_hash(text: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in text.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+struct StableFormatHasher(u64);
+
+impl StableFormatHasher {
+    const fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325_u64)
     }
-    hash
+}
+
+impl fmt::Write for StableFormatHasher {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        for byte in text.bytes() {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        Ok(())
+    }
+}
+
+fn stable_format_hash(arguments: fmt::Arguments<'_>) -> u64 {
+    let mut hasher = StableFormatHasher::new();
+    fmt::Write::write_fmt(&mut hasher, arguments).expect("stable hash formatter cannot fail");
+    hasher.0
 }
 
 impl Default for JitEngine {
@@ -2176,6 +2377,81 @@ mod tests {
 
         assert_eq!(error, JitError::EmptyRegionId);
         assert_eq!(engine.stats().compile_requests, 0);
+    }
+
+    #[test]
+    fn function_fingerprint_excludes_unrelated_function_bodies() {
+        fn unit_with_foreign_result(foreign_constant: usize) -> php_ir::IrUnit {
+            let mut builder = IrBuilder::new(UnitId::new(45));
+            let file = builder.add_file("function-cache-identity.php");
+            let span = IrSpan::new(file, 0, 8);
+            let constants = [
+                builder.intern_constant(IrConstant::Int(1)),
+                builder.intern_constant(IrConstant::Int(2)),
+            ];
+
+            for (name, constant) in [
+                ("requested", constants[0]),
+                ("unrelated", constants[foreign_constant]),
+            ] {
+                let function = builder.start_function(name, FunctionFlags::default(), span);
+                builder.set_return_type(function, Some(IrReturnType::Int));
+                let block = builder.append_block(function);
+                let result = builder.alloc_register(function);
+                builder.emit(
+                    function,
+                    block,
+                    InstructionKind::LoadConst {
+                        dst: result,
+                        constant,
+                    },
+                    span,
+                );
+                builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+            }
+            builder.set_entry(FunctionId::new(0));
+            builder.finish()
+        }
+
+        let first = unit_with_foreign_result(0);
+        let changed = unit_with_foreign_result(1);
+        let batched = crate::stable_function_ir_fingerprints(&first);
+        let context = crate::stable_function_ir_fingerprint_context(&first);
+
+        assert_eq!(batched.len(), first.functions.len());
+        assert_eq!(
+            batched[0],
+            crate::stable_function_ir_fingerprint(&first, FunctionId::new(0))
+        );
+        assert_eq!(
+            batched[1],
+            crate::stable_function_ir_fingerprint(&first, FunctionId::new(1))
+        );
+        assert_eq!(
+            batched[0],
+            crate::stable_function_ir_fingerprint_in_context(&first, FunctionId::new(0), context,)
+        );
+
+        assert_ne!(
+            crate::stable_ir_fingerprint(&first),
+            crate::stable_ir_fingerprint(&changed)
+        );
+        assert_eq!(
+            crate::stable_function_ir_fingerprint(&first, FunctionId::new(0)),
+            crate::stable_function_ir_fingerprint(&changed, FunctionId::new(0))
+        );
+        assert_ne!(
+            crate::stable_function_ir_fingerprint(&first, FunctionId::new(1)),
+            crate::stable_function_ir_fingerprint(&changed, FunctionId::new(1))
+        );
+
+        let mut strict = first.clone();
+        strict.strict_types = true;
+        strict.file_strict_types[0] = true;
+        assert_ne!(
+            crate::stable_function_ir_fingerprint(&first, FunctionId::new(0)),
+            crate::stable_function_ir_fingerprint(&strict, FunctionId::new(0))
+        );
     }
 
     #[test]
@@ -2303,7 +2579,21 @@ mod tests {
         let metadata = handle.region_state_metadata().expect("entry metadata");
         assert_eq!(metadata.function_entries.len(), 1);
         assert_eq!(metadata.function_entries[0].function, entry);
-        assert_eq!(handle.relocatable_code().unwrap().functions.len(), 1);
+        let artifact_functions = &handle.relocatable_code().unwrap().functions;
+        assert_eq!(
+            artifact_functions
+                .iter()
+                .filter(|function| function.function.index() < unit.functions.len())
+                .count(),
+            1,
+            "internal native fragments must not be counted as foreign PHP function bodies"
+        );
+        assert!(
+            artifact_functions
+                .iter()
+                .filter(|function| function.function.index() < unit.functions.len())
+                .all(|function| function.function == entry)
+        );
         assert_eq!(
             handle.invoke_i64(&[], crate::JIT_RUNTIME_ABI_HASH).unwrap(),
             4

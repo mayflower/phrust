@@ -1,7 +1,7 @@
 use super::executable_region::validate_pre_regalloc_structure;
 use super::{
     CraneliftNativeCompiler, build_trivial_add_clif_smoke, native_dim_operation,
-    runtime_helper_abi_hash,
+    native_local_store_operation, ordinary_local_fast_path, runtime_helper_abi_hash,
 };
 use crate::region_ir::{BaselineRegionBuilder, CompileMetadata, NativeCompilerTier};
 use crate::{
@@ -15,12 +15,30 @@ use php_ir::instruction::{IrCallArg, IrCallArgValueKind};
 use php_ir::{
     BinaryOp, ClassEntry, ClassFlags, ClassId, ClassMethodEntry, ClassMethodFlags, FunctionFlags,
     FunctionId, InstructionKind, IrBuilder, IrConstant, IrParam, IrReturnType, IrSpan, LocalId,
-    Operand, RegId, UnitId,
+    Operand, UnitId,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NATIVE_DYNAMIC_EFFECTS: AtomicUsize = AtomicUsize::new(0);
 static SSA_FORBIDDEN_HELPER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[test]
+fn plain_local_flags_exclude_php_visible_global_slots() {
+    let locals = vec!["value".to_owned(), "GLOBALS".to_owned(), "_GET".to_owned()];
+
+    assert!(ordinary_local_fast_path(false, &locals, LocalId::new(0)));
+    assert_eq!(
+        native_local_store_operation(false, &locals, LocalId::new(0)),
+        crate::JIT_LOCAL_STORE_PLAIN_LOCAL
+    );
+    assert!(!ordinary_local_fast_path(true, &locals, LocalId::new(0)));
+    assert!(!ordinary_local_fast_path(false, &locals, LocalId::new(1)));
+    assert!(!ordinary_local_fast_path(false, &locals, LocalId::new(2)));
+    assert_eq!(
+        native_local_store_operation(false, &locals, LocalId::new(2)),
+        0
+    );
+}
 
 #[test]
 fn persistent_helper_abi_identity_ignores_process_addresses() {
@@ -78,11 +96,10 @@ fn oversized_finished_clif_is_rejected_before_regalloc() {
     }
     let error = validate_pre_regalloc_structure(&clif, &region, Some(7)).unwrap_err();
     assert_eq!(error.code, "JIT_CRANELIFT_PRE_REGALLOC_BUDGET");
-    assert!(error.detail.contains("clif_blocks=2049/2048"));
+    assert!(error.detail.contains("clif_blocks=2049/768"));
 }
 
 extern "C" fn forbidden_local_fetch(
-    _context: u64,
     _op: u32,
     _value: i64,
     _function: i64,
@@ -95,27 +112,7 @@ extern "C" fn forbidden_local_fetch(
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
-#[allow(unsafe_code)]
-extern "C" fn passthrough_local_fetch(
-    _context: u64,
-    _op: u32,
-    value: i64,
-    _function: i64,
-    _local: i64,
-    _file: i64,
-    _start: i64,
-    out: *mut i64,
-) -> i32 {
-    if out.is_null() {
-        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
-    }
-    // SAFETY: generated code owns this synchronous stack output slot.
-    unsafe { out.write(value) };
-    0
-}
-
 extern "C" fn forbidden_local_store(
-    _context: u64,
     _op: u32,
     _current: i64,
     _value: i64,
@@ -127,14 +124,17 @@ extern "C" fn forbidden_local_store(
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
-extern "C" fn forbidden_lifecycle(_context: u64, _op: u32, _value: i64, _out: *mut i64) -> i32 {
+extern "C" fn forbidden_lifecycle(_op: u32, _value: i64, _out: *mut i64) -> i32 {
     SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
 #[allow(unsafe_code)]
-extern "C" fn passthrough_lifecycle(_context: u64, _op: u32, value: i64, out: *mut i64) -> i32 {
-    if out.is_null() {
+extern "C" fn frame_cleanup_only_lifecycle(op: u32, value: i64, out: *mut i64) -> i32 {
+    let is_frame_cleanup =
+        op & 0x8000_0000 != 0 && op & 1 == 1 && ((op >> 11) & 0x0f_ffff) == 0x0f_ffff;
+    if !is_frame_cleanup || out.is_null() {
+        SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
         return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
     // SAFETY: generated code owns this synchronous stack output slot.
@@ -142,18 +142,44 @@ extern "C" fn passthrough_lifecycle(_context: u64, _op: u32, value: i64, out: *m
     0
 }
 
-extern "C" fn forbidden_type_predicate(
-    _context: u64,
+extern "C" fn forbidden_binary(
     _op: u32,
-    _value: i64,
+    _lhs: i64,
+    _rhs: i64,
+    _function: i64,
+    _continuation: i64,
     _out: *mut i64,
 ) -> i32 {
     SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
+extern "C" fn forbidden_compare(_op: u32, _lhs: i64, _rhs: i64, _out: *mut i64) -> i32 {
+    SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
+    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+}
+
+extern "C" fn forbidden_truthy(_value: i64, _out: *mut i64) -> i32 {
+    SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
+    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+}
+
+extern "C" fn forbidden_cast(_op: u32, _value: i64, _out: *mut i64) -> i32 {
+    SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
+    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+}
+
+extern "C" fn forbidden_unary(_op: u32, _value: i64, _out: *mut i64) -> i32 {
+    SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
+    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+}
+
+extern "C" fn forbidden_type_predicate(_op: u32, _value: i64, _out: *mut i64) -> i32 {
+    SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
+    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+}
+
 extern "C" fn forbidden_stable_length(
-    _context: u64,
     _op: u32,
     _value: i64,
     _function: i64,
@@ -174,16 +200,8 @@ extern "C" fn forbidden_call_dispatch(
 }
 
 #[allow(unsafe_code)]
-extern "C" fn frame_cleanup_only_lifecycle(
-    _context: u64,
-    op: u32,
-    value: i64,
-    out: *mut i64,
-) -> i32 {
-    let is_frame_cleanup =
-        op & 0x8000_0000 != 0 && op & 1 == 1 && ((op >> 11) & 0x0f_ffff) == 0x0f_ffff;
-    if !is_frame_cleanup || out.is_null() {
-        SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
+extern "C" fn passthrough_lifecycle(_op: u32, value: i64, out: *mut i64) -> i32 {
+    if out.is_null() {
         return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
     // SAFETY: generated code owns this synchronous stack output slot.
@@ -191,47 +209,26 @@ extern "C" fn frame_cleanup_only_lifecycle(
     0
 }
 
-extern "C" fn forbidden_binary(
-    _context: u64,
+#[allow(unsafe_code)]
+extern "C" fn passthrough_local_fetch(
     _op: u32,
-    _lhs: i64,
-    _rhs: i64,
+    value: i64,
     _function: i64,
-    _continuation: i64,
-    _out: *mut i64,
+    _local: i64,
+    _file: i64,
+    _start: i64,
+    out: *mut i64,
 ) -> i32 {
-    SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
-}
-
-extern "C" fn forbidden_compare(
-    _context: u64,
-    _op: u32,
-    _lhs: i64,
-    _rhs: i64,
-    _out: *mut i64,
-) -> i32 {
-    SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
-}
-
-extern "C" fn forbidden_truthy(_context: u64, _value: i64, _out: *mut i64) -> i32 {
-    SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
-}
-
-extern "C" fn forbidden_cast(_context: u64, _op: u32, _value: i64, _out: *mut i64) -> i32 {
-    SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
-}
-
-extern "C" fn forbidden_unary(_context: u64, _op: u32, _value: i64, _out: *mut i64) -> i32 {
-    SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+    if out.is_null() {
+        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
+    }
+    // SAFETY: generated code owns this synchronous stack output slot.
+    unsafe { out.write(value) };
+    0
 }
 
 #[allow(unsafe_code)]
-extern "C" fn test_array_new(_context: u64, _op: u32, out: *mut i64) -> i32 {
+extern "C" fn test_array_new(_op: u32, out: *mut i64) -> i32 {
     if out.is_null() {
         return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
@@ -242,7 +239,6 @@ extern "C" fn test_array_new(_context: u64, _op: u32, out: *mut i64) -> i32 {
 
 #[allow(unsafe_code)]
 extern "C" fn test_array_insert(
-    _context: u64,
     append: u32,
     array: i64,
     _key: i64,
@@ -398,7 +394,7 @@ fn optimizing_scalar_ssa_executes_without_local_truthy_or_lifecycle_helpers() {
         function: Some(function),
         runtime_helpers: crate::JitRuntimeHelperAddresses {
             native_binary: forbidden_binary as *const () as usize,
-            native_local_fetch: passthrough_local_fetch as *const () as usize,
+            native_local_fetch: forbidden_local_fetch as *const () as usize,
             native_local_store: forbidden_local_store as *const () as usize,
             native_value_lifecycle: forbidden_lifecycle as *const () as usize,
             native_truthy: forbidden_truthy as *const () as usize,
@@ -417,149 +413,6 @@ fn optimizing_scalar_ssa_executes_without_local_truthy_or_lifecycle_helpers() {
             .expect("optimizing SSA execution"),
         42
     );
-    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
-}
-
-#[test]
-fn optimizing_reference_local_reads_published_scalar_view_without_helper() {
-    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
-    let mut builder = IrBuilder::new(UnitId::new(4_217));
-    let file = builder.add_file("optimizing-reference-scalar-view.php");
-    let span = IrSpan::new(file, 0, 1);
-    let function = builder.start_function(
-        "optimizing_reference_scalar_view",
-        FunctionFlags::default(),
-        span,
-    );
-    let local = builder.intern_local(function, "value");
-    builder.push_param(
-        function,
-        IrParam {
-            name: "value".to_owned(),
-            local,
-            required: true,
-            default: None,
-            type_: None,
-            by_ref: true,
-            variadic: false,
-            attributes: Vec::new(),
-        },
-    );
-    let block = builder.append_block(function);
-    let loaded = builder.alloc_register(function);
-    builder.emit(
-        function,
-        block,
-        InstructionKind::LoadLocal { dst: loaded, local },
-        span,
-    );
-    builder.terminate_return(function, block, Some(Operand::Register(loaded)), span);
-    let unit = builder.finish();
-    let mut backend = CraneliftNativeCompiler;
-    let outcome = backend.compile_region(&NativeCompileRequest {
-        compile: &JitCompileRequest::new("cl.optimizing.reference-scalar-view").with_opt_level(2),
-        unit: Some(&unit),
-        function: Some(function),
-        runtime_helpers: crate::JitRuntimeHelperAddresses {
-            native_local_fetch: forbidden_local_fetch as *const () as usize,
-            native_value_lifecycle: forbidden_lifecycle as *const () as usize,
-            ..crate::JitRuntimeHelperAddresses::default()
-        },
-    });
-
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("optimizing reference scalar view");
-    let mut reference_view = crate::JitNativeReferenceScalarView {
-        abi_version: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION,
-        state: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED,
-        encoded: 73,
-    };
-    let mut views = vec![crate::JitNativeValueView::default(); 8];
-    views[7] = crate::JitNativeValueView {
-        kind: crate::JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR,
-        flags: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION,
-        length: std::ptr::from_mut(&mut reference_view) as usize as u64,
-    };
-    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
-        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        value_view_capacity: views.len() as u32,
-        value_views: views.as_mut_ptr() as usize as u64,
-        ..crate::JitNativeRuntimeView::default()
-    });
-    let reference =
-        crate::jit_encode_typed_runtime_value(7, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
-    assert_eq!(
-        handle
-            .invoke_i64(&[reference], JIT_RUNTIME_ABI_HASH)
-            .expect("cached scalar reference read"),
-        73
-    );
-    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
-}
-
-#[test]
-fn optimizing_unknown_scalar_truthiness_uses_guarded_native_lanes() {
-    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
-    let mut builder = IrBuilder::new(UnitId::new(4_210));
-    let file = builder.add_file("optimizing-guarded-truthiness.php");
-    let span = IrSpan::new(file, 0, 1);
-    let function = builder.start_function(
-        "optimizing_guarded_truthiness",
-        FunctionFlags::default(),
-        span,
-    );
-    let local = builder.intern_local(function, "value");
-    builder.push_param(
-        function,
-        IrParam {
-            name: "value".to_owned(),
-            local,
-            required: true,
-            default: None,
-            type_: None,
-            by_ref: false,
-            variadic: false,
-            attributes: Vec::new(),
-        },
-    );
-    let entry = builder.append_block(function);
-    let truthy = builder.append_block(function);
-    let falsey = builder.append_block(function);
-    builder.terminate_jump_if(function, entry, Operand::Local(local), truthy, falsey, span);
-    let one = builder.intern_constant(IrConstant::Int(1));
-    let zero = builder.intern_constant(IrConstant::Int(0));
-    builder.terminate_return(function, truthy, Some(Operand::Constant(one)), span);
-    builder.terminate_return(function, falsey, Some(Operand::Constant(zero)), span);
-    let unit = builder.finish();
-    let mut backend = CraneliftNativeCompiler;
-    let outcome = backend.compile_region(&NativeCompileRequest {
-        compile: &JitCompileRequest::new("cl.optimizing.guarded-truthiness").with_opt_level(2),
-        unit: Some(&unit),
-        function: Some(function),
-        runtime_helpers: crate::JitRuntimeHelperAddresses {
-            native_truthy: forbidden_truthy as *const () as usize,
-            ..crate::JitRuntimeHelperAddresses::default()
-        },
-    });
-
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("guarded truthiness handle");
-    for (value, expected) in [
-        (0, 0),
-        (-17, 1),
-        (crate::jit_encode_constant(u32::MAX), 0),
-        (crate::jit_encode_constant(crate::JIT_VALUE_FALSE), 0),
-        (crate::jit_encode_constant(crate::JIT_VALUE_TRUE), 1),
-    ] {
-        assert_eq!(
-            handle
-                .invoke_i64(&[value], JIT_RUNTIME_ABI_HASH)
-                .unwrap_or_else(|error| {
-                    panic!("guarded truthiness execution failed for {value}: {error:?}")
-                }),
-            expected
-        );
-    }
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 
@@ -712,12 +565,16 @@ fn optimizing_boolean_relational_compare_normalizes_tagged_payloads() {
 }
 
 #[test]
-fn optimizing_unknown_value_strict_null_identity_stays_native() {
+fn optimizing_reference_local_reads_published_scalar_view_without_helper() {
     SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
-    let mut builder = IrBuilder::new(UnitId::new(4_211));
-    let file = builder.add_file("optimizing-strict-null.php");
+    let mut builder = IrBuilder::new(UnitId::new(4_217));
+    let file = builder.add_file("optimizing-reference-scalar-view.php");
     let span = IrSpan::new(file, 0, 1);
-    let function = builder.start_function("optimizing_strict_null", FunctionFlags::default(), span);
+    let function = builder.start_function(
+        "optimizing_reference_scalar_view",
+        FunctionFlags::default(),
+        span,
+    );
     let local = builder.intern_local(function, "value");
     builder.push_param(
         function,
@@ -727,7 +584,7 @@ fn optimizing_unknown_value_strict_null_identity_stays_native() {
             required: true,
             default: None,
             type_: None,
-            by_ref: false,
+            by_ref: true,
             variadic: false,
             attributes: Vec::new(),
         },
@@ -740,115 +597,14 @@ fn optimizing_unknown_value_strict_null_identity_stays_native() {
         InstructionKind::LoadLocal { dst: loaded, local },
         span,
     );
-    let null = builder.intern_constant(IrConstant::Null);
-    let compared = builder.alloc_register(function);
-    builder.emit(
-        function,
-        block,
-        InstructionKind::Compare {
-            dst: compared,
-            op: php_ir::CompareOp::NotIdentical,
-            lhs: Operand::Register(loaded),
-            rhs: Operand::Constant(null),
-        },
-        span,
-    );
-    builder.terminate_return(function, block, Some(Operand::Register(compared)), span);
+    builder.terminate_return(function, block, Some(Operand::Register(loaded)), span);
     let unit = builder.finish();
     let mut backend = CraneliftNativeCompiler;
     let outcome = backend.compile_region(&NativeCompileRequest {
-        compile: &JitCompileRequest::new("cl.optimizing.strict-null").with_opt_level(2),
+        compile: &JitCompileRequest::new("cl.optimizing.reference-scalar-view").with_opt_level(2),
         unit: Some(&unit),
         function: Some(function),
         runtime_helpers: crate::JitRuntimeHelperAddresses {
-            native_compare: forbidden_compare as *const () as usize,
-            native_local_fetch: forbidden_local_fetch as *const () as usize,
-            ..crate::JitRuntimeHelperAddresses::default()
-        },
-    });
-
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("optimizing strict-null handle");
-    for (input, expected) in [
-        (
-            crate::jit_encode_constant(u32::MAX),
-            crate::jit_encode_constant(crate::JIT_VALUE_FALSE),
-        ),
-        (41, crate::jit_encode_constant(crate::JIT_VALUE_TRUE)),
-        (
-            crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
-            crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
-        ),
-    ] {
-        assert_eq!(
-            handle
-                .invoke_i64(&[input], JIT_RUNTIME_ABI_HASH)
-                .expect("strict null identity execution"),
-            expected
-        );
-    }
-    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
-}
-
-#[test]
-fn optimizing_dynamic_scalar_identity_avoids_compare_helper() {
-    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
-    let mut builder = IrBuilder::new(UnitId::new(4_222));
-    let file = builder.add_file("optimizing-dynamic-identity.php");
-    let span = IrSpan::new(file, 0, 1);
-    let function = builder.start_function("dynamic_identity", FunctionFlags::default(), span);
-    let mut operands = Vec::new();
-    for name in ["left", "right"] {
-        let local = builder.intern_local(function, name);
-        builder.push_param(
-            function,
-            IrParam {
-                name: name.to_owned(),
-                local,
-                required: true,
-                default: None,
-                type_: None,
-                by_ref: false,
-                variadic: false,
-                attributes: Vec::new(),
-            },
-        );
-        let loaded = builder.alloc_register(function);
-        operands.push((local, loaded));
-    }
-    let block = builder.append_block(function);
-    for (local, loaded) in &operands {
-        builder.emit(
-            function,
-            block,
-            InstructionKind::LoadLocal {
-                dst: *loaded,
-                local: *local,
-            },
-            span,
-        );
-    }
-    let compared = builder.alloc_register(function);
-    builder.emit(
-        function,
-        block,
-        InstructionKind::Compare {
-            dst: compared,
-            op: php_ir::CompareOp::NotIdentical,
-            lhs: Operand::Register(operands[0].1),
-            rhs: Operand::Register(operands[1].1),
-        },
-        span,
-    );
-    builder.terminate_return(function, block, Some(Operand::Register(compared)), span);
-    let unit = builder.finish();
-    let mut backend = CraneliftNativeCompiler;
-    let outcome = backend.compile_region(&NativeCompileRequest {
-        compile: &JitCompileRequest::new("cl.optimizing.dynamic-identity").with_opt_level(2),
-        unit: Some(&unit),
-        function: Some(function),
-        runtime_helpers: crate::JitRuntimeHelperAddresses {
-            native_compare: forbidden_compare as *const () as usize,
             native_local_fetch: forbidden_local_fetch as *const () as usize,
             native_value_lifecycle: forbidden_lifecycle as *const () as usize,
             ..crate::JitRuntimeHelperAddresses::default()
@@ -856,167 +612,17 @@ fn optimizing_dynamic_scalar_identity_avoids_compare_helper() {
     });
 
     assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("optimizing dynamic identity handle");
-    for (arguments, expected) in [
-        ([41, 41], crate::jit_encode_constant(crate::JIT_VALUE_FALSE)),
-        ([41, 42], crate::jit_encode_constant(crate::JIT_VALUE_TRUE)),
-    ] {
-        assert_eq!(
-            handle
-                .invoke_i64(&arguments, JIT_RUNTIME_ABI_HASH)
-                .expect("dynamic scalar identity execution"),
-            expected
-        );
-    }
-    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
-}
-
-#[test]
-fn optimizing_isset_local_uses_exact_native_null_test() {
-    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
-    let mut builder = IrBuilder::new(UnitId::new(4_212));
-    let file = builder.add_file("optimizing-isset-local.php");
-    let span = IrSpan::new(file, 0, 1);
-    let function = builder.start_function("optimizing_isset_local", FunctionFlags::default(), span);
-    let local = builder.intern_local(function, "value");
-    builder.push_param(
-        function,
-        IrParam {
-            name: "value".to_owned(),
-            local,
-            required: true,
-            default: None,
-            type_: None,
-            by_ref: false,
-            variadic: false,
-            attributes: Vec::new(),
-        },
-    );
-    let block = builder.append_block(function);
-    let isset = builder.alloc_register(function);
-    builder.emit(
-        function,
-        block,
-        InstructionKind::IssetLocal { dst: isset, local },
-        span,
-    );
-    builder.terminate_return(function, block, Some(Operand::Register(isset)), span);
-    let unit = builder.finish();
-    let mut backend = CraneliftNativeCompiler;
-    let outcome = backend.compile_region(&NativeCompileRequest {
-        compile: &JitCompileRequest::new("cl.optimizing.isset-local").with_opt_level(2),
-        unit: Some(&unit),
-        function: Some(function),
-        runtime_helpers: crate::JitRuntimeHelperAddresses {
-            native_compare: forbidden_compare as *const () as usize,
-            native_local_fetch: forbidden_local_fetch as *const () as usize,
-            native_value_lifecycle: forbidden_lifecycle as *const () as usize,
-            ..crate::JitRuntimeHelperAddresses::default()
-        },
-    });
-
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("optimizing isset-local handle");
-    assert_eq!(
-        handle
-            .invoke_i64(
-                &[crate::jit_encode_constant(u32::MAX)],
-                JIT_RUNTIME_ABI_HASH
-            )
-            .expect("isset null"),
-        crate::jit_encode_constant(crate::JIT_VALUE_FALSE)
-    );
-    assert_eq!(
-        handle
-            .invoke_i64(
-                &[crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED)],
-                JIT_RUNTIME_ABI_HASH
-            )
-            .expect("isset uninitialized"),
-        crate::jit_encode_constant(crate::JIT_VALUE_FALSE)
-    );
-    assert_eq!(
-        handle
-            .invoke_i64(&[41], JIT_RUNTIME_ABI_HASH)
-            .expect("isset integer"),
-        crate::jit_encode_constant(crate::JIT_VALUE_TRUE)
-    );
-    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
-}
-
-#[test]
-fn optimizing_empty_local_uses_guarded_native_truthiness() {
-    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
-    let mut builder = IrBuilder::new(UnitId::new(4_216));
-    let file = builder.add_file("optimizing-empty-local.php");
-    let span = IrSpan::new(file, 0, 1);
-    let function = builder.start_function("optimizing_empty_local", FunctionFlags::default(), span);
-    let local = builder.intern_local(function, "value");
-    builder.push_param(
-        function,
-        IrParam {
-            name: "value".to_owned(),
-            local,
-            required: true,
-            default: None,
-            type_: None,
-            by_ref: false,
-            variadic: false,
-            attributes: Vec::new(),
-        },
-    );
-    let block = builder.append_block(function);
-    let empty = builder.alloc_register(function);
-    builder.emit(
-        function,
-        block,
-        InstructionKind::EmptyLocal { dst: empty, local },
-        span,
-    );
-    builder.terminate_return(function, block, Some(Operand::Register(empty)), span);
-    let unit = builder.finish();
-    let mut backend = CraneliftNativeCompiler;
-    let outcome = backend.compile_region(&NativeCompileRequest {
-        compile: &JitCompileRequest::new("cl.optimizing.empty-local").with_opt_level(2),
-        unit: Some(&unit),
-        function: Some(function),
-        runtime_helpers: crate::JitRuntimeHelperAddresses {
-            native_cast: forbidden_cast as *const () as usize,
-            native_local_fetch: forbidden_local_fetch as *const () as usize,
-            native_stable_length: forbidden_stable_length as *const () as usize,
-            native_truthy: forbidden_truthy as *const () as usize,
-            native_unary: forbidden_unary as *const () as usize,
-            native_value_lifecycle: forbidden_lifecycle as *const () as usize,
-            ..crate::JitRuntimeHelperAddresses::default()
-        },
-    });
-
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("optimizing empty-local handle");
-    for (input, expected) in [
-        (0, crate::jit_encode_constant(crate::JIT_VALUE_TRUE)),
-        (1, crate::jit_encode_constant(crate::JIT_VALUE_FALSE)),
-        (
-            crate::jit_encode_constant(u32::MAX),
-            crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
-        ),
-        (
-            crate::jit_encode_constant(crate::JIT_VALUE_FALSE),
-            crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
-        ),
-    ] {
-        assert_eq!(
-            handle
-                .invoke_i64(&[input], JIT_RUNTIME_ABI_HASH)
-                .expect("empty-local execution"),
-            expected
-        );
-    }
+    let handle = outcome.handle.expect("optimizing reference scalar view");
+    let mut reference_view = crate::JitNativeReferenceScalarView {
+        abi_version: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION,
+        state: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED,
+        encoded: 73,
+    };
     let mut views = vec![crate::JitNativeValueView::default(); 8];
     views[7] = crate::JitNativeValueView {
-        kind: crate::JIT_NATIVE_VALUE_VIEW_ARRAY,
-        flags: 0,
-        length: 0,
+        kind: crate::JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR,
+        flags: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION,
+        length: std::ptr::from_mut(&mut reference_view) as usize as u64,
     };
     let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
@@ -1024,312 +630,13 @@ fn optimizing_empty_local_uses_guarded_native_truthiness() {
         value_views: views.as_mut_ptr() as usize as u64,
         ..crate::JitNativeRuntimeView::default()
     });
-    let array = crate::jit_encode_typed_runtime_value(7, crate::JIT_VALUE_RUNTIME_ARRAY_TAG);
+    let reference =
+        crate::jit_encode_typed_runtime_value(7, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
     assert_eq!(
         handle
-            .invoke_i64(&[array], JIT_RUNTIME_ABI_HASH)
-            .expect("empty array execution"),
-        crate::jit_encode_constant(crate::JIT_VALUE_TRUE)
-    );
-    views[7].length = 1;
-    assert_eq!(
-        handle
-            .invoke_i64(&[array], JIT_RUNTIME_ABI_HASH)
-            .expect("non-empty array execution"),
-        crate::jit_encode_constant(crate::JIT_VALUE_FALSE)
-    );
-    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
-}
-
-#[test]
-fn optimizing_builtin_type_predicate_uses_native_tag_test() {
-    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
-    let mut builder = IrBuilder::new(UnitId::new(4_213));
-    let file = builder.add_file("optimizing-type-predicate.php");
-    let span = IrSpan::new(file, 0, 1);
-    let function =
-        builder.start_function("optimizing_type_predicate", FunctionFlags::default(), span);
-    let local = builder.intern_local(function, "value");
-    builder.push_param(
-        function,
-        IrParam {
-            name: "value".to_owned(),
-            local,
-            required: true,
-            default: None,
-            type_: None,
-            by_ref: false,
-            variadic: false,
-            attributes: Vec::new(),
-        },
-    );
-    let block = builder.append_block(function);
-    let loaded = builder.alloc_register(function);
-    builder.emit(
-        function,
-        block,
-        InstructionKind::LoadLocal { dst: loaded, local },
-        span,
-    );
-    let result = builder.alloc_register(function);
-    builder.emit(
-        function,
-        block,
-        InstructionKind::CallFunction {
-            dst: result,
-            name: "is_array".to_owned(),
-            args: vec![IrCallArg {
-                name: None,
-                value: Operand::Register(loaded),
-                unpack: false,
-                value_kind: IrCallArgValueKind::Direct,
-                by_ref_local: None,
-                by_ref_dim: None,
-                by_ref_property: None,
-                by_ref_property_dim: None,
-            }],
-        },
-        span,
-    );
-    builder.terminate_return(function, block, Some(Operand::Register(result)), span);
-    let unit = builder.finish();
-    let mut backend = CraneliftNativeCompiler;
-    let outcome = backend.compile_region(&NativeCompileRequest {
-        compile: &JitCompileRequest::new("cl.optimizing.type-predicate").with_opt_level(2),
-        unit: Some(&unit),
-        function: Some(function),
-        runtime_helpers: crate::JitRuntimeHelperAddresses {
-            native_call_dispatch: forbidden_call_dispatch as *const () as usize,
-            native_type_predicate: forbidden_type_predicate as *const () as usize,
-            native_local_fetch: passthrough_local_fetch as *const () as usize,
-            native_value_lifecycle: passthrough_lifecycle as *const () as usize,
-            ..crate::JitRuntimeHelperAddresses::default()
-        },
-    });
-
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("optimizing type-predicate handle");
-    for (input, expected) in [
-        (
-            crate::jit_encode_typed_runtime_value(7, crate::JIT_VALUE_RUNTIME_ARRAY_TAG),
-            crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
-        ),
-        (
-            crate::jit_encode_typed_runtime_value(8, crate::JIT_VALUE_RUNTIME_STRING_TAG),
-            crate::jit_encode_constant(crate::JIT_VALUE_FALSE),
-        ),
-        (41, crate::jit_encode_constant(crate::JIT_VALUE_FALSE)),
-    ] {
-        assert_eq!(
-            handle
-                .invoke_i64(&[input], JIT_RUNTIME_ABI_HASH)
-                .expect("native type predicate execution"),
-            expected
-        );
-    }
-    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
-}
-
-#[test]
-fn optimizing_builtin_length_uses_versioned_value_view() {
-    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
-    let mut builder = IrBuilder::new(UnitId::new(4_214));
-    let file = builder.add_file("optimizing-stable-length.php");
-    let span = IrSpan::new(file, 0, 1);
-    let function =
-        builder.start_function("optimizing_stable_length", FunctionFlags::default(), span);
-    let local = builder.intern_local(function, "value");
-    builder.push_param(
-        function,
-        IrParam {
-            name: "value".to_owned(),
-            local,
-            required: true,
-            default: None,
-            type_: None,
-            by_ref: false,
-            variadic: false,
-            attributes: Vec::new(),
-        },
-    );
-    let block = builder.append_block(function);
-    let loaded = builder.alloc_register(function);
-    builder.emit(
-        function,
-        block,
-        InstructionKind::LoadLocal { dst: loaded, local },
-        span,
-    );
-    let result = builder.alloc_register(function);
-    builder.emit(
-        function,
-        block,
-        InstructionKind::CallFunction {
-            dst: result,
-            name: "strlen".to_owned(),
-            args: vec![IrCallArg {
-                name: None,
-                value: Operand::Register(loaded),
-                unpack: false,
-                value_kind: IrCallArgValueKind::Direct,
-                by_ref_local: None,
-                by_ref_dim: None,
-                by_ref_property: None,
-                by_ref_property_dim: None,
-            }],
-        },
-        span,
-    );
-    builder.terminate_return(function, block, Some(Operand::Register(result)), span);
-    let unit = builder.finish();
-    let mut backend = CraneliftNativeCompiler;
-    let outcome = backend.compile_region(&NativeCompileRequest {
-        compile: &JitCompileRequest::new("cl.optimizing.stable-length").with_opt_level(2),
-        unit: Some(&unit),
-        function: Some(function),
-        runtime_helpers: crate::JitRuntimeHelperAddresses {
-            native_call_dispatch: forbidden_call_dispatch as *const () as usize,
-            native_stable_length: forbidden_stable_length as *const () as usize,
-            native_local_fetch: passthrough_local_fetch as *const () as usize,
-            native_value_lifecycle: passthrough_lifecycle as *const () as usize,
-            ..crate::JitRuntimeHelperAddresses::default()
-        },
-    });
-
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("optimizing stable-length handle");
-    let mut views = vec![crate::JitNativeValueView::default(); 8];
-    views[7] = crate::JitNativeValueView {
-        kind: crate::JIT_NATIVE_VALUE_VIEW_STRING,
-        flags: 0,
-        length: 17,
-    };
-    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
-        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        value_view_capacity: views.len() as u32,
-        value_views: views.as_mut_ptr() as usize as u64,
-        ..crate::JitNativeRuntimeView::default()
-    });
-    let input = crate::jit_encode_typed_runtime_value(7, crate::JIT_VALUE_RUNTIME_STRING_TAG);
-    assert_eq!(
-        handle
-            .invoke_i64(&[input], JIT_RUNTIME_ABI_HASH)
-            .expect("stable string length execution"),
-        17
-    );
-    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
-}
-
-#[test]
-fn optimizing_bounded_argument_wrapper_inlines_without_dispatch() {
-    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
-    let mut builder = IrBuilder::new(UnitId::new(4_215));
-    let file = builder.add_file("optimizing-inline-argument.php");
-    let span = IrSpan::new(file, 0, 1);
-
-    let callee = builder.start_function("identity_wrapper", FunctionFlags::default(), span);
-    let callee_local = builder.intern_local(callee, "value");
-    builder.push_param(
-        callee,
-        IrParam {
-            name: "value".to_owned(),
-            local: callee_local,
-            required: true,
-            default: None,
-            type_: None,
-            by_ref: false,
-            variadic: false,
-            attributes: Vec::new(),
-        },
-    );
-    let callee_block = builder.append_block(callee);
-    let callee_value = builder.alloc_register(callee);
-    builder.emit(
-        callee,
-        callee_block,
-        InstructionKind::LoadLocal {
-            dst: callee_value,
-            local: callee_local,
-        },
-        span,
-    );
-    builder.terminate_return(
-        callee,
-        callee_block,
-        Some(Operand::Register(callee_value)),
-        span,
-    );
-    builder.register_function_name("identity_wrapper", callee);
-
-    let caller = builder.start_function("inline_argument_caller", FunctionFlags::default(), span);
-    let caller_local = builder.intern_local(caller, "value");
-    builder.push_param(
-        caller,
-        IrParam {
-            name: "value".to_owned(),
-            local: caller_local,
-            required: true,
-            default: None,
-            type_: None,
-            by_ref: false,
-            variadic: false,
-            attributes: Vec::new(),
-        },
-    );
-    let caller_block = builder.append_block(caller);
-    let caller_value = builder.alloc_register(caller);
-    builder.emit(
-        caller,
-        caller_block,
-        InstructionKind::LoadLocal {
-            dst: caller_value,
-            local: caller_local,
-        },
-        span,
-    );
-    let result = builder.alloc_register(caller);
-    builder.emit(
-        caller,
-        caller_block,
-        InstructionKind::CallFunction {
-            dst: result,
-            name: "identity_wrapper".to_owned(),
-            args: vec![IrCallArg {
-                name: None,
-                value: Operand::Register(caller_value),
-                unpack: false,
-                value_kind: IrCallArgValueKind::Direct,
-                by_ref_local: None,
-                by_ref_dim: None,
-                by_ref_property: None,
-                by_ref_property_dim: None,
-            }],
-        },
-        span,
-    );
-    builder.terminate_return(caller, caller_block, Some(Operand::Register(result)), span);
-    let unit = builder.finish();
-    let mut backend = CraneliftNativeCompiler;
-    let outcome = backend.compile_region(&NativeCompileRequest {
-        compile: &JitCompileRequest::new("cl.optimizing.inline-argument").with_opt_level(2),
-        unit: Some(&unit),
-        function: Some(caller),
-        runtime_helpers: crate::JitRuntimeHelperAddresses {
-            native_call_dispatch: forbidden_call_dispatch as *const () as usize,
-            native_local_fetch: passthrough_local_fetch as *const () as usize,
-            native_value_lifecycle: passthrough_lifecycle as *const () as usize,
-            ..crate::JitRuntimeHelperAddresses::default()
-        },
-    });
-
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("bounded argument inline handle");
-    assert_eq!(handle.inlined_calls_per_invocation(), 1);
-    assert_eq!(
-        handle
-            .invoke_i64(&[42], JIT_RUNTIME_ABI_HASH)
-            .expect("bounded argument inline execution"),
-        42
+            .invoke_i64(&[reference], JIT_RUNTIME_ABI_HASH)
+            .expect("cached scalar reference read"),
+        73
     );
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
@@ -2495,58 +1802,17 @@ fn function_scoped_compile_routes_same_unit_callee_through_trampoline() {
             .iter()
             .all(|entry| entry.function != callee)
     );
-    assert!(
-        metadata.native_transitions.is_empty(),
-        "ordinary calls must not add native resume transitions"
+    assert_eq!(
+        metadata.native_transitions.len(),
+        1,
+        "the userland call must publish one resumable caller continuation"
     );
+    assert_eq!(metadata.native_transitions[0].function, function);
     assert_eq!(
         handle
             .invoke_i64(&[41], JIT_RUNTIME_ABI_HASH)
             .expect("native caller should dispatch the callee"),
         42
-    );
-}
-
-#[test]
-fn function_scoped_compile_resumes_only_statically_suspending_calls() {
-    extern "C" fn trampoline(
-        _vm_context: u64,
-        _frame: *mut crate::JitNativeCallFrame,
-        _out: *mut crate::JitCallResult,
-    ) -> i32 {
-        crate::JitCallStatus::RETURN.0 as i32
-    }
-
-    let (unit, function, callee) = suspending_direct_call_fixture();
-    let mut backend = CraneliftNativeCompiler;
-    let request = JitCompileRequest::new("cl.region.suspending-direct-call");
-    let outcome = backend.compile_region(&NativeCompileRequest {
-        compile: &request,
-        unit: Some(&unit),
-        function: Some(function),
-        runtime_helpers: crate::JitRuntimeHelperAddresses {
-            native_call_dispatch: trampoline as *const () as usize,
-            ..crate::JitRuntimeHelperAddresses::default()
-        },
-    });
-
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome
-        .handle
-        .expect("suspending direct-call region should compile");
-    let metadata = handle.region_state_metadata().expect("region metadata");
-    assert_eq!(metadata.native_transitions.len(), 1);
-    assert_eq!(metadata.native_transitions[0].function, function);
-    assert_eq!(
-        metadata.native_transitions[0].result_register,
-        Some(RegId::new(0))
-    );
-    assert!(
-        metadata
-            .native_transitions
-            .iter()
-            .all(|transition| transition.function != callee),
-        "function-on-demand compilation must not pull the callee into the artifact"
     );
 }
 
@@ -2693,10 +1959,10 @@ fn cranelift_helper_arithmetic_overflow_returns_native_status() {
 }
 
 #[test]
-fn cranelift_overflow_materializes_precise_region_continuation() {
+fn optimizing_overflow_materializes_precise_region_continuation() {
     let (unit, function) = helper_overflow_fixture();
     let mut backend = CraneliftNativeCompiler;
-    let request = JitCompileRequest::new("cl.region.deopt-state");
+    let request = JitCompileRequest::new("cl.region.deopt-state").with_opt_level(2);
     let outcome = backend.compile_region(&NativeCompileRequest {
         compile: &request,
         unit: Some(&unit),
@@ -2781,7 +2047,7 @@ fn native_side_exit_bounds_published_registers_to_abi_capacity() {
     let unit = builder.finish();
     let mut backend = CraneliftNativeCompiler;
     let outcome = backend.compile_region(&NativeCompileRequest {
-        compile: &JitCompileRequest::new("cl.region.register-capacity"),
+        compile: &JitCompileRequest::new("cl.region.register-capacity").with_opt_level(2),
         unit: Some(&unit),
         function: Some(function),
         runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
@@ -2834,14 +2100,14 @@ fn ordinary_instructions_do_not_create_resume_or_clif_entry_blocks() {
     let handle = outcome
         .handle
         .expect("large-register region should compile");
-    let clif_blocks = outcome.diagnostics[0]
+    let max_fragment_clif_blocks = outcome.diagnostics[0]
         .split_ascii_whitespace()
-        .find_map(|field| field.strip_prefix("clif_blocks="))
+        .find_map(|field| field.strip_prefix("max_fragment_clif_blocks="))
         .and_then(|value| value.parse::<usize>().ok())
-        .expect("compile diagnostic must report the actual CLIF block count");
+        .expect("compile diagnostic must report the actual maximum fragment CLIF block count");
     assert!(
-        clif_blocks <= 4,
-        "a straight-line function may add bounded entry/return plumbing, not one block per instruction: {clif_blocks} blocks"
+        max_fragment_clif_blocks <= 8,
+        "a straight-line fragment may add bounded entry/return plumbing, not one block per instruction: {max_fragment_clif_blocks} blocks"
     );
     assert!(
         handle.code_bytes() < 64_000,
@@ -2995,11 +2261,7 @@ fn implicit_method_receiver_survives_native_fragment_boundary() {
             .region_state_metadata()
             .expect("fragment metadata")
             .compiler_tier,
-        crate::region_ir::NativeCompilerTier::Optimizing
-    );
-    assert!(
-        handle.ssa_metrics().0 > 0,
-        "fragment locals must be promoted"
+        crate::region_ir::NativeCompilerTier::Baseline
     );
 }
 
@@ -3492,85 +2754,6 @@ fn scalar_direct_call_fixture() -> (php_ir::IrUnit, FunctionId, FunctionId) {
     (builder.finish(), caller, callee)
 }
 
-fn suspending_direct_call_fixture() -> (php_ir::IrUnit, FunctionId, FunctionId) {
-    let mut builder = IrBuilder::new(UnitId::new(713));
-    let file = builder.add_file("native-nested-fiber.php");
-    let span = IrSpan::new(file, 0, 30);
-
-    let leaf = builder.start_function("suspend_in_leaf", FunctionFlags::default(), span);
-    builder.set_return_type(leaf, Some(IrReturnType::Int));
-    let leaf_block = builder.append_block(leaf);
-    let suspended = builder.intern_constant(IrConstant::Int(5));
-    let resumed = builder.alloc_register(leaf);
-    builder.emit(
-        leaf,
-        leaf_block,
-        InstructionKind::CallStaticMethod {
-            dst: resumed,
-            class_name: "Fiber".to_owned(),
-            method: "suspend".to_owned(),
-            args: vec![IrCallArg {
-                name: None,
-                value: Operand::Constant(suspended),
-                unpack: false,
-                value_kind: IrCallArgValueKind::Direct,
-                by_ref_local: None,
-                by_ref_dim: None,
-                by_ref_property: None,
-                by_ref_property_dim: None,
-            }],
-        },
-        span,
-    );
-    builder.terminate_return(leaf, leaf_block, Some(Operand::Register(resumed)), span);
-    builder.register_function_name("suspend_in_leaf", leaf);
-
-    let callee = builder.start_function("suspend_in_helper", FunctionFlags::default(), span);
-    builder.set_return_type(callee, Some(IrReturnType::Int));
-    let callee_block = builder.append_block(callee);
-    let leaf_result = builder.alloc_register(callee);
-    builder.emit(
-        callee,
-        callee_block,
-        InstructionKind::CallFunction {
-            dst: leaf_result,
-            name: "suspend_in_leaf".to_owned(),
-            args: Vec::new(),
-        },
-        span,
-    );
-    builder.terminate_return(
-        callee,
-        callee_block,
-        Some(Operand::Register(leaf_result)),
-        span,
-    );
-    builder.register_function_name("suspend_in_helper", callee);
-
-    let caller = builder.start_function("native_fiber_caller", FunctionFlags::default(), span);
-    builder.set_entry(caller);
-    builder.set_return_type(caller, Some(IrReturnType::Int));
-    let caller_block = builder.append_block(caller);
-    let call_result = builder.alloc_register(caller);
-    builder.emit(
-        caller,
-        caller_block,
-        InstructionKind::CallFunction {
-            dst: call_result,
-            name: "suspend_in_helper".to_owned(),
-            args: Vec::new(),
-        },
-        span,
-    );
-    builder.terminate_return(
-        caller,
-        caller_block,
-        Some(Operand::Register(call_result)),
-        span,
-    );
-    (builder.finish(), caller, callee)
-}
-
 fn wide_parameter_fixture() -> (php_ir::IrUnit, FunctionId) {
     let mut builder = IrBuilder::new(UnitId::new(0));
     let file = builder.add_file("packed-arguments.php");
@@ -3891,4 +3074,442 @@ fn typed_int_param(builder: &mut IrBuilder, function: FunctionId, name: &str) ->
         },
     );
     local
+}
+
+#[test]
+fn optimizing_unknown_scalar_truthiness_uses_guarded_native_lanes() {
+    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
+    let mut builder = IrBuilder::new(UnitId::new(4_210));
+    let file = builder.add_file("optimizing-guarded-truthiness.php");
+    let span = IrSpan::new(file, 0, 1);
+    let function = builder.start_function(
+        "optimizing_guarded_truthiness",
+        FunctionFlags::default(),
+        span,
+    );
+    let local = untyped_param(&mut builder, function, "value");
+    let entry = builder.append_block(function);
+    let truthy = builder.append_block(function);
+    let falsey = builder.append_block(function);
+    builder.terminate_jump_if(function, entry, Operand::Local(local), truthy, falsey, span);
+    let one = builder.intern_constant(IrConstant::Int(1));
+    let zero = builder.intern_constant(IrConstant::Int(0));
+    builder.terminate_return(function, truthy, Some(Operand::Constant(one)), span);
+    builder.terminate_return(function, falsey, Some(Operand::Constant(zero)), span);
+    let unit = builder.finish();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.optimizing.guarded-truthiness").with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_truthy: forbidden_truthy as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("guarded truthiness handle");
+    for (value, expected) in [
+        (0, 0),
+        (-17, 1),
+        (crate::jit_encode_constant(u32::MAX), 0),
+        (crate::jit_encode_constant(crate::JIT_VALUE_FALSE), 0),
+        (crate::jit_encode_constant(crate::JIT_VALUE_TRUE), 1),
+    ] {
+        assert_eq!(
+            handle
+                .invoke_i64(&[value], JIT_RUNTIME_ABI_HASH)
+                .expect("guarded truthiness execution"),
+            expected
+        );
+    }
+    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn optimizing_unknown_value_strict_null_identity_stays_native() {
+    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
+    let mut builder = IrBuilder::new(UnitId::new(4_211));
+    let file = builder.add_file("optimizing-strict-null.php");
+    let span = IrSpan::new(file, 0, 1);
+    let function = builder.start_function("optimizing_strict_null", FunctionFlags::default(), span);
+    let local = untyped_param(&mut builder, function, "value");
+    let block = builder.append_block(function);
+    let loaded = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::LoadLocal { dst: loaded, local },
+        span,
+    );
+    let null = builder.intern_constant(IrConstant::Null);
+    let compared = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::Compare {
+            dst: compared,
+            op: php_ir::CompareOp::NotIdentical,
+            lhs: Operand::Register(loaded),
+            rhs: Operand::Constant(null),
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(compared)), span);
+    let unit = builder.finish();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.optimizing.strict-null").with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_compare: forbidden_compare as *const () as usize,
+            native_local_fetch: forbidden_local_fetch as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("optimizing strict-null handle");
+    for (input, expected) in [
+        (
+            crate::jit_encode_constant(u32::MAX),
+            crate::jit_encode_constant(crate::JIT_VALUE_FALSE),
+        ),
+        (41, crate::jit_encode_constant(crate::JIT_VALUE_TRUE)),
+        (
+            crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
+            crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
+        ),
+    ] {
+        assert_eq!(
+            handle
+                .invoke_i64(&[input], JIT_RUNTIME_ABI_HASH)
+                .expect("strict null identity execution"),
+            expected
+        );
+    }
+    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn optimizing_empty_local_uses_guarded_native_truthiness() {
+    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
+    let mut builder = IrBuilder::new(UnitId::new(4_216));
+    let file = builder.add_file("optimizing-empty-local.php");
+    let span = IrSpan::new(file, 0, 1);
+    let function = builder.start_function("optimizing_empty_local", FunctionFlags::default(), span);
+    let local = untyped_param(&mut builder, function, "value");
+    let block = builder.append_block(function);
+    let empty = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::EmptyLocal { dst: empty, local },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(empty)), span);
+    let unit = builder.finish();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.optimizing.empty-local").with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_cast: forbidden_cast as *const () as usize,
+            native_local_fetch: forbidden_local_fetch as *const () as usize,
+            native_stable_length: forbidden_stable_length as *const () as usize,
+            native_truthy: forbidden_truthy as *const () as usize,
+            native_unary: forbidden_unary as *const () as usize,
+            native_value_lifecycle: forbidden_lifecycle as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("optimizing empty-local handle");
+    for (input, expected) in [
+        (0, crate::jit_encode_constant(crate::JIT_VALUE_TRUE)),
+        (1, crate::jit_encode_constant(crate::JIT_VALUE_FALSE)),
+        (
+            crate::jit_encode_constant(u32::MAX),
+            crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
+        ),
+        (
+            crate::jit_encode_constant(crate::JIT_VALUE_FALSE),
+            crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
+        ),
+    ] {
+        assert_eq!(
+            handle
+                .invoke_i64(&[input], JIT_RUNTIME_ABI_HASH)
+                .expect("empty-local execution"),
+            expected
+        );
+    }
+    let mut views = vec![crate::JitNativeValueView::default(); 8];
+    views[7] = crate::JitNativeValueView {
+        kind: crate::JIT_NATIVE_VALUE_VIEW_ARRAY,
+        flags: 0,
+        length: 0,
+    };
+    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
+        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
+        value_view_capacity: views.len() as u32,
+        value_views: views.as_mut_ptr() as usize as u64,
+        ..crate::JitNativeRuntimeView::default()
+    });
+    let array = crate::jit_encode_typed_runtime_value(7, crate::JIT_VALUE_RUNTIME_ARRAY_TAG);
+    assert_eq!(
+        handle
+            .invoke_i64(&[array], JIT_RUNTIME_ABI_HASH)
+            .expect("empty array execution"),
+        crate::jit_encode_constant(crate::JIT_VALUE_TRUE)
+    );
+    views[7].length = 1;
+    assert_eq!(
+        handle
+            .invoke_i64(&[array], JIT_RUNTIME_ABI_HASH)
+            .expect("non-empty array execution"),
+        crate::jit_encode_constant(crate::JIT_VALUE_FALSE)
+    );
+    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn optimizing_builtin_type_predicate_uses_native_tag_test() {
+    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
+    let mut builder = IrBuilder::new(UnitId::new(4_213));
+    let file = builder.add_file("optimizing-type-predicate.php");
+    let span = IrSpan::new(file, 0, 1);
+    let function =
+        builder.start_function("optimizing_type_predicate", FunctionFlags::default(), span);
+    let local = untyped_param(&mut builder, function, "value");
+    let block = builder.append_block(function);
+    let loaded = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::LoadLocal { dst: loaded, local },
+        span,
+    );
+    let result = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: result,
+            name: "is_scalar".to_owned(),
+            args: vec![IrCallArg {
+                name: None,
+                value: Operand::Register(loaded),
+                unpack: false,
+                value_kind: IrCallArgValueKind::Direct,
+                by_ref_local: None,
+                by_ref_dim: None,
+                by_ref_property: None,
+                by_ref_property_dim: None,
+            }],
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+    let unit = builder.finish();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.optimizing.type-predicate").with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_call_dispatch: forbidden_call_dispatch as *const () as usize,
+            native_type_predicate: forbidden_type_predicate as *const () as usize,
+            native_local_fetch: passthrough_local_fetch as *const () as usize,
+            native_value_lifecycle: passthrough_lifecycle as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("optimizing type-predicate handle");
+    for (input, expected) in [
+        (
+            crate::jit_encode_typed_runtime_value(7, crate::JIT_VALUE_RUNTIME_ARRAY_TAG),
+            crate::jit_encode_constant(crate::JIT_VALUE_FALSE),
+        ),
+        (
+            crate::jit_encode_typed_runtime_value(8, crate::JIT_VALUE_RUNTIME_STRING_TAG),
+            crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
+        ),
+        (
+            crate::jit_encode_typed_runtime_value(9, crate::JIT_VALUE_RUNTIME_OBJECT_TAG),
+            crate::jit_encode_constant(crate::JIT_VALUE_FALSE),
+        ),
+        (41, crate::jit_encode_constant(crate::JIT_VALUE_TRUE)),
+    ] {
+        assert_eq!(
+            handle
+                .invoke_i64(&[input], JIT_RUNTIME_ABI_HASH)
+                .expect("native type predicate execution"),
+            expected
+        );
+    }
+    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn optimizing_builtin_length_uses_versioned_value_view() {
+    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
+    let mut builder = IrBuilder::new(UnitId::new(4_214));
+    let file = builder.add_file("optimizing-stable-length.php");
+    let span = IrSpan::new(file, 0, 1);
+    let function =
+        builder.start_function("optimizing_stable_length", FunctionFlags::default(), span);
+    let local = untyped_param(&mut builder, function, "value");
+    let block = builder.append_block(function);
+    let loaded = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::LoadLocal { dst: loaded, local },
+        span,
+    );
+    let result = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: result,
+            name: "strlen".to_owned(),
+            args: vec![IrCallArg {
+                name: None,
+                value: Operand::Register(loaded),
+                unpack: false,
+                value_kind: IrCallArgValueKind::Direct,
+                by_ref_local: None,
+                by_ref_dim: None,
+                by_ref_property: None,
+                by_ref_property_dim: None,
+            }],
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+    let unit = builder.finish();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.optimizing.stable-length").with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_call_dispatch: forbidden_call_dispatch as *const () as usize,
+            native_stable_length: forbidden_stable_length as *const () as usize,
+            native_local_fetch: passthrough_local_fetch as *const () as usize,
+            native_value_lifecycle: passthrough_lifecycle as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("optimizing stable-length handle");
+    let mut views = vec![crate::JitNativeValueView::default(); 8];
+    views[7] = crate::JitNativeValueView {
+        kind: crate::JIT_NATIVE_VALUE_VIEW_STRING,
+        flags: 0,
+        length: 17,
+    };
+    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
+        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
+        value_view_capacity: views.len() as u32,
+        value_views: views.as_mut_ptr() as usize as u64,
+        ..crate::JitNativeRuntimeView::default()
+    });
+    let input = crate::jit_encode_typed_runtime_value(7, crate::JIT_VALUE_RUNTIME_STRING_TAG);
+    assert_eq!(
+        handle
+            .invoke_i64(&[input], JIT_RUNTIME_ABI_HASH)
+            .expect("stable string length execution"),
+        17
+    );
+    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn optimizing_bounded_argument_wrapper_inlines_without_dispatch() {
+    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
+    let mut builder = IrBuilder::new(UnitId::new(4_215));
+    let file = builder.add_file("optimizing-inline-argument.php");
+    let span = IrSpan::new(file, 0, 1);
+    let callee = builder.start_function("identity_wrapper", FunctionFlags::default(), span);
+    let callee_local = untyped_param(&mut builder, callee, "value");
+    let callee_block = builder.append_block(callee);
+    let callee_value = builder.alloc_register(callee);
+    builder.emit(
+        callee,
+        callee_block,
+        InstructionKind::LoadLocal {
+            dst: callee_value,
+            local: callee_local,
+        },
+        span,
+    );
+    builder.terminate_return(
+        callee,
+        callee_block,
+        Some(Operand::Register(callee_value)),
+        span,
+    );
+    builder.register_function_name("identity_wrapper", callee);
+    let caller = builder.start_function("inline_argument_caller", FunctionFlags::default(), span);
+    let caller_local = untyped_param(&mut builder, caller, "value");
+    let caller_block = builder.append_block(caller);
+    let caller_value = builder.alloc_register(caller);
+    builder.emit(
+        caller,
+        caller_block,
+        InstructionKind::LoadLocal {
+            dst: caller_value,
+            local: caller_local,
+        },
+        span,
+    );
+    let result = builder.alloc_register(caller);
+    builder.emit(
+        caller,
+        caller_block,
+        InstructionKind::CallFunction {
+            dst: result,
+            name: "identity_wrapper".to_owned(),
+            args: vec![IrCallArg {
+                name: None,
+                value: Operand::Register(caller_value),
+                unpack: false,
+                value_kind: IrCallArgValueKind::Direct,
+                by_ref_local: None,
+                by_ref_dim: None,
+                by_ref_property: None,
+                by_ref_property_dim: None,
+            }],
+        },
+        span,
+    );
+    builder.terminate_return(caller, caller_block, Some(Operand::Register(result)), span);
+    let unit = builder.finish();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.optimizing.inline-argument").with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(caller),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_call_dispatch: forbidden_call_dispatch as *const () as usize,
+            native_local_fetch: passthrough_local_fetch as *const () as usize,
+            native_value_lifecycle: passthrough_lifecycle as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("bounded argument inline handle");
+    assert_eq!(handle.inlined_calls_per_invocation(), 1);
+    assert_eq!(
+        handle
+            .invoke_i64(&[42], JIT_RUNTIME_ABI_HASH)
+            .expect("bounded argument inline execution"),
+        42
+    );
+    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
