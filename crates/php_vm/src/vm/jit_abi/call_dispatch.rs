@@ -24,12 +24,17 @@ fn native_dynamic_call_reason(
     descriptor: &crate::compiled_unit::NativeCallSiteDescriptor,
     arguments: &[php_jit::JitNativeCallArgument],
 ) -> &'static str {
-    if arguments.iter().any(|argument| {
-        argument.flags.0
-            & (php_jit::JitNativeArgFlags::NAMED.0 | php_jit::JitNativeArgFlags::UNPACK.0)
-            != 0
-    }) {
-        return "variadic/default/named/unpack";
+    if arguments
+        .iter()
+        .any(|argument| argument.flags.0 & php_jit::JitNativeArgFlags::NAMED.0 != 0)
+    {
+        return "named arguments";
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument.flags.0 & php_jit::JitNativeArgFlags::UNPACK.0 != 0)
+    {
+        return "unpacked arguments";
     }
     if arguments
         .iter()
@@ -71,10 +76,35 @@ fn native_dynamic_call_reason(
     if target.params.iter().any(|parameter| parameter.by_ref) || target.returns_by_ref {
         return "by-reference";
     }
-    if target.params.iter().any(|parameter| parameter.variadic)
-        || arguments.len() != target.params.len()
-    {
-        return "variadic/default/named/unpack";
+    if target.params.iter().any(|parameter| parameter.variadic) {
+        return "variadic target";
+    }
+    if arguments.len() < target.params.len() {
+        let omitted = &target.params[arguments.len()..];
+        if omitted
+            .iter()
+            .any(|parameter| matches!(parameter.default, Some(php_ir::IrConstant::Array(_))))
+        {
+            return "omitted array defaults";
+        }
+        if omitted.iter().any(|parameter| parameter.default.is_none()) {
+            return "omitted required arguments";
+        }
+        if omitted.iter().any(|parameter| {
+            parameter.default.as_ref().is_some_and(|default| {
+                !context
+                    .unit
+                    .constants
+                    .iter()
+                    .any(|constant| constant == default)
+            })
+        }) {
+            return "omitted non-interned scalar defaults";
+        }
+        return "omitted interned scalar defaults";
+    }
+    if arguments.len() > target.params.len() {
+        return "extra positional arguments";
     }
     if target.flags.is_closure || !target.captures.is_empty() {
         return "closure/capture";
