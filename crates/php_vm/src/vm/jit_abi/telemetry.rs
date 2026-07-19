@@ -656,6 +656,14 @@ impl NativeExecutionContext<'_> {
             &mut counters.native_call_dynamic_by_reason,
             &nested.native_call_dynamic_by_reason,
         );
+        merge_counter_map(
+            &mut counters.native_builtin_calls_by_name,
+            &nested.native_builtin_calls_by_name,
+        );
+        merge_counter_map(
+            &mut counters.native_builtin_time_nanos_by_name,
+            &nested.native_builtin_time_nanos_by_name,
+        );
         merge_gauge_map_max(
             &mut counters.native_code_bytes_by_function,
             &nested.native_code_bytes_by_function,
