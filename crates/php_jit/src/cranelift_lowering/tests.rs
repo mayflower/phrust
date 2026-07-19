@@ -270,6 +270,22 @@ extern "C" fn test_local_array_insert(
     test_array_insert(append, array, key, value, out)
 }
 
+#[allow(unsafe_code)]
+extern "C" fn test_array_fetch_typed_string(
+    _quiet: u32,
+    _array: i64,
+    _key: i64,
+    out: *mut i64,
+) -> i32 {
+    if out.is_null() {
+        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
+    }
+    let value = crate::jit_encode_typed_runtime_value(7, crate::JIT_VALUE_RUNTIME_STRING_TAG);
+    // SAFETY: generated code owns this synchronous stack output slot.
+    unsafe { out.write(value) };
+    0
+}
+
 #[test]
 fn lifecycle_operation_carries_function_and_continuation_context() {
     let encoded = native_dim_operation(1, FunctionId::new(37), 91_337);
@@ -3282,6 +3298,53 @@ fn optimizing_unknown_value_strict_null_identity_stays_native() {
             expected
         );
     }
+    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn optimizing_isset_dim_uses_typed_non_null_result_without_compare_helper() {
+    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
+    let mut builder = IrBuilder::new(UnitId::new(4_218));
+    let file = builder.add_file("optimizing-isset-dim.php");
+    let span = IrSpan::new(file, 0, 1);
+    let function = builder.start_function("optimizing_isset_dim", FunctionFlags::default(), span);
+    let array = untyped_param(&mut builder, function, "array");
+    let key = builder.intern_constant(IrConstant::Int(0));
+    let block = builder.append_block(function);
+    let isset = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::IssetDim {
+            dst: isset,
+            local: array,
+            dims: vec![Operand::Constant(key)],
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(isset)), span);
+    let unit = builder.finish();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.optimizing.isset-dim").with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_array_fetch: test_array_fetch_typed_string as *const () as usize,
+            native_compare: forbidden_compare as *const () as usize,
+            native_local_fetch: forbidden_local_fetch as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("optimizing isset-dim handle");
+    let array = crate::jit_encode_typed_runtime_value(3, crate::JIT_VALUE_RUNTIME_ARRAY_TAG);
+    assert_eq!(
+        handle
+            .invoke_i64(&[array], JIT_RUNTIME_ABI_HASH)
+            .expect("typed isset-dim execution"),
+        crate::jit_encode_constant(crate::JIT_VALUE_TRUE)
+    );
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 

@@ -2105,6 +2105,75 @@ fn lower_guarded_strict_identity(
     Ok(builder.block_params(merge)[0])
 }
 
+fn lower_guarded_isset_value(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    helper: Option<NativeHelper>,
+    value: ir::Value,
+    result_out: ir::Value,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    let null = builder
+        .ins()
+        .iconst(types::I64, crate::jit_encode_constant(u32::MAX));
+    if !helper.is_some_and(|helper| helper.inline_runtime_view) {
+        return lower_native_value_operation(
+            module,
+            builder,
+            helper,
+            native_compare_opcode(RegionCompareOpCode::NotIdentical),
+            &[value, null],
+            result_out,
+        );
+    }
+
+    let slow = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+
+    let kind = builder
+        .ins()
+        .band_imm(value, crate::JIT_VALUE_RUNTIME_KIND_MASK as i64);
+    let is_reference = builder.ins().icmp_imm(
+        IntCC::Equal,
+        kind,
+        crate::JIT_VALUE_RUNTIME_REFERENCE_TAG as i64,
+    );
+    let is_boxed_scalar =
+        builder
+            .ins()
+            .icmp_imm(IntCC::Equal, kind, crate::JIT_VALUE_RUNTIME_TAG as i64);
+    let is_constant = lower_value_has_namespace_tag(builder, value, crate::JIT_VALUE_CONSTANT_TAG);
+    let constant_index = builder.ins().ireduce(types::I32, value);
+    let is_reserved = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        constant_index,
+        i64::from(crate::JIT_VALUE_TRUE),
+    );
+    let is_not_reserved = lower_not_bool(builder, is_reserved);
+    let is_opaque_constant = builder.ins().band(is_constant, is_not_reserved);
+    let needs_decode = builder.ins().bor(is_reference, is_boxed_scalar);
+    let needs_decode = builder.ins().bor(needs_decode, is_opaque_constant);
+    let is_set = builder.ins().icmp(IntCC::NotEqual, value, null);
+    let is_set = encode_native_bool(builder, is_set);
+    builder
+        .ins()
+        .brif(needs_decode, slow, &[], merge, &[is_set.into()]);
+
+    builder.switch_to_block(slow);
+    let is_set = lower_native_value_operation(
+        module,
+        builder,
+        helper,
+        native_compare_opcode(RegionCompareOpCode::NotIdentical),
+        &[value, null],
+        result_out,
+    )?;
+    builder.ins().jump(merge, &[is_set.into()]);
+
+    builder.switch_to_block(merge);
+    Ok(builder.block_params(merge)[0])
+}
+
 fn lower_guarded_integer_compare(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
@@ -5096,15 +5165,11 @@ fn lower_region_instruction(
                     result_out,
                 )?;
             }
-            let null = builder
-                .ins()
-                .iconst(types::I64, crate::jit_encode_constant(u32::MAX));
-            let result = lower_native_value_operation(
+            let result = lower_guarded_isset_value(
                 module,
                 builder,
                 native_operations.compare,
-                native_compare_opcode(RegionCompareOpCode::NotIdentical),
-                &[value, null],
+                value,
                 result_out,
             )?;
             define_region_register(builder, register_variables, registers, *dst, result)?;
