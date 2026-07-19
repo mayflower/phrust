@@ -132,20 +132,13 @@ pub(super) fn invoke_native_function_with_metadata_strict(
             .iter()
             .copied()
             .collect::<request_state::NativeTraceArguments>();
-        let root_arguments = raw_supplied
-            .iter()
-            .map(|value| context.decode(*value))
-            .collect::<Result<Vec<_>, _>>()?;
-        context.push_call_arguments(root_arguments);
-        let result = invoke_native_method_with_prepared_trace_arguments(
+        return invoke_native_method_with_prepared_trace_arguments(
             context,
             function,
             &bound,
             Some(visible_arguments),
             Some(target_metadata),
         );
-        context.pop_call_arguments();
-        return result;
     }
     let mut assigned = vec![None; fixed_count];
     let mut variadic = php_runtime::api::PhpArray::new();
@@ -321,22 +314,13 @@ pub(super) fn invoke_native_function_with_metadata_strict(
         .chain(&visible_extra)
         .copied()
         .collect::<request_state::NativeTraceArguments>();
-    let root_arguments = assigned
-        .iter()
-        .flatten()
-        .chain(&visible_extra)
-        .map(|value| context.decode(*value))
-        .collect::<Result<Vec<_>, _>>()?;
-    context.push_call_arguments(root_arguments);
-    let result = invoke_native_method_with_prepared_trace_arguments(
+    invoke_native_method_with_prepared_trace_arguments(
         context,
         function,
         &bound,
         Some(visible_arguments),
         Some(target_metadata),
-    );
-    context.pop_call_arguments();
-    result
+    )
 }
 
 pub(super) fn materialize_native_property_reference_arguments(

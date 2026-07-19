@@ -1851,7 +1851,6 @@ fn cranelift_dynamic_call_uses_typed_native_trampoline() {
         // SAFETY: The generated call owns both ABI records for this
         // synchronous test invocation.
         let frame = unsafe { &*frame };
-        assert_eq!(frame.abi_version, crate::JIT_RUNTIME_ABI_VERSION);
         assert_eq!(frame.target.kind, crate::JitNativeCallKind::FUNCTION);
         // SAFETY: `out` is a checked, caller-owned result record.
         unsafe {

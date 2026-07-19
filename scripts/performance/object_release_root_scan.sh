@@ -49,4 +49,26 @@ jq -e '
     exit 1
 }
 
-printf '%s\n' '[pass] object release preserves output and uses indexed request-root membership'
+if rg -q 'call_arguments: Vec<Vec<Value>>|push_call_arguments|pop_call_arguments' \
+    crates/php_vm/src/vm/jit_abi.rs \
+    crates/php_vm/src/vm/jit_abi/call_support.rs; then
+    printf '%s\n' '[fail] warm userland calls still materialize a duplicate argument root stack' >&2
+    exit 1
+fi
+
+rg -q 'fn live_native_values_contain_object' crates/php_vm/src/vm/jit_abi.rs || {
+    printf '%s\n' '[fail] destructor release no longer scans already-live native handles on demand' >&2
+    exit 1
+}
+
+rg -q 'Option<NativeInstructionPtr>' crates/php_vm/src/vm/jit_abi.rs || {
+    printf '%s\n' '[fail] continuation lookup again clones owned IR instructions on the helper path' >&2
+    exit 1
+}
+
+rg -q 'map\(std::sync::Arc::as_ptr\)' crates/php_vm/src/vm/jit_abi.rs || {
+    printf '%s\n' '[fail] callsite lookup again performs an Arc clone/drop per warm dispatch' >&2
+    exit 1
+}
+
+printf '%s\n' '[pass] object release preserves output without per-call root or metadata clones'

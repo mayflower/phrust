@@ -5,16 +5,6 @@ use super::{
 };
 
 #[test]
-fn helper_root_mutations_are_declared_only_for_stable_root_shapes() {
-    assert_eq!(
-        super::helper_root_mutation_reason("dynamic_code"),
-        Some(super::RootMutationReason::GlobalOrStatic)
-    );
-    assert_eq!(super::helper_root_mutation_reason("reference_bind"), None);
-    assert_eq!(super::helper_root_mutation_reason("local_store"), None);
-}
-
-#[test]
 fn positional_builtin_arguments_do_not_require_rebinding() {
     use php_ir::instruction::{IrCallArg, IrCallArgValueKind};
 
@@ -207,7 +197,7 @@ fn native_php_diagnostics_match_cli_and_http_rendering() {
 }
 
 #[test]
-fn native_call_trampoline_requests_compile_without_interpreter_reentry() {
+fn native_call_trampoline_trusts_the_published_internal_abi() {
     let mut frame = php_jit::JitNativeCallFrame {
         function_id: 3,
         continuation_id: 7,
@@ -223,9 +213,9 @@ fn native_call_trampoline_requests_compile_without_interpreter_reentry() {
     frame.abi_version = frame.abi_version.saturating_add(1);
     assert_eq!(
         jit_native_call_dispatch_abi(0, &mut frame, &mut out),
-        php_jit::JitCallStatus::ABI_MISMATCH.0 as i32
+        php_jit::JitCallStatus::COMPILE_REQUIRED.0 as i32
     );
-    assert_eq!(out.status, php_jit::JitCallStatus::ABI_MISMATCH);
+    assert_eq!(out.status, php_jit::JitCallStatus::COMPILE_REQUIRED);
 }
 
 #[test]

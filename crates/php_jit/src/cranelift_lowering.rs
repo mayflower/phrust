@@ -2026,6 +2026,54 @@ fn lower_guarded_strict_identity(
     Ok(builder.block_params(merge)[0])
 }
 
+fn lower_guarded_integer_compare(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    helper: Option<NativeHelper>,
+    op: RegionCompareOpCode,
+    lhs: ir::Value,
+    rhs: ir::Value,
+    result_out: ir::Value,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    let direct = builder.create_block();
+    let slow = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+
+    let lhs_constant = lower_value_has_namespace_tag(builder, lhs, crate::JIT_VALUE_CONSTANT_TAG);
+    let rhs_constant = lower_value_has_namespace_tag(builder, rhs, crate::JIT_VALUE_CONSTANT_TAG);
+    let lhs_int = lower_is_immediate_int(builder, lhs, lhs_constant);
+    let rhs_int = lower_is_immediate_int(builder, rhs, rhs_constant);
+    let both_int = builder.ins().band(lhs_int, rhs_int);
+    builder.ins().brif(both_int, direct, &[], slow, &[]);
+
+    builder.switch_to_block(direct);
+    let value = lower_direct_compare(
+        builder,
+        op,
+        lhs,
+        rhs,
+        SsaValueClass::Int,
+        SsaValueClass::Int,
+    )
+    .expect("integer comparisons have direct CLIF lowering");
+    builder.ins().jump(merge, &[value.into()]);
+
+    builder.switch_to_block(slow);
+    let value = lower_native_value_operation(
+        module,
+        builder,
+        helper,
+        native_compare_opcode(op),
+        &[lhs, rhs],
+        result_out,
+    )?;
+    builder.ins().jump(merge, &[value.into()]);
+
+    builder.switch_to_block(merge);
+    Ok(builder.block_params(merge)[0])
+}
+
 fn lower_guarded_value_lifecycle(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
@@ -2136,7 +2184,9 @@ fn lower_guarded_native_local_store(
     result_out: ir::Value,
     deopt_out: ir::Value,
 ) -> Result<ir::Value, CraneliftLoweringError> {
-    if local_store.is_some_and(|helper| !helper.inline_runtime_view) {
+    if local_store.is_some_and(|helper| !helper.inline_runtime_view)
+        || operation & crate::JIT_LOCAL_STORE_PLAIN_LOCAL == 0
+    {
         let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
         let local_value = builder.ins().iconst(types::I64, i64::from(local.raw()));
         let operation = if move_input {
@@ -2230,7 +2280,7 @@ fn lower_guarded_native_local_fetch(
     result_out: ir::Value,
     deopt_out: ir::Value,
 ) -> Result<ir::Value, CraneliftLoweringError> {
-    if helper.is_some_and(|helper| !helper.inline_runtime_view) {
+    if helper.is_some_and(|helper| !helper.inline_runtime_view) || !method_local_fast_path {
         return lower_native_local_fetch(
             module,
             builder,
@@ -4337,12 +4387,13 @@ fn lower_region_instruction(
                     result_out,
                 )?
             } else if native_operations.compare.is_some() {
-                lower_native_value_operation(
+                lower_guarded_integer_compare(
                     module,
                     builder,
                     native_operations.compare,
-                    native_compare_opcode(*op),
-                    &[lhs, rhs],
+                    *op,
+                    lhs,
+                    rhs,
                     result_out,
                 )?
             } else {
@@ -5819,22 +5870,7 @@ fn lower_native_call_trampoline(
     };
     store_i32(
         builder,
-        std::mem::offset_of!(crate::JitNativeCallFrame, abi_version),
-        crate::JIT_RUNTIME_ABI_VERSION,
-    );
-    store_i32(
-        builder,
-        std::mem::offset_of!(crate::JitNativeCallFrame, struct_size),
-        frame_size,
-    );
-    store_i32(
-        builder,
         std::mem::offset_of!(crate::JitNativeCallFrame, function_id),
-        function.raw(),
-    );
-    store_i32(
-        builder,
-        std::mem::offset_of!(crate::JitNativeCallFrame, region_id),
         function.raw(),
     );
     store_i32(
@@ -5852,25 +5888,10 @@ fn lower_native_call_trampoline(
         std::mem::offset_of!(crate::JitNativeCallFrame, source_instruction_id),
         instruction.id.raw(),
     );
-    let result_slot = match call.result {
-        RegionCallResult::Register(register) => register.raw(),
-        RegionCallResult::ReferenceLocal(local) => local.raw(),
-        RegionCallResult::Discard => u32::MAX,
-    };
-    store_i32(
-        builder,
-        std::mem::offset_of!(crate::JitNativeCallFrame, result_slot),
-        result_slot,
-    );
     store_i32(
         builder,
         std::mem::offset_of!(crate::JitNativeCallFrame, local_count),
         published_local_count,
-    );
-    store_i32(
-        builder,
-        std::mem::offset_of!(crate::JitNativeCallFrame, temporary_count),
-        0,
     );
     store_i32(
         builder,
@@ -5911,22 +5932,6 @@ fn lower_native_call_trampoline(
         frame_ptr,
         std::mem::offset_of!(crate::JitNativeCallFrame, local_slots) as i32,
     );
-    for offset in [
-        std::mem::offset_of!(crate::JitNativeCallFrame, temporary_slots),
-        std::mem::offset_of!(crate::JitNativeCallFrame, caller_frame),
-        std::mem::offset_of!(crate::JitNativeCallFrame, class_context),
-        std::mem::offset_of!(crate::JitNativeCallFrame, exception_metadata),
-        std::mem::offset_of!(crate::JitNativeCallFrame, trace_metadata),
-        std::mem::offset_of!(crate::JitNativeCallFrame, generator_handle),
-        std::mem::offset_of!(crate::JitNativeCallFrame, fiber_handle),
-    ] {
-        builder.ins().store(
-            MemFlagsData::new(),
-            zero,
-            frame_ptr,
-            i32::try_from(offset).unwrap_or(i32::MAX),
-        );
-    }
     builder.ins().store(
         MemFlagsData::new(),
         arguments_ptr,
@@ -5948,8 +5953,7 @@ fn lower_native_call_trampoline(
         frame_ptr,
         std::mem::offset_of!(crate::JitNativeCallFrame, receiver_handle) as i32,
     );
-    let (kind, target_function, symbol_hash, class_hash) =
-        native_call_target_metadata(&call.target);
+    let (kind, target_function, _, _) = native_call_target_metadata(&call.target);
     let target_offset = std::mem::offset_of!(crate::JitNativeCallFrame, target);
     store_i32(
         builder,
@@ -5961,31 +5965,6 @@ fn lower_native_call_trampoline(
         target_offset + std::mem::offset_of!(crate::JitNativeCallTarget, function_id),
         direct_builtin_helper.unwrap_or(target_function),
     );
-    builder.ins().store(
-        MemFlagsData::new(),
-        zero,
-        frame_ptr,
-        i32::try_from(target_offset + std::mem::offset_of!(crate::JitNativeCallTarget, generation))
-            .unwrap_or(i32::MAX),
-    );
-    for (offset, value) in [
-        (
-            target_offset + std::mem::offset_of!(crate::JitNativeCallTarget, symbol_hash),
-            symbol_hash,
-        ),
-        (
-            target_offset + std::mem::offset_of!(crate::JitNativeCallTarget, class_hash),
-            class_hash,
-        ),
-    ] {
-        let value = builder.ins().iconst(types::I64, value as i64);
-        builder.ins().store(
-            MemFlagsData::new(),
-            value,
-            frame_ptr,
-            i32::try_from(offset).unwrap_or(i32::MAX),
-        );
-    }
 
     let out_size = std::mem::size_of::<crate::JitCallResult>() as u32;
     let out_slot = builder.create_sized_stack_slot(StackSlotData::new(

@@ -273,21 +273,15 @@ pub(crate) enum NativeCallSiteKind {
 #[derive(Debug)]
 pub(crate) struct NativeCallSiteDescriptor {
     pub kind: NativeCallSiteKind,
-    pub function_id: u32,
-    pub continuation_id: u32,
-    pub source_block_id: u32,
-    pub source_instruction_id: u32,
     pub span: IrSpan,
     pub target_symbol: Option<Arc<str>>,
     pub target_function: Option<FunctionId>,
     /// Stable builtin entry resolved once with immutable callsite metadata.
-    /// The helper ID carried by generated code is revalidated against it at
-    /// dispatch, so the warm path needs no global registry lookup.
+    /// Generated code and this immutable table are published together, so the
+    /// warm path needs neither a registry lookup nor redundant ID validation.
     pub direct_builtin: Option<PreparedNativeBuiltin>,
     pub arguments: Arc<[php_ir::instruction::IrCallArg]>,
     pub argument_operand_offset: usize,
-    pub result_slot: u32,
-    pub returns_by_reference: bool,
     pub pic_slot: u64,
     semantic_instruction: Arc<php_ir::Instruction>,
     method_pic: PersistentNativeMethodPic,
@@ -759,15 +753,6 @@ impl CompiledUnit {
                                 } else {
                                     None
                                 };
-                                let result_slot = match call.result {
-                                    php_jit::region_ir::RegionCallResult::Register(register) => {
-                                        register.raw()
-                                    }
-                                    php_jit::region_ir::RegionCallResult::ReferenceLocal(local) => {
-                                        local.raw()
-                                    }
-                                    php_jit::region_ir::RegionCallResult::Discard => u32::MAX,
-                                };
                                 let pic_slot = (u64::from(function.raw()) << 32)
                                     | u64::from(instruction.continuation_id);
                                 let continuation = instruction.continuation_id as usize;
@@ -777,18 +762,12 @@ impl CompiledUnit {
                                 function_callsites[continuation] =
                                     Some(Arc::new(NativeCallSiteDescriptor {
                                         kind,
-                                        function_id: function.raw(),
-                                        continuation_id: instruction.continuation_id,
-                                        source_block_id: block.id.raw(),
-                                        source_instruction_id: instruction.id.raw(),
                                         span: instruction.span,
                                         target_symbol,
                                         target_function,
                                         direct_builtin,
                                         arguments: Arc::from(call.args.clone()),
                                         argument_operand_offset: call.argument_operand_offset,
-                                        result_slot,
-                                        returns_by_reference: call.returns_by_reference,
                                         pic_slot,
                                         semantic_instruction,
                                         method_pic: PersistentNativeMethodPic::default(),

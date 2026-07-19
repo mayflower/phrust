@@ -318,17 +318,15 @@ impl NativeExecutionContext<'_> {
                 "request_membership_traversal".to_owned(),
                 self.root_index.membership_traversals(),
             );
-        let (call_traversals, call_cache_hits, call_cache_misses) =
-            self.call_root_index.telemetry();
         counters
             .runtime_helper_object_release_root_scans_by_reason
-            .insert("call_membership_traversal".to_owned(), call_traversals);
+            .insert("call_membership_traversal".to_owned(), 0);
         counters
             .runtime_helper_object_release_root_scans_by_reason
-            .insert("call_membership_cache_hit".to_owned(), call_cache_hits);
+            .insert("call_membership_cache_hit".to_owned(), 0);
         counters
             .runtime_helper_object_release_root_scans_by_reason
-            .insert("call_membership_cache_miss".to_owned(), call_cache_misses);
+            .insert("call_membership_cache_miss".to_owned(), 0);
         counters.native_slow_path_entries_by_reason =
             named_counters(&SLOW_PATH_REASONS, telemetry.slow_paths);
         let mut seen_regions = std::collections::BTreeSet::new();

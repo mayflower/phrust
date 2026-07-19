@@ -1679,7 +1679,7 @@ pub(in crate::vm) extern "C" fn jit_native_reference_bind_abi(
                 context,
                 &target,
                 &key,
-                source.as_ref(),
+                source.as_deref(),
                 NativeDimensionOperation::Reference,
             )
             .is_err()
@@ -2054,7 +2054,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_insert_abi(
                 context,
                 &target,
                 &key,
-                source.as_ref(),
+                source.as_deref(),
                 NativeDimensionOperation::Insert,
             )
             .is_err()
@@ -3222,7 +3222,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_fetch_abi(
             if emit_native_array_dimension_conversion_diagnostic(
                 context,
                 &key,
-                source.as_ref(),
+                source.as_deref(),
                 NativeDimensionOperation::Fetch { quiet: quiet == 1 },
             )
             .is_err()
@@ -3245,7 +3245,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_fetch_abi(
                 &key,
                 quiet,
                 true,
-                source.as_ref(),
+                source.as_deref(),
                 out,
             );
         }
@@ -3306,7 +3306,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_fetch_abi(
             context,
             &array,
             &key,
-            source.as_ref(),
+            source.as_deref(),
             NativeDimensionOperation::Fetch { quiet: quiet == 1 },
         )
         .is_err()
@@ -3442,7 +3442,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_fetch_abi(
             &key,
             quiet,
             array_target,
-            source.as_ref(),
+            source.as_deref(),
             out,
         )
     })
@@ -3480,7 +3480,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_unset_abi(
             context,
             &target,
             &key,
-            source.as_ref(),
+            source.as_deref(),
             NativeDimensionOperation::Unset,
         )
         .is_err()

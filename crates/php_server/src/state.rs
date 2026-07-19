@@ -150,8 +150,11 @@ impl ServerEngineState {
         } else {
             base_options.optimization_level
         };
-        let worker_state =
-            VmWorkerState::new_with_background_tiering(base_options.vm_options.tiering.clone());
+        // Warm server requests must not compete with speculative Cranelift
+        // work. Compile the selected production tier on demand and keep the
+        // worker cache stable instead of scheduling threshold-based
+        // background recompilation.
+        let worker_state = VmWorkerState::new(base_options.vm_options.tiering.clone());
         Self {
             engine_profile,
             native_cache,

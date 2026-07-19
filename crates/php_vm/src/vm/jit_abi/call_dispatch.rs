@@ -174,27 +174,17 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
     if frame.is_null() || out.is_null() {
         return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let result = (|| {
         // SAFETY: The generated caller owns both records for this synchronous
         // call and the pointers were checked for null above.
         let frame = unsafe { &mut *frame };
-        if frame.abi_version != php_jit::JIT_RUNTIME_ABI_VERSION
-            || frame.struct_size as usize != std::mem::size_of::<php_jit::JitNativeCallFrame>()
-            || (frame.argument_count != 0 && frame.arguments == 0)
-            || (frame.local_count != 0 && frame.local_slots == 0)
-        {
-            return (
-                php_jit::JitCallStatus::ABI_MISMATCH.0 as i32,
-                php_jit::JitCallStatus::ABI_MISMATCH,
-                None,
-            );
-        }
         let mut empty_arguments = [];
         let arguments: &mut [php_jit::JitNativeCallArgument] = if frame.argument_count == 0 {
             &mut empty_arguments
         } else {
-            // SAFETY: ABI validation above proves a non-null caller-owned
-            // argument table with `argument_count` live entries.
+            // SAFETY: The native compiler emits the caller-owned argument
+            // table and its exact live count. This internal hot ABI is trusted
+            // after code publication instead of revalidating every call.
             unsafe {
                 std::slice::from_raw_parts_mut(
                     frame.arguments as *mut php_jit::JitNativeCallArgument,
@@ -212,28 +202,13 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                     frame.function_id, frame.source_block_id, frame.source_instruction_id,
                 ));
             };
+            // SAFETY: the descriptor is owned by the active compiled unit.
+            // Unit storage remains alive and immutable for the synchronous
+            // native dispatch, while the raw pointer avoids an atomic Arc
+            // clone/drop on every warm callsite invocation.
+            let descriptor = unsafe { &*descriptor };
             callsite_span = Some(descriptor.span);
             let instruction = descriptor.semantic_instruction();
-            if descriptor.function_id != frame.function_id
-                || descriptor.continuation_id != frame.continuation_id
-                || descriptor.source_block_id != frame.source_block_id
-                || descriptor.source_instruction_id != frame.source_instruction_id
-                || descriptor.result_slot != frame.result_slot
-                || descriptor.returns_by_reference
-                    != (frame.flags & php_jit::JitNativeCallFrame::FLAG_RETURN_REFERENCE != 0)
-                || descriptor.span != instruction.span
-                || descriptor.pic_slot
-                    != ((u64::from(frame.function_id) << 32) | u64::from(frame.continuation_id))
-                || descriptor.target_function.is_some_and(|function| {
-                    frame.target.function_id != u32::MAX
-                        && frame.target.function_id != function.raw()
-                })
-            {
-                return Err(
-                    "E_PHP_VM_NATIVE_CALLSITE_MISMATCH: generated callsite metadata is stale"
-                        .to_owned(),
-                );
-            }
             let direct_builtin =
                 frame.flags & php_jit::JitNativeCallFrame::FLAG_DIRECT_BUILTIN != 0;
             let direct_external =
@@ -328,7 +303,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 drop(telemetry);
                 if !direct_builtin && !direct_external_in_place {
                     let dynamic_reason =
-                        native_dynamic_call_reason(context, frame, &descriptor, arguments);
+                        native_dynamic_call_reason(context, frame, descriptor, arguments);
                     let mut telemetry = context.runtime_telemetry.borrow_mut();
                     let count = telemetry
                         .counters
@@ -343,7 +318,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
             } else if let Some(operation) = semantic_operation {
                 semantic_operation_helper_id(operation)
             } else {
-                call_dispatch_helper_id(&descriptor)
+                call_dispatch_helper_id(descriptor)
             };
             if context.options.collect_counters {
                 context.enter_runtime_helper(helper_id);
@@ -367,7 +342,6 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
             if direct_builtin {
                 let entry = descriptor
                     .direct_builtin
-                    .filter(|builtin| builtin.entry.helper_id() == frame.target.function_id)
                     .ok_or_else(|| {
                         format!(
                             "E_PHP_VM_UNRESOLVED_CALLABLE: builtin helper {} is not published",
@@ -704,7 +678,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 };
                 let class_name = object.class_name();
                 if let Some(target) =
-                    context.lookup_native_method_pic(&descriptor, &class_name, method)
+                    context.lookup_native_method_pic(descriptor, &class_name, method)
                 {
                     context.record_native_method_pic(true);
                     match target {
@@ -800,7 +774,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                         ));
                     }
                     if context.install_native_method_pic(
-                        &descriptor,
+                        descriptor,
                         &class_name,
                         method,
                         NativeMethodPicTarget::CurrentUnit {
@@ -842,7 +816,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                         &encoded
                     };
                     if context.install_native_method_pic(
-                        &descriptor,
+                        descriptor,
                         &class_name,
                         method,
                         NativeMethodPicTarget::DynamicUnit {
@@ -956,7 +930,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 }
                 if let Some(class) = resolved_class.as_deref()
                     && let Some(target) =
-                        context.lookup_native_method_pic(&descriptor, class, method)
+                        context.lookup_native_method_pic(descriptor, class, method)
                 {
                     context.record_native_method_pic(true);
                     let forwarding = matches!(
@@ -1090,7 +1064,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                     } else {
                         if let Some(class) = resolved_class.as_deref()
                             && context.install_native_method_pic(
-                                &descriptor,
+                                descriptor,
                                 class,
                                 method,
                                 NativeMethodPicTarget::CurrentUnit {
@@ -1147,7 +1121,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                         )
                     } else {
                         if context.install_native_method_pic(
-                            &descriptor,
+                            descriptor,
                             class,
                             method,
                             NativeMethodPicTarget::DynamicUnit {
@@ -1680,12 +1654,8 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 None,
             ),
         }
-    }));
-    let (status, call_status, value) = result.unwrap_or((
-        php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
-        php_jit::JitCallStatus::RUNTIME_ERROR,
-        None,
-    ));
+    })();
+    let (status, call_status, value) = result;
     // SAFETY: `out` is a checked, caller-owned result record.
     unsafe {
         out.write(php_jit::JitCallResult {

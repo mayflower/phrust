@@ -477,6 +477,9 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
     if request.is_null() || out.is_null() {
         return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
+    let _ = with_native_context(|context| {
+        context.mark_roots_dirty(RootMutationReason::GlobalOrStatic);
+    });
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: Generated code owns this request for the synchronous call.
         let request = unsafe { &*request };

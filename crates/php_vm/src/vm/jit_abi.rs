@@ -44,7 +44,7 @@ use request_state::{
     NativeBacktraceFrame, NativeFunctionNameScope, NativeLastError,
     NativeRegisteredExtensionRequestState,
 };
-use root_index::{IncrementalCallRootIndex, RequestRootIndex, RootMutationReason};
+use root_index::{RequestRootIndex, RootMutationReason, values_contain_object};
 pub(super) use runtime_ops::{
     jit_native_argument_check_abi, jit_native_array_fetch_abi, jit_native_array_insert_abi,
     jit_native_array_new_abi, jit_native_array_spread_abi, jit_native_array_unset_abi,
@@ -306,6 +306,21 @@ impl std::ops::Deref for ActiveNativeUnit {
     }
 }
 
+#[derive(Clone, Copy)]
+struct NativeInstructionPtr(*const php_ir::Instruction);
+
+// SAFETY: Continuation instructions are owned by the active immutable
+// CompiledUnit (or its immutable IR unit fallback). Both outlive every
+// synchronous native helper invocation that receives this pointer.
+#[allow(unsafe_code)]
+impl std::ops::Deref for NativeInstructionPtr {
+    type Target = php_ir::Instruction;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.0 }
+    }
+}
+
 pub(super) struct NativeExecutionContext<'a> {
     compiled: crate::compiled_unit::CompiledUnit,
     unit: ActiveNativeUnit,
@@ -315,7 +330,6 @@ pub(super) struct NativeExecutionContext<'a> {
     native_entries:
         std::sync::Arc<std::collections::BTreeMap<php_ir::FunctionId, php_jit::JitFunctionHandle>>,
     resolved_native_entries: NativeResolvedEntryCache,
-    call_arguments: Vec<Vec<Value>>,
     native_call_encoded_scratch: Vec<i64>,
     native_frame_arena: NativeFrameArena,
     native_method_pics: std::collections::BTreeMap<u64, NativeMethodPic>,
@@ -323,6 +337,7 @@ pub(super) struct NativeExecutionContext<'a> {
     values: Vec<Option<NativeStoredValue>>,
     value_refcounts: Vec<u32>,
     value_views: Vec<php_jit::JitNativeValueView>,
+    interned_value_handles: std::collections::HashMap<NativeValueIdentity, u32>,
     native_poll_counter: Box<u32>,
     free_value_slots: Vec<u32>,
     /// Successfully resolved IR constants are immutable for the lifetime of
@@ -335,10 +350,6 @@ pub(super) struct NativeExecutionContext<'a> {
     /// Long-lived request roots (globals, statics, callbacks, sessions, and
     /// suspended state). This index must not be invalidated by every call.
     root_index: RequestRootIndex,
-    /// Roots owned by the active native call stack. Argument frames are
-    /// pushed and popped frequently, so rebuilding this small domain must not
-    /// traverse the complete request graph.
-    call_root_index: IncrementalCallRootIndex,
     resources: php_runtime::api::ResourceTable,
     builtin_request_state: php_runtime::api::BuiltinRequestState,
     registered_extensions: NativeRegisteredExtensionRequestState,
@@ -456,6 +467,24 @@ enum NativeStoredValue {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum NativeValueIdentity {
+    Object(u64),
+    Reference(u64),
+}
+
+fn stored_value_identity(value: &NativeStoredValue) -> Option<NativeValueIdentity> {
+    match value {
+        NativeStoredValue::Php(Value::Object(object)) => {
+            Some(NativeValueIdentity::Object(object.id()))
+        }
+        NativeStoredValue::Php(Value::Reference(reference)) => {
+            Some(NativeValueIdentity::Reference(reference.gc_debug_id()))
+        }
+        _ => None,
+    }
+}
+
 fn stored_value_tag(value: &NativeStoredValue) -> u64 {
     match value {
         NativeStoredValue::Php(Value::Reference(_)) => php_jit::JIT_VALUE_RUNTIME_REFERENCE_TAG,
@@ -503,19 +532,12 @@ struct NativeFiberExecution {
 impl<'a> NativeExecutionContext<'a> {
     fn mark_roots_dirty(&mut self, reason: RootMutationReason) {
         self.root_index.mark_dirty(reason);
-        if reason == RootMutationReason::RootedContainer {
-            self.call_root_index.mark_dirty(reason);
-        }
     }
 
     fn mark_rooted_container_dirty(&mut self, value: &Value) {
         self.root_index
             .mark_dirty(RootMutationReason::RootedContainer);
         self.root_index.refresh_container(value);
-        if self.call_root_index.is_dirty() || self.call_root_index.contains_container(value) {
-            self.call_root_index
-                .refresh_container(value, &self.call_arguments);
-        }
     }
 
     fn value_has_native_destructor(&self, value: &Value) -> bool {
@@ -543,9 +565,6 @@ impl<'a> NativeExecutionContext<'a> {
     fn add_rooted_nested_container(&mut self, parent: &Value, child: &Value) {
         if self.root_index.is_dirty() || self.root_index.contains_container(parent) {
             self.root_index.add_nested_container(parent, child);
-        }
-        if self.call_root_index.is_dirty() || self.call_root_index.contains_container(parent) {
-            self.call_root_index.add_nested_container(parent, child);
         }
     }
 
@@ -580,20 +599,6 @@ impl<'a> NativeExecutionContext<'a> {
             let roots = self.request_root_values();
             self.root_index.synchronize(&roots);
         }
-    }
-
-    fn push_call_arguments(&mut self, arguments: Vec<Value>) {
-        self.call_root_index.push(&arguments);
-        self.call_arguments.push(arguments);
-    }
-
-    fn pop_call_arguments(&mut self) {
-        let popped = self.call_arguments.pop();
-        debug_assert!(popped.is_some(), "native call argument stack underflow");
-        debug_assert!(
-            self.call_root_index.pop(),
-            "native call root stack underflow"
-        );
     }
 
     fn finalize_replaced_value(&mut self, previous: Value) -> Result<(), String> {
@@ -725,7 +730,6 @@ impl<'a> NativeExecutionContext<'a> {
             worker_state,
             native_entries,
             resolved_native_entries: NativeResolvedEntryCache::default(),
-            call_arguments: Vec::new(),
             native_call_encoded_scratch: Vec::with_capacity(native_call_argument_capacity),
             native_frame_arena: NativeFrameArena::default(),
             native_method_pics: std::collections::BTreeMap::new(),
@@ -733,13 +737,14 @@ impl<'a> NativeExecutionContext<'a> {
             values: Vec::new(),
             value_refcounts: Vec::with_capacity(NATIVE_VALUE_REFCOUNT_CAPACITY),
             value_views: Vec::with_capacity(NATIVE_VALUE_REFCOUNT_CAPACITY),
-            // Wrapping 63 + 1 makes the first loop-header visit poll.
-            native_poll_counter: Box::new(63),
+            interned_value_handles: std::collections::HashMap::new(),
+            // Wrapping 4095 + 1 makes the first loop-header visit poll. Native
+            // code then checks the deadline once per 4096 loop-header visits.
+            native_poll_counter: Box::new(4095),
             free_value_slots: Vec::new(),
             decoded_constant_cache: RefCell::new(std::collections::HashMap::new()),
             runtime_class_cache: RefCell::new(std::collections::HashMap::new()),
             root_index: RequestRootIndex::new_dirty(),
-            call_root_index: IncrementalCallRootIndex::new_clean(),
             resources,
             builtin_request_state: php_runtime::api::BuiltinRequestState::new(),
             registered_extensions: NativeRegisteredExtensionRequestState::default(),
@@ -977,6 +982,20 @@ impl<'a> NativeExecutionContext<'a> {
     fn encode_stored_value(&mut self, value: NativeStoredValue) -> Result<i64, String> {
         let tag = stored_value_tag(&value);
         let view = stored_value_view(&value);
+        let identity = stored_value_identity(&value);
+        if let Some((identity, index)) = identity.and_then(|identity| {
+            self.interned_value_handles
+                .get(&identity)
+                .copied()
+                .map(|index| (identity, index))
+        }) {
+            let index = index as usize;
+            if self.values.get(index).and_then(Option::as_ref).is_some() {
+                self.retain_runtime_value_index(index)?;
+                return Ok(php_jit::jit_encode_typed_runtime_value(index as u32, tag));
+            }
+            self.interned_value_handles.remove(&identity);
+        }
         if let Some(index) = self.free_value_slots.pop() {
             let slot = self
                 .values
@@ -988,6 +1007,9 @@ impl<'a> NativeExecutionContext<'a> {
             *slot = Some(value);
             self.value_refcounts[index as usize] = 1;
             self.value_views[index as usize] = view;
+            if let Some(identity) = identity {
+                self.interned_value_handles.insert(identity, index);
+            }
             self.record_value_table_reuse();
             return Ok(php_jit::jit_encode_typed_runtime_value(index, tag));
         }
@@ -1002,6 +1024,9 @@ impl<'a> NativeExecutionContext<'a> {
         self.values.push(Some(value));
         self.value_refcounts.push(1);
         self.value_views.push(view);
+        if let Some(identity) = identity {
+            self.interned_value_handles.insert(identity, index);
+        }
         self.record_value_table_allocation(self.values.len());
         Ok(php_jit::jit_encode_typed_runtime_value(index, tag))
     }
@@ -1143,6 +1168,9 @@ impl<'a> NativeExecutionContext<'a> {
                 .get_mut(index)
                 .ok_or_else(|| format!("native runtime value {index} is missing"))?
                 .take();
+            if let Some(identity) = value.as_ref().and_then(stored_value_identity) {
+                self.interned_value_handles.remove(&identity);
+            }
             self.value_views[index] = php_jit::JitNativeValueView::default();
             if let Some(NativeStoredValue::Php(Value::Object(object))) = value {
                 let class_name = object.class_name();
@@ -1193,15 +1221,38 @@ impl<'a> NativeExecutionContext<'a> {
         if self.root_index.contains(object_id) {
             return true;
         }
-        if self.call_root_index.is_dirty() {
-            let reason = self.call_root_index.last_reason().as_str();
-            self.call_root_index.rebuild(&self.call_arguments);
-            self.record_object_release_root_check(false);
-            self.record_root_rebuild_reason(reason);
-        } else {
-            self.record_object_release_root_check(true);
-        }
-        self.call_root_index.contains(object_id)
+        self.live_native_values_contain_object(object_id)
+    }
+
+    fn live_native_values_contain_object(&self, object_id: u64) -> bool {
+        self.values.iter().flatten().any(|stored| match stored {
+            NativeStoredValue::Php(value) => values_contain_object([value], object_id),
+            NativeStoredValue::Iterator {
+                entries,
+                live_object,
+                user_iterator,
+                ..
+            } => {
+                values_contain_object(
+                    entries.iter().flat_map(|(key, value)| [key, value]),
+                    object_id,
+                ) || live_object
+                    .as_ref()
+                    .is_some_and(|object| object.id() == object_id)
+                    || user_iterator
+                        .as_ref()
+                        .is_some_and(|object| object.id() == object_id)
+            }
+            NativeStoredValue::GeneratorIterator { delegation, .. } => delegation
+                .as_ref()
+                .is_some_and(|delegation| match delegation {
+                    NativeGeneratorDelegation::Array { entries, .. } => values_contain_object(
+                        entries.iter().flat_map(|(key, value)| [key, value]),
+                        object_id,
+                    ),
+                    NativeGeneratorDelegation::Generator { .. } => false,
+                }),
+        })
     }
 
     fn run_object_destructor(&mut self, object: php_runtime::api::ObjectRef) -> Result<(), String> {
@@ -1923,21 +1974,21 @@ impl<'a> NativeExecutionContext<'a> {
         &self,
         function: u32,
         continuation: u32,
-    ) -> Option<php_ir::Instruction> {
+    ) -> Option<NativeInstructionPtr> {
         if let Some(instruction) = self
             .continuation_instructions
             .get(function as usize)
             .and_then(|instructions| instructions.get(continuation as usize))
             .and_then(Option::as_ref)
         {
-            return Some(instruction.as_ref().clone());
+            return Some(NativeInstructionPtr(std::sync::Arc::as_ptr(instruction)));
         }
         let function = self.unit.functions.get(function as usize)?;
         let mut current = 0_u32;
         for block in &function.blocks {
             for instruction in &block.instructions {
                 if current == continuation {
-                    return Some(instruction.clone());
+                    return Some(NativeInstructionPtr(std::ptr::from_ref(instruction)));
                 }
                 current = current.saturating_add(1);
             }
@@ -1950,12 +2001,12 @@ impl<'a> NativeExecutionContext<'a> {
         &self,
         function: u32,
         continuation: u32,
-    ) -> Option<std::sync::Arc<crate::compiled_unit::NativeCallSiteDescriptor>> {
+    ) -> Option<*const crate::compiled_unit::NativeCallSiteDescriptor> {
         self.native_callsites
             .get(function as usize)
             .and_then(|callsites| callsites.get(continuation as usize))
             .and_then(Option::as_ref)
-            .cloned()
+            .map(std::sync::Arc::as_ptr)
     }
 
     fn native_method_epochs(&self) -> (u64, u64) {
@@ -2401,9 +2452,6 @@ fn with_native_context_for<R>(
     operation: impl FnOnce(&mut NativeExecutionContext<'_>) -> R,
 ) -> Option<R> {
     with_native_context(|context| {
-        if let Some(reason) = helper_root_mutation_reason(helper_id) {
-            context.mark_roots_dirty(reason);
-        }
         let collect_counters = context.options.collect_counters;
         if collect_counters {
             context.enter_runtime_helper(helper_id);
@@ -2414,13 +2462,6 @@ fn with_native_context_for<R>(
         }
         result
     })
-}
-
-fn helper_root_mutation_reason(helper_id: &str) -> Option<RootMutationReason> {
-    match helper_id {
-        "dynamic_code" => Some(RootMutationReason::GlobalOrStatic),
-        _ => None,
-    }
 }
 
 fn ir_constant_value(constant: &php_ir::IrConstant) -> Result<Value, String> {

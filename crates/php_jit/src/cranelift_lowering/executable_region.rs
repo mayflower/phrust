@@ -3894,31 +3894,32 @@ fn define_region_graph_function(
         let mut native_operations = native_operations.with_terminal_exit(NativeTerminalExit {
             block: terminal_exit,
         });
-        if compilation_mode
-            == crate::cranelift_lowering::baseline_streaming::NativeCompilationMode::SsaOptimizing
-        {
-            native_operations.value_lifecycle = native_operations
-                .value_lifecycle
-                .map(NativeHelper::with_inline_runtime_view);
-            native_operations.compare = native_operations
-                .compare
-                .map(NativeHelper::with_inline_runtime_view);
-            native_operations.local_fetch = native_operations
-                .local_fetch
-                .map(NativeHelper::with_inline_runtime_view);
-            native_operations.local_store = native_operations
-                .local_store
-                .map(NativeHelper::with_inline_runtime_view);
-            native_operations.truthy = native_operations
-                .truthy
-                .map(NativeHelper::with_inline_runtime_view);
-            native_operations.type_predicate = native_operations
-                .type_predicate
-                .map(NativeHelper::with_inline_runtime_view);
-            native_operations.stable_length = native_operations
-                .stable_length
-                .map(NativeHelper::with_inline_runtime_view);
-        }
+        // These guards read the request-owned runtime view directly and only
+        // call Rust for reference, warning, destructor, or unsupported dynamic
+        // cases. Baseline code needs the same fast paths: forcing every local,
+        // scalar comparison, and retain/release through helpers dominated warm
+        // execution long after compilation had finished.
+        native_operations.value_lifecycle = native_operations
+            .value_lifecycle
+            .map(NativeHelper::with_inline_runtime_view);
+        native_operations.compare = native_operations
+            .compare
+            .map(NativeHelper::with_inline_runtime_view);
+        native_operations.local_fetch = native_operations
+            .local_fetch
+            .map(NativeHelper::with_inline_runtime_view);
+        native_operations.local_store = native_operations
+            .local_store
+            .map(NativeHelper::with_inline_runtime_view);
+        native_operations.truthy = native_operations
+            .truthy
+            .map(NativeHelper::with_inline_runtime_view);
+        native_operations.type_predicate = native_operations
+            .type_predicate
+            .map(NativeHelper::with_inline_runtime_view);
+        native_operations.stable_length = native_operations
+            .stable_length
+            .map(NativeHelper::with_inline_runtime_view);
         let local_ids = fragment.map_or_else(
             || {
                 (0..region.local_count)
@@ -4594,9 +4595,50 @@ fn define_region_graph_function(
             if loop_headers.contains(&region_block.id)
                 && let Some(helper) = native_operations.execution_poll
             {
+                let count_visits = builder.create_block();
+                let poll = builder.create_block();
+                let continue_execution = builder.create_block();
+                let runtime_view_offset =
+                    std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
+                let counter_address = builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    deopt_out,
+                    runtime_view_offset
+                        + std::mem::offset_of!(crate::JitNativeRuntimeView, poll_counter) as i32,
+                );
+                let pointer_type = module.target_config().pointer_type();
+                let counter_address = if pointer_type == types::I64 {
+                    counter_address
+                } else {
+                    builder.ins().ireduce(pointer_type, counter_address)
+                };
+                let counter_available = builder.ins().icmp_imm(IntCC::NotEqual, counter_address, 0);
+                builder
+                    .ins()
+                    .brif(counter_available, count_visits, &[], poll, &[]);
+
+                builder.switch_to_block(count_visits);
+                let counter =
+                    builder
+                        .ins()
+                        .load(types::I32, MemFlagsData::new(), counter_address, 0);
+                let counter = builder.ins().iadd_imm(counter, 1);
+                let counter = builder.ins().band_imm(counter, 4095);
+                builder
+                    .ins()
+                    .store(MemFlagsData::new(), counter, counter_address, 0);
+                let deadline_check = builder.ins().icmp_imm(IntCC::Equal, counter, 0);
+                builder
+                    .ins()
+                    .brif(deadline_check, poll, &[], continue_execution, &[]);
+
+                builder.switch_to_block(poll);
                 let call = call_native_helper(module, &mut builder, helper, &[]);
                 let status = builder.inst_results(call)[0];
                 require_native_operation_ok(&mut builder, status, helper.terminal_exit()?)?;
+                builder.ins().jump(continue_execution, &[]);
+                builder.switch_to_block(continue_execution);
             }
             let mut terminated = false;
             for instruction in &region_block.instructions {
