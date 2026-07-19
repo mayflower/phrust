@@ -2822,13 +2822,14 @@ fn lower_region_instruction(
             let cl_value = lower_region_operand(builder, locals, registers, *src)?;
             let fact = lowering_operand_fact(value_flow, constants, *src);
             let cl_value = if value_copy_requires_retain(fact) {
-                lower_native_value_operation(
+                lower_guarded_value_lifecycle(
                     module,
                     builder,
                     native_operations.value_lifecycle,
                     native_dim_operation(0, function, instruction.continuation_id),
-                    &[cl_value],
+                    cl_value,
                     result_out,
+                    deopt_out,
                 )?
             } else {
                 cl_value
@@ -4023,13 +4024,14 @@ fn lower_region_instruction(
             let mut call_args = Vec::with_capacity(prepared_call_args.len());
             let mut consumed_call_arguments = Vec::new();
             for (index, mut value) in prepared_call_args.into_iter().enumerate() {
-                value = lower_native_value_operation(
+                value = lower_guarded_value_lifecycle(
                     module,
                     builder,
                     native_operations.value_lifecycle,
                     native_dim_operation(0, function, instruction.continuation_id),
-                    &[value],
+                    value,
                     result_out,
+                    deopt_out,
                 )?;
                 let consumed_by_call = index < call.argument_operand_offset
                     || index
@@ -4251,13 +4253,14 @@ fn lower_region_instruction(
                     &[],
                 );
                 builder.switch_to_block(preserve_result);
-                let _ = lower_native_value_operation(
+                let _ = lower_guarded_value_lifecycle(
                     module,
                     builder,
                     native_operations.value_lifecycle,
                     native_dim_operation(0, function, instruction.continuation_id),
-                    &[value],
+                    value,
                     result_out,
+                    deopt_out,
                 )?;
                 builder.ins().jump(release_arguments, &[]);
                 builder.switch_to_block(release_arguments);
