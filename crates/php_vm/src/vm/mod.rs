@@ -15,17 +15,17 @@ use jit_abi::{
     NativeExecutionContext, activate_native_context, jit_native_argument_check_abi,
     jit_native_array_fetch_abi, jit_native_array_insert_abi, jit_native_array_insert_local_abi,
     jit_native_array_new_abi, jit_native_array_spread_abi, jit_native_array_unset_abi,
-    jit_native_binary_abi, jit_native_call_dispatch_abi, jit_native_cast_abi,
-    jit_native_compare_abi, jit_native_constant_fetch_abi, jit_native_dynamic_code_abi,
-    jit_native_echo_abi, jit_native_exception_new_abi, jit_native_execution_poll_abi,
-    jit_native_foreach_cleanup_abi, jit_native_foreach_init_abi, jit_native_foreach_next_abi,
-    jit_native_frame_alloc_abi, jit_native_frame_release_abi, jit_native_function_resolve_abi,
-    jit_native_local_fetch_abi, jit_native_local_store_abi, jit_native_object_clone_abi,
-    jit_native_object_clone_with_abi, jit_native_object_new_abi, jit_native_property_assign_abi,
-    jit_native_property_fetch_abi, jit_native_reference_bind_abi, jit_native_return_check_abi,
-    jit_native_runtime_fatal_abi, jit_native_stable_length_abi, jit_native_string_predicate_abi,
-    jit_native_truthy_abi, jit_native_type_predicate_abi, jit_native_unary_abi,
-    jit_native_value_lifecycle_abi,
+    jit_native_binary_abi, jit_native_builtin_dispatch_abi, jit_native_call_dispatch_abi,
+    jit_native_cast_abi, jit_native_compare_abi, jit_native_constant_fetch_abi,
+    jit_native_dynamic_code_abi, jit_native_echo_abi, jit_native_exception_new_abi,
+    jit_native_execution_poll_abi, jit_native_foreach_cleanup_abi, jit_native_foreach_init_abi,
+    jit_native_foreach_next_abi, jit_native_frame_alloc_abi, jit_native_frame_release_abi,
+    jit_native_function_resolve_abi, jit_native_local_fetch_abi, jit_native_local_store_abi,
+    jit_native_object_clone_abi, jit_native_object_clone_with_abi, jit_native_object_new_abi,
+    jit_native_property_assign_abi, jit_native_property_fetch_abi, jit_native_reference_bind_abi,
+    jit_native_return_check_abi, jit_native_runtime_fatal_abi, jit_native_stable_length_abi,
+    jit_native_string_predicate_abi, jit_native_truthy_abi, jit_native_type_predicate_abi,
+    jit_native_unary_abi, jit_native_value_lifecycle_abi,
 };
 use php_runtime::api::{OutputBuffer, Value};
 use std::collections::{HashMap, HashSet};
@@ -1586,6 +1586,7 @@ fn cache_image(
 fn runtime_helper_addresses() -> php_jit::JitRuntimeHelperAddresses {
     php_jit::JitRuntimeHelperAddresses {
         native_call_dispatch: jit_native_call_dispatch_abi as *const () as usize,
+        native_builtin_dispatch: jit_native_builtin_dispatch_abi as *const () as usize,
         native_function_resolve: jit_native_function_resolve_abi as *const () as usize,
         native_frame_alloc: jit_native_frame_alloc_abi as *const () as usize,
         native_frame_release: jit_native_frame_release_abi as *const () as usize,
@@ -2436,8 +2437,7 @@ mod tests {
         assert_eq!(counters.native_call_argument_allocation_bytes, 0);
         assert_eq!(
             counters.native_call_frame_bytes,
-            (std::mem::size_of::<php_jit::JitNativeCallFrame>() + std::mem::size_of::<i64>())
-                as u64
+            std::mem::size_of::<i64>() as u64
         );
         assert_eq!(counters.native_frame_arena_high_water_bytes, 0);
     }

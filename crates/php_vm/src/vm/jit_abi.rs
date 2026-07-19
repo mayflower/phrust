@@ -28,7 +28,7 @@ pub(super) use dynamic_units::{jit_native_function_resolve_abi, native_entries_f
 use frame_arena::NativeFrameArena;
 pub(super) use frame_arena::{jit_native_frame_alloc_abi, jit_native_frame_release_abi};
 
-pub(super) use call_dispatch::jit_native_call_dispatch_abi;
+pub(super) use call_dispatch::{jit_native_builtin_dispatch_abi, jit_native_call_dispatch_abi};
 use call_support::*;
 use diagnostics::*;
 pub(super) use dynamic_code::jit_native_dynamic_code_abi;

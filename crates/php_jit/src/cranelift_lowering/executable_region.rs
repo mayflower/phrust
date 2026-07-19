@@ -1095,6 +1095,12 @@ pub(super) fn compile_region_graph_native(
                     })
             })
         });
+    let needs_builtin_dispatch = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(kind, RegionInstructionKind::NativeCall(call)
+                if stable_builtin_helper_id(&call.target).is_some())
+        })
+    });
     let needs_frame_arena = runtime_helpers.native_frame_alloc != 0
         && runtime_helpers.native_frame_release != 0
         && regions.values().any(|region| {
@@ -1108,6 +1114,12 @@ pub(super) fn compile_region_graph_native(
             "dynamic or complex call requires the typed native dispatch trampoline",
         ));
     }
+    if needs_builtin_dispatch && runtime_helpers.native_builtin_dispatch == 0 {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_NATIVE_BUILTIN_DISPATCH",
+            "direct builtin call requires the stable-ID native builtin dispatcher",
+        ));
+    }
     let needs_dynamic_code = regions.values().any(RegionGraph::has_native_dynamic_code);
     if needs_dynamic_code && runtime_helpers.native_dynamic_code == 0 {
         return Err(CraneliftLoweringError::new(
@@ -1116,6 +1128,7 @@ pub(super) fn compile_region_graph_native(
         ));
     }
     let native_call_symbol = NATIVE_CALL_DISPATCH_SYMBOL.to_owned();
+    let native_builtin_dispatch_symbol = NATIVE_BUILTIN_DISPATCH_SYMBOL.to_owned();
     let native_function_resolve_symbol = NATIVE_FUNCTION_RESOLVE_SYMBOL.to_owned();
     let native_dynamic_code_symbol = NATIVE_DYNAMIC_CODE_SYMBOL.to_owned();
     let needs_unary = regions.values().any(|region| {
@@ -1426,6 +1439,12 @@ pub(super) fn compile_region_graph_native(
         imports.push((
             native_call_symbol.clone(),
             runtime_helpers.native_call_dispatch,
+        ));
+    }
+    if needs_builtin_dispatch {
+        imports.push((
+            native_builtin_dispatch_symbol.clone(),
+            runtime_helpers.native_builtin_dispatch,
         ));
     }
     if needs_function_resolver {
@@ -1751,6 +1770,24 @@ pub(super) fn compile_region_graph_native(
             };
             let mut native_operations = NativeOperationFunctions::default();
             let pointer_type = module.target_config().pointer_type();
+            if needs_builtin_dispatch {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.returns.push(AbiParam::new(types::I32));
+                native_operations.builtin_dispatch = Some(declare_native_helper(
+                    module,
+                    &native_builtin_dispatch_symbol,
+                    &signature,
+                    helper_address(&native_builtin_dispatch_symbol),
+                )?);
+            }
             if needs_function_resolver {
                 let mut signature = module.make_signature();
                 signature.params.push(AbiParam::new(types::I64));

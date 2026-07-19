@@ -6,7 +6,7 @@ pub use php_runtime::api::JitHelperId;
 
 /// Stable ABI fingerprint for the helper-symbol registry. Bumped whenever the
 /// registry's symbol set or any helper ABI changes.
-pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4820_0000_0010;
+pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4820_0000_0011;
 
 /// Helper argument kind.
 #[repr(u32)]
@@ -112,6 +112,16 @@ const NATIVE_CONTEXT_VALUE_OUT_3_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::Value,
     JitHelperArgKind::U64,
     JitHelperArgKind::U64,
+    JitHelperArgKind::U64,
+];
+const NATIVE_BUILTIN_DISPATCH_ARGS: &[JitHelperArgKind] = &[
+    JitHelperArgKind::I64,
+    JitHelperArgKind::I64,
+    JitHelperArgKind::I64,
+    JitHelperArgKind::U64,
+    JitHelperArgKind::I64,
+    JitHelperArgKind::U64,
+    JitHelperArgKind::I64,
     JitHelperArgKind::U64,
 ];
 
@@ -459,6 +469,15 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         has_side_effects: false,
         description: "direct PHP string contains/starts-with/ends-with predicate",
     },
+    JitHelperSymbol {
+        id: JitHelperId(52),
+        name: "phrust_jit_native_builtin_dispatch",
+        args: NATIVE_BUILTIN_DISPATCH_ARGS,
+        returns: JitHelperReturnKind::Status,
+        can_throw: true,
+        has_side_effects: true,
+        description: "direct stable-ID builtin dispatch without a generic call frame",
+    },
 ];
 
 /// Looks up a helper by stable id.
@@ -486,6 +505,7 @@ pub fn resolve_helper_address(
     let helper = lookup_helper_by_id(id)?;
     match helper.name {
         "phrust_jit_native_call_dispatch" => Some(runtime.native_call_dispatch),
+        "phrust_jit_native_builtin_dispatch" => Some(runtime.native_builtin_dispatch),
         "phrust_jit_native_function_resolve" => Some(runtime.native_function_resolve),
         "phrust_native_frame_alloc" => Some(runtime.native_frame_alloc),
         "phrust_native_frame_release" => Some(runtime.native_frame_release),
@@ -574,7 +594,7 @@ mod tests {
             JIT_HELPER_SYMBOLS.first().expect("first").id,
             JitHelperId(14)
         );
-        assert_eq!(JIT_HELPER_SYMBOLS.last().expect("last").id, JitHelperId(51));
+        assert_eq!(JIT_HELPER_SYMBOLS.last().expect("last").id, JitHelperId(52));
     }
 
     #[test]

@@ -264,6 +264,181 @@ pub(super) fn native_function_argument_requires_reference_at(
     None
 }
 
+// SAFETY: generated code owns the argument/local tables and result record for
+// the complete synchronous helper invocation. Published callsite metadata
+// validates the stable builtin ID before PHP-visible work begins.
+#[allow(unsafe_code)]
+pub(in crate::vm) extern "C" fn jit_native_builtin_dispatch_abi(
+    helper_id: u32,
+    function: u32,
+    continuation: u32,
+    arguments: *const i64,
+    argument_count: u32,
+    local_slots: *const php_jit::JitAbiSlot,
+    local_count: u32,
+    out: *mut php_jit::JitCallResult,
+) -> i32 {
+    if out.is_null()
+        || (argument_count != 0 && arguments.is_null())
+        || (local_count != 0 && local_slots.is_null())
+    {
+        return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+    }
+    let arguments = if argument_count == 0 {
+        &[]
+    } else {
+        // SAFETY: validated above; generated code publishes the exact length.
+        unsafe { std::slice::from_raw_parts(arguments, argument_count as usize) }
+    };
+    let local_slots = if local_count == 0 {
+        &[]
+    } else {
+        // SAFETY: validated above; generated code publishes the exact length.
+        unsafe { std::slice::from_raw_parts(local_slots, local_count as usize) }
+    };
+    let mut callsite_span = None;
+    let outcome = with_native_context(|context| {
+        let descriptor = context
+            .prepared_native_callsite(function, continuation)
+            .ok_or_else(|| {
+                format!(
+                    "E_PHP_VM_UNRESOLVED_CALLABLE: direct builtin callsite is unavailable at function={function} continuation={continuation}"
+                )
+            })?;
+        // SAFETY: the active immutable CompiledUnit owns the descriptor for
+        // this complete synchronous invocation.
+        let descriptor = unsafe { &*descriptor };
+        let prepared = descriptor.direct_builtin.ok_or_else(|| {
+            "E_PHP_VM_UNRESOLVED_CALLABLE: direct builtin metadata is unavailable".to_owned()
+        })?;
+        if prepared.entry.helper_id() != helper_id {
+            return Err("E_PHP_VM_NATIVE_CALLSITE_MISMATCH: builtin helper ID is stale".to_owned());
+        }
+        callsite_span = Some(descriptor.span);
+        let instruction = descriptor.semantic_instruction();
+        let started_at = context
+            .options
+            .collect_counters
+            .then(std::time::Instant::now);
+        if context.options.collect_counters {
+            let mut telemetry = context.runtime_telemetry.borrow_mut();
+            telemetry.counters.native_call_direct =
+                telemetry.counters.native_call_direct.saturating_add(1);
+            telemetry.counters.native_builtin_direct_eligible = telemetry
+                .counters
+                .native_builtin_direct_eligible
+                .saturating_add(1);
+            telemetry.counters.native_builtin_direct_executed = telemetry
+                .counters
+                .native_builtin_direct_executed
+                .saturating_add(1);
+            telemetry.counters.native_callsite_total =
+                telemetry.counters.native_callsite_total.saturating_add(1);
+            telemetry.counters.native_call_frame_bytes = telemetry
+                .counters
+                .native_call_frame_bytes
+                .saturating_add(std::mem::size_of_val(arguments) as u64)
+                .saturating_add(std::mem::size_of_val(local_slots) as u64);
+            let count = telemetry
+                .counters
+                .native_builtin_calls_by_name
+                .entry(prepared.entry.name().to_owned())
+                .or_default();
+            *count = count.saturating_add(1);
+            drop(telemetry);
+            context.enter_runtime_helper("call_builtin_direct");
+        }
+        let result = (|| {
+            let expanded =
+                bind_native_builtin_arguments(context, prepared.entry.name(), arguments, None)?;
+            execute_native_builtin(
+                context,
+                prepared.entry.name(),
+                expanded.as_ref(),
+                instruction,
+                Some((function, local_slots)),
+                Some(prepared),
+            )
+        })();
+        if context.options.collect_counters {
+            let elapsed = started_at
+                .map(|started| started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or(0);
+            let mut telemetry = context.runtime_telemetry.borrow_mut();
+            let total = telemetry
+                .counters
+                .native_builtin_time_nanos_by_name
+                .entry(prepared.entry.name().to_owned())
+                .or_default();
+            *total = total.saturating_add(elapsed);
+            drop(telemetry);
+            context.exit_runtime_helper("call_builtin_direct");
+        }
+        result
+    });
+
+    let (status, value) = match outcome {
+        Some(Ok(value)) => (php_jit::JitCallStatus::RETURN, Some(value)),
+        Some(Err(message)) if message == "E_PHP_RETHROW" => {
+            let value = with_native_context(|context| {
+                let mut throwable = context.take_pending_throwable()?;
+                if let Some(span) = callsite_span {
+                    throwable = native_throwable_with_call_source(context, throwable, span);
+                }
+                context.encode(throwable).ok()
+            })
+            .flatten();
+            (php_jit::JitCallStatus::THROW, value)
+        }
+        Some(Err(message)) if message.starts_with("E_PHP_THROW:") => {
+            let payload = message.trim_start_matches("E_PHP_THROW:");
+            let (class, message) = payload.split_once(':').unwrap_or(("Error", payload));
+            let value = with_native_context(|context| {
+                callsite_span
+                    .and_then(|span| encode_native_throwable_at(context, class, message, span).ok())
+                    .or_else(|| encode_native_throwable(context, class, message).ok())
+            })
+            .flatten();
+            (php_jit::JitCallStatus::THROW, value)
+        }
+        Some(Err(message)) if message == "E_PHP_SUSPEND_FIBER" => {
+            let value =
+                with_native_context(|context| context.pending_fiber_suspension_value.take())
+                    .flatten();
+            (php_jit::JitCallStatus::SUSPEND_FIBER, value)
+        }
+        Some(Err(message)) if message.starts_with("E_PHP_EXIT:") => (
+            php_jit::JitCallStatus::EXIT,
+            message
+                .trim_start_matches("E_PHP_EXIT:")
+                .parse::<i64>()
+                .ok(),
+        ),
+        Some(Err(message)) if message == NATIVE_RUNTIME_ERROR_MARKER => {
+            (php_jit::JitCallStatus::RUNTIME_ERROR, None)
+        }
+        Some(Err(message)) => {
+            let _ = with_native_context(|context| publish_native_call_diagnostic(context, message));
+            (php_jit::JitCallStatus::RUNTIME_ERROR, None)
+        }
+        None => (php_jit::JitCallStatus::COMPILE_REQUIRED, None),
+    };
+    let status_code = status.0 as i32;
+    // SAFETY: `out` was checked and remains caller-owned for this invocation.
+    unsafe {
+        out.write(php_jit::JitCallResult {
+            status,
+            detail: status_code as u32,
+            value: value.map_or_else(php_jit::JitAbiSlot::default, |value| php_jit::JitAbiSlot {
+                tag: 3,
+                flags: 0,
+                payload: value as u64,
+            }),
+        });
+    }
+    status_code
+}
+
 /// Typed native call trampoline entry. Target compilation and lookup are
 /// requested explicitly; this boundary has no alternate executor entry.
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.

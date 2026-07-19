@@ -3447,6 +3447,7 @@ fn optimizing_array_key_exists_bypasses_generic_builtin_dispatch() {
         function: Some(function),
         runtime_helpers: crate::JitRuntimeHelperAddresses {
             native_call_dispatch: forbidden_call_dispatch as *const () as usize,
+            native_builtin_dispatch: forbidden_call_dispatch as *const () as usize,
             native_array_fetch: test_array_key_exists_fast as *const () as usize,
             native_local_fetch: passthrough_local_fetch as *const () as usize,
             native_value_lifecycle: passthrough_lifecycle as *const () as usize,
@@ -3546,6 +3547,7 @@ fn optimizing_string_predicate_bypasses_generic_builtin_dispatch() {
         function: Some(function),
         runtime_helpers: crate::JitRuntimeHelperAddresses {
             native_call_dispatch: forbidden_call_dispatch as *const () as usize,
+            native_builtin_dispatch: forbidden_call_dispatch as *const () as usize,
             native_string_predicate: test_string_predicate_fast as *const () as usize,
             native_local_fetch: passthrough_local_fetch as *const () as usize,
             native_value_lifecycle: passthrough_lifecycle as *const () as usize,
@@ -3692,6 +3694,7 @@ fn optimizing_builtin_type_predicate_uses_native_tag_test() {
         function: Some(function),
         runtime_helpers: crate::JitRuntimeHelperAddresses {
             native_call_dispatch: forbidden_call_dispatch as *const () as usize,
+            native_builtin_dispatch: forbidden_call_dispatch as *const () as usize,
             native_type_predicate: forbidden_type_predicate as *const () as usize,
             native_local_fetch: passthrough_local_fetch as *const () as usize,
             native_value_lifecycle: passthrough_lifecycle as *const () as usize,
@@ -3771,6 +3774,7 @@ fn optimizing_builtin_length_uses_versioned_value_view() {
         function: Some(function),
         runtime_helpers: crate::JitRuntimeHelperAddresses {
             native_call_dispatch: forbidden_call_dispatch as *const () as usize,
+            native_builtin_dispatch: forbidden_call_dispatch as *const () as usize,
             native_stable_length: forbidden_stable_length as *const () as usize,
             native_local_fetch: passthrough_local_fetch as *const () as usize,
             native_value_lifecycle: passthrough_lifecycle as *const () as usize,

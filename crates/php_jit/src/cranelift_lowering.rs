@@ -161,6 +161,7 @@ enum NativeDirectCallee {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct NativeOperationFunctions {
+    builtin_dispatch: Option<NativeHelper>,
     function_resolve: Option<NativeHelper>,
     frame_alloc: Option<NativeHelper>,
     frame_release: Option<NativeHelper>,
@@ -207,6 +208,7 @@ impl NativeOperationFunctions {
             };
         }
         bind!(
+            builtin_dispatch,
             function_resolve,
             frame_alloc,
             frame_release,
@@ -365,6 +367,7 @@ fn native_helper_import_symbol(base: &str, address: usize) -> String {
 }
 
 const NATIVE_CALL_DISPATCH_SYMBOL: &str = "phrust_jit_native_call_dispatch";
+const NATIVE_BUILTIN_DISPATCH_SYMBOL: &str = "phrust_jit_native_builtin_dispatch";
 const NATIVE_FUNCTION_RESOLVE_SYMBOL: &str = "phrust_jit_native_function_resolve";
 const NATIVE_DYNAMIC_CODE_SYMBOL: &str = "phrust_jit_native_dynamic_code";
 
@@ -4206,6 +4209,40 @@ fn lower_region_instruction(
                 }
                 return Ok(());
             }
+            if let Some(helper_id) = stable_builtin_helper_id(&call.target)
+                && call.argument_operand_offset == 0
+                && call.operands.len() == call.args.len()
+                && call.args.iter().enumerate().all(|(index, argument)| {
+                    argument.name.is_none()
+                        && !argument.unpack
+                        && !call.argument_requires_reference_binding(index)
+                })
+                && !call.returns_by_reference
+                && !matches!(call.result, RegionCallResult::ReferenceLocal(_))
+            {
+                lower_direct_builtin_call(
+                    module,
+                    builder,
+                    native_operations.builtin_dispatch,
+                    native_operations.value_lifecycle,
+                    value_flow,
+                    locals,
+                    register_variables,
+                    registers,
+                    call,
+                    helper_id,
+                    instruction,
+                    transition_live_registers,
+                    streaming_call_exit,
+                    result_out,
+                    deopt_out,
+                    function,
+                    local_count,
+                    native_version,
+                    pointer_type,
+                )?;
+                return Ok(());
+            }
             let direct_target = call
                 .direct_compiled_target()
                 .filter(|_| {
@@ -6063,6 +6100,207 @@ fn lower_native_suspension(
         define_region_register(builder, register_variables, registers, register, value)?;
     }
     define_region_register(builder, register_variables, registers, dst, resume_value)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_direct_builtin_call(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    builtin_helper: Option<NativeHelper>,
+    native_value_lifecycle_helper: Option<NativeHelper>,
+    value_flow: &ExecutableValueFlow,
+    locals: &NativeLocalMap,
+    register_variables: &NativeRegisterMap,
+    registers: &mut NativeRegisterMap,
+    call: &RegionNativeCall,
+    helper_id: u32,
+    instruction: &RegionInstruction,
+    transition_live_registers: &[RegId],
+    streaming_call_exit: Option<NativeStreamingCallExit>,
+    result_out: ir::Value,
+    deopt_out: ir::Value,
+    function: FunctionId,
+    local_count: u32,
+    native_version: u32,
+    pointer_type: ir::Type,
+) -> Result<(), CraneliftLoweringError> {
+    let helper = builtin_helper.ok_or_else(|| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_NATIVE_BUILTIN_DISPATCH",
+            "direct builtin call has no stable-ID dispatcher",
+        )
+    })?;
+    let argument_count = call.args.len();
+    let mut consumed_arguments = Vec::new();
+    let arguments_ptr = if argument_count == 0 {
+        builder.ins().iconst(pointer_type, 0)
+    } else {
+        let bytes = argument_count
+            .checked_mul(std::mem::size_of::<i64>())
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_NATIVE_BUILTIN_ARGUMENTS",
+                    "direct builtin argument table exceeds native stack limits",
+                )
+            })?;
+        let pointer = allocate_native_stack_storage(builder, pointer_type, bytes, 3);
+        for (index, (argument, operand)) in call.args.iter().zip(&call.operands).enumerate() {
+            let operand = operand.ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_NATIVE_BUILTIN_ARGUMENTS",
+                    "direct builtin argument is missing its native operand",
+                )
+            })?;
+            let value = lower_region_operand(builder, locals, registers, operand)?;
+            if matches!(
+                operand,
+                RegionOperand::Register(register)
+                    if value_flow.register_fact(register).ownership != SsaOwnership::Borrowed
+            ) && native_argument_has_location(argument)
+            {
+                consumed_arguments.push(value);
+            }
+            builder.ins().store(
+                MemFlagsData::new(),
+                value,
+                pointer,
+                i32::try_from(index.saturating_mul(8)).unwrap_or(i32::MAX),
+            );
+        }
+        pointer
+    };
+
+    let publishes_locals = matches!(&call.target, RegionCallTarget::Function { name, .. }
+        if name.trim_start_matches('\\').eq_ignore_ascii_case("compact"));
+    let published_local_count = if publishes_locals { local_count } else { 0 };
+    let local_slots_ptr = if published_local_count == 0 {
+        builder.ins().iconst(pointer_type, 0)
+    } else {
+        let slot_size = std::mem::size_of::<crate::JitAbiSlot>();
+        let bytes = (published_local_count as usize)
+            .checked_mul(slot_size)
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_NATIVE_BUILTIN_LOCALS",
+                    "direct builtin local publication exceeds native stack limits",
+                )
+            })?;
+        let pointer = allocate_native_stack_storage(builder, pointer_type, bytes, 3);
+        for index in 0..published_local_count {
+            let base = i32::try_from(index as usize * slot_size).unwrap_or(i32::MAX);
+            let tag = builder.ins().iconst(types::I32, 3);
+            builder.ins().store(MemFlagsData::new(), tag, pointer, base);
+            let flags = builder.ins().iconst(types::I32, 0);
+            builder
+                .ins()
+                .store(MemFlagsData::new(), flags, pointer, base + 4);
+            let value = use_local_variable(builder, locals, LocalId::new(index))?;
+            builder
+                .ins()
+                .store(MemFlagsData::new(), value, pointer, base + 8);
+        }
+        pointer
+    };
+
+    let out_slot = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        std::mem::size_of::<crate::JitCallResult>() as u32,
+        3,
+    ));
+    let out_ptr = builder.ins().stack_addr(pointer_type, out_slot, 0);
+    let helper_id = builder.ins().iconst(types::I32, i64::from(helper_id));
+    let function_id = builder.ins().iconst(types::I32, i64::from(function.raw()));
+    let continuation = builder
+        .ins()
+        .iconst(types::I32, i64::from(instruction.continuation_id));
+    let argument_count_value = builder.ins().iconst(
+        types::I32,
+        i64::try_from(argument_count).unwrap_or(i64::MAX),
+    );
+    let local_count_value = builder
+        .ins()
+        .iconst(types::I32, i64::from(published_local_count));
+    let helper_call = call_native_helper(
+        module,
+        builder,
+        helper,
+        &[
+            helper_id,
+            function_id,
+            continuation,
+            arguments_ptr,
+            argument_count_value,
+            local_slots_ptr,
+            local_count_value,
+            out_ptr,
+        ],
+    );
+    let status = builder.inst_results(helper_call)[0];
+    let ok = builder.create_block();
+    let side_exit = builder.create_block();
+    let is_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        status,
+        i64::from(crate::JitCallStatus::RETURN.0),
+    );
+    builder.ins().brif(is_ok, ok, &[], side_exit, &[]);
+
+    builder.switch_to_block(side_exit);
+    publish_native_register_state(builder, deopt_out, registers, transition_live_registers);
+    let control_value = builder.ins().stack_load(types::I64, out_slot, 16);
+    if let Some(streaming_call_exit) = streaming_call_exit {
+        let continuation = builder
+            .ins()
+            .iconst(types::I32, i64::from(instruction.continuation_id));
+        let masks = native_local_mask_words(&instruction.live_locals)
+            .into_iter()
+            .map(|mask| builder.ins().iconst(types::I64, mask as i64))
+            .map(Into::into)
+            .collect::<Vec<ir::BlockArg>>();
+        let mut args = Vec::<ir::BlockArg>::with_capacity(3 + masks.len());
+        args.push(status.into());
+        args.push(control_value.into());
+        args.push(continuation.into());
+        args.extend(masks);
+        builder.ins().jump(streaming_call_exit.block, &args);
+    } else {
+        publish_native_call_state(
+            builder,
+            deopt_out,
+            function,
+            local_count,
+            instruction,
+            locals,
+            native_version,
+        )?;
+        builder
+            .ins()
+            .store(MemFlagsData::new(), control_value, result_out, 0);
+        builder.ins().return_(&[status]);
+    }
+
+    builder.switch_to_block(ok);
+    for argument in consumed_arguments {
+        let _ = lower_native_value_operation(
+            module,
+            builder,
+            native_value_lifecycle_helper,
+            native_dim_operation(1, function, instruction.continuation_id),
+            &[argument],
+            result_out,
+        )?;
+    }
+    let value = builder.ins().stack_load(types::I64, out_slot, 16);
+    match call.result {
+        RegionCallResult::Register(register) => {
+            define_region_register(builder, register_variables, registers, register, value)?;
+        }
+        RegionCallResult::Discard => {}
+        RegionCallResult::ReferenceLocal(_) => unreachable!("filtered before direct builtin call"),
+    }
     Ok(())
 }
 

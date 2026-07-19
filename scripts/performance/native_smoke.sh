@@ -53,9 +53,9 @@ jq -e '
     exit 1
 }
 
-# Positional by-value builtins use the compact i64 argument table. The former
-# full JitNativeCallArgument layout writes 640000 bytes for this exact fixture;
-# the compact ABI writes 512000 bytes on the pinned 64-bit target.
+# Positional by-value builtins call the stable-ID helper directly. The former
+# generic call-frame path wrote 512000 bytes for this fixture; the direct ABI
+# publishes only the 32000 bytes of actual i64 arguments.
 compact_builtin_counters="$OUT_DIR/native-compact-builtin-counters.json"
 compact_builtin_output="$OUT_DIR/native-compact-builtin.out"
 "$VM" run --counters-json "$compact_builtin_counters" \
@@ -72,7 +72,7 @@ jq -e '
   .native_call_direct == 3000 and
   .native_callsite_total == 3000 and
   .runtime_helper_calls_by_id.string_predicate == 3000 and
-  .native_call_frame_bytes <= 520000
+  .native_call_frame_bytes <= 40000
 ' "$compact_builtin_counters" >/dev/null || {
     printf '%s\n' '[fail] direct builtin calls exceeded the compact frame budget' >&2
     exit 1

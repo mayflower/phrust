@@ -114,6 +114,8 @@ impl CraneliftCompilerIdentity {
 pub struct JitRuntimeHelperAddresses {
     /// Typed dynamic-call resolver/invoker; never an interpreter dispatcher.
     pub native_call_dispatch: usize,
+    /// Direct statically identified builtin invocation over packed i64 arguments.
+    pub native_builtin_dispatch: usize,
     /// Resolves or compiles one statically known PHP callee without invoking it.
     pub native_function_resolve: usize,
     /// Allocates bounded request-local native call-frame storage.

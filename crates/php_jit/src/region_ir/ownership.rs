@@ -52,9 +52,9 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         may_alias_input: false,
     };
     match name {
-        "phrust_jit_native_call_dispatch" | "phrust_jit_native_dynamic_code" => {
-            Some(owned(NONE, false))
-        }
+        "phrust_jit_native_call_dispatch"
+        | "phrust_jit_native_builtin_dispatch"
+        | "phrust_jit_native_dynamic_code" => Some(owned(NONE, false)),
         "phrust_jit_native_function_resolve"
         | "phrust_native_frame_alloc"
         | "phrust_native_frame_release" => Some(none(NONE)),
