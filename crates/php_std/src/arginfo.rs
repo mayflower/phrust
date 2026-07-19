@@ -430,7 +430,7 @@ impl ArgumentValidator {
     pub fn validate_owned(
         &self,
         info: &FunctionArgInfo,
-        mut args: php_runtime::api::BuiltinArgs,
+        mut args: Vec<Value>,
         span: RuntimeSourceSpan,
     ) -> Result<ValidatedArguments, ArginfoError> {
         validate_arity(info, args.len(), span.clone())?;

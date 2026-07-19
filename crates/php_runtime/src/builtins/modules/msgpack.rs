@@ -51,7 +51,7 @@ pub fn unpack_value(input: &PhpString) -> Result<Value, String> {
 
 fn builtin_msgpack_pack(
     _context: &mut BuiltinContext<'_>,
-    args: crate::builtins::BuiltinArgs,
+    args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if args.len() != 1 {
@@ -64,7 +64,7 @@ fn builtin_msgpack_pack(
 
 fn builtin_msgpack_unpack(
     context: &mut BuiltinContext<'_>,
-    args: crate::builtins::BuiltinArgs,
+    args: Vec<Value>,
     span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if args.len() != 1 {

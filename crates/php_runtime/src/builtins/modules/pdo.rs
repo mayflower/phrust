@@ -14,7 +14,7 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[BuiltinEntry::new(
 
 pub(in crate::builtins::modules) fn builtin_pdo_drivers(
     _context: &mut BuiltinContext<'_>,
-    args: crate::builtins::BuiltinArgs,
+    args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("pdo_drivers", &args, 0)?;

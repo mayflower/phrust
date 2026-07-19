@@ -2,7 +2,7 @@ use super::*;
 
 pub(in crate::builtins::modules) fn builtin_serialize(
     context: &mut BuiltinContext<'_>,
-    args: crate::builtins::BuiltinArgs,
+    args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("serialize", &args, 1)?;
@@ -17,7 +17,7 @@ pub(in crate::builtins::modules) fn builtin_serialize(
 
 pub(in crate::builtins::modules) fn builtin_setlocale(
     _context: &mut BuiltinContext<'_>,
-    args: crate::builtins::BuiltinArgs,
+    args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if args.is_empty() {
@@ -41,7 +41,7 @@ pub(in crate::builtins::modules) fn builtin_setlocale(
 
 pub(in crate::builtins::modules) fn builtin_unserialize(
     context: &mut BuiltinContext<'_>,
-    args: crate::builtins::BuiltinArgs,
+    args: Vec<Value>,
     span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if !(1..=2).contains(&args.len()) {
@@ -71,7 +71,7 @@ pub(in crate::builtins::modules) fn builtin_unserialize(
 
 pub(in crate::builtins::modules) fn builtin_var_export(
     context: &mut BuiltinContext<'_>,
-    args: crate::builtins::BuiltinArgs,
+    args: Vec<Value>,
     span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if !(1..=2).contains(&args.len()) {

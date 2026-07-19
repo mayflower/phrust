@@ -27,7 +27,7 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
 
 fn builtin_is_soap_fault(
     _context: &mut BuiltinContext<'_>,
-    args: crate::builtins::BuiltinArgs,
+    args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if args.len() != 1 {
@@ -43,7 +43,7 @@ fn builtin_is_soap_fault(
 
 fn builtin_use_soap_error_handler(
     context: &mut BuiltinContext<'_>,
-    args: crate::builtins::BuiltinArgs,
+    args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if args.len() > 1 {
