@@ -328,10 +328,6 @@ impl RequestRootIndex {
         self.dirty
     }
 
-    pub(super) const fn should_synchronize(&self) -> bool {
-        self.dirty
-    }
-
     #[cfg(test)]
     pub(super) fn replace(&mut self, membership: RootMembership) {
         self.object_counts.clear();

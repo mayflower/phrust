@@ -509,12 +509,34 @@ impl<'a> NativeExecutionContext<'a> {
     }
 
     fn mark_rooted_container_dirty(&mut self, value: &Value) {
-        if self.root_index.is_dirty() || self.root_index.contains_container(value) {
-            self.root_index.refresh_container(value);
-        }
+        self.root_index
+            .mark_dirty(RootMutationReason::RootedContainer);
+        self.root_index.refresh_container(value);
         if self.call_root_index.is_dirty() || self.call_root_index.contains_container(value) {
             self.call_root_index
                 .refresh_container(value, &self.call_arguments);
+        }
+    }
+
+    fn value_has_native_destructor(&self, value: &Value) -> bool {
+        let mut value = value.clone();
+        for _ in 0..16 {
+            match value {
+                Value::Reference(reference) => value = reference.get(),
+                Value::Object(object) => {
+                    return self.object_has_native_destructor(&object.class_name());
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn synchronize_destructor_root_change(&mut self, previous: &Value, replacement: &Value) {
+        if self.value_has_native_destructor(previous)
+            || self.value_has_native_destructor(replacement)
+        {
+            self.synchronize_request_roots();
         }
     }
 
@@ -554,7 +576,7 @@ impl<'a> NativeExecutionContext<'a> {
     }
 
     fn synchronize_request_roots(&mut self) {
-        if self.root_index.should_synchronize() {
+        if self.root_index.is_dirty() {
             let roots = self.request_root_values();
             self.root_index.synchronize(&roots);
         }
@@ -2387,7 +2409,6 @@ fn with_native_context_for<R>(
             context.enter_runtime_helper(helper_id);
         }
         let result = operation(context);
-        context.synchronize_request_roots();
         if collect_counters {
             context.exit_runtime_helper(helper_id);
         }
@@ -2398,7 +2419,6 @@ fn with_native_context_for<R>(
 fn helper_root_mutation_reason(helper_id: &str) -> Option<RootMutationReason> {
     match helper_id {
         "dynamic_code" => Some(RootMutationReason::GlobalOrStatic),
-        "reference_bind" => Some(RootMutationReason::RootedContainer),
         _ => None,
     }
 }
@@ -5586,6 +5606,7 @@ fn execute_native_bind_global(
     context
         .inherited_globals
         .insert(name.clone(), Value::Reference(reference.clone()));
+    context.mark_roots_dirty(RootMutationReason::GlobalOrStatic);
     Some(context.encode(Value::Reference(reference)))
 }
 

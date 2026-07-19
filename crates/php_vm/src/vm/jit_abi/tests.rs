@@ -5,6 +5,16 @@ use super::{
 };
 
 #[test]
+fn helper_root_mutations_are_declared_only_for_stable_root_shapes() {
+    assert_eq!(
+        super::helper_root_mutation_reason("dynamic_code"),
+        Some(super::RootMutationReason::GlobalOrStatic)
+    );
+    assert_eq!(super::helper_root_mutation_reason("reference_bind"), None);
+    assert_eq!(super::helper_root_mutation_reason("local_store"), None);
+}
+
+#[test]
 fn positional_builtin_arguments_do_not_require_rebinding() {
     use php_ir::instruction::{IrCallArg, IrCallArgValueKind};
 

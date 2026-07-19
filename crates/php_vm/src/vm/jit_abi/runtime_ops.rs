@@ -1070,12 +1070,6 @@ pub(in crate::vm) extern "C" fn jit_native_local_store_abi(
             context.record_local_store_reason("unknown");
             return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
         };
-        // Region lowering may append deterministic synthetic locals for
-        // closure snapshots. They have no PHP-visible name to publish into an
-        // include scope, but otherwise use the same local-store operation.
-        if is_top_level || name.as_deref() == Some("GLOBALS") {
-            context.mark_roots_dirty(RootMutationReason::GlobalOrStatic);
-        }
         if !is_top_level
             && name.as_deref() != Some("GLOBALS")
             && context.php_handle_is_reference(current) == Some(false)
@@ -1102,14 +1096,17 @@ pub(in crate::vm) extern "C" fn jit_native_local_store_abi(
                 php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
             };
         }
-        let inherited_reference = is_top_level
+        let inherited_global = is_top_level
             .then(|| {
                 name.as_ref()
                     .and_then(|name| context.inherited_globals.get(name))
-                    .filter(|value| matches!(value, Value::Reference(_)))
                     .cloned()
             })
             .flatten();
+        let inherited_reference = inherited_global
+            .as_ref()
+            .filter(|value| matches!(value, Value::Reference(_)))
+            .cloned();
         let current_value = match inherited_reference
             .clone()
             .map_or_else(|| context.decode(current), Ok)
@@ -1164,10 +1161,19 @@ pub(in crate::vm) extern "C" fn jit_native_local_store_abi(
         }
         if name.as_deref() == Some("GLOBALS") {
             publish_native_globals_array(context, &replacement);
+            context.mark_roots_dirty(RootMutationReason::GlobalOrStatic);
         }
         if let Value::Reference(reference) = current_value {
+            if is_top_level && let Some(name) = name.as_ref().filter(|name| *name != "GLOBALS") {
+                context
+                    .inherited_globals
+                    .insert(name.clone(), Value::Reference(reference.clone()));
+            }
             let previous = reference.get();
             let membership_changed = rooted_membership_may_change(&previous, &replacement);
+            let synchronize_destructor_roots = membership_changed
+                && (context.value_has_native_destructor(&previous)
+                    || context.value_has_native_destructor(&replacement));
             let replacement_scalar = context.native_scalar_encoding(&replacement);
             reference.set(replacement);
             if let Some(encoded) = replacement_scalar {
@@ -1175,6 +1181,9 @@ pub(in crate::vm) extern "C" fn jit_native_local_store_abi(
             }
             if membership_changed {
                 context.mark_rooted_container_dirty(&Value::Reference(reference.clone()));
+                if synchronize_destructor_roots {
+                    context.synchronize_request_roots();
+                }
             }
             if let Err(error) = context.finalize_replaced_value(previous) {
                 record_native_helper_failure(
@@ -1189,11 +1198,6 @@ pub(in crate::vm) extern "C" fn jit_native_local_store_abi(
                     format!("local store could not consume moved value {value}: {error}"),
                 );
                 return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
-            }
-            if is_top_level && let Some(name) = name.filter(|name| name != "GLOBALS") {
-                context
-                    .inherited_globals
-                    .insert(name, Value::Reference(reference.clone()));
             }
             let stored = match context.decode(current) {
                 Ok(Value::Reference(current_reference)) if current_reference.ptr_eq(&reference) => {
@@ -1246,8 +1250,20 @@ pub(in crate::vm) extern "C" fn jit_native_local_store_abi(
             } else {
                 value
             };
-            if is_top_level && let Some(name) = name.filter(|name| name != "GLOBALS") {
-                context.inherited_globals.insert(name, replacement);
+            if is_top_level && let Some(name) = name.as_ref().filter(|name| *name != "GLOBALS") {
+                let membership_changed = inherited_global
+                    .as_ref()
+                    .is_none_or(|previous| rooted_membership_may_change(previous, &replacement));
+                context
+                    .inherited_globals
+                    .insert(name.clone(), replacement.clone());
+                if membership_changed {
+                    context.mark_roots_dirty(RootMutationReason::GlobalOrStatic);
+                    context.synchronize_destructor_root_change(
+                        inherited_global.as_ref().unwrap_or(&Value::Uninitialized),
+                        &replacement,
+                    );
+                }
             }
             if !move_input && let Err(error) = context.retain(stored) {
                 record_native_helper_failure(
@@ -1574,6 +1590,7 @@ pub(in crate::vm) extern "C" fn jit_native_reference_bind_abi(
                     return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
                 };
                 context.inherited_globals.insert(name.clone(), value);
+                context.mark_roots_dirty(RootMutationReason::GlobalOrStatic);
             }
             return if write_native_value(out, encoded) {
                 0
@@ -1588,11 +1605,16 @@ pub(in crate::vm) extern "C" fn jit_native_reference_bind_abi(
             let Ok(default) = context.decode(encoded) else {
                 return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
             };
+            let key = (context.unit_identity, function, local);
+            let inserted = !context.static_locals.contains_key(&key);
             let reference = context
                 .static_locals
-                .entry((context.unit_identity, function, local))
+                .entry(key)
                 .or_insert_with(|| php_runtime::api::ReferenceCell::new(default))
                 .clone();
+            if inserted {
+                context.mark_roots_dirty(RootMutationReason::GlobalOrStatic);
+            }
             return match context.encode(Value::Reference(reference)) {
                 Ok(value) if write_native_value(out, value) => 0,
                 _ => php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
