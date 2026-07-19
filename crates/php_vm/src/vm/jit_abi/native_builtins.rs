@@ -1889,6 +1889,7 @@ fn execute_native_read_builtin_fast(
     context: &mut NativeExecutionContext<'_>,
     name: &str,
     arguments: &[i64],
+    source: &php_ir::Instruction,
 ) -> Result<Option<i64>, String> {
     match (name, arguments) {
         ("count", [array]) => {
@@ -1907,6 +1908,39 @@ fn execute_native_read_builtin_fast(
                 Value::Reference(reference) => reference.get(),
                 key => key,
             };
+            match &key {
+                Value::Null | Value::Uninitialized => emit_native_php_warning(
+                    context,
+                    php_runtime::api::PHP_E_DEPRECATED,
+                    "Using null as the key parameter for array_key_exists() is deprecated, use an empty string instead",
+                    source,
+                )?,
+                Value::Float(key) => {
+                    let key = key.to_f64();
+                    let label = native_php_float_label(key);
+                    if !key.is_finite() {
+                        emit_native_php_warning(
+                            context,
+                            php_runtime::api::PHP_E_WARNING,
+                            &format!(
+                                "The float {label} is not representable as an int, cast occurred"
+                            ),
+                            source,
+                        )?;
+                    }
+                    if key.is_nan() || key.fract() != 0.0 {
+                        emit_native_php_warning(
+                            context,
+                            php_runtime::api::PHP_E_DEPRECATED,
+                            &format!(
+                                "Implicit conversion from float {label} to int loses precision"
+                            ),
+                            source,
+                        )?;
+                    }
+                }
+                _ => {}
+            }
             let Some(key) = php_runtime::api::ArrayKey::from_value(&key) else {
                 return Ok(None);
             };
@@ -1971,7 +2005,8 @@ pub(super) fn execute_native_builtin(
     if let Some(result) = execute_native_type_predicate(context, &normalized, arguments)? {
         return Ok(result);
     }
-    if let Some(result) = execute_native_read_builtin_fast(context, &normalized, arguments)? {
+    if let Some(result) = execute_native_read_builtin_fast(context, &normalized, arguments, source)?
+    {
         return Ok(result);
     }
     if let Some(result) = execute_native_internal_builtin(context, &normalized, arguments) {

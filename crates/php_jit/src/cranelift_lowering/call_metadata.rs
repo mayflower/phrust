@@ -113,6 +113,40 @@ pub(super) fn stable_builtin_length(target: &RegionCallTarget) -> Option<u32> {
     }
 }
 
+pub(super) fn stable_builtin_array_key_exists(target: &RegionCallTarget) -> bool {
+    let RegionCallTarget::Function {
+        name,
+        function: None,
+    } = target
+    else {
+        return false;
+    };
+    let normalized = name.trim_start_matches('\\');
+    !normalized.contains('\\')
+        && (normalized.eq_ignore_ascii_case("array_key_exists")
+            || normalized.eq_ignore_ascii_case("key_exists"))
+}
+
+pub(super) fn stable_builtin_string_predicate(target: &RegionCallTarget) -> Option<u32> {
+    let RegionCallTarget::Function {
+        name,
+        function: None,
+    } = target
+    else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "str_contains" => Some(0),
+        "str_starts_with" => Some(1),
+        "str_ends_with" => Some(2),
+        _ => None,
+    }
+}
+
 pub(super) fn native_argument_flags(argument: &php_ir::instruction::IrCallArg) -> u32 {
     let mut flags = crate::JitNativeArgFlags::default();
     if argument.name.is_some() {

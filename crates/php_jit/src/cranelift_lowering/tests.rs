@@ -286,6 +286,40 @@ extern "C" fn test_array_fetch_typed_string(
     0
 }
 
+#[allow(unsafe_code)]
+extern "C" fn test_array_key_exists_fast(
+    operation: u32,
+    array: i64,
+    key: i64,
+    out: *mut i64,
+) -> i32 {
+    if operation != 2
+        || array != crate::jit_encode_typed_runtime_value(3, crate::JIT_VALUE_RUNTIME_ARRAY_TAG)
+        || key != 7
+        || out.is_null()
+    {
+        return crate::JitCallStatus::ABI_MISMATCH.0 as i32;
+    }
+    // SAFETY: generated code owns this synchronous stack output slot.
+    unsafe { out.write(crate::jit_encode_constant(crate::JIT_VALUE_TRUE)) };
+    0
+}
+
+#[allow(unsafe_code)]
+extern "C" fn test_string_predicate_fast(
+    operation: u32,
+    _haystack: i64,
+    _needle: i64,
+    out: *mut i64,
+) -> i32 {
+    if operation & 0xff != 1 || out.is_null() {
+        return crate::JitCallStatus::ABI_MISMATCH.0 as i32;
+    }
+    // SAFETY: generated code owns this synchronous stack output slot.
+    unsafe { out.write(crate::jit_encode_constant(crate::JIT_VALUE_TRUE)) };
+    0
+}
+
 #[test]
 fn lifecycle_operation_carries_function_and_continuation_context() {
     let encoded = native_dim_operation(1, FunctionId::new(37), 91_337);
@@ -3343,6 +3377,187 @@ fn optimizing_isset_dim_uses_typed_non_null_result_without_compare_helper() {
         handle
             .invoke_i64(&[array], JIT_RUNTIME_ABI_HASH)
             .expect("typed isset-dim execution"),
+        crate::jit_encode_constant(crate::JIT_VALUE_TRUE)
+    );
+    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn optimizing_array_key_exists_bypasses_generic_builtin_dispatch() {
+    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
+    let mut builder = IrBuilder::new(UnitId::new(4_219));
+    let file = builder.add_file("optimizing-array-key-exists.php");
+    let span = IrSpan::new(file, 0, 1);
+    let function = builder.start_function(
+        "optimizing_array_key_exists",
+        FunctionFlags::default(),
+        span,
+    );
+    let array = untyped_param(&mut builder, function, "array");
+    let block = builder.append_block(function);
+    let loaded = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::LoadLocal {
+            dst: loaded,
+            local: array,
+        },
+        span,
+    );
+    let key = builder.intern_constant(IrConstant::Int(7));
+    let result = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: result,
+            name: "array_key_exists".to_owned(),
+            args: vec![
+                IrCallArg {
+                    name: None,
+                    value: Operand::Constant(key),
+                    unpack: false,
+                    value_kind: IrCallArgValueKind::Direct,
+                    by_ref_local: None,
+                    by_ref_dim: None,
+                    by_ref_property: None,
+                    by_ref_property_dim: None,
+                },
+                IrCallArg {
+                    name: None,
+                    value: Operand::Register(loaded),
+                    unpack: false,
+                    value_kind: IrCallArgValueKind::Direct,
+                    by_ref_local: None,
+                    by_ref_dim: None,
+                    by_ref_property: None,
+                    by_ref_property_dim: None,
+                },
+            ],
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+    let unit = builder.finish();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.optimizing.array-key-exists").with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_call_dispatch: forbidden_call_dispatch as *const () as usize,
+            native_array_fetch: test_array_key_exists_fast as *const () as usize,
+            native_local_fetch: passthrough_local_fetch as *const () as usize,
+            native_value_lifecycle: passthrough_lifecycle as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("array_key_exists handle");
+    let array = crate::jit_encode_typed_runtime_value(3, crate::JIT_VALUE_RUNTIME_ARRAY_TAG);
+    assert_eq!(
+        handle
+            .invoke_i64(&[array], JIT_RUNTIME_ABI_HASH)
+            .expect("array_key_exists execution"),
+        crate::jit_encode_constant(crate::JIT_VALUE_TRUE)
+    );
+    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn optimizing_string_predicate_bypasses_generic_builtin_dispatch() {
+    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
+    let mut builder = IrBuilder::new(UnitId::new(4_220));
+    let file = builder.add_file("optimizing-string-predicate.php");
+    let span = IrSpan::new(file, 0, 1);
+    let function = builder.start_function(
+        "optimizing_string_predicate",
+        FunctionFlags::default(),
+        span,
+    );
+    let haystack = untyped_param(&mut builder, function, "haystack");
+    let needle = untyped_param(&mut builder, function, "needle");
+    let block = builder.append_block(function);
+    let loaded_haystack = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::LoadLocal {
+            dst: loaded_haystack,
+            local: haystack,
+        },
+        span,
+    );
+    let loaded_needle = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::LoadLocal {
+            dst: loaded_needle,
+            local: needle,
+        },
+        span,
+    );
+    let result = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: result,
+            name: "str_starts_with".to_owned(),
+            args: vec![
+                IrCallArg {
+                    name: None,
+                    value: Operand::Register(loaded_haystack),
+                    unpack: false,
+                    value_kind: IrCallArgValueKind::Direct,
+                    by_ref_local: None,
+                    by_ref_dim: None,
+                    by_ref_property: None,
+                    by_ref_property_dim: None,
+                },
+                IrCallArg {
+                    name: None,
+                    value: Operand::Register(loaded_needle),
+                    unpack: false,
+                    value_kind: IrCallArgValueKind::Direct,
+                    by_ref_local: None,
+                    by_ref_dim: None,
+                    by_ref_property: None,
+                    by_ref_property_dim: None,
+                },
+            ],
+        },
+        span,
+    );
+    let yes = builder.append_block(function);
+    let no = builder.append_block(function);
+    builder.terminate_jump_if(function, block, Operand::Register(result), yes, no, span);
+    let true_value = builder.intern_constant(IrConstant::Bool(true));
+    let false_value = builder.intern_constant(IrConstant::Bool(false));
+    builder.terminate_return(function, yes, Some(Operand::Constant(true_value)), span);
+    builder.terminate_return(function, no, Some(Operand::Constant(false_value)), span);
+    let unit = builder.finish();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.optimizing.string-predicate").with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_call_dispatch: forbidden_call_dispatch as *const () as usize,
+            native_string_predicate: test_string_predicate_fast as *const () as usize,
+            native_local_fetch: passthrough_local_fetch as *const () as usize,
+            native_value_lifecycle: passthrough_lifecycle as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("string predicate handle");
+    assert_eq!(
+        handle
+            .invoke_i64(&[17, 19], JIT_RUNTIME_ABI_HASH)
+            .expect("string predicate execution"),
         crate::jit_encode_constant(crate::JIT_VALUE_TRUE)
     );
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);

@@ -1,7 +1,7 @@
 use super::NativeExecutionContext;
 
-const HELPER_OTHER: usize = 48;
-const HELPER_NAMES: [&str; 49] = [
+const HELPER_OTHER: usize = 49;
+const HELPER_NAMES: [&str; 50] = [
     "execution_poll",
     "unary",
     "binary",
@@ -50,6 +50,7 @@ const HELPER_NAMES: [&str; 49] = [
     "semantic_bind_global",
     "semantic_bound_closure_class",
     "native_transition",
+    "string_predicate",
     "other",
 ];
 const LOCAL_REASONS: [&str; 8] = [

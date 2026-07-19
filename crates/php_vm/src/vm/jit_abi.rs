@@ -55,8 +55,8 @@ pub(super) use runtime_ops::{
     jit_native_object_clone_abi, jit_native_object_clone_with_abi, jit_native_object_new_abi,
     jit_native_property_assign_abi, jit_native_property_fetch_abi, jit_native_reference_bind_abi,
     jit_native_return_check_abi, jit_native_runtime_fatal_abi, jit_native_stable_length_abi,
-    jit_native_truthy_abi, jit_native_type_predicate_abi, jit_native_unary_abi,
-    jit_native_value_lifecycle_abi,
+    jit_native_string_predicate_abi, jit_native_truthy_abi, jit_native_type_predicate_abi,
+    jit_native_unary_abi, jit_native_value_lifecycle_abi,
 };
 use semantic_dispatch::*;
 use telemetry::NativeRuntimeTelemetry;

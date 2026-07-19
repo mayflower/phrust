@@ -280,20 +280,36 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
         // SAFETY: The generated caller owns both records for this synchronous
         // call and the pointers were checked for null above.
         let frame = unsafe { &mut *frame };
-        let mut empty_arguments = [];
-        let arguments: &mut [php_jit::JitNativeCallArgument] = if frame.argument_count == 0 {
-            &mut empty_arguments
-        } else {
-            // SAFETY: The native compiler emits the caller-owned argument
-            // table and its exact live count. This internal hot ABI is trusted
-            // after code publication instead of revalidating every call.
+        let compact_arguments =
+            frame.flags & php_jit::JitNativeCallFrame::FLAG_COMPACT_ARGUMENTS != 0;
+        let compact_argument_values: &[i64] = if compact_arguments && frame.argument_count != 0 {
+            // SAFETY: The compact frame flag is emitted only with a contiguous
+            // caller-owned i64 table containing exactly `argument_count`
+            // entries for this synchronous call.
             unsafe {
-                std::slice::from_raw_parts_mut(
-                    frame.arguments as *mut php_jit::JitNativeCallArgument,
+                std::slice::from_raw_parts(
+                    frame.arguments as *const i64,
                     frame.argument_count as usize,
                 )
             }
+        } else {
+            &[]
         };
+        let mut empty_arguments = [];
+        let arguments: &mut [php_jit::JitNativeCallArgument] =
+            if compact_arguments || frame.argument_count == 0 {
+                &mut empty_arguments
+            } else {
+                // SAFETY: The native compiler emits the caller-owned argument
+                // table and its exact live count. This internal hot ABI is trusted
+                // after code publication instead of revalidating every call.
+                unsafe {
+                    std::slice::from_raw_parts_mut(
+                        frame.arguments as *mut php_jit::JitNativeCallArgument,
+                        frame.argument_count as usize,
+                    )
+                }
+            };
         let mut callsite_span = None;
         let outcome = with_native_context(|context| {
             let descriptor =
@@ -330,14 +346,26 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                     .as_deref()
                     .and_then(|name| context.external_function(name))
                     .is_some_and(|target| context.can_invoke_external_in_place(target));
-            let mut encoded = std::mem::take(&mut context.native_call_encoded_scratch);
-            let encoded_capacity_before = encoded.capacity();
-            encoded.clear();
-            encoded.extend(
-                arguments
-                    .iter()
-                    .map(|argument| argument.value.payload as i64),
-            );
+            let (mut encoded, encoded_capacity_before) = if compact_arguments && direct_builtin {
+                // Compact direct calls already expose the exact payload
+                // slice consumed by the builtin. Borrow it in place instead
+                // of copying every argument through the runtime scratch Vec.
+                (std::borrow::Cow::Borrowed(compact_argument_values), 0)
+            } else {
+                let mut encoded = std::mem::take(&mut context.native_call_encoded_scratch);
+                let encoded_capacity_before = encoded.capacity();
+                encoded.clear();
+                if compact_arguments {
+                    encoded.extend_from_slice(compact_argument_values);
+                } else {
+                    encoded.extend(
+                        arguments
+                            .iter()
+                            .map(|argument| argument.value.payload as i64),
+                    );
+                }
+                (std::borrow::Cow::Owned(encoded), encoded_capacity_before)
+            };
             let empty_local_values = [];
             let local_values: &[php_jit::JitAbiSlot] = if frame.local_count == 0 {
                 &empty_local_values
@@ -353,10 +381,13 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 }
             };
             if context.options.collect_counters {
-                let allocated_bytes = encoded
-                    .capacity()
-                    .saturating_sub(encoded_capacity_before)
-                    .saturating_mul(std::mem::size_of::<i64>());
+                let allocated_bytes = match &encoded {
+                    std::borrow::Cow::Borrowed(_) => 0,
+                    std::borrow::Cow::Owned(encoded) => encoded
+                        .capacity()
+                        .saturating_sub(encoded_capacity_before)
+                        .saturating_mul(std::mem::size_of::<i64>()),
+                };
                 let mut telemetry = context.runtime_telemetry.borrow_mut();
                 if direct_builtin {
                     telemetry.counters.native_call_direct =
@@ -408,7 +439,11 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 telemetry.counters.native_call_frame_bytes =
                     telemetry.counters.native_call_frame_bytes.saturating_add(
                         (std::mem::size_of::<php_jit::JitNativeCallFrame>()
-                            + std::mem::size_of_val(arguments)) as u64,
+                            + if compact_arguments {
+                                std::mem::size_of_val(compact_argument_values)
+                            } else {
+                                std::mem::size_of_val(arguments)
+                            }) as u64,
                     );
                 drop(telemetry);
                 if !direct_builtin && !direct_external_in_place {
@@ -518,7 +553,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                             .to_owned()
                     })?;
                 let invocation_arguments = if descriptor.target_function.is_some() {
-                    encoded.as_slice()
+                    encoded.as_ref()
                 } else {
                     visible_arguments
                 };
@@ -1565,7 +1600,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 materialize_native_property_reference_arguments(
                     context,
                     arguments,
-                    &mut encoded,
+                    encoded.to_mut(),
                     metadata,
                 )?;
                 return invoke_native_function_with_metadata_strict(
@@ -1597,7 +1632,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 materialize_native_property_reference_arguments(
                     context,
                     arguments,
-                    &mut encoded,
+                    encoded.to_mut(),
                     metadata,
                 )?;
                 return invoke_native_external_function_with_metadata(
@@ -1663,8 +1698,10 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 );
                 context.exit_runtime_helper(helper_id);
             }
-            encoded.clear();
-            context.native_call_encoded_scratch = encoded;
+            if let std::borrow::Cow::Owned(mut encoded) = encoded {
+                encoded.clear();
+                context.native_call_encoded_scratch = encoded;
+            }
             outcome
         });
         match outcome {
@@ -1698,7 +1735,9 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 let (class, message) = payload.split_once(':').unwrap_or(("Error", payload));
                 let source_span = callsite_span;
                 let value = with_native_context(|context| {
-                    let target = (frame.target.function_id != u32::MAX)
+                    let target = (!compact_arguments
+                        && frame.flags & php_jit::JitNativeCallFrame::FLAG_DIRECT_BUILTIN == 0
+                        && frame.target.function_id != u32::MAX)
                         .then(|| php_ir::FunctionId::new(frame.target.function_id))
                         .and_then(|function| context.unit.functions.get(function.index()))
                         .map(|function| (function.span, function.name.clone()));

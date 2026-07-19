@@ -73,6 +73,7 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         | "phrust_native_array_unset"
         | "phrust_native_array_spread"
         | "phrust_native_object_clone_with" => Some(owned(BORROW_2, true)),
+        "phrust_native_string_predicate" => Some(owned(BORROW_2, false)),
         "phrust_native_local_store"
         | "phrust_native_reference_bind"
         | "phrust_native_property_fetch"

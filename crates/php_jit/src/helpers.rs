@@ -6,7 +6,7 @@ pub use php_runtime::api::JitHelperId;
 
 /// Stable ABI fingerprint for the helper-symbol registry. Bumped whenever the
 /// registry's symbol set or any helper ABI changes.
-pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4820_0000_000f;
+pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4820_0000_0010;
 
 /// Helper argument kind.
 #[repr(u32)]
@@ -450,6 +450,15 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         has_side_effects: true,
         description: "PHP array insert consuming and replacing one local owner",
     },
+    JitHelperSymbol {
+        id: JitHelperId(51),
+        name: "phrust_native_string_predicate",
+        args: NATIVE_OP_2_ARGS,
+        returns: JitHelperReturnKind::Status,
+        can_throw: false,
+        has_side_effects: false,
+        description: "direct PHP string contains/starts-with/ends-with predicate",
+    },
 ];
 
 /// Looks up a helper by stable id.
@@ -511,6 +520,7 @@ pub fn resolve_helper_address(
         "phrust_native_truthy" => Some(runtime.native_truthy),
         "phrust_native_type_predicate" => Some(runtime.native_type_predicate),
         "phrust_native_stable_length" => Some(runtime.native_stable_length),
+        "phrust_native_string_predicate" => Some(runtime.native_string_predicate),
         "phrust_native_runtime_fatal" => Some(runtime.native_runtime_fatal),
         "phrust_native_execution_poll" => Some(runtime.native_execution_poll),
         _ => None,
@@ -564,7 +574,7 @@ mod tests {
             JIT_HELPER_SYMBOLS.first().expect("first").id,
             JitHelperId(14)
         );
-        assert_eq!(JIT_HELPER_SYMBOLS.last().expect("last").id, JitHelperId(50));
+        assert_eq!(JIT_HELPER_SYMBOLS.last().expect("last").id, JitHelperId(51));
     }
 
     #[test]

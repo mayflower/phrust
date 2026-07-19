@@ -194,6 +194,7 @@ struct NativeOperationFunctions {
     truthy: Option<NativeHelper>,
     type_predicate: Option<NativeHelper>,
     stable_length: Option<NativeHelper>,
+    string_predicate: Option<NativeHelper>,
     runtime_fatal: Option<NativeHelper>,
     execution_poll: Option<NativeHelper>,
 }
@@ -239,6 +240,7 @@ impl NativeOperationFunctions {
             truthy,
             type_predicate,
             stable_length,
+            string_predicate,
             runtime_fatal,
             execution_poll,
         );
@@ -1853,6 +1855,63 @@ fn lower_stable_builtin_type_predicate(
 
     builder.switch_to_block(merge);
     Ok(builder.block_params(merge)[0])
+}
+
+fn lower_fast_array_key_exists(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    helper: Option<NativeHelper>,
+    array: ir::Value,
+    key: ir::Value,
+    result_out: ir::Value,
+) -> Result<(ir::Value, ir::Value), CraneliftLoweringError> {
+    let helper = helper.ok_or_else(|| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_ARRAY_KEY_EXISTS",
+            "array_key_exists fast path has no declared array lookup helper",
+        )
+    })?;
+    let operation = builder.ins().iconst(types::I32, 2);
+    let call = call_native_helper(
+        module,
+        builder,
+        helper,
+        &[operation, array, key, result_out],
+    );
+    let status = builder.inst_results(call)[0];
+    let value = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), result_out, 0);
+    Ok((status, value))
+}
+
+fn lower_fast_string_predicate(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    helper: Option<NativeHelper>,
+    operation: u32,
+    haystack: ir::Value,
+    needle: ir::Value,
+    result_out: ir::Value,
+) -> Result<(ir::Value, ir::Value), CraneliftLoweringError> {
+    let helper = helper.ok_or_else(|| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_STRING_PREDICATE",
+            "string predicate fast path has no declared runtime helper",
+        )
+    })?;
+    let operation = builder.ins().iconst(types::I32, i64::from(operation));
+    let call = call_native_helper(
+        module,
+        builder,
+        helper,
+        &[operation, haystack, needle, result_out],
+    );
+    let status = builder.inst_results(call)[0];
+    let value = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), result_out, 0);
+    Ok((status, value))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3844,6 +3903,214 @@ fn lower_region_instruction(
             define_region_register(builder, register_variables, registers, *dst, value)?;
         }
         RegionInstructionKind::NativeCall(call) => {
+            if let Some(operation) = stable_builtin_string_predicate(&call.target)
+                && call.argument_operand_offset == 0
+                && call.args.len() == 2
+                && call
+                    .args
+                    .iter()
+                    .all(|argument| argument.name.is_none() && !argument.unpack)
+                && call.operands.len() == 2
+                && !matches!(call.result, RegionCallResult::ReferenceLocal(_))
+                && let (Some(haystack_operand), Some(needle_operand)) =
+                    (call.operands[0], call.operands[1])
+            {
+                let haystack = lower_region_operand(builder, locals, registers, haystack_operand)?;
+                let needle = lower_region_operand(builder, locals, registers, needle_operand)?;
+                let consume_haystack = matches!(
+                    haystack_operand,
+                    RegionOperand::Register(register)
+                        if value_flow.register_fact(register).ownership != SsaOwnership::Borrowed
+                ) && native_argument_has_location(&call.args[0]);
+                let consume_needle = matches!(
+                    needle_operand,
+                    RegionOperand::Register(register)
+                        if value_flow.register_fact(register).ownership != SsaOwnership::Borrowed
+                ) && native_argument_has_location(&call.args[1]);
+                let operation = operation
+                    | if consume_haystack { 1 << 8 } else { 0 }
+                    | if consume_needle { 1 << 9 } else { 0 };
+                let (status, value) = lower_fast_string_predicate(
+                    module,
+                    builder,
+                    native_operations.string_predicate,
+                    operation,
+                    haystack,
+                    needle,
+                    result_out,
+                )?;
+                let fast = builder.create_block();
+                let slow = builder.create_block();
+                let merge = builder.create_block();
+                let result_register = match call.result {
+                    RegionCallResult::Register(destination) => {
+                        builder.append_block_param(merge, types::I64);
+                        Some(destination)
+                    }
+                    RegionCallResult::Discard => None,
+                    RegionCallResult::ReferenceLocal(_) => unreachable!("filtered above"),
+                };
+                let hit = builder.ins().icmp_imm(IntCC::Equal, status, 0);
+                builder.ins().brif(hit, fast, &[], slow, &[]);
+
+                builder.switch_to_block(fast);
+                if result_register.is_some() {
+                    builder.ins().jump(merge, &[value.into()]);
+                } else {
+                    builder.ins().jump(merge, &[]);
+                }
+
+                builder.switch_to_block(slow);
+                lower_native_call_trampoline(
+                    module,
+                    builder,
+                    native_call_helper,
+                    native_operations.reference_bind,
+                    native_operations.value_lifecycle,
+                    value_flow,
+                    locals,
+                    register_variables,
+                    registers,
+                    function_params,
+                    call,
+                    source_block,
+                    instruction,
+                    transition_live_registers,
+                    streaming_call_exit,
+                    result_out,
+                    deopt_out,
+                    function,
+                    local_count,
+                    native_version,
+                    pointer_type,
+                )?;
+                if let Some(destination) = result_register {
+                    let slow_value = use_region_register(builder, registers, destination)?;
+                    builder.ins().jump(merge, &[slow_value.into()]);
+                } else {
+                    builder.ins().jump(merge, &[]);
+                }
+                builder.switch_to_block(merge);
+                if let Some(destination) = result_register {
+                    let merged = builder.block_params(merge)[0];
+                    define_region_register(
+                        builder,
+                        register_variables,
+                        registers,
+                        destination,
+                        merged,
+                    )?;
+                }
+                return Ok(());
+            }
+            if stable_builtin_array_key_exists(&call.target)
+                && call.argument_operand_offset == 0
+                && call.args.len() == 2
+                && call
+                    .args
+                    .iter()
+                    .all(|argument| argument.name.is_none() && !argument.unpack)
+                && call.operands.len() == 2
+                && !matches!(call.result, RegionCallResult::ReferenceLocal(_))
+                && let (Some(key_operand), Some(array_operand)) =
+                    (call.operands[0], call.operands[1])
+            {
+                let key = lower_region_operand(builder, locals, registers, key_operand)?;
+                let array = lower_region_operand(builder, locals, registers, array_operand)?;
+                let (status, value) = lower_fast_array_key_exists(
+                    module,
+                    builder,
+                    native_operations.array_fetch,
+                    array,
+                    key,
+                    result_out,
+                )?;
+                let fast = builder.create_block();
+                let slow = builder.create_block();
+                let merge = builder.create_block();
+                let result_register = match call.result {
+                    RegionCallResult::Register(destination) => {
+                        builder.append_block_param(merge, types::I64);
+                        Some(destination)
+                    }
+                    RegionCallResult::Discard => None,
+                    RegionCallResult::ReferenceLocal(_) => unreachable!("filtered above"),
+                };
+                let hit = builder.ins().icmp_imm(IntCC::Equal, status, 0);
+                builder.ins().brif(hit, fast, &[], slow, &[]);
+
+                builder.switch_to_block(fast);
+                for (argument, (operand, source)) in call
+                    .args
+                    .iter()
+                    .zip([(key_operand, key), (array_operand, array)])
+                {
+                    if matches!(
+                        operand,
+                        RegionOperand::Register(register)
+                            if value_flow.register_fact(register).ownership
+                                != SsaOwnership::Borrowed
+                    ) && native_argument_has_location(argument)
+                    {
+                        let _ = lower_native_value_operation(
+                            module,
+                            builder,
+                            native_operations.value_lifecycle,
+                            native_dim_operation(1, function, instruction.continuation_id),
+                            &[source],
+                            result_out,
+                        )?;
+                    }
+                }
+                if result_register.is_some() {
+                    builder.ins().jump(merge, &[value.into()]);
+                } else {
+                    builder.ins().jump(merge, &[]);
+                }
+
+                builder.switch_to_block(slow);
+                lower_native_call_trampoline(
+                    module,
+                    builder,
+                    native_call_helper,
+                    native_operations.reference_bind,
+                    native_operations.value_lifecycle,
+                    value_flow,
+                    locals,
+                    register_variables,
+                    registers,
+                    function_params,
+                    call,
+                    source_block,
+                    instruction,
+                    transition_live_registers,
+                    streaming_call_exit,
+                    result_out,
+                    deopt_out,
+                    function,
+                    local_count,
+                    native_version,
+                    pointer_type,
+                )?;
+                if let Some(destination) = result_register {
+                    let slow_value = use_region_register(builder, registers, destination)?;
+                    builder.ins().jump(merge, &[slow_value.into()]);
+                } else {
+                    builder.ins().jump(merge, &[]);
+                }
+                builder.switch_to_block(merge);
+                if let Some(destination) = result_register {
+                    let merged = builder.block_params(merge)[0];
+                    define_region_register(
+                        builder,
+                        register_variables,
+                        registers,
+                        destination,
+                        merged,
+                    )?;
+                }
+                return Ok(());
+            }
             if let Some(predicate) = stable_builtin_type_predicate(&call.target)
                 && call.argument_operand_offset == 0
                 && call.args.len() == 1
@@ -5829,7 +6096,20 @@ fn lower_native_call_trampoline(
             "native call site has no typed dispatch trampoline",
         )
     })?;
-    let argument_size = std::mem::size_of::<crate::JitNativeCallArgument>();
+    let direct_builtin_helper = stable_builtin_helper_id(&call.target);
+    let compact_builtin_arguments = direct_builtin_helper.is_some()
+        && call.argument_operand_offset == 0
+        && call.operands.len() == call.args.len()
+        && call.args.iter().enumerate().all(|(index, argument)| {
+            argument.name.is_none()
+                && !argument.unpack
+                && !call.argument_requires_reference_binding(index)
+        });
+    let argument_size = if compact_builtin_arguments {
+        std::mem::size_of::<i64>()
+    } else {
+        std::mem::size_of::<crate::JitNativeCallArgument>()
+    };
     // Direct-call regions append scalar defaults to `operands` so compiled
     // callees can receive a complete fixed-arity frame. Once a call falls
     // back to the runtime binder, however, those defaults must be bound by
@@ -5981,6 +6261,13 @@ fn lower_native_call_trampoline(
                         .or_insert_with(|| (original, vec![flags_offset]));
                 }
             }
+            let payload = lowered.unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+            if compact_builtin_arguments {
+                builder
+                    .ins()
+                    .store(MemFlagsData::new(), payload, pointer, base);
+                continue;
+            }
             let tag = if lowered.is_some() { 3 } else { 0 };
             let tag = builder.ins().iconst(types::I32, tag);
             builder.ins().store(MemFlagsData::new(), tag, pointer, base);
@@ -5988,7 +6275,6 @@ fn lower_native_call_trampoline(
             builder
                 .ins()
                 .store(MemFlagsData::new(), abi_flags, pointer, base + 4);
-            let payload = lowered.unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
             builder
                 .ins()
                 .store(MemFlagsData::new(), payload, pointer, base + 8);
@@ -6113,7 +6399,6 @@ fn lower_native_call_trampoline(
         std::mem::offset_of!(crate::JitNativeCallFrame, argument_count),
         u32::try_from(argument_count).unwrap_or(u32::MAX),
     );
-    let direct_builtin_helper = stable_builtin_helper_id(&call.target);
     let direct_external = direct_builtin_helper.is_none()
         && matches!(&call.target, RegionCallTarget::Function { name, function: None }
         if function_params.values().any(|(candidate, ..)| {
@@ -6133,6 +6418,10 @@ fn lower_native_call_trampoline(
         0
     } | if direct_external {
         crate::JitNativeCallFrame::FLAG_DIRECT_EXTERNAL
+    } else {
+        0
+    } | if compact_builtin_arguments {
+        crate::JitNativeCallFrame::FLAG_COMPACT_ARGUMENTS
     } else {
         0
     };

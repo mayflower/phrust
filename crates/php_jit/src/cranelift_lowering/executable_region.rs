@@ -1316,7 +1316,8 @@ pub(super) fn compile_region_graph_native(
                     | RegionInstructionKind::BindReferenceIntoDim { .. }
                     | RegionInstructionKind::BindReferenceIntoPropertyDim { .. }
                     | RegionInstructionKind::BindReferenceDimFromProperty { .. }
-            )
+            ) || matches!(kind, RegionInstructionKind::NativeCall(call)
+                if stable_builtin_array_key_exists(&call.target))
         })
     });
     let needs_array_unset = regions.values().any(|region| {
@@ -1401,6 +1402,12 @@ pub(super) fn compile_region_graph_native(
                 kind,
                 RegionInstructionKind::EmptyDim { .. } | RegionInstructionKind::EmptyLocal { .. }
             ) || matches!(kind, RegionInstructionKind::NativeCall(call) if stable_builtin_length(&call.target).is_some())
+        })
+    });
+    let needs_string_predicate = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(kind, RegionInstructionKind::NativeCall(call)
+                if stable_builtin_string_predicate(&call.target).is_some())
         })
     });
     let needs_runtime_fatal = regions.values().any(|region| {
@@ -1623,6 +1630,12 @@ pub(super) fn compile_region_graph_native(
             runtime_helpers.native_stable_length,
             test_native_stable_length_fallback as *const () as usize,
             "phrust_native_stable_length",
+        ),
+        (
+            needs_string_predicate,
+            runtime_helpers.native_string_predicate,
+            test_native_string_predicate_fallback as *const () as usize,
+            "phrust_native_string_predicate",
         ),
         (
             needs_runtime_fatal,
@@ -2026,6 +2039,14 @@ pub(super) fn compile_region_graph_native(
                     "phrust_native_stable_length",
                     3,
                     helper_address("phrust_native_stable_length"),
+                )?);
+            }
+            if needs_string_predicate {
+                native_operations.string_predicate = Some(declare_value_operation(
+                    module,
+                    "phrust_native_string_predicate",
+                    2,
+                    helper_address("phrust_native_string_predicate"),
                 )?);
             }
             if needs_runtime_fatal {
@@ -3952,6 +3973,9 @@ fn define_region_graph_function(
             .map(NativeHelper::with_inline_runtime_view);
         native_operations.stable_length = native_operations
             .stable_length
+            .map(NativeHelper::with_inline_runtime_view);
+        native_operations.string_predicate = native_operations
+            .string_predicate
             .map(NativeHelper::with_inline_runtime_view);
         let local_ids = fragment.map_or_else(
             || {

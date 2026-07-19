@@ -182,6 +182,8 @@ pub struct JitRuntimeHelperAddresses {
     pub native_type_predicate: usize,
     /// Typed `strlen`/array `count` slow path for stable value views.
     pub native_stable_length: usize,
+    /// Direct string contains/starts-with/ends-with predicate over native handles.
+    pub native_string_predicate: usize,
     /// Typed runtime-fatal publication operation.
     pub native_runtime_fatal: usize,
     /// Cooperative execution-deadline poll emitted at native loop headers.

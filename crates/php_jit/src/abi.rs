@@ -11,13 +11,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use php_ir::{FunctionId, LocalId, RegId};
 
 /// Version for the C-compatible runtime ABI records.
-pub const JIT_RUNTIME_ABI_VERSION: u32 = 24;
+pub const JIT_RUNTIME_ABI_VERSION: u32 = 25;
 
 /// Stable ABI fingerprint for Cranelift ABI.
 ///
 /// This is updated only when a `repr(C)` boundary type changes layout or tag
 /// meaning. It is intentionally independent from Rust type names.
-pub const JIT_RUNTIME_ABI_HASH: u64 = 0x0dc1_a824_0000_002f;
+pub const JIT_RUNTIME_ABI_HASH: u64 = 0x0dc1_a825_0000_0030;
 
 /// No stable length is published for this runtime value slot.
 pub const JIT_NATIVE_VALUE_VIEW_NONE: u32 = 0;
@@ -671,6 +671,9 @@ impl JitNativeCallFrame {
     pub const FLAG_RETURN_REFERENCE: u32 = 1 << 1;
     pub const FLAG_DIRECT_BUILTIN: u32 = 1 << 2;
     pub const FLAG_DIRECT_EXTERNAL: u32 = 1 << 3;
+    /// `arguments` points to a contiguous `i64` payload table. All argument
+    /// names, unpack flags and by-reference bindings are known absent.
+    pub const FLAG_COMPACT_ARGUMENTS: u32 = 1 << 4;
 }
 
 /// Dynamic call resolver/invoker. It may compile and retry a native entry, but
@@ -1466,7 +1469,7 @@ mod tests {
 
     #[test]
     fn c_abi_layout_is_stable() {
-        assert_eq!(JIT_RUNTIME_ABI_VERSION, 24);
+        assert_eq!(JIT_RUNTIME_ABI_VERSION, 25);
         assert_ne!(JIT_RUNTIME_ABI_HASH, 0);
         assert_eq!(size_of::<JitOpaqueHandle>(), 8);
         assert_eq!(size_of::<JitCValueTag>(), 4);

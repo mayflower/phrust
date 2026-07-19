@@ -23,8 +23,9 @@ use jit_abi::{
     jit_native_local_fetch_abi, jit_native_local_store_abi, jit_native_object_clone_abi,
     jit_native_object_clone_with_abi, jit_native_object_new_abi, jit_native_property_assign_abi,
     jit_native_property_fetch_abi, jit_native_reference_bind_abi, jit_native_return_check_abi,
-    jit_native_runtime_fatal_abi, jit_native_stable_length_abi, jit_native_truthy_abi,
-    jit_native_type_predicate_abi, jit_native_unary_abi, jit_native_value_lifecycle_abi,
+    jit_native_runtime_fatal_abi, jit_native_stable_length_abi, jit_native_string_predicate_abi,
+    jit_native_truthy_abi, jit_native_type_predicate_abi, jit_native_unary_abi,
+    jit_native_value_lifecycle_abi,
 };
 use php_runtime::api::{OutputBuffer, Value};
 use std::collections::{HashMap, HashSet};
@@ -1619,6 +1620,7 @@ fn runtime_helper_addresses() -> php_jit::JitRuntimeHelperAddresses {
         native_truthy: jit_native_truthy_abi as *const () as usize,
         native_type_predicate: jit_native_type_predicate_abi as *const () as usize,
         native_stable_length: jit_native_stable_length_abi as *const () as usize,
+        native_string_predicate: jit_native_string_predicate_abi as *const () as usize,
         native_runtime_fatal: jit_native_runtime_fatal_abi as *const () as usize,
         native_execution_poll: jit_native_execution_poll_abi as *const () as usize,
     }
@@ -2432,6 +2434,11 @@ mod tests {
         assert_eq!(counters.native_builtin_direct_executed, 1);
         assert_eq!(counters.native_call_dynamic, 0);
         assert_eq!(counters.native_call_argument_allocation_bytes, 0);
+        assert_eq!(
+            counters.native_call_frame_bytes,
+            (std::mem::size_of::<php_jit::JitNativeCallFrame>() + std::mem::size_of::<i64>())
+                as u64
+        );
         assert_eq!(counters.native_frame_arena_high_water_bytes, 0);
     }
 

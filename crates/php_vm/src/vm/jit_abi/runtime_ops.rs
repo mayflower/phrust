@@ -3311,6 +3311,44 @@ pub(in crate::vm) extern "C" fn jit_native_array_fetch_abi(
     out: *mut i64,
 ) -> i32 {
     with_native_context_for("array_fetch", |context| {
+        // The compiler uses operation 2 for the non-coercing common case of
+        // array_key_exists(). A miss means "use the complete builtin path",
+        // not that the key is absent: references, constants and coercible PHP
+        // keys retain their ordinary diagnostics and type handling there.
+        if quiet == 2 {
+            let Some(index) = context.plain_array_storage_index(array) else {
+                return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
+            };
+            let key = if php_jit::jit_decode_runtime_value(key).is_none()
+                && php_jit::jit_decode_constant(key).is_none()
+            {
+                php_runtime::api::ArrayKey::Int(key)
+            } else if let Some(key @ Value::String(_)) = context.borrowed_php_value(key) {
+                php_runtime::api::ArrayKey::from_value(key)
+                    .expect("string values always normalize to PHP array keys")
+            } else if php_jit::jit_decode_constant(key).is_some() {
+                let Ok(key @ Value::String(_)) = context.decode(key) else {
+                    return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
+                };
+                php_runtime::api::ArrayKey::from_value(&key)
+                    .expect("string values always normalize to PHP array keys")
+            } else {
+                return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
+            };
+            let exists = context
+                .array_at(index)
+                .is_ok_and(|array| array.get(&key).is_some());
+            let encoded = php_jit::jit_encode_constant(if exists {
+                php_jit::JIT_VALUE_TRUE
+            } else {
+                php_jit::JIT_VALUE_FALSE
+            });
+            return if write_native_value(out, encoded) {
+                0
+            } else {
+                php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
+            };
+        }
         let (quiet, source_function, source) = if quiet & 0x8000_0000 != 0 {
             let function = (quiet >> 1) & 0x3ff;
             let continuation = (quiet >> 11) & 0x0f_ffff;
@@ -4122,6 +4160,63 @@ pub(in crate::vm) extern "C" fn jit_native_stable_length_abi(
         match execute_native_builtin(context, name, &[src], &source, None, None) {
             Ok(value) if write_native_value(out, value) => 0,
             _ => php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
+        }
+    })
+    .unwrap_or(php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32)
+}
+
+pub(in crate::vm) extern "C" fn jit_native_string_predicate_abi(
+    op: u32,
+    haystack_encoded: i64,
+    needle_encoded: i64,
+    out: *mut i64,
+) -> i32 {
+    let operation = op & 0xff;
+    if operation > 2 || out.is_null() {
+        return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
+    }
+    with_native_context_for("string_predicate", |context| {
+        let exact_string = |encoded| {
+            if let Some(Value::String(value)) = context.borrowed_php_value(encoded) {
+                return Some(value.clone());
+            }
+            match context.decode(encoded).ok()? {
+                Value::String(value) => Some(value),
+                _ => None,
+            }
+        };
+        let Some(haystack) = exact_string(haystack_encoded) else {
+            return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
+        };
+        let Some(needle) = exact_string(needle_encoded) else {
+            return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
+        };
+        let haystack = haystack.as_bytes();
+        let needle = needle.as_bytes();
+        let matched = match operation {
+            0 if needle.is_empty() => true,
+            0 => haystack
+                .windows(needle.len())
+                .any(|window| window == needle),
+            1 => haystack.starts_with(needle),
+            2 => haystack.ends_with(needle),
+            _ => unreachable!("validated string predicate operation"),
+        };
+        if op & (1 << 8) != 0 {
+            let _ = context.release(haystack_encoded);
+        }
+        if op & (1 << 9) != 0 {
+            let _ = context.release(needle_encoded);
+        }
+        let encoded = php_jit::jit_encode_constant(if matched {
+            php_jit::JIT_VALUE_TRUE
+        } else {
+            php_jit::JIT_VALUE_FALSE
+        });
+        if write_native_value(out, encoded) {
+            0
+        } else {
+            php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
         }
     })
     .unwrap_or(php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32)
