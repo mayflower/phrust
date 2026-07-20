@@ -1,6 +1,19 @@
 use super::*;
 use std::sync::Arc;
 
+fn positional_native_call_argument() -> php_ir::instruction::IrCallArg {
+    php_ir::instruction::IrCallArg {
+        name: None,
+        value: php_ir::Operand::Register(php_ir::RegId::new(0)),
+        unpack: false,
+        value_kind: php_ir::instruction::IrCallArgValueKind::Direct,
+        by_ref_local: None,
+        by_ref_dim: None,
+        by_ref_property: None,
+        by_ref_property_dim: None,
+    }
+}
+
 pub(super) fn native_string(value: Value) -> Result<Vec<u8>, String> {
     match value {
         Value::String(value) => Ok(value.as_bytes().to_vec()),
@@ -1963,6 +1976,172 @@ fn execute_native_read_builtin_fast(
     }
 }
 
+pub(super) fn execute_prepared_runtime_builtin(
+    context: &mut NativeExecutionContext<'_>,
+    arguments: &[i64],
+    source: php_ir::IrSpan,
+    prepared: crate::compiled_unit::PreparedNativeBuiltin,
+) -> Result<i64, String> {
+    let entry = prepared.entry;
+    let name = entry.name();
+    if !prepared.fixed_arity_validated {
+        validate_native_builtin_arity_with_metadata(name, arguments.len(), prepared.metadata)?;
+    }
+    validate_native_builtin_types(context, name, arguments, source, Some(prepared.type_info))?;
+    let mut values = arguments
+        .iter()
+        .enumerate()
+        .map(|(index, argument)| {
+            let value = context.decode(*argument)?;
+            let by_ref = prepared
+                .metadata
+                .and_then(|function| {
+                    function.params.get(index).or_else(|| {
+                        function
+                            .params
+                            .last()
+                            .filter(|parameter| parameter.variadic)
+                    })
+                })
+                .is_some_and(|parameter| parameter.by_ref);
+            Ok::<Value, String>(if by_ref {
+                value
+            } else if let Value::Reference(reference) = value {
+                reference.get()
+            } else {
+                value
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if name == "shm_put_var" {
+        prepare_native_sysvshm_serialization(context, &mut values)?;
+    }
+    let span = php_runtime::api::RuntimeSourceSpan {
+        file: context
+            .unit
+            .files
+            .get(source.file.index())
+            .map(|file| file.path.clone()),
+        start: source.start,
+        end: source.end,
+    };
+    let lightweight_handler = matches!(
+        entry.handler_kind(),
+        php_runtime::api::BuiltinHandlerKind::Pure0
+            | php_runtime::api::BuiltinHandlerKind::Pure1
+            | php_runtime::api::BuiltinHandlerKind::Pure2
+            | php_runtime::api::BuiltinHandlerKind::Pure3
+            | php_runtime::api::BuiltinHandlerKind::BorrowedN
+            | php_runtime::api::BuiltinHandlerKind::Json
+            | php_runtime::api::BuiltinHandlerKind::Pcre
+    );
+    let (result, diagnostics) = if lightweight_handler {
+        let mut builtin = php_runtime::api::BuiltinContext::with_borrowed_runtime_request_state(
+            &mut context.output,
+            &mut context.cwd,
+            Arc::clone(&context.include_path),
+            context.options.runtime_context.filesystem.clone(),
+            Some(&mut context.resources),
+            &mut context.builtin_request_state,
+            &mut context.ini_registry,
+            &mut context.default_timezone,
+            Arc::clone(&context.environment),
+        );
+        builtin.set_diagnostic_display(php_runtime::api::PhpDiagnosticDisplayOptions {
+            display_errors: false,
+            error_reporting: context.error_reporting,
+            leading_newline: true,
+        });
+        let result = (entry.function())(&mut builtin, values, span);
+        let diagnostics = builtin.take_diagnostics();
+        (result, diagnostics)
+    } else {
+        let mut builtin = php_runtime::api::BuiltinContext::with_borrowed_runtime_request_state(
+            &mut context.output,
+            &mut context.cwd,
+            Arc::clone(&context.include_path),
+            context.options.runtime_context.filesystem.clone(),
+            Some(&mut context.resources),
+            &mut context.builtin_request_state,
+            &mut context.ini_registry,
+            &mut context.default_timezone,
+            Arc::clone(&context.environment),
+        );
+        builtin.set_diagnostic_display(php_runtime::api::PhpDiagnosticDisplayOptions {
+            display_errors: false,
+            error_reporting: context.error_reporting,
+            leading_newline: true,
+        });
+        if let php_runtime::api::RuntimeRequestMode::Http(request) =
+            &context.options.runtime_context.request_mode
+        {
+            builtin.set_php_input(Arc::clone(&request.raw_body));
+        }
+        builtin.set_filter_input_arrays_shared(Rc::clone(&context.filter_input_arrays));
+        builtin.set_http_response_state(&mut context.http_response);
+        builtin.set_upload_registry(&mut context.upload_registry);
+        builtin.set_session_state(&mut context.session, context.session_global.clone());
+        builtin.set_session_loader(context.options.runtime_context.session_loader.as_ref());
+        builtin.set_session_id_generator(
+            context
+                .options
+                .runtime_context
+                .session_id_generator
+                .as_ref(),
+        );
+        builtin.sync_session_state_from_global();
+        let mut mysql_state = context.mysql_state.borrow_mut();
+        builtin.set_mysql_state(&mut mysql_state);
+        context.registered_extensions.bind(&mut builtin);
+        let result = (entry.function())(&mut builtin, values, span);
+        builtin.sync_session_state_from_global();
+        let diagnostics = builtin.take_diagnostics();
+        (result, diagnostics)
+    };
+    if name.starts_with("session_") {
+        context.mark_roots_dirty(RootMutationReason::Session);
+    }
+    if !diagnostics.is_empty() {
+        let diagnostic_source = php_ir::Instruction {
+            id: php_ir::InstrId::new(0),
+            span: source,
+            kind: php_ir::InstructionKind::Nop,
+        };
+        for diagnostic in diagnostics {
+            let errno = match diagnostic.severity() {
+                php_runtime::api::RuntimeSeverity::Notice => php_runtime::api::PHP_E_NOTICE,
+                php_runtime::api::RuntimeSeverity::Deprecation => {
+                    php_runtime::api::PHP_E_DEPRECATED
+                }
+                _ => php_runtime::api::PHP_E_WARNING,
+            };
+            emit_native_php_diagnostic(
+                context,
+                errno,
+                diagnostic.message(),
+                &diagnostic_source,
+                true,
+            )?;
+        }
+    }
+    match result {
+        Ok(value) => context.encode(value),
+        Err(error) => {
+            let id = error.diagnostic_id().to_ascii_uppercase();
+            let class = if id.contains("ARITY") || id.contains("ARGUMENT_COUNT") {
+                "ArgumentCountError"
+            } else if id.contains("VALUE") {
+                "ValueError"
+            } else if id.contains("TYPE") {
+                "TypeError"
+            } else {
+                "Error"
+            };
+            Err(format!("E_PHP_THROW:{class}:{}", error.message()))
+        }
+    }
+}
+
 pub(super) fn execute_native_builtin(
     context: &mut NativeExecutionContext<'_>,
     name: &str,
@@ -1971,8 +2150,22 @@ pub(super) fn execute_native_builtin(
     caller_locals: Option<(u32, &[php_jit::JitAbiSlot])>,
     prepared: Option<crate::compiled_unit::PreparedNativeBuiltin>,
 ) -> Result<i64, String> {
-    let normalized = normalized_native_builtin_name(name);
-    if native_builtin_is_unavailable_target_function(&normalized) {
+    if let Some(prepared) = prepared
+        && matches!(
+            prepared.entry.execution_kind(),
+            php_runtime::api::BuiltinExecutionKind::Runtime
+        )
+    {
+        return execute_prepared_runtime_builtin(context, arguments, source.span, prepared);
+    }
+    // A prepared direct callsite owns a canonical static registry name. The
+    // generic path still normalizes dynamic names, while warm direct calls do
+    // no allocation, case folding, or registry-availability lookup.
+    let normalized = prepared.map_or_else(
+        || normalized_native_builtin_name(name),
+        |builtin| std::borrow::Cow::Borrowed(builtin.entry.name()),
+    );
+    if prepared.is_none() && native_builtin_is_unavailable_target_function(&normalized) {
         return Err(format!(
             "E_PHP_THROW:Error:Call to undefined function {name}()"
         ));
@@ -1990,16 +2183,18 @@ pub(super) fn execute_native_builtin(
             true,
         )?;
     }
-    validate_native_builtin_arity_with_metadata(
-        &normalized,
-        arguments.len(),
-        prepared.and_then(|builtin| builtin.metadata),
-    )?;
+    if !prepared.is_some_and(|builtin| builtin.fixed_arity_validated) {
+        validate_native_builtin_arity_with_metadata(
+            &normalized,
+            arguments.len(),
+            prepared.and_then(|builtin| builtin.metadata),
+        )?;
+    }
     validate_native_builtin_types(
         context,
         &normalized,
         arguments,
-        source,
+        source.span,
         prepared.map(|builtin| builtin.type_info),
     )?;
     if let Some(result) = execute_native_type_predicate(context, &normalized, arguments)? {
@@ -3230,8 +3425,7 @@ pub(super) fn execute_native_builtin(
                 .iter()
                 .find(|class| {
                     class.name == normalized_name
-                        && (!class.flags.is_conditional
-                            || context.dynamic_classes.contains(&class.name))
+                        && (!class.flags.is_conditional || context.class_is_visible(&class.name))
                 })
                 .is_some_and(matches_kind)
                 || native_external_class_ref(context, &normalized_name)
@@ -3273,7 +3467,7 @@ pub(super) fn execute_native_builtin(
                         callback_error = Some(error);
                         break;
                     }
-                    if context.dynamic_classes.contains(&normalized_name) {
+                    if context.class_is_visible(&normalized_name) {
                         exists = true;
                         break;
                     }
@@ -3302,34 +3496,44 @@ pub(super) fn execute_native_builtin(
                 return Err("call_user_func_array(): argument #2 must be an array".to_owned());
             };
             if native_callable_has_no_by_ref_parameters(context, &callback) == Some(true) {
-                let mut encoded = Vec::with_capacity(arguments.len() + 1);
+                let mut encoded = std::mem::take(&mut context.native_call_encoded_scratch);
+                encoded.clear();
+                encoded.reserve(arguments.len() + 1);
                 encoded.push(callback_handle);
-                let mut metadata = Vec::with_capacity(arguments.len());
-                for (key, value) in arguments.iter() {
-                    encoded.push(context.encode(value.clone())?);
-                    metadata.push(php_ir::instruction::IrCallArg {
-                        name: match key {
+                let result = (|| {
+                    let mut metadata: Option<Vec<php_ir::instruction::IrCallArg>> = None;
+                    for (key, value) in arguments.iter() {
+                        encoded.push(context.encode(value.clone())?);
+                        let name = match key {
                             php_runtime::api::ArrayKey::Int(_) => None,
                             php_runtime::api::ArrayKey::String(name) => {
                                 Some(name.to_string_lossy())
                             }
-                        },
-                        value: php_ir::Operand::Register(php_ir::RegId::new(0)),
-                        unpack: false,
-                        value_kind: php_ir::instruction::IrCallArgValueKind::Direct,
-                        by_ref_local: None,
-                        by_ref_dim: None,
-                        by_ref_property: None,
-                        by_ref_property_dim: None,
-                    });
-                }
-                return invoke_native_encoded_callable_value_from(
-                    context,
-                    &encoded,
-                    source,
-                    Some(metadata),
-                    caller_locals.map(|(function, _)| function),
-                );
+                        };
+                        if name.is_some() && metadata.is_none() {
+                            metadata = Some(
+                                (0..encoded.len().saturating_sub(2))
+                                    .map(|_| positional_native_call_argument())
+                                    .collect(),
+                            );
+                        }
+                        if let Some(metadata) = metadata.as_mut() {
+                            let mut argument = positional_native_call_argument();
+                            argument.name = name;
+                            metadata.push(argument);
+                        }
+                    }
+                    invoke_native_encoded_callable_value_from(
+                        context,
+                        &encoded,
+                        source,
+                        metadata,
+                        caller_locals.map(|(function, _)| function),
+                    )
+                })();
+                encoded.clear();
+                context.native_call_encoded_scratch = encoded;
+                return result;
             }
             let mut values = Vec::with_capacity(arguments.len());
             let mut metadata = Vec::with_capacity(arguments.len());
@@ -4174,7 +4378,7 @@ fn validate_native_builtin_types(
     context: &NativeExecutionContext<'_>,
     name: &str,
     arguments: &[i64],
-    source: &php_ir::Instruction,
+    source: php_ir::IrSpan,
     prepared_info: Option<Option<&php_std::arginfo::FunctionArgInfo>>,
 ) -> Result<(), String> {
     if let Some(info) = prepared_info {
@@ -4209,7 +4413,7 @@ fn validate_native_builtin_types_with_info(
     context: &NativeExecutionContext<'_>,
     info: &php_std::arginfo::FunctionArgInfo,
     arguments: &[i64],
-    source: &php_ir::Instruction,
+    source: php_ir::IrSpan,
 ) -> Result<(), String> {
     let values = arguments
         .iter()
@@ -4220,7 +4424,7 @@ fn validate_native_builtin_types_with_info(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mode = if context.unit.strict_types_for_span(source.span) {
+    let mode = if context.unit.strict_types_for_span(source) {
         php_std::arginfo::CoercionMode::Strict
     } else {
         php_std::arginfo::CoercionMode::Weak
@@ -4229,10 +4433,10 @@ fn validate_native_builtin_types_with_info(
         file: context
             .unit
             .files
-            .get(source.span.file.index())
+            .get(source.file.index())
             .map(|file| file.path.clone()),
-        start: source.span.start,
-        end: source.span.end,
+        start: source.start,
+        end: source.end,
     };
     php_std::arginfo::ArgumentValidator::new(mode)
         .validate(info, &values, span)

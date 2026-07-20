@@ -2378,6 +2378,7 @@ fn dim_fetch_lowers_binary_index_expression() {
     assert!(snapshot.contains("local:1 $counter"), "{snapshot}");
     assert!(snapshot.contains("binary r"), "{snapshot}");
     assert!(snapshot.contains("fetch_dim r"), "{snapshot}");
+    assert!(snapshot.contains("mode=read"), "{snapshot}");
 }
 
 #[test]
@@ -2828,6 +2829,7 @@ fn call_arg_property_dimension_emits_by_ref_metadata() {
     assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
     let snapshot = result.unit.to_snapshot_text();
     assert!(snapshot.contains("by_ref_property_dim="), "{snapshot}");
+    assert!(snapshot.contains("mode=lvalue"), "{snapshot}");
 }
 
 #[test]

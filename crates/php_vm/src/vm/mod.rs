@@ -15,118 +15,24 @@ use jit_abi::{
     NativeExecutionContext, activate_native_context, jit_native_argument_check_abi,
     jit_native_array_fetch_abi, jit_native_array_insert_abi, jit_native_array_insert_local_abi,
     jit_native_array_new_abi, jit_native_array_spread_abi, jit_native_array_unset_abi,
-    jit_native_binary_abi, jit_native_builtin_dispatch_abi, jit_native_call_dispatch_abi,
-    jit_native_cast_abi, jit_native_compare_abi, jit_native_constant_fetch_abi,
-    jit_native_dynamic_code_abi, jit_native_echo_abi, jit_native_exception_new_abi,
-    jit_native_execution_poll_abi, jit_native_foreach_cleanup_abi, jit_native_foreach_init_abi,
-    jit_native_foreach_next_abi, jit_native_frame_alloc_abi, jit_native_frame_release_abi,
-    jit_native_function_resolve_abi, jit_native_local_fetch_abi, jit_native_local_store_abi,
-    jit_native_object_clone_abi, jit_native_object_clone_with_abi, jit_native_object_new_abi,
-    jit_native_property_assign_abi, jit_native_property_fetch_abi, jit_native_reference_bind_abi,
-    jit_native_return_check_abi, jit_native_runtime_fatal_abi, jit_native_stable_length_abi,
-    jit_native_string_predicate_abi, jit_native_truthy_abi, jit_native_type_predicate_abi,
-    jit_native_unary_abi, jit_native_value_lifecycle_abi,
+    jit_native_binary_abi, jit_native_builtin_dispatch_abi,
+    jit_native_builtin_dispatch_diagnostic_abi, jit_native_call_dispatch_abi,
+    jit_native_call_dispatch_diagnostic_abi, jit_native_cast_abi, jit_native_compare_abi,
+    jit_native_constant_fetch_abi, jit_native_dynamic_code_abi, jit_native_echo_abi,
+    jit_native_exception_new_abi, jit_native_execution_poll_abi, jit_native_foreach_cleanup_abi,
+    jit_native_foreach_init_abi, jit_native_foreach_next_abi, jit_native_frame_alloc_abi,
+    jit_native_frame_release_abi, jit_native_function_resolve_abi, jit_native_local_fetch_abi,
+    jit_native_local_store_abi, jit_native_object_clone_abi, jit_native_object_clone_with_abi,
+    jit_native_object_new_abi, jit_native_property_assign_abi, jit_native_property_fetch_abi,
+    jit_native_reference_bind_abi, jit_native_return_check_abi, jit_native_runtime_fatal_abi,
+    jit_native_semantic_dispatch_abi, jit_native_semantic_dispatch_diagnostic_abi,
+    jit_native_stable_length_abi, jit_native_string_predicate_abi, jit_native_truthy_abi,
+    jit_native_type_predicate_abi, jit_native_unary_abi, jit_native_value_lifecycle_abi,
 };
 use php_runtime::api::{OutputBuffer, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-
-fn validate_native_class_table(unit: &php_ir::IrUnit) -> Result<(), String> {
-    let find_class = |name: &str| {
-        let normalized = php_ir::module::normalize_class_name(name);
-        unit.classes.iter().find(|class| class.name == normalized)
-    };
-    for class in unit
-        .classes
-        .iter()
-        .filter(|class| !class.flags.is_conditional)
-    {
-        if let Some(parent_name) = class.parent.as_deref()
-            && let Some(parent) = find_class(parent_name)
-        {
-            if parent.flags.is_final || parent.flags.is_enum {
-                return Err(format!(
-                    "Class {} cannot extend final class {}",
-                    class.display_name, parent.display_name
-                ));
-            }
-            for method in &class.methods {
-                let mut ancestor = Some(parent);
-                while let Some(current) = ancestor {
-                    if current.methods.iter().any(|candidate| {
-                        candidate.name.eq_ignore_ascii_case(&method.name)
-                            && candidate.flags.is_final
-                    }) {
-                        return Err(format!(
-                            "Cannot override final method {}::{}()",
-                            current.display_name, method.name
-                        ));
-                    }
-                    ancestor = current.parent.as_deref().and_then(&find_class);
-                }
-            }
-        }
-
-        if class.flags.is_abstract || class.flags.is_interface || class.flags.is_trait {
-            continue;
-        }
-        let implements = |name: &str| {
-            let mut current = Some(class);
-            while let Some(candidate) = current {
-                if let Some(method) = candidate
-                    .methods
-                    .iter()
-                    .find(|method| method.name.eq_ignore_ascii_case(name))
-                {
-                    return Some(method);
-                }
-                current = candidate.parent.as_deref().and_then(&find_class);
-            }
-            None
-        };
-        let mut required = Vec::new();
-        let mut ancestor = class.parent.as_deref().and_then(&find_class);
-        while let Some(current) = ancestor {
-            required.extend(
-                current
-                    .methods
-                    .iter()
-                    .filter(|method| method.flags.is_abstract)
-                    .map(|method| (current, method)),
-            );
-            ancestor = current.parent.as_deref().and_then(&find_class);
-        }
-        for interface_name in &class.interfaces {
-            if let Some(interface) = find_class(interface_name) {
-                required.extend(interface.methods.iter().map(|method| (interface, method)));
-            }
-        }
-        for (owner, method) in required {
-            let Some(implementation) = implements(&method.name) else {
-                return Err(format!(
-                    "Class {} contains an abstract method {}::{}()",
-                    class.display_name, owner.display_name, method.name
-                ));
-            };
-            if implementation.flags.is_abstract {
-                return Err(format!(
-                    "Class {} contains an abstract method {}::{}()",
-                    class.display_name, owner.display_name, method.name
-                ));
-            }
-            if owner.flags.is_interface
-                && (implementation.flags.is_private || implementation.flags.is_protected)
-            {
-                return Err(format!(
-                    "Access level to {}::{}() must be public",
-                    class.display_name, method.name
-                ));
-            }
-        }
-    }
-    Ok(())
-}
 
 /// Process-owned state shared by native request coordinators.
 #[derive(Clone, Debug)]
@@ -321,6 +227,7 @@ impl VmWorkerState {
                 options,
                 function_ir_fingerprint,
                 unit.prepared_ir_fingerprint(),
+                unit.artifact_identity(),
                 &format!(
                     "{}-external-signatures-{external_signatures_hash:016x}",
                     unit.prepared_dependency_identity()
@@ -506,19 +413,27 @@ impl VmWorkerState {
             let loaded = if cache.config().mode.can_write() {
                 self.get_or_load_native_unit(&identity, || {
                     cache
-                        .get_or_compile(&identity, resolve_native_cache_helper, || {
-                            let (records, _) = self
-                                .compile_native(unit, function, options, external_signatures)
-                                .map_err(php_jit::NativeCacheError::InvalidHeader)?;
-                            let image = cache_image(identity.clone(), function, &records)?;
-                            compiled_records = Some(records);
-                            Ok(image)
-                        })
+                        .get_or_compile(
+                            &identity,
+                            |stable_id| {
+                                resolve_native_cache_helper(stable_id, options.collect_counters)
+                            },
+                            || {
+                                let (records, _) = self
+                                    .compile_native(unit, function, options, external_signatures)
+                                    .map_err(php_jit::NativeCacheError::InvalidHeader)?;
+                                let image = cache_image(identity.clone(), function, &records)?;
+                                compiled_records = Some(records);
+                                Ok(image)
+                            },
+                        )
                         .map(|(artifact, _)| Some(artifact))
                 })
             } else {
                 self.get_or_load_native_unit(&identity, || {
-                    cache.load(&identity, resolve_native_cache_helper)
+                    cache.load(&identity, |stable_id| {
+                        resolve_native_cache_helper(stable_id, options.collect_counters)
+                    })
                 })
             };
             let loaded = match loaded {
@@ -664,7 +579,12 @@ impl Vm {
                 unit.prepared_ir_verification_errors()
             ));
         }
-        validate_native_class_table(unit.unit())?;
+        match unit.prepared_class_validation() {
+            crate::compiled_unit::PreparedClassValidation::Valid => {}
+            crate::compiled_unit::PreparedClassValidation::Invalid(diagnostic) => {
+                return Err(diagnostic.to_string());
+            }
+        }
         let selected_function = if let Some(name) = function_name {
             Some(
                 unit.unit()
@@ -698,7 +618,7 @@ impl Vm {
                 unit.unit(),
                 function,
                 request,
-                runtime_helper_addresses(),
+                runtime_helper_addresses(false),
             )
             .map_err(|error| error.to_string())?;
         Ok(NativeCompileProbeReport {
@@ -735,8 +655,10 @@ impl Vm {
                 ),
             );
         }
-        if let Err(error) = validate_native_class_table(unit.unit()) {
-            return VmResult::compile_error(output, error);
+        if let crate::compiled_unit::PreparedClassValidation::Invalid(diagnostic) =
+            unit.prepared_class_validation()
+        {
+            return VmResult::compile_error(output, diagnostic.to_string());
         }
 
         if let Some(decision) = self.worker_state.background_tiering_decision(
@@ -792,28 +714,39 @@ impl Vm {
                 let cache_started = Instant::now();
                 let result = self.worker_state.get_or_load_native_unit(identity, || {
                     cache
-                        .get_or_compile(identity, resolve_native_cache_helper, || {
-                            let compile_started = Instant::now();
-                            let (records, disposition) = match self
-                                .compile_native_with_external_function_signatures(
-                                    &unit,
-                                    entry,
-                                    external_signatures,
-                                ) {
-                                Ok(records) => records,
-                                Err(error) => {
+                        .get_or_compile(
+                            identity,
+                            |stable_id| {
+                                resolve_native_cache_helper(
+                                    stable_id,
+                                    self.options.collect_counters,
+                                )
+                            },
+                            || {
+                                let compile_started = Instant::now();
+                                let (records, disposition) = match self
+                                    .compile_native_with_external_function_signatures(
+                                        &unit,
+                                        entry,
+                                        external_signatures,
+                                    ) {
+                                    Ok(records) => records,
+                                    Err(error) => {
+                                        native_compile_time += compile_started.elapsed();
+                                        cached_compile_error = Some(error.clone());
+                                        return Err(php_jit::NativeCacheError::InvalidHeader(
+                                            error,
+                                        ));
+                                    }
+                                };
+                                if disposition.compiled() {
                                     native_compile_time += compile_started.elapsed();
-                                    cached_compile_error = Some(error.clone());
-                                    return Err(php_jit::NativeCacheError::InvalidHeader(error));
                                 }
-                            };
-                            if disposition.compiled() {
-                                native_compile_time += compile_started.elapsed();
-                            }
-                            let image = cache_image(identity.clone(), entry, &records);
-                            cached_compile_records = Some(records);
-                            image
-                        })
+                                let image = cache_image(identity.clone(), entry, &records);
+                                cached_compile_records = Some(records);
+                                image
+                            },
+                        )
                         .map(|(artifact, _)| Some(artifact))
                 });
                 cache_load_time += cache_started.elapsed().saturating_sub(native_compile_time);
@@ -860,7 +793,9 @@ impl Vm {
             } else if cache.config().mode.can_read() {
                 let cache_started = Instant::now();
                 let loaded = self.worker_state.get_or_load_native_unit(identity, || {
-                    cache.load(identity, resolve_native_cache_helper)
+                    cache.load(identity, |stable_id| {
+                        resolve_native_cache_helper(stable_id, self.options.collect_counters)
+                    })
                 });
                 cache_load_time += cache_started.elapsed();
                 if let Ok(Some(loaded)) = loaded {
@@ -976,20 +911,22 @@ impl Vm {
         let native_entries = Arc::new(native_entries);
         let mut context = NativeExecutionContext::new(
             &unit,
-            unit.cache_identity(),
+            unit.artifact_identity(),
             &self.options,
             &self.worker_state,
             output,
             native_entries,
         );
-        context.install_root_dynamic_unit(unit.clone());
+        context.attach_root_deployment_image(unit.clone());
         let native_execution_started_at =
             self.options.collect_counters.then(std::time::Instant::now);
         context.record_native_direct_calls(handle);
         let guard = activate_native_context(&mut context);
-        let outcome = handle.invoke_i64_with_native_unwind(
+        let runtime = std::ptr::from_mut(&mut context).cast::<std::ffi::c_void>();
+        let outcome = handle.invoke_i64_with_native_unwind_runtime(
             &[],
             php_jit::JIT_RUNTIME_ABI_HASH,
+            runtime,
             |types, value| {
                 let class = context
                     .decode_result(value)
@@ -1050,27 +987,28 @@ impl Vm {
         let session = std::mem::take(&mut context.session);
         let process_exit_terminates_process = context.process_exit_terminates_process();
         let mut result = if let Some(throwable) = shutdown_throwable {
-            native_uncaught_throwable_result(context.output, Some(throwable))
+            native_uncaught_throwable_result(std::mem::take(&mut context.output), Some(throwable))
         } else if let Some(error) = shutdown_error {
             VmResult::runtime_error(
-                context.output,
-                context.diagnostic,
+                std::mem::take(&mut context.output),
+                context.diagnostic.take(),
                 format!("E_NATIVE_SHUTDOWN: {error}"),
             )
         } else if exception_handled {
-            VmResult::success(context.output, Some(Value::Null))
+            VmResult::success(std::mem::take(&mut context.output), Some(Value::Null))
         } else {
             match outcome {
                 Ok(php_jit::JitI64InvokeOutcome::Returned(value)) => {
                     match context.decode_result(value) {
                         Ok(value) => {
-                            let mut result = VmResult::success(context.output, Some(value));
-                            result.diagnostics.extend(context.diagnostic);
+                            let mut result =
+                                VmResult::success(std::mem::take(&mut context.output), Some(value));
+                            result.diagnostics.extend(context.diagnostic.take());
                             result
                         }
                         Err(error) => VmResult::runtime_error(
-                            context.output,
-                            context.diagnostic,
+                            std::mem::take(&mut context.output),
+                            context.diagnostic.take(),
                             format!("E_NATIVE_VALUE: {error}"),
                         ),
                     }
@@ -1087,13 +1025,13 @@ impl Vm {
                         Ok(Value::Bool(value)) => i32::from(value),
                         _ => 0,
                     };
-                    VmResult::success_exit(context.output, exit_code)
+                    VmResult::success_exit(std::mem::take(&mut context.output), exit_code)
                 }
                 Ok(php_jit::JitI64InvokeOutcome::SideExit { status, value, .. })
                     if status == php_jit::JitCallStatus::THROW.0 as i32 =>
                 {
                     let throwable = context.decode_result(value).ok();
-                    native_uncaught_throwable_result(context.output, throwable)
+                    native_uncaught_throwable_result(std::mem::take(&mut context.output), throwable)
                 }
                 Ok(php_jit::JitI64InvokeOutcome::SideExit { status, .. })
                     if status == php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32 =>
@@ -1113,29 +1051,38 @@ impl Vm {
                         .windows(b"Fatal error".len())
                         .any(|window| window == b"Fatal error")
                     {
-                        VmResult::fatal(context.output, context.diagnostic, message)
+                        VmResult::fatal(
+                            std::mem::take(&mut context.output),
+                            context.diagnostic.take(),
+                            message,
+                        )
                     } else {
-                        VmResult::runtime_error(context.output, context.diagnostic, message)
+                        VmResult::runtime_error(
+                            std::mem::take(&mut context.output),
+                            context.diagnostic.take(),
+                            message,
+                        )
                     }
                 }
                 Ok(php_jit::JitI64InvokeOutcome::SideExit { status, .. })
                     if status == php_jit::JitCallStatus::RETURN_REFERENCE.0 as i32 =>
                 {
-                    VmResult::success(context.output, None)
+                    VmResult::success(std::mem::take(&mut context.output), None)
                 }
                 Ok(php_jit::JitI64InvokeOutcome::SideExit { status, .. }) => {
                     VmResult::runtime_error(
-                        context.output,
-                        context.diagnostic,
+                        std::mem::take(&mut context.output),
+                        context.diagnostic.take(),
                         format!("native entry returned status {status}"),
                     )
                 }
                 Err(error) => VmResult::compile_error(
-                    context.output,
+                    std::mem::take(&mut context.output),
                     format!("E_NATIVE_ENTRY: native entry invocation failed: {error:?}"),
                 ),
             }
         };
+        context.recycle_native_value_arena();
         result.process_exit_terminates_process = process_exit_terminates_process;
         result.http_response = Some(Box::new(http_response));
         result.upload_registry = Some(Box::new(upload_registry));
@@ -1311,6 +1258,7 @@ pub(super) fn compile_native_function_graph(
     options: &VmOptions,
     ir_fingerprint: &str,
     deployment_identity: &str,
+    deployment_runtime_identity: u64,
     dependency_identity: &str,
     external_signatures: &[php_jit::JitExternalFunctionSignature],
 ) -> Result<Vec<php_jit::JitUnitCompileRecord>, String> {
@@ -1329,10 +1277,11 @@ pub(super) fn compile_native_function_graph(
                 .with_function_name(function_name)
                 .with_ir_fingerprint(ir_fingerprint)
                 .with_deployment_identity(deployment_identity)
+                .with_deployment_runtime_identity(deployment_runtime_identity)
                 .with_dependency_identity(dependency_identity)
                 .with_external_function_signatures(external_signatures.to_vec())
                 .with_opt_level(options.native_optimization.opt_level()),
-            runtime_helper_addresses(),
+            runtime_helper_addresses(options.collect_counters),
         )
         .map_err(|error| error.to_string())?;
     Ok(vec![php_jit::JitUnitCompileRecord { function, result }])
@@ -1570,7 +1519,8 @@ fn native_cache_identity(
         pointer_width: usize::BITS as u8,
         cpu_feature_fingerprint: isa.feature_fingerprint,
         optimization_tier,
-        optimization_config_hash: u64::from(options.native_optimization.opt_level()),
+        optimization_config_hash: u64::from(options.native_optimization.opt_level())
+            | (u64::from(options.collect_counters) << 8),
         php_semantic_config_hash: 0x0008_0005_0007,
     })
 }
@@ -1583,54 +1533,178 @@ fn cache_image(
     php_jit::NativeArtifactImage::from_compile_records(identity, records)
 }
 
-fn runtime_helper_addresses() -> php_jit::JitRuntimeHelperAddresses {
+fn runtime_helper_addresses(diagnostic: bool) -> php_jit::JitRuntimeHelperAddresses {
+    macro_rules! helper_address {
+        ($production:path, $diagnostic:path) => {
+            if diagnostic {
+                $diagnostic as *const () as usize
+            } else {
+                $production as *const () as usize
+            }
+        };
+    }
     php_jit::JitRuntimeHelperAddresses {
-        native_call_dispatch: jit_native_call_dispatch_abi as *const () as usize,
-        native_builtin_dispatch: jit_native_builtin_dispatch_abi as *const () as usize,
-        native_function_resolve: jit_native_function_resolve_abi as *const () as usize,
-        native_frame_alloc: jit_native_frame_alloc_abi as *const () as usize,
-        native_frame_release: jit_native_frame_release_abi as *const () as usize,
-        native_dynamic_code: jit_native_dynamic_code_abi as *const () as usize,
-        native_unary: jit_native_unary_abi as *const () as usize,
-        native_binary: jit_native_binary_abi as *const () as usize,
-        native_compare: jit_native_compare_abi as *const () as usize,
-        native_cast: jit_native_cast_abi as *const () as usize,
-        native_echo: jit_native_echo_abi as *const () as usize,
-        native_local_fetch: jit_native_local_fetch_abi as *const () as usize,
-        native_local_store: jit_native_local_store_abi as *const () as usize,
-        native_value_lifecycle: jit_native_value_lifecycle_abi as *const () as usize,
-        native_reference_bind: jit_native_reference_bind_abi as *const () as usize,
-        native_argument_check: jit_native_argument_check_abi as *const () as usize,
-        native_return_check: jit_native_return_check_abi as *const () as usize,
-        native_exception_new: jit_native_exception_new_abi as *const () as usize,
-        native_array_new: jit_native_array_new_abi as *const () as usize,
-        native_object_new: jit_native_object_new_abi as *const () as usize,
-        native_property_fetch: jit_native_property_fetch_abi as *const () as usize,
-        native_property_assign: jit_native_property_assign_abi as *const () as usize,
-        native_object_clone: jit_native_object_clone_abi as *const () as usize,
-        native_object_clone_with: jit_native_object_clone_with_abi as *const () as usize,
-        native_array_insert: jit_native_array_insert_abi as *const () as usize,
-        native_array_insert_local: jit_native_array_insert_local_abi as *const () as usize,
-        native_array_fetch: jit_native_array_fetch_abi as *const () as usize,
-        native_array_unset: jit_native_array_unset_abi as *const () as usize,
-        native_array_spread: jit_native_array_spread_abi as *const () as usize,
-        native_foreach_init: jit_native_foreach_init_abi as *const () as usize,
-        native_foreach_next: jit_native_foreach_next_abi as *const () as usize,
-        native_foreach_cleanup: jit_native_foreach_cleanup_abi as *const () as usize,
-        native_constant_fetch: jit_native_constant_fetch_abi as *const () as usize,
-        native_truthy: jit_native_truthy_abi as *const () as usize,
-        native_type_predicate: jit_native_type_predicate_abi as *const () as usize,
-        native_stable_length: jit_native_stable_length_abi as *const () as usize,
-        native_string_predicate: jit_native_string_predicate_abi as *const () as usize,
-        native_runtime_fatal: jit_native_runtime_fatal_abi as *const () as usize,
-        native_execution_poll: jit_native_execution_poll_abi as *const () as usize,
+        native_call_dispatch: helper_address!(
+            jit_native_call_dispatch_abi,
+            jit_native_call_dispatch_diagnostic_abi
+        ),
+        native_builtin_dispatch: helper_address!(
+            jit_native_builtin_dispatch_abi,
+            jit_native_builtin_dispatch_diagnostic_abi
+        ),
+        native_semantic_dispatch: helper_address!(
+            jit_native_semantic_dispatch_abi,
+            jit_native_semantic_dispatch_diagnostic_abi
+        ),
+        native_function_resolve: helper_address!(
+            jit_native_function_resolve_abi,
+            jit_abi::jit_native_function_resolve_diagnostic_abi
+        ),
+        native_frame_alloc: helper_address!(
+            jit_native_frame_alloc_abi,
+            jit_abi::jit_native_frame_alloc_diagnostic_abi
+        ),
+        native_frame_release: helper_address!(
+            jit_native_frame_release_abi,
+            jit_abi::jit_native_frame_release_diagnostic_abi
+        ),
+        native_dynamic_code: helper_address!(
+            jit_native_dynamic_code_abi,
+            jit_abi::jit_native_dynamic_code_diagnostic_abi
+        ),
+        native_unary: helper_address!(
+            jit_native_unary_abi,
+            jit_abi::jit_native_unary_diagnostic_abi
+        ),
+        native_binary: helper_address!(
+            jit_native_binary_abi,
+            jit_abi::jit_native_binary_diagnostic_abi
+        ),
+        native_compare: helper_address!(
+            jit_native_compare_abi,
+            jit_abi::jit_native_compare_diagnostic_abi
+        ),
+        native_cast: helper_address!(jit_native_cast_abi, jit_abi::jit_native_cast_diagnostic_abi),
+        native_echo: helper_address!(jit_native_echo_abi, jit_abi::jit_native_echo_diagnostic_abi),
+        native_local_fetch: helper_address!(
+            jit_native_local_fetch_abi,
+            jit_abi::jit_native_local_fetch_diagnostic_abi
+        ),
+        native_local_store: helper_address!(
+            jit_native_local_store_abi,
+            jit_abi::jit_native_local_store_diagnostic_abi
+        ),
+        native_value_lifecycle: helper_address!(
+            jit_native_value_lifecycle_abi,
+            jit_abi::jit_native_value_lifecycle_diagnostic_abi
+        ),
+        native_reference_bind: helper_address!(
+            jit_native_reference_bind_abi,
+            jit_abi::jit_native_reference_bind_diagnostic_abi
+        ),
+        native_argument_check: helper_address!(
+            jit_native_argument_check_abi,
+            jit_abi::jit_native_argument_check_diagnostic_abi
+        ),
+        native_return_check: helper_address!(
+            jit_native_return_check_abi,
+            jit_abi::jit_native_return_check_diagnostic_abi
+        ),
+        native_exception_new: helper_address!(
+            jit_native_exception_new_abi,
+            jit_abi::jit_native_exception_new_diagnostic_abi
+        ),
+        native_array_new: helper_address!(
+            jit_native_array_new_abi,
+            jit_abi::jit_native_array_new_diagnostic_abi
+        ),
+        native_object_new: helper_address!(
+            jit_native_object_new_abi,
+            jit_abi::jit_native_object_new_diagnostic_abi
+        ),
+        native_property_fetch: helper_address!(
+            jit_native_property_fetch_abi,
+            jit_abi::jit_native_property_fetch_diagnostic_abi
+        ),
+        native_property_assign: helper_address!(
+            jit_native_property_assign_abi,
+            jit_abi::jit_native_property_assign_diagnostic_abi
+        ),
+        native_object_clone: helper_address!(
+            jit_native_object_clone_abi,
+            jit_abi::jit_native_object_clone_diagnostic_abi
+        ),
+        native_object_clone_with: helper_address!(
+            jit_native_object_clone_with_abi,
+            jit_abi::jit_native_object_clone_with_diagnostic_abi
+        ),
+        native_array_insert: helper_address!(
+            jit_native_array_insert_abi,
+            jit_abi::jit_native_array_insert_diagnostic_abi
+        ),
+        native_array_insert_local: helper_address!(
+            jit_native_array_insert_local_abi,
+            jit_abi::jit_native_array_insert_local_diagnostic_abi
+        ),
+        native_array_fetch: helper_address!(
+            jit_native_array_fetch_abi,
+            jit_abi::jit_native_array_fetch_diagnostic_abi
+        ),
+        native_array_unset: helper_address!(
+            jit_native_array_unset_abi,
+            jit_abi::jit_native_array_unset_diagnostic_abi
+        ),
+        native_array_spread: helper_address!(
+            jit_native_array_spread_abi,
+            jit_abi::jit_native_array_spread_diagnostic_abi
+        ),
+        native_foreach_init: helper_address!(
+            jit_native_foreach_init_abi,
+            jit_abi::jit_native_foreach_init_diagnostic_abi
+        ),
+        native_foreach_next: helper_address!(
+            jit_native_foreach_next_abi,
+            jit_abi::jit_native_foreach_next_diagnostic_abi
+        ),
+        native_foreach_cleanup: helper_address!(
+            jit_native_foreach_cleanup_abi,
+            jit_abi::jit_native_foreach_cleanup_diagnostic_abi
+        ),
+        native_constant_fetch: helper_address!(
+            jit_native_constant_fetch_abi,
+            jit_abi::jit_native_constant_fetch_diagnostic_abi
+        ),
+        native_truthy: helper_address!(
+            jit_native_truthy_abi,
+            jit_abi::jit_native_truthy_diagnostic_abi
+        ),
+        native_type_predicate: helper_address!(
+            jit_native_type_predicate_abi,
+            jit_abi::jit_native_type_predicate_diagnostic_abi
+        ),
+        native_stable_length: helper_address!(
+            jit_native_stable_length_abi,
+            jit_abi::jit_native_stable_length_diagnostic_abi
+        ),
+        native_string_predicate: helper_address!(
+            jit_native_string_predicate_abi,
+            jit_abi::jit_native_string_predicate_diagnostic_abi
+        ),
+        native_runtime_fatal: helper_address!(
+            jit_native_runtime_fatal_abi,
+            jit_abi::jit_native_runtime_fatal_diagnostic_abi
+        ),
+        native_execution_poll: helper_address!(
+            jit_native_execution_poll_abi,
+            jit_abi::jit_native_execution_poll_diagnostic_abi
+        ),
     }
 }
 
-fn resolve_native_cache_helper(stable_id: u32) -> Option<usize> {
+fn resolve_native_cache_helper(stable_id: u32, diagnostic: bool) -> Option<usize> {
     php_jit::resolve_helper_address(
         php_runtime::api::JitHelperId(stable_id),
-        runtime_helper_addresses(),
+        runtime_helper_addresses(diagnostic),
     )
 }
 
@@ -1643,6 +1717,47 @@ mod tests {
         InstructionKind, IrConstant, IrParam, IrReturnType, IrSpan, Operand, UnitId,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn production_and_diagnostic_helpers_use_distinct_tables() {
+        let production = runtime_helper_addresses(false);
+        let diagnostic = runtime_helper_addresses(true);
+
+        assert_ne!(production.native_array_fetch, diagnostic.native_array_fetch);
+        assert_ne!(
+            production.native_value_lifecycle,
+            diagnostic.native_value_lifecycle
+        );
+        assert_ne!(
+            production.native_foreach_next,
+            diagnostic.native_foreach_next
+        );
+        assert_ne!(
+            production.native_call_dispatch,
+            diagnostic.native_call_dispatch
+        );
+        assert_ne!(
+            production.native_builtin_dispatch,
+            diagnostic.native_builtin_dispatch
+        );
+        assert_ne!(
+            production.native_semantic_dispatch,
+            diagnostic.native_semantic_dispatch
+        );
+
+        let array_fetch = php_jit::lookup_helper_by_name("phrust_native_array_fetch")
+            .expect("array-fetch helper is registered")
+            .id
+            .0;
+        assert_eq!(
+            resolve_native_cache_helper(array_fetch, false),
+            Some(production.native_array_fetch)
+        );
+        assert_eq!(
+            resolve_native_cache_helper(array_fetch, true),
+            Some(diagnostic.native_array_fetch)
+        );
+    }
 
     fn returning_unit(value: i64) -> CompiledUnit {
         let mut builder = IrBuilder::new(UnitId::new(991));

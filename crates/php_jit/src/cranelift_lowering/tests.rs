@@ -22,6 +22,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static NATIVE_DYNAMIC_EFFECTS: AtomicUsize = AtomicUsize::new(0);
 static SSA_FORBIDDEN_HELPER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static LOCAL_ARRAY_INSERT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static ARRAY_FETCH_FALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+static FOREACH_NEXT_FALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
 fn plain_local_flags_exclude_php_visible_global_slots() {
@@ -101,86 +103,142 @@ fn oversized_finished_clif_is_rejected_before_regalloc() {
 }
 
 extern "C" fn forbidden_local_fetch(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     _value: i64,
     _function: i64,
     _local: i64,
     _file: i64,
     _start: i64,
-    _out: *mut i64,
-) -> i32 {
+) -> crate::JitNativeValueResult {
     SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+    crate::JitNativeValueResult {
+        value: 0,
+        status: crate::JitCallStatus::RUNTIME_ERROR.0 as i64,
+    }
 }
 
 extern "C" fn forbidden_local_store(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     _current: i64,
     _value: i64,
     _function: i64,
     _local: i64,
-    _out: *mut i64,
-) -> i32 {
+) -> crate::JitNativeValueResult {
     SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+    crate::JitNativeValueResult {
+        value: 0,
+        status: crate::JitCallStatus::RUNTIME_ERROR.0 as i64,
+    }
 }
 
-extern "C" fn forbidden_lifecycle(_op: u32, _value: i64, _out: *mut i64) -> i32 {
+extern "C" fn forbidden_lifecycle(
+    _runtime: *mut std::ffi::c_void,
+    _op: u32,
+    _value: i64,
+) -> crate::JitNativeValueResult {
     SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+    crate::JitNativeValueResult {
+        value: 0,
+        status: crate::JitCallStatus::RUNTIME_ERROR.0 as i64,
+    }
 }
 
-#[allow(unsafe_code)]
-extern "C" fn frame_cleanup_only_lifecycle(op: u32, value: i64, out: *mut i64) -> i32 {
+extern "C" fn frame_cleanup_only_lifecycle(
+    _runtime: *mut std::ffi::c_void,
+    op: u32,
+    value: i64,
+) -> crate::JitNativeValueResult {
     let is_frame_cleanup =
         op & 0x8000_0000 != 0 && op & 1 == 1 && ((op >> 11) & 0x0f_ffff) == 0x0f_ffff;
-    if !is_frame_cleanup || out.is_null() {
+    if !is_frame_cleanup {
         SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
+        return crate::JitNativeValueResult {
+            value: 0,
+            status: crate::JitCallStatus::RUNTIME_ERROR.0 as i64,
+        };
     }
-    // SAFETY: generated code owns this synchronous stack output slot.
-    unsafe { out.write(value) };
-    0
+    crate::JitNativeValueResult { value, status: 0 }
 }
 
 extern "C" fn forbidden_binary(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     _lhs: i64,
     _rhs: i64,
     _function: i64,
     _continuation: i64,
-    _out: *mut i64,
-) -> i32 {
+) -> crate::JitNativeValueResult {
     SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+    crate::JitNativeValueResult {
+        value: 0,
+        status: crate::JitCallStatus::RUNTIME_ERROR.0 as i64,
+    }
 }
 
-extern "C" fn forbidden_compare(_op: u32, _lhs: i64, _rhs: i64, _out: *mut i64) -> i32 {
+extern "C" fn forbidden_compare(
+    _runtime: *mut std::ffi::c_void,
+    _op: u32,
+    _lhs: i64,
+    _rhs: i64,
+) -> crate::JitNativeValueResult {
     SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+    crate::JitNativeValueResult {
+        value: 0,
+        status: crate::JitCallStatus::RUNTIME_ERROR.0 as i64,
+    }
 }
 
-extern "C" fn forbidden_truthy(_value: i64, _out: *mut i64) -> i32 {
+extern "C" fn forbidden_truthy(
+    _runtime: *mut std::ffi::c_void,
+    _value: i64,
+) -> crate::JitNativeValueResult {
     SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+    crate::JitNativeValueResult {
+        value: 0,
+        status: crate::JitCallStatus::RUNTIME_ERROR.0 as i64,
+    }
 }
 
-extern "C" fn forbidden_cast(_op: u32, _value: i64, _out: *mut i64) -> i32 {
+extern "C" fn forbidden_cast(
+    _runtime: *mut std::ffi::c_void,
+    _op: u32,
+    _value: i64,
+) -> crate::JitNativeValueResult {
     SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+    crate::JitNativeValueResult {
+        value: 0,
+        status: crate::JitCallStatus::RUNTIME_ERROR.0 as i64,
+    }
 }
 
-extern "C" fn forbidden_unary(_op: u32, _value: i64, _out: *mut i64) -> i32 {
+extern "C" fn forbidden_unary(
+    _runtime: *mut std::ffi::c_void,
+    _op: u32,
+    _value: i64,
+) -> crate::JitNativeValueResult {
     SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+    crate::JitNativeValueResult {
+        value: 0,
+        status: crate::JitCallStatus::RUNTIME_ERROR.0 as i64,
+    }
 }
 
-extern "C" fn forbidden_type_predicate(_op: u32, _value: i64, _out: *mut i64) -> i32 {
+extern "C" fn forbidden_type_predicate(
+    _runtime: *mut std::ffi::c_void,
+    _op: u32,
+    _value: i64,
+) -> crate::JitNativeValueResult {
     SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+    crate::JitNativeValueResult {
+        value: 0,
+        status: crate::JitCallStatus::RUNTIME_ERROR.0 as i64,
+    }
 }
 
 extern "C" fn forbidden_stable_length(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     _value: i64,
     _function: i64,
@@ -192,6 +250,7 @@ extern "C" fn forbidden_stable_length(
 }
 
 extern "C" fn forbidden_call_dispatch(
+    _runtime: *mut std::ffi::c_void,
     _context: u64,
     _frame: *mut crate::JitNativeCallFrame,
     _out: *mut crate::JitCallResult,
@@ -200,124 +259,182 @@ extern "C" fn forbidden_call_dispatch(
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
-#[allow(unsafe_code)]
-extern "C" fn passthrough_lifecycle(_op: u32, value: i64, out: *mut i64) -> i32 {
-    if out.is_null() {
-        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
+extern "C" fn forbidden_reference_bind(
+    _runtime: *mut std::ffi::c_void,
+    _op: u32,
+    _value: i64,
+    _key: i64,
+    _reserved: i64,
+) -> crate::JitNativeValueResult {
+    SSA_FORBIDDEN_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
+    crate::JitNativeValueResult {
+        value: 0,
+        status: crate::JitCallStatus::RUNTIME_ERROR.0 as i64,
     }
-    // SAFETY: generated code owns this synchronous stack output slot.
-    unsafe { out.write(value) };
-    0
 }
 
 #[allow(unsafe_code)]
+extern "C" fn return_first_call_argument(
+    _runtime: *mut std::ffi::c_void,
+    _context: u64,
+    frame: *mut crate::JitNativeCallFrame,
+    out: *mut crate::JitCallResult,
+) -> i32 {
+    assert!(!frame.is_null());
+    assert!(!out.is_null());
+    // SAFETY: generated code owns the frame, argument table, and result for
+    // the complete synchronous call.
+    let frame = unsafe { &*frame };
+    assert_eq!(frame.argument_count, 1);
+    let argument = unsafe { &*(frame.arguments as *const crate::JitNativeCallArgument) };
+    unsafe {
+        out.write(crate::JitCallResult {
+            status: crate::JitCallStatus::RETURN,
+            detail: 0,
+            value: argument.value,
+        });
+    }
+    crate::JitCallStatus::RETURN.0 as i32
+}
+
+extern "C" fn passthrough_lifecycle(
+    _runtime: *mut std::ffi::c_void,
+    _op: u32,
+    value: i64,
+) -> crate::JitNativeValueResult {
+    crate::JitNativeValueResult { value, status: 0 }
+}
+
 extern "C" fn passthrough_local_fetch(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     value: i64,
     _function: i64,
     _local: i64,
     _file: i64,
     _start: i64,
-    out: *mut i64,
-) -> i32 {
-    if out.is_null() {
-        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
-    }
-    // SAFETY: generated code owns this synchronous stack output slot.
-    unsafe { out.write(value) };
-    0
+) -> crate::JitNativeValueResult {
+    crate::JitNativeValueResult { value, status: 0 }
 }
 
-#[allow(unsafe_code)]
-extern "C" fn test_array_new(_op: u32, out: *mut i64) -> i32 {
-    if out.is_null() {
-        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
+extern "C" fn test_array_new(
+    _runtime: *mut std::ffi::c_void,
+    _op: u32,
+) -> crate::JitNativeValueResult {
+    crate::JitNativeValueResult {
+        value: crate::jit_encode_runtime_value(7),
+        status: 0,
     }
-    // SAFETY: generated code owns this synchronous stack output slot.
-    unsafe { out.write(crate::jit_encode_runtime_value(7)) };
-    0
 }
 
-#[allow(unsafe_code)]
 extern "C" fn test_array_insert(
+    _runtime: *mut std::ffi::c_void,
     append: u32,
     array: i64,
     _key: i64,
     _value: i64,
-    out: *mut i64,
-) -> i32 {
+) -> crate::JitNativeValueResult {
     let append = if append & 0x8000_0000 != 0 {
         append & 1
     } else {
         append
     };
-    if append != 1 || out.is_null() {
-        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
+    if append != 1 {
+        return crate::JitNativeValueResult {
+            value: 0,
+            status: crate::JitCallStatus::RUNTIME_ERROR.0 as i64,
+        };
     }
-    // SAFETY: generated code owns this synchronous stack output slot.
-    unsafe { out.write(array) };
-    0
+    crate::JitNativeValueResult {
+        value: array,
+        status: 0,
+    }
 }
 
 extern "C" fn test_local_array_insert(
+    _runtime: *mut std::ffi::c_void,
     append: u32,
     array: i64,
     key: i64,
     value: i64,
-    out: *mut i64,
-) -> i32 {
+) -> crate::JitNativeValueResult {
     LOCAL_ARRAY_INSERT_CALLS.fetch_add(1, Ordering::SeqCst);
-    test_array_insert(append, array, key, value, out)
+    test_array_insert(_runtime, append, array, key, value)
 }
 
-#[allow(unsafe_code)]
 extern "C" fn test_array_fetch_typed_string(
+    _runtime: *mut std::ffi::c_void,
     _quiet: u32,
     _array: i64,
     _key: i64,
-    out: *mut i64,
-) -> i32 {
-    if out.is_null() {
-        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
+) -> crate::JitNativeValueResult {
+    crate::JitNativeValueResult {
+        value: crate::jit_encode_typed_runtime_value(7, crate::JIT_VALUE_RUNTIME_STRING_TAG),
+        status: 0,
     }
-    let value = crate::jit_encode_typed_runtime_value(7, crate::JIT_VALUE_RUNTIME_STRING_TAG);
-    // SAFETY: generated code owns this synchronous stack output slot.
-    unsafe { out.write(value) };
-    0
 }
 
-#[allow(unsafe_code)]
+extern "C" fn forbidden_cached_array_fetch(
+    _runtime: *mut std::ffi::c_void,
+    _quiet: u32,
+    _array: i64,
+    _key: i64,
+) -> crate::JitNativeValueResult {
+    ARRAY_FETCH_FALLBACK_CALLS.fetch_add(1, Ordering::SeqCst);
+    crate::JitNativeValueResult {
+        value: crate::jit_encode_constant(u32::MAX),
+        status: crate::JitCallStatus::RUNTIME_ERROR.0 as i64,
+    }
+}
+
+extern "C" fn forbidden_foreach_next(
+    _runtime: *mut std::ffi::c_void,
+    _iterator: i64,
+    _key_out: *mut i64,
+    _value_out: *mut i64,
+    _has_out: *mut i64,
+) -> i32 {
+    FOREACH_NEXT_FALLBACK_CALLS.fetch_add(1, Ordering::SeqCst);
+    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+}
+
 extern "C" fn test_array_key_exists_fast(
+    _runtime: *mut std::ffi::c_void,
     operation: u32,
     array: i64,
     key: i64,
-    out: *mut i64,
-) -> i32 {
+) -> crate::JitNativeValueResult {
     if operation != 2
         || array != crate::jit_encode_typed_runtime_value(3, crate::JIT_VALUE_RUNTIME_ARRAY_TAG)
         || key != 7
-        || out.is_null()
     {
-        return crate::JitCallStatus::ABI_MISMATCH.0 as i32;
+        return crate::JitNativeValueResult {
+            value: crate::jit_encode_constant(u32::MAX),
+            status: crate::JitCallStatus::ABI_MISMATCH.0 as i64,
+        };
     }
-    // SAFETY: generated code owns this synchronous stack output slot.
-    unsafe { out.write(crate::jit_encode_constant(crate::JIT_VALUE_TRUE)) };
-    0
+    crate::JitNativeValueResult {
+        value: crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
+        status: 0,
+    }
 }
 
-#[allow(unsafe_code)]
 extern "C" fn test_string_predicate_fast(
+    _runtime: *mut std::ffi::c_void,
     operation: u32,
     _haystack: i64,
     _needle: i64,
-    out: *mut i64,
-) -> i32 {
-    if operation & 0xff != 1 || out.is_null() {
-        return crate::JitCallStatus::ABI_MISMATCH.0 as i32;
+) -> crate::JitNativeValueResult {
+    if operation & 0xff != 1 {
+        return crate::JitNativeValueResult {
+            value: 0,
+            status: crate::JitCallStatus::ABI_MISMATCH.0 as i64,
+        };
     }
-    // SAFETY: generated code owns this synchronous stack output slot.
-    unsafe { out.write(crate::jit_encode_constant(crate::JIT_VALUE_TRUE)) };
-    0
+    crate::JitNativeValueResult {
+        value: crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
+        status: 0,
+    }
 }
 
 #[test]
@@ -333,6 +450,7 @@ fn lifecycle_operation_carries_function_and_continuation_context() {
 }
 
 extern "C" fn test_native_dynamic_code(
+    _runtime: *mut std::ffi::c_void,
     _vm_context: u64,
     request: *mut crate::JitNativeDynamicCodeRequest,
     out: *mut crate::JitCallResult,
@@ -680,16 +798,18 @@ fn optimizing_reference_local_reads_published_scalar_view_without_helper() {
         state: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED,
         encoded: 73,
     };
-    let mut views = vec![crate::JitNativeValueView::default(); 8];
-    views[7] = crate::JitNativeValueView {
+    let mut slots = vec![crate::JitNativeValueSlot::default(); 8];
+    slots[7] = crate::JitNativeValueSlot {
+        refcount: 1,
         kind: crate::JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR,
         flags: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION,
-        length: std::ptr::from_mut(&mut reference_view) as usize as u64,
+        payload: std::ptr::from_mut(&mut reference_view) as usize as u64,
+        ..crate::JitNativeValueSlot::default()
     };
     let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        value_view_capacity: views.len() as u32,
-        value_views: views.as_mut_ptr() as usize as u64,
+        value_slot_capacity: slots.len() as u32,
+        value_slots: slots.as_mut_ptr() as usize as u64,
         ..crate::JitNativeRuntimeView::default()
     });
     let reference =
@@ -1193,6 +1313,7 @@ fn native_unwind_resumes_compiled_catch_without_interpreter_frame() {
 #[test]
 fn native_unwind_catches_throw_from_direct_compiled_callee() {
     extern "C" fn throwing_trampoline(
+        _runtime: *mut std::ffi::c_void,
         _vm_context: u64,
         frame: *mut crate::JitNativeCallFrame,
         out: *mut crate::JitCallResult,
@@ -1894,6 +2015,7 @@ fn cranelift_backend_executes_multiblock_region_ir() {
 #[test]
 fn function_scoped_compile_routes_same_unit_callee_through_trampoline() {
     extern "C" fn trampoline(
+        _runtime: *mut std::ffi::c_void,
         _vm_context: u64,
         frame: *mut crate::JitNativeCallFrame,
         out: *mut crate::JitCallResult,
@@ -1962,6 +2084,73 @@ fn function_scoped_compile_routes_same_unit_callee_through_trampoline() {
 }
 
 #[test]
+fn published_same_unit_entry_bypasses_the_warm_resolver() {
+    extern "C" fn forbidden_resolver(
+        _runtime: *mut std::ffi::c_void,
+        _vm_context: u64,
+        _function: u64,
+        _out: *mut usize,
+    ) -> i32 {
+        panic!("published same-unit entry unexpectedly entered the resolver")
+    }
+
+    #[allow(unsafe_code)]
+    extern "C" fn published_callee(
+        _runtime: *mut std::ffi::c_void,
+        _arguments: *const i64,
+        out: *mut i64,
+        _deopt: *mut crate::JitDeoptState,
+        _resume_id: i32,
+        _resume_state: *mut std::ffi::c_void,
+    ) -> i32 {
+        // SAFETY: the generated caller owns this result slot synchronously.
+        unsafe { out.write(42) };
+        crate::JitCallStatus::RETURN.0 as i32
+    }
+
+    let (unit, function, callee) = scalar_direct_call_fixture();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.region.cached-direct-call"),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_call_dispatch: forbidden_call_dispatch as *const () as usize,
+            native_function_resolve: forbidden_resolver as *const () as usize,
+            native_value_lifecycle: passthrough_lifecycle as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("cached direct-call region");
+
+    let unit_identity = u64::from(unit.id.raw());
+    let mut entries = vec![crate::JitNativeFunctionEntryCacheRecord::default(); 4_096];
+    let slot = (callee.index() ^ (unit_identity as usize).wrapping_mul(31)) & 4_095;
+    entries[slot] = crate::JitNativeFunctionEntryCacheRecord {
+        unit_identity,
+        signature_epoch: 9,
+        address: published_callee as *const () as usize as u64,
+        function_id: callee.raw(),
+        reserved: 0,
+    };
+    let mut signature_epoch = 9_u64;
+    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
+        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
+        function_entry_cache: entries.as_mut_ptr() as usize as u64,
+        function_entry_cache_mask: 4_095,
+        signature_epoch: std::ptr::from_mut(&mut signature_epoch) as usize as u64,
+        ..crate::JitNativeRuntimeView::default()
+    });
+    assert_eq!(
+        handle
+            .invoke_i64(&[41], JIT_RUNTIME_ABI_HASH)
+            .expect("published direct callee execution"),
+        42
+    );
+}
+
+#[test]
 fn cranelift_packed_region_abi_supports_more_than_sixteen_arguments() {
     let (unit, function) = wide_parameter_fixture();
     let mut backend = CraneliftNativeCompiler;
@@ -1987,6 +2176,7 @@ fn cranelift_packed_region_abi_supports_more_than_sixteen_arguments() {
 #[test]
 fn cranelift_dynamic_call_uses_typed_native_trampoline() {
     extern "C" fn trampoline(
+        _runtime: *mut std::ffi::c_void,
         _vm_context: u64,
         frame: *mut crate::JitNativeCallFrame,
         out: *mut crate::JitCallResult,
@@ -2029,6 +2219,44 @@ fn cranelift_dynamic_call_uses_typed_native_trampoline() {
         panic!("dynamic call unexpectedly returned");
     };
     assert_eq!(status, crate::JitCallStatus::COMPILE_REQUIRED.0 as i32);
+}
+
+#[test]
+fn published_external_by_value_signature_skips_reference_probe() {
+    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
+    let (unit, function) = external_lvalue_call_fixture();
+    let mut backend = CraneliftNativeCompiler;
+    let request = JitCompileRequest::new("cl.region.external-by-value")
+        .with_external_function_signatures(vec![crate::JitExternalFunctionSignature {
+            name: "deployment_function".to_owned(),
+            params: vec![crate::JitExternalParameterSignature {
+                name: "value".to_owned(),
+                by_ref: false,
+                variadic: false,
+            }],
+        }]);
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &request,
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_call_dispatch: return_first_call_argument as *const () as usize,
+            native_reference_bind: forbidden_reference_bind as *const () as usize,
+            native_local_fetch: passthrough_local_fetch as *const () as usize,
+            native_value_lifecycle: passthrough_lifecycle as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    assert_eq!(
+        outcome
+            .handle
+            .expect("external by-value call")
+            .invoke_i64(&[41], JIT_RUNTIME_ABI_HASH)
+            .expect("published by-value call executes"),
+        41
+    );
+    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -2945,6 +3173,46 @@ fn scalar_dynamic_call_fixture() -> (php_ir::IrUnit, FunctionId) {
     (builder.finish(), function)
 }
 
+fn external_lvalue_call_fixture() -> (php_ir::IrUnit, FunctionId) {
+    let mut builder = IrBuilder::new(UnitId::new(4_224));
+    let file = builder.add_file("external-lvalue-call.php");
+    let span = IrSpan::new(file, 0, 1);
+    let function =
+        builder.start_function("external_lvalue_wrapper", FunctionFlags::default(), span);
+    builder.set_entry(function);
+    let local = untyped_param(&mut builder, function, "value");
+    let block = builder.append_block(function);
+    let loaded = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::LoadLocal { dst: loaded, local },
+        span,
+    );
+    let result = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: result,
+            name: "deployment_function".to_owned(),
+            args: vec![IrCallArg {
+                name: None,
+                value: Operand::Register(loaded),
+                unpack: false,
+                value_kind: IrCallArgValueKind::Direct,
+                by_ref_local: Some(local),
+                by_ref_dim: None,
+                by_ref_property: None,
+                by_ref_property_dim: None,
+            }],
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+    (builder.finish(), function)
+}
+
 fn scalar_native_include_fixture() -> (php_ir::IrUnit, FunctionId) {
     let mut builder = IrBuilder::new(UnitId::new(0));
     let file = builder.add_file("native-include.php");
@@ -3267,6 +3535,56 @@ fn optimizing_unknown_scalar_truthiness_uses_guarded_native_lanes() {
             expected
         );
     }
+    let mut slots = vec![crate::JitNativeValueSlot::default(); 11];
+    slots[7] = crate::JitNativeValueSlot {
+        refcount: 1,
+        kind: crate::JIT_NATIVE_VALUE_VIEW_ARRAY,
+        flags: crate::JIT_NATIVE_ARRAY_VIEW_ABI_VERSION,
+        payload: 0,
+        ..crate::JitNativeValueSlot::default()
+    };
+    slots[8] = crate::JitNativeValueSlot {
+        refcount: 1,
+        kind: crate::JIT_NATIVE_VALUE_VIEW_STRING,
+        flags: crate::JIT_NATIVE_STRING_VIEW_ABI_VERSION,
+        reserved: crate::JIT_NATIVE_STRING_VALUE_ZERO,
+        payload: 1,
+        ..crate::JitNativeValueSlot::default()
+    };
+    slots[9] = crate::JitNativeValueSlot {
+        refcount: 1,
+        kind: crate::JIT_NATIVE_VALUE_VIEW_STRING,
+        flags: crate::JIT_NATIVE_STRING_VIEW_ABI_VERSION,
+        payload: 4,
+        ..crate::JitNativeValueSlot::default()
+    };
+    slots[10] = crate::JitNativeValueSlot {
+        refcount: 1,
+        kind: crate::JIT_NATIVE_VALUE_VIEW_ARRAY,
+        flags: crate::JIT_NATIVE_ARRAY_VIEW_ABI_VERSION,
+        payload: 3,
+        ..crate::JitNativeValueSlot::default()
+    };
+    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
+        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
+        value_slot_capacity: slots.len() as u32,
+        value_slots: slots.as_mut_ptr() as usize as u64,
+        ..crate::JitNativeRuntimeView::default()
+    });
+    for (index, tag, expected) in [
+        (7, crate::JIT_VALUE_RUNTIME_ARRAY_TAG, 0),
+        (8, crate::JIT_VALUE_RUNTIME_STRING_TAG, 0),
+        (9, crate::JIT_VALUE_RUNTIME_STRING_TAG, 1),
+        (10, crate::JIT_VALUE_RUNTIME_ARRAY_TAG, 1),
+    ] {
+        let value = crate::jit_encode_typed_runtime_value(index, tag);
+        assert_eq!(
+            handle
+                .invoke_i64(&[value], JIT_RUNTIME_ABI_HASH)
+                .expect("guarded runtime truthiness execution"),
+            expected
+        );
+    }
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 
@@ -3380,6 +3698,162 @@ fn optimizing_isset_dim_uses_typed_non_null_result_without_compare_helper() {
         crate::jit_encode_constant(crate::JIT_VALUE_TRUE)
     );
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn array_fetch_reads_published_direct_mapped_entry_without_helper() {
+    ARRAY_FETCH_FALLBACK_CALLS.store(0, Ordering::SeqCst);
+    let mut builder = IrBuilder::new(UnitId::new(4_222));
+    let file = builder.add_file("native-array-cache.php");
+    let span = IrSpan::new(file, 0, 1);
+    let function = builder.start_function("native_array_cache", FunctionFlags::default(), span);
+    let array = untyped_param(&mut builder, function, "array");
+    let block = builder.append_block(function);
+    let key = builder.intern_constant(IrConstant::Int(7));
+    let fetched = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::FetchDim {
+            dst: fetched,
+            array: Operand::Local(array),
+            key: Operand::Constant(key),
+            quiet: false,
+            mode: php_ir::instruction::DimFetchMode::Read,
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(fetched)), span);
+    let unit = builder.finish();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.native-array-cache").with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_array_fetch: forbidden_cached_array_fetch as *const () as usize,
+            native_local_fetch: forbidden_local_fetch as *const () as usize,
+            native_value_lifecycle: passthrough_lifecycle as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("native array cache handle");
+
+    let encoded_key = 7_i64;
+    let slot = ((encoded_key as u64 ^ ((encoded_key as u64) >> 32)) as usize) & 15;
+    let mut entries = [crate::JitNativeArrayCacheEntry::default(); 16];
+    entries[slot] = crate::JitNativeArrayCacheEntry {
+        key: encoded_key,
+        value: 73,
+        unit_identity: 0,
+    };
+    let mut slots = vec![crate::JitNativeValueSlot::default(); 4];
+    slots[3] = crate::JitNativeValueSlot {
+        refcount: 1,
+        kind: crate::JIT_NATIVE_VALUE_VIEW_ARRAY,
+        flags: crate::JIT_NATIVE_ARRAY_VIEW_ABI_VERSION,
+        payload: 1,
+        aux: entries.as_mut_ptr() as usize as u64,
+        ..crate::JitNativeValueSlot::default()
+    };
+    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
+        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
+        value_slot_capacity: slots.len() as u32,
+        value_slots: slots.as_mut_ptr() as usize as u64,
+        ..crate::JitNativeRuntimeView::default()
+    });
+    let array = crate::jit_encode_typed_runtime_value(3, crate::JIT_VALUE_RUNTIME_ARRAY_TAG);
+    assert_eq!(
+        handle
+            .invoke_i64(&[array], JIT_RUNTIME_ABI_HASH)
+            .expect("direct mapped array fetch"),
+        73
+    );
+    assert_eq!(ARRAY_FETCH_FALLBACK_CALLS.load(Ordering::SeqCst), 0);
+
+    std::hint::black_box(&entries);
+}
+
+#[test]
+fn foreach_next_advances_published_snapshot_without_helper() {
+    FOREACH_NEXT_FALLBACK_CALLS.store(0, Ordering::SeqCst);
+    let mut builder = IrBuilder::new(UnitId::new(4_223));
+    let file = builder.add_file("native-foreach-view.php");
+    let span = IrSpan::new(file, 0, 1);
+    let function = builder.start_function("native_foreach_view", FunctionFlags::default(), span);
+    let iterator_local = untyped_param(&mut builder, function, "iterator");
+    let block = builder.append_block(function);
+    let iterator = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::LoadLocal {
+            dst: iterator,
+            local: iterator_local,
+        },
+        span,
+    );
+    let has_value = builder.alloc_register(function);
+    let key = builder.alloc_register(function);
+    let value = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::ForeachNext {
+            has_value,
+            iterator,
+            key: Some(key),
+            value,
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(value)), span);
+    let unit = builder.finish();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.native-foreach-view").with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_foreach_next: forbidden_foreach_next as *const () as usize,
+            native_local_fetch: passthrough_local_fetch as *const () as usize,
+            native_value_lifecycle: passthrough_lifecycle as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("native foreach view handle");
+
+    let mut entries = [crate::JitNativeForeachEntry { key: 7, value: 73 }];
+    let mut foreach_view = crate::JitNativeForeachView {
+        cursor: 0,
+        length: entries.len() as u64,
+        entries: entries.as_mut_ptr() as usize as u64,
+    };
+    let mut slots = vec![crate::JitNativeValueSlot::default(); 4];
+    slots[3] = crate::JitNativeValueSlot {
+        refcount: 1,
+        kind: crate::JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT,
+        flags: crate::JIT_NATIVE_FOREACH_VIEW_ABI_VERSION,
+        payload: std::ptr::from_mut(&mut foreach_view) as usize as u64,
+        ..crate::JitNativeValueSlot::default()
+    };
+    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
+        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
+        value_slot_capacity: slots.len() as u32,
+        value_slots: slots.as_mut_ptr() as usize as u64,
+        ..crate::JitNativeRuntimeView::default()
+    });
+    let iterator = crate::jit_encode_typed_runtime_value(3, crate::JIT_VALUE_RUNTIME_ITERATOR_TAG);
+    assert_eq!(
+        handle
+            .invoke_i64(&[iterator], JIT_RUNTIME_ABI_HASH)
+            .expect("direct foreach execution"),
+        73
+    );
+    assert_eq!(foreach_view.cursor, 1);
+    assert_eq!(FOREACH_NEXT_FALLBACK_CALLS.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -3619,16 +4093,18 @@ fn optimizing_empty_local_uses_guarded_native_truthiness() {
             expected
         );
     }
-    let mut views = vec![crate::JitNativeValueView::default(); 8];
-    views[7] = crate::JitNativeValueView {
+    let mut slots = vec![crate::JitNativeValueSlot::default(); 8];
+    slots[7] = crate::JitNativeValueSlot {
+        refcount: 1,
         kind: crate::JIT_NATIVE_VALUE_VIEW_ARRAY,
-        flags: 0,
-        length: 0,
+        flags: crate::JIT_NATIVE_ARRAY_VIEW_ABI_VERSION,
+        payload: 0,
+        ..crate::JitNativeValueSlot::default()
     };
     let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        value_view_capacity: views.len() as u32,
-        value_views: views.as_mut_ptr() as usize as u64,
+        value_slot_capacity: slots.len() as u32,
+        value_slots: slots.as_mut_ptr() as usize as u64,
         ..crate::JitNativeRuntimeView::default()
     });
     let array = crate::jit_encode_typed_runtime_value(7, crate::JIT_VALUE_RUNTIME_ARRAY_TAG);
@@ -3638,7 +4114,8 @@ fn optimizing_empty_local_uses_guarded_native_truthiness() {
             .expect("empty array execution"),
         crate::jit_encode_constant(crate::JIT_VALUE_TRUE)
     );
-    views[7].length = 1;
+    slots[7].payload = 1;
+    assert_eq!(slots[7].payload, 1);
     assert_eq!(
         handle
             .invoke_i64(&[array], JIT_RUNTIME_ABI_HASH)
@@ -3783,16 +4260,18 @@ fn optimizing_builtin_length_uses_versioned_value_view() {
     });
     assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
     let handle = outcome.handle.expect("optimizing stable-length handle");
-    let mut views = vec![crate::JitNativeValueView::default(); 8];
-    views[7] = crate::JitNativeValueView {
+    let mut slots = vec![crate::JitNativeValueSlot::default(); 8];
+    slots[7] = crate::JitNativeValueSlot {
+        refcount: 1,
         kind: crate::JIT_NATIVE_VALUE_VIEW_STRING,
-        flags: 0,
-        length: 17,
+        flags: crate::JIT_NATIVE_STRING_VIEW_ABI_VERSION,
+        payload: 17,
+        ..crate::JitNativeValueSlot::default()
     };
     let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        value_view_capacity: views.len() as u32,
-        value_views: views.as_mut_ptr() as usize as u64,
+        value_slot_capacity: slots.len() as u32,
+        value_slots: slots.as_mut_ptr() as usize as u64,
         ..crate::JitNativeRuntimeView::default()
     });
     let input = crate::jit_encode_typed_runtime_value(7, crate::JIT_VALUE_RUNTIME_STRING_TAG);

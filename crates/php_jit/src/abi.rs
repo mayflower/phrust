@@ -11,41 +11,107 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use php_ir::{FunctionId, LocalId, RegId};
 
 /// Version for the C-compatible runtime ABI records.
-pub const JIT_RUNTIME_ABI_VERSION: u32 = 25;
+pub const JIT_RUNTIME_ABI_VERSION: u32 = 35;
 
 /// Stable ABI fingerprint for Cranelift ABI.
 ///
 /// This is updated only when a `repr(C)` boundary type changes layout or tag
 /// meaning. It is intentionally independent from Rust type names.
-pub const JIT_RUNTIME_ABI_HASH: u64 = 0x0dc1_a825_0000_0030;
+pub const JIT_RUNTIME_ABI_HASH: u64 = 0x0dc1_a835_0000_003e;
 
 /// No stable length is published for this runtime value slot.
 pub const JIT_NATIVE_VALUE_VIEW_NONE: u32 = 0;
 /// Stable byte-length descriptor for one request-owned PHP string.
 pub const JIT_NATIVE_VALUE_VIEW_STRING: u32 = 1;
+/// Layout/meaning version for the string payload in [`JitNativeValueSlot`].
+pub const JIT_NATIVE_STRING_VIEW_ABI_VERSION: u32 = 1;
+/// The published string payload contains the PHP-false string `"0"`.
+pub const JIT_NATIVE_STRING_VALUE_ZERO: u32 = 1;
 /// Stable element-count descriptor for one request-owned PHP array.
 pub const JIT_NATIVE_VALUE_VIEW_ARRAY: u32 = 2;
 /// Stable scalar-only descriptor for one request-owned PHP reference cell.
 pub const JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR: u32 = 3;
+/// Stable by-value array-iteration snapshot owned by the request arena.
+pub const JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT: u32 = 4;
+/// Layout/meaning version for the array payload in [`JitNativeValueSlot`].
+pub const JIT_NATIVE_ARRAY_VIEW_ABI_VERSION: u32 = 2;
+/// Entry marker used by a lazily populated native packed-array cache.
+pub const JIT_NATIVE_ARRAY_CACHE_MISS: i64 = 0x7ff3_0000_0000_0000_u64 as i64;
 /// Layout/meaning version for [`JitNativeReferenceScalarView`].
 pub const JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION: u32 = 1;
+/// Layout/meaning version for [`JitNativeForeachView`].
+pub const JIT_NATIVE_FOREACH_VIEW_ABI_VERSION: u32 = 1;
+/// Fixed entry count for the request-owned trusted global-reference cache.
+pub const JIT_NATIVE_GLOBAL_REFERENCE_CACHE_SIZE: usize = 4_096;
 /// The reference view has no cached immediate value.
 pub const JIT_NATIVE_REFERENCE_SCALAR_VIEW_EMPTY: u32 = 0;
 /// The reference view contains a cached immediate value.
 pub const JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED: u32 = 1;
 
-/// Versioned descriptor generated code may inspect without depending on the
-/// layout of `Value`, `PhpString`, `PhpArray`, or their Rust containers.
+/// Stable request-owned value slot inspected by generated code.
+///
+/// The PHP value itself remains opaque to Cranelift.  Refcount, type view and
+/// the two type-specific payload words deliberately live in one cache-local
+/// record so hot native operations do not chase three parallel Rust vectors.
+/// For arrays `payload` is the current length and `aux` points at the sparse
+/// encoded-value cache.  For strings `payload` is the byte length.  Reference
+/// and foreach views place their descriptor address in `payload`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct JitNativeValueView {
+pub struct JitNativeValueSlot {
+    pub refcount: u32,
     pub kind: u32,
     pub flags: u32,
+    pub reserved: u32,
+    pub payload: u64,
+    pub aux: u64,
+}
+
+/// One direct-mapped native array lookup entry. The raw encoded key is pinned
+/// together with the encoded result until mutation invalidates the view.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JitNativeArrayCacheEntry {
+    pub key: i64,
+    pub value: i64,
+    /// Non-zero only for a unit-local constant operand. This prevents equal
+    /// constant indexes from unrelated include units from aliasing.
+    pub unit_identity: u64,
+}
+
+impl Default for JitNativeArrayCacheEntry {
+    fn default() -> Self {
+        Self {
+            key: JIT_NATIVE_ARRAY_CACHE_MISS,
+            value: 0,
+            unit_identity: 0,
+        }
+    }
+}
+
+/// One immutable, already-encoded PHP key/value pair. The owning iterator
+/// retains both handles until cleanup; generated code retains only values it
+/// publishes into the current native frame.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitNativeForeachEntry {
+    pub key: i64,
+    pub value: i64,
+}
+
+/// Request-owned cursor over an immutable by-value array snapshot. This
+/// descriptor is deliberately independent from `PhpArray` and Rust iterator
+/// layouts so generated code can advance it directly.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitNativeForeachView {
+    pub cursor: u64,
     pub length: u64,
+    pub entries: u64,
 }
 
 /// Layout contract for the scalar-only reference view owned by `php_runtime`.
-/// Generated code reaches this record through [`JitNativeValueView::length`]
+/// Generated code reaches this record through [`JitNativeValueSlot::payload`]
 /// only after validating both ABI versions and the reference descriptor kind.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -55,26 +121,105 @@ pub struct JitNativeReferenceScalarView {
     pub encoded: i64,
 }
 
-/// Versioned request-owned view used by generated code for checked native
-/// value-table refcount updates. The pointed-to `u32` cells are an ABI array,
-/// not a Rust container layout, and remain stable for the activation lifetime.
+/// Versioned request-owned view used by generated code to reach the compact
+/// native value plane. The slots are an ABI array, not a Rust container
+/// layout, and remain stable for the activation lifetime.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct JitNativeRuntimeView {
     pub abi_version: u32,
-    pub refcount_capacity: u32,
-    pub refcounts: u64,
-    pub value_view_capacity: u32,
-    pub value_view_reserved: u32,
-    pub value_views: u64,
+    pub value_slot_capacity: u32,
+    pub value_slots: u64,
     /// Request-local loop-header counter. Generated code performs a deadline
     /// poll on the first header visit and at a fixed bounded cadence.
     pub poll_counter: u64,
+    /// Direct-mapped request cache of already-published same-unit entries.
+    pub function_entry_cache: u64,
+    pub function_entry_cache_mask: u32,
+    pub function_entry_cache_reserved: u32,
+    /// Pointer to the live signature epoch used to invalidate cached entries.
+    pub signature_epoch: u64,
+    /// Direct-mapped request cache of references produced by immutable
+    /// `global $name` callsites. The cache owns one encoded handle per live
+    /// record; generated code retains that handle without entering Rust.
+    pub global_reference_cache: u64,
+    pub global_reference_cache_mask: u32,
+    pub global_reference_cache_reserved: u32,
+}
+
+/// Register-returned result for trusted native value helpers.
+///
+/// Both supported native targets return this two-word C record in integer
+/// result registers.  This avoids constructing an output pointer in generated
+/// code for the overwhelmingly common helper shape.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitNativeValueResult {
+    pub value: i64,
+    pub status: i64,
+}
+
+/// One request-owned warm function-entry cache record. Generated code reads
+/// this C layout directly and falls back to the compile-on-demand resolver on
+/// any mismatch.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitNativeFunctionEntryCacheRecord {
+    pub unit_identity: u64,
+    pub signature_epoch: u64,
+    pub address: u64,
+    pub function_id: u32,
+    pub reserved: u32,
+}
+
+/// One request-owned, trusted `global $name` callsite result.
+///
+/// The complete numeric callsite identity is compared before use. This makes
+/// cache collisions ordinary misses and avoids putting source names or Rust
+/// map lookups on the generated warm path.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitNativeGlobalReferenceCacheRecord {
+    pub unit_identity: u64,
+    pub encoded: i64,
+    /// Stable request-local identity of the PHP reference cell. The runtime
+    /// uses it to invalidate only callsites for a cell that is actually
+    /// unbound; unrelated global writes leave the warm cache intact.
+    pub reference_identity: u64,
+    pub function_id: u32,
+    pub continuation_id: u32,
+    pub valid: u32,
+    pub reserved: u32,
+}
+
+/// Select the direct-mapped slot for one immutable numeric callsite.
+///
+/// Both the runtime publisher and Cranelift lowering use this exact function;
+/// generated code therefore embeds the final byte offset and performs no
+/// runtime hashing.
+#[must_use]
+pub const fn jit_native_global_reference_cache_index(
+    unit_identity: u64,
+    function_id: u32,
+    continuation_id: u32,
+    mask: u32,
+) -> usize {
+    let mut mixed = unit_identity
+        ^ (function_id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (continuation_id as u64)
+            .rotate_left(29)
+            .wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed ^= mixed >> 30;
+    mixed = mixed.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed ^= mixed >> 27;
+    mixed = mixed.wrapping_mul(0x94d0_49bb_1331_11eb);
+    mixed ^= mixed >> 31;
+    (mixed as usize) & (mask as usize)
 }
 
 thread_local! {
     static ACTIVE_NATIVE_RUNTIME_VIEW: Cell<JitNativeRuntimeView> =
-        const { Cell::new(JitNativeRuntimeView { abi_version: 0, refcount_capacity: 0, refcounts: 0, value_view_capacity: 0, value_view_reserved: 0, value_views: 0, poll_counter: 0 }) };
+        const { Cell::new(JitNativeRuntimeView { abi_version: 0, value_slot_capacity: 0, value_slots: 0, poll_counter: 0, function_entry_cache: 0, function_entry_cache_mask: 0, function_entry_cache_reserved: 0, signature_epoch: 0, global_reference_cache: 0, global_reference_cache_mask: 0, global_reference_cache_reserved: 0 }) };
 }
 
 /// Restores the preceding request view when native execution leaves the
@@ -1457,19 +1602,35 @@ mod tests {
     use php_ir::{FunctionId, LocalId};
 
     use super::{
-        JIT_RUNTIME_ABI_HASH, JIT_RUNTIME_ABI_VERSION, JitCExit, JitCExitTag, JitCFrameView,
-        JitCValue, JitCValueTag, JitCallStatus, JitDeoptState, JitFrameHandle, JitFrameView,
-        JitNativeArgFlags, JitNativeCallArgument, JitNativeCallFrame, JitNativeCallKind,
-        JitNativeControlRecord, JitNativeDynamicCodeKind, JitNativeDynamicCodeRequest,
-        JitNativeExceptionHandler, JitNativeFiberState, JitNativeFrameHeader,
-        JitNativeGeneratorState, JitNativeIndirectionEntry, JitNativePcMetadata,
-        JitNativeRootEntry, JitNativeSuspensionGenerationPolicy, JitOpaqueHandle,
-        JitOpaqueValueKind, JitSideExit, JitVmContextHandle, SideExitReason,
+        JIT_NATIVE_GLOBAL_REFERENCE_CACHE_SIZE, JIT_RUNTIME_ABI_HASH, JIT_RUNTIME_ABI_VERSION,
+        JitCExit, JitCExitTag, JitCFrameView, JitCValue, JitCValueTag, JitCallStatus,
+        JitDeoptState, JitFrameHandle, JitFrameView, JitNativeArgFlags, JitNativeCallArgument,
+        JitNativeCallFrame, JitNativeCallKind, JitNativeControlRecord, JitNativeDynamicCodeKind,
+        JitNativeDynamicCodeRequest, JitNativeExceptionHandler, JitNativeFiberState,
+        JitNativeFrameHeader, JitNativeGeneratorState, JitNativeIndirectionEntry,
+        JitNativePcMetadata, JitNativeRootEntry, JitNativeSuspensionGenerationPolicy,
+        JitNativeValueSlot, JitOpaqueHandle, JitOpaqueValueKind, JitSideExit, JitVmContextHandle,
+        SideExitReason, jit_native_global_reference_cache_index,
     };
 
     #[test]
+    fn global_reference_cache_hash_distributes_continuations() {
+        let slots = (0..1_024_u32)
+            .map(|continuation| {
+                jit_native_global_reference_cache_index(
+                    0x1234_5678_9abc_def0,
+                    37,
+                    continuation,
+                    (JIT_NATIVE_GLOBAL_REFERENCE_CACHE_SIZE - 1) as u32,
+                )
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert!(slots.len() > 850, "only {} distinct slots", slots.len());
+    }
+
+    #[test]
     fn c_abi_layout_is_stable() {
-        assert_eq!(JIT_RUNTIME_ABI_VERSION, 25);
+        assert_eq!(JIT_RUNTIME_ABI_VERSION, 35);
         assert_ne!(JIT_RUNTIME_ABI_HASH, 0);
         assert_eq!(size_of::<JitOpaqueHandle>(), 8);
         assert_eq!(size_of::<JitCValueTag>(), 4);
@@ -1490,6 +1651,11 @@ mod tests {
         assert_eq!(align_of::<JitNativeRootEntry>(), 4);
         assert_eq!(align_of::<JitNativeGeneratorState>(), 8);
         assert_eq!(align_of::<JitNativeFiberState>(), 8);
+        assert_eq!(size_of::<JitNativeValueSlot>(), 32);
+        assert_eq!(align_of::<JitNativeValueSlot>(), 8);
+        assert_eq!(std::mem::offset_of!(JitNativeValueSlot, refcount), 0);
+        assert_eq!(std::mem::offset_of!(JitNativeValueSlot, payload), 16);
+        assert_eq!(std::mem::offset_of!(JitNativeValueSlot, aux), 24);
         assert_eq!(
             JitNativeCallFrame::default().struct_size as usize,
             size_of::<JitNativeCallFrame>()

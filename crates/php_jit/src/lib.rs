@@ -25,23 +25,29 @@ pub mod region_ir;
 
 pub use abi::{
     JIT_DEOPT_LOCAL_MASK_WORDS, JIT_DEOPT_MAX_REGISTERS, JIT_DEOPT_MAX_SLOTS,
+    JIT_NATIVE_ARRAY_CACHE_MISS, JIT_NATIVE_ARRAY_VIEW_ABI_VERSION,
+    JIT_NATIVE_FOREACH_VIEW_ABI_VERSION, JIT_NATIVE_GLOBAL_REFERENCE_CACHE_SIZE,
     JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION, JIT_NATIVE_REFERENCE_SCALAR_VIEW_EMPTY,
-    JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED, JIT_NATIVE_VALUE_VIEW_ARRAY,
-    JIT_NATIVE_VALUE_VIEW_NONE, JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR,
-    JIT_NATIVE_VALUE_VIEW_STRING, JIT_RUNTIME_ABI_HASH, JIT_RUNTIME_ABI_VERSION, JitAbiSlot,
-    JitAbiValue, JitBailout, JitBailoutKind, JitCExit, JitCExitTag, JitCFrameView, JitCValue,
-    JitCValueTag, JitCallResult, JitCallStatus, JitDeoptState, JitExceptionMarker, JitFrameHandle,
-    JitFrameView, JitNativeArgFlags, JitNativeCallArgument, JitNativeCallFrame, JitNativeCallKind,
+    JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED, JIT_NATIVE_STRING_VALUE_ZERO,
+    JIT_NATIVE_STRING_VIEW_ABI_VERSION, JIT_NATIVE_VALUE_VIEW_ARRAY,
+    JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT, JIT_NATIVE_VALUE_VIEW_NONE,
+    JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR, JIT_NATIVE_VALUE_VIEW_STRING, JIT_RUNTIME_ABI_HASH,
+    JIT_RUNTIME_ABI_VERSION, JitAbiSlot, JitAbiValue, JitBailout, JitBailoutKind, JitCExit,
+    JitCExitTag, JitCFrameView, JitCValue, JitCValueTag, JitCallResult, JitCallStatus,
+    JitDeoptState, JitExceptionMarker, JitFrameHandle, JitFrameView, JitNativeArgFlags,
+    JitNativeArrayCacheEntry, JitNativeCallArgument, JitNativeCallFrame, JitNativeCallKind,
     JitNativeCallTarget, JitNativeControlRecord, JitNativeDestructorPoint,
     JitNativeDispatchTrampoline, JitNativeDynamicCodeKind, JitNativeDynamicCodeRequest,
     JitNativeDynamicCodeTrampoline, JitNativeExceptionHandler, JitNativeFiberState,
-    JitNativeFrameHeader, JitNativeGeneratorState, JitNativeIndirectionEntry, JitNativePcMetadata,
+    JitNativeForeachEntry, JitNativeForeachView, JitNativeFrameHeader,
+    JitNativeFunctionEntryCacheRecord, JitNativeGeneratorState,
+    JitNativeGlobalReferenceCacheRecord, JitNativeIndirectionEntry, JitNativePcMetadata,
     JitNativeReferenceScalarView, JitNativeResumeInputKind, JitNativeRootEntry, JitNativeRootKind,
     JitNativeRuntimeView, JitNativeRuntimeViewGuard, JitNativeSuspendKind,
-    JitNativeSuspensionGenerationPolicy, JitNativeTransitionState, JitNativeValueView,
-    JitOpaqueHandle, JitOpaqueValueKind, JitRegionResult, JitRuntimeCallout,
+    JitNativeSuspensionGenerationPolicy, JitNativeTransitionState, JitNativeValueResult,
+    JitNativeValueSlot, JitOpaqueHandle, JitOpaqueValueKind, JitRegionResult, JitRuntimeCallout,
     JitRuntimeCalloutResult, JitSideExit, JitVmContextHandle, SideExitReason,
-    activate_native_runtime_view,
+    activate_native_runtime_view, jit_native_global_reference_cache_index,
 };
 pub use backend::{NativeCompileOutcome, NativeCompileRequest, NativeCompilerApi};
 pub use code_manager::{
@@ -116,6 +122,8 @@ pub struct JitRuntimeHelperAddresses {
     pub native_call_dispatch: usize,
     /// Direct statically identified builtin invocation over packed i64 arguments.
     pub native_builtin_dispatch: usize,
+    /// Direct typed PHP semantic operation over packed i64 operands.
+    pub native_semantic_dispatch: usize,
     /// Resolves or compiles one statically known PHP callee without invoking it.
     pub native_function_resolve: usize,
     /// Allocates bounded request-local native call-frame storage.
@@ -336,6 +344,10 @@ pub struct JitCompileRequest {
     /// nor its single-flight compile key, while every declaration in one unit
     /// must still agree on the same indirection-cell namespace.
     pub deployment_identity: Option<String>,
+    /// Process-local numeric identity shared with the active runtime unit.
+    /// It is used only for request-cache addressing and is never persisted as
+    /// an address-bearing artifact identity.
+    pub deployment_runtime_identity: u64,
     /// Optimization level active when the request was made.
     pub opt_level: u8,
     /// Effective runtime/compiler configuration hash for process-cache identity.
@@ -357,6 +369,7 @@ impl JitCompileRequest {
             function_name: None,
             ir_fingerprint: None,
             deployment_identity: None,
+            deployment_runtime_identity: 0,
             opt_level: 0,
             config_hash: 0,
             invalidation_generation: 0,
@@ -393,6 +406,13 @@ impl JitCompileRequest {
     #[must_use]
     pub fn with_deployment_identity(mut self, identity: impl Into<String>) -> Self {
         self.deployment_identity = Some(identity.into());
+        self
+    }
+
+    /// Adds the numeric identity used by the request-local native entry cache.
+    #[must_use]
+    pub const fn with_deployment_runtime_identity(mut self, identity: u64) -> Self {
+        self.deployment_runtime_identity = identity;
         self
     }
 
@@ -1144,6 +1164,32 @@ impl JitFunctionHandle {
         entry.invoke_i64_with_deopt(args)
     }
 
+    /// Invokes a validated native entry with the request fast-state pointer
+    /// that generated code passes unchanged to callees and runtime helpers.
+    pub fn invoke_i64_with_deopt_runtime(
+        &self,
+        args: &[i64],
+        runtime_abi_hash: u64,
+        runtime: *mut std::ffi::c_void,
+    ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
+        let Some(entry) = self.native_entry else {
+            return Err(JitInvokeError::MissingNativeEntry);
+        };
+        if runtime_abi_hash != JIT_RUNTIME_ABI_HASH || entry.abi_hash != JIT_RUNTIME_ABI_HASH {
+            return Err(JitInvokeError::AbiHashMismatch {
+                expected: JIT_RUNTIME_ABI_HASH,
+                actual: runtime_abi_hash,
+            });
+        }
+        if args.len() != usize::from(entry.arity) {
+            return Err(JitInvokeError::ArityMismatch {
+                expected: entry.arity,
+                actual: args.len() as u8,
+            });
+        }
+        entry.invoke_i64_with_deopt_runtime(args, runtime)
+    }
+
     /// Enters the exact baseline-native continuation described by `state`.
     /// Live locals/registers are reconstructed from the shared native state;
     /// instructions before the continuation are not executed again.
@@ -1152,7 +1198,7 @@ impl JitFunctionHandle {
         state: &JitNativeTransitionState,
         runtime_abi_hash: u64,
     ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
-        self.invoke_i64_transition_impl(state, runtime_abi_hash, true)
+        self.invoke_i64_transition_impl(state, runtime_abi_hash, true, std::ptr::null_mut())
     }
 
     /// Re-enters a continuation published by this same native artifact. This
@@ -1163,7 +1209,18 @@ impl JitFunctionHandle {
         state: &JitNativeTransitionState,
         runtime_abi_hash: u64,
     ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
-        self.invoke_i64_transition_impl(state, runtime_abi_hash, false)
+        self.invoke_i64_transition_impl(state, runtime_abi_hash, false, std::ptr::null_mut())
+    }
+
+    /// Re-enters a continuation while preserving the request fast-state
+    /// pointer used by the suspended native call.
+    pub fn invoke_i64_same_artifact_transition_runtime(
+        &self,
+        state: &JitNativeTransitionState,
+        runtime_abi_hash: u64,
+        runtime: *mut std::ffi::c_void,
+    ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
+        self.invoke_i64_transition_impl(state, runtime_abi_hash, false, runtime)
     }
 
     fn invoke_i64_transition_impl(
@@ -1171,6 +1228,7 @@ impl JitFunctionHandle {
         state: &JitNativeTransitionState,
         runtime_abi_hash: u64,
         require_baseline: bool,
+        runtime: *mut std::ffi::c_void,
     ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
         if runtime_abi_hash != JIT_RUNTIME_ABI_HASH {
             return Err(JitInvokeError::AbiHashMismatch {
@@ -1254,6 +1312,7 @@ impl JitFunctionHandle {
             &args,
             transition.resume_id,
             resume_state as *const JitNativeTransitionState,
+            runtime,
         )
     }
 
@@ -1282,13 +1341,30 @@ impl JitFunctionHandle {
         &self,
         args: &[i64],
         runtime_abi_hash: u64,
+        catch_matches: impl FnMut(&[String], i64) -> bool,
+    ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
+        self.invoke_i64_with_native_unwind_runtime(
+            args,
+            runtime_abi_hash,
+            std::ptr::null_mut(),
+            catch_matches,
+        )
+    }
+
+    /// Runs native unwind with a request fast-state pointer passed directly
+    /// through every generated continuation entry.
+    pub fn invoke_i64_with_native_unwind_runtime(
+        &self,
+        args: &[i64],
+        runtime_abi_hash: u64,
+        runtime: *mut std::ffi::c_void,
         mut catch_matches: impl FnMut(&[String], i64) -> bool,
     ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
         let Some(entry) = self.native_entry else {
             return Err(JitInvokeError::MissingNativeEntry);
         };
         let Some(metadata) = self.region_state_metadata() else {
-            return self.invoke_i64_with_deopt(args, runtime_abi_hash);
+            return self.invoke_i64_with_deopt_runtime(args, runtime_abi_hash, runtime);
         };
         if runtime_abi_hash != JIT_RUNTIME_ABI_HASH || entry.abi_hash != JIT_RUNTIME_ABI_HASH {
             return Err(JitInvokeError::AbiHashMismatch {
@@ -1302,7 +1378,7 @@ impl JitFunctionHandle {
                 actual: args.len() as u8,
             });
         }
-        let mut outcome = entry.invoke_i64_with_deopt(args)?;
+        let mut outcome = entry.invoke_i64_with_deopt_runtime(args, runtime)?;
         loop {
             let JitI64InvokeOutcome::SideExit {
                 status,
@@ -1367,6 +1443,7 @@ impl JitFunctionHandle {
                         JitCallStatus::CONTINUE,
                         value,
                         resume_state,
+                        runtime,
                     )?;
                 }
                 JitNativeUnwindTarget::Finally {
@@ -1374,8 +1451,8 @@ impl JitFunctionHandle {
                     pending,
                     handler_index: _,
                 } => {
-                    outcome =
-                        entry.invoke_i64_handler_resume(args, block, pending, value, state)?;
+                    outcome = entry
+                        .invoke_i64_handler_resume(args, block, pending, value, state, runtime)?;
                 }
                 JitNativeUnwindTarget::Propagate(_) => {
                     return Ok(JitI64InvokeOutcome::SideExit {
@@ -1398,6 +1475,26 @@ impl JitFunctionHandle {
         input: JitNativeResumeInputKind,
         value: i64,
         runtime_abi_hash: u64,
+    ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
+        self.invoke_i64_suspension_resume_runtime(
+            args,
+            state,
+            input,
+            value,
+            runtime_abi_hash,
+            std::ptr::null_mut(),
+        )
+    }
+
+    /// Resumes a generated suspension with the original request fast state.
+    pub fn invoke_i64_suspension_resume_runtime(
+        &self,
+        args: &[i64],
+        state: &JitDeoptState,
+        input: JitNativeResumeInputKind,
+        value: i64,
+        runtime_abi_hash: u64,
+        runtime: *mut std::ffi::c_void,
     ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
         let Some(metadata) = self.region_state_metadata() else {
             return Err(JitInvokeError::MissingSuspensionEntry(
@@ -1428,7 +1525,7 @@ impl JitFunctionHandle {
                 actual: args.len() as u8,
             });
         }
-        entry.invoke_i64_suspension_resume(args, state, input, value)
+        entry.invoke_i64_suspension_resume(args, state, input, value, runtime)
     }
 
     /// Resumes a generator/fiber continuation and executes any generated
@@ -1440,17 +1537,52 @@ impl JitFunctionHandle {
         input: JitNativeResumeInputKind,
         value: i64,
         runtime_abi_hash: u64,
+        catch_matches: impl FnMut(&[String], i64) -> bool,
+    ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
+        self.invoke_i64_suspension_resume_with_native_unwind_runtime(
+            args,
+            state,
+            input,
+            value,
+            runtime_abi_hash,
+            std::ptr::null_mut(),
+            catch_matches,
+        )
+    }
+
+    /// Resumes a suspension and generated unwind with direct request state.
+    pub fn invoke_i64_suspension_resume_with_native_unwind_runtime(
+        &self,
+        args: &[i64],
+        state: &JitDeoptState,
+        input: JitNativeResumeInputKind,
+        value: i64,
+        runtime_abi_hash: u64,
+        runtime: *mut std::ffi::c_void,
         mut catch_matches: impl FnMut(&[String], i64) -> bool,
     ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
         let Some(metadata) = self.region_state_metadata() else {
-            return self.invoke_i64_suspension_resume(args, state, input, value, runtime_abi_hash);
+            return self.invoke_i64_suspension_resume_runtime(
+                args,
+                state,
+                input,
+                value,
+                runtime_abi_hash,
+                runtime,
+            );
         };
         let Some(entry) = self.native_entry else {
             return Err(JitInvokeError::MissingNativeEntry);
         };
         let function = FunctionId::new(state.function_id);
-        let mut outcome =
-            self.invoke_i64_suspension_resume(args, state, input, value, runtime_abi_hash)?;
+        let mut outcome = self.invoke_i64_suspension_resume_runtime(
+            args,
+            state,
+            input,
+            value,
+            runtime_abi_hash,
+            runtime,
+        )?;
         loop {
             let JitI64InvokeOutcome::SideExit {
                 status,
@@ -1514,6 +1646,7 @@ impl JitFunctionHandle {
                         JitCallStatus::CONTINUE,
                         value,
                         resume_state,
+                        runtime,
                     )?;
                 }
                 JitNativeUnwindTarget::Finally {
@@ -1521,8 +1654,8 @@ impl JitFunctionHandle {
                     pending,
                     handler_index: _,
                 } => {
-                    outcome =
-                        entry.invoke_i64_handler_resume(args, block, pending, value, state)?;
+                    outcome = entry
+                        .invoke_i64_handler_resume(args, block, pending, value, state, runtime)?;
                 }
                 JitNativeUnwindTarget::Propagate(_) => {
                     return Ok(JitI64InvokeOutcome::SideExit {
@@ -1629,7 +1762,12 @@ impl JitNativeEntry {
         if self.kind != JitNativeEntryKind::PackedI64StatusOut {
             return Err(JitInvokeError::MissingOsrEntry(entry_id));
         }
-        self.invoke_i64_status_out_with_resume(args, entry_id as i32, state as *const _)
+        self.invoke_i64_status_out_with_resume(
+            args,
+            entry_id as i32,
+            state as *const _,
+            std::ptr::null_mut(),
+        )
     }
 
     fn invoke_i64_handler_resume(
@@ -1639,6 +1777,7 @@ impl JitNativeEntry {
         status: JitCallStatus,
         value: i64,
         mut state: JitDeoptState,
+        runtime: *mut std::ffi::c_void,
     ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
         if self.kind != JitNativeEntryKind::PackedI64StatusOut {
             return Err(JitInvokeError::MissingNativeEntry);
@@ -1649,6 +1788,7 @@ impl JitNativeEntry {
             args,
             native_handler_resume_id(block),
             &state as *const _,
+            runtime,
         )
     }
 
@@ -1658,6 +1798,7 @@ impl JitNativeEntry {
         state: &JitDeoptState,
         input: JitNativeResumeInputKind,
         value: i64,
+        runtime: *mut std::ffi::c_void,
     ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
         if self.kind != JitNativeEntryKind::PackedI64StatusOut {
             return Err(JitInvokeError::MissingSuspensionEntry(
@@ -1675,6 +1816,7 @@ impl JitNativeEntry {
             args,
             native_suspension_resume_id(state.continuation_id),
             &resumed as *const _,
+            runtime,
         )
     }
 
@@ -1757,7 +1899,15 @@ impl JitNativeEntry {
         self,
         args: &[i64],
     ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
-        self.invoke_i64_status_out_with_resume(args, -1, std::ptr::null())
+        self.invoke_i64_status_out_with_resume(args, -1, std::ptr::null(), std::ptr::null_mut())
+    }
+
+    fn invoke_i64_with_deopt_runtime(
+        self,
+        args: &[i64],
+        runtime: *mut std::ffi::c_void,
+    ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
+        self.invoke_i64_status_out_with_resume(args, -1, std::ptr::null(), runtime)
     }
 
     fn invoke_i64_status_out_with_resume(
@@ -1765,11 +1915,16 @@ impl JitNativeEntry {
         args: &[i64],
         resume_id: i32,
         resume_state: *const JitDeoptState,
+        runtime: *mut std::ffi::c_void,
     ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
         let mut out = 0_i64;
         let out_ptr = &mut out as *mut i64;
-        let mut deopt = JitDeoptState::default();
-        let deopt_ptr = &mut deopt as *mut JitDeoptState;
+        // Normal native returns only use the request runtime view inside this
+        // buffer. Do not clear the 256 local and 64 register slots for every
+        // warm call; complete the sparse state only when native code actually
+        // reports a side exit.
+        let mut deopt = prepare_native_deopt_out();
+        let deopt_ptr = deopt.as_mut_ptr();
         // SAFETY: Handles are created only after Cranelift defines the matching
         // packed status/out signature. `args.as_ptr()` remains valid for the
         // synchronous native call, including the zero-length case where native
@@ -1777,23 +1932,99 @@ impl JitNativeEntry {
         // and exact arity before reaching this call.
         let status = unsafe {
             let function: extern "C" fn(
+                *mut std::ffi::c_void,
                 *const i64,
                 *mut i64,
                 *mut JitDeoptState,
                 i32,
                 *const JitDeoptState,
             ) -> i32 = mem::transmute(self.address);
-            function(args.as_ptr(), out_ptr, deopt_ptr, resume_id, resume_state)
+            function(
+                runtime,
+                args.as_ptr(),
+                out_ptr,
+                deopt_ptr,
+                resume_id,
+                resume_state,
+            )
         };
         if status == JitCallStatus::RETURN.0 as i32 {
             Ok(JitI64InvokeOutcome::Returned(out))
         } else {
+            // SAFETY: the call initializes every slot selected by the masks.
+            // The preparation initialized all scalar metadata; this fills the
+            // complementary sparse slots before constructing the Rust value.
+            let deopt = unsafe { complete_native_deopt_out(deopt) };
             Ok(JitI64InvokeOutcome::SideExit {
                 status,
                 value: out,
                 state: deopt,
             })
         }
+    }
+}
+
+fn prepare_native_deopt_out() -> std::mem::MaybeUninit<JitDeoptState> {
+    let mut state = std::mem::MaybeUninit::<JitDeoptState>::uninit();
+    let pointer = state.as_mut_ptr();
+    // SAFETY: each write targets a distinct scalar/metadata field. The large
+    // value arrays deliberately remain uninitialized until a side exit.
+    unsafe {
+        std::ptr::addr_of_mut!((*pointer).function_id).write(u32::MAX);
+        std::ptr::addr_of_mut!((*pointer).continuation_id).write(u32::MAX);
+        std::ptr::addr_of_mut!((*pointer).slot_count).write(0);
+        std::ptr::addr_of_mut!((*pointer).native_version).write(0);
+        std::ptr::addr_of_mut!((*pointer).initialized_mask).write(0);
+        std::ptr::addr_of_mut!((*pointer).initialized_masks_high)
+            .write([0; JIT_DEOPT_LOCAL_MASK_WORDS - 1]);
+        std::ptr::addr_of_mut!((*pointer).control_status).write(JitCallStatus::CONTINUE);
+        std::ptr::addr_of_mut!((*pointer).control_reserved).write(0);
+        std::ptr::addr_of_mut!((*pointer).control_value).write(0);
+        std::ptr::addr_of_mut!((*pointer).suspend_kind).write(0);
+        std::ptr::addr_of_mut!((*pointer).suspend_flags).write(0);
+        std::ptr::addr_of_mut!((*pointer).yielded_key).write(0);
+        std::ptr::addr_of_mut!((*pointer).delegation_handle).write(0);
+        std::ptr::addr_of_mut!((*pointer).initialized_register_mask).write(0);
+        std::ptr::addr_of_mut!((*pointer).runtime_view).write(abi::current_native_runtime_view());
+    }
+    state
+}
+
+/// Completes the inactive portion of a sparse native side-exit state.
+///
+/// # Safety
+///
+/// `state` must have been produced by [`prepare_native_deopt_out`], and native
+/// code must have initialized every local/register selected by its masks.
+unsafe fn complete_native_deopt_out(
+    mut state: std::mem::MaybeUninit<JitDeoptState>,
+) -> JitDeoptState {
+    let pointer = state.as_mut_ptr();
+    // SAFETY: scalar masks were initialized before the native call. Selected
+    // elements were written by native code; the loops initialize every other
+    // element without reading it.
+    unsafe {
+        let low_mask = std::ptr::addr_of!((*pointer).initialized_mask).read();
+        let high_masks = std::ptr::addr_of!((*pointer).initialized_masks_high).read();
+        let slots = std::ptr::addr_of_mut!((*pointer).slots).cast::<i64>();
+        for index in 0..JIT_DEOPT_MAX_SLOTS {
+            let mask = if index < u64::BITS as usize {
+                low_mask
+            } else {
+                high_masks[index / u64::BITS as usize - 1]
+            };
+            if mask & (1_u64 << (index % u64::BITS as usize)) == 0 {
+                slots.add(index).write(0);
+            }
+        }
+        let register_mask = std::ptr::addr_of!((*pointer).initialized_register_mask).read();
+        let registers = std::ptr::addr_of_mut!((*pointer).registers).cast::<i64>();
+        for index in 0..JIT_DEOPT_MAX_REGISTERS {
+            if register_mask & (1_u64 << index) == 0 {
+                registers.add(index).write(0);
+            }
+        }
+        state.assume_init()
     }
 }
 
@@ -2463,6 +2694,7 @@ mod tests {
     #[test]
     fn compile_function_does_not_publish_same_unit_callee_body() {
         extern "C" fn trampoline(
+            _runtime: *mut std::ffi::c_void,
             _vm_context: u64,
             _frame: *mut crate::JitNativeCallFrame,
             out: *mut crate::JitCallResult,

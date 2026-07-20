@@ -17,6 +17,7 @@ use std::{
 };
 
 static NEXT_COMPILED_UNIT_CACHE_ID: AtomicU64 = AtomicU64::new(1);
+static PREPARED_BUILTIN_DEFINITIONS: OnceLock<Box<[PreparedBuiltinDefinition]>> = OnceLock::new();
 
 /// Authoritative IR unit handed to the native execution coordinator.
 #[derive(Clone)]
@@ -165,6 +166,7 @@ impl SymbolIndex {
 #[derive(Debug)]
 struct PreparedUnit {
     ir_verification_errors: OnceLock<usize>,
+    class_validation: OnceLock<PreparedClassValidation>,
     native_indexes: OnceLock<PreparedNativeIndexes>,
     ir_fingerprint: OnceLock<String>,
     function_ir_fingerprint_context: OnceLock<php_jit::StableFunctionIrFingerprintContext>,
@@ -172,12 +174,20 @@ struct PreparedUnit {
     dependency_identity: OnceLock<String>,
     external_function_calls: OnceLock<PreparedExternalFunctionCalls>,
     native_function_metadata: OnceLock<Box<[Arc<PreparedNativeFunctionMetadata>]>>,
+    deployment_image: OnceLock<PreparedDeploymentNativeImage>,
     ir_verification_runs: AtomicU64,
     continuation_index_runs: AtomicU64,
     ir_fingerprint_runs: AtomicU64,
     function_ir_fingerprint_runs: AtomicU64,
     dependency_identity_runs: AtomicU64,
     class_validation_runs: AtomicU64,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedDeploymentNativeImage {
+    pub function_exports: Arc<std::collections::HashMap<Arc<str>, FunctionId>>,
+    pub exported_classes: Arc<std::collections::HashSet<Arc<str>>>,
+    pub native_call_argument_capacity: usize,
 }
 
 impl PreparedUnit {
@@ -193,6 +203,7 @@ impl PreparedUnit {
         }
         Self {
             ir_verification_errors: OnceLock::new(),
+            class_validation: OnceLock::new(),
             native_indexes: OnceLock::new(),
             ir_fingerprint: OnceLock::new(),
             function_ir_fingerprint_context: OnceLock::new(),
@@ -200,6 +211,7 @@ impl PreparedUnit {
             dependency_identity: OnceLock::new(),
             external_function_calls: OnceLock::new(),
             native_function_metadata: OnceLock::new(),
+            deployment_image: OnceLock::new(),
             ir_verification_runs: AtomicU64::new(0),
             continuation_index_runs: AtomicU64::new(0),
             ir_fingerprint_runs: AtomicU64::new(0),
@@ -208,6 +220,17 @@ impl PreparedUnit {
             class_validation_runs: AtomicU64::new(0),
         }
     }
+}
+
+/// Immutable result of validating the class graph owned by a compiled unit.
+///
+/// The result belongs to the published unit rather than to a request. Warm
+/// execution reads this once-initialized value and never traverses the class
+/// hierarchy again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PreparedClassValidation {
+    Valid,
+    Invalid(Arc<str>),
 }
 
 #[derive(Debug)]
@@ -296,6 +319,93 @@ pub(crate) struct PreparedNativeBuiltin {
     pub entry: php_runtime::api::BuiltinEntry,
     pub metadata: Option<&'static php_std::generated::arginfo::GeneratedFunctionMetadata>,
     pub type_info: Option<&'static php_std::arginfo::FunctionArgInfo>,
+    /// The immutable positional callsite was checked against the published
+    /// arginfo once. PHP-visible value/type checks still run where required,
+    /// but warm execution does not recount the same signature parameters.
+    pub fixed_arity_validated: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedBuiltinDefinition {
+    entry: php_runtime::api::BuiltinEntry,
+    metadata: Option<&'static php_std::generated::arginfo::GeneratedFunctionMetadata>,
+    type_info: Option<&'static php_std::arginfo::FunctionArgInfo>,
+}
+
+impl PreparedNativeBuiltin {
+    pub(crate) fn for_entry(
+        entry: php_runtime::api::BuiltinEntry,
+        argument_count: usize,
+        positional: bool,
+    ) -> Self {
+        let definition = prepared_builtin_definitions()
+            .get(entry.dense_id() as usize)
+            .copied()
+            .filter(|definition| definition.entry.dense_id() == entry.dense_id())
+            .expect("published builtin dense ID must resolve to its prepared definition");
+        Self::from_definition(definition, argument_count, positional)
+    }
+
+    pub(crate) fn for_dense_id(
+        dense_id: u32,
+        argument_count: usize,
+        positional: bool,
+    ) -> Option<Self> {
+        let definition = prepared_builtin_definitions()
+            .get(dense_id as usize)
+            .copied()?;
+        (definition.entry.dense_id() == dense_id)
+            .then(|| Self::from_definition(definition, argument_count, positional))
+    }
+
+    fn from_definition(
+        definition: PreparedBuiltinDefinition,
+        argument_count: usize,
+        positional: bool,
+    ) -> Self {
+        let PreparedBuiltinDefinition {
+            entry,
+            metadata,
+            type_info,
+        } = definition;
+        Self {
+            entry,
+            metadata,
+            type_info,
+            fixed_arity_validated: positional
+                && prepared_builtin_arity_is_valid(entry.name(), metadata, argument_count),
+        }
+    }
+}
+
+fn prepared_builtin_definitions() -> &'static [PreparedBuiltinDefinition] {
+    PREPARED_BUILTIN_DEFINITIONS.get_or_init(|| {
+        php_runtime::api::BuiltinRegistry::new()
+            .entries()
+            .iter()
+            .copied()
+            .map(|entry| {
+                let metadata = php_std::arginfo::function_metadata_indexed(entry.name());
+                let type_info = metadata
+                    .filter(|metadata| {
+                        matches!(metadata.extension, "hash" | "json" | "pcre" | "tokenizer")
+                            && !metadata.params.iter().any(|parameter| {
+                                parameter
+                                    .type_decl
+                                    .split('|')
+                                    .any(|atom| atom.trim() == "callable")
+                            })
+                    })
+                    .and_then(|_| php_std::arginfo::function_arginfo_indexed(entry.name()));
+                PreparedBuiltinDefinition {
+                    entry,
+                    metadata,
+                    type_info,
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    })
 }
 
 impl NativeCallSiteDescriptor {
@@ -471,6 +581,35 @@ pub struct CompiledUnitLayoutStats {
 }
 
 impl CompiledUnit {
+    pub(crate) fn prepared_deployment_image(&self) -> &PreparedDeploymentNativeImage {
+        self.inner.prepared.deployment_image.get_or_init(|| {
+            let unit = self.unit();
+            let mut function_exports =
+                std::collections::HashMap::with_capacity(unit.function_table.len());
+            for entry in &unit.function_table {
+                function_exports
+                    .entry(Arc::<str>::from(entry.name.to_ascii_lowercase()))
+                    .or_insert(entry.function);
+            }
+            PreparedDeploymentNativeImage {
+                function_exports: Arc::new(function_exports),
+                exported_classes: Arc::new(
+                    unit.classes
+                        .iter()
+                        .filter(|class| class.span.start != 0 || class.span.end != 0)
+                        .map(|class| Arc::<str>::from(class.name.as_str()))
+                        .collect(),
+                ),
+                native_call_argument_capacity: unit
+                    .functions
+                    .iter()
+                    .map(|function| function.params.len() + function.captures.len() + 1)
+                    .max()
+                    .unwrap_or(0),
+            }
+        })
+    }
+
     /// Wraps an IR unit and snapshots all source files that are currently readable.
     #[must_use]
     pub fn new(unit: IrUnit) -> Self {
@@ -670,6 +809,19 @@ impl CompiledUnit {
         })
     }
 
+    pub(crate) fn prepared_class_validation(&self) -> &PreparedClassValidation {
+        self.inner.prepared.class_validation.get_or_init(|| {
+            self.inner
+                .prepared
+                .class_validation_runs
+                .fetch_add(1, Ordering::Relaxed);
+            validate_native_class_table(&self.inner.unit).map_or_else(
+                |diagnostic| PreparedClassValidation::Invalid(Arc::from(diagnostic)),
+                |()| PreparedClassValidation::Valid,
+            )
+        })
+    }
+
     fn prepared_native_indexes(&self) -> &PreparedNativeIndexes {
         self.inner.prepared.native_indexes.get_or_init(|| {
             self.inner
@@ -719,35 +871,13 @@ impl CompiledUnit {
                                             })
                                             .filter(|entry| entry.helper_id() != 0)
                                             .map(|entry| {
-                                                let metadata =
-                                                    php_std::arginfo::function_metadata_indexed(
-                                                        entry.name(),
-                                                    );
-                                                let type_info = metadata
-                                                    .filter(|metadata| {
-                                                        matches!(
-                                                            metadata.extension,
-                                                            "hash" | "json" | "pcre" | "tokenizer"
-                                                        ) && !metadata.params.iter().any(
-                                                            |parameter| {
-                                                                parameter.type_decl.split('|').any(
-                                                                    |atom| {
-                                                                        atom.trim() == "callable"
-                                                                    },
-                                                                )
-                                                            },
-                                                        )
-                                                    })
-                                                    .and_then(|_| {
-                                                        php_std::arginfo::function_arginfo_indexed(
-                                                            entry.name(),
-                                                        )
-                                                    });
-                                                PreparedNativeBuiltin {
+                                                PreparedNativeBuiltin::for_entry(
                                                     entry,
-                                                    metadata,
-                                                    type_info,
-                                                }
+                                                    call.args.len(),
+                                                    call.args.iter().all(|argument| {
+                                                        argument.name.is_none() && !argument.unpack
+                                                    }),
+                                                )
                                             })
                                     })
                                 } else {
@@ -1233,6 +1363,102 @@ fn artifact_identity(
     hash
 }
 
+fn validate_native_class_table(unit: &IrUnit) -> Result<(), String> {
+    let find_class = |name: &str| {
+        let normalized = normalize_class_name(name);
+        unit.classes.iter().find(|class| class.name == normalized)
+    };
+    for class in unit
+        .classes
+        .iter()
+        .filter(|class| !class.flags.is_conditional)
+    {
+        if let Some(parent_name) = class.parent.as_deref()
+            && let Some(parent) = find_class(parent_name)
+        {
+            if parent.flags.is_final || parent.flags.is_enum {
+                return Err(format!(
+                    "Class {} cannot extend final class {}",
+                    class.display_name, parent.display_name
+                ));
+            }
+            for method in &class.methods {
+                let mut ancestor = Some(parent);
+                while let Some(current) = ancestor {
+                    if current.methods.iter().any(|candidate| {
+                        candidate.name.eq_ignore_ascii_case(&method.name)
+                            && candidate.flags.is_final
+                    }) {
+                        return Err(format!(
+                            "Cannot override final method {}::{}()",
+                            current.display_name, method.name
+                        ));
+                    }
+                    ancestor = current.parent.as_deref().and_then(&find_class);
+                }
+            }
+        }
+
+        if class.flags.is_abstract || class.flags.is_interface || class.flags.is_trait {
+            continue;
+        }
+        let implements = |name: &str| {
+            let mut current = Some(class);
+            while let Some(candidate) = current {
+                if let Some(method) = candidate
+                    .methods
+                    .iter()
+                    .find(|method| method.name.eq_ignore_ascii_case(name))
+                {
+                    return Some(method);
+                }
+                current = candidate.parent.as_deref().and_then(&find_class);
+            }
+            None
+        };
+        let mut required = Vec::new();
+        let mut ancestor = class.parent.as_deref().and_then(&find_class);
+        while let Some(current) = ancestor {
+            required.extend(
+                current
+                    .methods
+                    .iter()
+                    .filter(|method| method.flags.is_abstract)
+                    .map(|method| (current, method)),
+            );
+            ancestor = current.parent.as_deref().and_then(&find_class);
+        }
+        for interface_name in &class.interfaces {
+            if let Some(interface) = find_class(interface_name) {
+                required.extend(interface.methods.iter().map(|method| (interface, method)));
+            }
+        }
+        for (owner, method) in required {
+            let Some(implementation) = implements(&method.name) else {
+                return Err(format!(
+                    "Class {} contains an abstract method {}::{}()",
+                    class.display_name, owner.display_name, method.name
+                ));
+            };
+            if implementation.flags.is_abstract {
+                return Err(format!(
+                    "Class {} contains an abstract method {}::{}()",
+                    class.display_name, owner.display_name, method.name
+                ));
+            }
+            if owner.flags.is_interface
+                && (implementation.flags.is_private || implementation.flags.is_protected)
+            {
+                return Err(format!(
+                    "Access level to {}::{}() must be public",
+                    class.display_name, method.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn stable_hash(bytes: &[u8]) -> u64 {
     hash_bytes(0xcbf2_9ce4_8422_2325, bytes)
 }
@@ -1270,6 +1496,33 @@ fn native_callsite_target(
         }
         RegionCallTarget::Semantic { .. } => (NativeCallSiteKind::Semantic, None, None),
     }
+}
+
+fn prepared_builtin_arity_is_valid(
+    name: &str,
+    metadata: Option<&php_std::generated::arginfo::GeneratedFunctionMetadata>,
+    argument_count: usize,
+) -> bool {
+    let Some(metadata) = metadata else {
+        return true;
+    };
+    let required = metadata
+        .params
+        .iter()
+        .filter(|parameter| {
+            !parameter.optional && parameter.default_value.is_none() && !parameter.variadic
+        })
+        .count();
+    let required = match name {
+        "array_intersect_uassoc" | "array_intersect_ukey" | "array_uintersect" => 2,
+        "array_uintersect_uassoc" => 3,
+        _ => required,
+    };
+    let variadic = metadata
+        .params
+        .last()
+        .is_some_and(|parameter| parameter.variadic);
+    argument_count >= required && (variadic || argument_count <= metadata.params.len())
 }
 
 fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
@@ -1319,6 +1572,50 @@ mod tests {
             },
             span: IrSpan::default(),
         }
+    }
+
+    #[test]
+    fn class_graph_validation_is_prepared_once_per_compiled_unit() {
+        let compiled = CompiledUnit::new(IrUnit::new(UnitId::new(77)));
+
+        assert_eq!(compiled.prepared_unit_stats().class_validation_runs, 0);
+        assert_eq!(
+            compiled.prepared_class_validation(),
+            &PreparedClassValidation::Valid
+        );
+        assert_eq!(compiled.prepared_unit_stats().class_validation_runs, 1);
+        assert_eq!(
+            compiled.prepared_class_validation(),
+            &PreparedClassValidation::Valid
+        );
+        assert_eq!(compiled.prepared_unit_stats().class_validation_runs, 1);
+    }
+
+    #[test]
+    fn deployment_symbol_image_is_prepared_once_and_preserves_first_function() {
+        let mut unit = IrUnit::new(UnitId::new(78));
+        unit.function_table.push(FunctionEntry {
+            name: "App\\Boot".to_owned(),
+            function: FunctionId::new(1),
+        });
+        unit.function_table.push(FunctionEntry {
+            name: "app\\boot".to_owned(),
+            function: FunctionId::new(2),
+        });
+        let compiled = CompiledUnit::new(unit);
+
+        let first = compiled.prepared_deployment_image();
+        let functions = Arc::clone(&first.function_exports);
+        let classes = Arc::clone(&first.exported_classes);
+        let second = compiled.prepared_deployment_image();
+
+        assert!(std::ptr::eq(first, second));
+        assert!(Arc::ptr_eq(&functions, &second.function_exports));
+        assert!(Arc::ptr_eq(&classes, &second.exported_classes));
+        assert_eq!(
+            second.function_exports.get("app\\boot"),
+            Some(&FunctionId::new(1))
+        );
     }
 
     #[test]

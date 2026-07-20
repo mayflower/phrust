@@ -1,6 +1,11 @@
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
-pub(super) extern "C" fn test_native_unary_fallback(op: u32, src: i64, out: *mut i64) -> i32 {
+pub(super) extern "C" fn test_native_unary_fallback(
+    _runtime: *mut std::ffi::c_void,
+    op: u32,
+    src: i64,
+    out: *mut i64,
+) -> i32 {
     if out.is_null() {
         return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
@@ -22,6 +27,7 @@ pub(super) extern "C" fn test_native_unary_fallback(op: u32, src: i64, out: *mut
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_binary_fallback(
+    _runtime: *mut std::ffi::c_void,
     op: u32,
     lhs: i64,
     rhs: i64,
@@ -51,6 +57,7 @@ pub(super) extern "C" fn test_native_binary_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_compare_fallback(
+    _runtime: *mut std::ffi::c_void,
     op: u32,
     lhs: i64,
     rhs: i64,
@@ -80,7 +87,12 @@ pub(super) extern "C" fn test_native_compare_fallback(
 
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
-pub(super) extern "C" fn test_native_cast_fallback(op: u32, src: i64, out: *mut i64) -> i32 {
+pub(super) extern "C" fn test_native_cast_fallback(
+    _runtime: *mut std::ffi::c_void,
+    op: u32,
+    src: i64,
+    out: *mut i64,
+) -> i32 {
     if out.is_null() {
         return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
@@ -94,11 +106,15 @@ pub(super) extern "C" fn test_native_cast_fallback(op: u32, src: i64, out: *mut 
     0
 }
 
-pub(super) extern "C" fn test_native_echo_fallback(_src: i64) -> i32 {
+pub(super) extern "C" fn test_native_echo_fallback(
+    _runtime: *mut std::ffi::c_void,
+    _src: i64,
+) -> i32 {
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
 pub(super) extern "C" fn test_native_local_fetch_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     value: i64,
     _function: i64,
@@ -117,6 +133,7 @@ pub(super) extern "C" fn test_native_local_fetch_fallback(
 }
 
 pub(super) extern "C" fn test_native_exception_new_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     message: i64,
     _function: i64,
@@ -135,6 +152,7 @@ pub(super) extern "C" fn test_native_exception_new_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_local_store_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     _current: i64,
     value: i64,
@@ -153,6 +171,7 @@ pub(super) extern "C" fn test_native_local_store_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_value_lifecycle_fallback(
+    _runtime: *mut std::ffi::c_void,
     op: u32,
     value: i64,
     out: *mut i64,
@@ -172,6 +191,7 @@ pub(super) extern "C" fn test_native_value_lifecycle_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_reference_bind_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     value: i64,
     _key: i64,
@@ -189,6 +209,7 @@ pub(super) extern "C" fn test_native_reference_bind_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_argument_check_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     value: i64,
     _target_function: i64,
@@ -208,6 +229,7 @@ pub(super) extern "C" fn test_native_argument_check_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_return_check_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     value: i64,
     _function: i64,
@@ -221,15 +243,24 @@ pub(super) extern "C" fn test_native_return_check_fallback(
     }
 }
 
-pub(super) extern "C" fn test_native_array_new_fallback(_op: u32, _out: *mut i64) -> i32 {
+pub(super) extern "C" fn test_native_array_new_fallback(
+    _runtime: *mut std::ffi::c_void,
+    _op: u32,
+    _out: *mut i64,
+) -> i32 {
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
-pub(super) extern "C" fn test_native_object_new_fallback(_op: u32, _out: *mut i64) -> i32 {
+pub(super) extern "C" fn test_native_object_new_fallback(
+    _runtime: *mut std::ffi::c_void,
+    _op: u32,
+    _out: *mut i64,
+) -> i32 {
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
 pub(super) extern "C" fn test_native_property_fetch_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     _object: i64,
     _function: i64,
@@ -240,6 +271,7 @@ pub(super) extern "C" fn test_native_property_fetch_fallback(
 }
 
 pub(super) extern "C" fn test_native_property_assign_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     _object: i64,
     _value: i64,
@@ -253,6 +285,7 @@ pub(super) extern "C" fn test_native_property_assign_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_object_clone_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     object: i64,
     out: *mut i64,
@@ -268,6 +301,7 @@ pub(super) extern "C" fn test_native_object_clone_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_object_clone_with_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     object: i64,
     _replacements: i64,
@@ -282,6 +316,7 @@ pub(super) extern "C" fn test_native_object_clone_with_fallback(
 }
 
 pub(super) extern "C" fn test_native_array_insert_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     _array: i64,
     _key: i64,
@@ -292,15 +327,19 @@ pub(super) extern "C" fn test_native_array_insert_fallback(
 }
 
 pub(super) extern "C" fn test_native_array_fetch_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     _array: i64,
     _key: i64,
-    _out: *mut i64,
-) -> i32 {
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+) -> crate::JitNativeValueResult {
+    crate::JitNativeValueResult {
+        value: crate::jit_encode_constant(u32::MAX),
+        status: crate::JitCallStatus::RUNTIME_ERROR.0 as i64,
+    }
 }
 
 pub(super) extern "C" fn test_native_array_unset_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     _array: i64,
     _key: i64,
@@ -310,6 +349,7 @@ pub(super) extern "C" fn test_native_array_unset_fallback(
 }
 
 pub(super) extern "C" fn test_native_array_spread_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     _array: i64,
     _source: i64,
@@ -319,6 +359,7 @@ pub(super) extern "C" fn test_native_array_spread_fallback(
 }
 
 pub(super) extern "C" fn test_native_foreach_init_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     _source: i64,
     _function: i64,
@@ -329,6 +370,7 @@ pub(super) extern "C" fn test_native_foreach_init_fallback(
 }
 
 pub(super) extern "C" fn test_native_foreach_next_fallback(
+    _runtime: *mut std::ffi::c_void,
     _iterator: i64,
     _key_out: *mut i64,
     _value_out: *mut i64,
@@ -337,11 +379,15 @@ pub(super) extern "C" fn test_native_foreach_next_fallback(
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
-pub(super) extern "C" fn test_native_foreach_cleanup_fallback(_iterator: i64) -> i32 {
+pub(super) extern "C" fn test_native_foreach_cleanup_fallback(
+    _runtime: *mut std::ffi::c_void,
+    _iterator: i64,
+) -> i32 {
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
 pub(super) extern "C" fn test_native_constant_fetch_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     _function: i64,
     _instruction: i64,
@@ -352,7 +398,11 @@ pub(super) extern "C" fn test_native_constant_fetch_fallback(
 
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
-pub(super) extern "C" fn test_native_truthy_fallback(src: i64, out: *mut i64) -> i32 {
+pub(super) extern "C" fn test_native_truthy_fallback(
+    _runtime: *mut std::ffi::c_void,
+    src: i64,
+    out: *mut i64,
+) -> i32 {
     if out.is_null() {
         return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
@@ -362,6 +412,7 @@ pub(super) extern "C" fn test_native_truthy_fallback(src: i64, out: *mut i64) ->
 }
 
 pub(super) extern "C" fn test_native_type_predicate_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     _src: i64,
     out: *mut i64,
@@ -377,6 +428,7 @@ pub(super) extern "C" fn test_native_type_predicate_fallback(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(super) extern "C" fn test_native_stable_length_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     _value: i64,
     _function: i64,
@@ -387,6 +439,7 @@ pub(super) extern "C" fn test_native_stable_length_fallback(
 }
 
 pub(super) extern "C" fn test_native_string_predicate_fallback(
+    _runtime: *mut std::ffi::c_void,
     _op: u32,
     _haystack: i64,
     _needle: i64,
@@ -396,12 +449,56 @@ pub(super) extern "C" fn test_native_string_predicate_fallback(
 }
 
 pub(super) extern "C" fn test_native_runtime_fatal_fallback(
+    _runtime: *mut std::ffi::c_void,
     _function: u32,
     _instruction: u32,
 ) -> i32 {
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
-pub(super) extern "C" fn test_native_execution_poll_fallback() -> i32 {
+pub(super) extern "C" fn test_native_execution_poll_fallback(
+    _runtime: *mut std::ffi::c_void,
+) -> i32 {
     0
 }
+macro_rules! register_value_fallback {
+    ($wrapper:ident => $target:ident ($($name:ident: $ty:ty),* $(,)?)) => {
+        pub(super) extern "C" fn $wrapper(
+            runtime: *mut std::ffi::c_void,
+            $($name: $ty),*
+        ) -> crate::JitNativeValueResult {
+            let mut value = crate::jit_encode_constant(u32::MAX);
+            let status = $target(runtime, $($name,)* &raw mut value);
+            crate::JitNativeValueResult {
+                value,
+                status: i64::from(status),
+            }
+        }
+    };
+}
+
+register_value_fallback!(test_native_unary_register_fallback => test_native_unary_fallback(op: u32, src: i64));
+register_value_fallback!(test_native_binary_register_fallback => test_native_binary_fallback(op: u32, lhs: i64, rhs: i64, function: i64, continuation: i64));
+register_value_fallback!(test_native_compare_register_fallback => test_native_compare_fallback(op: u32, lhs: i64, rhs: i64));
+register_value_fallback!(test_native_cast_register_fallback => test_native_cast_fallback(op: u32, src: i64));
+register_value_fallback!(test_native_local_fetch_register_fallback => test_native_local_fetch_fallback(op: u32, value: i64, function: i64, local: i64, file: i64, start: i64));
+register_value_fallback!(test_native_local_store_register_fallback => test_native_local_store_fallback(op: u32, current: i64, value: i64, function: i64, local: i64));
+register_value_fallback!(test_native_value_lifecycle_register_fallback => test_native_value_lifecycle_fallback(op: u32, value: i64));
+register_value_fallback!(test_native_reference_bind_register_fallback => test_native_reference_bind_fallback(op: u32, value: i64, key: i64, reserved: i64));
+register_value_fallback!(test_native_argument_check_register_fallback => test_native_argument_check_fallback(op: u32, value: i64, target_function: i64, parameter_flags: i64, caller_function: i64, continuation: i64));
+register_value_fallback!(test_native_return_check_register_fallback => test_native_return_check_fallback(op: u32, value: i64, function: i64));
+register_value_fallback!(test_native_exception_new_register_fallback => test_native_exception_new_fallback(op: u32, message: i64, function: i64, continuation: i64));
+register_value_fallback!(test_native_array_new_register_fallback => test_native_array_new_fallback(op: u32));
+register_value_fallback!(test_native_object_new_register_fallback => test_native_object_new_fallback(op: u32));
+register_value_fallback!(test_native_property_fetch_register_fallback => test_native_property_fetch_fallback(op: u32, object: i64, function: i64, continuation: i64));
+register_value_fallback!(test_native_property_assign_register_fallback => test_native_property_assign_fallback(op: u32, object: i64, value: i64, function: i64, continuation: i64));
+register_value_fallback!(test_native_object_clone_register_fallback => test_native_object_clone_fallback(op: u32, object: i64));
+register_value_fallback!(test_native_object_clone_with_register_fallback => test_native_object_clone_with_fallback(op: u32, object: i64, replacements: i64));
+register_value_fallback!(test_native_array_insert_register_fallback => test_native_array_insert_fallback(op: u32, array: i64, key: i64, value: i64));
+register_value_fallback!(test_native_array_unset_register_fallback => test_native_array_unset_fallback(op: u32, array: i64, key: i64));
+register_value_fallback!(test_native_array_spread_register_fallback => test_native_array_spread_fallback(op: u32, array: i64, source: i64));
+register_value_fallback!(test_native_foreach_init_register_fallback => test_native_foreach_init_fallback(op: u32, source: i64, function: i64, local: i64));
+register_value_fallback!(test_native_constant_fetch_register_fallback => test_native_constant_fetch_fallback(op: u32, function: i64, instruction: i64));
+register_value_fallback!(test_native_type_predicate_register_fallback => test_native_type_predicate_fallback(op: u32, src: i64));
+register_value_fallback!(test_native_stable_length_register_fallback => test_native_stable_length_fallback(op: u32, value: i64, function: i64, continuation: i64));
+register_value_fallback!(test_native_string_predicate_register_fallback => test_native_string_predicate_fallback(op: u32, haystack: i64, needle: i64));

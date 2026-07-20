@@ -1853,6 +1853,16 @@ impl PhpArray {
     /// and diagnostics.
     #[must_use]
     pub fn gc_debug_id(&self) -> u64 {
+        self.native_storage_id()
+    }
+
+    /// Returns the stable identity of the current copy-on-write storage.
+    ///
+    /// Native execution uses this identity to share one request handle for
+    /// multiple by-value facades over the same immutable storage. A write that
+    /// separates the storage receives a new identity before publication.
+    #[must_use]
+    pub fn native_storage_id(&self) -> u64 {
         self.storage.storage_id()
     }
 

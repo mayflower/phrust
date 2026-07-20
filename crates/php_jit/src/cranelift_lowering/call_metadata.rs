@@ -68,6 +68,23 @@ pub(super) fn stable_builtin_helper_id(target: &RegionCallTarget) -> Option<u32>
         .filter(|helper_id| *helper_id != 0)
 }
 
+pub(super) fn stable_builtin_dense_id(target: &RegionCallTarget) -> Option<u32> {
+    let RegionCallTarget::Function {
+        name,
+        function: None,
+    } = target
+    else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\').to_ascii_lowercase();
+    if normalized.contains('\\') {
+        return None;
+    }
+    php_runtime::api::BuiltinRegistry::new()
+        .get(&normalized)
+        .map(php_runtime::api::BuiltinEntry::dense_id)
+}
+
 pub(super) fn stable_builtin_type_predicate(target: &RegionCallTarget) -> Option<u32> {
     let RegionCallTarget::Function {
         name,
@@ -179,9 +196,53 @@ pub(super) fn known_user_argument_requires_reference(
     call: &RegionNativeCall,
     index: usize,
     function_params: &BTreeMap<FunctionId, NativeFunctionMetadata>,
+    external_function_signatures: &[crate::JitExternalFunctionSignature],
     caller: FunctionId,
 ) -> Option<bool> {
     let argument = call.args.get(index)?;
+    if let RegionCallTarget::Function {
+        name,
+        function: None,
+    } = &call.target
+    {
+        let normalized = name.trim_start_matches('\\');
+        let has_local_metadata = function_params.values().any(|(candidate, ..)| {
+            candidate
+                .trim_start_matches('\\')
+                .eq_ignore_ascii_case(normalized)
+        });
+        if !has_local_metadata {
+            let signature = external_function_signatures.iter().find(|signature| {
+                signature
+                    .name
+                    .trim_start_matches('\\')
+                    .eq_ignore_ascii_case(normalized)
+            })?;
+            let parameter = argument.name.as_deref().map_or_else(
+                || {
+                    signature.params.get(index).or_else(|| {
+                        signature
+                            .params
+                            .last()
+                            .filter(|parameter| parameter.variadic)
+                    })
+                },
+                |name| {
+                    signature
+                        .params
+                        .iter()
+                        .find(|parameter| parameter.name.eq_ignore_ascii_case(name))
+                        .or_else(|| {
+                            signature
+                                .params
+                                .last()
+                                .filter(|parameter| parameter.variadic)
+                        })
+                },
+            );
+            return Some(parameter.is_some_and(|parameter| parameter.by_ref));
+        }
+    }
     let method_matches = |candidate: &str, method: &str| {
         candidate
             .rsplit_once("::")

@@ -670,13 +670,17 @@ pub(super) fn execute_native_dynamic_callable(
     instruction: &php_ir::Instruction,
     encoded: &[i64],
     caller_function: Option<u32>,
+    prepared_arguments: Option<&[php_ir::instruction::IrCallArg]>,
+    prepared_builtin_source: bool,
 ) -> Option<Result<i64, String>> {
-    if !matches!(
-        instruction.kind,
-        php_ir::InstructionKind::CallCallable { .. }
-            | php_ir::InstructionKind::CallClosure { .. }
-            | php_ir::InstructionKind::Pipe { .. }
-    ) {
+    if !prepared_builtin_source
+        && !matches!(
+            instruction.kind,
+            php_ir::InstructionKind::CallCallable { .. }
+                | php_ir::InstructionKind::CallClosure { .. }
+                | php_ir::InstructionKind::Pipe { .. }
+        )
+    {
         return None;
     }
     let Some((callee, arguments)) = encoded.split_first() else {
@@ -686,12 +690,11 @@ pub(super) fn execute_native_dynamic_callable(
         Ok(value) => dereference_native_callable_value(value),
         Err(error) => return Some(Err(error)),
     };
-    let metadata = match &instruction.kind {
+    let metadata = prepared_arguments.or_else(|| match &instruction.kind {
         php_ir::InstructionKind::CallCallable { args, .. }
         | php_ir::InstructionKind::CallClosure { args, .. } => Some(args.as_slice()),
-        php_ir::InstructionKind::Pipe { .. } => None,
         _ => None,
-    };
+    });
     let result = (|| -> Result<i64, String> {
         match callee {
             Value::Callable(callable) => match callable.as_ref() {
@@ -1227,8 +1230,13 @@ pub(super) fn execute_native_fiber_method(
                 arguments.extend_from_slice(&encoded[1..]);
                 fiber.set_state(php_runtime::api::FiberState::Running);
                 let previous_fiber = context.active_fiber.replace(fiber.id());
+                let runtime = std::ptr::from_mut(context).cast::<std::ffi::c_void>();
                 let outcome = handle
-                    .invoke_i64_with_deopt(&arguments, php_jit::JIT_RUNTIME_ABI_HASH)
+                    .invoke_i64_with_deopt_runtime(
+                        &arguments,
+                        php_jit::JIT_RUNTIME_ABI_HASH,
+                        runtime,
+                    )
                     .map_err(|error| format!("native fiber invocation failed: {error:?}"))?;
                 context.active_fiber = previous_fiber;
                 finish_native_fiber_outcome(context, &fiber, handle, arguments, outcome)
@@ -1256,14 +1264,16 @@ pub(super) fn execute_native_fiber_method(
                 };
                 if let Some(mut nested) = execution.nested.take() {
                     let previous_fiber = context.active_fiber.replace(fiber.id());
+                    let runtime = std::ptr::from_mut(context).cast::<std::ffi::c_void>();
                     let nested_outcome = nested
                         .handle
-                        .invoke_i64_suspension_resume_with_native_unwind(
+                        .invoke_i64_suspension_resume_with_native_unwind_runtime(
                             &nested.arguments,
                             &nested.state,
                             kind,
                             value,
                             php_jit::JIT_RUNTIME_ABI_HASH,
+                            runtime,
                             |types, value| native_catch_matches(context, types, value),
                         )
                         .map_err(|error| format!("native nested fiber resume failed: {error:?}"))?;
@@ -1281,11 +1291,13 @@ pub(super) fn execute_native_fiber_method(
                                 value,
                             ));
                             let previous_fiber = context.active_fiber.replace(fiber.id());
+                            let runtime = std::ptr::from_mut(context).cast::<std::ffi::c_void>();
                             let outcome = execution
                                 .handle
-                                .invoke_i64_same_artifact_transition(
+                                .invoke_i64_same_artifact_transition_runtime(
                                     &execution.state,
                                     php_jit::JIT_RUNTIME_ABI_HASH,
+                                    runtime,
                                 )
                                 .map_err(|error| {
                                     format!("native fiber caller resume failed: {error:?}")
@@ -1316,14 +1328,16 @@ pub(super) fn execute_native_fiber_method(
                     }
                 }
                 let previous_fiber = context.active_fiber.replace(fiber.id());
+                let runtime = std::ptr::from_mut(&mut *context).cast::<std::ffi::c_void>();
                 let outcome = execution
                     .handle
-                    .invoke_i64_suspension_resume_with_native_unwind(
+                    .invoke_i64_suspension_resume_with_native_unwind_runtime(
                         &execution.arguments,
                         &execution.state,
                         kind,
                         value,
                         php_jit::JIT_RUNTIME_ABI_HASH,
+                        runtime,
                         |types, value| native_catch_matches(context, types, value),
                     )
                     .map_err(|error| format!("native fiber resume failed: {error:?}"))?;
@@ -1375,31 +1389,13 @@ pub(super) fn invoke_native_encoded_callable_value_from(
     metadata: Option<Vec<php_ir::instruction::IrCallArg>>,
     caller_function: Option<u32>,
 ) -> Result<i64, String> {
-    let metadata = metadata.unwrap_or_else(|| {
-        encoded
-            .iter()
-            .skip(1)
-            .map(|_| php_ir::instruction::IrCallArg {
-                name: None,
-                value: php_ir::Operand::Register(php_ir::RegId::new(0)),
-                unpack: false,
-                value_kind: php_ir::instruction::IrCallArgValueKind::Direct,
-                by_ref_local: None,
-                by_ref_dim: None,
-                by_ref_property: None,
-                by_ref_property_dim: None,
-            })
-            .collect()
-    });
-    let call = php_ir::Instruction {
-        id: source.id,
-        span: source.span,
-        kind: php_ir::InstructionKind::CallCallable {
-            dst: php_ir::RegId::new(0),
-            callee: php_ir::Operand::Register(php_ir::RegId::new(0)),
-            args: metadata,
-        },
-    };
-    execute_native_dynamic_callable(context, &call, &encoded, caller_function)
-        .unwrap_or_else(|| Err("dynamic callable dispatch was not selected".to_owned()))
+    execute_native_dynamic_callable(
+        context,
+        source,
+        encoded,
+        caller_function,
+        metadata.as_deref(),
+        true,
+    )
+    .unwrap_or_else(|| Err("dynamic callable dispatch was not selected".to_owned()))
 }

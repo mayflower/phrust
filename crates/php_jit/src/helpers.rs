@@ -6,7 +6,7 @@ pub use php_runtime::api::JitHelperId;
 
 /// Stable ABI fingerprint for the helper-symbol registry. Bumped whenever the
 /// registry's symbol set or any helper ABI changes.
-pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4820_0000_0011;
+pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4820_0000_0018;
 
 /// Helper argument kind.
 #[repr(u32)]
@@ -36,6 +36,8 @@ pub enum JitHelperReturnKind {
     Void = 3,
     /// Helper returns a status code and writes the value through an out pointer.
     Status = 4,
+    /// Helper returns a two-word value/status record in result registers.
+    ValueStatus = 5,
 }
 
 /// Stable helper symbol metadata.
@@ -63,6 +65,11 @@ const NATIVE_CONTEXT_POINTERS_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::U64,
     JitHelperArgKind::U64,
 ];
+const NATIVE_FUNCTION_RESOLVE_ARGS: &[JitHelperArgKind] = &[
+    JitHelperArgKind::VmContext,
+    JitHelperArgKind::U64,
+    JitHelperArgKind::U64,
+];
 const NATIVE_FRAME_ALLOC_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::VmContext,
     JitHelperArgKind::U64,
@@ -70,24 +77,18 @@ const NATIVE_FRAME_ALLOC_ARGS: &[JitHelperArgKind] = &[
 ];
 const NATIVE_FRAME_RELEASE_ARGS: &[JitHelperArgKind] =
     &[JitHelperArgKind::VmContext, JitHelperArgKind::U64];
-const NATIVE_OP_0_ARGS: &[JitHelperArgKind] = &[JitHelperArgKind::I64, JitHelperArgKind::U64];
-const NATIVE_OP_1_ARGS: &[JitHelperArgKind] = &[
-    JitHelperArgKind::I64,
-    JitHelperArgKind::Value,
-    JitHelperArgKind::U64,
-];
+const NATIVE_OP_0_ARGS: &[JitHelperArgKind] = &[JitHelperArgKind::I64];
+const NATIVE_OP_1_ARGS: &[JitHelperArgKind] = &[JitHelperArgKind::I64, JitHelperArgKind::Value];
 const NATIVE_OP_2_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::I64,
     JitHelperArgKind::Value,
     JitHelperArgKind::Value,
-    JitHelperArgKind::U64,
 ];
 const NATIVE_OP_3_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::I64,
     JitHelperArgKind::Value,
     JitHelperArgKind::Value,
     JitHelperArgKind::Value,
-    JitHelperArgKind::U64,
 ];
 const NATIVE_OP_4_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::I64,
@@ -95,7 +96,6 @@ const NATIVE_OP_4_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::Value,
     JitHelperArgKind::Value,
     JitHelperArgKind::Value,
-    JitHelperArgKind::U64,
 ];
 const NATIVE_OP_5_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::I64,
@@ -104,7 +104,6 @@ const NATIVE_OP_5_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::Value,
     JitHelperArgKind::Value,
     JitHelperArgKind::Value,
-    JitHelperArgKind::U64,
 ];
 const NATIVE_CONTEXT_VALUE_OUT_ARGS: &[JitHelperArgKind] =
     &[JitHelperArgKind::Value, JitHelperArgKind::U64];
@@ -118,7 +117,18 @@ const NATIVE_BUILTIN_DISPATCH_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::I64,
     JitHelperArgKind::I64,
     JitHelperArgKind::I64,
+    JitHelperArgKind::I64,
+    JitHelperArgKind::I64,
     JitHelperArgKind::U64,
+    JitHelperArgKind::I64,
+    JitHelperArgKind::U64,
+    JitHelperArgKind::I64,
+    JitHelperArgKind::U64,
+];
+const NATIVE_SEMANTIC_DISPATCH_ARGS: &[JitHelperArgKind] = &[
+    JitHelperArgKind::I64,
+    JitHelperArgKind::I64,
+    JitHelperArgKind::I64,
     JitHelperArgKind::I64,
     JitHelperArgKind::U64,
     JitHelperArgKind::I64,
@@ -149,7 +159,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(16),
         name: "phrust_native_unary",
         args: NATIVE_OP_1_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "typed PHP unary operation",
@@ -158,7 +168,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(17),
         name: "phrust_native_binary",
         args: NATIVE_OP_4_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "typed PHP binary operation",
@@ -167,7 +177,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(18),
         name: "phrust_native_compare",
         args: NATIVE_OP_2_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: false,
         description: "typed PHP comparison",
@@ -176,7 +186,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(19),
         name: "phrust_native_cast",
         args: NATIVE_OP_1_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "typed PHP cast",
@@ -194,7 +204,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(21),
         name: "phrust_native_local_fetch",
         args: NATIVE_OP_5_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "local and superglobal load",
@@ -203,7 +213,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(22),
         name: "phrust_native_local_store",
         args: NATIVE_OP_4_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "local or reference-cell store",
@@ -212,7 +222,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(23),
         name: "phrust_native_value_lifecycle",
         args: NATIVE_OP_1_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: false,
         has_side_effects: true,
         description: "request-owned value retain or release",
@@ -221,7 +231,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(24),
         name: "phrust_native_reference_bind",
         args: NATIVE_OP_3_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "PHP reference binding",
@@ -230,7 +240,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(25),
         name: "phrust_native_return_check",
         args: NATIVE_OP_2_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "declared return-type enforcement",
@@ -239,7 +249,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(26),
         name: "phrust_native_exception_new",
         args: NATIVE_OP_3_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "throwable materialization",
@@ -248,7 +258,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(27),
         name: "phrust_native_array_new",
         args: NATIVE_OP_0_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "PHP array allocation",
@@ -257,7 +267,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(28),
         name: "phrust_native_object_new",
         args: NATIVE_OP_0_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "PHP object allocation",
@@ -266,7 +276,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(29),
         name: "phrust_native_property_fetch",
         args: NATIVE_OP_3_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "object property read",
@@ -275,7 +285,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(30),
         name: "phrust_native_property_assign",
         args: NATIVE_OP_4_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "object property write",
@@ -284,7 +294,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(31),
         name: "phrust_native_object_clone",
         args: NATIVE_OP_1_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "PHP object clone",
@@ -293,7 +303,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(32),
         name: "phrust_native_object_clone_with",
         args: NATIVE_OP_2_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "PHP object clone with replacement properties",
@@ -302,7 +312,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(33),
         name: "phrust_native_array_insert",
         args: NATIVE_OP_3_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "PHP array insert or append",
@@ -311,7 +321,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(34),
         name: "phrust_native_array_fetch",
         args: NATIVE_OP_2_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "PHP array dimension fetch",
@@ -320,7 +330,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(35),
         name: "phrust_native_array_unset",
         args: NATIVE_OP_2_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "PHP array dimension unset",
@@ -329,7 +339,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(36),
         name: "phrust_native_array_spread",
         args: NATIVE_OP_2_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "PHP array spread",
@@ -338,7 +348,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(37),
         name: "phrust_native_foreach_init",
         args: NATIVE_OP_3_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "foreach iterator initialization",
@@ -365,7 +375,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(40),
         name: "phrust_native_constant_fetch",
         args: NATIVE_OP_2_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "runtime constant lookup",
@@ -419,7 +429,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(46),
         name: "phrust_native_argument_check",
         args: NATIVE_OP_5_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "direct-call declared parameter type enforcement",
@@ -427,7 +437,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
     JitHelperSymbol {
         id: JitHelperId(47),
         name: "phrust_jit_native_function_resolve",
-        args: NATIVE_CONTEXT_POINTERS_ARGS,
+        args: NATIVE_FUNCTION_RESOLVE_ARGS,
         returns: JitHelperReturnKind::Status,
         can_throw: true,
         has_side_effects: true,
@@ -437,7 +447,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(48),
         name: "phrust_native_type_predicate",
         args: NATIVE_OP_1_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: false,
         has_side_effects: false,
         description: "direct PHP type predicate",
@@ -446,7 +456,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(49),
         name: "phrust_native_stable_length",
         args: NATIVE_OP_3_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: false,
         description: "typed strlen/count fallback for stable value views",
@@ -455,7 +465,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(50),
         name: "phrust_native_array_insert_local",
         args: NATIVE_OP_3_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: true,
         has_side_effects: true,
         description: "PHP array insert consuming and replacing one local owner",
@@ -464,7 +474,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         id: JitHelperId(51),
         name: "phrust_native_string_predicate",
         args: NATIVE_OP_2_ARGS,
-        returns: JitHelperReturnKind::Status,
+        returns: JitHelperReturnKind::ValueStatus,
         can_throw: false,
         has_side_effects: false,
         description: "direct PHP string contains/starts-with/ends-with predicate",
@@ -477,6 +487,15 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         can_throw: true,
         has_side_effects: true,
         description: "direct stable-ID builtin dispatch without a generic call frame",
+    },
+    JitHelperSymbol {
+        id: JitHelperId(53),
+        name: "phrust_jit_native_semantic_dispatch",
+        args: NATIVE_SEMANTIC_DISPATCH_ARGS,
+        returns: JitHelperReturnKind::Status,
+        can_throw: true,
+        has_side_effects: true,
+        description: "direct typed semantic dispatch without a generic call frame",
     },
 ];
 
@@ -506,6 +525,7 @@ pub fn resolve_helper_address(
     match helper.name {
         "phrust_jit_native_call_dispatch" => Some(runtime.native_call_dispatch),
         "phrust_jit_native_builtin_dispatch" => Some(runtime.native_builtin_dispatch),
+        "phrust_jit_native_semantic_dispatch" => Some(runtime.native_semantic_dispatch),
         "phrust_jit_native_function_resolve" => Some(runtime.native_function_resolve),
         "phrust_native_frame_alloc" => Some(runtime.native_frame_alloc),
         "phrust_native_frame_release" => Some(runtime.native_frame_release),
@@ -594,7 +614,7 @@ mod tests {
             JIT_HELPER_SYMBOLS.first().expect("first").id,
             JitHelperId(14)
         );
-        assert_eq!(JIT_HELPER_SYMBOLS.last().expect("last").id, JitHelperId(52));
+        assert_eq!(JIT_HELPER_SYMBOLS.last().expect("last").id, JitHelperId(53));
     }
 
     #[test]

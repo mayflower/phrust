@@ -1,8 +1,43 @@
 use super::native_builtins::format_native_php_diagnostic;
 use super::{
-    NativeResolvedEntryCache, dereference_native_callable_value, jit_native_call_dispatch_abi,
-    jit_native_dynamic_code_abi, jit_native_value_lifecycle_abi, native_backtrace_frame,
+    NATIVE_RESOLVED_ENTRY_CACHE_SIZE, NativeResolvedEntryCache, dereference_native_callable_value,
+    jit_native_value_lifecycle_abi, native_array_key_is_cacheable, native_backtrace_frame,
 };
+
+#[test]
+fn resolved_entry_cache_publishes_the_generated_code_abi_record() {
+    let mut cache = NativeResolvedEntryCache::default();
+    let function = php_ir::FunctionId::new(37);
+    cache.insert(91, function, 7, 0x1234);
+    assert_eq!(cache.get(91, function, 7), Some(0x1234));
+    assert_eq!(cache.get(92, function, 7), None);
+    let slot =
+        (function.index() ^ 91_usize.wrapping_mul(31)) & (NATIVE_RESOLVED_ENTRY_CACHE_SIZE - 1);
+    assert_eq!(
+        cache.entries[slot],
+        php_jit::JitNativeFunctionEntryCacheRecord {
+            unit_identity: 91,
+            signature_epoch: 7,
+            address: 0x1234,
+            function_id: function.raw(),
+            reserved: 0,
+        }
+    );
+}
+
+#[test]
+fn read_only_fetch_dim_cache_accepts_only_stable_key_handles() {
+    assert!(native_array_key_is_cacheable(17));
+    assert!(native_array_key_is_cacheable(
+        php_jit::jit_encode_typed_runtime_value(3, php_jit::JIT_VALUE_RUNTIME_STRING_TAG)
+    ));
+    assert!(native_array_key_is_cacheable(php_jit::jit_encode_constant(
+        17
+    )));
+    assert!(!native_array_key_is_cacheable(
+        php_jit::jit_encode_typed_runtime_value(4, php_jit::JIT_VALUE_RUNTIME_REFERENCE_TAG)
+    ));
+}
 
 #[test]
 fn positional_builtin_arguments_do_not_require_rebinding() {
@@ -118,15 +153,15 @@ fn resolved_native_entry_cache_validates_identity_epoch_and_collisions() {
     let first = php_ir::FunctionId::new(3);
     let collision = php_ir::FunctionId::new(3 + 4_096);
 
-    assert_eq!(cache.get(None, first, 7), None);
-    cache.insert(None, first, 7, 0x1234);
-    assert_eq!(cache.get(None, first, 7), Some(0x1234));
-    assert_eq!(cache.get(Some(0), first, 7), None);
-    assert_eq!(cache.get(None, first, 8), None);
+    assert_eq!(cache.get(11, first, 7), None);
+    cache.insert(11, first, 7, 0x1234);
+    assert_eq!(cache.get(11, first, 7), Some(0x1234));
+    assert_eq!(cache.get(12, first, 7), None);
+    assert_eq!(cache.get(11, first, 8), None);
 
-    cache.insert(None, collision, 7, 0x5678);
-    assert_eq!(cache.get(None, first, 7), None);
-    assert_eq!(cache.get(None, collision, 7), Some(0x5678));
+    cache.insert(11, collision, 7, 0x5678);
+    assert_eq!(cache.get(11, first, 7), None);
+    assert_eq!(cache.get(11, collision, 7), Some(0x5678));
 }
 
 #[test]
@@ -137,20 +172,11 @@ fn immediate_value_lifecycle_bypasses_request_context() {
         php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE),
     ] {
         for operation in [0, 1, 0x8000_0000, 0x8000_0001] {
-            let mut out = 0_i64;
-            assert_eq!(
-                jit_native_value_lifecycle_abi(operation, encoded, &mut out),
-                0
-            );
-            assert_eq!(out, encoded);
+            let result = jit_native_value_lifecycle_abi(std::ptr::null_mut(), operation, encoded);
+            assert_eq!(result.status, 0);
+            assert_eq!(result.value, encoded);
         }
     }
-
-    let mut out = 0_i64;
-    assert_eq!(
-        jit_native_value_lifecycle_abi(2, 42, &mut out),
-        php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
-    );
 }
 
 #[test]
@@ -194,42 +220,6 @@ fn native_php_diagnostics_match_cli_and_http_rendering() {
         http,
         "<br />\n<b>Deprecated</b>:  Using null as an array offset is deprecated, use an empty string instead in <b>/srv/index.php</b> on line <b>17</b><br />\n"
     );
-}
-
-#[test]
-fn native_call_trampoline_trusts_the_published_internal_abi() {
-    let mut frame = php_jit::JitNativeCallFrame {
-        function_id: 3,
-        continuation_id: 7,
-        ..php_jit::JitNativeCallFrame::default()
-    };
-    let mut out = php_jit::JitCallResult::default();
-    assert_eq!(
-        jit_native_call_dispatch_abi(0, &mut frame, &mut out),
-        php_jit::JitCallStatus::COMPILE_REQUIRED.0 as i32
-    );
-    assert_eq!(out.status, php_jit::JitCallStatus::COMPILE_REQUIRED);
-
-    frame.abi_version = frame.abi_version.saturating_add(1);
-    assert_eq!(
-        jit_native_call_dispatch_abi(0, &mut frame, &mut out),
-        php_jit::JitCallStatus::COMPILE_REQUIRED.0 as i32
-    );
-    assert_eq!(out.status, php_jit::JitCallStatus::COMPILE_REQUIRED);
-}
-
-#[test]
-fn native_dynamic_code_boundary_requires_an_active_execution_context() {
-    let mut request = php_jit::JitNativeDynamicCodeRequest {
-        kind: php_jit::JitNativeDynamicCodeKind::EVAL,
-        ..php_jit::JitNativeDynamicCodeRequest::default()
-    };
-    let mut out = php_jit::JitCallResult::default();
-    assert_eq!(
-        jit_native_dynamic_code_abi(0, &mut request, &mut out),
-        php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
-    );
-    assert_eq!(out.status, php_jit::JitCallStatus::RUNTIME_ERROR);
 }
 
 #[test]

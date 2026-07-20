@@ -10,6 +10,7 @@ use super::*;
 // caller-owned machine-word slot checked before it is written.
 #[allow(unsafe_code)]
 pub(in crate::vm) extern "C" fn jit_native_function_resolve_abi(
+    runtime: *mut NativeRequestFastState,
     _vm_context: u64,
     function: u64,
     out: *mut usize,
@@ -21,7 +22,7 @@ pub(in crate::vm) extern "C" fn jit_native_function_resolve_abi(
         return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
     };
     let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        with_native_context(|context| {
+        with_native_context_for(runtime, "function_resolve", |context| {
             let function = php_ir::FunctionId::new(function);
             let unit = context.current_dynamic_unit;
             if let Some(address) = context.resolved_native_entry_address(unit, function) {
@@ -50,7 +51,9 @@ pub(in crate::vm) extern "C" fn jit_native_function_resolve_abi(
             0
         }
         Ok(Some(Err(message))) => {
-            let _ = with_native_context(|context| publish_native_call_diagnostic(context, message));
+            let _ = with_native_context_for(runtime, "function_resolve", |context| {
+                publish_native_call_diagnostic(context, message)
+            });
             php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
         }
         Ok(None) => php_jit::JitCallStatus::COMPILE_REQUIRED.0 as i32,
@@ -367,13 +370,6 @@ pub(super) fn collect_visible_external_function_signatures(
                 .unit()
                 .functions
                 .get(target.function.index())?;
-            // Ordinary by-value calls need no compile-time cross-unit
-            // contract: the runtime binder clears speculative local flags and
-            // dimension/property locations remain values. Only a by-reference
-            // parameter changes the generated caller's lvalue preparation.
-            if !function.params.iter().any(|parameter| parameter.by_ref) {
-                return None;
-            }
             Some(php_jit::JitExternalFunctionSignature {
                 // Match the source unit's call target. The lowering lookup is
                 // intentionally independent of the publishing unit's spelling.
@@ -431,7 +427,11 @@ pub(super) fn native_external_class_ref<'a>(
         .class_aliases
         .get(requested.as_ref())
         .map_or(requested.as_ref(), String::as_str);
-    let unit = *context.external_class_units.get(normalized)?;
+    let unit = context
+        .external_class_units
+        .get(normalized)
+        .copied()
+        .or_else(|| context.deployment_classes.contains(normalized).then_some(0))?;
     if context.current_dynamic_unit == Some(unit) {
         return None;
     }

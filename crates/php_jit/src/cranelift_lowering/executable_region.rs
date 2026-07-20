@@ -888,12 +888,13 @@ fn declare_value_operation(
 ) -> Result<NativeHelper, CraneliftLoweringError> {
     let pointer_type = module.target_config().pointer_type();
     let mut signature = module.make_signature();
+    signature.params.push(AbiParam::new(pointer_type));
     signature.params.push(AbiParam::new(types::I32));
     for _ in 0..arity {
         signature.params.push(AbiParam::new(types::I64));
     }
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.returns.push(AbiParam::new(types::I32));
+    signature.returns.push(AbiParam::new(types::I64));
+    signature.returns.push(AbiParam::new(types::I64));
     let import_symbol = native_helper_import_symbol(symbol, address);
     let function = module
         .declare_function(&import_symbol, Linkage::Import, &signature)
@@ -907,6 +908,8 @@ fn declare_value_operation(
         function,
         terminal_exit: None,
         inline_runtime_view: false,
+        register_value_result: true,
+        runtime: None,
     })
 }
 
@@ -916,9 +919,12 @@ fn declare_native_helper(
     signature: &ir::Signature,
     address: usize,
 ) -> Result<NativeHelper, CraneliftLoweringError> {
+    let pointer_type = module.target_config().pointer_type();
+    let mut signature = signature.clone();
+    signature.params.insert(0, AbiParam::new(pointer_type));
     let import_symbol = native_helper_import_symbol(symbol, address);
     let function = module
-        .declare_function(&import_symbol, Linkage::Import, signature)
+        .declare_function(&import_symbol, Linkage::Import, &signature)
         .map_err(|error| {
             CraneliftLoweringError::new(
                 "JIT_CRANELIFT_REJECT_NATIVE_OPERATION",
@@ -929,6 +935,8 @@ fn declare_native_helper(
         function,
         terminal_exit: None,
         inline_runtime_view: false,
+        register_value_result: false,
+        runtime: None,
     })
 }
 
@@ -944,6 +952,11 @@ pub(super) fn compile_region_graph_native(
         CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_REGION_VERIFY", error.to_string())
     })?;
     let function = region.function;
+    let runtime_unit_identity = if request.deployment_runtime_identity == 0 {
+        u64::from(unit.id.raw())
+    } else {
+        request.deployment_runtime_identity
+    };
     let mut regions = BTreeMap::from([(function, region)]);
     for candidate in regions.values_mut() {
         if candidate.compile_metadata.tier == NativeCompilerTier::Optimizing {
@@ -1065,13 +1078,14 @@ pub(super) fn compile_region_graph_native(
                 matches!(
                     kind,
                     RegionInstructionKind::NativeCall(call)
-                        if matches!(call.result, RegionCallResult::ReferenceLocal(_))
+                        if !matches!(call.target, RegionCallTarget::Semantic { .. })
+                            && (matches!(call.result, RegionCallResult::ReferenceLocal(_))
                             || call.args.iter().any(|argument| {
                                 argument.name.is_some() || argument.unpack
                             })
                             || call.direct_compiled_target().is_some_and(|target| {
                                 trampoline_functions.contains(&target)
-                            })
+                            }))
                 )
             })
     });
@@ -1101,6 +1115,12 @@ pub(super) fn compile_region_graph_native(
                 if stable_builtin_helper_id(&call.target).is_some())
         })
     });
+    let needs_semantic_dispatch = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(kind, RegionInstructionKind::NativeCall(call)
+                if matches!(call.target, RegionCallTarget::Semantic { .. }))
+        })
+    });
     let needs_frame_arena = runtime_helpers.native_frame_alloc != 0
         && runtime_helpers.native_frame_release != 0
         && regions.values().any(|region| {
@@ -1120,6 +1140,12 @@ pub(super) fn compile_region_graph_native(
             "direct builtin call requires the stable-ID native builtin dispatcher",
         ));
     }
+    if needs_semantic_dispatch && runtime_helpers.native_semantic_dispatch == 0 {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_NATIVE_SEMANTIC_DISPATCH",
+            "typed semantic operation requires the direct semantic dispatcher",
+        ));
+    }
     let needs_dynamic_code = regions.values().any(RegionGraph::has_native_dynamic_code);
     if needs_dynamic_code && runtime_helpers.native_dynamic_code == 0 {
         return Err(CraneliftLoweringError::new(
@@ -1129,6 +1155,7 @@ pub(super) fn compile_region_graph_native(
     }
     let native_call_symbol = NATIVE_CALL_DISPATCH_SYMBOL.to_owned();
     let native_builtin_dispatch_symbol = NATIVE_BUILTIN_DISPATCH_SYMBOL.to_owned();
+    let native_semantic_dispatch_symbol = NATIVE_SEMANTIC_DISPATCH_SYMBOL.to_owned();
     let native_function_resolve_symbol = NATIVE_FUNCTION_RESOLVE_SYMBOL.to_owned();
     let native_dynamic_code_symbol = NATIVE_DYNAMIC_CODE_SYMBOL.to_owned();
     let needs_unary = regions.values().any(|region| {
@@ -1447,6 +1474,12 @@ pub(super) fn compile_region_graph_native(
             runtime_helpers.native_builtin_dispatch,
         ));
     }
+    if needs_semantic_dispatch {
+        imports.push((
+            native_semantic_dispatch_symbol.clone(),
+            runtime_helpers.native_semantic_dispatch,
+        ));
+    }
     if needs_function_resolver {
         imports.push((
             native_function_resolve_symbol.clone(),
@@ -1473,25 +1506,25 @@ pub(super) fn compile_region_graph_native(
         (
             needs_unary,
             runtime_helpers.native_unary,
-            test_native_unary_fallback as *const () as usize,
+            test_native_unary_register_fallback as *const () as usize,
             "phrust_native_unary",
         ),
         (
             needs_binary,
             runtime_helpers.native_binary,
-            test_native_binary_fallback as *const () as usize,
+            test_native_binary_register_fallback as *const () as usize,
             "phrust_native_binary",
         ),
         (
             needs_compare,
             runtime_helpers.native_compare,
-            test_native_compare_fallback as *const () as usize,
+            test_native_compare_register_fallback as *const () as usize,
             "phrust_native_compare",
         ),
         (
             needs_cast,
             runtime_helpers.native_cast,
-            test_native_cast_fallback as *const () as usize,
+            test_native_cast_register_fallback as *const () as usize,
             "phrust_native_cast",
         ),
         (
@@ -1503,91 +1536,91 @@ pub(super) fn compile_region_graph_native(
         (
             needs_local_fetch,
             runtime_helpers.native_local_fetch,
-            test_native_local_fetch_fallback as *const () as usize,
+            test_native_local_fetch_register_fallback as *const () as usize,
             "phrust_native_local_fetch",
         ),
         (
             needs_local_store,
             runtime_helpers.native_local_store,
-            test_native_local_store_fallback as *const () as usize,
+            test_native_local_store_register_fallback as *const () as usize,
             "phrust_native_local_store",
         ),
         (
             needs_value_lifecycle,
             runtime_helpers.native_value_lifecycle,
-            test_native_value_lifecycle_fallback as *const () as usize,
+            test_native_value_lifecycle_register_fallback as *const () as usize,
             "phrust_native_value_lifecycle",
         ),
         (
             needs_reference_bind,
             runtime_helpers.native_reference_bind,
-            test_native_reference_bind_fallback as *const () as usize,
+            test_native_reference_bind_register_fallback as *const () as usize,
             "phrust_native_reference_bind",
         ),
         (
             needs_argument_check,
             runtime_helpers.native_argument_check,
-            test_native_argument_check_fallback as *const () as usize,
+            test_native_argument_check_register_fallback as *const () as usize,
             "phrust_native_argument_check",
         ),
         (
             needs_return_check,
             runtime_helpers.native_return_check,
-            test_native_return_check_fallback as *const () as usize,
+            test_native_return_check_register_fallback as *const () as usize,
             "phrust_native_return_check",
         ),
         (
             needs_exception_new,
             runtime_helpers.native_exception_new,
-            test_native_exception_new_fallback as *const () as usize,
+            test_native_exception_new_register_fallback as *const () as usize,
             "phrust_native_exception_new",
         ),
         (
             needs_array_new,
             runtime_helpers.native_array_new,
-            test_native_array_new_fallback as *const () as usize,
+            test_native_array_new_register_fallback as *const () as usize,
             "phrust_native_array_new",
         ),
         (
             needs_object_new,
             runtime_helpers.native_object_new,
-            test_native_object_new_fallback as *const () as usize,
+            test_native_object_new_register_fallback as *const () as usize,
             "phrust_native_object_new",
         ),
         (
             needs_property_fetch,
             runtime_helpers.native_property_fetch,
-            test_native_property_fetch_fallback as *const () as usize,
+            test_native_property_fetch_register_fallback as *const () as usize,
             "phrust_native_property_fetch",
         ),
         (
             needs_property_assign,
             runtime_helpers.native_property_assign,
-            test_native_property_assign_fallback as *const () as usize,
+            test_native_property_assign_register_fallback as *const () as usize,
             "phrust_native_property_assign",
         ),
         (
             needs_object_clone,
             runtime_helpers.native_object_clone,
-            test_native_object_clone_fallback as *const () as usize,
+            test_native_object_clone_register_fallback as *const () as usize,
             "phrust_native_object_clone",
         ),
         (
             needs_object_clone_with,
             runtime_helpers.native_object_clone_with,
-            test_native_object_clone_with_fallback as *const () as usize,
+            test_native_object_clone_with_register_fallback as *const () as usize,
             "phrust_native_object_clone_with",
         ),
         (
             needs_array_insert,
             runtime_helpers.native_array_insert,
-            test_native_array_insert_fallback as *const () as usize,
+            test_native_array_insert_register_fallback as *const () as usize,
             "phrust_native_array_insert",
         ),
         (
             needs_array_insert,
             runtime_helpers.native_array_insert_local,
-            test_native_array_insert_fallback as *const () as usize,
+            test_native_array_insert_register_fallback as *const () as usize,
             "phrust_native_array_insert_local",
         ),
         (
@@ -1599,19 +1632,19 @@ pub(super) fn compile_region_graph_native(
         (
             needs_array_unset,
             runtime_helpers.native_array_unset,
-            test_native_array_unset_fallback as *const () as usize,
+            test_native_array_unset_register_fallback as *const () as usize,
             "phrust_native_array_unset",
         ),
         (
             needs_array_spread,
             runtime_helpers.native_array_spread,
-            test_native_array_spread_fallback as *const () as usize,
+            test_native_array_spread_register_fallback as *const () as usize,
             "phrust_native_array_spread",
         ),
         (
             needs_foreach_init,
             runtime_helpers.native_foreach_init,
-            test_native_foreach_init_fallback as *const () as usize,
+            test_native_foreach_init_register_fallback as *const () as usize,
             "phrust_native_foreach_init",
         ),
         (
@@ -1629,7 +1662,7 @@ pub(super) fn compile_region_graph_native(
         (
             needs_constant_fetch,
             runtime_helpers.native_constant_fetch,
-            test_native_constant_fetch_fallback as *const () as usize,
+            test_native_constant_fetch_register_fallback as *const () as usize,
             "phrust_native_constant_fetch",
         ),
         (
@@ -1641,19 +1674,19 @@ pub(super) fn compile_region_graph_native(
         (
             needs_type_predicate,
             runtime_helpers.native_type_predicate,
-            test_native_type_predicate_fallback as *const () as usize,
+            test_native_type_predicate_register_fallback as *const () as usize,
             "phrust_native_type_predicate",
         ),
         (
             needs_stable_length,
             runtime_helpers.native_stable_length,
-            test_native_stable_length_fallback as *const () as usize,
+            test_native_stable_length_register_fallback as *const () as usize,
             "phrust_native_stable_length",
         ),
         (
             needs_string_predicate,
             runtime_helpers.native_string_predicate,
-            test_native_string_predicate_fallback as *const () as usize,
+            test_native_string_predicate_register_fallback as *const () as usize,
             "phrust_native_string_predicate",
         ),
         (
@@ -1775,6 +1808,8 @@ pub(super) fn compile_region_graph_native(
                 signature.params.push(AbiParam::new(types::I32));
                 signature.params.push(AbiParam::new(types::I32));
                 signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(types::I32));
                 signature.params.push(AbiParam::new(pointer_type));
                 signature.params.push(AbiParam::new(types::I32));
                 signature.params.push(AbiParam::new(pointer_type));
@@ -1786,6 +1821,23 @@ pub(super) fn compile_region_graph_native(
                     &native_builtin_dispatch_symbol,
                     &signature,
                     helper_address(&native_builtin_dispatch_symbol),
+                )?);
+            }
+            if needs_semantic_dispatch {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.returns.push(AbiParam::new(types::I32));
+                native_operations.semantic_dispatch = Some(declare_native_helper(
+                    module,
+                    &native_semantic_dispatch_symbol,
+                    &signature,
+                    helper_address(&native_semantic_dispatch_symbol),
                 )?);
             }
             if needs_function_resolver {
@@ -2191,34 +2243,6 @@ pub(super) fn compile_region_graph_native(
                     ))
                 })
                 .collect::<BTreeMap<_, _>>();
-            for (index, signature) in request.external_function_signatures.iter().enumerate() {
-                let Ok(index) = u32::try_from(index) else {
-                    break;
-                };
-                let function_id = FunctionId::new(u32::MAX.saturating_sub(index));
-                if function_params.contains_key(&function_id) {
-                    continue;
-                }
-                let params = signature
-                    .params
-                    .iter()
-                    .enumerate()
-                    .map(|(index, parameter)| php_ir::IrParam {
-                        name: parameter.name.clone(),
-                        local: LocalId::new(u32::try_from(index).unwrap_or(u32::MAX)),
-                        required: false,
-                        default: None,
-                        type_: None,
-                        by_ref: parameter.by_ref,
-                        variadic: parameter.variadic,
-                        attributes: Vec::new(),
-                    })
-                    .collect::<Vec<_>>();
-                function_params.insert(
-                    function_id,
-                    (signature.name.clone(), params, true, signature.params.len()),
-                );
-            }
             function_params.extend(regions.iter().map(|(function, region)| {
                 (
                     *function,
@@ -2259,6 +2283,7 @@ pub(super) fn compile_region_graph_native(
                                     &inline_constants,
                                     &tail_forwards,
                                     &function_params,
+                                    &request.external_function_signatures,
                                     native_call_helper,
                                     native_dynamic_code_helper,
                                     native_operations,
@@ -2268,6 +2293,7 @@ pub(super) fn compile_region_graph_native(
                                         fragment,
                                         functions: &fragment_functions,
                                     }),
+                                    runtime_unit_identity,
                                     mode,
                                     layout.fragments.len() == 1,
                                     true,
@@ -2416,6 +2442,7 @@ pub(super) fn compile_region_graph_native(
                                     &inline_constants,
                                     &tail_forwards,
                                     &function_params,
+                                    &request.external_function_signatures,
                                     native_call_helper,
                                     native_dynamic_code_helper,
                                     native_operations,
@@ -2425,6 +2452,7 @@ pub(super) fn compile_region_graph_native(
                                         fragment,
                                         functions: &fragment_functions,
                                     }),
+                                    runtime_unit_identity,
                                     compilation_mode,
                                     true,
                                     false,
@@ -2469,6 +2497,7 @@ pub(super) fn compile_region_graph_native(
                                     &inline_constants,
                                     &tail_forwards,
                                     &function_params,
+                                    &request.external_function_signatures,
                                     native_call_helper,
                                     native_dynamic_code_helper,
                                     native_operations,
@@ -2478,6 +2507,7 @@ pub(super) fn compile_region_graph_native(
                                         fragment,
                                         functions: &fragment_functions,
                                     }),
+                                    runtime_unit_identity,
                                     compilation_mode,
                                     false,
                                     false,
@@ -2531,11 +2561,13 @@ pub(super) fn compile_region_graph_native(
                             &inline_constants,
                             &tail_forwards,
                             &function_params,
+                            &request.external_function_signatures,
                             native_call_helper,
                             native_dynamic_code_helper,
                             native_operations,
                             &register_liveness,
                             None,
+                            runtime_unit_identity,
                             compilation_mode,
                             false,
                             false,
@@ -3155,6 +3187,7 @@ fn region_fragment_signature(
         signature.call_conv = CallConv::Tail;
     }
     signature.params.push(AbiParam::new(pointer_type));
+    signature.params.push(AbiParam::new(pointer_type));
     signature.returns.push(AbiParam::new(types::I32));
     Ok(signature)
 }
@@ -3468,11 +3501,12 @@ fn define_region_fragment_wrapper(
         builder.append_block_params_for_function_params(entry);
         builder.switch_to_block(entry);
         let params = builder.block_params(entry).to_vec();
-        let arguments = params[0];
-        let result_out = params[1];
-        let deopt_out = params[2];
-        let resume_id = params[3];
-        let resume_state = params[4];
+        let runtime = params[0];
+        let arguments = params[1];
+        let result_out = params[2];
+        let deopt_out = params[3];
+        let resume_id = params[4];
+        let resume_state = params[5];
         let frame_layout = &layout.frame;
         let frame_bytes = frame_layout.frame_bytes()?;
         let frame_slot = builder.create_sized_stack_slot(StackSlotData::new(
@@ -3617,7 +3651,7 @@ fn define_region_fragment_wrapper(
                 frame,
                 frame_layout.entry_id_offset(),
             );
-            let call = builder.ins().call(callee, &[frame]);
+            let call = builder.ins().call(callee, &[runtime, frame]);
             let status = builder.inst_results(call)[0];
             builder.ins().return_(&[status]);
         }
@@ -3798,11 +3832,13 @@ fn define_region_graph_function(
     inline_constants: &BTreeMap<FunctionId, BoundedInlineValue>,
     tail_forwards: &BTreeMap<(FunctionId, u32), FunctionId>,
     function_params: &BTreeMap<FunctionId, NativeFunctionMetadata>,
+    external_function_signatures: &[crate::JitExternalFunctionSignature],
     native_call_helper: Option<NativeHelper>,
     native_dynamic_code_helper: Option<NativeHelper>,
     native_operations: NativeOperationFunctions,
     register_liveness: &NativeRegisterLiveness,
     fragment: Option<NativeFragmentDefinition<'_>>,
+    unit_identity: u64,
     compilation_mode: crate::cranelift_lowering::baseline_streaming::NativeCompilationMode,
     inline_fragment_entry: bool,
     preflight_only: bool,
@@ -3877,6 +3913,7 @@ fn define_region_graph_function(
         builder.append_block_params_for_function_params(native_entry);
         builder.switch_to_block(native_entry);
         let params = builder.block_params(native_entry).to_vec();
+        let runtime = params[0];
         let frame_layout = fragment.map(|fragment| &fragment.layout.frame);
         let fragment_frame = if fragment.is_some() {
             if inline_fragment_entry {
@@ -3890,7 +3927,7 @@ fn define_region_graph_function(
                 ));
                 Some(builder.ins().stack_addr(pointer_type, frame_slot, 0))
             } else {
-                Some(params[0])
+                Some(params[1])
             }
         } else {
             None
@@ -3907,10 +3944,10 @@ fn define_region_graph_function(
                     if inline_fragment_entry {
                         let entry_id = builder.ins().iconst(types::I32, 0);
                         for (value, offset) in [
-                            (params[0], layout.arguments_offset()),
-                            (params[1], layout.result_out_offset()),
-                            (params[2], layout.deopt_out_offset()),
-                            (params[4], layout.resume_state_offset()),
+                            (params[1], layout.arguments_offset()),
+                            (params[2], layout.result_out_offset()),
+                            (params[3], layout.deopt_out_offset()),
+                            (params[5], layout.resume_state_offset()),
                         ] {
                             builder
                                 .ins()
@@ -3918,7 +3955,7 @@ fn define_region_graph_function(
                         }
                         builder.ins().store(
                             MemFlagsData::new(),
-                            params[3],
+                            params[4],
                             frame,
                             layout.resume_id_offset(),
                         );
@@ -3929,7 +3966,7 @@ fn define_region_graph_function(
                             layout.entry_id_offset(),
                         );
                         (
-                            params[0], params[1], params[2], params[3], params[4], entry_id,
+                            params[1], params[2], params[3], params[4], params[5], entry_id,
                         )
                     } else {
                         (
@@ -3980,11 +4017,17 @@ fn define_region_graph_function(
                     Some(entry_id),
                 )
             } else {
-                (params[0], params[1], params[2], params[3], params[4], None)
+                (params[1], params[2], params[3], params[4], params[5], None)
             };
-        let mut native_operations = native_operations.with_terminal_exit(NativeTerminalExit {
-            block: terminal_exit,
-        });
+        let native_call_helper = native_call_helper.map(|helper| helper.with_runtime(runtime));
+        let native_dynamic_code_helper =
+            native_dynamic_code_helper.map(|helper| helper.with_runtime(runtime));
+        let mut native_operations =
+            native_operations
+                .with_runtime(runtime)
+                .with_terminal_exit(NativeTerminalExit {
+                    block: terminal_exit,
+                });
         // These guards read the request-owned runtime view directly and only
         // call Rust for reference, warning, destructor, or unsupported dynamic
         // cases. Baseline code needs the same fast paths: forcing every local,
@@ -4010,6 +4053,12 @@ fn define_region_graph_function(
             .map(NativeHelper::with_inline_runtime_view);
         native_operations.stable_length = native_operations
             .stable_length
+            .map(NativeHelper::with_inline_runtime_view);
+        native_operations.array_fetch = native_operations
+            .array_fetch
+            .map(NativeHelper::with_inline_runtime_view);
+        native_operations.foreach_next = native_operations
+            .foreach_next
             .map(NativeHelper::with_inline_runtime_view);
         native_operations.string_predicate = native_operations
             .string_predicate
@@ -4760,7 +4809,14 @@ fn define_region_graph_function(
                     let callee = module.declare_func_in_func(*target, builder.func);
                     builder.ins().return_call(
                         callee,
-                        &[arguments, result_out, deopt_out, resume_id, resume_state],
+                        &[
+                            runtime,
+                            arguments,
+                            result_out,
+                            deopt_out,
+                            resume_id,
+                            resume_state,
+                        ],
                     );
                     terminated = true;
                     break;
@@ -4771,6 +4827,7 @@ fn define_region_graph_function(
                     functions,
                     inline_constants,
                     function_params,
+                    external_function_signatures,
                     native_call_helper,
                     native_dynamic_code_helper,
                     native_operations,
@@ -4798,6 +4855,7 @@ fn define_region_graph_function(
                     native_version,
                     region.flags.is_top_level,
                     &region.locals,
+                    unit_identity,
                     pointer_type,
                 )
                 .map_err(|error| {
@@ -4840,6 +4898,7 @@ fn define_region_graph_function(
                 &locals,
                 &registers,
                 result_out,
+                deopt_out,
                 pending_status,
                 pending_value,
                 module,
@@ -4932,7 +4991,7 @@ fn define_region_graph_function(
                         .expect("fragment frame layout")
                         .resume_id_offset(),
                 );
-                builder.ins().return_call(callee, &[frame]);
+                builder.ins().return_call(callee, &[runtime, frame]);
             }
         }
         if let (Some(streaming_call_exit), Some(frame)) =

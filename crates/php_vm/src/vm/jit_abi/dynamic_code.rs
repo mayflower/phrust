@@ -134,7 +134,18 @@ fn execute_native_include(
             if matches!(value, Value::Uninitialized) {
                 continue;
             }
-            inherited_globals.insert(name.clone(), value);
+            match inherited_globals.get(name).cloned() {
+                Some(Value::Reference(reference)) => match value {
+                    Value::Reference(replacement) if reference.ptr_eq(&replacement) => {}
+                    Value::Reference(replacement) => {
+                        inherited_globals.insert(name.clone(), Value::Reference(replacement));
+                    }
+                    replacement => reference.set(replacement),
+                },
+                _ => {
+                    inherited_globals.insert(name.clone(), value);
+                }
+            }
         }
     }
     NATIVE_INCLUDE_GLOBALS.with(|globals| {
@@ -212,6 +223,7 @@ fn execute_native_include(
     context.restore_include_symbols(returned_symbols);
     let exports = NATIVE_INCLUDE_EXPORTS.with(|exports| exports.borrow_mut().take());
     context.inherited_globals = returned_globals;
+    context.reconcile_native_global_reference_cache()?;
     if request.caller_frame != 0 {
         let caller_frame = request.caller_frame as *mut i64;
         for (index, name) in caller_locals.iter().enumerate() {
@@ -302,7 +314,18 @@ fn execute_native_eval(
             if matches!(value, Value::Uninitialized) {
                 continue;
             }
-            inherited_globals.insert(name.clone(), value);
+            match inherited_globals.get(name).cloned() {
+                Some(Value::Reference(reference)) => match value {
+                    Value::Reference(replacement) if reference.ptr_eq(&replacement) => {}
+                    Value::Reference(replacement) => {
+                        inherited_globals.insert(name.clone(), Value::Reference(replacement));
+                    }
+                    replacement => reference.set(replacement),
+                },
+                _ => {
+                    inherited_globals.insert(name.clone(), value);
+                }
+            }
         }
     }
     NATIVE_INCLUDE_GLOBALS.with(|globals| {
@@ -380,6 +403,7 @@ fn execute_native_eval(
     context.restore_include_symbols(returned_symbols);
     let exports = NATIVE_INCLUDE_EXPORTS.with(|exports| exports.borrow_mut().take());
     context.inherited_globals = returned_globals;
+    context.reconcile_native_global_reference_cache()?;
     if request.caller_frame != 0 {
         let caller_frame = request.caller_frame as *mut i64;
         for (index, name) in caller_locals.iter().enumerate() {
@@ -470,6 +494,7 @@ fn render_native_include_failure(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
+    runtime: *mut NativeRequestFastState,
     _vm_context: u64,
     request: *mut php_jit::JitNativeDynamicCodeRequest,
     out: *mut php_jit::JitCallResult,
@@ -477,7 +502,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
     if request.is_null() || out.is_null() {
         return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
-    let _ = with_native_context(|context| {
+    let _ = with_native_context_for(runtime, "dynamic_code", |context| {
         context.mark_roots_dirty(RootMutationReason::GlobalOrStatic);
     });
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -495,7 +520,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
                 | php_jit::JitNativeDynamicCodeKind::REQUIRE
                 | php_jit::JitNativeDynamicCodeKind::REQUIRE_ONCE
         ) {
-            with_native_context_for("dynamic_code", |context| match execute_native_include(context, request) {
+            with_native_context_for(runtime, "dynamic_code", |context| match execute_native_include(context, request) {
                 Ok(NativeDynamicCodeOutcome::Returned(value)) => {
                     (php_jit::JitCallStatus::RETURN, Some(value))
                 }
@@ -519,7 +544,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
             })
             .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
         } else if request.kind == php_jit::JitNativeDynamicCodeKind::EVAL {
-            with_native_context_for("dynamic_code", |context| match execute_native_eval(context, request) {
+            with_native_context_for(runtime, "dynamic_code", |context| match execute_native_eval(context, request) {
                 Ok(NativeDynamicCodeOutcome::Returned(value)) => {
                     (php_jit::JitCallStatus::RETURN, Some(value))
                 }
@@ -533,7 +558,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
             })
             .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
         } else if request.kind == php_jit::JitNativeDynamicCodeKind::DECLARE_FUNCTION {
-            with_native_context_for("dynamic_code", |context| {
+            with_native_context_for(runtime, "dynamic_code", |context| {
                 let function = php_ir::FunctionId::new(request.declared_function_id);
                 let Some(target) = context.unit.functions.get(function.index()) else {
                     return (php_jit::JitCallStatus::RUNTIME_ERROR, None);
@@ -549,7 +574,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
             })
             .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
         } else if request.kind == php_jit::JitNativeDynamicCodeKind::DECLARE_CLASS {
-            with_native_context_for("dynamic_code", |context| {
+            with_native_context_for(runtime, "dynamic_code", |context| {
                 let class =
                     context.unit.classes.iter().find(|class| {
                         stable_native_symbol_hash(&class.name) == request.symbol_hash
@@ -565,7 +590,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
             })
             .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
         } else if request.kind == php_jit::JitNativeDynamicCodeKind::REGISTER_CONSTANT {
-            with_native_context_for("dynamic_code", |context| {
+            with_native_context_for(runtime, "dynamic_code", |context| {
                 let instruction = context
                     .instruction_for_continuation(
                         request.caller_function_id,
@@ -605,7 +630,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
             })
             .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
         } else if request.kind == php_jit::JitNativeDynamicCodeKind::EMIT_DIAGNOSTIC {
-            with_native_context_for("dynamic_code", |context| {
+            with_native_context_for(runtime, "dynamic_code", |context| {
                 let instruction = context
                     .instruction_for_continuation(
                         request.caller_function_id,
@@ -652,7 +677,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
             })
             .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
         } else if request.kind == php_jit::JitNativeDynamicCodeKind::MAKE_CLOSURE {
-            with_native_context_for("dynamic_code", |context| {
+            with_native_context_for(runtime, "dynamic_code", |context| {
                 let captures = context
                     .instruction_for_continuation(
                         request.caller_function_id,

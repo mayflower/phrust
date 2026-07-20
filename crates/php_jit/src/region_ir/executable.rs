@@ -656,6 +656,7 @@ pub enum RegionInstructionKind {
         array: RegionOperand,
         key: RegionOperand,
         quiet: bool,
+        mode: php_ir::instruction::DimFetchMode,
     },
     FetchConst {
         dst: RegId,
@@ -917,7 +918,9 @@ impl RegionGraph {
     pub fn has_native_trampoline_calls(&self) -> bool {
         self.blocks.iter().any(|block| {
             block.instructions.iter().any(|instruction| {
-                matches!(&instruction.kind, RegionInstructionKind::NativeCall(call) if call.direct_compiled_target().is_none())
+                matches!(&instruction.kind, RegionInstructionKind::NativeCall(call)
+                    if call.direct_compiled_target().is_none()
+                        && !matches!(call.target, RegionCallTarget::Semantic { .. }))
             })
         })
     }
@@ -1670,11 +1673,13 @@ impl BaselineRegionBuilder {
                         array,
                         key,
                         quiet,
+                        mode,
                     } => RegionInstructionKind::FetchDim {
                         dst: *dst,
                         array: lower_operand(unit, *array),
                         key: lower_operand(unit, *key),
                         quiet: *quiet,
+                        mode: *mode,
                     },
                     InstructionKind::ArrayGet { dst, array, index } => {
                         RegionInstructionKind::FetchDim {
@@ -1682,6 +1687,7 @@ impl BaselineRegionBuilder {
                             array: lower_operand(unit, *array),
                             key: lower_operand(unit, *index),
                             quiet: false,
+                            mode: php_ir::instruction::DimFetchMode::Read,
                         }
                     }
                     InstructionKind::FetchConst { dst, .. } => {

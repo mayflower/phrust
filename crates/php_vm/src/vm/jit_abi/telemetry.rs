@@ -624,6 +624,10 @@ impl NativeExecutionContext<'_> {
         counters.native_value_table_high_water = counters
             .native_value_table_high_water
             .max(nested.native_value_table_high_water);
+        merge_counter_map(
+            &mut counters.native_value_table_materializations_by_kind_and_origin,
+            &nested.native_value_table_materializations_by_kind_and_origin,
+        );
         counters.native_ssa_promoted_locals = counters
             .native_ssa_promoted_locals
             .saturating_add(nested.native_ssa_promoted_locals);
@@ -656,6 +660,10 @@ impl NativeExecutionContext<'_> {
         merge_counter_map(
             &mut counters.native_call_dynamic_by_reason,
             &nested.native_call_dynamic_by_reason,
+        );
+        merge_counter_map(
+            &mut counters.native_call_dynamic_by_target,
+            &nested.native_call_dynamic_by_target,
         );
         merge_counter_map(
             &mut counters.native_builtin_calls_by_name,
@@ -900,9 +908,13 @@ impl NativeExecutionContext<'_> {
         );
     }
 
-    pub(super) fn record_value_table_allocation(&self, high_water: usize) {
+    pub(super) fn record_value_table_allocation(&self, high_water: usize, kind: &'static str) {
         if self.options.collect_counters {
             let mut telemetry = self.runtime_telemetry.borrow_mut();
+            let helper = telemetry
+                .helper_timing_stack
+                .last()
+                .map_or("outside_helper", |frame| HELPER_NAMES[frame.helper_index]);
             telemetry.counters.native_value_table_allocations = telemetry
                 .counters
                 .native_value_table_allocations
@@ -911,16 +923,30 @@ impl NativeExecutionContext<'_> {
                 .counters
                 .native_value_table_high_water
                 .max(high_water as u64);
+            *telemetry
+                .counters
+                .native_value_table_materializations_by_kind_and_origin
+                .entry(format!("{kind}@{helper}"))
+                .or_default() += 1;
         }
     }
 
-    pub(super) fn record_value_table_reuse(&self) {
+    pub(super) fn record_value_table_reuse(&self, kind: &'static str) {
         if self.options.collect_counters {
             let mut telemetry = self.runtime_telemetry.borrow_mut();
+            let helper = telemetry
+                .helper_timing_stack
+                .last()
+                .map_or("outside_helper", |frame| HELPER_NAMES[frame.helper_index]);
             telemetry.counters.native_value_table_reuses = telemetry
                 .counters
                 .native_value_table_reuses
                 .saturating_add(1);
+            *telemetry
+                .counters
+                .native_value_table_materializations_by_kind_and_origin
+                .entry(format!("{kind}@{helper}"))
+                .or_default() += 1;
         }
     }
 

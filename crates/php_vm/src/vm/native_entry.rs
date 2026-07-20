@@ -33,14 +33,16 @@ impl Vm {
             output,
             native_entries,
         );
-        context.install_root_dynamic_unit(unit.clone());
+        context.attach_root_deployment_image(unit.clone());
         let native_execution_started_at =
             self.options.collect_counters.then(std::time::Instant::now);
         context.record_native_direct_calls(&handle);
         let guard = activate_native_context(&mut context);
-        let outcome = handle.invoke_i64_with_native_unwind(
+        let runtime = std::ptr::from_mut(&mut context).cast::<std::ffi::c_void>();
+        let outcome = handle.invoke_i64_with_native_unwind_runtime(
             &[],
             php_jit::JIT_RUNTIME_ABI_HASH,
+            runtime,
             |types, value| {
                 let class = context
                     .decode_result(value)
@@ -102,27 +104,34 @@ impl Vm {
         let session = std::mem::take(&mut context.session);
         let process_exit_terminates_process = context.process_exit_terminates_process();
         let mut result = if let Some(throwable) = shutdown_throwable {
-            super::native_uncaught_throwable_result(context.output, Some(throwable))
+            super::native_uncaught_throwable_result(
+                std::mem::take(&mut context.output),
+                Some(throwable),
+            )
         } else if let Some(error) = shutdown_error {
             VmResult::runtime_error(
-                context.output,
-                context.diagnostic,
+                std::mem::take(&mut context.output),
+                context.diagnostic.take(),
                 format!("E_NATIVE_SHUTDOWN: {error}"),
             )
         } else if exception_handled {
-            VmResult::success(context.output, Some(php_runtime::api::Value::Null))
+            VmResult::success(
+                std::mem::take(&mut context.output),
+                Some(php_runtime::api::Value::Null),
+            )
         } else {
             match outcome {
                 Ok(php_jit::JitI64InvokeOutcome::Returned(encoded)) => {
                     match context.decode_result(encoded) {
                         Ok(value) => {
-                            let mut result = VmResult::success(context.output, Some(value));
-                            result.diagnostics.extend(context.diagnostic);
+                            let mut result =
+                                VmResult::success(std::mem::take(&mut context.output), Some(value));
+                            result.diagnostics.extend(context.diagnostic.take());
                             result
                         }
                         Err(error) => VmResult::runtime_error(
-                            context.output,
-                            context.diagnostic,
+                            std::mem::take(&mut context.output),
+                            context.diagnostic.take(),
                             format!("E_NATIVE_VALUE: {error}"),
                         ),
                     }
@@ -141,13 +150,16 @@ impl Vm {
                         Ok(php_runtime::api::Value::Bool(value)) => i32::from(value),
                         _ => 0,
                     };
-                    VmResult::success_exit(context.output, exit_code)
+                    VmResult::success_exit(std::mem::take(&mut context.output), exit_code)
                 }
                 Ok(php_jit::JitI64InvokeOutcome::SideExit { status, value, .. })
                     if status == php_jit::JitCallStatus::THROW.0 as i32 =>
                 {
                     let throwable = context.decode_result(value).ok();
-                    super::native_uncaught_throwable_result(context.output, throwable)
+                    super::native_uncaught_throwable_result(
+                        std::mem::take(&mut context.output),
+                        throwable,
+                    )
                 }
                 Ok(php_jit::JitI64InvokeOutcome::SideExit { status, .. })
                     if status == php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32 =>
@@ -167,29 +179,38 @@ impl Vm {
                         .windows(b"Fatal error".len())
                         .any(|window| window == b"Fatal error")
                     {
-                        VmResult::fatal(context.output, context.diagnostic, message)
+                        VmResult::fatal(
+                            std::mem::take(&mut context.output),
+                            context.diagnostic.take(),
+                            message,
+                        )
                     } else {
-                        VmResult::runtime_error(context.output, context.diagnostic, message)
+                        VmResult::runtime_error(
+                            std::mem::take(&mut context.output),
+                            context.diagnostic.take(),
+                            message,
+                        )
                     }
                 }
                 Ok(php_jit::JitI64InvokeOutcome::SideExit { status, .. })
                     if status == php_jit::JitCallStatus::RETURN_REFERENCE.0 as i32 =>
                 {
-                    VmResult::success(context.output, None)
+                    VmResult::success(std::mem::take(&mut context.output), None)
                 }
                 Ok(php_jit::JitI64InvokeOutcome::SideExit { status, .. }) => {
                     VmResult::runtime_error(
-                        context.output,
-                        context.diagnostic,
+                        std::mem::take(&mut context.output),
+                        context.diagnostic.take(),
                         format!("cached native entry returned status {status}"),
                     )
                 }
                 Err(error) => VmResult::compile_error(
-                    context.output,
+                    std::mem::take(&mut context.output),
                     format!("E_NATIVE_CACHE_ENTRY: cached entry invocation failed: {error:?}"),
                 ),
             }
         };
+        context.recycle_native_value_arena();
         result.process_exit_terminates_process = process_exit_terminates_process;
         result.http_response = Some(Box::new(http_response));
         result.upload_registry = Some(Box::new(upload_registry));

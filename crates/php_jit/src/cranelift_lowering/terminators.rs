@@ -7,7 +7,7 @@ fn lower_region_condition(
     locals: &NativeLocalMap,
     registers: &NativeRegisterMap,
     native_operations: NativeOperationFunctions,
-    _result_out: ir::Value,
+    deopt_out: ir::Value,
     condition: RegionOperand,
     constants: &[IrConstant],
     value_flow: &ExecutableValueFlow,
@@ -31,7 +31,7 @@ fn lower_region_condition(
         _ => {}
     }
     if let Some(helper) = native_operations.truthy {
-        lower_guarded_unknown_condition(module, builder, helper, value)
+        lower_guarded_unknown_condition(module, builder, helper, value, deopt_out)
     } else if builder.func.dfg.value_type(value) == types::I64 {
         Ok(builder.ins().icmp_imm(IntCC::NotEqual, value, 0))
     } else {
@@ -47,6 +47,7 @@ pub(super) fn lower_guarded_unknown_condition(
     builder: &mut FunctionBuilder<'_>,
     helper: NativeHelper,
     value: ir::Value,
+    deopt_out: ir::Value,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     if !helper.inline_runtime_view {
         let slot =
@@ -63,6 +64,9 @@ pub(super) fn lower_guarded_unknown_condition(
         let truthy = builder.ins().stack_load(types::I64, slot, 0);
         return Ok(builder.ins().icmp_imm(IntCC::NotEqual, truthy, 0));
     }
+    let inspect_runtime = builder.create_block();
+    let inspect_non_runtime = builder.create_block();
+    let inspect_descriptor = builder.create_block();
     let slow = builder.create_block();
     let merge = builder.create_block();
     builder.append_block_param(merge, types::I8);
@@ -100,12 +104,114 @@ pub(super) fn lower_guarded_unknown_condition(
             .icmp_imm(IntCC::Equal, tag, crate::JIT_VALUE_CONSTANT_TAG as i64);
     let is_not_reserved = builder.ins().icmp_imm(IntCC::Equal, is_reserved, 0);
     let is_opaque_constant = builder.ins().band(is_constant, is_not_reserved);
-    let needs_slow_path = builder.ins().bor(is_runtime, is_opaque_constant);
     let integer_truthy = builder.ins().icmp_imm(IntCC::NotEqual, value, 0);
     let direct_truthy = builder.ins().select(is_reserved, is_true, integer_truthy);
     builder
         .ins()
-        .brif(needs_slow_path, slow, &[], merge, &[direct_truthy.into()]);
+        .brif(is_runtime, inspect_runtime, &[], inspect_non_runtime, &[]);
+
+    builder.switch_to_block(inspect_non_runtime);
+    builder.ins().brif(
+        is_opaque_constant,
+        slow,
+        &[],
+        merge,
+        &[direct_truthy.into()],
+    );
+
+    builder.switch_to_block(inspect_runtime);
+    let runtime_kind = builder
+        .ins()
+        .band_imm(value, crate::JIT_VALUE_RUNTIME_KIND_MASK as i64);
+    let is_array = builder.ins().icmp_imm(
+        IntCC::Equal,
+        runtime_kind,
+        crate::JIT_VALUE_RUNTIME_ARRAY_TAG as i64,
+    );
+    let is_string = builder.ins().icmp_imm(
+        IntCC::Equal,
+        runtime_kind,
+        crate::JIT_VALUE_RUNTIME_STRING_TAG as i64,
+    );
+    let has_direct_descriptor = builder.ins().bor(is_array, is_string);
+    builder
+        .ins()
+        .brif(has_direct_descriptor, inspect_descriptor, &[], slow, &[]);
+
+    builder.switch_to_block(inspect_descriptor);
+    let pointer_type = module.target_config().pointer_type();
+    let view_offset = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
+    let slots = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        deopt_out,
+        view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, value_slots) as i32,
+    );
+    let index = builder.ins().ireduce(types::I32, value);
+    let index = builder.ins().uextend(pointer_type, index);
+    let byte_offset = builder.ins().ishl_imm(index, 5);
+    let descriptor = builder.ins().iadd(slots, byte_offset);
+    let kind = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        descriptor,
+        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+    );
+    let flags = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        descriptor,
+        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+    );
+    let reserved = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        descriptor,
+        std::mem::offset_of!(crate::JitNativeValueSlot, reserved) as i32,
+    );
+    let length = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        descriptor,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+    );
+    let array_kind = builder.ins().icmp_imm(
+        IntCC::Equal,
+        kind,
+        i64::from(crate::JIT_NATIVE_VALUE_VIEW_ARRAY),
+    );
+    let array_version = builder.ins().icmp_imm(
+        IntCC::Equal,
+        flags,
+        i64::from(crate::JIT_NATIVE_ARRAY_VIEW_ABI_VERSION),
+    );
+    let array_descriptor = builder.ins().band(array_kind, array_version);
+    let array_ok = builder.ins().band(is_array, array_descriptor);
+    let string_kind = builder.ins().icmp_imm(
+        IntCC::Equal,
+        kind,
+        i64::from(crate::JIT_NATIVE_VALUE_VIEW_STRING),
+    );
+    let string_version = builder.ins().icmp_imm(
+        IntCC::Equal,
+        flags,
+        i64::from(crate::JIT_NATIVE_STRING_VIEW_ABI_VERSION),
+    );
+    let string_descriptor = builder.ins().band(string_kind, string_version);
+    let string_ok = builder.ins().band(is_string, string_descriptor);
+    let descriptor_ok = builder.ins().bor(array_ok, string_ok);
+    let non_empty = builder.ins().icmp_imm(IntCC::NotEqual, length, 0);
+    let is_zero_string = builder.ins().icmp_imm(
+        IntCC::Equal,
+        reserved,
+        i64::from(crate::JIT_NATIVE_STRING_VALUE_ZERO),
+    );
+    let not_zero_string = builder.ins().icmp_imm(IntCC::Equal, is_zero_string, 0);
+    let string_truthy = builder.ins().band(non_empty, not_zero_string);
+    let runtime_truthy = builder.ins().select(is_string, string_truthy, non_empty);
+    builder
+        .ins()
+        .brif(descriptor_ok, merge, &[runtime_truthy.into()], slow, &[]);
 
     builder.switch_to_block(slow);
     let slot =
@@ -134,6 +240,7 @@ pub(super) fn lower_region_terminator(
     locals: &NativeLocalMap,
     registers: &NativeRegisterMap,
     result_out: ir::Value,
+    deopt_out: ir::Value,
     pending_status: Variable,
     pending_value: Variable,
     module: &mut JITModule,
@@ -159,7 +266,7 @@ pub(super) fn lower_region_terminator(
                 locals,
                 registers,
                 native_operations,
-                result_out,
+                deopt_out,
                 *condition,
                 constants,
                 value_flow,
@@ -181,7 +288,7 @@ pub(super) fn lower_region_terminator(
                 locals,
                 registers,
                 native_operations,
-                result_out,
+                deopt_out,
                 *condition,
                 constants,
                 value_flow,
@@ -203,7 +310,7 @@ pub(super) fn lower_region_terminator(
                 locals,
                 registers,
                 native_operations,
-                result_out,
+                deopt_out,
                 *condition,
                 constants,
                 value_flow,

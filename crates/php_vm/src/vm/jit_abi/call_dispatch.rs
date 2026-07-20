@@ -269,21 +269,88 @@ pub(super) fn native_function_argument_requires_reference_at(
 // validates the stable builtin ID before PHP-visible work begins.
 #[allow(unsafe_code)]
 pub(in crate::vm) extern "C" fn jit_native_builtin_dispatch_abi(
-    helper_id: u32,
+    runtime: *mut NativeRequestFastState,
+    builtin_id: u32,
     function: u32,
-    continuation: u32,
+    source_file: u32,
+    source_start: u32,
+    source_end: u32,
     arguments: *const i64,
     argument_count: u32,
     local_slots: *const php_jit::JitAbiSlot,
     local_count: u32,
     out: *mut php_jit::JitCallResult,
 ) -> i32 {
-    if out.is_null()
-        || (argument_count != 0 && arguments.is_null())
-        || (local_count != 0 && local_slots.is_null())
-    {
-        return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+    // SAFETY: production publication validates the immutable callsite and
+    // generated argument shape before this entry can execute.
+    unsafe {
+        jit_native_builtin_dispatch_impl::<false>(
+            runtime,
+            builtin_id,
+            function,
+            source_file,
+            source_start,
+            source_end,
+            arguments,
+            argument_count,
+            local_slots,
+            local_count,
+            out,
+        )
     }
+}
+
+// SAFETY: diagnostic publication uses the same trusted internal ABI and adds
+// accounting in a separately compiled function.
+#[allow(unsafe_code)]
+pub(in crate::vm) extern "C" fn jit_native_builtin_dispatch_diagnostic_abi(
+    runtime: *mut NativeRequestFastState,
+    builtin_id: u32,
+    function: u32,
+    source_file: u32,
+    source_start: u32,
+    source_end: u32,
+    arguments: *const i64,
+    argument_count: u32,
+    local_slots: *const php_jit::JitAbiSlot,
+    local_count: u32,
+    out: *mut php_jit::JitCallResult,
+) -> i32 {
+    // SAFETY: diagnostic publication validates the same generated ABI.
+    unsafe {
+        jit_native_builtin_dispatch_impl::<true>(
+            runtime,
+            builtin_id,
+            function,
+            source_file,
+            source_start,
+            source_end,
+            arguments,
+            argument_count,
+            local_slots,
+            local_count,
+            out,
+        )
+    }
+}
+
+#[allow(unsafe_code)]
+unsafe fn jit_native_builtin_dispatch_impl<const DIAGNOSTIC: bool>(
+    runtime: *mut NativeRequestFastState,
+    builtin_id: u32,
+    function: u32,
+    source_file: u32,
+    source_start: u32,
+    source_end: u32,
+    arguments: *const i64,
+    argument_count: u32,
+    local_slots: *const php_jit::JitAbiSlot,
+    local_count: u32,
+    out: *mut php_jit::JitCallResult,
+) -> i32 {
+    debug_assert!(!out.is_null());
+    debug_assert!(argument_count == 0 || !arguments.is_null());
+    debug_assert!(local_count == 0 || !local_slots.is_null());
     let arguments = if argument_count == 0 {
         &[]
     } else {
@@ -296,31 +363,20 @@ pub(in crate::vm) extern "C" fn jit_native_builtin_dispatch_abi(
         // SAFETY: validated above; generated code publishes the exact length.
         unsafe { std::slice::from_raw_parts(local_slots, local_count as usize) }
     };
-    let mut callsite_span = None;
-    let outcome = with_native_context(|context| {
-        let descriptor = context
-            .prepared_native_callsite(function, continuation)
-            .ok_or_else(|| {
-                format!(
-                    "E_PHP_VM_UNRESOLVED_CALLABLE: direct builtin callsite is unavailable at function={function} continuation={continuation}"
-                )
-            })?;
-        // SAFETY: the active immutable CompiledUnit owns the descriptor for
-        // this complete synchronous invocation.
-        let descriptor = unsafe { &*descriptor };
-        let prepared = descriptor.direct_builtin.ok_or_else(|| {
-            "E_PHP_VM_UNRESOLVED_CALLABLE: direct builtin metadata is unavailable".to_owned()
+    let callsite_span =
+        php_ir::IrSpan::new(php_ir::FileId::new(source_file), source_start, source_end);
+    let outcome = with_native_context_for(runtime, "call_dispatch", |context| {
+        let prepared = crate::compiled_unit::PreparedNativeBuiltin::for_dense_id(
+            builtin_id,
+            argument_count as usize,
+            true,
+        )
+        .ok_or_else(|| {
+            format!("E_PHP_VM_UNRESOLVED_CALLABLE: builtin ID {builtin_id} is unavailable")
         })?;
-        if prepared.entry.helper_id() != helper_id {
-            return Err("E_PHP_VM_NATIVE_CALLSITE_MISMATCH: builtin helper ID is stale".to_owned());
-        }
-        callsite_span = Some(descriptor.span);
-        let instruction = descriptor.semantic_instruction();
-        let started_at = context
-            .options
-            .collect_counters
-            .then(std::time::Instant::now);
-        if context.options.collect_counters {
+        let entry = prepared.entry;
+        let started_at = DIAGNOSTIC.then(std::time::Instant::now);
+        if DIAGNOSTIC {
             let mut telemetry = context.runtime_telemetry.borrow_mut();
             telemetry.counters.native_call_direct =
                 telemetry.counters.native_call_direct.saturating_add(1);
@@ -348,19 +404,31 @@ pub(in crate::vm) extern "C" fn jit_native_builtin_dispatch_abi(
             drop(telemetry);
             context.enter_runtime_helper("call_builtin_direct");
         }
-        let result = (|| {
-            let expanded =
-                bind_native_builtin_arguments(context, prepared.entry.name(), arguments, None)?;
+        // This entry is emitted only for positional, non-unpacked arguments.
+        // Publication prepared the exact builtin record together with the
+        // callsite, so the warm path neither rebinds arguments nor validates
+        // a redundant helper ID/name pair.
+        let result = if matches!(
+            entry.execution_kind(),
+            php_runtime::api::BuiltinExecutionKind::Runtime
+        ) {
+            execute_prepared_runtime_builtin(context, arguments, callsite_span, prepared)
+        } else {
+            let instruction = php_ir::Instruction {
+                id: php_ir::InstrId::new(0),
+                span: callsite_span,
+                kind: php_ir::InstructionKind::Nop,
+            };
             execute_native_builtin(
                 context,
-                prepared.entry.name(),
-                expanded.as_ref(),
-                instruction,
+                entry.name(),
+                arguments,
+                &instruction,
                 Some((function, local_slots)),
                 Some(prepared),
             )
-        })();
-        if context.options.collect_counters {
+        };
+        if DIAGNOSTIC {
             let elapsed = started_at
                 .map(|started| started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
                 .unwrap_or(0);
@@ -377,10 +445,25 @@ pub(in crate::vm) extern "C" fn jit_native_builtin_dispatch_abi(
         result
     });
 
+    finish_native_dispatch_outcome(runtime, outcome, Some(callsite_span), out)
+}
+
+// Converts one trusted internal dispatch outcome into the stable native
+// control result. PHP-visible throw/suspend/exit semantics remain centralized
+// here while individual prepared dispatchers avoid the generic call frame.
+// SAFETY: `out` is owned by generated code for the synchronous helper call.
+#[allow(unsafe_code)]
+pub(super) fn finish_native_dispatch_outcome(
+    runtime: *mut NativeRequestFastState,
+    outcome: Option<Result<i64, String>>,
+    callsite_span: Option<php_ir::IrSpan>,
+    out: *mut php_jit::JitCallResult,
+) -> i32 {
+    debug_assert!(!out.is_null());
     let (status, value) = match outcome {
         Some(Ok(value)) => (php_jit::JitCallStatus::RETURN, Some(value)),
         Some(Err(message)) if message == "E_PHP_RETHROW" => {
-            let value = with_native_context(|context| {
+            let value = with_native_context_for(runtime, "call_dispatch", |context| {
                 let mut throwable = context.take_pending_throwable()?;
                 if let Some(span) = callsite_span {
                     throwable = native_throwable_with_call_source(context, throwable, span);
@@ -393,7 +476,7 @@ pub(in crate::vm) extern "C" fn jit_native_builtin_dispatch_abi(
         Some(Err(message)) if message.starts_with("E_PHP_THROW:") => {
             let payload = message.trim_start_matches("E_PHP_THROW:");
             let (class, message) = payload.split_once(':').unwrap_or(("Error", payload));
-            let value = with_native_context(|context| {
+            let value = with_native_context_for(runtime, "call_dispatch", |context| {
                 callsite_span
                     .and_then(|span| encode_native_throwable_at(context, class, message, span).ok())
                     .or_else(|| encode_native_throwable(context, class, message).ok())
@@ -402,9 +485,10 @@ pub(in crate::vm) extern "C" fn jit_native_builtin_dispatch_abi(
             (php_jit::JitCallStatus::THROW, value)
         }
         Some(Err(message)) if message == "E_PHP_SUSPEND_FIBER" => {
-            let value =
-                with_native_context(|context| context.pending_fiber_suspension_value.take())
-                    .flatten();
+            let value = with_native_context_for(runtime, "call_dispatch", |context| {
+                context.pending_fiber_suspension_value.take()
+            })
+            .flatten();
             (php_jit::JitCallStatus::SUSPEND_FIBER, value)
         }
         Some(Err(message)) if message.starts_with("E_PHP_EXIT:") => (
@@ -418,7 +502,9 @@ pub(in crate::vm) extern "C" fn jit_native_builtin_dispatch_abi(
             (php_jit::JitCallStatus::RUNTIME_ERROR, None)
         }
         Some(Err(message)) => {
-            let _ = with_native_context(|context| publish_native_call_diagnostic(context, message));
+            let _ = with_native_context_for(runtime, "call_dispatch", |context| {
+                publish_native_call_diagnostic(context, message)
+            });
             (php_jit::JitCallStatus::RUNTIME_ERROR, None)
         }
         None => (php_jit::JitCallStatus::COMPILE_REQUIRED, None),
@@ -444,11 +530,39 @@ pub(in crate::vm) extern "C" fn jit_native_builtin_dispatch_abi(
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
+    runtime: *mut NativeRequestFastState,
+    vm_context: u64,
+    frame: *mut php_jit::JitNativeCallFrame,
+    out: *mut php_jit::JitCallResult,
+) -> i32 {
+    // SAFETY: production publication validates the generated frame ABI.
+    unsafe { jit_native_call_dispatch_impl::<false>(runtime, vm_context, frame, out) }
+}
+
+// SAFETY: diagnostic publication uses the same generated ABI and adds
+// accounting in a separately compiled entry.
+#[allow(unsafe_code)]
+pub(in crate::vm) extern "C" fn jit_native_call_dispatch_diagnostic_abi(
+    runtime: *mut NativeRequestFastState,
+    vm_context: u64,
+    frame: *mut php_jit::JitNativeCallFrame,
+    out: *mut php_jit::JitCallResult,
+) -> i32 {
+    // SAFETY: diagnostic publication validates the same frame contract.
+    unsafe { jit_native_call_dispatch_impl::<true>(runtime, vm_context, frame, out) }
+}
+
+#[allow(unsafe_code)]
+unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
+    runtime: *mut NativeRequestFastState,
     _vm_context: u64,
     frame: *mut php_jit::JitNativeCallFrame,
     out: *mut php_jit::JitCallResult,
 ) -> i32 {
-    if frame.is_null() || out.is_null() {
+    debug_assert!(!runtime.is_null());
+    debug_assert!(!frame.is_null());
+    debug_assert!(!out.is_null());
+    if DIAGNOSTIC && (frame.is_null() || out.is_null()) {
         return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
     let result = (|| {
@@ -486,7 +600,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 }
             };
         let mut callsite_span = None;
-        let outcome = with_native_context(|context| {
+        let outcome = with_native_context_for(runtime, "call_dispatch", |context| {
             let descriptor =
                 context.prepared_native_callsite(frame.function_id, frame.continuation_id);
             let Some(descriptor) = descriptor else {
@@ -555,7 +669,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                     )
                 }
             };
-            if context.options.collect_counters {
+            if DIAGNOSTIC {
                 let allocated_bytes = match &encoded {
                     std::borrow::Cow::Borrowed(_) => 0,
                     std::borrow::Cow::Owned(encoded) => encoded
@@ -624,6 +738,21 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 if !direct_builtin && !direct_external_in_place {
                     let dynamic_reason =
                         native_dynamic_call_reason(context, frame, descriptor, arguments);
+                    let dynamic_target = descriptor.target_symbol.as_deref().unwrap_or_else(|| {
+                        match descriptor.kind {
+                            crate::compiled_unit::NativeCallSiteKind::Closure => "<closure>",
+                            crate::compiled_unit::NativeCallSiteKind::Callable => "<callable>",
+                            crate::compiled_unit::NativeCallSiteKind::Pipe => "<pipe>",
+                            crate::compiled_unit::NativeCallSiteKind::DynamicConstructor => {
+                                "<dynamic-constructor>"
+                            }
+                            crate::compiled_unit::NativeCallSiteKind::Semantic => "<semantic>",
+                            crate::compiled_unit::NativeCallSiteKind::Function
+                            | crate::compiled_unit::NativeCallSiteKind::Method
+                            | crate::compiled_unit::NativeCallSiteKind::StaticMethod
+                            | crate::compiled_unit::NativeCallSiteKind::Constructor => "<unknown>",
+                        }
+                    });
                     let mut telemetry = context.runtime_telemetry.borrow_mut();
                     let count = telemetry
                         .counters
@@ -631,6 +760,12 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                         .entry(dynamic_reason.to_owned())
                         .or_default();
                     *count = count.saturating_add(1);
+                    let target_count = telemetry
+                        .counters
+                        .native_call_dynamic_by_target
+                        .entry(format!("{dynamic_reason}: {dynamic_target}"))
+                        .or_default();
+                    *target_count = target_count.saturating_add(1);
                 }
             }
             let helper_id = if direct_builtin {
@@ -640,13 +775,10 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
             } else {
                 call_dispatch_helper_id(descriptor)
             };
-            if context.options.collect_counters {
+            if DIAGNOSTIC {
                 context.enter_runtime_helper(helper_id);
             }
-            let callsite_started_at = context
-                .options
-                .collect_counters
-                .then(std::time::Instant::now);
+            let callsite_started_at = DIAGNOSTIC.then(std::time::Instant::now);
             let outcome = (|| {
             let completed_nested_fiber_matches = context
                 .completed_nested_fiber_call
@@ -658,6 +790,40 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 && let Some((_, _, value)) = context.completed_nested_fiber_call.take()
             {
                 return Ok(value);
+            }
+            if direct_external_in_place {
+                let name = descriptor.target_symbol.as_deref().ok_or_else(|| {
+                    "E_PHP_VM_UNRESOLVED_CALLABLE: prepared external function has no symbol"
+                        .to_owned()
+                })?;
+                let target = context.external_function(name).ok_or_else(|| {
+                    format!("E_PHP_VM_UNRESOLVED_CALLABLE: function {name} is no longer visible")
+                })?;
+                let metadata = Some(descriptor.arguments.as_ref());
+                if let Some(parameters) = context
+                    .dynamic_units
+                    .get(target.unit)
+                    .and_then(|unit| unit.compiled.unit().functions.get(target.function.index()))
+                    .map(|function| function.params.as_slice())
+                {
+                    mark_native_function_argument_references(arguments, metadata, parameters);
+                }
+                materialize_native_property_reference_arguments(
+                    context,
+                    arguments,
+                    encoded.to_mut(),
+                    metadata,
+                )?;
+                return invoke_native_external_function_with_metadata(
+                    context,
+                    target,
+                    &encoded,
+                    metadata,
+                    None,
+                    context
+                        .unit
+                        .strict_types_for_span(descriptor.span),
+                );
             }
             if direct_builtin {
                 let entry = descriptor
@@ -771,6 +937,8 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                         instruction,
                         &encoded,
                         Some(frame.function_id),
+                        None,
+                        false,
                     )
             {
                 return result;
@@ -1798,11 +1966,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                     .and_then(|unit| unit.compiled.unit().functions.get(function.function.index()))
                     .map(|function| function.params.as_slice())
                 {
-                    mark_native_function_argument_references(
-                        arguments,
-                        metadata,
-                        parameters,
-                    );
+                    mark_native_function_argument_references(arguments, metadata, parameters);
                 }
                 materialize_native_property_reference_arguments(
                     context,
@@ -1849,7 +2013,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                     message
                 }
             });
-            if context.options.collect_counters {
+            if DIAGNOSTIC {
                 let inclusive_nanos = callsite_started_at
                     .map(|started_at| {
                         started_at.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
@@ -1890,7 +2054,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
             }
             Some(Err(message)) if message == "E_PHP_RETHROW" => {
                 let source_span = callsite_span;
-                let value = with_native_context(|context| {
+                let value = with_native_context_for(runtime, "call_dispatch", |context| {
                     let mut throwable = context.take_pending_throwable()?;
                     if let Some(source_span) = source_span {
                         throwable =
@@ -1909,7 +2073,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 let payload = message.trim_start_matches("E_PHP_THROW:");
                 let (class, message) = payload.split_once(':').unwrap_or(("Error", payload));
                 let source_span = callsite_span;
-                let value = with_native_context(|context| {
+                let value = with_native_context_for(runtime, "call_dispatch", |context| {
                     let target = (!compact_arguments
                         && frame.flags & php_jit::JitNativeCallFrame::FLAG_DIRECT_BUILTIN == 0
                         && frame.target.function_id != u32::MAX)
@@ -1951,9 +2115,10 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 )
             }
             Some(Err(message)) if message == "E_PHP_SUSPEND_FIBER" => {
-                let value =
-                    with_native_context(|context| context.pending_fiber_suspension_value.take())
-                        .flatten();
+                let value = with_native_context_for(runtime, "call_dispatch", |context| {
+                    context.pending_fiber_suspension_value.take()
+                })
+                .flatten();
                 (
                     php_jit::JitCallStatus::SUSPEND_FIBER.0 as i32,
                     php_jit::JitCallStatus::SUSPEND_FIBER,
@@ -1977,8 +2142,9 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_abi(
                 None,
             ),
             Some(Err(message)) => {
-                let _ =
-                    with_native_context(|context| publish_native_call_diagnostic(context, message));
+                let _ = with_native_context_for(runtime, "call_dispatch", |context| {
+                    publish_native_call_diagnostic(context, message)
+                });
                 (
                     php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
                     php_jit::JitCallStatus::RUNTIME_ERROR,

@@ -205,6 +205,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="fail a diagnostic restart probe unless the profiled request compiles no native code",
     )
     parser.add_argument(
+        "--max-value-table-allocations",
+        type=int,
+        default=None,
+        help="fail a diagnostic request above this native value-slot allocation count",
+    )
+    parser.add_argument(
+        "--max-value-table-high-water",
+        type=int,
+        default=None,
+        help="fail a diagnostic request above this native value-table high-water mark",
+    )
+    parser.add_argument(
         "--engine-preset",
         choices=("baseline", "default"),
         default="default",
@@ -1236,6 +1248,30 @@ def collect_diagnostics(
         failures.append(
             f"restart request performed {compile_attempts!r} native compile attempts; expected 0"
         )
+    value_table_allocations = native.get("value_table_allocations")
+    if (
+        args.max_value_table_allocations is not None
+        and (
+            not isinstance(value_table_allocations, int)
+            or value_table_allocations > args.max_value_table_allocations
+        )
+    ):
+        failures.append(
+            "native value-table allocations "
+            f"{value_table_allocations!r} exceed {args.max_value_table_allocations}"
+        )
+    value_table_high_water = native.get("value_table_high_water")
+    if (
+        args.max_value_table_high_water is not None
+        and (
+            not isinstance(value_table_high_water, int)
+            or value_table_high_water > args.max_value_table_high_water
+        )
+    ):
+        failures.append(
+            "native value-table high-water "
+            f"{value_table_high_water!r} exceeds {args.max_value_table_high_water}"
+        )
     cache_restart = {
         "schema_version": 1,
         "cache_mode": args.native_cache,
@@ -2088,8 +2124,8 @@ def self_test() -> int:
     assert "requires --mode clean" in " ".join(validate_configuration(invalid_ab))
     assert cranelift_dependency_version()
     source_abi = native_source_abi_identity()
-    assert source_abi["version"] == 24
-    assert source_abi["hash"] == 0x0DC1_A824_0000_002F
+    assert source_abi["version"] == 33
+    assert source_abi["hash"] == 0x0DC1_A833_0000_0038
     host_cpu = cpu_identity()
     assert len(host_cpu["feature_fingerprint_sha256"]) == 64
     ab_off = {

@@ -19,7 +19,7 @@ printf 'before\ndestruct\nafter\n' | cmp -s - "$out_dir/unrooted-output.txt" || 
 }
 
 jq -e '
-    .schema_version == 12 and
+    .schema_version == 13 and
     .runtime_helper_calls_by_id.value_release > 0 and
     .runtime_helper_object_release_fast_paths > 0 and
     .runtime_helper_object_release_root_scans == 0
@@ -39,7 +39,7 @@ printf 'rooted\nafter\n' | cmp -s - "$out_dir/rooted-output.txt" || {
 }
 
 jq -e '
-    .schema_version == 12 and
+    .schema_version == 13 and
     .runtime_helper_calls_by_id.value_release > 0 and
     .runtime_helper_object_release_fast_paths > 0 and
     .runtime_helper_object_release_root_scans == 0 and

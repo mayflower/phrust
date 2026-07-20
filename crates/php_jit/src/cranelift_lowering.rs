@@ -126,6 +126,8 @@ struct NativeHelper {
     function: FuncId,
     terminal_exit: Option<NativeTerminalExit>,
     inline_runtime_view: bool,
+    register_value_result: bool,
+    runtime: Option<ir::Value>,
 }
 
 impl NativeHelper {
@@ -151,6 +153,13 @@ impl NativeHelper {
             ..self
         }
     }
+
+    fn with_runtime(self, runtime: ir::Value) -> Self {
+        Self {
+            runtime: Some(runtime),
+            ..self
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -161,7 +170,9 @@ enum NativeDirectCallee {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct NativeOperationFunctions {
+    runtime: Option<ir::Value>,
     builtin_dispatch: Option<NativeHelper>,
+    semantic_dispatch: Option<NativeHelper>,
     function_resolve: Option<NativeHelper>,
     frame_alloc: Option<NativeHelper>,
     frame_release: Option<NativeHelper>,
@@ -201,6 +212,56 @@ struct NativeOperationFunctions {
 }
 
 impl NativeOperationFunctions {
+    fn with_runtime(mut self, runtime: ir::Value) -> Self {
+        self.runtime = Some(runtime);
+        macro_rules! bind {
+            ($($field:ident),+ $(,)?) => {
+                $(self.$field = self.$field.map(|helper| helper.with_runtime(runtime));)+
+            };
+        }
+        bind!(
+            builtin_dispatch,
+            semantic_dispatch,
+            function_resolve,
+            frame_alloc,
+            frame_release,
+            unary,
+            binary,
+            compare,
+            cast,
+            echo,
+            local_fetch,
+            local_store,
+            value_lifecycle,
+            reference_bind,
+            argument_check,
+            return_check,
+            exception_new,
+            array_new,
+            object_new,
+            property_fetch,
+            property_assign,
+            object_clone,
+            object_clone_with,
+            array_insert,
+            array_insert_local,
+            array_fetch,
+            array_unset,
+            array_spread,
+            foreach_init,
+            foreach_next,
+            foreach_cleanup,
+            constant_fetch,
+            truthy,
+            type_predicate,
+            stable_length,
+            string_predicate,
+            runtime_fatal,
+            execution_poll,
+        );
+        self
+    }
+
     fn with_terminal_exit(mut self, terminal_exit: NativeTerminalExit) -> Self {
         macro_rules! bind {
             ($($field:ident),+ $(,)?) => {
@@ -209,6 +270,7 @@ impl NativeOperationFunctions {
         }
         bind!(
             builtin_dispatch,
+            semantic_dispatch,
             function_resolve,
             frame_alloc,
             frame_release,
@@ -257,7 +319,13 @@ fn call_native_helper(
     arguments: &[ir::Value],
 ) -> ir::Inst {
     let callee = module.declare_func_in_func(helper.function, builder.func);
-    builder.ins().call(callee, arguments)
+    let runtime = helper
+        .runtime
+        .expect("native helper must be bound to the request fast-state value");
+    let mut direct_arguments = Vec::with_capacity(arguments.len() + 1);
+    direct_arguments.push(runtime);
+    direct_arguments.extend_from_slice(arguments);
+    builder.ins().call(callee, &direct_arguments)
 }
 
 fn native_php_entry_signature(module: &JITModule) -> Signature {
@@ -267,6 +335,7 @@ fn native_php_entry_signature(module: &JITModule) -> Signature {
     {
         signature.call_conv = CallConv::Tail;
     }
+    signature.params.push(AbiParam::new(pointer_type));
     signature.params.push(AbiParam::new(pointer_type));
     signature.params.push(AbiParam::new(pointer_type));
     signature.params.push(AbiParam::new(pointer_type));
@@ -368,6 +437,7 @@ fn native_helper_import_symbol(base: &str, address: usize) -> String {
 
 const NATIVE_CALL_DISPATCH_SYMBOL: &str = "phrust_jit_native_call_dispatch";
 const NATIVE_BUILTIN_DISPATCH_SYMBOL: &str = "phrust_jit_native_builtin_dispatch";
+const NATIVE_SEMANTIC_DISPATCH_SYMBOL: &str = "phrust_jit_native_semantic_dispatch";
 const NATIVE_FUNCTION_RESOLVE_SYMBOL: &str = "phrust_jit_native_function_resolve";
 const NATIVE_DYNAMIC_CODE_SYMBOL: &str = "phrust_jit_native_dynamic_code";
 
@@ -1352,17 +1422,24 @@ fn lower_native_value_operation(
     let mut args = Vec::with_capacity(operands.len() + 2);
     args.push(opcode);
     args.extend_from_slice(operands);
-    args.push(result_out);
+    if !helper.register_value_result {
+        args.push(result_out);
+    }
     let call = call_native_helper(module, builder, helper, &args);
-    let value = builder
-        .ins()
-        .load(types::I64, MemFlagsData::new(), result_out, 0);
-    require_native_value_operation_ok(
-        builder,
-        builder.inst_results(call)[0],
-        helper.terminal_exit()?,
-        value,
-    )?;
+    let (value, status) = if helper.register_value_result {
+        let value = builder.inst_results(call)[0];
+        let status = builder.inst_results(call)[1];
+        (value, builder.ins().ireduce(types::I32, status))
+    } else {
+        let status = builder.inst_results(call)[0];
+        (
+            builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), result_out, 0),
+            status,
+        )
+    };
+    require_native_value_operation_ok(builder, status, helper.terminal_exit()?, value)?;
     Ok(value)
 }
 
@@ -1391,12 +1468,23 @@ fn lower_native_value_operation_with_state(
     let mut args = Vec::with_capacity(operands.len() + 2);
     args.push(opcode);
     args.extend_from_slice(operands);
-    args.push(result_out);
+    if !helper.register_value_result {
+        args.push(result_out);
+    }
     let call = call_native_helper(module, builder, helper, &args);
-    let status = builder.inst_results(call)[0];
-    let value = builder
-        .ins()
-        .load(types::I64, MemFlagsData::new(), result_out, 0);
+    let (value, status) = if helper.register_value_result {
+        let value = builder.inst_results(call)[0];
+        let status = builder.inst_results(call)[1];
+        (value, builder.ins().ireduce(types::I32, status))
+    } else {
+        let status = builder.inst_results(call)[0];
+        (
+            builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), result_out, 0),
+            status,
+        )
+    };
     let ok = builder.create_block();
     let failed = builder.create_block();
     let is_ok = builder.ins().icmp_imm(IntCC::Equal, status, 0);
@@ -1484,7 +1572,6 @@ fn lower_direct_reference_argument(
     argument: &php_ir::instruction::IrCallArg,
     argument_index: usize,
     fallback_value: ir::Value,
-    source_block: BlockId,
     instruction: &RegionInstruction,
     function: FunctionId,
     defer_until_signature_published: bool,
@@ -1590,10 +1677,9 @@ fn lower_direct_reference_argument(
         let function_value = builder
             .ins()
             .iconst(types::I64, function_and_argument as i64);
-        let locator = builder.ins().iconst(
-            types::I64,
-            native_instruction_locator(source_block, instruction.id),
-        );
+        let locator = builder
+            .ins()
+            .iconst(types::I64, i64::from(instruction.continuation_id));
         return lower_native_value_operation(
             module,
             builder,
@@ -1614,10 +1700,9 @@ fn lower_direct_reference_argument(
         let function_value = builder
             .ins()
             .iconst(types::I64, function_and_argument as i64);
-        let locator = builder.ins().iconst(
-            types::I64,
-            native_instruction_locator(source_block, instruction.id),
-        );
+        let locator = builder
+            .ins()
+            .iconst(types::I64, i64::from(instruction.continuation_id));
         let mut reference = lower_native_value_operation(
             module,
             builder,
@@ -1684,12 +1769,11 @@ fn lower_native_binary_operation(
         module,
         builder,
         helper,
-        &[opcode, lhs, rhs, function_value, continuation, result_out],
+        &[opcode, lhs, rhs, function_value, continuation],
     );
-    let status = builder.inst_results(call)[0];
-    let value = builder
-        .ins()
-        .load(types::I64, MemFlagsData::new(), result_out, 0);
+    let value = builder.inst_results(call)[0];
+    let status = builder.inst_results(call)[1];
+    let status = builder.ins().ireduce(types::I32, status);
     if native_version == 0 {
         require_native_value_operation_ok(builder, status, helper.terminal_exit()?, value)?;
         return Ok(value);
@@ -1875,16 +1959,25 @@ fn lower_fast_array_key_exists(
         )
     })?;
     let operation = builder.ins().iconst(types::I32, 2);
-    let call = call_native_helper(
-        module,
-        builder,
-        helper,
-        &[operation, array, key, result_out],
-    );
-    let status = builder.inst_results(call)[0];
-    let value = builder
-        .ins()
-        .load(types::I64, MemFlagsData::new(), result_out, 0);
+    let args = if helper.register_value_result {
+        vec![operation, array, key]
+    } else {
+        vec![operation, array, key, result_out]
+    };
+    let call = call_native_helper(module, builder, helper, &args);
+    let (value, status) = if helper.register_value_result {
+        let value = builder.inst_results(call)[0];
+        let status = builder.inst_results(call)[1];
+        (value, builder.ins().ireduce(types::I32, status))
+    } else {
+        let status = builder.inst_results(call)[0];
+        (
+            builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), result_out, 0),
+            status,
+        )
+    };
     Ok((status, value))
 }
 
@@ -1895,7 +1988,7 @@ fn lower_fast_string_predicate(
     operation: u32,
     haystack: ir::Value,
     needle: ir::Value,
-    result_out: ir::Value,
+    _result_out: ir::Value,
 ) -> Result<(ir::Value, ir::Value), CraneliftLoweringError> {
     let helper = helper.ok_or_else(|| {
         CraneliftLoweringError::new(
@@ -1904,16 +1997,10 @@ fn lower_fast_string_predicate(
         )
     })?;
     let operation = builder.ins().iconst(types::I32, i64::from(operation));
-    let call = call_native_helper(
-        module,
-        builder,
-        helper,
-        &[operation, haystack, needle, result_out],
-    );
-    let status = builder.inst_results(call)[0];
-    let value = builder
-        .ins()
-        .load(types::I64, MemFlagsData::new(), result_out, 0);
+    let call = call_native_helper(module, builder, helper, &[operation, haystack, needle]);
+    let value = builder.inst_results(call)[0];
+    let status = builder.inst_results(call)[1];
+    let status = builder.ins().ireduce(types::I32, status);
     Ok((status, value))
 }
 
@@ -1962,63 +2049,63 @@ fn lower_stable_builtin_length(
 
     builder.switch_to_block(inspect);
     let view_offset = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
-    let version = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        deopt_out,
-        view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, abi_version) as i32,
-    );
-    let capacity = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        deopt_out,
-        view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, value_view_capacity) as i32,
-    );
     let pointer_type = module.target_config().pointer_type();
     let views = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
         deopt_out,
-        view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, value_views) as i32,
+        view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, value_slots) as i32,
     );
     let index = builder.ins().ireduce(types::I32, value);
-    let version_ok = builder.ins().icmp_imm(
-        IntCC::Equal,
-        version,
-        i64::from(crate::JIT_RUNTIME_ABI_VERSION),
-    );
-    let pointer_ok = builder.ins().icmp_imm(IntCC::NotEqual, views, 0);
-    let index_ok = builder.ins().icmp(IntCC::UnsignedLessThan, index, capacity);
-    let view_ok = builder.ins().band(version_ok, pointer_ok);
-    let view_ok = builder.ins().band(view_ok, index_ok);
-    builder.ins().brif(view_ok, direct, &[], slow, &[]);
+    builder.ins().jump(direct, &[]);
 
     builder.switch_to_block(direct);
     let index = builder.ins().uextend(pointer_type, index);
-    let byte_offset = builder.ins().ishl_imm(index, 4);
+    let byte_offset = builder.ins().ishl_imm(index, 5);
     let descriptor = builder.ins().iadd(views, byte_offset);
     let kind = builder.ins().load(
         types::I32,
         MemFlagsData::new(),
         descriptor,
-        std::mem::offset_of!(crate::JitNativeValueView, kind) as i32,
+        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
     );
-    let length = builder.ins().load(
+    let flags = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        descriptor,
+        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+    );
+    let payload = builder.ins().load(
         types::I64,
         MemFlagsData::new(),
         descriptor,
-        std::mem::offset_of!(crate::JitNativeValueView, length) as i32,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
     );
     let kind_ok = builder
         .ins()
         .icmp_imm(IntCC::Equal, kind, i64::from(expected_kind));
-    let length_ok = builder.ins().icmp_imm(
-        IntCC::UnsignedLessThan,
-        length,
-        crate::JIT_VALUE_CONSTANT_TAG as i64,
-    );
-    let descriptor_ok = builder.ins().band(kind_ok, length_ok);
     let publish = builder.create_block();
+    let (length, descriptor_ok) = if op == 0 {
+        let length_ok = builder.ins().icmp_imm(
+            IntCC::UnsignedLessThan,
+            payload,
+            crate::JIT_VALUE_CONSTANT_TAG as i64,
+        );
+        (payload, builder.ins().band(kind_ok, length_ok))
+    } else {
+        let flags_ok = builder.ins().icmp_imm(
+            IntCC::Equal,
+            flags,
+            i64::from(crate::JIT_NATIVE_ARRAY_VIEW_ABI_VERSION),
+        );
+        let descriptor_ok = builder.ins().band(kind_ok, flags_ok);
+        let length_ok = builder.ins().icmp_imm(
+            IntCC::UnsignedLessThan,
+            payload,
+            crate::JIT_VALUE_CONSTANT_TAG as i64,
+        );
+        (payload, builder.ins().band(descriptor_ok, length_ok))
+    };
     builder.ins().brif(descriptor_ok, publish, &[], slow, &[]);
     builder.switch_to_block(publish);
     builder.ins().jump(merge, &[length.into()]);
@@ -2038,6 +2125,384 @@ fn lower_stable_builtin_length(
 
     builder.switch_to_block(merge);
     Ok(builder.block_params(merge)[0])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_cached_array_fetch(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    helper: Option<NativeHelper>,
+    lifecycle: Option<NativeHelper>,
+    operation: u32,
+    array: ir::Value,
+    key: ir::Value,
+    unit_identity: u64,
+    result_out: ir::Value,
+    deopt_out: ir::Value,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    if !helper.is_some_and(|helper| helper.inline_runtime_view) {
+        return lower_native_value_operation(
+            module,
+            builder,
+            helper,
+            operation,
+            &[array, key],
+            result_out,
+        );
+    }
+    let inspect_runtime = builder.create_block();
+    let inspect_descriptor = builder.create_block();
+    let inspect_entry = builder.create_block();
+    let cached = builder.create_block();
+    let slow = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(cached, types::I64);
+    builder.append_block_param(merge, types::I64);
+
+    let is_array = lower_value_has_tag(builder, array, crate::JIT_VALUE_RUNTIME_ARRAY_TAG);
+    builder
+        .ins()
+        .brif(is_array, inspect_runtime, &[], slow, &[]);
+
+    let pointer_type = module.target_config().pointer_type();
+    let view_offset = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
+    builder.switch_to_block(inspect_runtime);
+    let views = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        deopt_out,
+        view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, value_slots) as i32,
+    );
+    let array_index = builder.ins().ireduce(types::I32, array);
+    builder.ins().jump(inspect_descriptor, &[]);
+
+    builder.switch_to_block(inspect_descriptor);
+    let array_index = builder.ins().uextend(pointer_type, array_index);
+    let descriptor_offset = builder.ins().ishl_imm(array_index, 5);
+    let descriptor = builder.ins().iadd(views, descriptor_offset);
+    let kind = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        descriptor,
+        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+    );
+    let flags = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        descriptor,
+        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+    );
+    let elements = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        descriptor,
+        std::mem::offset_of!(crate::JitNativeValueSlot, aux) as i32,
+    );
+    let kind_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        kind,
+        i64::from(crate::JIT_NATIVE_VALUE_VIEW_ARRAY),
+    );
+    let flags_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        flags,
+        i64::from(crate::JIT_NATIVE_ARRAY_VIEW_ABI_VERSION),
+    );
+    let pointer_ok = builder.ins().icmp_imm(IntCC::NotEqual, elements, 0);
+    let descriptor_ok = builder.ins().band(kind_ok, flags_ok);
+    let descriptor_ok = builder.ins().band(descriptor_ok, pointer_ok);
+    builder
+        .ins()
+        .brif(descriptor_ok, inspect_entry, &[], slow, &[]);
+
+    builder.switch_to_block(inspect_entry);
+    let elements = if pointer_type == types::I64 {
+        elements
+    } else {
+        builder.ins().ireduce(pointer_type, elements)
+    };
+    let is_constant = lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
+    let is_null = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, key, crate::jit_encode_constant(u32::MAX));
+    let is_uninitialized = builder.ins().icmp_imm(
+        IntCC::Equal,
+        key,
+        crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED),
+    );
+    let is_false = builder.ins().icmp_imm(
+        IntCC::Equal,
+        key,
+        crate::jit_encode_constant(crate::JIT_VALUE_FALSE),
+    );
+    let is_true = builder.ins().icmp_imm(
+        IntCC::Equal,
+        key,
+        crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
+    );
+    let is_reserved = builder.ins().bor(is_null, is_uninitialized);
+    let is_reserved = builder.ins().bor(is_reserved, is_false);
+    let is_reserved = builder.ins().bor(is_reserved, is_true);
+    let is_not_reserved = builder.ins().icmp_imm(IntCC::Equal, is_reserved, 0);
+    let is_unit_constant = builder.ins().band(is_constant, is_not_reserved);
+    let current_unit = builder.ins().iconst(types::I64, unit_identity as i64);
+    let no_unit = builder.ins().iconst(types::I64, 0);
+    let key_unit = builder
+        .ins()
+        .select(is_unit_constant, current_unit, no_unit);
+    let high = builder.ins().ushr_imm(key, 32);
+    let hash = builder.ins().bxor(key, high);
+    let unit_high = builder.ins().ushr_imm(key_unit, 29);
+    let hash = builder.ins().bxor(hash, key_unit);
+    let hash = builder.ins().bxor(hash, unit_high);
+    let slot = builder.ins().band_imm(hash, 15);
+    let entry_offset = builder.ins().imul_imm(
+        slot,
+        i64::try_from(std::mem::size_of::<crate::JitNativeArrayCacheEntry>()).unwrap_or(i64::MAX),
+    );
+    let entry_offset = if pointer_type == types::I64 {
+        entry_offset
+    } else {
+        builder.ins().ireduce(pointer_type, entry_offset)
+    };
+    let entry = builder.ins().iadd(elements, entry_offset);
+    let cached_key = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), entry, 0);
+    let cached_unit = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        entry,
+        std::mem::offset_of!(crate::JitNativeArrayCacheEntry, unit_identity) as i32,
+    );
+    let key_ok = builder.ins().icmp(IntCC::Equal, cached_key, key);
+    let unit_ok = builder.ins().icmp(IntCC::Equal, cached_unit, key_unit);
+    let key_ok = builder.ins().band(key_ok, unit_ok);
+    let value = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        entry,
+        std::mem::offset_of!(crate::JitNativeArrayCacheEntry, value) as i32,
+    );
+    builder
+        .ins()
+        .brif(key_ok, cached, &[value.into()], slow, &[]);
+
+    builder.switch_to_block(cached);
+    let value = builder.block_params(cached)[0];
+    let value =
+        lower_guarded_value_lifecycle(module, builder, lifecycle, 0, value, result_out, deopt_out)?;
+    builder.ins().jump(merge, &[value.into()]);
+
+    builder.switch_to_block(slow);
+    let value = lower_native_value_operation(
+        module,
+        builder,
+        helper,
+        operation,
+        &[array, key],
+        result_out,
+    )?;
+    builder.ins().jump(merge, &[value.into()]);
+
+    builder.switch_to_block(merge);
+    Ok(builder.block_params(merge)[0])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_direct_foreach_next(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    helper: Option<NativeHelper>,
+    lifecycle: Option<NativeHelper>,
+    iterator: ir::Value,
+    result_out: ir::Value,
+    deopt_out: ir::Value,
+) -> Result<(ir::Value, ir::Value, ir::Value), CraneliftLoweringError> {
+    let pointer_type = module.target_config().pointer_type();
+    let helper = helper.ok_or_else(|| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_NATIVE_OPERATION",
+            "native foreach-next helper was not declared",
+        )
+    })?;
+    let slow = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+    builder.append_block_param(merge, types::I64);
+    builder.append_block_param(merge, types::I64);
+
+    if helper.inline_runtime_view {
+        let inspect_runtime = builder.create_block();
+        let inspect_descriptor = builder.create_block();
+        let inspect_cursor = builder.create_block();
+        let present = builder.create_block();
+        let exhausted = builder.create_block();
+
+        let is_iterator =
+            lower_value_has_tag(builder, iterator, crate::JIT_VALUE_RUNTIME_ITERATOR_TAG);
+        builder
+            .ins()
+            .brif(is_iterator, inspect_runtime, &[], slow, &[]);
+
+        let view_offset = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
+        builder.switch_to_block(inspect_runtime);
+        let views = builder.ins().load(
+            pointer_type,
+            MemFlagsData::new(),
+            deopt_out,
+            view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, value_slots) as i32,
+        );
+        let index = builder.ins().ireduce(types::I32, iterator);
+        builder.ins().jump(inspect_descriptor, &[]);
+
+        builder.switch_to_block(inspect_descriptor);
+        let index = builder.ins().uextend(pointer_type, index);
+        let descriptor_offset = builder.ins().ishl_imm(index, 5);
+        let descriptor = builder.ins().iadd(views, descriptor_offset);
+        let kind = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            descriptor,
+            std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+        );
+        let flags = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            descriptor,
+            std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+        );
+        let payload = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            descriptor,
+            std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+        );
+        let kind_ok = builder.ins().icmp_imm(
+            IntCC::Equal,
+            kind,
+            i64::from(crate::JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT),
+        );
+        let flags_ok = builder.ins().icmp_imm(
+            IntCC::Equal,
+            flags,
+            i64::from(crate::JIT_NATIVE_FOREACH_VIEW_ABI_VERSION),
+        );
+        let payload_ok = builder.ins().icmp_imm(IntCC::NotEqual, payload, 0);
+        let descriptor_ok = builder.ins().band(kind_ok, flags_ok);
+        let descriptor_ok = builder.ins().band(descriptor_ok, payload_ok);
+        builder
+            .ins()
+            .brif(descriptor_ok, inspect_cursor, &[], slow, &[]);
+
+        builder.switch_to_block(inspect_cursor);
+        let foreach_view = if pointer_type == types::I64 {
+            payload
+        } else {
+            builder.ins().ireduce(pointer_type, payload)
+        };
+        let cursor = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            foreach_view,
+            std::mem::offset_of!(crate::JitNativeForeachView, cursor) as i32,
+        );
+        let length = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            foreach_view,
+            std::mem::offset_of!(crate::JitNativeForeachView, length) as i32,
+        );
+        let has_value = builder.ins().icmp(IntCC::UnsignedLessThan, cursor, length);
+        builder.ins().brif(has_value, present, &[], exhausted, &[]);
+
+        builder.switch_to_block(present);
+        let entries = builder.ins().load(
+            pointer_type,
+            MemFlagsData::new(),
+            foreach_view,
+            std::mem::offset_of!(crate::JitNativeForeachView, entries) as i32,
+        );
+        let entry_offset = builder.ins().ishl_imm(cursor, 4);
+        let entry_offset = if pointer_type == types::I64 {
+            entry_offset
+        } else {
+            builder.ins().ireduce(pointer_type, entry_offset)
+        };
+        let entry = builder.ins().iadd(entries, entry_offset);
+        let key = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            entry,
+            std::mem::offset_of!(crate::JitNativeForeachEntry, key) as i32,
+        );
+        let value = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            entry,
+            std::mem::offset_of!(crate::JitNativeForeachEntry, value) as i32,
+        );
+        let next = builder.ins().iadd_imm(cursor, 1);
+        builder.ins().store(
+            MemFlagsData::new(),
+            next,
+            foreach_view,
+            std::mem::offset_of!(crate::JitNativeForeachView, cursor) as i32,
+        );
+        let key = lower_guarded_value_lifecycle(
+            module, builder, lifecycle, 0, key, result_out, deopt_out,
+        )?;
+        let value = lower_guarded_value_lifecycle(
+            module, builder, lifecycle, 0, value, result_out, deopt_out,
+        )?;
+        let one = builder.ins().iconst(types::I64, 1);
+        builder
+            .ins()
+            .jump(merge, &[key.into(), value.into(), one.into()]);
+
+        builder.switch_to_block(exhausted);
+        let null = builder
+            .ins()
+            .iconst(types::I64, crate::jit_encode_constant(u32::MAX));
+        let zero = builder.ins().iconst(types::I64, 0);
+        builder
+            .ins()
+            .jump(merge, &[null.into(), null.into(), zero.into()]);
+    } else {
+        builder.ins().jump(slow, &[]);
+    }
+
+    builder.switch_to_block(slow);
+    let key_slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+    let value_slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+    let has_slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+    let key_out = builder.ins().stack_addr(pointer_type, key_slot, 0);
+    let value_out = builder.ins().stack_addr(pointer_type, value_slot, 0);
+    let has_out = builder.ins().stack_addr(pointer_type, has_slot, 0);
+    let call = call_native_helper(
+        module,
+        builder,
+        helper,
+        &[iterator, key_out, value_out, has_out],
+    );
+    require_native_operation_ok(
+        builder,
+        builder.inst_results(call)[0],
+        helper.terminal_exit()?,
+    )?;
+    let key = builder.ins().stack_load(types::I64, key_slot, 0);
+    let value = builder.ins().stack_load(types::I64, value_slot, 0);
+    let has = builder.ins().stack_load(types::I64, has_slot, 0);
+    builder
+        .ins()
+        .jump(merge, &[key.into(), value.into(), has.into()]);
+
+    builder.switch_to_block(merge);
+    let params = builder.block_params(merge);
+    Ok((params[0], params[1], params[2]))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2086,6 +2551,7 @@ fn lower_guarded_empty_condition(
             )
         })?,
         value,
+        deopt_out,
     )?;
     builder.ins().jump(merge, &[generic_truthy.into()]);
 
@@ -2307,13 +2773,13 @@ fn lower_guarded_value_lifecycle(
         let is_runtime = lower_is_runtime_handle(builder, value);
         let view_offset = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
         let pointer_type = module.target_config().pointer_type();
-        let refcounts = builder.ins().load(
+        let value_slots = builder.ins().load(
             pointer_type,
             MemFlagsData::new(),
             deopt_out,
-            view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, refcounts) as i32,
+            view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, value_slots) as i32,
         );
-        let pointer_ok = builder.ins().icmp_imm(IntCC::NotEqual, refcounts, 0);
+        let pointer_ok = builder.ins().icmp_imm(IntCC::NotEqual, value_slots, 0);
         let direct = builder.ins().band(is_runtime, pointer_ok);
 
         // Native execution publishes a stable request-local refcount table and
@@ -2321,12 +2787,12 @@ fn lower_guarded_value_lifecycle(
         // capacity/version guard nor a helper fallback. Keep a valid scratch
         // address for constants and standalone invocations without a runtime
         // view so the emitted update remains one branchless basic block.
-        let safe_base = builder.ins().select(direct, refcounts, result_out);
+        let safe_base = builder.ins().select(direct, value_slots, result_out);
         let index = builder.ins().ireduce(types::I32, value);
         let zero_index = builder.ins().iconst(types::I32, 0);
         let safe_index = builder.ins().select(direct, index, zero_index);
         let safe_index = builder.ins().uextend(pointer_type, safe_index);
-        let byte_offset = builder.ins().ishl_imm(safe_index, 2);
+        let byte_offset = builder.ins().ishl_imm(safe_index, 5);
         let cell = builder.ins().iadd(safe_base, byte_offset);
         let count = builder.ins().load(types::I32, MemFlagsData::new(), cell, 0);
         let incremented = builder.ins().iadd_imm(count, 1);
@@ -2338,45 +2804,23 @@ fn lower_guarded_value_lifecycle(
     let done = builder.create_block();
     let is_runtime = lower_is_runtime_handle(builder, value);
     let view_offset = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
-    let version = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        deopt_out,
-        view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, abi_version) as i32,
-    );
-    let capacity = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        deopt_out,
-        view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, refcount_capacity) as i32,
-    );
     let pointer_type = module.target_config().pointer_type();
-    let refcounts = builder.ins().load(
+    let value_slots = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
         deopt_out,
-        view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, refcounts) as i32,
+        view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, value_slots) as i32,
     );
     let index = builder.ins().ireduce(types::I32, value);
-    let version_ok = builder.ins().icmp_imm(
-        IntCC::Equal,
-        version,
-        i64::from(crate::JIT_RUNTIME_ABI_VERSION),
-    );
-    let pointer_ok = builder.ins().icmp_imm(IntCC::NotEqual, refcounts, 0);
-    let index_ok = builder.ins().icmp(IntCC::UnsignedLessThan, index, capacity);
-    let view_ok = builder.ins().band(version_ok, pointer_ok);
-    let view_ok = builder.ins().band(view_ok, index_ok);
-    let direct_ok = builder.ins().band(is_runtime, view_ok);
+    let direct_ok = is_runtime;
 
-    // Point invalid and non-runtime lanes at the always-valid result scratch
-    // before loading. This keeps the common refcount update branchless without
-    // speculating through a null or out-of-range runtime-view pointer.
-    let safe_base = builder.ins().select(direct_ok, refcounts, result_out);
+    // Published code owns a validated request view for every runtime handle.
+    // Constants still use the scratch lane so the update remains branchless.
+    let safe_base = builder.ins().select(direct_ok, value_slots, result_out);
     let zero_index = builder.ins().iconst(types::I32, 0);
     let safe_index = builder.ins().select(direct_ok, index, zero_index);
     let safe_index = builder.ins().uextend(pointer_type, safe_index);
-    let byte_offset = builder.ins().ishl_imm(safe_index, 2);
+    let byte_offset = builder.ins().ishl_imm(safe_index, 5);
     let cell = builder.ins().iadd(safe_base, byte_offset);
     let count = builder.ins().load(types::I32, MemFlagsData::new(), cell, 0);
     let count_ok = builder.ins().icmp_imm(IntCC::UnsignedGreaterThan, count, 1);
@@ -2396,6 +2840,7 @@ fn lower_guarded_value_lifecycle(
     Ok(value)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn lower_guarded_native_local_store(
     module: &mut JITModule,
@@ -2553,60 +2998,37 @@ fn lower_guarded_native_local_fetch(
 
     builder.switch_to_block(inspect_reference);
     let view_offset = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
-    let version = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        deopt_out,
-        view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, abi_version) as i32,
-    );
-    let capacity = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        deopt_out,
-        view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, value_view_capacity) as i32,
-    );
     let pointer_type = module.target_config().pointer_type();
     let views = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
         deopt_out,
-        view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, value_views) as i32,
+        view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, value_slots) as i32,
     );
     let index = builder.ins().ireduce(types::I32, value);
-    let version_ok = builder.ins().icmp_imm(
-        IntCC::Equal,
-        version,
-        i64::from(crate::JIT_RUNTIME_ABI_VERSION),
-    );
-    let pointer_ok = builder.ins().icmp_imm(IntCC::NotEqual, views, 0);
-    let index_ok = builder.ins().icmp(IntCC::UnsignedLessThan, index, capacity);
-    let descriptor_ok = builder.ins().band(version_ok, pointer_ok);
-    let descriptor_ok = builder.ins().band(descriptor_ok, index_ok);
-    builder
-        .ins()
-        .brif(descriptor_ok, inspect_descriptor, &[], slow, &[]);
+    builder.ins().jump(inspect_descriptor, &[]);
 
     builder.switch_to_block(inspect_descriptor);
     let index = builder.ins().uextend(pointer_type, index);
-    let byte_offset = builder.ins().ishl_imm(index, 4);
+    let byte_offset = builder.ins().ishl_imm(index, 5);
     let descriptor = builder.ins().iadd(views, byte_offset);
     let kind = builder.ins().load(
         types::I32,
         MemFlagsData::new(),
         descriptor,
-        std::mem::offset_of!(crate::JitNativeValueView, kind) as i32,
+        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
     );
     let flags = builder.ins().load(
         types::I32,
         MemFlagsData::new(),
         descriptor,
-        std::mem::offset_of!(crate::JitNativeValueView, flags) as i32,
+        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
     );
     let address = builder.ins().load(
         types::I64,
         MemFlagsData::new(),
         descriptor,
-        std::mem::offset_of!(crate::JitNativeValueView, length) as i32,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
     );
     let kind_ok = builder.ins().icmp_imm(
         IntCC::Equal,
@@ -2918,10 +3340,6 @@ const fn native_frame_cleanup_operation(function: FunctionId) -> u32 {
     }
 }
 
-const fn native_instruction_locator(block: BlockId, instruction: php_ir::InstrId) -> i64 {
-    ((block.raw() as u64) << 32 | instruction.raw() as u64) as i64
-}
-
 fn lowering_operand_fact(
     value_flow: &ExecutableValueFlow,
     constants: &[IrConstant],
@@ -2937,6 +3355,7 @@ fn lower_region_instruction(
     functions: &BTreeMap<FunctionId, FuncId>,
     inline_constants: &BTreeMap<FunctionId, BoundedInlineValue>,
     function_params: &BTreeMap<FunctionId, NativeFunctionMetadata>,
+    external_function_signatures: &[crate::JitExternalFunctionSignature],
     native_call_helper: Option<NativeHelper>,
     native_dynamic_code_helper: Option<NativeHelper>,
     native_operations: NativeOperationFunctions,
@@ -2961,6 +3380,7 @@ fn lower_region_instruction(
     native_version: u32,
     function_is_top_level: bool,
     function_local_names: &[String],
+    unit_identity: u64,
     pointer_type: ir::Type,
 ) -> Result<(), CraneliftLoweringError> {
     let native_reference_publish = function_is_top_level
@@ -3411,10 +3831,9 @@ fn lower_region_instruction(
                 result_out,
             )?;
             let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
-            let instruction_id = builder.ins().iconst(
-                types::I64,
-                native_instruction_locator(source_block, instruction.id),
-            );
+            let instruction_id = builder
+                .ins()
+                .iconst(types::I64, i64::from(instruction.continuation_id));
             let _ = lower_native_value_operation(
                 module,
                 builder,
@@ -3427,10 +3846,9 @@ fn lower_region_instruction(
         RegionInstructionKind::BindReferenceFromProperty { target, object } => {
             let object = lower_region_operand(builder, locals, registers, *object)?;
             let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
-            let instruction_id = builder.ins().iconst(
-                types::I64,
-                native_instruction_locator(source_block, instruction.id),
-            );
+            let instruction_id = builder
+                .ins()
+                .iconst(types::I64, i64::from(instruction.continuation_id));
             let reference = lower_native_value_operation(
                 module,
                 builder,
@@ -3457,10 +3875,9 @@ fn lower_region_instruction(
         } => {
             let object = lower_region_operand(builder, locals, registers, *object)?;
             let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
-            let instruction_id = builder.ins().iconst(
-                types::I64,
-                native_instruction_locator(source_block, instruction.id),
-            );
+            let instruction_id = builder
+                .ins()
+                .iconst(types::I64, i64::from(instruction.continuation_id));
             let mut reference = lower_native_value_operation(
                 module,
                 builder,
@@ -3520,10 +3937,9 @@ fn lower_region_instruction(
                 result_out,
             )?;
             let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
-            let instruction_id = builder.ins().iconst(
-                types::I64,
-                native_instruction_locator(source_block, instruction.id),
-            );
+            let instruction_id = builder
+                .ins()
+                .iconst(types::I64, i64::from(instruction.continuation_id));
             let root = lower_native_value_operation(
                 module,
                 builder,
@@ -3602,10 +4018,9 @@ fn lower_region_instruction(
         } => {
             let object = lower_region_operand(builder, locals, registers, *object)?;
             let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
-            let instruction_id = builder.ins().iconst(
-                types::I64,
-                native_instruction_locator(source_block, instruction.id),
-            );
+            let instruction_id = builder
+                .ins()
+                .iconst(types::I64, i64::from(instruction.continuation_id));
             if keys.is_empty() && !*append {
                 // `$local =& $object->property` must reuse an existing
                 // property reference. Fetching the dereferenced value,
@@ -3729,10 +4144,9 @@ fn lower_region_instruction(
             publish_native_register_state(builder, deopt_out, registers, transition_live_registers);
             let source_value = use_local_variable(builder, locals, *source)?;
             let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
-            let instruction_id = builder.ins().iconst(
-                types::I64,
-                native_instruction_locator(source_block, instruction.id),
-            );
+            let instruction_id = builder
+                .ins()
+                .iconst(types::I64, i64::from(instruction.continuation_id));
             let reference = lower_native_value_operation(
                 module,
                 builder,
@@ -3890,6 +4304,7 @@ fn lower_region_instruction(
                         )
                     })?,
                     src,
+                    deopt_out,
                 )?;
                 let inverted = builder.ins().bxor_imm(truthy, 1);
                 encode_native_bool(builder, inverted)
@@ -3975,6 +4390,7 @@ fn lower_region_instruction(
                     register_variables,
                     registers,
                     function_params,
+                    external_function_signatures,
                     call,
                     source_block,
                     instruction,
@@ -4083,6 +4499,7 @@ fn lower_region_instruction(
                     register_variables,
                     registers,
                     function_params,
+                    external_function_signatures,
                     call,
                     source_block,
                     instruction,
@@ -4209,7 +4626,7 @@ fn lower_region_instruction(
                 }
                 return Ok(());
             }
-            if let Some(helper_id) = stable_builtin_helper_id(&call.target)
+            if let Some(builtin_id) = stable_builtin_dense_id(&call.target)
                 && call.argument_operand_offset == 0
                 && call.operands.len() == call.args.len()
                 && call.args.iter().enumerate().all(|(index, argument)| {
@@ -4230,7 +4647,7 @@ fn lower_region_instruction(
                     register_variables,
                     registers,
                     call,
-                    helper_id,
+                    builtin_id,
                     instruction,
                     transition_live_registers,
                     streaming_call_exit,
@@ -4239,6 +4656,55 @@ fn lower_region_instruction(
                     function,
                     local_count,
                     native_version,
+                    pointer_type,
+                )?;
+                return Ok(());
+            }
+            if let RegionCallTarget::Semantic { operation } = &call.target {
+                if matches!(
+                    operation,
+                    crate::region_ir::RegionSemanticOp::BindGlobal { .. }
+                ) {
+                    lower_cached_bind_global(
+                        module,
+                        builder,
+                        native_operations.semantic_dispatch,
+                        native_operations.value_lifecycle,
+                        locals,
+                        register_variables,
+                        registers,
+                        call,
+                        instruction,
+                        transition_live_registers,
+                        streaming_call_exit,
+                        result_out,
+                        deopt_out,
+                        function,
+                        local_count,
+                        native_version,
+                        unit_identity,
+                        pointer_type,
+                    )?;
+                    return Ok(());
+                }
+                lower_direct_semantic_call(
+                    module,
+                    builder,
+                    native_operations.semantic_dispatch,
+                    locals,
+                    register_variables,
+                    registers,
+                    call,
+                    operation.operation_id(),
+                    instruction,
+                    transition_live_registers,
+                    streaming_call_exit,
+                    result_out,
+                    deopt_out,
+                    function,
+                    local_count,
+                    native_version,
+                    unit_identity,
                     pointer_type,
                 )?;
                 return Ok(());
@@ -4316,6 +4782,7 @@ fn lower_region_instruction(
                     register_variables,
                     registers,
                     function_params,
+                    external_function_signatures,
                     call,
                     source_block,
                     instruction,
@@ -4372,7 +4839,6 @@ fn lower_region_instruction(
                         argument,
                         visible_index,
                         value,
-                        source_block,
                         instruction,
                         function,
                         false,
@@ -4511,6 +4977,9 @@ fn lower_region_instruction(
                 );
             }
             let callee_call_args = [
+                native_operations
+                    .runtime
+                    .expect("native call must carry request fast state"),
                 arguments,
                 callee_result_out,
                 deopt_out,
@@ -4528,12 +4997,116 @@ fn lower_region_instruction(
                     builder.ins().call(callee_ref, &callee_call_args)
                 }
                 NativeDirectCallee::Resolved(target) => {
+                    let callee_unit_identity = unit_identity;
                     let helper = native_operations.function_resolve.ok_or_else(|| {
                         CraneliftLoweringError::new(
                             "JIT_CRANELIFT_REJECT_NATIVE_FUNCTION_RESOLVER",
                             "statically known callee has no compile-on-demand resolver",
                         )
                     })?;
+                    let inspect_record = builder.create_block();
+                    let cache_hit = builder.create_block();
+                    let resolve = builder.create_block();
+                    let address_ready = builder.create_block();
+                    builder.append_block_param(cache_hit, pointer_type);
+                    builder.append_block_param(address_ready, pointer_type);
+
+                    let runtime_view_offset =
+                        std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
+                    let cache = builder.ins().load(
+                        pointer_type,
+                        MemFlagsData::new(),
+                        deopt_out,
+                        runtime_view_offset
+                            + std::mem::offset_of!(
+                                crate::JitNativeRuntimeView,
+                                function_entry_cache,
+                            ) as i32,
+                    );
+                    let epoch_pointer = builder.ins().load(
+                        pointer_type,
+                        MemFlagsData::new(),
+                        deopt_out,
+                        runtime_view_offset
+                            + std::mem::offset_of!(crate::JitNativeRuntimeView, signature_epoch,)
+                                as i32,
+                    );
+                    builder.ins().jump(inspect_record, &[]);
+
+                    builder.switch_to_block(inspect_record);
+                    let cache_index =
+                        (target.index() ^ (callee_unit_identity as usize).wrapping_mul(31)) & 4_095;
+                    let record = builder.ins().iadd_imm(
+                        cache,
+                        i64::try_from(cache_index.saturating_mul(std::mem::size_of::<
+                            crate::JitNativeFunctionEntryCacheRecord,
+                        >()))
+                        .unwrap_or(i64::MAX),
+                    );
+                    let cached_unit = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::new(),
+                        record,
+                        std::mem::offset_of!(
+                            crate::JitNativeFunctionEntryCacheRecord,
+                            unit_identity,
+                        ) as i32,
+                    );
+                    let cached_epoch = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::new(),
+                        record,
+                        std::mem::offset_of!(
+                            crate::JitNativeFunctionEntryCacheRecord,
+                            signature_epoch,
+                        ) as i32,
+                    );
+                    let cached_address = builder.ins().load(
+                        pointer_type,
+                        MemFlagsData::new(),
+                        record,
+                        std::mem::offset_of!(crate::JitNativeFunctionEntryCacheRecord, address,)
+                            as i32,
+                    );
+                    let cached_function = builder.ins().load(
+                        types::I32,
+                        MemFlagsData::new(),
+                        record,
+                        std::mem::offset_of!(crate::JitNativeFunctionEntryCacheRecord, function_id,)
+                            as i32,
+                    );
+                    let live_epoch =
+                        builder
+                            .ins()
+                            .load(types::I64, MemFlagsData::new(), epoch_pointer, 0);
+                    let unit_ok = builder.ins().icmp_imm(
+                        IntCC::Equal,
+                        cached_unit,
+                        callee_unit_identity as i64,
+                    );
+                    let function_ok = builder.ins().icmp_imm(
+                        IntCC::Equal,
+                        cached_function,
+                        i64::from(target.raw()),
+                    );
+                    let epoch_ok = builder.ins().icmp(IntCC::Equal, cached_epoch, live_epoch);
+                    let address_ok = builder.ins().icmp_imm(IntCC::NotEqual, cached_address, 0);
+                    let record_ok = builder.ins().band(unit_ok, function_ok);
+                    let record_ok = builder.ins().band(record_ok, epoch_ok);
+                    let record_ok = builder.ins().band(record_ok, address_ok);
+                    builder.ins().brif(
+                        record_ok,
+                        cache_hit,
+                        &[cached_address.into()],
+                        resolve,
+                        &[],
+                    );
+
+                    builder.switch_to_block(cache_hit);
+                    let cached_address = builder.block_params(cache_hit)[0];
+                    builder.ins().jump(address_ready, &[cached_address.into()]);
+
+                    builder.switch_to_block(resolve);
                     let address_slot = builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
                         pointer_type.bytes(),
@@ -4554,6 +5127,10 @@ fn lower_region_instruction(
                         helper.terminal_exit()?,
                     )?;
                     let address = builder.ins().stack_load(pointer_type, address_slot, 0);
+                    builder.ins().jump(address_ready, &[address.into()]);
+
+                    builder.switch_to_block(address_ready);
+                    let address = builder.block_params(address_ready)[0];
                     let signature = native_php_entry_signature(module);
                     let signature = builder.import_signature(signature);
                     builder
@@ -4957,10 +5534,9 @@ fn lower_region_instruction(
             publish_native_register_state(builder, deopt_out, registers, transition_live_registers);
             let object = lower_region_operand(builder, locals, registers, *object)?;
             let function = builder.ins().iconst(types::I64, i64::from(function.raw()));
-            let instruction_id = builder.ins().iconst(
-                types::I64,
-                native_instruction_locator(source_block, instruction.id),
-            );
+            let instruction_id = builder
+                .ins()
+                .iconst(types::I64, i64::from(instruction.continuation_id));
             let value = lower_native_value_operation(
                 module,
                 builder,
@@ -4984,10 +5560,9 @@ fn lower_region_instruction(
             publish_native_register_state(builder, deopt_out, registers, transition_live_registers);
             let class_name = lower_region_operand(builder, locals, registers, *class_name)?;
             let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
-            let instruction_id = builder.ins().iconst(
-                types::I64,
-                native_instruction_locator(source_block, instruction.id),
-            );
+            let instruction_id = builder
+                .ins()
+                .iconst(types::I64, i64::from(instruction.continuation_id));
             let value = lower_native_value_operation(
                 module,
                 builder,
@@ -5011,10 +5586,9 @@ fn lower_region_instruction(
             publish_native_register_state(builder, deopt_out, registers, transition_live_registers);
             let object = lower_region_operand(builder, locals, registers, *object)?;
             let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
-            let instruction_id = builder.ins().iconst(
-                types::I64,
-                native_instruction_locator(source_block, instruction.id),
-            );
+            let instruction_id = builder
+                .ins()
+                .iconst(types::I64, i64::from(instruction.continuation_id));
             let value = lower_native_value_operation(
                 module,
                 builder,
@@ -5044,10 +5618,9 @@ fn lower_region_instruction(
                 SsaOwnership::Owned | SsaOwnership::Moved
             );
             let function = builder.ins().iconst(types::I64, i64::from(function.raw()));
-            let instruction_id = builder.ins().iconst(
-                types::I64,
-                native_instruction_locator(source_block, instruction.id),
-            );
+            let instruction_id = builder
+                .ins()
+                .iconst(types::I64, i64::from(instruction.continuation_id));
             let value = lower_native_value_operation(
                 module,
                 builder,
@@ -5159,6 +5732,7 @@ fn lower_region_instruction(
             array,
             key,
             quiet,
+            mode,
         } => {
             // The dimension helper borrows and dereferences its target. Passing
             // the encoded local directly avoids manufacturing an owned copy
@@ -5191,14 +5765,31 @@ fn lower_region_instruction(
                 )
             };
             let key = lower_region_operand(builder, locals, registers, *key)?;
-            let value = lower_native_value_operation(
-                module,
-                builder,
-                native_operations.array_fetch,
-                native_dim_operation(u32::from(*quiet), function, instruction.continuation_id),
-                &[array, key],
-                result_out,
-            )?;
+            let operation =
+                native_dim_operation(u32::from(*quiet), function, instruction.continuation_id);
+            let value = if *mode == php_ir::instruction::DimFetchMode::Read {
+                lower_cached_array_fetch(
+                    module,
+                    builder,
+                    native_operations.array_fetch,
+                    native_operations.value_lifecycle,
+                    operation,
+                    array,
+                    key,
+                    unit_identity,
+                    result_out,
+                    deopt_out,
+                )?
+            } else {
+                lower_native_value_operation(
+                    module,
+                    builder,
+                    native_operations.array_fetch,
+                    operation,
+                    &[array, key],
+                    result_out,
+                )?
+            };
             if release_array {
                 let _ = lower_native_value_operation(
                     module,
@@ -5723,53 +6314,24 @@ fn lower_region_instruction(
             key,
             value,
         } => {
-            let helper = native_operations.foreach_next.ok_or_else(|| {
-                CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_NATIVE_OPERATION",
-                    "native foreach-next helper was not declared",
-                )
-            })?;
-            let key_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                8,
-                3,
-            ));
-            let value_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                8,
-                3,
-            ));
-            let has_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                8,
-                3,
-            ));
             let iterator_value = lower_region_operand(
                 builder,
                 locals,
                 registers,
                 RegionOperand::Register(*iterator),
             )?;
-            let key_out = builder.ins().stack_addr(pointer_type, key_slot, 0);
-            let value_out = builder.ins().stack_addr(pointer_type, value_slot, 0);
-            let has_out = builder.ins().stack_addr(pointer_type, has_slot, 0);
-            let call = call_native_helper(
+            let (next_key, next_value, has) = lower_direct_foreach_next(
                 module,
                 builder,
-                helper,
-                &[iterator_value, key_out, value_out, has_out],
-            );
-            require_native_operation_ok(
-                builder,
-                builder.inst_results(call)[0],
-                helper.terminal_exit()?,
+                native_operations.foreach_next,
+                native_operations.value_lifecycle,
+                iterator_value,
+                result_out,
+                deopt_out,
             )?;
-            let has = builder.ins().stack_load(types::I64, has_slot, 0);
-            let next_value = builder.ins().stack_load(types::I64, value_slot, 0);
             define_region_register(builder, register_variables, registers, *has_value, has)?;
             define_region_register(builder, register_variables, registers, *value, next_value)?;
             if let Some(key) = key {
-                let next_key = builder.ins().stack_load(types::I64, key_slot, 0);
                 define_region_register(builder, register_variables, registers, *key, next_key)?;
             }
         }
@@ -6104,6 +6666,297 @@ fn lower_native_suspension(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn lower_cached_bind_global(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    semantic_helper: Option<NativeHelper>,
+    lifecycle: Option<NativeHelper>,
+    locals: &NativeLocalMap,
+    register_variables: &NativeRegisterMap,
+    registers: &mut NativeRegisterMap,
+    call: &RegionNativeCall,
+    instruction: &RegionInstruction,
+    transition_live_registers: &[RegId],
+    streaming_call_exit: Option<NativeStreamingCallExit>,
+    result_out: ir::Value,
+    deopt_out: ir::Value,
+    function: FunctionId,
+    local_count: u32,
+    native_version: u32,
+    unit_identity: u64,
+    pointer_type: ir::Type,
+) -> Result<(), CraneliftLoweringError> {
+    let RegionCallResult::ReferenceLocal(destination) = call.result else {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_BIND_GLOBAL_RESULT",
+            "BindGlobal must publish a reference local",
+        ));
+    };
+    let inspect = builder.create_block();
+    let cached = builder.create_block();
+    let slow = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(cached, types::I64);
+    builder.append_block_param(merge, types::I64);
+
+    let runtime_view_offset = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
+    let cache = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        deopt_out,
+        runtime_view_offset
+            + std::mem::offset_of!(crate::JitNativeRuntimeView, global_reference_cache) as i32,
+    );
+    builder.ins().jump(inspect, &[]);
+
+    builder.switch_to_block(inspect);
+    let cache_index = crate::jit_native_global_reference_cache_index(
+        unit_identity,
+        function.raw(),
+        instruction.continuation_id,
+        (crate::JIT_NATIVE_GLOBAL_REFERENCE_CACHE_SIZE - 1) as u32,
+    );
+    let record = builder.ins().iadd_imm(
+        cache,
+        i64::try_from(cache_index.saturating_mul(std::mem::size_of::<
+            crate::JitNativeGlobalReferenceCacheRecord,
+        >()))
+        .unwrap_or(i64::MAX),
+    );
+    let cached_unit = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        record,
+        std::mem::offset_of!(crate::JitNativeGlobalReferenceCacheRecord, unit_identity) as i32,
+    );
+    let encoded = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        record,
+        std::mem::offset_of!(crate::JitNativeGlobalReferenceCacheRecord, encoded) as i32,
+    );
+    let cached_function = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        record,
+        std::mem::offset_of!(crate::JitNativeGlobalReferenceCacheRecord, function_id) as i32,
+    );
+    let cached_continuation = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        record,
+        std::mem::offset_of!(crate::JitNativeGlobalReferenceCacheRecord, continuation_id) as i32,
+    );
+    let valid = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        record,
+        std::mem::offset_of!(crate::JitNativeGlobalReferenceCacheRecord, valid) as i32,
+    );
+    let unit_ok = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, cached_unit, unit_identity as i64);
+    let function_ok =
+        builder
+            .ins()
+            .icmp_imm(IntCC::Equal, cached_function, i64::from(function.raw()));
+    let continuation_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        cached_continuation,
+        i64::from(instruction.continuation_id),
+    );
+    let valid = builder.ins().icmp_imm(IntCC::NotEqual, valid, 0);
+    let record_ok = builder.ins().band(unit_ok, function_ok);
+    let record_ok = builder.ins().band(record_ok, continuation_ok);
+    let record_ok = builder.ins().band(record_ok, valid);
+    builder
+        .ins()
+        .brif(record_ok, cached, &[encoded.into()], slow, &[]);
+
+    builder.switch_to_block(cached);
+    let encoded = builder.block_params(cached)[0];
+    let encoded = lower_guarded_value_lifecycle(
+        module, builder, lifecycle, 0, encoded, result_out, deopt_out,
+    )?;
+    builder.ins().jump(merge, &[encoded.into()]);
+
+    builder.switch_to_block(slow);
+    lower_direct_semantic_call(
+        module,
+        builder,
+        semantic_helper,
+        locals,
+        register_variables,
+        registers,
+        call,
+        crate::region_ir::RegionSemanticOperationId::BindGlobal,
+        instruction,
+        transition_live_registers,
+        streaming_call_exit,
+        result_out,
+        deopt_out,
+        function,
+        local_count,
+        native_version,
+        unit_identity,
+        pointer_type,
+    )?;
+    let encoded = use_local_variable(builder, locals, destination)?;
+    builder.ins().jump(merge, &[encoded.into()]);
+
+    builder.switch_to_block(merge);
+    let encoded = builder.block_params(merge)[0];
+    define_local_variable(builder, locals, destination, encoded)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_direct_semantic_call(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    semantic_helper: Option<NativeHelper>,
+    locals: &NativeLocalMap,
+    register_variables: &NativeRegisterMap,
+    registers: &mut NativeRegisterMap,
+    call: &RegionNativeCall,
+    operation: crate::region_ir::RegionSemanticOperationId,
+    instruction: &RegionInstruction,
+    transition_live_registers: &[RegId],
+    streaming_call_exit: Option<NativeStreamingCallExit>,
+    result_out: ir::Value,
+    deopt_out: ir::Value,
+    function: FunctionId,
+    local_count: u32,
+    native_version: u32,
+    unit_identity: u64,
+    pointer_type: ir::Type,
+) -> Result<(), CraneliftLoweringError> {
+    let helper = semantic_helper.ok_or_else(|| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_NATIVE_SEMANTIC_DISPATCH",
+            "typed semantic operation has no direct dispatcher",
+        )
+    })?;
+    let operand_count = call.operands.len();
+    let operands_ptr = if operand_count == 0 {
+        builder.ins().iconst(pointer_type, 0)
+    } else {
+        let bytes = operand_count
+            .checked_mul(std::mem::size_of::<i64>())
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_NATIVE_SEMANTIC_OPERANDS",
+                    "semantic operand table exceeds native stack limits",
+                )
+            })?;
+        let pointer = allocate_native_stack_storage(builder, pointer_type, bytes, 3);
+        for (index, operand) in call.operands.iter().enumerate() {
+            let operand = operand.ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_NATIVE_SEMANTIC_OPERANDS",
+                    "semantic operation is missing a materialized operand",
+                )
+            })?;
+            let value = lower_region_operand(builder, locals, registers, operand)?;
+            builder.ins().store(
+                MemFlagsData::new(),
+                value,
+                pointer,
+                i32::try_from(index.saturating_mul(8)).unwrap_or(i32::MAX),
+            );
+        }
+        pointer
+    };
+
+    let out_slot = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        std::mem::size_of::<crate::JitCallResult>() as u32,
+        3,
+    ));
+    let out_ptr = builder.ins().stack_addr(pointer_type, out_slot, 0);
+    let function_id = builder.ins().iconst(types::I32, i64::from(function.raw()));
+    let unit_identity = builder.ins().iconst(types::I64, unit_identity as i64);
+    let continuation = builder
+        .ins()
+        .iconst(types::I32, i64::from(instruction.continuation_id));
+    let operation_id = builder.ins().iconst(types::I32, i64::from(operation.raw()));
+    let operand_count = builder
+        .ins()
+        .iconst(types::I32, i64::try_from(operand_count).unwrap_or(i64::MAX));
+    let helper_call = call_native_helper(
+        module,
+        builder,
+        helper,
+        &[
+            unit_identity,
+            function_id,
+            continuation,
+            operation_id,
+            operands_ptr,
+            operand_count,
+            out_ptr,
+        ],
+    );
+    let status = builder.inst_results(helper_call)[0];
+    let ok = builder.create_block();
+    let side_exit = builder.create_block();
+    let is_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        status,
+        i64::from(crate::JitCallStatus::RETURN.0),
+    );
+    builder.ins().brif(is_ok, ok, &[], side_exit, &[]);
+
+    builder.switch_to_block(side_exit);
+    publish_native_register_state(builder, deopt_out, registers, transition_live_registers);
+    let control_value = builder.ins().stack_load(types::I64, out_slot, 16);
+    if let Some(streaming_call_exit) = streaming_call_exit {
+        let continuation = builder
+            .ins()
+            .iconst(types::I32, i64::from(instruction.continuation_id));
+        let masks = native_local_mask_words(&instruction.live_locals)
+            .into_iter()
+            .map(|mask| builder.ins().iconst(types::I64, mask as i64))
+            .map(Into::into)
+            .collect::<Vec<ir::BlockArg>>();
+        let mut args = Vec::<ir::BlockArg>::with_capacity(3 + masks.len());
+        args.push(status.into());
+        args.push(control_value.into());
+        args.push(continuation.into());
+        args.extend(masks);
+        builder.ins().jump(streaming_call_exit.block, &args);
+    } else {
+        publish_native_call_state(
+            builder,
+            deopt_out,
+            function,
+            local_count,
+            instruction,
+            locals,
+            native_version,
+        )?;
+        builder
+            .ins()
+            .store(MemFlagsData::new(), control_value, result_out, 0);
+        builder.ins().return_(&[status]);
+    }
+
+    builder.switch_to_block(ok);
+    let value = builder.ins().stack_load(types::I64, out_slot, 16);
+    match call.result {
+        RegionCallResult::Register(register) => {
+            define_region_register(builder, register_variables, registers, register, value)?;
+        }
+        RegionCallResult::ReferenceLocal(local) => {
+            define_local_variable(builder, locals, local, value)?;
+        }
+        RegionCallResult::Discard => {}
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn lower_direct_builtin_call(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
@@ -6114,7 +6967,7 @@ fn lower_direct_builtin_call(
     register_variables: &NativeRegisterMap,
     registers: &mut NativeRegisterMap,
     call: &RegionNativeCall,
-    helper_id: u32,
+    builtin_id: u32,
     instruction: &RegionInstruction,
     transition_live_registers: &[RegId],
     streaming_call_exit: Option<NativeStreamingCallExit>,
@@ -6211,11 +7064,17 @@ fn lower_direct_builtin_call(
         3,
     ));
     let out_ptr = builder.ins().stack_addr(pointer_type, out_slot, 0);
-    let helper_id = builder.ins().iconst(types::I32, i64::from(helper_id));
+    let builtin_id = builder.ins().iconst(types::I32, i64::from(builtin_id));
     let function_id = builder.ins().iconst(types::I32, i64::from(function.raw()));
-    let continuation = builder
+    let source_file = builder
         .ins()
-        .iconst(types::I32, i64::from(instruction.continuation_id));
+        .iconst(types::I32, i64::from(instruction.span.file.raw()));
+    let source_start = builder
+        .ins()
+        .iconst(types::I32, i64::from(instruction.span.start));
+    let source_end = builder
+        .ins()
+        .iconst(types::I32, i64::from(instruction.span.end));
     let argument_count_value = builder.ins().iconst(
         types::I32,
         i64::try_from(argument_count).unwrap_or(i64::MAX),
@@ -6228,9 +7087,11 @@ fn lower_direct_builtin_call(
         builder,
         helper,
         &[
-            helper_id,
+            builtin_id,
             function_id,
-            continuation,
+            source_file,
+            source_start,
+            source_end,
             arguments_ptr,
             argument_count_value,
             local_slots_ptr,
@@ -6316,6 +7177,7 @@ fn lower_native_call_trampoline(
     register_variables: &NativeRegisterMap,
     registers: &mut NativeRegisterMap,
     function_params: &BTreeMap<FunctionId, NativeFunctionMetadata>,
+    external_function_signatures: &[crate::JitExternalFunctionSignature],
     call: &RegionNativeCall,
     source_block: BlockId,
     instruction: &RegionInstruction,
@@ -6410,6 +7272,7 @@ fn lower_native_call_trampoline(
                 call,
                 visible_index,
                 function_params,
+                external_function_signatures,
                 function,
             );
             let requires_reference = known_reference_requirement
@@ -6484,7 +7347,6 @@ fn lower_native_call_trampoline(
                     argument,
                     visible_index,
                     value,
-                    source_block,
                     instruction,
                     function,
                     defer_until_signature_published,
