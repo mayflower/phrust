@@ -1,0 +1,29 @@
+{
+  "description": "Enforce complete Cranelift production replacements instead of wrapper-based migrations.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/native_replacement_prompt.py\"",
+            "timeout": 10,
+            "statusMessage": "Applying the native replacement contract"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/native_replacement_stop.py\"",
+            "timeout": 180,
+            "statusMessage": "Checking the native replacement contract"
+          }
+        ]
+      }
+    ]
+  }
+}

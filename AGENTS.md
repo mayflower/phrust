@@ -113,6 +113,37 @@ Do not automatically update the target PHP version without a new ADR.
   runnable PHPT fixtures belong under `tests/phpt/generated/`; run artifacts
   belong under `target/`.
 
+### Cranelift Production Replacements
+
+- Externally observable PHP 8.5 behavior is the compatibility boundary.
+  Internal compatibility with a retired VM route, runtime helper ABI, generic
+  binder, interpreter path, fallback implementation, or wrapper API is not a
+  product requirement.
+- When a task requests removal, replacement, retirement, cutover, or
+  elimination of an execution route, implement a complete production
+  replacement. Do not narrow it into a local micro-optimization or a staged
+  compatibility migration.
+- The same final change must delete the named old route or make it
+  production-unreachable. Old and new production routes may not coexist at
+  completion.
+- Do not substitute an adapter, wrapper, bridge, dual dispatch, shadow
+  implementation, renamed legacy helper, feature-gated old route, generic
+  catch-all recovery, or preparation-only refactor for the requested deletion.
+- Prefer the smallest **complete vertical replacement**, not the smallest diff.
+  Temporary internal breakage while editing is acceptable; the final state must
+  build and pass its gates.
+- Genuine PHP-semantic slow paths remain allowed only when runtime PHP behavior
+  makes them dynamic. Name and justify them explicitly; they must not re-enter
+  a retired engine route.
+- Every architecture-replacement tranche needs a concrete JSON contract under
+  `docs/performance/native-replacement-contracts/`. The contract names removal
+  targets, allowed semantic slow paths, validation commands, and expected clean
+  wall-time plus structural counter movement.
+- Before completion, run
+  `python3 scripts/verify/native_replacement_guard.py --require-contract --diff-policy`.
+  A renamed or wrapped legacy route is a failed result even when a local metric
+  improves.
+
 ## Validation Commands
 
 - Use the narrowest relevant check while iterating.
@@ -130,7 +161,9 @@ Do not automatically update the target PHP version without a new ADR.
   `just stdlib-coverage`, or the relevant `diff-*` gate before
   `just verify-stdlib`.
 - For performance changes, prefer the focused smoke target that owns the
-  optimization path before `just verify-performance`.
+  optimization path before `just verify-performance`. Architecture replacements
+  must also pass the native replacement guard and every command in their
+  checked-in contract.
 - For PHPT tooling or baseline changes, run `just verify-phpt`; use
   `just ci-phpt-smoke` for the CI runner-smoke contract.
 - Before finishing broad cross-layer changes, run the matching aggregate gate:
@@ -183,3 +216,12 @@ edits without gates, and native/JIT reporting while no native code changed.
 A performance claim needs production Rust changes plus an executable gate
 (`just profiler-overhead-gate`, the WordPress root benchmark, or a focused
 fixture with before/after counters).
+
+For a Cranelift production replacement, also run the checked-in contract's
+validation commands and:
+
+```bash
+python3 scripts/verify/native_replacement_guard.py \
+  --require-contract \
+  --diff-policy
+```
