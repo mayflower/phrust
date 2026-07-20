@@ -19,21 +19,8 @@
       }
     ]
   },
-  "allowed_php_semantic_slow_paths": [
-    {
-      "name": "runtime-created callable resolution",
-      "reason": "PHP permits a callable target to be created after publication, so this target cannot use a prepared stable-call entry."
-    }
-  ],
-  "diff_allowlist": [
-    {
-      "pattern": "runtime_dynamic_callable_slow",
-      "paths": [
-        "crates/php_vm/src/vm/"
-      ],
-      "reason": "This typed resolver is entered only for a callable target created at runtime and does not re-enter the retired engine route."
-    }
-  ],
+  "allowed_php_semantic_slow_paths": [],
+  "diff_allowlist": [],
   "required_validation": [
     "python3 scripts/verify/native_replacement_guard.py --require-contract --diff-policy",
     "nix develop -c just runtime-semantics-diff",
