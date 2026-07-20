@@ -255,8 +255,8 @@ def validate_contract_document(document: Any) -> tuple[list[str], tuple[DiffAllo
         failures.append("remove must name at least one legacy symbol or path")
 
     slow_paths = document.get("allowed_php_semantic_slow_paths")
-    if not isinstance(slow_paths, list) or not slow_paths:
-        failures.append("allowed_php_semantic_slow_paths must be a non-empty list")
+    if not isinstance(slow_paths, list):
+        failures.append("allowed_php_semantic_slow_paths must be a list")
     else:
         for index, item in enumerate(slow_paths):
             label = f"allowed_php_semantic_slow_paths[{index}]"
