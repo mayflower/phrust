@@ -29,11 +29,12 @@ python3 scripts/verify/native_replacement_guard.py \
   --diff-policy
 ```
 
-Codex project hooks activate this mode automatically for prompts that combine a
-Cranelift/native architecture target with an explicit request to remove or
-replace a legacy route. Add `[native-replacement]` to a prompt to activate it
-unambiguously. Use `[native-replacement:off]` only for a task that discusses an
-old route without replacing production architecture.
+Codex project hooks activate this mode automatically whenever a prompt combines
+an explicit removal/replacement instruction with a fallback, wrapper, adapter,
+bridge, legacy route, interpreter route, generic binder, or comparable old
+execution path. Add `[native-replacement]` to activate it unambiguously. Use
+`[native-replacement:off]` only for discussion or analysis that does not request
+a production cutover.
 
 ## Allowed PHP-semantic slow paths
 
