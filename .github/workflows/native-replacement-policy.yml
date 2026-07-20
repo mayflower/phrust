@@ -1,0 +1,90 @@
+name: native replacement policy
+
+on:
+  pull_request:
+    paths:
+      - ".codex/**"
+      - "AGENTS.md"
+      - "crates/php_jit/src/**"
+      - "crates/php_vm/src/vm/**"
+      - "crates/php_runtime/src/**"
+      - "crates/php_executor/src/**"
+      - "crates/php_server/src/**"
+      - "docs/performance/native-replacement-contracts/**"
+      - "scripts/performance/ratchet_next_prompt.py"
+      - "scripts/verify/native_replacement_*.py"
+      - ".github/workflows/native-replacement-policy.yml"
+  push:
+    branches: [main]
+    paths:
+      - ".codex/**"
+      - "AGENTS.md"
+      - "crates/php_jit/src/**"
+      - "crates/php_vm/src/vm/**"
+      - "crates/php_runtime/src/**"
+      - "crates/php_executor/src/**"
+      - "crates/php_server/src/**"
+      - "docs/performance/native-replacement-contracts/**"
+      - "scripts/performance/ratchet_next_prompt.py"
+      - "scripts/verify/native_replacement_*.py"
+      - ".github/workflows/native-replacement-policy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: reject wrapper-based native changes
+    runs-on: mayflower-k8s-runners
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Self-test policy and hooks
+        run: |
+          python3 -m py_compile \
+            scripts/verify/native_replacement_guard.py \
+            scripts/verify/native_replacement_git.py \
+            scripts/verify/native_replacement_policy.py \
+            scripts/performance/ratchet_next_prompt.py \
+            .codex/hooks/native_replacement_prompt.py \
+            .codex/hooks/native_replacement_stop.py
+          python3 -m json.tool .codex/hooks.json >/dev/null
+          python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+          tomllib.loads(Path(".codex/config.toml").read_text(encoding="utf-8"))
+          PY
+          python3 scripts/verify/native_replacement_guard.py --self-test
+          python3 .codex/hooks/native_replacement_prompt.py --self-test
+          python3 .codex/hooks/native_replacement_stop.py --self-test
+          python3 scripts/performance/ratchet_next_prompt.py --self-test
+
+      - name: Check pull-request additions
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 scripts/verify/native_replacement_guard.py \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --diff-policy
+
+      - name: Check pushed additions
+        if: github.event_name == 'push'
+        env:
+          BASE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          python3 scripts/verify/native_replacement_guard.py \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --diff-policy
