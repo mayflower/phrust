@@ -91,6 +91,7 @@ help:
       '  just wordpress-reference-image Build pinned PHP-FPM/OPcache benchmark image' \
       '  just wordpress-root-benchmark Run clean Phrust vs PHP-FPM WordPress gate' \
       '  just wordpress-root-tranche-gate Run strict c1-p50 performance acceptance gate' \
+      '  just trusted-runtime-hotpath-gate Check trusted ABI/property ratchets' \
       '  just wordpress-root-benchmark-feedback-ab Run persistent-feedback A/B' \
       '  just cranelift-only-no-alternate-emitter Prove the retired native emitter is absent' \
       '  just cranelift-only-precondition Rebuild the pinned cutover foundation report' \
@@ -506,7 +507,7 @@ verify-stdlib:
 # Correctness-focused performance gates. Sub-gates share one engine build
 # through the perf-build dependency (deduplicated within this invocation).
 # Release-profile and report gates live in verify-performance-extended.
-verify-performance: native-fast-baseline-ratchet native-linkage-ratchet wordpress-benchmark-self-test fast-baseline-acceptance-self-test performance-tests performance-regression benchmark-smoke framework-smoke default-profile-smoke app-flow-smoke baseline-native-compile-smoke function-on-demand-gate cache-roundtrip optimizer-diff native-ssa-ratchet native-hotpath-ratchet reference-scalar-view reference-dimension-operand local-array-write-gate templates-smoke inline-cache-model-tests native-smoke object-release-root-scan safety-audit-smoke
+verify-performance: native-fast-baseline-ratchet native-linkage-ratchet wordpress-benchmark-self-test fast-baseline-acceptance-self-test performance-tests performance-regression benchmark-smoke framework-smoke default-profile-smoke app-flow-smoke baseline-native-compile-smoke function-on-demand-gate cache-roundtrip optimizer-diff native-ssa-ratchet native-hotpath-ratchet trusted-runtime-hotpath-gate reference-scalar-view reference-dimension-operand local-array-write-gate templates-smoke inline-cache-model-tests native-smoke object-release-root-scan safety-audit-smoke
     @printf '%s\n' '[pass] performance verification complete'
 
 # Heavy release-profile and report gates, split out of verify-performance so
@@ -1214,6 +1215,11 @@ perf-pr-guard *args:
 profiler-overhead-gate:
     if [ -z "${PHRUST_WORDPRESS_URL:-}" ]; then cargo build -p php_server --bin phrust-server; fi
     PHRUST_SERVER="${PHRUST_SERVER:-${CARGO_TARGET_DIR:-target}/debug/phrust-server}" scripts/performance/profiler_overhead_gate.py
+
+# Trusted internal execution must not regain request-local metadata copies,
+# checked output pointers, or panic wrappers.
+trusted-runtime-hotpath-gate:
+    scripts/performance/trusted_runtime_hotpath_gate.sh
 
 # Generated CLIF/metadata checks, plus optional strict WordPress counter gates.
 native-hotpath-ratchet *args:

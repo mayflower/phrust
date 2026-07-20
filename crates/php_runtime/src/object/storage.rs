@@ -208,6 +208,15 @@ impl ObjectStorage {
         self.dynamic_properties.insert(name, value);
     }
 
+    fn set_borrowed(&mut self, name: &str, value: Value) {
+        if let Some(slot) = self.layout.slot_by_name.get(name).copied() {
+            crate::layout_stats::record_object_declared_slot_write();
+            self.declared_slots[slot as usize] = Some(value);
+            return;
+        }
+        self.set(name.to_owned(), value);
+    }
+
     fn unset(&mut self, name: &str) -> bool {
         if let Some(slot) = self.layout.slot_by_name.get(name).copied() {
             let slot_value = &mut self.declared_slots[slot as usize];
@@ -538,6 +547,13 @@ impl ObjectRef {
     /// Writes a property value.
     pub fn set_property(&self, name: impl Into<String>, value: Value) {
         self.cell.storage.borrow_mut().set(name.into(), value);
+    }
+
+    /// Writes a property while borrowing its already-published name.
+    /// Declared slots need no owned key; only a genuinely dynamic property
+    /// materializes a `String` for the side map.
+    pub fn set_property_borrowed(&self, name: &str, value: Value) {
+        self.cell.storage.borrow_mut().set_borrowed(name, value);
     }
 
     /// Attempts to write a property value without panicking on nested borrows.

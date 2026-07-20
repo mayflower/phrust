@@ -257,13 +257,12 @@ pub(in crate::vm) extern "C" fn jit_native_execution_poll_abi(
 
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
+#[inline(always)]
 fn write_native_value(out: *mut i64, value: i64) -> bool {
-    let Some(out) = std::ptr::NonNull::new(out) else {
-        return false;
-    };
-    // SAFETY: Generated code supplies a non-null stack-owned i64 out slot for
-    // the duration of this synchronous helper call.
-    unsafe { out.as_ptr().write(value) };
+    // SAFETY: This is an internal generated-code ABI. Publication validates
+    // the helper signature once, and every wrapper supplies a live stack-owned
+    // i64 slot for the duration of the synchronous call.
+    unsafe { out.write(value) };
     true
 }
 
@@ -1738,7 +1737,10 @@ pub(in crate::vm) extern "C" fn jit_native_reference_bind_abi(
             };
         }
         if op == 3 {
-            let Some(property) = native_property_name(context, key, reserved, true) else {
+            let Some(locator) = native_property_locator(context, key, reserved) else {
+                return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+            };
+            let Some(property) = locator.name(true) else {
                 return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
             };
             let Ok(mut object) = context.decode(encoded) else {
@@ -1753,16 +1755,16 @@ pub(in crate::vm) extern "C" fn jit_native_reference_bind_abi(
             let Value::Object(object) = object else {
                 return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
             };
-            let (reference, added) = match object.get_property(&property) {
+            let (reference, added) = match object.get_property(property) {
                 Some(Value::Reference(reference)) => (reference, false),
                 Some(value) => {
                     let reference = php_runtime::api::ReferenceCell::new(value);
-                    object.set_property(property, Value::Reference(reference.clone()));
+                    object.set_property_borrowed(property, Value::Reference(reference.clone()));
                     (reference, true)
                 }
                 None => {
                     let reference = php_runtime::api::ReferenceCell::new(Value::Null);
-                    object.set_property(property, Value::Reference(reference.clone()));
+                    object.set_property_borrowed(property, Value::Reference(reference.clone()));
                     (reference, true)
                 }
             };
@@ -2586,12 +2588,56 @@ pub(in crate::vm) extern "C" fn jit_native_object_new_abi(
     .unwrap_or(php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32)
 }
 
-fn native_property_name(
+struct NativePropertyLocator {
+    instruction: NativeInstructionPtr,
+    argument_index: Option<usize>,
+}
+
+fn native_call_argument_property(argument: &php_ir::instruction::IrCallArg) -> Option<&str> {
+    argument
+        .by_ref_property
+        .as_ref()
+        .map(|target| target.property.as_str())
+        .or_else(|| {
+            argument
+                .by_ref_property_dim
+                .as_ref()
+                .map(|target| target.property.as_str())
+        })
+}
+
+impl NativePropertyLocator {
+    fn name(&self, assign: bool) -> Option<&str> {
+        match &self.instruction.kind {
+            php_ir::InstructionKind::FetchProperty { property, .. } if !assign => Some(property),
+            php_ir::InstructionKind::AssignProperty { property, .. }
+            | php_ir::InstructionKind::BindReferenceProperty { property, .. }
+            | php_ir::InstructionKind::BindReferenceFromProperty { property, .. }
+            | php_ir::InstructionKind::BindReferenceFromPropertyDim { property, .. }
+                if assign =>
+            {
+                Some(property)
+            }
+            php_ir::InstructionKind::BindReferencePropertyDim { property, .. }
+            | php_ir::InstructionKind::BindReferenceDimFromProperty { property, .. } => {
+                Some(property)
+            }
+            php_ir::InstructionKind::CallFunction { args, .. } if assign => {
+                self.argument_index.map_or_else(
+                    || args.iter().find_map(native_call_argument_property),
+                    |index| args.get(index).and_then(native_call_argument_property),
+                )
+            }
+            _ => None,
+        }
+    }
+}
+
+fn native_property_locator(
     context: &NativeExecutionContext<'_>,
     function: i64,
     continuation: i64,
-    assign: bool,
-) -> Option<String> {
+) -> Option<NativePropertyLocator> {
     let function_and_argument = function as u64;
     let function = usize::try_from(function_and_argument as u32).ok()?;
     let argument_index = u32::try_from(function_and_argument >> 32)
@@ -2600,48 +2646,10 @@ fn native_property_name(
         .and_then(|index| usize::try_from(index).ok());
     let continuation = u32::try_from(continuation).ok()?;
     let instruction = context.instruction_for_continuation(function as u32, continuation)?;
-    match &instruction.kind {
-        php_ir::InstructionKind::FetchProperty { property, .. } if !assign => {
-            Some(property.clone())
-        }
-        php_ir::InstructionKind::AssignProperty { property, .. } if assign => {
-            Some(property.clone())
-        }
-        php_ir::InstructionKind::BindReferenceProperty { property, .. } if assign => {
-            Some(property.clone())
-        }
-        php_ir::InstructionKind::BindReferenceFromProperty { property, .. } if assign => {
-            Some(property.clone())
-        }
-        php_ir::InstructionKind::BindReferenceFromPropertyDim { property, .. } if assign => {
-            Some(property.clone())
-        }
-        php_ir::InstructionKind::BindReferencePropertyDim { property, .. } => {
-            Some(property.clone())
-        }
-        php_ir::InstructionKind::BindReferenceDimFromProperty { property, .. } => {
-            Some(property.clone())
-        }
-        php_ir::InstructionKind::CallFunction { args, .. } if assign => {
-            let property = |argument: &php_ir::instruction::IrCallArg| {
-                argument
-                    .by_ref_property
-                    .as_ref()
-                    .map(|target| target.property.clone())
-                    .or_else(|| {
-                        argument
-                            .by_ref_property_dim
-                            .as_ref()
-                            .map(|target| target.property.clone())
-                    })
-            };
-            argument_index.map_or_else(
-                || args.iter().find_map(property),
-                |index| args.get(index).and_then(property),
-            )
-        }
-        _ => None,
-    }
+    Some(NativePropertyLocator {
+        instruction,
+        argument_index,
+    })
 }
 
 fn native_property_span(
@@ -2778,7 +2786,20 @@ pub(in crate::vm) extern "C" fn jit_native_property_fetch_abi(
                 None => php_jit::JitCallStatus::ABI_MISMATCH.0 as i32,
             };
         }
-        let Some(property) = native_property_name(context, function, instruction_id, false) else {
+        let Some(locator) = native_property_locator(context, function, instruction_id) else {
+            context.diagnostic = Some(php_runtime::api::RuntimeDiagnostic::new(
+                "E_PHP_NATIVE_PROPERTY_FETCH",
+                php_runtime::api::RuntimeSeverity::FatalError,
+                format!(
+                    "native property metadata is missing for function {function} locator {instruction_id}"
+                ),
+                php_runtime::api::RuntimeSourceSpan::default(),
+                Vec::new(),
+                None,
+            ));
+            return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+        };
+        let Some(property) = locator.name(false) else {
             context.diagnostic = Some(php_runtime::api::RuntimeDiagnostic::new(
                 "E_PHP_NATIVE_PROPERTY_FETCH",
                 php_runtime::api::RuntimeSeverity::FatalError,
@@ -3066,7 +3087,16 @@ pub(in crate::vm) extern "C" fn jit_native_property_assign_abi(
     }
     let encoded_value = value;
     with_native_context_for(runtime, "property_assign", |context| {
-        let Some(property) = native_property_name(context, function, instruction_id, true) else {
+        let Some(locator) = native_property_locator(context, function, instruction_id) else {
+            record_native_helper_failure(
+                context,
+                format!(
+                    "native property assignment metadata is missing for function {function} locator {instruction_id}"
+                ),
+            );
+            return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+        };
+        let Some(property) = locator.name(true) else {
             record_native_helper_failure(
                 context,
                 format!(
@@ -3250,7 +3280,7 @@ pub(in crate::vm) extern "C" fn jit_native_property_assign_abi(
                 .get_property(&property)
                 .unwrap_or(Value::Uninitialized);
             let membership_changed = rooted_membership_may_change(&previous, &value);
-            object.set_property(property.as_str(), value.clone());
+            object.set_property_borrowed(property, value.clone());
             if membership_changed {
                 context.mark_rooted_container_dirty(&Value::Object(object.clone()));
             }
@@ -3280,7 +3310,7 @@ pub(in crate::vm) extern "C" fn jit_native_property_assign_abi(
                 .get_property(&property)
                 .unwrap_or(Value::Uninitialized);
             let membership_changed = rooted_membership_may_change(&previous, &value);
-            object.set_property(property.as_str(), value.clone());
+            object.set_property_borrowed(property, value.clone());
             if membership_changed {
                 context.mark_rooted_container_dirty(&Value::Object(object.clone()));
             }
