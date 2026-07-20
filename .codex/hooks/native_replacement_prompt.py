@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Activate strict replacement mode for architecture-cutover prompts.
+"""Activate strict replacement mode for legacy-route removal prompts.
 
 Codex sends one JSON event on stdin. For matching prompts this hook persists a
 small per-session marker under the Git directory and injects additional
@@ -29,11 +29,6 @@ EXPLICIT = re.compile(
     r"cranelift[ _-]only[ _-]cutover",
     re.IGNORECASE,
 )
-NATIVE = re.compile(
-    r"\b(?:cranelift|jit|native|warm[ _-]?path|hot[ _-]?path|runtime[ _-]?abi|"
-    r"execution[ _-]?engine|ausf(?:ü|ue)hrungsengine)\b",
-    re.IGNORECASE,
-)
 REPLACEMENT = re.compile(
     r"\b(?:remove|delete|eliminate|replace|retire|cut[ _-]?over|shut[ _-]?off|"
     r"make\s+.+?unreachable|entfern(?:e|en|t)|ersetz(?:e|en|t)|"
@@ -46,11 +41,6 @@ LEGACY_ROUTE = re.compile(
     r"old[ _-]?(?:route|path|api)|alte[nr]?[ _-]?(?:route|pfad|strecke)|"
     r"interpreter|generic[ _-]?(?:binder|runtime|helper|route)|"
     r"dual[ _-]?(?:dispatch|route|path)|shadow[ _-]?(?:route|path))\b",
-    re.IGNORECASE,
-)
-ARCHITECTURE = re.compile(
-    r"\b(?:architecture|architektur|execution[ _-]?(?:route|path)|"
-    r"ausf(?:ü|ue)hrungsstrecke|production[ _-]?(?:route|path))\b",
     re.IGNORECASE,
 )
 
@@ -99,11 +89,7 @@ def prompt_requests_replacement(prompt: str) -> bool:
         return False
     if EXPLICIT.search(prompt):
         return True
-    return bool(
-        REPLACEMENT.search(prompt)
-        and LEGACY_ROUTE.search(prompt)
-        and (NATIVE.search(prompt) or ARCHITECTURE.search(prompt))
-    )
+    return bool(REPLACEMENT.search(prompt) and LEGACY_ROUTE.search(prompt))
 
 
 def write_state(path: Path, document: dict[str, Any]) -> None:
@@ -183,6 +169,8 @@ def self_test() -> int:
         "Replace the Cranelift fallback route completely",
         "Die alte native Wrapper-Strecke vollständig entfernen",
         "Cut over the execution architecture and eliminate the generic binder",
+        "Eliminiere endlich alle Fallbacks",
+        "Remove the wrapper around the old route",
     )
     negatives = (
         "Fix a parser diagnostic",
