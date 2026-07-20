@@ -37,10 +37,11 @@ REPLACEMENT = re.compile(
     re.IGNORECASE,
 )
 LEGACY_ROUTE = re.compile(
-    r"\b(?:fallback|wrapper|adapter|bridge|safe[ _-]?path|safepath|legacy|"
-    r"old[ _-]?(?:route|path|api)|alte[nr]?[ _-]?(?:route|pfad|strecke)|"
-    r"interpreter|generic[ _-]?(?:binder|runtime|helper|route)|"
-    r"dual[ _-]?(?:dispatch|route|path)|shadow[ _-]?(?:route|path))\b",
+    r"\b(?:fallbacks?|wrappers?|adapters?|bridges?|safe[ _-]?paths?|safepaths?|legacy|"
+    r"old[ _-]?(?:routes?|paths?|apis?)|"
+    r"alte[nr]?[ _-]?(?:routen?|pfade?|strecken?)|"
+    r"interpreters?|generic[ _-]?(?:binders?|runtimes?|helpers?|routes?)|"
+    r"dual[ _-]?(?:dispatch|routes?|paths?)|shadow[ _-]?(?:routes?|paths?))\b",
     re.IGNORECASE,
 )
 
@@ -170,7 +171,7 @@ def self_test() -> int:
         "Die alte native Wrapper-Strecke vollständig entfernen",
         "Cut over the execution architecture and eliminate the generic binder",
         "Eliminiere endlich alle Fallbacks",
-        "Remove the wrapper around the old route",
+        "Remove the wrappers around the old routes",
     )
     negatives = (
         "Fix a parser diagnostic",
