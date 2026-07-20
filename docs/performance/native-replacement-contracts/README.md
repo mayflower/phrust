@@ -14,7 +14,8 @@ route, or fallback implementation is not a requirement.
 1. Create one concrete `*.json` contract for the tranche before changing the
    production path.
 2. Name the exact legacy symbols, paths, and call edges that must disappear.
-3. Name the genuinely runtime-dynamic PHP semantic slow paths that remain.
+3. Name the genuinely runtime-dynamic PHP semantic slow paths that remain. Use
+   an empty list when none remain; never invent a slow path to satisfy the schema.
 4. Implement the smallest **complete vertical replacement**. Do not leave old
    and new production routes coexisting.
 5. Run the replacement guard, then every correctness, application, and
@@ -47,7 +48,8 @@ and cannot be decided when the native image is published. Typical examples are:
 - exception, warning, destructor, generator, and fiber state transitions.
 
 These paths must be typed and out of line. They must not re-enter a retired
-interpreter, VM executor, generic stable-call binder, or old runtime ABI.
+interpreter, VM executor, generic stable-call binder, or old runtime ABI. The
+contract list may be empty when the replacement needs no semantic slow path.
 
 ## Forbidden engine fallbacks
 
