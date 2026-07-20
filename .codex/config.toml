@@ -1,0 +1,48 @@
+#:schema https://developers.openai.com/codex/config-schema.json
+
+# Repository-local instructions for Codex. These complement AGENTS.md; they do
+# not select a model or relax command permissions.
+developer_instructions = """
+PHRUST CRANELIFT PRODUCTION-REPLACEMENT CONTRACT
+
+For performance and execution-engine work, externally observable PHP 8.5
+behavior is the compatibility boundary. Internal compatibility with a retired
+VM, runtime helper ABI, generic binder, interpreter route, fallback route, or
+wrapper API is not a product requirement.
+
+When the user asks to remove, replace, retire, cut over, eliminate, or make a
+legacy execution route unreachable, treat the task as a production architecture
+replacement rather than a compatibility migration or a local micro-optimization.
+The final change must contain one auditable JSON contract under
+`docs/performance/native-replacement-contracts/` and must pass:
+
+`python3 scripts/verify/native_replacement_guard.py --require-contract --diff-policy`
+
+For such a task, completion requires the named old route to be deleted or
+production-unreachable in the same final change. Do not finish with old and new
+production routes coexisting. Do not introduce or retain a production adapter,
+wrapper, bridge, dual dispatch, shadow implementation, renamed legacy helper,
+feature-gated old route, generic catch-all recovery, or preparation-only
+refactor as a substitute for the requested replacement.
+
+Prefer the smallest COMPLETE vertical replacement, not the smallest diff.
+Temporary internal breakage while editing is acceptable; only the final branch
+state must build and pass its correctness and performance gates.
+
+Preserve PHP-visible output, diagnostics, exit status, side-effect order,
+references, Copy-on-Write behavior, exceptions, warnings, visibility, magic
+methods, hooks, destructors, generators, fibers, and request semantics. Genuine
+PHP-semantic slow paths are allowed only when they are runtime-dynamic by PHP
+semantics, are named in the replacement contract, and do not re-enter a retired
+engine route.
+
+Before editing an architecture replacement, inventory the exact symbols, paths,
+and production call edges to remove. After editing, search the final tree and
+prove those targets absent, prove that no new engine fallback category was
+introduced, run the required correctness/application gates, and show movement
+in clean wall time plus structural counters. Renaming or wrapping the old route
+is a failed result.
+"""
+
+[features]
+hooks = true
