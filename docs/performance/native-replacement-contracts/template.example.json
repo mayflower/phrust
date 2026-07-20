@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "mode": "production-architecture-replacement",
+  "title": "Replace the stable-call runtime bridge with direct native calls",
+  "target_architecture": "Published stable callsites invoke trusted native entries with a prepared binder plan and never enter the retired generic runtime bridge.",
+  "production_scope": [
+    "crates/php_jit/src/",
+    "crates/php_vm/src/vm/"
+  ],
+  "remove": {
+    "symbols": [
+      "legacy_runtime_call_bridge"
+    ],
+    "paths": [],
+    "call_edges": [
+      {
+        "caller": "compiled_stable_callsite",
+        "callee": "legacy_runtime_call_bridge"
+      }
+    ]
+  },
+  "allowed_php_semantic_slow_paths": [
+    {
+      "name": "runtime-created callable resolution",
+      "reason": "PHP permits a callable target to be created after publication, so this target cannot use a prepared stable-call entry."
+    }
+  ],
+  "diff_allowlist": [
+    {
+      "pattern": "runtime_dynamic_callable_slow",
+      "paths": [
+        "crates/php_vm/src/vm/"
+      ],
+      "reason": "This typed resolver is entered only for a callable target created at runtime and does not re-enter the retired engine route."
+    }
+  ],
+  "required_validation": [
+    "python3 scripts/verify/native_replacement_guard.py --require-contract --diff-policy",
+    "nix develop -c just runtime-semantics-diff",
+    "nix develop -c just wordpress-root-tranche-gate target/performance/wordpress-root/baseline.json"
+  ],
+  "expected_metric_movement": [
+    {
+      "metric": "warm_c1_p50_ms",
+      "direction": "decrease",
+      "reason": "Stable calls stop crossing the generic runtime bridge."
+    },
+    {
+      "metric": "native_call_runtime_mediated",
+      "direction": "decrease",
+      "reason": "Published stable callsites invoke their native target directly."
+    },
+    {
+      "metric": "new_engine_fallback_categories",
+      "direction": "zero",
+      "reason": "The replacement must not introduce another production fallback classification."
+    }
+  ],
+  "acceptance": {
+    "old_route_production_reachable": false,
+    "new_engine_fallback_categories": 0,
+    "external_php_behavior_preserved": true
+  }
+}
