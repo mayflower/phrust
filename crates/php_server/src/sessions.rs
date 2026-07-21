@@ -76,20 +76,5 @@ pub(crate) fn finalize_session_state(
         .metrics
         .session_store_writes
         .fetch_add(1, Ordering::Relaxed);
-    if output.session.newly_created() {
-        output
-            .http_response
-            .add_header_line(
-                &format!(
-                    "Set-Cookie: {}={}; Path={}; HttpOnly",
-                    state.sessions.config.cookie_name,
-                    output.session.id(),
-                    state.sessions.config.cookie_path
-                ),
-                false,
-                None,
-            )
-            .map_err(|message| format!("session cookie header failed: {message}"))?;
-    }
     Ok(())
 }

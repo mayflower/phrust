@@ -191,7 +191,11 @@ fn execute_native_include(
         context.options.clone(),
         context.worker_state.clone(),
     )
-    .execute_with_external_function_signatures((*compiled).clone(), &external_signatures);
+    .execute_with_external_function_signatures_and_output(
+        (*compiled).clone(),
+        &external_signatures,
+        std::mem::take(&mut context.output),
+    );
     if let (Some(started_at), Some(counters)) = (nested_started_at, result.counters.as_deref()) {
         context.merge_nested_runtime_counters(counters, started_at.elapsed());
     }
@@ -236,7 +240,7 @@ fn execute_native_include(
             unsafe { caller_frame.add(index).write(encoded) };
         }
     }
-    context.output.write_bytes(result.output.as_bytes());
+    context.output = result.output;
     if let Some(exit_code) = result.process_exit_code {
         let value = context.encode(Value::Int(i64::from(exit_code)))?;
         return Ok(NativeDynamicCodeOutcome::Exit(value));
@@ -371,7 +375,11 @@ fn execute_native_eval(
         context.options.clone(),
         context.worker_state.clone(),
     )
-    .execute_with_external_function_signatures(compiled, &external_signatures);
+    .execute_with_external_function_signatures_and_output(
+        compiled,
+        &external_signatures,
+        std::mem::take(&mut context.output),
+    );
     if let (Some(started_at), Some(counters)) = (nested_started_at, result.counters.as_deref()) {
         context.merge_nested_runtime_counters(counters, started_at.elapsed());
     }
@@ -415,7 +423,7 @@ fn execute_native_eval(
             unsafe { caller_frame.add(index).write(encoded) };
         }
     }
-    context.output.write_bytes(result.output.as_bytes());
+    context.output = result.output;
     if let Some(exit_code) = result.process_exit_code {
         let value = context.encode(Value::Int(i64::from(exit_code)))?;
         return Ok(NativeDynamicCodeOutcome::Exit(value));

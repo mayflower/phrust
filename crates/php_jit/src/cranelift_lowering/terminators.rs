@@ -789,6 +789,7 @@ fn lower_region_frame_exit(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_owned_frame_locals(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,

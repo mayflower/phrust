@@ -2,11 +2,9 @@ use crate::{
     multipart::cleanup_uploaded_files, perf_trace::PerfTraceEvent, response::ResponseBody,
     sessions::finalize_session_state, state::AppState,
 };
-use hyper::{Response, header};
+use hyper::Response;
 use php_executor::PhpExecutionOutput;
 use php_runtime::api::RuntimeUploadedFile;
-use std::sync::atomic::Ordering;
-use tracing::warn;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestStage {
@@ -30,9 +28,6 @@ impl RequestStage {
         }
     }
 }
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PhpResponseBytes(pub(crate) u64);
 
 /// Owns request-local cleanup until execution transfers it to the runtime
 /// output or exits through an error path.
@@ -68,8 +63,14 @@ impl Drop for RequestCleanup {
     }
 }
 
-/// Completed request data. Consuming this value is the only path that emits
-/// request-final metrics, traces, and profiles.
+#[derive(Clone, Debug)]
+pub(crate) struct PhpTransferCompletion {
+    pub(crate) trace: Option<PerfTraceEvent>,
+    pub(crate) failure_stage: Option<RequestStage>,
+}
+
+/// PHP execution data carried with the response until the shared transfer
+/// lifecycle completes. No request-final observability is emitted here.
 pub(crate) struct RequestOutcome {
     response: Response<ResponseBody>,
     cache_hit: Option<bool>,
@@ -97,46 +98,16 @@ impl RequestOutcome {
         }
     }
 
-    pub(crate) fn finalize(
-        self,
-        state: &AppState,
+    pub(crate) fn into_response(
+        mut self,
         trace: Option<PerfTraceEvent>,
     ) -> (Response<ResponseBody>, Option<bool>) {
-        let response_bytes = self
-            .response
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .or_else(|| {
-                self.response
-                    .extensions()
-                    .get::<PhpResponseBytes>()
-                    .map(|bytes| bytes.0)
-            })
-            .unwrap_or(0);
-        state
-            .services
-            .metrics
-            .response_output_bytes
-            .fetch_add(response_bytes, Ordering::Relaxed);
-        if let Some(mut trace) = trace {
-            trace.status = self.response.status().as_u16();
-            trace.cache_hit = self.cache_hit;
-            trace.failure_phase = self.failure_stage.map(RequestStage::name);
-            trace.response_bytes = response_bytes;
-            if let Some(writer) = &state.observability.perf_trace
-                && let Err(error) = writer.write(&trace)
-            {
-                warn!(%error, path=%writer.path().display(), "perf trace write failed");
-            }
-            if trace.profile_requested
-                && let Some(writer) = &state.observability.request_profile
-                && let Err(error) = writer.write(&trace, trace.profile_counters.as_ref())
-            {
-                warn!(%error, dir=%writer.dir().display(), "request profile write failed");
-            }
-        }
+        self.response
+            .extensions_mut()
+            .insert(PhpTransferCompletion {
+                trace,
+                failure_stage: self.failure_stage,
+            });
         (self.response, self.cache_hit)
     }
 }

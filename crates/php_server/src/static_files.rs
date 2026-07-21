@@ -114,11 +114,6 @@ pub(crate) async fn static_file_response(
     if start > 0 && file.seek(SeekFrom::Start(start)).await.is_err() {
         return response::text(StatusCode::INTERNAL_SERVER_ERROR, "static file failed\n");
     }
-    state
-        .services
-        .metrics
-        .static_streamed_bytes
-        .fetch_add(content_len, Ordering::Relaxed);
     static_stream_response(
         status,
         &selection,
@@ -203,7 +198,7 @@ where
         content_range,
     );
     builder
-        .body(response::reader_body(reader))
+        .body(response::reader_body_with_length(reader, content_len))
         .expect("static stream response builder is valid")
 }
 

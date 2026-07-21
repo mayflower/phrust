@@ -1983,10 +1983,19 @@ pub(super) fn execute_prepared_runtime_builtin(
 ) -> Result<i64, String> {
     let entry = prepared.entry;
     let name = entry.name();
+    context.http_response.headers_sent |= context.output.http_response().headers_sent;
     if !prepared.fixed_arity_validated {
         validate_native_builtin_arity_with_metadata(name, arguments.len(), prepared.metadata)?;
     }
     validate_native_builtin_types(context, name, arguments, source, Some(prepared.type_info))?;
+    if name == "flush" {
+        context
+            .output
+            .set_http_response(context.http_response.clone());
+        context.output.flush_root();
+        context.http_response.headers_sent |= context.output.http_response().headers_sent;
+        return context.encode(Value::Null);
+    }
     let mut values = arguments
         .iter()
         .enumerate()
@@ -2097,6 +2106,12 @@ pub(super) fn execute_prepared_runtime_builtin(
         let diagnostics = builtin.take_diagnostics();
         (result, diagnostics)
     };
+    if name == "session_start" {
+        publish_native_session_cookie(context)?;
+    }
+    context
+        .output
+        .set_http_response(context.http_response.clone());
     if name.starts_with("session_") {
         context.mark_roots_dirty(RootMutationReason::Session);
     }
@@ -2149,6 +2164,7 @@ pub(super) fn execute_native_builtin(
     caller_locals: Option<(u32, &[php_jit::JitAbiSlot])>,
     prepared: Option<crate::compiled_unit::PreparedNativeBuiltin>,
 ) -> Result<i64, String> {
+    context.http_response.headers_sent |= context.output.http_response().headers_sent;
     if let Some(prepared) = prepared
         && matches!(
             prepared.entry.execution_kind(),
@@ -2205,6 +2221,14 @@ pub(super) fn execute_native_builtin(
     }
     if let Some(result) = execute_native_internal_builtin(context, &normalized, arguments) {
         return result;
+    }
+    if normalized == "flush" {
+        context
+            .output
+            .set_http_response(context.http_response.clone());
+        context.output.flush_root();
+        context.http_response.headers_sent |= context.output.http_response().headers_sent;
+        return context.encode(Value::Null);
     }
     match normalized.as_ref() {
         "get_included_files" | "get_required_files" => {
@@ -2799,6 +2823,16 @@ pub(super) fn execute_native_builtin(
         "get_current_user" => {
             context.encode(Value::String(PhpString::from_bytes(b"phrust".to_vec())))
         }
+        "connection_aborted" => context.encode(Value::Int(i64::from(
+            context.options.runtime_context.cancellation.is_cancelled(),
+        ))),
+        "connection_status" => context.encode(Value::Int(
+            if context.options.runtime_context.cancellation.is_cancelled() {
+                1
+            } else {
+                0
+            },
+        )),
         "ignore_user_abort" => {
             if arguments.len() > 1 {
                 return Err("ignore_user_abort() expects at most 1 argument".to_owned());
@@ -2809,6 +2843,11 @@ pub(super) fn execute_native_builtin(
                 .is_some_and(|value| value != "0" && !value.is_empty());
             if let Some(value) = arguments.first() {
                 let enabled = php_runtime::api::to_bool(&context.decode(*value)?)?;
+                context
+                    .options
+                    .runtime_context
+                    .cancellation
+                    .set_ignore_user_abort(enabled);
                 context
                     .ini_registry
                     .set("ignore_user_abort", if enabled { "1" } else { "0" });
@@ -4333,6 +4372,12 @@ pub(super) fn execute_native_builtin(
                 let diagnostics = builtin.take_diagnostics();
                 (result, diagnostics)
             };
+            if normalized == "session_start" {
+                publish_native_session_cookie(context)?;
+            }
+            context
+                .output
+                .set_http_response(context.http_response.clone());
             if normalized.starts_with("session_") {
                 context.mark_roots_dirty(RootMutationReason::Session);
             }
@@ -4364,6 +4409,42 @@ pub(super) fn execute_native_builtin(
             }
         }
     }
+}
+
+fn publish_native_session_cookie(context: &mut NativeExecutionContext<'_>) -> Result<(), String> {
+    if !matches!(
+        context.options.runtime_context.request_mode,
+        php_runtime::api::RuntimeRequestMode::Http(_)
+    ) || context.http_response.headers_sent
+        || !context.session.newly_created()
+        || context
+            .ini_registry
+            .get("session.use_cookies")
+            .is_some_and(|value| value == "0" || value.is_empty())
+    {
+        return Ok(());
+    }
+    let name = context.session.name();
+    let prefix = format!("{name}=");
+    if context.http_response.headers.iter().any(|header| {
+        header.name.eq_ignore_ascii_case("Set-Cookie") && header.value.starts_with(&prefix)
+    }) {
+        return Ok(());
+    }
+    let path = context
+        .ini_registry
+        .get("session.cookie_path")
+        .unwrap_or("/");
+    context.http_response.add_header_line(
+        &format!(
+            "Set-Cookie: {}={}; Path={}; HttpOnly",
+            context.session.name(),
+            context.session.id(),
+            path
+        ),
+        false,
+        None,
+    )
 }
 
 #[cfg(test)]

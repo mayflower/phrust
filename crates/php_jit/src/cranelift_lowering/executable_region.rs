@@ -2736,6 +2736,7 @@ pub(super) fn compile_region_graph_native(
                     function_code_metrics.insert(candidate.function, metrics);
                 }
             }
+            #[allow(clippy::drop_non_drop)]
             drop(append_defined);
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 module
@@ -3393,7 +3394,7 @@ fn region_fragment_signature(
     Ok(signature)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn declare_fragment_functions(
     module: &mut JITModule,
     root_symbol: &str,
@@ -4552,15 +4553,15 @@ fn define_region_graph_function(
             })
             .map(|continuation| (continuation, builder.create_block()))
             .collect::<BTreeMap<_, _>>();
-        let optimizing_block_resume_loaders = (region.compile_metadata.tier
-            == NativeCompilerTier::Optimizing)
-            .then(|| {
+        let optimizing_block_resume_loaders =
+            if region.compile_metadata.tier == NativeCompilerTier::Optimizing {
                 owned_blocks
                     .iter()
                     .map(|block| (block.id, builder.create_block()))
                     .collect::<BTreeMap<_, _>>()
-            })
-            .unwrap_or_default();
+            } else {
+                BTreeMap::new()
+            };
         let osr_entries = region
             .osr_entries()
             .into_iter()
@@ -5195,7 +5196,7 @@ fn define_region_graph_function(
                         instruction,
                         transition_live_registers,
                         constants,
-                        &value_flow,
+                        value_flow,
                         inline_constants,
                         function_params,
                         runtime,
@@ -5238,7 +5239,7 @@ fn define_region_graph_function(
                         instruction,
                         transition_live_registers,
                         constants,
-                        &value_flow,
+                        value_flow,
                         streaming_call_exit,
                         result_out,
                         deopt_out,
@@ -5320,7 +5321,7 @@ fn define_region_graph_function(
                     region.return_type.as_ref(),
                     &region_block.terminator,
                     constants,
-                    &value_flow,
+                    value_flow,
                 )
                 .map(|emitted| {
                     production_lowering.push(crate::JitProductionLoweringMetadata {
@@ -5350,7 +5351,7 @@ fn define_region_graph_function(
                     region.return_type.is_some(),
                     &region_block.terminator,
                     constants,
-                    &value_flow,
+                    value_flow,
                 ),
             }?;
         }

@@ -10,8 +10,9 @@ CGI, Apache module, `mod_php`, or external PHP process compatibility.
 - `crates/php_server/src/config.rs` owns server CLI/configuration parsing.
 - `crates/php_server/src/routing.rs` owns docroot routing, front-controller
   routing, path normalization, and static-vs-PHP classification.
-- `crates/php_server/src/response.rs` owns HTTP response construction from
-  static files and executor output.
+- `crates/php_server/src/response.rs` and `transfer.rs` own the shared
+  frame-streaming body, emitted-byte accounting, and exact-once transfer
+  lifecycle.
 - `crates/php_server/src/server.rs` owns Hyper/Tokio request handling, optional
   Rustls termination, limits, metrics, graceful shutdown, and executor/cache
   wiring.
@@ -39,16 +40,19 @@ Deadline checks happen in VM dispatch; native blocking builtins are observed
 when control returns to dispatch rather than by preemptive Tokio cancellation.
 
 Static files stream through Tokio file I/O with `HEAD`, validators, byte
-ranges, and precompressed sidecar selection. PHP scripts execute in a blocking
-region inside the server process because the request-local PHP runtime state is
-not `Send`.
+ranges, and precompressed sidecar selection. PHP scripts execute on fixed,
+pinned PHP worker threads. Root output is delivered through a bounded channel,
+so transport backpressure blocks only its PHP producer; client disconnects are
+checked by VM safepoints. Admission capacity is released only after both PHP
+cleanup and response transfer finish or abort.
 
 ## Transport And Configuration
 
 Plain HTTP is the default. When `--tls-cert` and `--tls-key` are provided, the
 same Hyper service is wrapped in Rustls and the startup handshake prints
-`listening https://<addr>`. TLS currently advertises `http/1.1` through ALPN;
-HTTP/2 and HTTP/3 are not enabled.
+`listening https://<addr>`. TLS advertises `h2` and `http/1.1` through ALPN.
+HTTP/3 can be enabled over QUIC with `--enable-http3`; it consumes the same
+response body frame by frame and does not collect the body first.
 
 Server configuration can come from CLI flags or a simple TOML-style
 `--config <path>` file, with CLI flags taking precedence. Production-oriented

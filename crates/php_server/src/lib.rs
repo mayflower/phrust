@@ -26,4 +26,5 @@ mod sessions;
 mod state;
 mod static_files;
 mod tls;
+mod transfer;
 mod worker_pool;

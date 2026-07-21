@@ -335,6 +335,7 @@ pub(in crate::vm) extern "C" fn jit_native_builtin_dispatch_diagnostic_abi(
 }
 
 #[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn jit_native_builtin_dispatch_impl<const DIAGNOSTIC: bool>(
     runtime: *mut NativeRequestFastState,
     builtin_id: u32,
@@ -553,6 +554,7 @@ pub(in crate::vm) extern "C" fn jit_native_call_dispatch_diagnostic_abi(
 }
 
 #[allow(unsafe_code)]
+#[allow(clippy::redundant_closure_call)]
 unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
     runtime: *mut NativeRequestFastState,
     _vm_context: u64,
@@ -738,7 +740,7 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                 if !direct_builtin && !direct_external_in_place {
                     let dynamic_reason =
                         native_dynamic_call_reason(context, frame, descriptor, arguments);
-                    let dynamic_target = descriptor.target_symbol.as_deref().unwrap_or_else(|| {
+                    let dynamic_target = descriptor.target_symbol.as_deref().unwrap_or({
                         match descriptor.kind {
                             crate::compiled_unit::NativeCallSiteKind::Closure => "<closure>",
                             crate::compiled_unit::NativeCallSiteKind::Callable => "<callable>",

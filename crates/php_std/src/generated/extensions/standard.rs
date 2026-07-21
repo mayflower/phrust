@@ -667,6 +667,22 @@ const FUNCTIONS: &[FunctionDescriptor] = &[
         true,
     ),
     FunctionDescriptor::generated(
+        "connection_aborted",
+        "standard",
+        SymbolVisibility::PhpVisible,
+        Some("core"),
+        None,
+        false,
+    ),
+    FunctionDescriptor::generated(
+        "connection_status",
+        "standard",
+        SymbolVisibility::PhpVisible,
+        Some("core"),
+        None,
+        false,
+    ),
+    FunctionDescriptor::generated(
         "constant",
         "standard",
         SymbolVisibility::PhpVisible,

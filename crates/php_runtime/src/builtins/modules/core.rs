@@ -79,6 +79,16 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
         BuiltinCompatibility::Php,
     ),
     BuiltinEntry::new(
+        "connection_aborted",
+        builtin_config_requires_vm,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
+        "connection_status",
+        builtin_config_requires_vm,
+        BuiltinCompatibility::Php,
+    ),
+    BuiltinEntry::new(
         "error_reporting",
         builtin_error_handling_requires_vm,
         BuiltinCompatibility::Php,

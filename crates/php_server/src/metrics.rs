@@ -60,6 +60,13 @@ pub(crate) struct ServerMetrics {
     pub(crate) persistent_engine_feedback_template_instantiations: AtomicU64,
     pub(crate) persistent_engine_feedback_template_absorptions: AtomicU64,
     pub(crate) response_output_bytes: AtomicU64,
+    pub(crate) transfers_completed: AtomicU64,
+    pub(crate) transfers_aborted: AtomicU64,
+    pub(crate) transfer_errors: AtomicU64,
+    pub(crate) worker_pool_failures: AtomicU64,
+    pub(crate) client_disconnect_cancellations: AtomicU64,
+    pub(crate) php_output_chunks: AtomicU64,
+    pub(crate) php_output_backpressure_nanos: AtomicU64,
     pub(crate) runtime_diagnostics: AtomicU64,
     pub(crate) session_seed_attempts: AtomicU64,
     pub(crate) session_store_loads: AtomicU64,
@@ -230,6 +237,13 @@ phrust_server_deployment_fingerprint_stale_total {}\n\
 phrust_server_immutable_release_cache_hits_total {}\n\
 phrust_server_entry_script_source_reads_total {}\n\
 phrust_server_response_output_bytes_total {}\n\
+phrust_server_transfers_completed_total {}\n\
+phrust_server_transfers_aborted_total {}\n\
+phrust_server_transfer_errors_total {}\n\
+phrust_server_worker_pool_failures_total {}\n\
+phrust_server_client_disconnect_cancellations_total {}\n\
+phrust_server_php_output_chunks_total {}\n\
+phrust_server_php_output_backpressure_nanos_total {}\n\
 phrust_server_runtime_diagnostics_total {}\n\
 phrust_server_session_seed_attempts_total {}\n\
 phrust_server_session_store_loads_total {}\n\
@@ -337,6 +351,13 @@ phrust_server_persistent_engine_feedback_template_absorptions_total {}\n",
             include_cache.immutable_release_hits,
             cache.source_reads,
             self.response_output_bytes.load(Ordering::Relaxed),
+            self.transfers_completed.load(Ordering::Relaxed),
+            self.transfers_aborted.load(Ordering::Relaxed),
+            self.transfer_errors.load(Ordering::Relaxed),
+            self.worker_pool_failures.load(Ordering::Relaxed),
+            self.client_disconnect_cancellations.load(Ordering::Relaxed),
+            self.php_output_chunks.load(Ordering::Relaxed),
+            self.php_output_backpressure_nanos.load(Ordering::Relaxed),
             self.runtime_diagnostics.load(Ordering::Relaxed),
             self.session_seed_attempts.load(Ordering::Relaxed),
             self.session_store_loads.load(Ordering::Relaxed),

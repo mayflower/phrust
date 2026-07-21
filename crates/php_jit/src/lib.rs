@@ -1363,7 +1363,7 @@ impl JitFunctionHandle {
         for (target_slot, (register, source_slot)) in transition
             .live_registers
             .iter()
-            .zip(register_source_slots.into_iter())
+            .zip(register_source_slots)
             .enumerate()
         {
             let source_slot = source_slot.expect("transition completeness was checked");
@@ -1656,6 +1656,7 @@ impl JitFunctionHandle {
     }
 
     /// Resumes a suspension and generated unwind with direct request state.
+    #[allow(clippy::too_many_arguments)]
     pub fn invoke_i64_suspension_resume_with_native_unwind_runtime(
         &self,
         args: &[i64],

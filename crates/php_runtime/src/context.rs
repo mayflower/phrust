@@ -1,12 +1,16 @@
 //! Deterministic runtime configuration for CLI fixture execution.
 
+use crate::output::OutputSinkHandle;
 use crate::{
     ArrayKey, FilesystemCapabilities, IniRegistry, PhpArray, PhpString, SessionState, Value,
 };
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 /// Minimal ini-like runtime options carried by the VM.
@@ -148,6 +152,60 @@ pub struct RuntimeUploadedFile {
     pub error: i64,
     pub size: u64,
 }
+
+#[derive(Clone, Debug)]
+pub struct RuntimeCancellationState {
+    inner: Arc<RuntimeCancellationInner>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeCancellationInner {
+    cancelled: AtomicBool,
+    ignore_user_abort: AtomicBool,
+}
+
+impl RuntimeCancellationState {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RuntimeCancellationInner::default()),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.inner.cancelled.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn ignore_user_abort(&self) -> bool {
+        self.inner.ignore_user_abort.load(Ordering::Acquire)
+    }
+
+    pub fn set_ignore_user_abort(&self, ignore: bool) {
+        self.inner
+            .ignore_user_abort
+            .store(ignore, Ordering::Release);
+    }
+}
+
+impl Default for RuntimeCancellationState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for RuntimeCancellationState {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Eq for RuntimeCancellationState {}
 
 /// Request-local registry of temp files accepted by the upload parser.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -543,6 +601,11 @@ pub struct RuntimeContext {
     pub session_id_generator: Option<SessionIdGenerateCallback>,
     /// Optional cooperative PHP execution budget for the VM.
     pub execution_time_limit: Option<Duration>,
+    /// Optional synchronous root-output destination. `None` selects exact
+    /// collecting output for CLI, tests, and other non-streaming callers.
+    pub output_sink: Option<OutputSinkHandle>,
+    /// Shared client-disconnect and ignore-user-abort state.
+    pub cancellation: RuntimeCancellationState,
     /// Runtime SAPI name visible through PHP_SAPI and php_sapi_name().
     pub sapi_name: String,
     /// Runtime binary path visible through PHP_BINARY.
@@ -567,6 +630,8 @@ impl Default for RuntimeContext {
             session_loader: None,
             session_id_generator: None,
             execution_time_limit: None,
+            output_sink: None,
+            cancellation: RuntimeCancellationState::new(),
             sapi_name: "cli".to_string(),
             php_binary: "phrust-php".to_string(),
         }
@@ -614,6 +679,18 @@ impl RuntimeContext {
     #[must_use]
     pub fn with_ini_overrides(mut self, overrides: Vec<(String, String)>) -> Self {
         self.ini_overrides = overrides;
+        self
+    }
+
+    #[must_use]
+    pub fn with_output_sink(mut self, sink: OutputSinkHandle) -> Self {
+        self.output_sink = Some(sink);
+        self
+    }
+
+    #[must_use]
+    pub fn with_cancellation(mut self, cancellation: RuntimeCancellationState) -> Self {
+        self.cancellation = cancellation;
         self
     }
 

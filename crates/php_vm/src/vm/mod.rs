@@ -369,8 +369,10 @@ impl VmWorkerState {
         let worker = self.clone();
         let submitted = submit_native_optimization_job(move || {
             let started = Instant::now();
-            let mut options = VmOptions::default();
-            options.native_optimization = NativeOptimizationPolicy::Optimizing;
+            let mut options = VmOptions {
+                native_optimization: NativeOptimizationPolicy::Optimizing,
+                ..VmOptions::default()
+            };
             options.tiering.enabled = false;
             let result = worker.compile_native_with_priority(
                 &unit,
@@ -754,8 +756,22 @@ impl Vm {
         unit: impl Into<CompiledUnit>,
         external_signatures: &[php_jit::JitExternalFunctionSignature],
     ) -> VmResult {
+        let output = self
+            .options
+            .runtime_context
+            .output_sink
+            .clone()
+            .map_or_else(OutputBuffer::default, OutputBuffer::with_sink);
+        self.execute_with_external_function_signatures_and_output(unit, external_signatures, output)
+    }
+
+    pub(super) fn execute_with_external_function_signatures_and_output(
+        &self,
+        unit: impl Into<CompiledUnit>,
+        external_signatures: &[php_jit::JitExternalFunctionSignature],
+        output: OutputBuffer,
+    ) -> VmResult {
         let unit = unit.into();
-        let output = OutputBuffer::default();
         let entry = unit.unit().entry;
         let Some(function) = unit.unit().functions.get(entry.index()) else {
             return VmResult::compile_error(output, "entry function is missing");
@@ -786,7 +802,11 @@ impl Vm {
             baseline_options.tiering.enabled = false;
             let mut result =
                 Vm::with_options_and_worker_state(baseline_options, self.worker_state.clone())
-                    .execute_with_external_function_signatures(unit.clone(), external_signatures);
+                    .execute_with_external_function_signatures_and_output(
+                        unit.clone(),
+                        external_signatures,
+                        output,
+                    );
             if result.status.is_success() {
                 self.worker_state.schedule_background_optimization(
                     decision,
@@ -1084,7 +1104,6 @@ impl Vm {
                 }
             })
         });
-        context.output.flush_all_buffers();
         drop(guard);
         context.publish_include_globals();
         let native_execution_time_nanos = native_execution_started_at.map_or(0, |started_at| {
@@ -1097,7 +1116,7 @@ impl Vm {
             counters.native_execution_time_nanos = native_execution_time_nanos;
             counters
         });
-        let http_response = std::mem::take(&mut context.http_response);
+        let mut http_response = std::mem::take(&mut context.http_response);
         let upload_registry = std::mem::take(&mut context.upload_registry);
         let session = std::mem::take(&mut context.session);
         let process_exit_terminates_process = context.process_exit_terminates_process();
@@ -1212,6 +1231,23 @@ impl Vm {
         };
         context.recycle_native_value_arena();
         result.process_exit_terminates_process = process_exit_terminates_process;
+        http_response.headers_sent |= result.output.http_response().headers_sent;
+        if !result.status.is_success() && !http_response.headers_sent {
+            http_response.status_code = if result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.id() == "E_PHP_VM_EXECUTION_TIMEOUT")
+            {
+                504
+            } else {
+                500
+            };
+        }
+        result.output.set_http_response(http_response.clone());
+        if !context.include_child {
+            result.output.finish();
+        }
+        http_response.headers_sent |= result.output.http_response().headers_sent;
         result.http_response = Some(Box::new(http_response));
         result.upload_registry = Some(Box::new(upload_registry));
         result.session = Some(Box::new(session));
@@ -1380,6 +1416,7 @@ impl Vm {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn compile_native_function_graph(
     unit: &php_ir::IrUnit,
     function: php_ir::FunctionId,
@@ -1913,10 +1950,12 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn server_worker_publishes_optimized_entry_after_hot_baseline_threshold() {
-        let mut tiering = crate::tiering::TieringOptions::default();
-        tiering.collect_stats = true;
-        tiering.function_entry_threshold = 2;
-        tiering.native_max_functions = 1;
+        let tiering = crate::tiering::TieringOptions {
+            collect_stats: true,
+            function_entry_threshold: 2,
+            native_max_functions: 1,
+            ..crate::tiering::TieringOptions::default()
+        };
         let worker = VmWorkerState::new_with_background_tiering(tiering.clone());
         let options = VmOptions {
             native_optimization: NativeOptimizationPolicy::Optimizing,
@@ -2212,7 +2251,7 @@ mod tests {
 
     fn optimizing_nested_constant_key_array_transition_unit() -> (CompiledUnit, php_ir::FunctionId)
     {
-        let mut builder = IrBuilder::new(UnitId::new(9_938_1));
+        let mut builder = IrBuilder::new(UnitId::new(99_381));
         let file = builder.add_file("native-nested-constant-key-array-transition.php");
         let span = IrSpan::new(file, 0, 48);
         let first_key_constant = builder.intern_constant(IrConstant::String("path".to_owned()));
@@ -2994,8 +3033,10 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn optimizing_call_miss_keeps_nested_warm_cell_on_baseline_entry() {
         let unit = direct_call_unit_with_identity(9_936, "native-on-demand-optimizer-cell.php");
-        let mut tiering = crate::tiering::TieringOptions::default();
-        tiering.collect_stats = true;
+        let tiering = crate::tiering::TieringOptions {
+            collect_stats: true,
+            ..crate::tiering::TieringOptions::default()
+        };
         let worker = VmWorkerState::new(tiering.clone());
         let result = Vm::with_options_and_worker_state(
             VmOptions {
@@ -3409,8 +3450,10 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn reached_method_is_published_to_the_optimizing_entry_table() {
-        let mut tiering = crate::tiering::TieringOptions::default();
-        tiering.collect_stats = true;
+        let tiering = crate::tiering::TieringOptions {
+            collect_stats: true,
+            ..crate::tiering::TieringOptions::default()
+        };
         let worker = VmWorkerState::new(tiering.clone());
         let unit = polymorphic_method_pic_unit();
         let method = unit.unit().classes[0].methods[0].function;

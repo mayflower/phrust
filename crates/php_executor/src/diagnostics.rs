@@ -147,8 +147,16 @@ pub(crate) fn execution_output_from_vm(
         }
     }
     let diagnostics_text = String::from_utf8(diagnostics).unwrap_or_default();
+    let output_stats = result.output.stats();
+    let output_delivery_error = result
+        .output
+        .delivery_error()
+        .map(|error| error.message().to_owned());
+    let stdout = result.output.into_bytes();
     PhpExecutionOutput {
-        stdout: result.output.as_bytes().to_vec(),
+        stdout,
+        output_stats,
+        output_delivery_error,
         diagnostics_text,
         diagnostics: result
             .diagnostics

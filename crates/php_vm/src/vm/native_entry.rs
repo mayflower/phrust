@@ -86,7 +86,6 @@ impl Vm {
                 }
             })
         });
-        context.output.flush_all_buffers();
         drop(guard);
         context.publish_include_globals();
         let native_execution_time_nanos = native_execution_started_at.map_or(0, |started_at| {
@@ -100,7 +99,7 @@ impl Vm {
             counters
         });
 
-        let http_response = std::mem::take(&mut context.http_response);
+        let mut http_response = std::mem::take(&mut context.http_response);
         let upload_registry = std::mem::take(&mut context.upload_registry);
         let session = std::mem::take(&mut context.session);
         let process_exit_terminates_process = context.process_exit_terminates_process();
@@ -226,6 +225,23 @@ impl Vm {
         };
         context.recycle_native_value_arena();
         result.process_exit_terminates_process = process_exit_terminates_process;
+        http_response.headers_sent |= result.output.http_response().headers_sent;
+        if !result.status.is_success() && !http_response.headers_sent {
+            http_response.status_code = if result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.id() == "E_PHP_VM_EXECUTION_TIMEOUT")
+            {
+                504
+            } else {
+                500
+            };
+        }
+        result.output.set_http_response(http_response.clone());
+        if !context.include_child {
+            result.output.finish();
+        }
+        http_response.headers_sent |= result.output.http_response().headers_sent;
         result.http_response = Some(Box::new(http_response));
         result.upload_registry = Some(Box::new(upload_registry));
         result.session = Some(Box::new(session));

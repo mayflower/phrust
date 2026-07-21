@@ -2232,6 +2232,34 @@
       "implementations": [
         {
           "kind": "runtime",
+          "module": "core"
+        }
+      ],
+      "name": "connection_aborted",
+      "visibility": "php"
+    },
+    {
+      "arginfo": {
+        "extension": "standard",
+        "source": "ext/standard/basic_functions.stub.php"
+      },
+      "implementations": [
+        {
+          "kind": "runtime",
+          "module": "core"
+        }
+      ],
+      "name": "connection_status",
+      "visibility": "php"
+    },
+    {
+      "arginfo": {
+        "extension": "standard",
+        "source": "ext/standard/basic_functions.stub.php"
+      },
+      "implementations": [
+        {
+          "kind": "runtime",
           "module": "reflection"
         },
         {

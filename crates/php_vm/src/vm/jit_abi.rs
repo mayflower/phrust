@@ -344,6 +344,7 @@ pub(super) struct NativeExecutionContext<'a> {
     /// native operands do not repeatedly search runtime constant registries.
     decoded_constant_cache:
         RefCell<std::collections::HashMap<(Option<usize>, usize), php_runtime::api::Value>>,
+    #[allow(clippy::type_complexity)]
     runtime_class_cache:
         RefCell<std::collections::HashMap<(Option<usize>, String), Rc<PreparedNativeRuntimeClass>>>,
     /// Long-lived request roots (globals, statics, callbacks, sessions, and
@@ -379,6 +380,7 @@ pub(super) struct NativeExecutionContext<'a> {
     static_properties: std::collections::BTreeMap<(String, String), Value>,
     static_locals: std::collections::BTreeMap<(u64, u32, u32), php_runtime::api::ReferenceCell>,
     enum_cases: std::collections::BTreeMap<(String, String), php_runtime::api::ObjectRef>,
+    #[allow(clippy::type_complexity)]
     class_constant_cache: std::collections::HashMap<
         (Option<usize>, u32),
         std::collections::HashMap<String, std::collections::HashMap<String, Value>>,
@@ -415,7 +417,7 @@ pub(super) struct NativeExecutionContext<'a> {
     native_callsites: std::sync::Arc<
         Vec<Vec<Option<std::sync::Arc<crate::compiled_unit::NativeCallSiteDescriptor>>>>,
     >,
-    include_child: bool,
+    pub(super) include_child: bool,
     execution_deadline_at: Option<std::time::Instant>,
     execution_deadline_mutable: bool,
     runtime_telemetry: Rc<RefCell<NativeRuntimeTelemetry>>,
@@ -911,6 +913,18 @@ impl<'a> NativeExecutionContext<'a> {
         dynamic_constants
             .entry("STDERR".to_owned())
             .or_insert(Value::Resource(stderr));
+        dynamic_constants.insert(
+            "PHP_SAPI".to_owned(),
+            Value::String(PhpString::from_bytes(
+                options.runtime_context.sapi_name.as_bytes().to_vec(),
+            )),
+        );
+        dynamic_constants.insert(
+            "PHP_BINARY".to_owned(),
+            Value::String(PhpString::from_bytes(
+                options.runtime_context.php_binary.as_bytes().to_vec(),
+            )),
+        );
         let continuation_instructions = compiled.prepared_continuation_instructions();
         let native_callsites = compiled.prepared_native_callsites();
         let native_call_argument_capacity = compiled
@@ -2990,15 +3004,15 @@ impl<'a> NativeExecutionContext<'a> {
         };
         // Cache only immediates and immutable strings. Object/reference/array
         // handles can form observable cycles and remain on the baseline path.
-        if let Some(value_index) = php_jit::jit_decode_runtime_value(value) {
-            if !matches!(
+        if let Some(value_index) = php_jit::jit_decode_runtime_value(value)
+            && !matches!(
                 self.values
                     .get(value_index as usize)
                     .and_then(Option::as_ref),
                 Some(NativeStoredValue::Php(Value::String(_)))
-            ) {
-                return Ok(());
-            }
+            )
+        {
+            return Ok(());
         }
         if self.object_property_caches[object_index].is_none() {
             self.object_property_caches[object_index] = Some(
@@ -5786,16 +5800,13 @@ fn invoke_native_method_with_prepared_trace_arguments(
             + usize::from(instance_method)
             + usize::from(metadata.implicit_closure_this)
     });
-    let frame_arguments = trace_arguments.map_or_else(
-        || {
-            arguments
-                .iter()
-                .skip(leading)
-                .copied()
-                .collect::<request_state::NativeTraceArguments>()
-        },
-        |arguments| arguments,
-    );
+    let frame_arguments = trace_arguments.unwrap_or_else(|| {
+        arguments
+            .iter()
+            .skip(leading)
+            .copied()
+            .collect::<request_state::NativeTraceArguments>()
+    });
     context
         .call_frames
         .push(native_backtrace_frame_from_metadata(
@@ -5909,7 +5920,7 @@ fn invoke_native_method_with_prepared_trace_arguments(
                 .collect::<Result<Vec<_>, _>>()?;
             context.pending_throwable = Some(native_throwable_with_frame(
                 throwable,
-                &function_name,
+                function_name,
                 arguments,
             ));
             context.mark_roots_dirty(RootMutationReason::PendingThrowable);
@@ -6236,9 +6247,7 @@ fn native_optimizing_transition_reason(
         .into();
     }
     let debug = format!("{kind:?}");
-    let end = debug
-        .find(|character: char| matches!(character, ' ' | '{' | '('))
-        .unwrap_or(debug.len());
+    let end = debug.find([' ', '{', '(']).unwrap_or(debug.len());
     format!("{family}:{}", &debug[..end]).into()
 }
 

@@ -31,6 +31,14 @@ if ($_SERVER["REQUEST_URI"] === "/router-hit") {
     echo "router-output:", $_SERVER["REQUEST_URI"];
     return true;
 }
+if ($_SERVER["REQUEST_URI"] === "/router-large") {
+    echo str_repeat("r", 1048576);
+    return true;
+}
+if ($_SERVER["REQUEST_URI"] === "/static.txt") {
+    echo str_repeat("discarded", 16384);
+    return false;
+}
 return false;
 PHP
 printf 'static-ok\n' >"$docroot/static.txt"
@@ -50,7 +58,11 @@ done
 [[ -n "$url" ]]
 
 curl -fsS "$url/" | grep -q '^index:/$'
-curl -fsS "$url/sapi.php" | grep -q '^cli-server|cli-server$'
+sapi="$(curl -fsS "$url/sapi.php")"
+if [[ "$sapi" != "cli-server|cli-server" ]]; then
+  printf '[fail] unexpected built-in SAPI identity: %q\n' "$sapi" >&2
+  exit 1
+fi
 curl -fsS "$url/static.txt" | grep -q '^static-ok$'
 status="$(curl -sS -o /dev/null -w '%{http_code}' "$url/missing.php")"
 [[ "$status" == "404" ]]
@@ -75,8 +87,18 @@ done
 [[ -n "$url" ]]
 
 curl -fsS "$url/router-hit" | grep -q '^router-output:/router-hit$'
+large_bytes="$(curl -fsS "$url/router-large" | wc -c | tr -d ' ')"
+[[ "$large_bytes" == "1048576" ]]
 curl -fsS "$url/static.txt" | grep -q '^static-ok$'
-curl -fsS "$url/sapi.php" | grep -q '^cli-server|cli-server$'
+sapi="$(curl -fsS "$url/sapi.php")"
+if [[ "$sapi" != "cli-server|cli-server" ]]; then
+  printf '[fail] unexpected routed SAPI identity: %q\n' "$sapi" >&2
+  exit 1
+fi
 curl -fsS "$url/" | grep -q '^index:/$'
+if find "${TMPDIR:-/tmp}" -maxdepth 1 -name "phrust-router-${server_pid}-*.spool" -print -quit | grep -q .; then
+  printf '%s\n' '[fail] built-in router left an output spool behind' >&2
+  exit 1
+fi
 
 printf '%s\n' '[ok] phrust-php built-in server smoke passed'

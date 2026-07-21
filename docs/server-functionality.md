@@ -28,13 +28,13 @@ The current server surface includes:
   cache invalidation.
 - Static file streaming, conditional requests, ranges, and precompressed asset
   selection.
-- Production-oriented config, access logs, metrics hardening, and Rustls
-  HTTP/1.1 TLS termination.
+- Production-oriented config, access logs, metrics hardening, Rustls
+  HTTP/1.1/HTTP/2 termination, and optional HTTP/3 over QUIC.
+- A shared bounded response-transfer core for static files and PHP, including
+  transport-visible `flush()`, backpressure, and client cancellation.
 
 - `server-compat-smoke all` is strict for every compatibility section currently
   listed in the harness.
-- HTTP/2 remains intentionally unimplemented. TLS is HTTP/1.1 over Rustls with
-  `http/1.1` ALPN.
 - Remaining gaps are tracked in `docs/server-known-gaps.md`; the current server
   improves standalone operability but does not turn phrust into full PHP
   SAPI compatibility.
@@ -43,8 +43,8 @@ The current server surface includes:
 
 The integrated server does not provide FPM, FastCGI, CGI, Apache modules,
 `mod_php`, external PHP process execution, Zend ABI emulation, a complete SAPI
-compatibility layer, HTTP/2, HTTP/3, Opcache parity, a full standard library,
-or a production process manager.
+compatibility layer, Opcache parity, a full standard library, or a production
+process manager.
 
 Known gaps should stay explicit until implemented and verified.
 
@@ -250,7 +250,7 @@ access_log = "/var/log/phrust/access.log"
 Access logging is disabled by default. `--access-log <path|->` enables one
 compact line per request, appending to a file path or writing to stdout when the
 target is `-`. Each line records epoch timestamp, method, path/query target,
-status, response bytes from `Content-Length`, duration in milliseconds, route
+status, body bytes emitted to the transport, transfer outcome, duration in milliseconds, route
 kind (`static`, `php`, `front-controller`, `health`, `metrics`, or rejection
 kind), and script-cache hit state when a PHP cache lookup happened.
 
@@ -278,8 +278,9 @@ routing, request body limits, PHP execution, script/include caches, sessions,
 access logging, and metrics stay on the same integrated path. Plain HTTP remains
 the default for local development when no TLS files are configured.
 
-The TLS transport advertises `http/1.1` through ALPN. HTTP/2 and HTTP/3 are not
-enabled. The local TLS smoke uses the committed self-signed
+The TLS transport advertises `h2` and `http/1.1` through ALPN. HTTP/3 is
+available over QUIC with `--enable-http3` and `--http3-listen`; all three
+protocols consume the same incremental response body. The local TLS smoke uses the committed self-signed
 localhost fixture under `fixtures/server/tls/` and `curl -k`:
 
 ```bash

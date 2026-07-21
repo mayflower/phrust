@@ -1382,7 +1382,7 @@ fn optimizing_owned_handle_moves_into_plain_local_without_refcount_pair() {
 
 #[test]
 fn baseline_new_array_uses_direct_native_arena_before_cold_helper() {
-    let mut builder = IrBuilder::new(UnitId::new(4_207_1));
+    let mut builder = IrBuilder::new(UnitId::new(42_071));
     let file = builder.add_file("baseline-direct-new-array.php");
     let span = IrSpan::new(file, 0, 1);
     let function =
@@ -1439,7 +1439,7 @@ fn baseline_new_array_uses_direct_native_arena_before_cold_helper() {
 #[test]
 fn baseline_array_append_and_fetch_stay_on_direct_native_data_plane() {
     SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
-    let mut builder = IrBuilder::new(UnitId::new(4_207_2));
+    let mut builder = IrBuilder::new(UnitId::new(42_072));
     let file = builder.add_file("baseline-direct-array-append.php");
     let span = IrSpan::new(file, 0, 1);
     let function = builder.start_function(
@@ -1525,7 +1525,7 @@ fn baseline_array_append_and_fetch_stay_on_direct_native_data_plane() {
 #[test]
 fn baseline_keyed_array_insert_and_overwrite_stay_on_direct_native_data_plane() {
     SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
-    let mut builder = IrBuilder::new(UnitId::new(4_207_3));
+    let mut builder = IrBuilder::new(UnitId::new(42_073));
     let file = builder.add_file("baseline-direct-keyed-array.php");
     let span = IrSpan::new(file, 0, 1);
     let function = builder.start_function(
@@ -1615,7 +1615,7 @@ fn baseline_keyed_array_insert_and_overwrite_stay_on_direct_native_data_plane() 
 fn optimizing_direct_array_matches_distinct_equal_string_key_handles() {
     SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
     ARRAY_FETCH_FALLBACK_CALLS.store(0, Ordering::SeqCst);
-    let mut builder = IrBuilder::new(UnitId::new(4_207_4));
+    let mut builder = IrBuilder::new(UnitId::new(42_074));
     let file = builder.add_file("baseline-direct-string-key-array.php");
     let span = IrSpan::new(file, 0, 1);
     let function = builder.start_function(
@@ -1746,7 +1746,7 @@ fn optimizing_direct_array_matches_distinct_equal_string_key_handles() {
 
 #[test]
 fn optimizing_constant_key_transition_preserves_array_register_identity() {
-    let mut builder = IrBuilder::new(UnitId::new(4_207_5));
+    let mut builder = IrBuilder::new(UnitId::new(42_075));
     let file = builder.add_file("optimizing-constant-key-transition.php");
     let span = IrSpan::new(file, 0, 1);
     let function = builder.start_function(
@@ -1907,7 +1907,7 @@ fn optimizing_constant_key_transition_preserves_array_register_identity() {
 
 #[test]
 fn constant_key_transition_restores_array_into_the_baseline_register() {
-    let mut builder = IrBuilder::new(UnitId::new(4_207_6));
+    let mut builder = IrBuilder::new(UnitId::new(42_076));
     let file = builder.add_file("constant-key-baseline-transition.php");
     let span = IrSpan::new(file, 0, 1);
     let function = builder.start_function(
@@ -2274,7 +2274,7 @@ fn optimizing_direct_array_foreach_has_no_runtime_helper_import() {
 fn baseline_direct_array_foreach_executes_without_foreach_helpers() {
     SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
     FOREACH_NEXT_FALLBACK_CALLS.store(0, Ordering::SeqCst);
-    let mut builder = IrBuilder::new(UnitId::new(4_224_1));
+    let mut builder = IrBuilder::new(UnitId::new(42_241));
     let file = builder.add_file("baseline-direct-array-foreach.php");
     let span = IrSpan::new(file, 0, 1);
     let function = builder.start_function(
@@ -5218,7 +5218,7 @@ fn optimizing_unknown_scalar_truthiness_uses_guarded_native_lanes() {
 
 #[test]
 fn optimizing_terminator_rejects_to_matching_baseline_continuation() {
-    let mut builder = IrBuilder::new(UnitId::new(4_210_1));
+    let mut builder = IrBuilder::new(UnitId::new(42_101));
     let file = builder.add_file("optimizing-terminator-transition.php");
     let span = IrSpan::new(file, 0, 1);
     let function = builder.start_function(
@@ -5286,7 +5286,7 @@ fn optimizing_terminator_rejects_to_matching_baseline_continuation() {
 
 #[test]
 fn optimizing_property_array_chain_uses_baseline_snapshot_order() {
-    let mut builder = IrBuilder::new(UnitId::new(4_210_2));
+    let mut builder = IrBuilder::new(UnitId::new(42_102));
     let file = builder.add_file("optimizing-property-array-chain.php");
     let span = IrSpan::new(file, 0, 1);
     let function = builder.start_function(
@@ -5852,7 +5852,6 @@ fn array_fetch_reads_complete_native_array_view_without_helper() {
         reserved: 0,
         payload: 1,
         aux: entries.as_mut_ptr() as usize as u64,
-        ..crate::JitNativeValueSlot::default()
     };
     let view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,

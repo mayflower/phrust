@@ -193,6 +193,18 @@ pub(in crate::vm) extern "C" fn jit_native_execution_poll_abi(
     runtime: *mut NativeRequestFastState,
 ) -> i32 {
     with_native_context_for(runtime, "execution_poll", |context| {
+        let cancellation = &context.options.runtime_context.cancellation;
+        if cancellation.is_cancelled() && !cancellation.ignore_user_abort() {
+            context.diagnostic = Some(php_runtime::api::RuntimeDiagnostic::new(
+                "E_PHP_CLIENT_DISCONNECTED",
+                php_runtime::api::RuntimeSeverity::RecoverableError,
+                "client disconnected during PHP execution",
+                php_runtime::api::RuntimeSourceSpan::default(),
+                Vec::new(),
+                None,
+            ));
+            return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+        }
         if context
             .execution_deadline_at
             .is_none_or(|deadline| std::time::Instant::now() < deadline)
@@ -2686,7 +2698,7 @@ pub(in crate::vm) extern "C" fn jit_native_property_fetch_abi(
             return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
         };
         let class_name = normalize_class_name(&object.class_name());
-        if let Some(value) = native_simple_xml_property(&object, &property) {
+        if let Some(value) = native_simple_xml_property(&object, property) {
             return match context.encode_baseline_call_value(value) {
                 Ok(value) if write_native_value(out, value) => 0,
                 Ok(_) => {
@@ -2776,7 +2788,7 @@ pub(in crate::vm) extern "C" fn jit_native_property_fetch_abi(
         // access; otherwise a real dynamic value is incorrectly hidden by
         // __get().
         if entry.is_none()
-            && let Some(mut value) = object.get_property(&property)
+            && let Some(mut value) = object.get_property(property)
         {
             for _ in 0..16 {
                 let Value::Reference(reference) = value else {
@@ -2860,7 +2872,7 @@ pub(in crate::vm) extern "C" fn jit_native_property_fetch_abi(
                 }
             };
         }
-        let mut value = object.get_property(&property).unwrap_or(Value::Null);
+        let mut value = object.get_property(property).unwrap_or(Value::Null);
         for _ in 0..16 {
             let Value::Reference(reference) = value else {
                 break;
@@ -3099,7 +3111,7 @@ pub(in crate::vm) extern "C" fn jit_native_property_assign_abi(
         }
         if entry.is_some_and(|entry| entry.flags.is_readonly)
             && object
-                .get_property(&property)
+                .get_property(property)
                 .is_some_and(|current| !matches!(current, Value::Uninitialized))
         {
             let display_class = class
@@ -3139,7 +3151,7 @@ pub(in crate::vm) extern "C" fn jit_native_property_assign_abi(
         }
         if bind_reference {
             let previous = object
-                .get_property(&property)
+                .get_property(property)
                 .unwrap_or(Value::Uninitialized);
             let membership_changed = rooted_membership_may_change(&previous, &value);
             object.set_property_borrowed(property, value.clone());
@@ -3153,7 +3165,7 @@ pub(in crate::vm) extern "C" fn jit_native_property_assign_abi(
                 );
                 return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
             }
-        } else if let Some(Value::Reference(reference)) = object.get_property(&property) {
+        } else if let Some(Value::Reference(reference)) = object.get_property(property) {
             let previous = reference.get();
             let membership_changed = rooted_membership_may_change(&previous, &value);
             reference.set(value.clone());
@@ -3169,7 +3181,7 @@ pub(in crate::vm) extern "C" fn jit_native_property_assign_abi(
             }
         } else {
             let previous = object
-                .get_property(&property)
+                .get_property(property)
                 .unwrap_or(Value::Uninitialized);
             let membership_changed = rooted_membership_may_change(&previous, &value);
             object.set_property_borrowed(property, value.clone());

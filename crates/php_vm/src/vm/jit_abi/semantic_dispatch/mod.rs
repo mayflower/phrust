@@ -66,6 +66,7 @@ pub(in crate::vm) extern "C" fn jit_native_semantic_dispatch_diagnostic_abi(
 }
 
 #[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn jit_native_semantic_dispatch_impl<const DIAGNOSTIC: bool>(
     runtime: *mut NativeRequestFastState,
     unit_identity: u64,

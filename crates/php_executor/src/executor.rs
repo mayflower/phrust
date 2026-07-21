@@ -102,6 +102,8 @@ impl PhpExecutor {
                 render_frontend_diagnostics(&pipeline).map_err(PhpExecutionError::Engine)?;
             return Err(PhpExecutionError::Compile(Box::new(PhpExecutionOutput {
                 stdout: Vec::new(),
+                output_stats: Default::default(),
+                output_delivery_error: None,
                 diagnostics_text,
                 diagnostics: frontend_diagnostic_envelopes(&pipeline),
                 status: PhpExecutionStatus::CompileError,

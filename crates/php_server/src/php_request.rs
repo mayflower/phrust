@@ -2,7 +2,7 @@ use super::{
     diagnostics::{RequestDiagnostic, emit_request_diagnostic, emit_server_debug_lazy},
     metrics::RequestPhase,
     perf_trace::PerfTraceEvent,
-    request_pipeline::{PhpResponseBytes, RequestCleanup, RequestOutcome, RequestStage},
+    request_pipeline::{PhpTransferCompletion, RequestCleanup, RequestOutcome, RequestStage},
     sessions::seed_session_state,
     state::{AppState, RequestExecutorCacheKey},
 };
@@ -10,12 +10,13 @@ use crate::{
     multipart::{MultipartError, MultipartStats, multipart_boundary, parse_multipart_into_context},
     response::{self, RequestBody, ResponseBody},
     routing::RequestRewriteRule,
+    transfer::PhpExecutionCoordinator,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::{
-    Method, Response, StatusCode, Version,
+    Method, Response, StatusCode,
     header::{self, HeaderName, HeaderValue},
     http::{HeaderMap, request::Parts},
 };
@@ -24,19 +25,25 @@ use php_executor::{
     PhpExecutionStatus, PhpExecutor, PhpRequestExecutionInput,
 };
 use php_runtime::api::{
-    RuntimeContext, RuntimeHttpRequestContext, RuntimeHttpResponseState, SessionIdGenerateCallback,
+    OutputDeliveryError, OutputSink, OutputSinkHandle, RuntimeCancellationState, RuntimeContext,
+    RuntimeHttpRequestContext, RuntimeHttpResponseState, SessionIdGenerateCallback,
     SessionLoadCallback, SessionState, Value, parse_cookie_header, parse_form_urlencoded_body,
 };
 use std::{
     cell::RefCell,
     collections::BTreeMap,
+    fs::{File, OpenOptions},
+    io::{Seek, SeekFrom, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    sync::{OwnedSemaphorePermit, TryAcquireError},
+    sync::{OwnedSemaphorePermit, TryAcquireError, mpsc, oneshot},
     time::timeout,
 };
 use tracing::{debug, warn};
@@ -44,6 +51,426 @@ use tracing::{debug, warn};
 pub(crate) struct PartsAndBody {
     pub(crate) parts: Parts,
     pub(crate) body: RequestBody,
+}
+
+const PHP_OUTPUT_QUEUE_CAPACITY: usize = 4;
+const ROUTER_MEMORY_SPOOL_BYTES: usize = 64 * 1024;
+static ROUTER_SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct PhpResponseHead {
+    response: RuntimeHttpResponseState,
+    complete_length: Option<u64>,
+}
+
+struct PhpResponseSink {
+    head: Mutex<Option<oneshot::Sender<PhpResponseHead>>>,
+    chunks: Option<mpsc::Sender<Result<Vec<u8>, std::io::Error>>>,
+    suppress_body: std::sync::atomic::AtomicBool,
+    cancellation: RuntimeCancellationState,
+    metrics: Arc<super::metrics::ServerMetrics>,
+    defer_head_until_finish: bool,
+}
+
+impl OutputSink for PhpResponseSink {
+    fn commit_before_write(&self) -> bool {
+        !self.defer_head_until_finish
+    }
+
+    fn commit(
+        &self,
+        response: &RuntimeHttpResponseState,
+        complete_length: Option<u64>,
+    ) -> Result<(), OutputDeliveryError> {
+        let status = StatusCode::from_u16(response.status_code).unwrap_or(StatusCode::OK);
+        let timeout_body = (status == StatusCode::GATEWAY_TIMEOUT && complete_length == Some(0))
+            .then_some(b"php execution timeout\n".to_vec());
+        let complete_length = timeout_body
+            .as_ref()
+            .map_or(complete_length, |body| Some(body.len() as u64));
+        if status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED {
+            self.suppress_body.store(true, Ordering::Release);
+        }
+        let sender = self
+            .head
+            .lock()
+            .map_err(|_| OutputDeliveryError::new("PHP response head lock poisoned"))?
+            .take();
+        if let Some(sender) = sender
+            && sender
+                .send(PhpResponseHead {
+                    response: response.clone(),
+                    complete_length,
+                })
+                .is_err()
+        {
+            self.cancellation.cancel();
+            return Err(OutputDeliveryError::new(
+                "PHP response head receiver closed",
+            ));
+        }
+        if let Some(body) = timeout_body {
+            self.write(body)?;
+        }
+        Ok(())
+    }
+
+    fn write(&self, chunk: Vec<u8>) -> Result<(), OutputDeliveryError> {
+        if self.suppress_body.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.cancellation.is_cancelled() {
+            return Ok(());
+        }
+        let Some(sender) = &self.chunks else {
+            return Ok(());
+        };
+        let wait_started = Instant::now();
+        let result = sender.blocking_send(Ok(chunk));
+        self.metrics.php_output_backpressure_nanos.fetch_add(
+            wait_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        if result.is_err() {
+            self.cancellation.cancel();
+            if self.cancellation.ignore_user_abort() {
+                Ok(())
+            } else {
+                Err(OutputDeliveryError::new(
+                    "PHP response body receiver closed",
+                ))
+            }
+        } else {
+            self.metrics
+                .php_output_chunks
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+}
+
+type PhpResponseBridge = (
+    OutputSinkHandle,
+    oneshot::Receiver<PhpResponseHead>,
+    mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+    Option<mpsc::Sender<Result<Vec<u8>, std::io::Error>>>,
+    RuntimeCancellationState,
+);
+
+fn php_response_bridge(
+    is_head: bool,
+    metrics: Arc<super::metrics::ServerMetrics>,
+) -> PhpResponseBridge {
+    let (head_sender, head_receiver) = oneshot::channel();
+    let (chunk_sender, chunk_receiver) = mpsc::channel(PHP_OUTPUT_QUEUE_CAPACITY);
+    let cancellation = RuntimeCancellationState::new();
+    let sink = PhpResponseSink {
+        head: Mutex::new(Some(head_sender)),
+        chunks: (!is_head).then_some(chunk_sender),
+        suppress_body: std::sync::atomic::AtomicBool::new(is_head),
+        cancellation: cancellation.clone(),
+        metrics,
+        defer_head_until_finish: is_head,
+    };
+    let failure_sender = sink.chunks.clone();
+    (
+        OutputSinkHandle::new(sink),
+        head_receiver,
+        chunk_receiver,
+        failure_sender,
+        cancellation,
+    )
+}
+
+#[derive(Clone)]
+struct DeferredRouterSink {
+    state: Arc<Mutex<DeferredRouterState>>,
+    suppress_body: bool,
+}
+
+struct DeferredRouterState {
+    head: Option<PhpResponseHead>,
+    storage: DeferredRouterStorage,
+    produced_bytes: u64,
+}
+
+enum DeferredRouterStorage {
+    Memory(Vec<u8>),
+    File(DeferredRouterFile),
+    Taken,
+}
+
+struct DeferredRouterFile {
+    file: Option<File>,
+    path: PathBuf,
+}
+
+impl Drop for DeferredRouterFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+enum DeferredRouterBody {
+    Memory(Vec<u8>),
+    File(File),
+}
+
+struct DeferredRouterOutput {
+    head: PhpResponseHead,
+    body: DeferredRouterBody,
+}
+
+impl DeferredRouterSink {
+    fn new(suppress_body: bool) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(DeferredRouterState {
+                head: None,
+                storage: DeferredRouterStorage::Memory(Vec::new()),
+                produced_bytes: 0,
+            })),
+            suppress_body,
+        }
+    }
+
+    fn take_output(&self) -> Result<DeferredRouterOutput, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "router output spool lock poisoned".to_owned())?;
+        let mut head = state
+            .head
+            .take()
+            .ok_or_else(|| "router response head was not committed".to_owned())?;
+        head.complete_length = Some(state.produced_bytes);
+        let storage = std::mem::replace(&mut state.storage, DeferredRouterStorage::Taken);
+        let body = match storage {
+            DeferredRouterStorage::Memory(bytes) => DeferredRouterBody::Memory(bytes),
+            DeferredRouterStorage::File(mut spool) => {
+                let mut file = spool
+                    .file
+                    .take()
+                    .ok_or_else(|| "router output spool file was already consumed".to_owned())?;
+                file.flush()
+                    .and_then(|_| file.seek(SeekFrom::Start(0)))
+                    .map_err(|error| format!("failed to rewind router output spool: {error}"))?;
+                // The open handle remains readable on the server's supported
+                // Unix platforms; unlinking now guarantees cleanup on normal
+                // completion, transport abort, or response drop.
+                std::fs::remove_file(&spool.path)
+                    .map_err(|error| format!("failed to unlink router output spool: {error}"))?;
+                DeferredRouterBody::File(file)
+            }
+            DeferredRouterStorage::Taken => {
+                return Err("router output spool was already consumed".to_owned());
+            }
+        };
+        Ok(DeferredRouterOutput { head, body })
+    }
+
+    fn create_spool_file() -> Result<DeferredRouterFile, std::io::Error> {
+        for _ in 0..32 {
+            let sequence = ROUTER_SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "phrust-router-{}-{sequence}.spool",
+                std::process::id()
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .read(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    return Ok(DeferredRouterFile {
+                        file: Some(file),
+                        path,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique router output spool",
+        ))
+    }
+}
+
+impl OutputSink for DeferredRouterSink {
+    fn commit(
+        &self,
+        response: &RuntimeHttpResponseState,
+        complete_length: Option<u64>,
+    ) -> Result<(), OutputDeliveryError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| OutputDeliveryError::new("router output spool lock poisoned"))?;
+        if state.head.is_none() {
+            state.head = Some(PhpResponseHead {
+                response: response.clone(),
+                complete_length,
+            });
+        }
+        Ok(())
+    }
+
+    fn write(&self, chunk: Vec<u8>) -> Result<(), OutputDeliveryError> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| OutputDeliveryError::new("router output spool lock poisoned"))?;
+        state.produced_bytes = state.produced_bytes.saturating_add(chunk.len() as u64);
+        if self.suppress_body {
+            return Ok(());
+        }
+        match &mut state.storage {
+            DeferredRouterStorage::Memory(bytes)
+                if bytes.len().saturating_add(chunk.len()) <= ROUTER_MEMORY_SPOOL_BYTES =>
+            {
+                bytes.extend_from_slice(&chunk);
+                Ok(())
+            }
+            DeferredRouterStorage::Memory(bytes) => {
+                let mut spool = Self::create_spool_file().map_err(|error| {
+                    OutputDeliveryError::new(format!(
+                        "failed to create router output spool: {error}"
+                    ))
+                })?;
+                let file = spool.file.as_mut().expect("new router spool owns a file");
+                file.write_all(bytes)
+                    .and_then(|_| file.write_all(&chunk))
+                    .map_err(|error| {
+                        OutputDeliveryError::new(format!(
+                            "failed to write router output spool: {error}"
+                        ))
+                    })?;
+                state.storage = DeferredRouterStorage::File(spool);
+                Ok(())
+            }
+            DeferredRouterStorage::File(spool) => spool
+                .file
+                .as_mut()
+                .ok_or_else(|| OutputDeliveryError::new("router output spool file missing"))?
+                .write_all(&chunk)
+                .map_err(|error| {
+                    OutputDeliveryError::new(format!(
+                        "failed to write router output spool: {error}"
+                    ))
+                }),
+            DeferredRouterStorage::Taken => Err(OutputDeliveryError::new(
+                "router output spool was already consumed",
+            )),
+        }
+    }
+}
+
+fn deferred_router_response(output: DeferredRouterOutput) -> Response<ResponseBody> {
+    let status = StatusCode::from_u16(output.head.response.status_code).unwrap_or(StatusCode::OK);
+    let suppress_body = status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED;
+    let body = if suppress_body {
+        response::full_body(Bytes::new())
+    } else {
+        match output.body {
+            DeferredRouterBody::Memory(bytes) => response::full_body(Bytes::from(bytes)),
+            DeferredRouterBody::File(file) => response::reader_body_with_length(
+                tokio::fs::File::from_std(file),
+                output.head.complete_length.unwrap_or_default(),
+            ),
+        }
+    };
+    let mut response = Response::builder()
+        .status(status)
+        .body(body)
+        .expect("deferred router response builder is valid");
+    apply_php_headers(response.headers_mut(), &output.head.response);
+    if let Some(content_length) = output.head.complete_length {
+        response.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&content_length.to_string())
+                .expect("content length header is valid"),
+        );
+    }
+    response
+}
+
+struct PhpExecutionCompletionGuard {
+    coordinator: PhpExecutionCoordinator,
+    failure_sender: Option<mpsc::Sender<Result<Vec<u8>, std::io::Error>>>,
+    metrics: Arc<super::metrics::ServerMetrics>,
+    fallback_trace: Option<PerfTraceEvent>,
+    completed: bool,
+}
+
+enum PhpWorkerRequestResult {
+    Response(Response<ResponseBody>, Option<bool>, PhpTransferCompletion),
+    Streamed(Option<bool>, PhpTransferCompletion),
+}
+
+enum PhpWorkerReply {
+    Response(Response<ResponseBody>, Option<bool>),
+    Streamed(Option<bool>),
+}
+
+fn worker_response_result(
+    mut result: (Response<ResponseBody>, Option<bool>),
+) -> PhpWorkerRequestResult {
+    let completion = result
+        .0
+        .extensions_mut()
+        .remove::<PhpTransferCompletion>()
+        .unwrap_or(PhpTransferCompletion {
+            trace: None,
+            failure_stage: Some(RequestStage::Execution),
+        });
+    PhpWorkerRequestResult::Response(result.0, result.1, completion)
+}
+
+impl PhpExecutionCompletionGuard {
+    fn new(
+        coordinator: PhpExecutionCoordinator,
+        failure_sender: Option<mpsc::Sender<Result<Vec<u8>, std::io::Error>>>,
+        metrics: Arc<super::metrics::ServerMetrics>,
+        fallback_trace: Option<PerfTraceEvent>,
+    ) -> Self {
+        Self {
+            coordinator,
+            failure_sender,
+            metrics,
+            fallback_trace,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self, completion: PhpTransferCompletion) {
+        self.completed = true;
+        self.failure_sender.take();
+        self.fallback_trace.take();
+        self.coordinator.complete(completion);
+    }
+}
+
+impl Drop for PhpExecutionCompletionGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.metrics
+                .worker_pool_failures
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(sender) = self.failure_sender.take() {
+                let _ = sender.blocking_send(Err(std::io::Error::other(
+                    "PHP worker terminated unexpectedly",
+                )));
+            }
+            self.coordinator.complete(PhpTransferCompletion {
+                trace: self.fallback_trace.take(),
+                failure_stage: Some(RequestStage::Execution),
+            });
+        }
+    }
 }
 
 thread_local! {
@@ -325,8 +752,7 @@ pub(crate) async fn execute_php_request(
                     ])
                 },
             );
-            let response =
-                php_output_response(*output, parts.method == Method::HEAD, parts.version);
+            let response = php_compile_error_response(*output, parts.method == Method::HEAD);
             return finish_php_request(
                 &state,
                 trace,
@@ -400,11 +826,26 @@ pub(crate) async fn execute_php_request(
             Some(RequestStage::ExecutorAcquisition),
         );
     };
+    let is_head = parts.method == Method::HEAD;
+    let (output_sink, mut head_receiver, body_receiver, failure_sender, cancellation) =
+        php_response_bridge(is_head, Arc::clone(&state.services.metrics));
+    let coordinator = PhpExecutionCoordinator::new();
+    let worker_coordinator = coordinator.clone();
+    let worker_cancellation = cancellation.clone();
+    let worker_state = Arc::clone(&state);
     let workers = Arc::clone(&state.concurrency.php_workers);
-    workers
-        .execute(move || {
-            run_php_request_on_worker(
-                state,
+    let submission_trace = trace.clone();
+    let panic_trace = trace.clone();
+    let mut worker_reply = match workers
+        .submit(move || {
+            let mut completion_guard = PhpExecutionCompletionGuard::new(
+                worker_coordinator.clone(),
+                failure_sender,
+                Arc::clone(&worker_state.services.metrics),
+                panic_trace,
+            );
+            let result = run_php_request_on_worker(
+                worker_state,
                 parts,
                 body,
                 script_path,
@@ -415,9 +856,141 @@ pub(crate) async fn execute_php_request(
                 lookup,
                 script_cache_hit,
                 cpu_permit,
-            )
+                output_sink,
+                worker_cancellation,
+            );
+            match result {
+                PhpWorkerRequestResult::Response(mut response, cache_hit, completion) => {
+                    completion_guard.complete(completion);
+                    response.extensions_mut().insert(worker_coordinator);
+                    PhpWorkerReply::Response(response, cache_hit)
+                }
+                PhpWorkerRequestResult::Streamed(cache_hit, completion) => {
+                    completion_guard.complete(completion);
+                    PhpWorkerReply::Streamed(cache_hit)
+                }
+            }
         })
         .await
+    {
+        Ok(reply) => reply,
+        Err(error) => {
+            state
+                .services
+                .metrics
+                .worker_pool_failures
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(%error, "PHP worker submission failed");
+            coordinator.complete(PhpTransferCompletion {
+                trace: submission_trace,
+                failure_stage: Some(RequestStage::Execution),
+            });
+            let mut response =
+                response::text(StatusCode::SERVICE_UNAVAILABLE, "PHP worker unavailable\n");
+            response.extensions_mut().insert(coordinator);
+            return (response, script_cache_hit);
+        }
+    };
+
+    tokio::select! {
+        head = &mut head_receiver => {
+            match head {
+                Ok(head) => {
+                    let response_started = Instant::now();
+                    let mut response = php_streaming_response(
+                        head,
+                        is_head,
+                        body_receiver,
+                        cancellation,
+                    );
+                    state.services.metrics.record_phase(
+                        RequestPhase::ResponseBuild,
+                        response_started.elapsed().as_nanos(),
+                    );
+                    response.extensions_mut().insert(coordinator);
+                    (response, script_cache_hit)
+                }
+                Err(_) => worker_result_response(
+                    worker_reply.await,
+                    coordinator,
+                    script_cache_hit,
+                    &state,
+                ),
+            }
+        }
+        result = &mut worker_reply => {
+            match head_receiver.try_recv() {
+                Ok(head) => {
+                    let response_started = Instant::now();
+                    let mut response = php_streaming_response(
+                        head,
+                        is_head,
+                        body_receiver,
+                        cancellation,
+                    );
+                    state.services.metrics.record_phase(
+                        RequestPhase::ResponseBuild,
+                        response_started.elapsed().as_nanos(),
+                    );
+                    response.extensions_mut().insert(coordinator);
+                    (response, script_cache_hit)
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    worker_result_response(result, coordinator, script_cache_hit, &state)
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    worker_result_response(result, coordinator, script_cache_hit, &state)
+                }
+            }
+        }
+    }
+}
+
+fn worker_result_response(
+    result: Result<
+        Result<PhpWorkerReply, crate::worker_pool::WorkerPoolError>,
+        tokio::sync::oneshot::error::RecvError,
+    >,
+    coordinator: PhpExecutionCoordinator,
+    cache_hit: Option<bool>,
+    state: &AppState,
+) -> (Response<ResponseBody>, Option<bool>) {
+    match result {
+        Ok(Ok(PhpWorkerReply::Response(response, cache_hit))) => (response, cache_hit),
+        Ok(Ok(PhpWorkerReply::Streamed(cache_hit))) => {
+            warn!("PHP worker completed streaming without committing a response head");
+            let mut response = response::text(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "PHP response head unavailable\n",
+            );
+            response.extensions_mut().insert(coordinator);
+            (response, cache_hit)
+        }
+        Ok(Err(error)) => {
+            state
+                .services
+                .metrics
+                .worker_pool_failures
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(%error, "PHP worker execution failed");
+            let mut response =
+                response::text(StatusCode::SERVICE_UNAVAILABLE, "PHP worker unavailable\n");
+            response.extensions_mut().insert(coordinator);
+            (response, cache_hit)
+        }
+        Err(error) => {
+            state
+                .services
+                .metrics
+                .worker_pool_failures
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(%error, "PHP worker reply dropped");
+            let mut response =
+                response::text(StatusCode::SERVICE_UNAVAILABLE, "PHP worker unavailable\n");
+            response.extensions_mut().insert(coordinator);
+            (response, cache_hit)
+        }
+    }
 }
 
 /// Synchronous request core: builds the PHP runtime context, parses
@@ -439,7 +1012,9 @@ fn run_php_request_on_worker(
     lookup: CompiledScriptCacheLookup,
     script_cache_hit: Option<bool>,
     cpu_permit: OwnedSemaphorePermit,
-) -> (Response<ResponseBody>, Option<bool>) {
+    output_sink: OutputSinkHandle,
+    cancellation: RuntimeCancellationState,
+) -> PhpWorkerRequestResult {
     let collect_request_trace =
         state.observability.perf_trace.is_some() || state.observability.request_profile.is_some();
     let script_name = script_name_for(&state.route_config.docroot, &script_path);
@@ -486,13 +1061,13 @@ fn run_php_request_on_worker(
         Err(error) => {
             let response =
                 multipart_error_response(error, &state, &parts, &request_id, &script_path, peer);
-            return finish_php_request(
+            return worker_response_result(finish_php_request(
                 &state,
                 trace,
                 response,
                 script_cache_hit,
                 Some(RequestStage::BodyAndMultipart),
-            );
+            ));
         }
     }
     record_phase(
@@ -546,13 +1121,13 @@ fn run_php_request_on_worker(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "session storage failed\n",
             );
-            return finish_php_request(
+            return worker_response_result(finish_php_request(
                 &state,
                 trace,
                 response,
                 script_cache_hit,
                 Some(RequestStage::SessionLoad),
-            );
+            ));
         }
     };
     record_phase(
@@ -575,13 +1150,15 @@ fn run_php_request_on_worker(
             )])
         },
     );
-    let runtime_context = php_runtime_context_for_http(
+    let mut runtime_context = php_runtime_context_for_http(
         &state,
         request_context,
         session_state,
         Arc::clone(&body),
         server_env_for_request(&state),
     );
+    runtime_context = runtime_context.with_output_sink(output_sink);
+    runtime_context = runtime_context.with_cancellation(cancellation);
     if state.request.execution_time_limit.is_none() {
         state
             .services
@@ -757,16 +1334,12 @@ fn run_php_request_on_worker(
                     || BTreeMap::from([("error".to_string(), error.clone())]),
                 );
                 warn!(%peer, error=%error, "session state finalization failed");
-                let response = response::text(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "session storage failed\n",
-                );
-                return finish_php_request(
-                    &state,
-                    trace,
-                    response,
+                return PhpWorkerRequestResult::Streamed(
                     script_cache_hit,
-                    Some(RequestStage::SessionAndUploadCleanup),
+                    PhpTransferCompletion {
+                        trace,
+                        failure_stage: Some(RequestStage::SessionAndUploadCleanup),
+                    },
                 );
             }
             record_phase(
@@ -791,26 +1364,23 @@ fn run_php_request_on_worker(
                     .metrics
                     .execution_timeouts
                     .fetch_add(1, Ordering::Relaxed);
-                let response = php_timeout_response(is_head, &output.http_response);
-                return finish_php_request(
-                    &state,
-                    trace,
-                    response,
+                return PhpWorkerRequestResult::Streamed(
                     script_cache_hit,
-                    Some(RequestStage::Execution),
+                    PhpTransferCompletion {
+                        trace,
+                        failure_stage: Some(RequestStage::Execution),
+                    },
                 );
             }
             log_php_execution_failure(&script_log_path, &output);
-            let response_started = Instant::now();
-            let response = response_construction_stage(output, is_head, parts.version);
-            record_phase(
-                &state,
-                &mut trace,
-                RequestPhase::ResponseBuild,
-                "response_build",
-                response_started.elapsed(),
-            );
-            finish_php_request(&state, trace, response, script_cache_hit, None)
+            PhpWorkerRequestResult::Streamed(
+                script_cache_hit,
+                PhpTransferCompletion {
+                    trace,
+                    failure_stage: (output.status != PhpExecutionStatus::Success)
+                        .then_some(RequestStage::Execution),
+                },
+            )
         }
         Err(PhpExecutionError::Compile(output)) => {
             log_php_execution_failure(&script_log_path, &output);
@@ -834,14 +1404,14 @@ fn run_php_request_on_worker(
                     ])
                 },
             );
-            let response = response_construction_stage(*output, is_head, parts.version);
-            finish_php_request(
+            let response = php_compile_error_response(*output, is_head);
+            worker_response_result(finish_php_request(
                 &state,
                 trace,
                 response,
                 script_cache_hit,
                 Some(RequestStage::Execution),
-            )
+            ))
         }
         Err(PhpExecutionError::Engine(error)) => {
             emit_server_debug_lazy(
@@ -864,13 +1434,13 @@ fn run_php_request_on_worker(
             warn!(script=%script_log_path.display(), %error, "php execution engine error");
             let response =
                 response::text(StatusCode::INTERNAL_SERVER_ERROR, "php execution failed\n");
-            finish_php_request(
+            worker_response_result(finish_php_request(
                 &state,
                 trace,
                 response,
                 script_cache_hit,
                 Some(RequestStage::Execution),
-            )
+            ))
         }
     }
 }
@@ -916,27 +1486,11 @@ pub(crate) async fn execute_builtin_router_if_configured(
         Arc::clone(&body),
         peer,
     );
-    let session_state = match session_load_stage(&request_context, &state) {
-        Ok(session) => session,
-        Err(error) => {
-            warn!(%peer, error=%error, "router session state preparation failed");
-            return Some(response::text(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "session storage failed\n",
-            ));
-        }
-    };
-    let runtime_context = php_runtime_context_for_http(
-        &state,
-        request_context,
-        session_state,
-        body,
-        server_env_for_request(&state),
-    );
+    let router_env = server_env_for_request(&state);
     let lookup = match executor_acquisition_stage(&state, &router_path) {
         Ok(lookup) => lookup,
         Err(PhpExecutionError::Compile(output)) => {
-            return Some(php_output_response(*output, false, parts.version));
+            return Some(php_compile_error_response(*output, false));
         }
         Err(PhpExecutionError::Engine(error)) => {
             warn!(script=%router_path.display(), %error, "router compile engine error");
@@ -946,23 +1500,69 @@ pub(crate) async fn execute_builtin_router_if_configured(
             ));
         }
     };
-    let output = match execution_stage(
-        Arc::clone(&state),
-        lookup,
-        router_path.clone(),
-        runtime_context,
-        true,
-    ) {
-        Ok(output) => output,
-        Err(error) => {
+    let execution_state = Arc::clone(&state);
+    let runtime_state = Arc::clone(&state);
+    let execution_path = router_path.clone();
+    let is_head = parts.method == Method::HEAD;
+    let workers = Arc::clone(&state.concurrency.php_workers);
+    let router_response = match workers
+        .execute(move || {
+            let deferred_sink = DeferredRouterSink::new(is_head);
+            let result = session_load_stage(&request_context, &runtime_state)
+                .map_err(|error| format!("router session state preparation failed: {error}"))
+                .and_then(|session_state| {
+                    let runtime_context = php_runtime_context_for_http(
+                        &runtime_state,
+                        request_context,
+                        session_state,
+                        body,
+                        router_env,
+                    )
+                    .with_output_sink(OutputSinkHandle::new(deferred_sink.clone()))
+                    .with_cancellation(RuntimeCancellationState::new());
+                    execution_stage(
+                        execution_state,
+                        lookup,
+                        execution_path,
+                        runtime_context,
+                        true,
+                    )
+                    .map_err(|error| format!("{error:?}"))
+                });
+            let result = match result {
+                Ok(output) if matches!(output.return_value, Some(Value::Bool(false))) => Ok(None),
+                Ok(_) => deferred_sink
+                    .take_output()
+                    .map(deferred_router_response)
+                    .map(Some),
+                Err(error) => Err(error),
+            };
+            drop(cpu_permit);
+            result
+        })
+        .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
             warn!(script=%router_path.display(), error=?error, "router execution engine error");
             return Some(response::text(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "router execution failed\n",
             ));
         }
+        Err(error) => {
+            state
+                .services
+                .metrics
+                .worker_pool_failures
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(script=%router_path.display(), %error, "router PHP worker unavailable");
+            return Some(response::text(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PHP worker unavailable\n",
+            ));
+        }
     };
-    drop(cpu_permit);
     emit_server_debug_lazy(
         &state,
         Some(request_id),
@@ -972,19 +1572,11 @@ pub(crate) async fn execute_builtin_router_if_configured(
         || {
             BTreeMap::from([(
                 "fallthrough".to_string(),
-                matches!(output.return_value, Some(Value::Bool(false))).to_string(),
+                router_response.is_none().to_string(),
             )])
         },
     );
-    if matches!(output.return_value, Some(Value::Bool(false))) {
-        None
-    } else {
-        Some(php_output_response(
-            output,
-            parts.method == Method::HEAD,
-            parts.version,
-        ))
-    }
+    router_response
 }
 
 struct CpuQueueCancellationGuard<'a> {
@@ -1086,10 +1678,7 @@ async fn acquire_cpu_execution_permit(state: &AppState) -> Option<OwnedSemaphore
     }
 }
 
-/// Executes a compiled script on the current thread. Callers are pinned
-/// PHP worker threads (or the pool's degraded inline path, which already
-/// wraps the whole request core in `block_in_place`), so no additional
-/// scheduling boundary is needed here.
+/// Executes a compiled script on its pinned PHP worker thread.
 fn executor_acquisition_stage(
     state: &AppState,
     script_path: &Path,
@@ -1422,45 +2011,59 @@ pub(crate) fn multipart_error_response(
     }
 }
 
-fn response_construction_stage(
-    output: PhpExecutionOutput,
+fn php_streaming_response(
+    head: PhpResponseHead,
     is_head: bool,
-    version: Version,
+    body_receiver: mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+    cancellation: RuntimeCancellationState,
 ) -> Response<ResponseBody> {
-    php_output_response(output, is_head, version)
+    let status = StatusCode::from_u16(head.response.status_code).unwrap_or(StatusCode::OK);
+    let suppress_body =
+        is_head || status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED;
+    let mut body = if suppress_body {
+        response::full_body(Bytes::new())
+    } else {
+        response::channel_body(body_receiver)
+    };
+    body.attach_cancellation(cancellation);
+    if let Some(complete_length) = head.complete_length {
+        body.set_expected_bytes(complete_length);
+    }
+    let mut response = Response::builder()
+        .status(status)
+        .body(body)
+        .expect("PHP streaming response builder is valid");
+    apply_php_headers(response.headers_mut(), &head.response);
+    if let Some(content_length) = head.complete_length {
+        response.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&content_length.to_string())
+                .expect("content length header is valid"),
+        );
+    }
+    response
 }
 
-pub(crate) fn php_output_response(
-    output: PhpExecutionOutput,
-    is_head: bool,
-    request_version: Version,
-) -> Response<ResponseBody> {
-    let status = match output.status {
-        PhpExecutionStatus::Success => {
-            StatusCode::from_u16(output.http_response.status_code).unwrap_or(StatusCode::OK)
-        }
-        PhpExecutionStatus::CompileError
-        | PhpExecutionStatus::RuntimeError
-        | PhpExecutionStatus::Unsupported
-        | PhpExecutionStatus::Fatal => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    let stdout_len = output.stdout.len();
-    let execution_failed = output.status != PhpExecutionStatus::Success;
-    let body = if output.stdout.is_empty() && execution_failed {
+fn php_compile_error_response(output: PhpExecutionOutput, is_head: bool) -> Response<ResponseBody> {
+    debug_assert_ne!(output.status, PhpExecutionStatus::Success);
+    let captured_output = output.stdout;
+    let captured = if captured_output.is_empty() {
         Bytes::from_static(b"php execution failed\n")
-    } else if is_head {
-        Bytes::new()
     } else {
-        Bytes::from(output.stdout)
+        Bytes::from(captured_output)
     };
-    let content_length = if is_head {
-        Some(stdout_len)
-    } else if execution_failed || request_version != Version::HTTP_2 {
-        Some(body.len())
-    } else {
-        None
-    };
-    php_transport_response(status, body, content_length, &output.http_response)
+    let content_length = captured.len();
+    let body = if is_head { Bytes::new() } else { captured };
+    let mut response = Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .body(response::full_body(body))
+        .expect("PHP compile-error response builder is valid");
+    apply_php_headers(response.headers_mut(), &output.http_response);
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&content_length.to_string()).expect("content length header is valid"),
+    );
+    response
 }
 
 pub(crate) fn php_execution_timed_out(output: &PhpExecutionOutput) -> bool {
@@ -1470,45 +2073,7 @@ pub(crate) fn php_execution_timed_out(output: &PhpExecutionOutput) -> bool {
         .any(|diagnostic| diagnostic.id() == "E_PHP_VM_EXECUTION_TIMEOUT")
 }
 
-pub(crate) fn php_timeout_response(
-    is_head: bool,
-    http_response: &RuntimeHttpResponseState,
-) -> Response<ResponseBody> {
-    let body = if is_head {
-        Bytes::new()
-    } else {
-        Bytes::from_static(b"php execution timeout\n")
-    };
-    let content_length = if is_head {
-        "php execution timeout\n".len()
-    } else {
-        body.len()
-    };
-    php_transport_response(
-        StatusCode::GATEWAY_TIMEOUT,
-        body,
-        Some(content_length),
-        http_response,
-    )
-}
-
-pub(crate) fn php_transport_response(
-    status: StatusCode,
-    body: Bytes,
-    content_length: Option<usize>,
-    http_response: &RuntimeHttpResponseState,
-) -> Response<ResponseBody> {
-    let response_bytes = body.len() as u64;
-    let response_body = if content_length.is_some() {
-        response::full_body(body)
-    } else {
-        response::stream_body_from_bytes(body)
-    };
-    let mut response = Response::builder()
-        .status(status)
-        .body(response_body)
-        .expect("php response builder is valid");
-    let headers = response.headers_mut();
+fn apply_php_headers(headers: &mut HeaderMap, http_response: &RuntimeHttpResponseState) {
     for header in &http_response.headers {
         if header.name.eq_ignore_ascii_case("Content-Length") {
             continue;
@@ -1527,17 +2092,6 @@ pub(crate) fn php_transport_response(
             HeaderValue::from_static(PHP_CONTENT_TYPE),
         );
     }
-    if let Some(content_length) = content_length {
-        headers.insert(
-            header::CONTENT_LENGTH,
-            HeaderValue::from_str(&content_length.to_string())
-                .expect("content length header is valid"),
-        );
-    }
-    response
-        .extensions_mut()
-        .insert(PhpResponseBytes(response_bytes));
-    response
 }
 
 pub(crate) const PHP_CONTENT_TYPE: &str = "text/html; charset=UTF-8";
@@ -1795,6 +2349,10 @@ pub(crate) fn php_runtime_context_for_http(
     RuntimeContext::controlled_http(request_context)
         .with_cwd(state.route_config.docroot.clone())
         .with_include_path(vec![state.route_config.docroot.clone()])
+        .with_ini_overrides(vec![(
+            "session.cookie_path".to_owned(),
+            state.sessions.config.cookie_path.clone(),
+        )])
         .with_session_state(session_state)
         .with_session_loader(session_load_callback(state))
         .with_session_id_generator(session_id_generate_callback(state))
@@ -1842,7 +2400,7 @@ fn record_phase(
 }
 
 fn finish_php_request(
-    state: &AppState,
+    _state: &AppState,
     trace: Option<PerfTraceEvent>,
     response: Response<ResponseBody>,
     cache_hit: Option<bool>,
@@ -1852,7 +2410,7 @@ fn finish_php_request(
         Some(stage) => RequestOutcome::failure(response, cache_hit, stage),
         None => RequestOutcome::success(response, cache_hit),
     }
-    .finalize(state, trace)
+    .into_response(trace)
 }
 
 pub(crate) fn header_value(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
@@ -1953,10 +2511,6 @@ pub(crate) fn server_name_from_host(host: &str) -> String {
         .map_or_else(|| host.to_string(), |(name, _)| name.to_string())
 }
 
-pub(crate) fn request_time() -> i64 {
-    request_time_pair().0
-}
-
 pub(crate) fn request_time_pair() -> (i64, i64) {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1973,6 +2527,7 @@ pub(crate) fn request_time_pair() -> (i64, i64) {
 #[cfg(test)]
 mod worker_payload_tests {
     use super::*;
+    use std::io::Read;
 
     fn assert_send<T: Send>() {}
 
@@ -1992,5 +2547,124 @@ mod worker_payload_tests {
         assert_send::<Option<crate::perf_trace::PerfTraceEvent>>();
         assert_send::<OwnedSemaphorePermit>();
         assert_send::<Response<ResponseBody>>();
+    }
+
+    #[test]
+    fn deferred_router_sink_keeps_small_output_in_memory() {
+        let sink = DeferredRouterSink::new(false);
+        sink.commit(&RuntimeHttpResponseState::default(), Some(5))
+            .expect("commit router head");
+        sink.write(b"hello".to_vec()).expect("write router output");
+
+        let output = sink.take_output().expect("take router output");
+        assert_eq!(output.head.complete_length, Some(5));
+        match output.body {
+            DeferredRouterBody::Memory(bytes) => assert_eq!(bytes, b"hello"),
+            DeferredRouterBody::File(_) => panic!("small output unexpectedly spooled to file"),
+        }
+    }
+
+    #[test]
+    fn deferred_router_sink_spills_and_unlinks_large_output() {
+        let sink = DeferredRouterSink::new(false);
+        sink.commit(&RuntimeHttpResponseState::default(), None)
+            .expect("commit router head");
+        let bytes = vec![b'x'; ROUTER_MEMORY_SPOOL_BYTES + 1];
+        sink.write(bytes.clone()).expect("write router output");
+        let spool_path = {
+            let state = sink.state.lock().expect("router state lock");
+            match &state.storage {
+                DeferredRouterStorage::File(spool) => spool.path.clone(),
+                _ => panic!("large output did not spill to a file"),
+            }
+        };
+        assert!(spool_path.exists());
+
+        let output = sink.take_output().expect("take router output");
+        assert!(!spool_path.exists());
+        assert_eq!(output.head.complete_length, Some(bytes.len() as u64));
+        let mut actual = Vec::new();
+        match output.body {
+            DeferredRouterBody::File(mut file) => {
+                file.read_to_end(&mut actual).expect("read router spool");
+            }
+            DeferredRouterBody::Memory(_) => panic!("large output remained in memory"),
+        }
+        assert_eq!(actual, bytes);
+    }
+
+    #[test]
+    fn dropping_deferred_router_sink_removes_unpublished_spool() {
+        let spool_path = {
+            let sink = DeferredRouterSink::new(false);
+            sink.write(vec![b'x'; ROUTER_MEMORY_SPOOL_BYTES + 1])
+                .expect("write router output");
+            let state = sink.state.lock().expect("router state lock");
+            match &state.storage {
+                DeferredRouterStorage::File(spool) => spool.path.clone(),
+                _ => panic!("large output did not spill to a file"),
+            }
+        };
+        assert!(!spool_path.exists());
+    }
+
+    #[tokio::test]
+    async fn php_chunk_bridge_blocks_only_producer_at_fixed_capacity() {
+        let (head_sender, _head_receiver) = oneshot::channel();
+        let (chunk_sender, mut chunk_receiver) = mpsc::channel(PHP_OUTPUT_QUEUE_CAPACITY);
+        let sink = Arc::new(PhpResponseSink {
+            head: Mutex::new(Some(head_sender)),
+            chunks: Some(chunk_sender),
+            suppress_body: std::sync::atomic::AtomicBool::new(false),
+            cancellation: RuntimeCancellationState::new(),
+            metrics: Arc::new(super::super::metrics::ServerMetrics::default()),
+            defer_head_until_finish: false,
+        });
+        let writer_sink = Arc::clone(&sink);
+        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            for index in 0..=PHP_OUTPUT_QUEUE_CAPACITY {
+                writer_sink
+                    .write(vec![index as u8])
+                    .expect("write PHP bridge chunk");
+            }
+            finished_sender.send(()).expect("signal producer finish");
+        });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(finished_receiver.try_recv().is_err());
+        assert_eq!(
+            chunk_receiver
+                .recv()
+                .await
+                .expect("queued PHP chunk")
+                .expect("successful PHP chunk"),
+            vec![0]
+        );
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("producer resumes after one queue slot opens");
+        writer.join().expect("join PHP bridge producer");
+    }
+
+    #[test]
+    fn php_chunk_bridge_receiver_drop_respects_ignore_user_abort() {
+        let (head_sender, _head_receiver) = oneshot::channel();
+        let (chunk_sender, chunk_receiver) = mpsc::channel(1);
+        drop(chunk_receiver);
+        let cancellation = RuntimeCancellationState::new();
+        let sink = PhpResponseSink {
+            head: Mutex::new(Some(head_sender)),
+            chunks: Some(chunk_sender),
+            suppress_body: std::sync::atomic::AtomicBool::new(false),
+            cancellation: cancellation.clone(),
+            metrics: Arc::new(super::super::metrics::ServerMetrics::default()),
+            defer_head_until_finish: false,
+        };
+
+        assert!(sink.write(vec![1]).is_err());
+        assert!(cancellation.is_cancelled());
+        cancellation.set_ignore_user_abort(true);
+        assert!(sink.write(vec![2]).is_ok());
     }
 }

@@ -17,7 +17,8 @@ Implemented surface:
   entry-script caches, bounded/preloaded script-cache controls, loopback-only
   cache clearing, streaming static files, validators, byte ranges,
   precompressed sidecars, config-file support, access logs, metrics token
-  protection, and Rustls HTTP/1.1 TLS termination.
+  protection, Rustls HTTP/1.1 and HTTP/2 termination, optional HTTP/3 over
+  QUIC, and bounded streaming PHP output with cooperative disconnect handling.
 
 Remaining known gaps:
 
@@ -31,13 +32,13 @@ Remaining known gaps:
   builtins are not interrupted mid-call; timeout is observed when control
   returns to VM dispatch.
 - Output buffering covers common `ob_*` capture/clean/flush operations and
-  basic `flush()` behavior, but callback output handlers and true HTTP chunk
-  streaming are not complete.
+  bounded HTTP streaming; callback output handlers remain incomplete.
 - Header support covers common `header()`, `headers_list()`, `headers_sent()`,
   and `http_response_code()` behavior, but full PHP header edge cases are not
   complete.
-- TLS termination supports Rustls HTTP/1.1 and advertises `http/1.1` through
-  ALPN. HTTP/2 and HTTP/3 are not implemented.
+- TLS termination supports Rustls HTTP/1.1 and HTTP/2; HTTP/3 uses the same
+  transfer core over QUIC. Broader flow-control and graceful-drain tuning
+  remains future work.
 - Static file serving streams from Tokio file I/O and supports validators,
   byte ranges, and precompressed sidecars. Sendfile is not implemented.
 - The compiled script cache is process-local only.

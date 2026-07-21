@@ -29,15 +29,16 @@ impl AccessLogger {
             .cache_hit
             .map_or("-", |hit| if hit { "hit" } else { "miss" });
         let line = format!(
-            "ts={} method={} path=\"{}\" status={} bytes={} duration_ms={} route={} cache={}\n",
+            "ts={} method={} path=\"{}\" status={} emitted_bytes={} duration_ms={} route={} cache={} outcome={}\n",
             entry.timestamp,
             entry.method,
             escape_log_value(entry.path),
             entry.status.as_u16(),
-            entry.bytes,
+            entry.emitted_bytes,
             entry.duration.as_millis(),
             entry.route,
-            cache_hit
+            cache_hit,
+            entry.outcome,
         );
         match &self.target {
             AccessLogTarget::Stdout => {
@@ -66,10 +67,11 @@ pub(crate) struct AccessLogEntry<'a> {
     pub(crate) method: &'a str,
     pub(crate) path: &'a str,
     pub(crate) status: StatusCode,
-    pub(crate) bytes: u64,
+    pub(crate) emitted_bytes: u64,
     pub(crate) duration: Duration,
     pub(crate) route: &'static str,
     pub(crate) cache_hit: Option<bool>,
+    pub(crate) outcome: &'static str,
 }
 
 #[cfg(test)]

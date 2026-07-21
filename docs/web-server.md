@@ -40,6 +40,14 @@ execution state is request-local and permits are released on cancellation.
 The metrics endpoint exposes admitted, queued, current, saturated, rejected,
 cancelled, and queue-timeout totals plus the cumulative `cpu_queue` phase.
 
+Response delivery uses one bounded transfer path for HTTP/1.1, HTTP/2, and
+optional HTTP/3. Static files are read incrementally, and regular PHP root
+output crosses a four-chunk bounded queue in 32 KiB chunks. `flush()` commits
+the PHP response head and makes pending root output visible before script
+completion. The `max_in_flight` permit remains owned until both PHP cleanup and
+response-body completion or abort; access logs and transfer counters therefore
+report emitted body frames, not planned `Content-Length` bytes.
+
 Pinned PHP workers reserve a 16 MiB OS-thread stack by default. Set
 `PHRUST_SERVER_PHP_WORKER_STACK_BYTES` to a positive byte count when a measured
 deployment needs a different bound. The older

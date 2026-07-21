@@ -21,6 +21,22 @@ pub const FUNCTIONS: &[GeneratedBuiltinDescriptor] = &[
         variadic: false,
     },
     GeneratedBuiltinDescriptor {
+        name: "connection_aborted",
+        extension: "standard",
+        return_type: Some("int"),
+        required_parameters: 0,
+        total_parameters: 0,
+        variadic: false,
+    },
+    GeneratedBuiltinDescriptor {
+        name: "connection_status",
+        extension: "standard",
+        return_type: Some("int"),
+        required_parameters: 0,
+        total_parameters: 0,
+        variadic: false,
+    },
+    GeneratedBuiltinDescriptor {
         name: "debug_zval_dump",
         extension: "standard",
         return_type: Some("void"),

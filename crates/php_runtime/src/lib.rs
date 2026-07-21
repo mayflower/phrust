@@ -147,11 +147,12 @@ pub mod api {
         ClosureDebugParameter, ClosurePayload,
     };
     pub use crate::context::{
-        ErrorReporting, ProcessCapability, RuntimeContext, RuntimeHttpHeader,
-        RuntimeHttpRequestContext, RuntimeHttpResponseState, RuntimeIniOptions, RuntimeInputFilter,
-        RuntimeRequestMode, RuntimeUploadedFile, SessionIdGenerateCallback, SessionLoadCallback,
-        StrictTypesInfo, UploadRegistry, UploadRegistryEntry, parse_cookie_header,
-        parse_form_urlencoded_body, parse_query_string, parse_query_string_with_separators,
+        ErrorReporting, ProcessCapability, RuntimeCancellationState, RuntimeContext,
+        RuntimeHttpHeader, RuntimeHttpRequestContext, RuntimeHttpResponseState, RuntimeIniOptions,
+        RuntimeInputFilter, RuntimeRequestMode, RuntimeUploadedFile, SessionIdGenerateCallback,
+        SessionLoadCallback, StrictTypesInfo, UploadRegistry, UploadRegistryEntry,
+        parse_cookie_header, parse_form_urlencoded_body, parse_query_string,
+        parse_query_string_with_separators,
     };
     pub use crate::convert::{
         ArithmeticNumber, NumericValue, compare, compare_php, equal, equal_php, float_fits_int,
@@ -214,7 +215,10 @@ pub mod api {
         ClassPropertyFlags, ClassPropertyHooks, ObjectRef, RuntimeType, display_class_name,
         normalize_class_name,
     };
-    pub use crate::output::{OutputBuffer, OutputStats};
+    pub use crate::output::{
+        OUTPUT_CHUNK_BYTES, OutputBuffer, OutputDeliveryError, OutputSink, OutputSinkHandle,
+        OutputStats,
+    };
     #[cfg(feature = "full-runtime")]
     pub use crate::pcre::{
         PREG_BACKTRACK_LIMIT_ERROR, PREG_BAD_UTF8_ERROR, PREG_BAD_UTF8_OFFSET_ERROR,

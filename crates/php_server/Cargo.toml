@@ -17,7 +17,7 @@ h3 = "0.0.8"
 h3-quinn = "0.0.10"
 http-body-util = "0.1"
 httpdate = "1"
-hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "http2", "server", "tokio"] }
 mimalloc = "0.1.52"
 php_executor = { path = "../php_executor", version = "0.0.0", default-features = false }

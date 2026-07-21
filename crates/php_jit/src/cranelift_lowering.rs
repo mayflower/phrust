@@ -217,6 +217,7 @@ struct NativeOperationFunctions {
 /// deliberately has no variant carrying helper addresses, so an optimizing
 /// artifact cannot acquire a generic warm-runtime import by accident.
 #[derive(Clone, Copy, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum NativeTierOperations {
     Baseline {
         call: Option<NativeHelper>,
@@ -2530,6 +2531,7 @@ fn lower_direct_new_array(
     Ok(builder.block_params(merge)[0])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_direct_array_append(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
@@ -5916,6 +5918,7 @@ fn lower_guarded_integer_binary(
     Ok(builder.block_params(merge)[0])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_cached_array_fetch(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
@@ -8623,6 +8626,7 @@ fn lower_optimizing_region_instruction(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_baseline_region_instruction(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,

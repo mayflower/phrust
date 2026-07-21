@@ -433,9 +433,10 @@ fn server_writes_compact_access_log_line() {
     assert!(log.contains("method=GET"), "{log}");
     assert!(log.contains("path=\"/static.txt?cache=1\""), "{log}");
     assert!(log.contains("status=200"), "{log}");
-    assert!(log.contains("bytes=13"), "{log}");
+    assert!(log.contains("emitted_bytes=13"), "{log}");
     assert!(log.contains("route=static"), "{log}");
     assert!(log.contains("cache=-"), "{log}");
+    assert!(log.contains("outcome=completed"), "{log}");
 }
 
 #[test]
@@ -459,18 +460,10 @@ fn server_request_profile_alone_stays_in_summary_mode() {
         "",
     );
 
-    stop_child(child);
-
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert_eq!(response_body(&response), "OK");
-    let profile_path = fs::read_dir(&profile_dir)
-        .expect("read profile dir")
-        .map(|entry| entry.expect("profile entry").path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .expect("request profile json");
+    let profile_path = wait_for_request_profile(&profile_dir);
+    stop_child(child);
     let profile: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(profile_path).expect("read profile json"))
             .expect("parse profile json");
@@ -552,18 +545,10 @@ fn server_request_profile_vm_counter_mode_collects_native_counters() {
         "",
     );
 
-    stop_child(child);
-
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert_eq!(response_body(&response), "3thingX2");
-    let profile_path = fs::read_dir(&profile_dir)
-        .expect("read profile dir")
-        .map(|entry| entry.expect("profile entry").path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .expect("request profile json");
+    let profile_path = wait_for_request_profile(&profile_dir);
+    stop_child(child);
     let profile: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(profile_path).expect("read profile json"))
             .expect("parse profile json");
@@ -693,8 +678,8 @@ fn server_debug_log_records_request_timeline_and_redacts_secrets() {
         "",
     );
 
+    let log = wait_for_file_to_contain(&debug_log, "D_PHRUST_SERVER_RESPONSE");
     stop_child(child);
-    let log = fs::read_to_string(&debug_log).expect("read debug log");
     fs::remove_dir_all(debug_dir).expect("remove debug temp dir");
 
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
@@ -826,8 +811,8 @@ fn server_debug_log_samples_successful_runtime_diagnostics() {
     let address = read_listening_address(&mut child);
     let response = http_request(&address, "GET", "/warn.php");
 
+    let log = wait_for_file_to_contain(&debug_log, "D_PHRUST_SERVER_EXECUTE_END");
     stop_child(child);
-    let log = fs::read_to_string(&debug_log).expect("read debug log");
     fs::remove_dir_all(debug_dir).expect("remove debug temp dir");
     fs::remove_dir_all(docroot).expect("remove temp docroot");
 
@@ -878,6 +863,346 @@ fn server_executes_php_script() {
 
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert!(response.ends_with("hello\n"), "{response}");
+}
+
+#[test]
+fn php_flush_makes_first_chunk_visible_before_script_end() {
+    let docroot = fixture_docroot("fixtures/server/php");
+    let mut child = start_server(&docroot, &[]);
+    let address = read_listening_address(&mut child);
+    let mut stream = TcpStream::connect(&address).expect("connect streaming request");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set streaming read timeout");
+    stream
+        .write_all(
+            b"GET /stream_flush.php HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .expect("write streaming request");
+
+    let started = Instant::now();
+    let mut received = Vec::new();
+    let mut buffer = [0_u8; 256];
+    while !received
+        .windows(b"first\n".len())
+        .any(|window| window == b"first\n")
+    {
+        let read = stream
+            .read(&mut buffer)
+            .expect("read first streaming chunk");
+        assert_ne!(read, 0, "response ended before first chunk");
+        received.extend_from_slice(&buffer[..read]);
+    }
+    let first_elapsed = started.elapsed();
+    stream
+        .read_to_end(&mut received)
+        .expect("read remaining streaming response");
+
+    stop_child(child);
+
+    let response = String::from_utf8_lossy(&received);
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.contains("first\n"), "{response}");
+    assert!(response.contains("second\n"), "{response}");
+    assert!(
+        first_elapsed < Duration::from_millis(400),
+        "first chunk arrived only after script delay: {first_elapsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn php_flush_makes_first_chunk_visible_over_http2() {
+    let docroot = fixture_docroot("fixtures/server/php");
+    let (cert, key) = tls_fixture_paths();
+    let cert_arg = cert.to_string_lossy().to_string();
+    let key_arg = key.to_string_lossy().to_string();
+    let mut child = start_server(&docroot, &["--tls-cert", &cert_arg, "--tls-key", &key_arg]);
+    let address = read_listening_address(&mut child);
+
+    let (status, chunks, first_elapsed) = http2_get(&address, "/stream_flush.php").await;
+
+    stop_child(child);
+    assert_eq!(status, hyper::StatusCode::OK);
+    assert_eq!(chunks.concat(), b"first\nsecond\n");
+    assert!(chunks.len() >= 2, "flush response arrived in one H2 frame");
+    assert!(
+        first_elapsed < Duration::from_millis(400),
+        "first H2 chunk arrived only after script delay: {first_elapsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn php_flush_makes_first_chunk_visible_over_http3() {
+    let docroot = fixture_docroot("fixtures/server/php");
+    let (cert, key) = tls_fixture_paths();
+    let cert_arg = cert.to_string_lossy().to_string();
+    let key_arg = key.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--tls-cert",
+            &cert_arg,
+            "--tls-key",
+            &key_arg,
+            "--enable-http3",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+
+    let (status, chunks, first_elapsed) = http3_get(&address, "/stream_flush.php").await;
+
+    stop_child(child);
+    assert_eq!(status, hyper::StatusCode::OK);
+    assert_eq!(chunks.concat(), b"first\nsecond\n");
+    assert!(chunks.len() >= 2, "flush response arrived in one H3 frame");
+    assert!(
+        first_elapsed < Duration::from_millis(400),
+        "first H3 chunk arrived only after script delay: {first_elapsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_http3_request_body_returns_413() {
+    let docroot = temp_docroot();
+    fs::write(docroot.join("post.php"), "<?php echo \"unexpected\\n\";\n")
+        .expect("write H3 POST fixture");
+    let (cert, key) = tls_fixture_paths();
+    let cert_arg = cert.to_string_lossy().to_string();
+    let key_arg = key.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--tls-cert",
+            &cert_arg,
+            "--tls-key",
+            &key_arg,
+            "--enable-http3",
+            "--max-body-bytes",
+            "8",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+
+    let status = http3_post_status(&address, "/post.php", b"0123456789abcdef").await;
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+    assert_eq!(status, hyper::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[test]
+fn php_client_disconnect_cancels_execution_and_releases_worker() {
+    let docroot = temp_docroot();
+    let marker = docroot.join("disconnect-finished");
+    let marker_php = marker
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'");
+    fs::write(
+        docroot.join("disconnect.php"),
+        format!(
+            "<?php echo \"first\\n\"; flush(); for ($i = 0; $i < 1000000000; $i++) {{}} file_put_contents('{marker_php}', 'finished');\n"
+        ),
+    )
+    .expect("write disconnect fixture");
+    fs::write(docroot.join("next.php"), "<?php echo \"next\\n\";\n")
+        .expect("write follow-up fixture");
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--max-in-flight",
+            "2",
+            "--cpu-execution-limit",
+            "1",
+            "--max-execution-ms",
+            "10000",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let mut stream = TcpStream::connect(&address).expect("connect disconnect request");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set disconnect response timeout");
+    stream
+        .write_all(b"GET /disconnect.php HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write disconnect request");
+    let mut received = Vec::new();
+    let mut buffer = [0_u8; 256];
+    while !received.windows(6).any(|window| window == b"first\n") {
+        let read = stream.read(&mut buffer).expect("read first PHP chunk");
+        assert_ne!(read, 0, "stream ended before first PHP chunk");
+        received.extend_from_slice(&buffer[..read]);
+    }
+    drop(stream);
+
+    let started = Instant::now();
+    let follow_up = http_request(&address, "GET", "/next.php");
+    let elapsed = started.elapsed();
+    let metrics = http_request(&address, "GET", "/__phrust/metrics");
+    let marker_exists = marker.exists();
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+    assert!(follow_up.starts_with("HTTP/1.1 200 OK"), "{follow_up}");
+    assert_eq!(response_body(&follow_up), "next\n");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "cancelled PHP worker was not released promptly: {elapsed:?}"
+    );
+    assert!(
+        !marker_exists,
+        "cancelled script reached its final statement"
+    );
+    assert!(
+        metrics.contains("phrust_server_transfers_aborted_total 1\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phrust_server_client_disconnect_cancellations_total 1\n"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn ignore_user_abort_observes_disconnect_and_discards_followup_output() {
+    let docroot = temp_docroot();
+    let marker = docroot.join("ignore-user-abort-status");
+    let marker_php = marker
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'");
+    fs::write(
+        docroot.join("ignore.php"),
+        format!(
+            "<?php ignore_user_abort(true); echo \"first\\n\"; flush(); usleep(300000); echo str_repeat('x', 1048576); file_put_contents('{marker_php}', connection_aborted() . ':' . connection_status());\n"
+        ),
+    )
+    .expect("write ignore-user-abort fixture");
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--max-in-flight",
+            "2",
+            "--cpu-execution-limit",
+            "1",
+            "--max-execution-ms",
+            "5000",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let mut stream = TcpStream::connect(&address).expect("connect ignore-user-abort request");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set ignore-user-abort response timeout");
+    stream
+        .write_all(b"GET /ignore.php HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write ignore-user-abort request");
+    let mut received = Vec::new();
+    let mut buffer = [0_u8; 256];
+    while !received.windows(6).any(|window| window == b"first\n") {
+        let read = stream.read(&mut buffer).expect("read first PHP chunk");
+        assert_ne!(read, 0, "stream ended before first PHP chunk");
+        received.extend_from_slice(&buffer[..read]);
+    }
+    drop(stream);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = fs::read_to_string(&marker).expect("ignored request completed and wrote status");
+    let metrics = http_request(&address, "GET", "/__phrust/metrics");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+    assert_eq!(status, "1:1");
+    assert!(
+        metrics.contains("phrust_server_client_disconnect_cancellations_total 1\n"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn php_head_large_output_is_counted_without_a_body() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("large.php"),
+        "<?php echo str_repeat('x', 10485760);\n",
+    )
+    .expect("write large HEAD fixture");
+    let mut child = start_server(&docroot, &[]);
+    let address = read_listening_address(&mut child);
+
+    let response = http_request(&address, "HEAD", "/large.php");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert_response_contains_header(&response, "content-length", "10485760");
+    assert_eq!(response_body(&response), "");
+}
+
+#[test]
+fn php_headers_freeze_at_first_transport_flush() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("headers.php"),
+        "<?php header('X-Before: yes'); echo \"first\\n\"; flush(); header('X-After: no'); echo headers_sent() ? \"sent\\n\" : \"open\\n\";\n",
+    )
+    .expect("write header commit fixture");
+    let mut child = start_server(&docroot, &[]);
+    let address = read_listening_address(&mut child);
+
+    let response = http_request(&address, "GET", "/headers.php");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert_response_contains_header(&response, "x-before", "yes");
+    assert_response_lacks_header(&response, "x-after", "no");
+    assert!(response_body(&response).contains("first\n"), "{response}");
+    assert!(response_body(&response).contains("sent\n"), "{response}");
+    assert_eq!(response_header_count(&response, "content-length"), 0);
+}
+
+#[test]
+fn php_fatal_before_commit_can_set_500() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("fatal.php"),
+        "<?php phrust_missing_function();\n",
+    )
+    .expect("write pre-commit fatal fixture");
+    let mut child = start_server(&docroot, &[]);
+    let address = read_listening_address(&mut child);
+
+    let response = http_request(&address, "GET", "/fatal.php");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+    assert!(
+        response.starts_with("HTTP/1.1 500 Internal Server Error"),
+        "{response}"
+    );
+}
+
+#[test]
+fn php_fatal_after_commit_does_not_rewrite_status() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("fatal.php"),
+        "<?php echo \"first\\n\"; flush(); phrust_missing_function();\n",
+    )
+    .expect("write post-commit fatal fixture");
+    let mut child = start_server(&docroot, &[]);
+    let address = read_listening_address(&mut child);
+
+    let response = http_request(&address, "GET", "/fatal.php");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response_body(&response).contains("first\n"), "{response}");
 }
 
 #[test]
@@ -2072,6 +2397,46 @@ fn server_returns_503_when_max_in_flight_wait_expires() {
 }
 
 #[test]
+fn static_transfer_holds_in_flight_capacity_until_body_drop() {
+    let docroot = temp_docroot();
+    let large_path = docroot.join("large.bin");
+    let large = fs::File::create(&large_path).expect("create large static fixture");
+    large
+        .set_len(64 * 1024 * 1024)
+        .expect("size large static fixture");
+    let mut child = start_server(&docroot, &["--max-in-flight", "1"]);
+    let address = read_listening_address(&mut child);
+    let mut held = TcpStream::connect(&address).expect("connect held static request");
+    held.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set held response timeout");
+    held.write_all(b"GET /large.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write held static request");
+    let mut prefix = Vec::new();
+    let mut read_buffer = [0_u8; 1024];
+    while !prefix.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = held
+            .read(&mut read_buffer)
+            .expect("read static response head");
+        assert_ne!(read, 0, "large static response ended unexpectedly");
+        prefix.extend_from_slice(&read_buffer[..read]);
+    }
+
+    let overloaded = http_request(&address, "GET", "/healthz");
+    assert!(
+        overloaded.starts_with("HTTP/1.1 503 Service Unavailable"),
+        "{overloaded}"
+    );
+
+    drop(held);
+    std::thread::sleep(Duration::from_millis(100));
+    let available = http_request(&address, "GET", "/healthz");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+    assert!(available.starts_with("HTTP/1.1 200 OK"), "{available}");
+}
+
+#[test]
 fn server_shutdown_signal_does_not_panic() {
     let docroot = temp_docroot();
     let mut child = start_server(&docroot, &[]);
@@ -2085,6 +2450,264 @@ fn server_shutdown_signal_does_not_panic() {
     fs::remove_dir_all(docroot).expect("remove temp docroot");
 
     assert!(status.success(), "server exited with {status}");
+}
+
+fn tls_fixture_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    (
+        root.join("fixtures/server/tls/localhost.crt"),
+        root.join("fixtures/server/tls/localhost.key"),
+    )
+}
+
+fn wait_for_request_profile(dir: &std::path::Path) -> std::path::PathBuf {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(path) = fs::read_dir(dir)
+            .expect("read profile dir")
+            .map(|entry| entry.expect("profile entry").path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+        {
+            return path;
+        }
+        assert!(Instant::now() < deadline, "request profile json");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_file_to_contain(path: &std::path::Path, needle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Ok(contents) = fs::read_to_string(path)
+            && contents.contains(needle)
+        {
+            return contents;
+        }
+        assert!(Instant::now() < deadline, "{path:?} to contain {needle}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[derive(Debug)]
+struct TestCertificateVerifier(Arc<tokio_rustls::rustls::crypto::CryptoProvider>);
+
+impl TestCertificateVerifier {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(Arc::new(
+            tokio_rustls::rustls::crypto::ring::default_provider(),
+        )))
+    }
+}
+
+impl tokio_rustls::rustls::client::danger::ServerCertVerifier for TestCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error>
+    {
+        Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &tokio_rustls::rustls::DigitallySignedStruct,
+    ) -> Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
+        tokio_rustls::rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &tokio_rustls::rustls::DigitallySignedStruct,
+    ) -> Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
+        tokio_rustls::rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn test_client_config(alpn: Vec<Vec<u8>>) -> tokio_rustls::rustls::ClientConfig {
+    let mut config = tokio_rustls::rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(TestCertificateVerifier::new())
+        .with_no_client_auth();
+    config.alpn_protocols = alpn;
+    config
+}
+
+async fn http2_get(address: &str, path: &str) -> (hyper::StatusCode, Vec<Vec<u8>>, Duration) {
+    use http_body_util::{BodyExt, Empty};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let tcp = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect H2 test client");
+    let connector =
+        tokio_rustls::TlsConnector::from(Arc::new(test_client_config(vec![b"h2".to_vec()])));
+    let tls = connector
+        .connect(
+            rustls_pki_types::ServerName::try_from("localhost").expect("valid test server name"),
+            tcp,
+        )
+        .await
+        .expect("connect H2 TLS");
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .expect("perform H2 handshake");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = hyper::Request::builder()
+        .uri(format!("https://localhost{path}"))
+        .body(Empty::<bytes::Bytes>::new())
+        .expect("build H2 request");
+    let started = Instant::now();
+    let response = sender.send_request(request).await.expect("send H2 request");
+    let status = response.status();
+    let mut body = response.into_body();
+    let mut chunks = Vec::new();
+    let mut first_elapsed = None;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.expect("receive H2 response frame");
+        if let Ok(data) = frame.into_data()
+            && !data.is_empty()
+        {
+            first_elapsed.get_or_insert_with(|| started.elapsed());
+            chunks.push(data.to_vec());
+        }
+    }
+    (
+        status,
+        chunks,
+        first_elapsed.expect("H2 response has a data frame"),
+    )
+}
+
+async fn http3_get(address: &str, path: &str) -> (hyper::StatusCode, Vec<Vec<u8>>, Duration) {
+    use bytes::Buf;
+    use quinn::crypto::rustls::QuicClientConfig;
+
+    let mut crypto = test_client_config(vec![b"h3".to_vec()]);
+    crypto.enable_early_data = true;
+    let client_config = quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(crypto).expect("build QUIC client config"),
+    ));
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind address"))
+        .expect("create QUIC client endpoint");
+    endpoint.set_default_client_config(client_config);
+    let connection = endpoint
+        .connect(address.parse().expect("server socket address"), "localhost")
+        .expect("start QUIC connection")
+        .await
+        .expect("connect QUIC client");
+    let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .expect("create H3 client");
+    let driver_task = tokio::spawn(async move { driver.wait_idle().await });
+    let request = hyper::Request::builder()
+        .uri(format!("https://localhost{path}"))
+        .body(())
+        .expect("build H3 request");
+    let started = Instant::now();
+    let mut stream = sender.send_request(request).await.expect("send H3 request");
+    stream.finish().await.expect("finish H3 request");
+    let response = stream.recv_response().await.expect("receive H3 response");
+    let status = response.status();
+    let mut chunks = Vec::new();
+    let mut first_elapsed = None;
+    while let Some(mut data) = stream.recv_data().await.expect("receive H3 data") {
+        let mut chunk = Vec::with_capacity(data.remaining());
+        while data.has_remaining() {
+            chunk.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+        }
+        if !chunk.is_empty() {
+            first_elapsed.get_or_insert_with(|| started.elapsed());
+            chunks.push(chunk);
+        }
+    }
+    drop(sender);
+    endpoint.close(quinn::VarInt::from_u32(0), b"test complete");
+    let _ = driver_task.await;
+    (
+        status,
+        chunks,
+        first_elapsed.expect("H3 response has a data frame"),
+    )
+}
+
+async fn http3_post_status(address: &str, path: &str, body: &[u8]) -> hyper::StatusCode {
+    use quinn::crypto::rustls::QuicClientConfig;
+
+    let mut crypto = test_client_config(vec![b"h3".to_vec()]);
+    crypto.enable_early_data = true;
+    let client_config = quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(crypto).expect("build QUIC client config"),
+    ));
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind address"))
+        .expect("create QUIC client endpoint");
+    endpoint.set_default_client_config(client_config);
+    let connection = endpoint
+        .connect(address.parse().expect("server socket address"), "localhost")
+        .expect("start QUIC connection")
+        .await
+        .expect("connect QUIC client");
+    let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .expect("create H3 client");
+    let driver_task = tokio::spawn(async move { driver.wait_idle().await });
+    let request = hyper::Request::post(format!("https://localhost{path}"))
+        .body(())
+        .expect("build H3 POST request");
+    let mut stream = sender.send_request(request).await.expect("send H3 request");
+    stream
+        .send_data(bytes::Bytes::copy_from_slice(body))
+        .await
+        .expect("send H3 request body");
+    stream.finish().await.expect("finish H3 request");
+    let status = stream
+        .recv_response()
+        .await
+        .expect("receive H3 response")
+        .status();
+    while stream
+        .recv_data()
+        .await
+        .expect("receive H3 response body")
+        .is_some()
+    {}
+    drop(sender);
+    endpoint.close(quinn::VarInt::from_u32(0), b"test complete");
+    let _ = driver_task.await;
+    status
 }
 
 fn start_server(docroot: &std::path::Path, extra_args: &[&str]) -> Child {
@@ -2133,6 +2756,7 @@ fn read_listening_address(child: &mut Child) -> String {
         .read_line(&mut line)
         .expect("read listening line from server");
     line.strip_prefix("listening http://")
+        .or_else(|| line.strip_prefix("listening https://"))
         .expect("listening line prefix")
         .trim()
         .to_string()

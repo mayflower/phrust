@@ -712,7 +712,7 @@ pub(super) fn execute_native_dynamic_callable(
         Ok(value) => dereference_native_callable_value(value),
         Err(error) => return Some(Err(error)),
     };
-    let metadata = prepared_arguments.or_else(|| match &instruction.kind {
+    let metadata = prepared_arguments.or(match &instruction.kind {
         php_ir::InstructionKind::CallCallable { args, .. }
         | php_ir::InstructionKind::CallClosure { args, .. } => Some(args.as_slice()),
         _ => None,

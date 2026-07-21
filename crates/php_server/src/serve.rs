@@ -7,10 +7,12 @@ use super::{
     metrics::metrics_response,
     php_request::{
         BodyReadError, PartsAndBody, execute_builtin_router_if_configured, execute_php_request,
-        read_limited_body, request_time,
+        read_limited_body,
     },
+    request_pipeline::PhpTransferCompletion,
     state::AppState,
     static_files::static_file_response,
+    transfer::{PhpExecutionCoordinator, TransferContext, TransferLifecycle},
 };
 use crate::{
     response::{self, RequestBody, ResponseBody},
@@ -122,6 +124,25 @@ pub(crate) async fn handle_parts(
     state: Arc<AppState>,
     peer: SocketAddr,
 ) -> Response<ResponseBody> {
+    match admit_request(&parts, &state, peer).await {
+        Ok(admission) => handle_parts_admitted(parts, body, state, peer, admission).await,
+        Err(response) => response,
+    }
+}
+
+pub(crate) struct RequestAdmission {
+    started: Instant,
+    request_id: String,
+    method: Method,
+    request_target: String,
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+pub(crate) async fn admit_request(
+    parts: &Parts,
+    state: &Arc<AppState>,
+    peer: SocketAddr,
+) -> Result<RequestAdmission, Response<ResponseBody>> {
     let started = Instant::now();
     let request_id = state.next_request_id();
     state
@@ -130,13 +151,12 @@ pub(crate) async fn handle_parts(
         .requests_total
         .fetch_add(1, Ordering::Relaxed);
     let method = parts.method.clone();
-    let request_version = parts.version;
     let request_target = parts
         .uri
         .path_and_query()
         .map_or_else(|| parts.uri.path().to_string(), |value| value.to_string());
     emit_server_debug_lazy(
-        &state,
+        state,
         Some(&request_id),
         "D_PHRUST_SERVER_REQUEST_ACCEPTED",
         "request",
@@ -162,7 +182,7 @@ pub(crate) async fn handle_parts(
         },
     );
     let admission_started = Instant::now();
-    let _permit = match timeout(
+    let permit = match timeout(
         REQUEST_ADMISSION_TIMEOUT,
         Arc::clone(&state.concurrency.in_flight).acquire_owned(),
     )
@@ -184,25 +204,46 @@ pub(crate) async fn handle_parts(
                 .metrics
                 .overload
                 .fetch_add(1, Ordering::Relaxed);
-            let response = overloaded();
-            state.services.metrics.record_response(response.status());
-            write_access_log(
-                &state,
-                AccessLogEntry {
-                    timestamp: request_time() as u64,
-                    method: method.as_str(),
-                    path: &request_target,
-                    status: response.status(),
-                    bytes: response_content_length(&response),
-                    duration: started.elapsed(),
+            let mut response = overloaded();
+            let status = response.status();
+            response
+                .body_mut()
+                .attach_lifecycle(TransferLifecycle::new(TransferContext {
+                    state: Arc::clone(state),
+                    request_id,
+                    started,
+                    method: method.to_string(),
+                    request_target,
                     route: "overload",
+                    status,
                     cache_hit: None,
-                },
-            );
+                    permit: None,
+                    php: None,
+                    execution: None,
+                }));
             debug!(%peer, "request rejected because max in-flight admission wait expired");
-            return response;
+            return Err(response);
         }
     };
+    Ok(RequestAdmission {
+        started,
+        request_id,
+        method,
+        request_target,
+        permit,
+    })
+}
+
+pub(crate) async fn handle_parts_admitted(
+    parts: Parts,
+    body: RequestBody,
+    state: Arc<AppState>,
+    peer: SocketAddr,
+    admission: RequestAdmission,
+) -> Response<ResponseBody> {
+    let method = admission.method.clone();
+    let request_id = admission.request_id.clone();
+    let request_version = parts.version;
     let route_started = Instant::now();
     let route = resolve_route(method.as_str(), parts.uri.path(), &state.route_config);
     let route_resolution = route_started.elapsed();
@@ -372,41 +413,36 @@ pub(crate) async fn handle_parts(
             }
         }
     }
-    state.services.metrics.record_response(response.status());
-    emit_server_debug_lazy(
-        &state,
-        Some(&request_id),
-        "D_PHRUST_SERVER_RESPONSE",
-        "response",
-        "server response generated",
-        || {
-            BTreeMap::from([
-                ("status".to_string(), response.status().as_u16().to_string()),
-                (
-                    "content_length".to_string(),
-                    response_content_length(&response).to_string(),
-                ),
-                ("route".to_string(), route_kind.to_string()),
-                (
-                    "duration_ms".to_string(),
-                    started.elapsed().as_millis().to_string(),
-                ),
-            ])
-        },
-    );
-    write_access_log(
-        &state,
-        AccessLogEntry {
-            timestamp: request_time() as u64,
-            method: method.as_str(),
-            path: &request_target,
-            status: response.status(),
-            bytes: response_content_length(&response),
-            duration: started.elapsed(),
-            route: route_kind,
+    finish_admitted_response(admission, state, response, route_kind, cache_hit)
+}
+
+pub(crate) fn finish_admitted_response(
+    admission: RequestAdmission,
+    state: Arc<AppState>,
+    mut response: Response<ResponseBody>,
+    route: &'static str,
+    cache_hit: Option<bool>,
+) -> Response<ResponseBody> {
+    let status = response.status();
+    let php = response.extensions_mut().remove::<PhpTransferCompletion>();
+    let execution = response
+        .extensions_mut()
+        .remove::<PhpExecutionCoordinator>();
+    response
+        .body_mut()
+        .attach_lifecycle(TransferLifecycle::new(TransferContext {
+            state,
+            request_id: admission.request_id,
+            started: admission.started,
+            method: admission.method.to_string(),
+            request_target: admission.request_target,
+            route,
+            status,
             cache_hit,
-        },
-    );
+            permit: Some(admission.permit),
+            php,
+            execution,
+        }));
     response
 }
 pub(crate) fn write_access_log(state: &AppState, entry: AccessLogEntry<'_>) {
@@ -416,15 +452,6 @@ pub(crate) fn write_access_log(state: &AppState, entry: AccessLogEntry<'_>) {
         warn!(%error, "access log write failed");
     }
 }
-pub(crate) fn response_content_length(response: &Response<ResponseBody>) -> u64 {
-    response
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0)
-}
-
 async fn execute_builtin_router_before_normal_route(
     parts: &Parts,
     body: RequestBody,

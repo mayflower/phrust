@@ -1,7 +1,7 @@
 use super::php_request::RequestLocalAddr;
 use crate::{
-    response::ResponseBody,
-    serve::{bytes_request_body, handle_parts},
+    response::{self, ResponseBody},
+    serve::{admit_request, bytes_request_body, finish_admitted_response, handle_parts_admitted},
     server::ServerError,
     state::AppState,
     tls::build_quic_server_config,
@@ -13,7 +13,11 @@ use hyper::{
     Response, StatusCode,
     header::{self, HeaderName},
 };
-use std::{net::SocketAddr, path::Path, sync::Arc};
+use std::{
+    net::SocketAddr,
+    path::Path,
+    sync::{Arc, atomic::Ordering},
+};
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
@@ -98,20 +102,52 @@ async fn handle_http3_request(
 ) {
     let (mut parts, ()) = request.into_parts();
     parts.extensions.insert(RequestLocalAddr(local_addr));
+    let admission = match admit_request(&parts, &state, peer).await {
+        Ok(admission) => admission,
+        Err(response) => {
+            if let Err(error) = send_http3_response(stream, response).await {
+                warn!(%peer, %error, "HTTP/3 overload response failed");
+            }
+            return;
+        }
+    };
     let body = match read_http3_request_body(&mut stream, state.request.max_body_bytes).await {
         Ok(body) => body,
         Err(Http3BodyReadError::Invalid(error)) => {
             warn!(%peer, %error, "HTTP/3 request body read failed");
-            let mut response = Response::new(());
-            *response.status_mut() = StatusCode::BAD_REQUEST;
-            if let Err(error) = stream.send_response(response).await {
+            let response = finish_admitted_response(
+                admission,
+                state,
+                response::text(StatusCode::BAD_REQUEST, "bad request\n"),
+                "bad-request",
+                None,
+            );
+            if let Err(error) = send_http3_response(stream, response).await {
                 warn!(%peer, %error, "HTTP/3 bad-request response failed");
             }
-            let _ = stream.finish().await;
+            return;
+        }
+        Err(Http3BodyReadError::TooLarge) => {
+            state
+                .services
+                .metrics
+                .body_too_large
+                .fetch_add(1, Ordering::Relaxed);
+            let response = finish_admitted_response(
+                admission,
+                state,
+                response::text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large\n"),
+                "body-too-large",
+                None,
+            );
+            if let Err(error) = send_http3_response(stream, response).await {
+                warn!(%peer, %error, "HTTP/3 payload-too-large response failed");
+            }
             return;
         }
     };
-    let response = handle_parts(parts, bytes_request_body(body), state, peer).await;
+    let response =
+        handle_parts_admitted(parts, bytes_request_body(body), state, peer, admission).await;
     if let Err(error) = send_http3_response(stream, response).await {
         warn!(%peer, %error, "HTTP/3 response send failed");
     }
@@ -120,6 +156,7 @@ async fn handle_http3_request(
 #[derive(Debug)]
 enum Http3BodyReadError {
     Invalid(String),
+    TooLarge,
 }
 
 async fn read_http3_request_body(
@@ -133,11 +170,12 @@ async fn read_http3_request_body(
         .map_err(|error| Http3BodyReadError::Invalid(error.to_string()))?
     {
         while chunk.has_remaining() {
-            let bytes = chunk.copy_to_bytes(chunk.remaining());
-            body.extend_from_slice(&bytes);
-            if body.len() > max_body_bytes {
-                return Ok(body.freeze());
+            let remaining = chunk.remaining();
+            if remaining > max_body_bytes.saturating_sub(body.len()) {
+                return Err(Http3BodyReadError::TooLarge);
             }
+            let bytes = chunk.copy_to_bytes(remaining);
+            body.extend_from_slice(&bytes);
         }
     }
     Ok(body.freeze())
@@ -147,24 +185,46 @@ async fn send_http3_response(
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     response: Response<ResponseBody>,
 ) -> Result<(), String> {
-    let (mut parts, body) = response.into_parts();
+    let (mut parts, mut body) = response.into_parts();
+    body.defer_completion();
     strip_http3_forbidden_headers(&mut parts.headers);
-    stream
-        .send_response(Response::from_parts(parts, ()))
-        .await
-        .map_err(|error| error.to_string())?;
-    let body = body
-        .collect()
-        .await
-        .map_err(|error| error.to_string())?
-        .to_bytes();
-    if !body.is_empty() {
-        stream
-            .send_data(body)
-            .await
-            .map_err(|error| error.to_string())?;
+    if let Err(error) = stream.send_response(Response::from_parts(parts, ())).await {
+        body.error();
+        return Err(error.to_string());
     }
-    stream.finish().await.map_err(|error| error.to_string())
+    while let Some(frame) = body.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                body.error();
+                return Err(error.to_string());
+            }
+        };
+        let frame = match frame.into_data() {
+            Ok(data) => {
+                if !data.is_empty()
+                    && let Err(error) = stream.send_data(data).await
+                {
+                    body.abort();
+                    return Err(error.to_string());
+                }
+                continue;
+            }
+            Err(frame) => frame,
+        };
+        if let Ok(trailers) = frame.into_trailers()
+            && let Err(error) = stream.send_trailers(trailers).await
+        {
+            body.abort();
+            return Err(error.to_string());
+        }
+    }
+    if let Err(error) = stream.finish().await {
+        body.abort();
+        return Err(error.to_string());
+    }
+    body.complete();
+    Ok(())
 }
 
 fn strip_http3_forbidden_headers(headers: &mut header::HeaderMap) {

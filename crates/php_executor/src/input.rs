@@ -1,8 +1,8 @@
 use php_diagnostics::DiagnosticEnvelope;
 use php_optimizer::OptimizationLevel;
 use php_runtime::api::{
-    ExitStatus, RuntimeContext, RuntimeDiagnostic, RuntimeHttpResponseState, SessionState,
-    UploadRegistry, Value,
+    ExitStatus, OutputStats, RuntimeContext, RuntimeDiagnostic, RuntimeHttpResponseState,
+    SessionState, UploadRegistry, Value,
 };
 use php_vm::api::{NativeCacheStats, TieringStats, VmCounters, VmOptions};
 use std::path::PathBuf;
@@ -57,6 +57,8 @@ pub struct PhpRequestExecutionInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhpExecutionOutput {
     pub stdout: Vec<u8>,
+    pub output_stats: OutputStats,
+    pub output_delivery_error: Option<String>,
     pub diagnostics_text: String,
     pub diagnostics: Vec<DiagnosticEnvelope>,
     pub status: PhpExecutionStatus,
@@ -77,6 +79,8 @@ impl PhpExecutionOutput {
     pub(crate) fn engine_error(error: String) -> Self {
         Self {
             stdout: Vec::new(),
+            output_stats: OutputStats::default(),
+            output_delivery_error: None,
             diagnostics_text: error,
             diagnostics: Vec::new(),
             status: PhpExecutionStatus::Fatal,
