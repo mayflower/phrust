@@ -44,6 +44,20 @@ pub(crate) struct ServerMetrics {
     pub(crate) static_not_modified: AtomicU64,
     pub(crate) static_partial_responses: AtomicU64,
     pub(crate) static_precompressed_hits: AtomicU64,
+    pub(crate) static_identity_responses: AtomicU64,
+    pub(crate) static_br_responses: AtomicU64,
+    pub(crate) static_zstd_responses: AtomicU64,
+    pub(crate) static_gzip_responses: AtomicU64,
+    pub(crate) static_not_acceptable: AtomicU64,
+    pub(crate) static_stale_sidecars: AtomicU64,
+    pub(crate) static_index_entries: AtomicU64,
+    pub(crate) static_index_builds: AtomicU64,
+    pub(crate) static_index_build_failures: AtomicU64,
+    pub(crate) static_index_hits: AtomicU64,
+    pub(crate) static_index_misses: AtomicU64,
+    pub(crate) static_mutable_resolutions: AtomicU64,
+    pub(crate) static_capability_opens: AtomicU64,
+    pub(crate) static_policy_denied: AtomicU64,
     pub(crate) script_cache_preload_successes: AtomicU64,
     pub(crate) script_cache_preload_failures: AtomicU64,
     pub(crate) script_cache_ready: AtomicU64,
@@ -436,6 +450,66 @@ phrust_server_persistent_engine_feedback_template_absorptions_total {}\n",
             "phrust_server_native_prewarm_nanos_total {}",
             self.native_prewarm_nanos.load(Ordering::Relaxed)
         );
+        for (name, value) in [
+            (
+                "phrust_server_static_identity_responses_total",
+                self.static_identity_responses.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_static_br_responses_total",
+                self.static_br_responses.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_static_zstd_responses_total",
+                self.static_zstd_responses.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_static_gzip_responses_total",
+                self.static_gzip_responses.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_static_not_acceptable_total",
+                self.static_not_acceptable.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_static_stale_sidecars_total",
+                self.static_stale_sidecars.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_static_index_entries",
+                self.static_index_entries.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_static_index_builds_total",
+                self.static_index_builds.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_static_index_build_failures_total",
+                self.static_index_build_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_static_index_hits_total",
+                self.static_index_hits.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_static_index_misses_total",
+                self.static_index_misses.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_static_mutable_resolutions_total",
+                self.static_mutable_resolutions.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_static_capability_opens_total",
+                self.static_capability_opens.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_static_policy_denied_total",
+                self.static_policy_denied.load(Ordering::Relaxed),
+            ),
+        ] {
+            let _ = writeln!(output, "{name} {value}");
+        }
         output
     }
 }

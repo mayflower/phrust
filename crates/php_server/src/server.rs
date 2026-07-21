@@ -12,6 +12,7 @@ use crate::{
         RequestTransport, RuntimeServices, ServerEngineState, SessionConfig, SessionServices,
         preload_script_cache, server_env_snapshot,
     },
+    static_files::StaticFileService,
     tls::build_tls_acceptor,
 };
 use php_diagnostics::{
@@ -245,8 +246,6 @@ impl From<std::io::Error> for ServerError {
 
 pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let docroot = config.validated_docroot()?;
-    let listener = TcpListener::bind(config.transport.listen).await?;
-    let local_addr = listener.local_addr()?;
     let script_cache_preload = config.engine.script_cache_preload.clone();
     let strict_preload = config.engine.strict_preload;
     let startup_front_controller = config.routing.front_controller.clone();
@@ -262,32 +261,11 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let startup_request_profile = config.observability.request_profile.clone();
     let startup_tls_enabled = config.transport.tls_cert.is_some();
     let startup_http3_enabled = config.transport.http3_enabled;
-    let http3_listen = config.transport.http3_listen.unwrap_or(local_addr);
     let engine_profile = config.engine.engine_preset;
     let tls_acceptor = build_tls_acceptor(
         config.transport.tls_cert.as_deref(),
         config.transport.tls_key.as_deref(),
     )?;
-    let http3_endpoint = if config.transport.http3_enabled {
-        let cert_path = config.transport.tls_cert.as_deref().ok_or_else(|| {
-            ConfigError::new(
-                "HTTP/3 requires TLS; provide --tls-cert <path> and --tls-key <path> with --enable-http3",
-            )
-        })?;
-        let key_path = config.transport.tls_key.as_deref().ok_or_else(|| {
-            ConfigError::new(
-                "HTTP/3 requires TLS; provide --tls-cert <path> and --tls-key <path> with --enable-http3",
-            )
-        })?;
-        Some(build_http3_endpoint(cert_path, key_path, http3_listen)?)
-    } else {
-        None
-    };
-    let http3_local_addr = http3_endpoint
-        .as_ref()
-        .map(|endpoint| endpoint.local_addr())
-        .transpose()?;
-    let http3_alt_svc = http3_local_addr.map(|addr| format!("h3=\":{}\"; ma=86400", addr.port()));
     let access_log = config
         .observability
         .access_log
@@ -313,41 +291,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
             .ensure_ready()
             .map_err(std::io::Error::other)?;
     }
-    let startup_scheme = if startup_tls_enabled { "https" } else { "http" };
-    println!("listening {startup_scheme}://{local_addr}");
-    eprintln!(
-        "startup docroot={} front_controller={} engine_preset={} script_cache={} script_cache_shards={} script_cache_max_entries={} upload_temp_dir={} session_save_path={} metrics_endpoint={} metrics_token={} access_log={} perf_trace={} request_profile={} tls={} tls_alpn={} http3={} http3_addr={}",
-        docroot.display(),
-        startup_front_controller
-            .as_ref()
-            .map_or("-", |path| path.to_str().unwrap_or("<non-utf8>")),
-        engine_profile,
-        startup_script_cache_enabled,
-        startup_script_cache_shards,
-        startup_script_cache_max_entries,
-        startup_upload_temp_dir.display(),
-        startup_session_save_path.display(),
-        startup_metrics_endpoint_enabled,
-        startup_metrics_token_enabled,
-        startup_access_log.as_deref().unwrap_or("-"),
-        startup_perf_trace
-            .as_ref()
-            .map_or("-", |path| path.to_str().unwrap_or("<non-utf8>")),
-        startup_request_profile
-            .as_ref()
-            .map_or("-", |path| path.to_str().unwrap_or("<non-utf8>")),
-        startup_tls_enabled,
-        if startup_tls_enabled {
-            "h2,http/1.1"
-        } else {
-            "-"
-        },
-        startup_http3_enabled,
-        http3_local_addr
-            .map(|addr| addr.to_string())
-            .unwrap_or_else(|| "-".to_string()),
-    );
-    debug!(%local_addr, docroot=%docroot.display(), "starting phrust server");
+    debug!(docroot=%docroot.display(), "initializing phrust server");
     let script_cache = Arc::new(if config.engine.script_cache_enabled {
         CompiledScriptCache::new_with_limits(
             config.engine.script_cache_shards,
@@ -380,16 +324,51 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         include_cache,
         config.engine.perf_ablation,
     ));
+    let metrics = Arc::new(ServerMetrics::default());
+    let static_files = Arc::new(
+        StaticFileService::new(
+            docroot.clone(),
+            config.engine.deployment_mode,
+            config.routing.indexes,
+            config.routing.php_extensions,
+            Arc::clone(&metrics),
+        )
+        .map_err(ServerError::Io)?,
+    );
+    let listener = TcpListener::bind(config.transport.listen).await?;
+    let local_addr = listener.local_addr()?;
+    debug!(%local_addr, docroot=%docroot.display(), "starting phrust server listener");
+    let http3_listen = config.transport.http3_listen.unwrap_or(local_addr);
+    let http3_endpoint = if config.transport.http3_enabled {
+        let cert_path = config.transport.tls_cert.as_deref().ok_or_else(|| {
+            ConfigError::new(
+                "HTTP/3 requires TLS; provide --tls-cert <path> and --tls-key <path> with --enable-http3",
+            )
+        })?;
+        let key_path = config.transport.tls_key.as_deref().ok_or_else(|| {
+            ConfigError::new(
+                "HTTP/3 requires TLS; provide --tls-cert <path> and --tls-key <path> with --enable-http3",
+            )
+        })?;
+        Some(build_http3_endpoint(cert_path, key_path, http3_listen)?)
+    } else {
+        None
+    };
+    let http3_local_addr = http3_endpoint
+        .as_ref()
+        .map(|endpoint| endpoint.local_addr())
+        .transpose()?;
+    let http3_alt_svc = http3_local_addr.map(|addr| format!("h3=\":{}\"; ma=86400", addr.port()));
     let state = Arc::new(AppState {
         route_config: RouteConfig {
             docroot,
-            index: config.routing.index,
             front_controller: config.routing.front_controller,
             builtin_router: config.routing.builtin_router,
             request_rewrites: config.routing.request_rewrites,
             metrics_endpoint_enabled: config.routing.metrics_endpoint_enabled,
             cache_clear_endpoint_enabled: config.routing.cache_clear_endpoint_enabled,
         },
+        static_files,
         request: RequestRuntimeConfig {
             max_body_bytes: config.limits.max_body_bytes,
             multipart_config: MultipartConfig {
@@ -442,12 +421,46 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
             http3_alt_svc,
         },
         services: RuntimeServices {
-            metrics: Arc::new(ServerMetrics::default()),
+            metrics,
             engine,
             request_counter: Arc::new(AtomicU64::new(0)),
         },
     });
     preload_script_cache(&state, script_cache_preload.as_deref(), strict_preload)?;
+    let startup_scheme = if startup_tls_enabled { "https" } else { "http" };
+    println!("listening {startup_scheme}://{local_addr}");
+    eprintln!(
+        "startup docroot={} front_controller={} engine_preset={} script_cache={} script_cache_shards={} script_cache_max_entries={} upload_temp_dir={} session_save_path={} metrics_endpoint={} metrics_token={} access_log={} perf_trace={} request_profile={} tls={} tls_alpn={} http3={} http3_addr={}",
+        state.route_config.docroot.display(),
+        startup_front_controller
+            .as_ref()
+            .map_or("-", |path| path.to_str().unwrap_or("<non-utf8>")),
+        engine_profile,
+        startup_script_cache_enabled,
+        startup_script_cache_shards,
+        startup_script_cache_max_entries,
+        startup_upload_temp_dir.display(),
+        startup_session_save_path.display(),
+        startup_metrics_endpoint_enabled,
+        startup_metrics_token_enabled,
+        startup_access_log.as_deref().unwrap_or("-"),
+        startup_perf_trace
+            .as_ref()
+            .map_or("-", |path| path.to_str().unwrap_or("<non-utf8>")),
+        startup_request_profile
+            .as_ref()
+            .map_or("-", |path| path.to_str().unwrap_or("<non-utf8>")),
+        startup_tls_enabled,
+        if startup_tls_enabled {
+            "h2,http/1.1"
+        } else {
+            "-"
+        },
+        startup_http3_enabled,
+        http3_local_addr
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+    );
     let native_isa = php_vm::api::cranelift_host_isa_identity()
         .map_err(|error| ServerError::Io(std::io::Error::other(error)))?;
     // phrust-diagnostics-allow: approved top-level native startup metadata stderr

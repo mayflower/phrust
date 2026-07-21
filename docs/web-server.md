@@ -48,6 +48,18 @@ completion. The `max_in_flight` permit remains owned until both PHP cleanup and
 response-body completion or abort; access logs and transfer counters therefore
 report emitted body frames, not planned `Content-Length` bytes.
 
+Static delivery resolves decoded path segments beneath a document-root
+capability and streams the already inspected regular-file handle. The default
+public policy hides source, secret, VCS, backup, dotfile, special-file, and
+direct sidecar paths. Directory indexes default to `index.php,index.html`;
+`--index` accepts an ordered CSV list and `--php-extensions` configures
+executable suffixes. Precompressed representations use full q-value/wildcard
+negotiation, and validators plus single ranges follow HTTP precondition order.
+`--deployment-mode dev` observes live files with `no-cache`; `immutable` builds
+a startup asset index and enables strong validators and cacheable release
+assets. Dynamic compression, multipart ranges, autoindex, and sendfile remain
+out of scope.
+
 Pinned PHP workers reserve a 16 MiB OS-thread stack by default. Set
 `PHRUST_SERVER_PHP_WORKER_STACK_BYTES` to a positive byte count when a measured
 deployment needs a different bound. The older

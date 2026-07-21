@@ -30,6 +30,7 @@ use tracing::warn;
 #[derive(Clone, Debug)]
 pub(crate) struct AppState {
     pub(crate) route_config: RouteConfig,
+    pub(crate) static_files: Arc<crate::static_files::StaticFileService>,
     pub(crate) request: RequestRuntimeConfig,
     pub(crate) concurrency: ConcurrencyServices,
     pub(crate) observability: ObservabilityState,

@@ -3,7 +3,10 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpStream,
     process::{Child, Command as Proc, Stdio},
-    sync::{Arc, Barrier},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -173,12 +176,498 @@ fn server_selects_precompressed_static_assets_when_accepted() {
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert_response_contains_header(&response, "content-encoding", "gzip");
     assert_response_contains_header(&response, "vary", "Accept-Encoding");
-    assert_response_contains_header(
-        &response,
-        "content-type",
-        "application/javascript; charset=UTF-8",
-    );
+    assert_response_contains_header(&response, "content-type", "text/javascript");
     assert_eq!(response_body(&response), "precompressed asset\n");
+}
+
+#[test]
+fn mutable_static_rejects_stale_and_orphaned_sidecars() {
+    let docroot = temp_docroot();
+    let identity_path = docroot.join("asset.txt");
+    let sidecar_path = docroot.join("asset.txt.gz");
+    fs::write(&identity_path, "identity").expect("write identity fixture");
+    fs::write(&sidecar_path, "stale-sidecar").expect("write stale sidecar fixture");
+    fs::write(docroot.join("orphan.txt.gz"), "orphan").expect("write orphan sidecar fixture");
+    let old = UNIX_EPOCH + Duration::from_secs(1_000);
+    let new = UNIX_EPOCH + Duration::from_secs(2_000);
+    fs::File::open(&sidecar_path)
+        .expect("open sidecar fixture")
+        .set_times(fs::FileTimes::new().set_modified(old))
+        .expect("set sidecar mtime");
+    fs::File::open(&identity_path)
+        .expect("open identity fixture")
+        .set_times(fs::FileTimes::new().set_modified(new))
+        .expect("set identity mtime");
+    let mut child = start_server(&docroot, &[]);
+    let address = read_listening_address(&mut child);
+    let stale = http_request_with_headers(
+        &address,
+        "GET",
+        "/asset.txt",
+        &[("Accept-Encoding", "gzip")],
+        "",
+    );
+    let orphan = http_request_with_headers(
+        &address,
+        "GET",
+        "/orphan.txt",
+        &[("Accept-Encoding", "gzip")],
+        "",
+    );
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+
+    assert_eq!(response_body(&stale), "identity");
+    assert_response_lacks_header(&stale, "content-encoding", "gzip");
+    assert!(orphan.starts_with("HTTP/1.1 404 Not Found"), "{orphan}");
+}
+
+#[test]
+fn server_enforces_static_public_policy_and_directory_contract() {
+    let docroot = temp_docroot();
+    fs::create_dir(docroot.join("ordered")).expect("create ordered directory");
+    fs::write(docroot.join("ordered/index.php"), "<?php echo 'php-index';")
+        .expect("write PHP index");
+    fs::write(docroot.join("ordered/index.html"), "html-index").expect("write HTML index");
+    fs::create_dir(docroot.join("html-only")).expect("create HTML directory");
+    fs::write(docroot.join("html-only/index.html"), "html-only").expect("write HTML-only index");
+    fs::create_dir(docroot.join("empty")).expect("create empty directory");
+    fs::create_dir(docroot.join(".well-known")).expect("create well-known directory");
+    fs::write(docroot.join(".well-known/example.txt"), "well-known")
+        .expect("write well-known fixture");
+    fs::write(docroot.join(".well-known/.secret"), "secret").expect("write nested secret");
+    fs::write(docroot.join("script.phtml"), "<?php echo 'phtml';").expect("write phtml fixture");
+    for path in [
+        ".env",
+        ".htaccess",
+        "web.config",
+        "source.inc",
+        "source.phar",
+        "source.php5",
+        "backup.txt.bak",
+        "swap.swp",
+        "temp.tmp",
+        "app.js.br",
+        "app.js.gz",
+        "app.js.zst",
+    ] {
+        fs::write(docroot.join(path), "must-not-be-public").expect("write hidden fixture");
+    }
+    fs::create_dir(docroot.join(".git")).expect("create VCS directory");
+    fs::write(docroot.join(".git/config"), "must-not-be-public").expect("write VCS fixture");
+
+    let mut child = start_server(&docroot, &["--php-extensions", "php,phtml"]);
+    let address = read_listening_address(&mut child);
+    let redirect = http_request(&address, "GET", "/ordered?x=1");
+    let ordered = http_request(&address, "GET", "/ordered/");
+    let html = http_request(&address, "GET", "/html-only/");
+    let empty = http_request(&address, "GET", "/empty/");
+    let well_known = http_request(&address, "GET", "/.well-known/example.txt");
+    let nested_secret = http_request(&address, "GET", "/.well-known/.secret");
+    let phtml = http_request(&address, "GET", "/script.phtml");
+    let hidden = [
+        "/.env",
+        "/.htaccess",
+        "/web.config",
+        "/source.inc",
+        "/source.phar",
+        "/source.php5",
+        "/backup.txt.bak",
+        "/swap.swp",
+        "/temp.tmp",
+        "/app.js.br",
+        "/app.js.gz",
+        "/app.js.zst",
+        "/.git/config",
+    ]
+    .map(|path| http_request(&address, "GET", path));
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+
+    assert!(
+        redirect.starts_with("HTTP/1.1 308 Permanent Redirect"),
+        "{redirect}"
+    );
+    assert_response_contains_header(&redirect, "location", "/ordered/?x=1");
+    assert_eq!(response_body(&ordered), "php-index");
+    assert_eq!(response_body(&html), "html-only");
+    assert!(empty.starts_with("HTTP/1.1 404 Not Found"), "{empty}");
+    assert_eq!(response_body(&well_known), "well-known");
+    assert!(
+        nested_secret.starts_with("HTTP/1.1 404 Not Found"),
+        "{nested_secret}"
+    );
+    assert_eq!(response_body(&phtml), "phtml");
+    for response in hidden {
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"), "{response}");
+        assert!(!response.contains("must-not-be-public"), "{response}");
+    }
+}
+
+#[test]
+fn directory_without_index_is_terminal_before_front_controller() {
+    let docroot = temp_docroot();
+    fs::create_dir(docroot.join("empty")).expect("create empty directory");
+    fs::write(docroot.join("index.php"), "<?php echo 'front';").expect("write front controller");
+
+    for mode in ["dev", "immutable"] {
+        let mut child = start_server(
+            &docroot,
+            &["--front-controller", "index.php", "--deployment-mode", mode],
+        );
+        let address = read_listening_address(&mut child);
+        let directory = http_request(&address, "GET", "/empty/");
+        let missing = http_request(&address, "GET", "/actually-missing");
+        stop_child(child);
+
+        assert!(
+            directory.starts_with("HTTP/1.1 404 Not Found"),
+            "mode={mode} {directory}"
+        );
+        assert_eq!(response_body(&missing), "front", "mode={mode}");
+    }
+
+    fs::remove_dir_all(docroot).expect("remove front-controller docroot");
+}
+
+#[test]
+fn server_honors_custom_index_order_and_static_method_allow() {
+    let docroot = temp_docroot();
+    fs::create_dir(docroot.join("ordered")).expect("create ordered directory");
+    fs::write(docroot.join("ordered/index.php"), "<?php echo 'php-index';")
+        .expect("write PHP index");
+    fs::write(docroot.join("ordered/index.html"), "html-index").expect("write HTML index");
+    fs::write(docroot.join("asset.txt"), "asset").expect("write static fixture");
+    let mut child = start_server(&docroot, &["--index", "index.html,index.php"]);
+    let address = read_listening_address(&mut child);
+    let ordered = http_request(&address, "GET", "/ordered/");
+    let method = http_request(&address, "POST", "/asset.txt");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+
+    assert_eq!(response_body(&ordered), "html-index");
+    assert!(
+        method.starts_with("HTTP/1.1 405 Method Not Allowed"),
+        "{method}"
+    );
+    assert_response_contains_header(&method, "allow", "GET, HEAD");
+}
+
+#[test]
+fn server_static_http_selection_matrix_is_representation_consistent() {
+    let docroot = temp_docroot();
+    fs::write(docroot.join("asset.a1b2c3d4.txt"), "identity-bytes")
+        .expect("write identity fixture");
+    fs::write(docroot.join("asset.a1b2c3d4.txt.br"), "brotli-bytes").expect("write br fixture");
+    fs::write(docroot.join("asset.a1b2c3d4.txt.zst"), "zstd-bytes").expect("write zstd fixture");
+    fs::write(docroot.join("asset.a1b2c3d4.txt.gz"), "gzip-bytes").expect("write gzip fixture");
+    let mut child = start_server(&docroot, &["--deployment-mode", "immutable"]);
+    let address = read_listening_address(&mut child);
+    let path = "/asset.a1b2c3d4.txt";
+
+    let identity = http_request(&address, "GET", path);
+    let gzip_weighted = http_request_with_headers(
+        &address,
+        "GET",
+        path,
+        &[("Accept-Encoding", "gzip;q=1, br;q=0.2")],
+        "",
+    );
+    let tie = http_request_with_headers(
+        &address,
+        "GET",
+        path,
+        &[("Accept-Encoding", "br;q=1,zstd;q=1,gzip;q=1,identity;q=1")],
+        "",
+    );
+    let multiple_headers = http_request_with_headers(
+        &address,
+        "GET",
+        path,
+        &[
+            ("Accept-Encoding", "br;q=0"),
+            ("Accept-Encoding", "zstd;q=1"),
+        ],
+        "",
+    );
+    let unacceptable = http_request_with_headers(
+        &address,
+        "GET",
+        path,
+        &[("Accept-Encoding", "identity;q=0,br;q=0,zstd;q=0,gzip;q=0")],
+        "",
+    );
+    let etag = response_header_values(&identity, "etag")[0].to_string();
+    let not_modified = http_request_with_headers(
+        &address,
+        "GET",
+        path,
+        &[("If-None-Match", &format!("W/{etag}"))],
+        "",
+    );
+    let failed = http_request_with_headers(&address, "GET", path, &[("If-Match", "\"wrong\"")], "");
+    let ranged = http_request_with_headers(
+        &address,
+        "GET",
+        path,
+        &[("Range", "bytes=2-5"), ("If-Range", &etag)],
+        "",
+    );
+    let ignored_range = http_request_with_headers(
+        &address,
+        "GET",
+        path,
+        &[("Range", "bytes=2-5"), ("If-Range", "W/\"wrong\"")],
+        "",
+    );
+    let malformed =
+        http_request_with_headers(&address, "GET", path, &[("Range", "bytes=oops")], "");
+    let multiple_ranges =
+        http_request_with_headers(&address, "GET", path, &[("Range", "bytes=0-1,3-4")], "");
+    let unknown_range =
+        http_request_with_headers(&address, "GET", path, &[("Range", "items=0-1")], "");
+    let encoded_range = http_request_with_headers(
+        &address,
+        "GET",
+        path,
+        &[("Accept-Encoding", "gzip"), ("Range", "bytes=1-3")],
+        "",
+    );
+    let unsatisfiable =
+        http_request_with_headers(&address, "GET", path, &[("Range", "bytes=999-")], "");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+
+    assert_eq!(response_body(&identity), "identity-bytes");
+    assert_response_contains_header(&identity, "vary", "Accept-Encoding");
+    assert_response_contains_header(
+        &identity,
+        "cache-control",
+        "public, max-age=31536000, immutable",
+    );
+    assert_response_contains_header(&identity, "x-content-type-options", "nosniff");
+    assert_eq!(response_body(&gzip_weighted), "gzip-bytes");
+    assert_response_contains_header(&gzip_weighted, "content-encoding", "gzip");
+    assert_ne!(
+        response_header_values(&identity, "etag"),
+        response_header_values(&gzip_weighted, "etag")
+    );
+    assert_eq!(response_body(&tie), "brotli-bytes");
+    assert_response_contains_header(&tie, "content-encoding", "br");
+    assert_eq!(response_body(&multiple_headers), "zstd-bytes");
+    assert_response_contains_header(&multiple_headers, "content-encoding", "zstd");
+    assert!(
+        unacceptable.starts_with("HTTP/1.1 406 Not Acceptable"),
+        "{unacceptable}"
+    );
+    assert!(
+        not_modified.starts_with("HTTP/1.1 304 Not Modified"),
+        "{not_modified}"
+    );
+    assert_response_contains_header(&not_modified, "vary", "Accept-Encoding");
+    assert!(
+        failed.starts_with("HTTP/1.1 412 Precondition Failed"),
+        "{failed}"
+    );
+    assert_response_contains_header(&failed, "etag", &etag);
+    assert!(
+        ranged.starts_with("HTTP/1.1 206 Partial Content"),
+        "{ranged}"
+    );
+    assert_eq!(response_body(&ranged), "enti");
+    assert!(
+        ignored_range.starts_with("HTTP/1.1 200 OK"),
+        "{ignored_range}"
+    );
+    assert_eq!(response_body(&ignored_range), "identity-bytes");
+    assert!(malformed.starts_with("HTTP/1.1 200 OK"), "{malformed}");
+    assert!(
+        multiple_ranges.starts_with("HTTP/1.1 200 OK"),
+        "{multiple_ranges}"
+    );
+    assert!(
+        unknown_range.starts_with("HTTP/1.1 200 OK"),
+        "{unknown_range}"
+    );
+    assert!(
+        encoded_range.starts_with("HTTP/1.1 206 Partial Content"),
+        "{encoded_range}"
+    );
+    assert_response_contains_header(&encoded_range, "content-encoding", "gzip");
+    assert_response_contains_header(&encoded_range, "content-range", "bytes 1-3/10");
+    assert_eq!(response_body(&encoded_range), "zip");
+    assert!(
+        unsatisfiable.starts_with("HTTP/1.1 416 Range Not Satisfiable"),
+        "{unsatisfiable}"
+    );
+    assert_response_contains_header(&unsatisfiable, "content-range", "bytes */14");
+}
+
+#[test]
+fn immutable_static_index_rebuilds_and_uses_one_open_per_hit() {
+    let docroot = temp_docroot();
+    fs::write(docroot.join("first.txt"), "first").expect("write indexed fixture");
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--deployment-mode",
+            "immutable",
+            "--enable-cache-clear-endpoint",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let first = http_request(&address, "GET", "/first.txt");
+    fs::write(docroot.join("later.txt"), "later").expect("write post-start fixture");
+    let before = http_request(&address, "GET", "/later.txt");
+    let metrics_before = http_request(&address, "GET", "/__phrust/metrics");
+    let clear = http_request(&address, "POST", "/__phrust/cache/clear");
+    let after = http_request(&address, "GET", "/later.txt");
+    let metrics_after = http_request(&address, "GET", "/__phrust/metrics");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+
+    assert_eq!(response_body(&first), "first");
+    assert!(before.starts_with("HTTP/1.1 404 Not Found"), "{before}");
+    assert!(
+        metrics_before.contains("phrust_server_static_capability_opens_total 1"),
+        "{metrics_before}"
+    );
+    assert!(clear.starts_with("HTTP/1.1 200 OK"), "{clear}");
+    assert_eq!(response_body(&after), "later");
+    assert!(
+        metrics_after.contains("phrust_server_static_capability_opens_total 2"),
+        "{metrics_after}"
+    );
+    assert!(
+        metrics_after.contains("phrust_server_static_index_builds_total 2"),
+        "{metrics_after}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn immutable_static_index_terminates_symlink_loops_before_readiness() {
+    use std::os::unix::{fs::symlink, net::UnixListener};
+
+    let docroot = temp_docroot();
+    fs::write(docroot.join("stable.txt"), "stable").expect("write loop fixture");
+    fs::write(docroot.join(".env"), "hidden").expect("write hidden index fixture");
+    fs::create_dir(docroot.join("nested")).expect("create loop directory");
+    symlink("..", docroot.join("nested/loop")).expect("create directory symlink loop");
+    symlink("stable.txt", docroot.join("internal.txt")).expect("create internal index symlink");
+    let outside = docroot.with_extension("immutable-outside");
+    fs::write(&outside, "outside-secret").expect("write outside index fixture");
+    symlink(&outside, docroot.join("outside.txt")).expect("create outside index symlink");
+    let fifo = docroot.join("pipe.txt");
+    let status = Proc::new("mkfifo").arg(&fifo).status().expect("run mkfifo");
+    assert!(status.success(), "mkfifo failed with {status}");
+    let socket = UnixListener::bind(docroot.join("socket.txt")).expect("bind index socket fixture");
+
+    let mut child = start_server(&docroot, &["--deployment-mode", "immutable"]);
+    let address = read_listening_address(&mut child);
+    let stable = http_request(&address, "GET", "/stable.txt");
+    let internal = http_request(&address, "GET", "/internal.txt");
+    let hidden = http_request(&address, "GET", "/.env");
+    let escaped = http_request(&address, "GET", "/outside.txt");
+    let fifo = http_request(&address, "GET", "/pipe.txt");
+    let socket_response = http_request(&address, "GET", "/socket.txt");
+
+    stop_child(child);
+    drop(socket);
+    fs::remove_dir_all(docroot).expect("remove loop docroot");
+    fs::remove_file(outside).expect("remove outside index fixture");
+
+    assert_eq!(response_body(&stable), "stable");
+    assert_eq!(response_body(&internal), "stable");
+    for response in [hidden, escaped, fifo, socket_response] {
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"), "{response}");
+        assert!(!response.contains("outside-secret"), "{response}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn immutable_static_index_failure_exits_without_readiness() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let docroot = temp_docroot();
+    fs::write(docroot.join(OsString::from_vec(vec![0xff])), "invalid-name")
+        .expect("write invalid startup fixture");
+    let mut child = start_server(&docroot, &["--deployment-mode", "immutable"]);
+
+    let status = wait_for_exit(&mut child, Duration::from_secs(5));
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .expect("startup stdout")
+        .read_to_string(&mut stdout)
+        .expect("read startup stdout");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("startup stderr")
+        .read_to_string(&mut stderr)
+        .expect("read startup stderr");
+    fs::remove_dir_all(docroot).expect("remove invalid startup docroot");
+
+    assert!(
+        !status.success(),
+        "immutable startup unexpectedly succeeded"
+    );
+    assert!(!stdout.contains("listening "), "{stdout}");
+    assert!(
+        stderr.contains("static index entry under `.` is not UTF-8"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_immutable_rebuild_keeps_the_previous_index_active() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let docroot = temp_docroot();
+    fs::write(docroot.join("stable.txt"), "stable").expect("write stable fixture");
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--deployment-mode",
+            "immutable",
+            "--enable-cache-clear-endpoint",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let before = http_request(&address, "GET", "/stable.txt");
+    fs::write(docroot.join(OsString::from_vec(vec![0xff])), "invalid-name")
+        .expect("write non-UTF8 rebuild fixture");
+    let clear = http_request(&address, "POST", "/__phrust/cache/clear");
+    let after = http_request(&address, "GET", "/stable.txt");
+    let metrics = http_request(&address, "GET", "/__phrust/metrics");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+
+    assert_eq!(response_body(&before), "stable");
+    assert!(
+        clear.starts_with("HTTP/1.1 500 Internal Server Error"),
+        "{clear}"
+    );
+    assert_eq!(response_body(&after), "stable");
+    assert!(
+        metrics.contains("phrust_server_static_index_build_failures_total 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phrust_server_static_index_builds_total 1"),
+        "{metrics}"
+    );
 }
 
 #[test]
@@ -761,7 +1250,7 @@ fn server_debug_log_contains_request_failure_diagnostics_without_secrets() {
 
     assert!(missing.starts_with("HTTP/1.1 404 Not Found"), "{missing}");
     assert!(
-        forbidden.starts_with("HTTP/1.1 403 Forbidden"),
+        forbidden.starts_with("HTTP/1.1 404 Not Found"),
         "{forbidden}"
     );
     assert!(
@@ -772,7 +1261,7 @@ fn server_debug_log_contains_request_failure_diagnostics_without_secrets() {
         log.contains("E_PHP_SERVER_SCRIPT_RESOLUTION_FAILED"),
         "{log}"
     );
-    assert!(log.contains("E_PHP_SERVER_OUTSIDE_DOCUMENT_ROOT"), "{log}");
+    assert!(!log.contains("E_PHP_SERVER_OUTSIDE_DOCUMENT_ROOT"), "{log}");
     assert!(log.contains("E_PHP_REQUEST_BODY_PARSE_FAILED"), "{log}");
     assert!(log.contains("\"method\":\"GET\""), "{log}");
     assert!(
@@ -959,6 +1448,354 @@ async fn php_flush_makes_first_chunk_visible_over_http3() {
         first_elapsed < Duration::from_millis(400),
         "first H3 chunk arrived only after script delay: {first_elapsed:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn static_semantics_match_over_http1_http2_and_http3() {
+    let docroot = temp_docroot();
+    fs::write(docroot.join("asset.a1b2c3d4.txt"), vec![b'x'; 192 * 1024])
+        .expect("write large identity fixture");
+    fs::write(
+        docroot.join("asset.a1b2c3d4.txt.br"),
+        vec![b'b'; 192 * 1024],
+    )
+    .expect("write large br fixture");
+    fs::write(docroot.join("asset.a1b2c3d4.txt.zst"), "zstd").expect("write zstd fixture");
+    fs::write(docroot.join("asset.a1b2c3d4.txt.gz"), "gzip").expect("write gzip fixture");
+    fs::create_dir(docroot.join("html")).expect("create HTML index directory");
+    fs::write(docroot.join("html/index.html"), "html-index").expect("write HTML index");
+    fs::create_dir(docroot.join("php")).expect("create PHP index directory");
+    fs::write(docroot.join("php/index.php"), "<?php echo 'php-index';").expect("write PHP index");
+    fs::write(docroot.join(".env"), "secret").expect("write hidden fixture");
+    #[cfg(unix)]
+    let outside = {
+        let outside = docroot.with_extension("h2-h3-outside");
+        fs::write(&outside, "outside-secret").expect("write outside protocol fixture");
+        std::os::unix::fs::symlink(&outside, docroot.join("outside.txt"))
+            .expect("create outside protocol symlink");
+        outside
+    };
+    let (cert, key) = tls_fixture_paths();
+    let cert_arg = cert.to_string_lossy().to_string();
+    let key_arg = key.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--tls-cert",
+            &cert_arg,
+            "--tls-key",
+            &key_arg,
+            "--enable-http3",
+            "--deployment-mode",
+            "immutable",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let path = "/asset.a1b2c3d4.txt";
+
+    let identity = protocol_request_set(&address, hyper::Method::GET, path, &[]).await;
+    for response in &identity {
+        assert_eq!(response.status, hyper::StatusCode::OK);
+        assert_eq!(response.body().len(), 192 * 1024);
+        assert!(response.chunks.len() >= 2, "{response:?}");
+        assert_eq!(
+            response.header(hyper::header::X_CONTENT_TYPE_OPTIONS),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response.header(hyper::header::CACHE_CONTROL),
+            Some("public, max-age=31536000, immutable")
+        );
+        assert_eq!(
+            response.header(hyper::header::VARY),
+            Some("Accept-Encoding")
+        );
+    }
+    let etag = identity[0]
+        .header(hyper::header::ETAG)
+        .expect("H2 ETag")
+        .to_owned();
+    assert_eq!(identity[1].header(hyper::header::ETAG), Some(etag.as_str()));
+
+    let head = protocol_request_set(&address, hyper::Method::HEAD, path, &[]).await;
+    for response in &head {
+        assert_eq!(response.status, hyper::StatusCode::OK);
+        assert!(response.body().is_empty());
+        assert_eq!(
+            response.header(hyper::header::CONTENT_LENGTH),
+            Some((192 * 1024).to_string().as_str())
+        );
+        assert_eq!(
+            response.header(hyper::header::X_CONTENT_TYPE_OPTIONS),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response.header(hyper::header::VARY),
+            Some("Accept-Encoding")
+        );
+    }
+
+    for (coding, body) in [("zstd", b"zstd".as_slice()), ("gzip", b"gzip")] {
+        let responses = protocol_request_set(
+            &address,
+            hyper::Method::GET,
+            path,
+            &[("accept-encoding", coding)],
+        )
+        .await;
+        for response in responses {
+            assert_eq!(response.status, hyper::StatusCode::OK);
+            assert_eq!(
+                response.header(hyper::header::CONTENT_ENCODING),
+                Some(coding)
+            );
+            assert_eq!(
+                response.header(hyper::header::X_CONTENT_TYPE_OPTIONS),
+                Some("nosniff")
+            );
+            assert_eq!(
+                response.header(hyper::header::VARY),
+                Some("Accept-Encoding")
+            );
+            assert_eq!(response.body(), body);
+        }
+    }
+    let brotli = protocol_request_set(
+        &address,
+        hyper::Method::GET,
+        path,
+        &[("accept-encoding", "br")],
+    )
+    .await;
+    for response in brotli {
+        assert_eq!(response.status, hyper::StatusCode::OK);
+        assert_eq!(response.header(hyper::header::CONTENT_ENCODING), Some("br"));
+        assert_eq!(response.body().len(), 192 * 1024);
+        assert!(response.chunks.len() >= 2, "{response:?}");
+    }
+
+    let range = protocol_request_set(
+        &address,
+        hyper::Method::GET,
+        path,
+        &[("range", "bytes=2-5"), ("if-range", &etag)],
+    )
+    .await;
+    for response in range {
+        assert_eq!(response.status, hyper::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.body(), b"xxxx");
+        assert_eq!(
+            response.header(hyper::header::CONTENT_RANGE),
+            Some("bytes 2-5/196608")
+        );
+        assert_eq!(
+            response.header(hyper::header::X_CONTENT_TYPE_OPTIONS),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response.header(hyper::header::VARY),
+            Some("Accept-Encoding")
+        );
+    }
+
+    let not_modified = protocol_request_set(
+        &address,
+        hyper::Method::GET,
+        path,
+        &[("if-none-match", &etag)],
+    )
+    .await;
+    let failed = protocol_request_set(
+        &address,
+        hyper::Method::GET,
+        path,
+        &[("if-match", "\"wrong\"")],
+    )
+    .await;
+    let unsatisfiable = protocol_request_set(
+        &address,
+        hyper::Method::GET,
+        path,
+        &[("range", "bytes=999999-")],
+    )
+    .await;
+    let unacceptable = protocol_request_set(
+        &address,
+        hyper::Method::GET,
+        path,
+        &[("accept-encoding", "identity;q=0,br;q=0,zstd;q=0,gzip;q=0")],
+    )
+    .await;
+    let redirect = protocol_request_set(&address, hyper::Method::GET, "/html?x=1", &[]).await;
+    let html = protocol_request_set(&address, hyper::Method::GET, "/html/", &[]).await;
+    let php = protocol_request_set(&address, hyper::Method::GET, "/php/", &[]).await;
+    let hidden = protocol_request_set(&address, hyper::Method::GET, "/.env", &[]).await;
+    #[cfg(unix)]
+    let escaped = protocol_request_set(&address, hyper::Method::GET, "/outside.txt", &[]).await;
+    let if_range_mismatch = protocol_request_set(
+        &address,
+        hyper::Method::GET,
+        path,
+        &[("range", "bytes=2-5"), ("if-range", "\"wrong\"")],
+    )
+    .await;
+
+    stop_child(child);
+    let mut dev_child = start_server(
+        &docroot,
+        &[
+            "--tls-cert",
+            &cert_arg,
+            "--tls-key",
+            &key_arg,
+            "--enable-http3",
+            "--deployment-mode",
+            "dev",
+        ],
+    );
+    let dev_address = read_listening_address(&mut dev_child);
+    let dev = protocol_request_set(&dev_address, hyper::Method::GET, path, &[]).await;
+    stop_child(dev_child);
+
+    for response in not_modified {
+        assert_eq!(response.status, hyper::StatusCode::NOT_MODIFIED);
+        assert!(response.body().is_empty());
+        assert_eq!(
+            response.header(hyper::header::VARY),
+            Some("Accept-Encoding")
+        );
+        assert_eq!(
+            response.header(hyper::header::X_CONTENT_TYPE_OPTIONS),
+            Some("nosniff")
+        );
+    }
+    for response in failed {
+        assert_eq!(response.status, hyper::StatusCode::PRECONDITION_FAILED);
+        assert!(response.body().is_empty());
+        assert_eq!(
+            response.header(hyper::header::VARY),
+            Some("Accept-Encoding")
+        );
+        assert_eq!(
+            response.header(hyper::header::X_CONTENT_TYPE_OPTIONS),
+            Some("nosniff")
+        );
+    }
+    for response in unsatisfiable {
+        assert_eq!(response.status, hyper::StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.header(hyper::header::CONTENT_RANGE),
+            Some("bytes */196608")
+        );
+        assert_eq!(
+            response.header(hyper::header::VARY),
+            Some("Accept-Encoding")
+        );
+        assert_eq!(
+            response.header(hyper::header::X_CONTENT_TYPE_OPTIONS),
+            Some("nosniff")
+        );
+    }
+    for response in unacceptable {
+        assert_eq!(response.status, hyper::StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(
+            response.header(hyper::header::VARY),
+            Some("Accept-Encoding")
+        );
+        assert_eq!(
+            response.header(hyper::header::X_CONTENT_TYPE_OPTIONS),
+            Some("nosniff")
+        );
+    }
+    for response in redirect {
+        assert_eq!(response.status, hyper::StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(response.header(hyper::header::LOCATION), Some("/html/?x=1"));
+    }
+    for response in html {
+        assert_eq!(response.status, hyper::StatusCode::OK);
+        assert_eq!(response.body(), b"html-index");
+        assert_eq!(
+            response.header(hyper::header::CACHE_CONTROL),
+            Some("no-cache")
+        );
+        assert_eq!(
+            response.header(hyper::header::X_CONTENT_TYPE_OPTIONS),
+            Some("nosniff")
+        );
+    }
+    for response in php {
+        assert_eq!(response.status, hyper::StatusCode::OK);
+        assert_eq!(response.body(), b"php-index");
+    }
+    for response in hidden {
+        assert_eq!(response.status, hyper::StatusCode::NOT_FOUND);
+        assert!(!response.body().windows(6).any(|window| window == b"secret"));
+    }
+    #[cfg(unix)]
+    for response in escaped {
+        assert_eq!(response.status, hyper::StatusCode::NOT_FOUND);
+        assert!(
+            !response
+                .body()
+                .windows(b"outside-secret".len())
+                .any(|window| window == b"outside-secret")
+        );
+    }
+    for response in if_range_mismatch {
+        assert_eq!(response.status, hyper::StatusCode::OK);
+        assert_eq!(response.body().len(), 192 * 1024);
+    }
+    for response in dev {
+        assert_eq!(response.status, hyper::StatusCode::OK);
+        assert_eq!(
+            response.header(hyper::header::CACHE_CONTROL),
+            Some("no-cache")
+        );
+        assert!(
+            response
+                .header(hyper::header::ETAG)
+                .is_some_and(|etag| etag.starts_with("W/"))
+        );
+    }
+
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+    #[cfg(unix)]
+    fs::remove_file(outside).expect("remove outside protocol fixture");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn static_client_aborts_finalize_over_http1_http2_and_http3() {
+    let docroot = temp_docroot();
+    let large = fs::File::create(docroot.join("large.bin")).expect("create abort fixture");
+    large
+        .set_len(256 * 1024 * 1024)
+        .expect("size abort fixture");
+    let (cert, key) = tls_fixture_paths();
+    let cert_arg = cert.to_string_lossy().to_string();
+    let key_arg = key.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--tls-cert",
+            &cert_arg,
+            "--tls-key",
+            &key_arg,
+            "--enable-http3",
+            "--deployment-mode",
+            "immutable",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+
+    abort_http1_response(&address, "/large.bin").await;
+    wait_for_metric_value(&address, "phrust_server_transfers_aborted_total", 1).await;
+    abort_http2_response(&address, "/large.bin").await;
+    wait_for_metric_value(&address, "phrust_server_transfers_aborted_total", 2).await;
+    abort_http3_response(&address, "/large.bin").await;
+    wait_for_metric_value(&address, "phrust_server_transfers_aborted_total", 3).await;
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove abort docroot");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1468,7 +2305,16 @@ fn non_session_request_with_session_cookie_does_not_load_session_store() {
         &[("Cookie", "PHPSESSID=session-secret")],
         "",
     );
-    let metrics = http_request(&address, "GET", "/__phrust/metrics");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let metrics = loop {
+        let metrics = http_request(&address, "GET", "/__phrust/metrics");
+        if metrics.contains("phrust_server_session_finalize_skipped_inactive_total 1\n")
+            || Instant::now() >= deadline
+        {
+            break metrics;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
 
     stop_child(child);
 
@@ -1974,8 +2820,111 @@ fn server_rejects_symlink_escape_from_docroot() {
     fs::remove_dir_all(docroot).expect("remove temp docroot");
     fs::remove_file(outside).expect("remove outside file");
 
-    assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
-    assert_eq!(response_body(&response), "forbidden\n");
+    assert!(response.starts_with("HTTP/1.1 404 Not Found"), "{response}");
+    assert_eq!(response_body(&response), "not found\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn server_static_capability_blocks_special_files_and_symlink_swap_races() {
+    use std::os::unix::{fs::symlink, net::UnixListener};
+
+    let docroot = temp_docroot();
+    let inside = docroot.join("inside.txt");
+    fs::write(&inside, "public").expect("write internal target");
+    let outside = docroot.with_extension("outside-static");
+    fs::write(&outside, "EXTERNAL-SECRET").expect("write external target");
+    symlink("inside.txt", docroot.join("internal-link.txt")).expect("create internal symlink");
+    symlink(&outside, docroot.join("external-link.txt")).expect("create external symlink");
+    let fifo = docroot.join("pipe.txt");
+    let status = Proc::new("mkfifo").arg(&fifo).status().expect("run mkfifo");
+    assert!(status.success(), "mkfifo failed with {status}");
+    let socket_path = docroot.join("socket.txt");
+    let socket = UnixListener::bind(&socket_path).expect("bind Unix socket fixture");
+    let race_path = docroot.join("race.txt");
+    symlink(&inside, &race_path).expect("create initial race symlink");
+
+    let mut child = start_server(&docroot, &[]);
+    let address = read_listening_address(&mut child);
+    let internal = http_request(&address, "GET", "/internal-link.txt");
+    let external = http_request(&address, "GET", "/external-link.txt");
+    let fifo_response = http_request(&address, "GET", "/pipe.txt");
+    let socket_response = http_request(&address, "GET", "/socket.txt");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let swap_stop = Arc::clone(&stop);
+    let swap_outside = outside.clone();
+    let swap_path = race_path.clone();
+    let swapper = std::thread::spawn(move || {
+        while !swap_stop.load(Ordering::Relaxed) {
+            let _ = fs::remove_file(&swap_path);
+            let _ = symlink(&swap_outside, &swap_path);
+            std::thread::yield_now();
+            let _ = fs::remove_file(&swap_path);
+            let _ = symlink("inside.txt", &swap_path);
+        }
+    });
+    for _ in 0..64 {
+        let response = http_request(&address, "GET", "/race.txt");
+        assert!(!response.contains("EXTERNAL-SECRET"), "{response}");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK")
+                || response.starts_with("HTTP/1.1 404 Not Found")
+                || response.starts_with("HTTP/1.1 308 Permanent Redirect"),
+            "{response}"
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
+    swapper.join().expect("join symlink swapper");
+
+    stop_child(child);
+    drop(socket);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+    fs::remove_file(outside).expect("remove outside file");
+
+    assert_eq!(response_body(&internal), "public");
+    assert!(external.starts_with("HTTP/1.1 404 Not Found"), "{external}");
+    assert!(
+        fifo_response.starts_with("HTTP/1.1 404 Not Found"),
+        "{fifo_response}"
+    );
+    assert!(
+        socket_response.starts_with("HTTP/1.1 404 Not Found"),
+        "{socket_response}"
+    );
+}
+
+#[test]
+fn server_rejects_unsafe_uri_paths_without_double_decoding() {
+    let docroot = temp_docroot();
+    fs::write(docroot.join("%2f.txt"), "single-decode").expect("write double-encoding fixture");
+    let mut child = start_server(&docroot, &[]);
+    let address = read_listening_address(&mut child);
+
+    for path in [
+        "/../secret",
+        "/%2e%2e/secret",
+        "/bad%2fname",
+        "/bad%5cname",
+        "/bad\\name",
+        "/bad%00name",
+        "/bad%1fname",
+        "/bad%xxname",
+        "//absolute",
+        "/C:/prefix",
+    ] {
+        let response = http_request(&address, "GET", path);
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "path={path} response={response}"
+        );
+    }
+    let double_encoded = http_request(&address, "GET", "/%252f.txt");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove temp docroot");
+
+    assert_eq!(response_body(&double_encoded), "single-decode");
 }
 
 #[test]
@@ -2612,6 +3561,247 @@ async fn http2_get(address: &str, path: &str) -> (hyper::StatusCode, Vec<Vec<u8>
     )
 }
 
+#[derive(Debug)]
+struct ProtocolResponse {
+    status: hyper::StatusCode,
+    headers: hyper::HeaderMap,
+    chunks: Vec<Vec<u8>>,
+}
+
+impl ProtocolResponse {
+    fn body(&self) -> Vec<u8> {
+        self.chunks.concat()
+    }
+
+    fn header(&self, name: hyper::header::HeaderName) -> Option<&str> {
+        self.headers.get(name).and_then(|value| value.to_str().ok())
+    }
+}
+
+async fn protocol_request_set(
+    address: &str,
+    method: hyper::Method,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> [ProtocolResponse; 3] {
+    let h1 = http1_request(address, method.clone(), path, headers).await;
+    let h2 = http2_request(address, method.clone(), path, headers).await;
+    let h3 = http3_request(address, method, path, headers).await;
+    [h1, h2, h3]
+}
+
+async fn http1_request(
+    address: &str,
+    method: hyper::Method,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> ProtocolResponse {
+    use http_body_util::{BodyExt, Empty};
+    use hyper_util::rt::TokioIo;
+
+    let tcp = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect H1 test client");
+    let connector =
+        tokio_rustls::TlsConnector::from(Arc::new(test_client_config(vec![b"http/1.1".to_vec()])));
+    let tls = connector
+        .connect(
+            rustls_pki_types::ServerName::try_from("localhost").expect("valid test server name"),
+            tcp,
+        )
+        .await
+        .expect("connect H1 TLS");
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .expect("perform H1 handshake");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut request = hyper::Request::builder()
+        .method(method)
+        .uri(format!("https://localhost{path}"));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = sender
+        .send_request(
+            request
+                .body(Empty::<bytes::Bytes>::new())
+                .expect("build H1 request"),
+        )
+        .await
+        .expect("send H1 request");
+    let (parts, mut body) = response.into_parts();
+    let mut chunks = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.expect("receive H1 response frame");
+        if let Ok(data) = frame.into_data()
+            && !data.is_empty()
+        {
+            chunks.push(data.to_vec());
+        }
+    }
+    ProtocolResponse {
+        status: parts.status,
+        headers: parts.headers,
+        chunks,
+    }
+}
+
+async fn http2_request(
+    address: &str,
+    method: hyper::Method,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> ProtocolResponse {
+    use http_body_util::{BodyExt, Empty};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let tcp = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect H2 test client");
+    let connector =
+        tokio_rustls::TlsConnector::from(Arc::new(test_client_config(vec![b"h2".to_vec()])));
+    let tls = connector
+        .connect(
+            rustls_pki_types::ServerName::try_from("localhost").expect("valid test server name"),
+            tcp,
+        )
+        .await
+        .expect("connect H2 TLS");
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .expect("perform H2 handshake");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut request = hyper::Request::builder()
+        .method(method)
+        .uri(format!("https://localhost{path}"));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = sender
+        .send_request(
+            request
+                .body(Empty::<bytes::Bytes>::new())
+                .expect("build H2 request"),
+        )
+        .await
+        .expect("send H2 request");
+    let (parts, mut body) = response.into_parts();
+    let mut chunks = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.expect("receive H2 response frame");
+        if let Ok(data) = frame.into_data()
+            && !data.is_empty()
+        {
+            chunks.push(data.to_vec());
+        }
+    }
+    ProtocolResponse {
+        status: parts.status,
+        headers: parts.headers,
+        chunks,
+    }
+}
+
+async fn abort_http1_response(address: &str, path: &str) {
+    use http_body_util::{BodyExt, Empty};
+    use hyper_util::rt::TokioIo;
+
+    let tcp = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect abort H1 client");
+    let connector =
+        tokio_rustls::TlsConnector::from(Arc::new(test_client_config(vec![b"http/1.1".to_vec()])));
+    let tls = connector
+        .connect(
+            rustls_pki_types::ServerName::try_from("localhost").expect("valid test server name"),
+            tcp,
+        )
+        .await
+        .expect("connect abort H1 TLS");
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .expect("perform abort H1 handshake");
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = hyper::Request::builder()
+        .uri(format!("https://localhost{path}"))
+        .body(Empty::<bytes::Bytes>::new())
+        .expect("build abort H1 request");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("send abort H1 request");
+    let mut body = response.into_body();
+    loop {
+        let frame = body
+            .frame()
+            .await
+            .expect("abort H1 response has a frame")
+            .expect("receive abort H1 response frame");
+        if frame.data_ref().is_some_and(|data| !data.is_empty()) {
+            break;
+        }
+    }
+    drop(body);
+    drop(sender);
+    connection_task.abort();
+    let _ = connection_task.await;
+}
+
+async fn abort_http2_response(address: &str, path: &str) {
+    use http_body_util::{BodyExt, Empty};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let tcp = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect abort H2 client");
+    let connector =
+        tokio_rustls::TlsConnector::from(Arc::new(test_client_config(vec![b"h2".to_vec()])));
+    let tls = connector
+        .connect(
+            rustls_pki_types::ServerName::try_from("localhost").expect("valid test server name"),
+            tcp,
+        )
+        .await
+        .expect("connect abort H2 TLS");
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .expect("perform abort H2 handshake");
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = hyper::Request::builder()
+        .uri(format!("https://localhost{path}"))
+        .body(Empty::<bytes::Bytes>::new())
+        .expect("build abort H2 request");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("send abort H2 request");
+    let mut body = response.into_body();
+    loop {
+        let frame = body
+            .frame()
+            .await
+            .expect("abort H2 response has a frame")
+            .expect("receive abort H2 response frame");
+        if frame.data_ref().is_some_and(|data| !data.is_empty()) {
+            break;
+        }
+    }
+    drop(body);
+    drop(sender);
+    connection_task.abort();
+    let _ = connection_task.await;
+}
+
 async fn http3_get(address: &str, path: &str) -> (hyper::StatusCode, Vec<Vec<u8>>, Duration) {
     use bytes::Buf;
     use quinn::crypto::rustls::QuicClientConfig;
@@ -2662,6 +3852,138 @@ async fn http3_get(address: &str, path: &str) -> (hyper::StatusCode, Vec<Vec<u8>
         chunks,
         first_elapsed.expect("H3 response has a data frame"),
     )
+}
+
+async fn http3_request(
+    address: &str,
+    method: hyper::Method,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> ProtocolResponse {
+    use bytes::Buf;
+    use quinn::crypto::rustls::QuicClientConfig;
+
+    let mut crypto = test_client_config(vec![b"h3".to_vec()]);
+    crypto.enable_early_data = true;
+    let client_config = quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(crypto).expect("build QUIC client config"),
+    ));
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind address"))
+        .expect("create QUIC client endpoint");
+    endpoint.set_default_client_config(client_config);
+    let connection = endpoint
+        .connect(address.parse().expect("server socket address"), "localhost")
+        .expect("start QUIC connection")
+        .await
+        .expect("connect QUIC client");
+    let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .expect("create H3 client");
+    let driver_task = tokio::spawn(async move { driver.wait_idle().await });
+    let mut request = hyper::Request::builder()
+        .method(method)
+        .uri(format!("https://localhost{path}"));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let mut stream = sender
+        .send_request(request.body(()).expect("build H3 request"))
+        .await
+        .expect("send H3 request");
+    stream.finish().await.expect("finish H3 request");
+    let response = stream.recv_response().await.expect("receive H3 response");
+    let (parts, ()) = response.into_parts();
+    let mut chunks = Vec::new();
+    while let Some(mut data) = stream.recv_data().await.expect("receive H3 data") {
+        let mut chunk = Vec::with_capacity(data.remaining());
+        while data.has_remaining() {
+            chunk.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+        }
+        if !chunk.is_empty() {
+            chunks.push(chunk);
+        }
+    }
+    drop(sender);
+    endpoint.close(quinn::VarInt::from_u32(0), b"test complete");
+    let _ = driver_task.await;
+    ProtocolResponse {
+        status: parts.status,
+        headers: parts.headers,
+        chunks,
+    }
+}
+
+async fn abort_http3_response(address: &str, path: &str) {
+    use bytes::Buf;
+    use quinn::crypto::rustls::QuicClientConfig;
+
+    let mut crypto = test_client_config(vec![b"h3".to_vec()]);
+    crypto.enable_early_data = true;
+    let client_config = quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(crypto).expect("build abort QUIC client config"),
+    ));
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind address"))
+        .expect("create abort QUIC client endpoint");
+    endpoint.set_default_client_config(client_config);
+    let connection = endpoint
+        .connect(address.parse().expect("server socket address"), "localhost")
+        .expect("start abort QUIC connection")
+        .await
+        .expect("connect abort QUIC client");
+    let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .expect("create abort H3 client");
+    let driver_task = tokio::spawn(async move { driver.wait_idle().await });
+    let request = hyper::Request::builder()
+        .uri(format!("https://localhost{path}"))
+        .body(())
+        .expect("build abort H3 request");
+    let mut stream = sender
+        .send_request(request)
+        .await
+        .expect("send abort H3 request");
+    stream.finish().await.expect("finish abort H3 request");
+    stream
+        .recv_response()
+        .await
+        .expect("receive abort H3 response");
+    let data = stream
+        .recv_data()
+        .await
+        .expect("receive abort H3 data")
+        .expect("abort H3 response has data");
+    assert!(data.has_remaining(), "abort H3 data frame is empty");
+    stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+    drop(stream);
+    drop(sender);
+    endpoint.close(quinn::VarInt::from_u32(0), b"static response aborted");
+    driver_task.abort();
+    let _ = driver_task.await;
+}
+
+async fn wait_for_metric_value(address: &str, metric: &str, expected: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = http2_request(address, hyper::Method::GET, "/__phrust/metrics", &[]).await;
+        let body = String::from_utf8(response.body()).expect("metrics response is UTF-8");
+        let value = body
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(' ')?;
+                (name == metric)
+                    .then(|| value.parse::<u64>().ok())
+                    .flatten()
+            })
+            .unwrap_or_default();
+        if value >= expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "metric {metric} remained {value}, expected at least {expected}: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn http3_post_status(address: &str, path: &str, body: &[u8]) -> hyper::StatusCode {

@@ -179,7 +179,9 @@ to warm application graphs without executing application code. Blank lines and
 
 Local cache invalidation is disabled by default. When explicitly enabled with
 `--enable-cache-clear-endpoint`, `POST /__phrust/cache/clear` clears process
-local entry-script and include caches, and the handler still rejects
+local entry-script and include caches. In `deployment_mode = "immutable"` it
+first builds and atomically publishes a replacement static-asset index. A
+failed rebuild leaves the previous index active. The handler still rejects
 non-loopback peers. There is no remote or cross-process invalidation protocol.
 
 Metrics expose script cache lookups, hits, misses, source reads, metadata stats,
@@ -189,31 +191,45 @@ under `/__phrust/metrics`.
 
 ## Static File Responses
 
-Static files are served with Tokio file I/O and Hyper streaming bodies instead
-of whole-file `std::fs::read` response construction. `HEAD` responses preserve
-the same metadata headers and accurate `Content-Length` without streaming a
-body.
+The document root is opened once as a filesystem capability. Request paths are
+decoded segment by segment, and static resolution opens files only relative to
+that capability. The regular-file metadata check and streaming use the same
+opened handle; the response path does not canonicalize, stat, and reopen an
+ambient pathname. Tokio and Hyper stream that handle without whole-file body
+collection. `HEAD` preserves the GET metadata and length without a body.
 
-Each static response includes `Accept-Ranges: bytes`, a weak `ETag`, and
-`Last-Modified` when the filesystem exposes modification time. The weak ETag is
-deterministically derived from file size and mtime; on Unix platforms it also
-includes the inode. The inode component is intentionally best-effort and
-platform-specific, so ETags are stable within one platform/filesystem but are
-not a cross-platform artifact format.
+The public-file policy returns 404 for dotfiles except first-segment
+`.well-known`, VCS/secret metadata, backup/editor files, non-configured
+PHP-source suffixes, special files, and directly addressed `.br`, `.zst`, or
+`.gz` sidecars. `php_extensions` (default `php`) controls executable suffixes.
+Directories redirect to a trailing slash with 308 and then try the ordered
+`index` list, which defaults to `index.php,index.html`; there is no autoindex.
 
-The server honors `If-None-Match` before `If-Modified-Since` and returns
-`304 Not Modified` for matching validators. Single byte ranges such as
-`Range: bytes=0-99`, open-ended ranges, and suffix ranges are supported.
-Invalid, unsatisfiable, or multiple ranges are rejected with
-`416 Range Not Satisfiable` and a `Content-Range: bytes */<length>` header.
+MIME types come from `mime_guess` with web-specific text, JavaScript, JSON, and
+WebAssembly overrides. Static responses include `X-Content-Type-Options:
+nosniff`. `Accept-Encoding` evaluates all header instances, q-values, wildcard,
+and identity, with equal-quality preference `br > zstd > gzip > identity`.
+Sidecars are representations of the identity URL only, and negotiated resources
+consistently send `Vary: Accept-Encoding`. No dynamic compression is performed.
 
-When `Accept-Encoding` allows a precompressed sidecar and a safe in-docroot
-`<path>.br`, `<path>.zst`, or `<path>.gz` file exists, the server streams that
-file with `Content-Encoding` and `Vary: Accept-Encoding` while retaining the
-original path's content type. No dynamic compression is performed.
+Preconditions run in HTTP order: `If-Match`, `If-Unmodified-Since`,
+`If-None-Match`, then `If-Modified-Since`. A matching strong `If-Range` enables
+a single byte range on the selected representation. Valid ranges return 206;
+only a syntactically valid but wholly unsatisfiable range returns 416. Malformed,
+unknown-unit, overflowed, and multi-range requests are ignored and return the
+full 200 representation. Range on HEAD is ignored.
 
-Metrics expose streamed static bytes, `304` responses, `206` responses, and
-precompressed static hits under `/__phrust/metrics`.
+In the default `dev` deployment mode every static request observes capability
+handle metadata, uses a weak ETag, and sends `Cache-Control: no-cache`.
+`immutable` builds a capability-relative asset index before readiness, uses one
+capability open per indexed static response and strong ETags, sends `no-cache`
+for HTML, one-year immutable caching for fingerprinted assets, and one-hour
+caching for other assets. This mode declares release files unchanged until
+restart or cache clear.
+
+Metrics expose emitted static bytes, validator/range/encoding outcomes,
+capability opens, policy denials, mutable resolutions, and immutable-index
+build/hit/miss counters under `/__phrust/metrics`.
 
 ## Production Server Configuration
 
@@ -227,7 +243,9 @@ Example:
 ```toml
 listen = "127.0.0.1:8080"
 docroot = "public"
-index = "index.php"
+index = "index.php,index.html"
+php_extensions = "php"
+deployment_mode = "immutable"
 front_controller = "index.php"
 max_body_bytes = 1048576
 upload_temp_dir = "/var/tmp/phrust-uploads"

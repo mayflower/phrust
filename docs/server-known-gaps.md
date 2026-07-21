@@ -39,8 +39,10 @@ Remaining known gaps:
 - TLS termination supports Rustls HTTP/1.1 and HTTP/2; HTTP/3 uses the same
   transfer core over QUIC. Broader flow-control and graceful-drain tuning
   remains future work.
-- Static file serving streams from Tokio file I/O and supports validators,
-  byte ranges, and precompressed sidecars. Sendfile is not implemented.
+- Static file serving uses a capability-rooted, handle-first streaming path
+  with validators, single byte ranges, and negotiated precompressed sidecars.
+  Dynamic compression, multipart ranges, autoindex, and sendfile are not
+  implemented.
 - The compiled script cache is process-local only.
 - Cache invalidation is local to one process through an explicitly enabled
   loopback-only admin endpoint; there is no cross-process cache sharing or

@@ -15,13 +15,15 @@ pub(crate) fn route_debug_name(route: &ResolvedRoute) -> &'static str {
         ResolvedRoute::Health => "health",
         ResolvedRoute::Metrics => "metrics",
         ResolvedRoute::CacheClear => "cache-clear",
-        ResolvedRoute::StaticFile { .. } => "static",
+        ResolvedRoute::StaticFile(_) => "static",
         ResolvedRoute::PhpScript { path_info, .. } if path_info.is_some() => "front-controller",
         ResolvedRoute::PhpScript { .. } => "php",
+        ResolvedRoute::DirectoryRedirect { .. } => "directory-redirect",
+        ResolvedRoute::NotAcceptable { .. } => "not-acceptable",
         ResolvedRoute::NotFound => "not-found",
-        ResolvedRoute::Forbidden => "forbidden",
         ResolvedRoute::BadRequest => "bad-request",
-        ResolvedRoute::MethodNotAllowed => "method-not-allowed",
+        ResolvedRoute::MethodNotAllowed { .. } => "method-not-allowed",
+        ResolvedRoute::InternalError(_) => "internal-error",
     }
 }
 

@@ -11,7 +11,7 @@ use super::{
     },
     request_pipeline::PhpTransferCompletion,
     state::AppState,
-    static_files::static_file_response,
+    static_files::{static_file_response, static_not_acceptable_response},
     transfer::{PhpExecutionCoordinator, TransferContext, TransferLifecycle},
 };
 use crate::{
@@ -245,7 +245,14 @@ pub(crate) async fn handle_parts_admitted(
     let request_id = admission.request_id.clone();
     let request_version = parts.version;
     let route_started = Instant::now();
-    let route = resolve_route(method.as_str(), parts.uri.path(), &state.route_config);
+    let route = resolve_route(
+        &method,
+        &parts.uri,
+        &parts.headers,
+        &state.route_config,
+        &state.static_files,
+    )
+    .await;
     let route_resolution = route_started.elapsed();
     state.services.metrics.record_phase(
         super::metrics::RequestPhase::RouteResolution,
@@ -270,11 +277,15 @@ pub(crate) async fn handle_parts_admitted(
         ResolvedRoute::Health => match method {
             Method::GET => (response::text(StatusCode::OK, "ok\n"), "health", None),
             Method::HEAD => (response::empty(StatusCode::OK), "health", None),
-            _ => (method_not_allowed(), "health", None),
+            _ => (method_not_allowed("GET, HEAD"), "health", None),
         },
         ResolvedRoute::Metrics => (metrics_response(&state, &parts), "metrics", None),
-        ResolvedRoute::CacheClear => (clear_cache_response(&state, peer), "cache-clear", None),
-        ResolvedRoute::StaticFile { path, metadata } => {
+        ResolvedRoute::CacheClear => (
+            clear_cache_response(&state, peer).await,
+            "cache-clear",
+            None,
+        ),
+        ResolvedRoute::StaticFile(representation) => {
             if let Some(response) = execute_builtin_router_before_normal_route(
                 &parts,
                 body,
@@ -292,12 +303,36 @@ pub(crate) async fn handle_parts_admitted(
                     .static_responses
                     .fetch_add(1, Ordering::Relaxed);
                 (
-                    static_file_response(&parts, &state, path, metadata).await,
+                    static_file_response(&parts, &state.services.metrics, representation).await,
                     "static",
                     None,
                 )
             }
         }
+        ResolvedRoute::DirectoryRedirect { location } => {
+            let mut response = response::empty(StatusCode::PERMANENT_REDIRECT);
+            match HeaderValue::from_str(&location) {
+                Ok(location) => {
+                    response.headers_mut().insert(header::LOCATION, location);
+                    (response, "directory-redirect", None)
+                }
+                Err(error) => {
+                    warn!(%error, "generated directory redirect location is invalid");
+                    (
+                        response::text(StatusCode::INTERNAL_SERVER_ERROR, "redirect failed\n"),
+                        "internal-error",
+                        None,
+                    )
+                }
+            }
+        }
+        ResolvedRoute::NotAcceptable {
+            vary_accept_encoding,
+        } => (
+            static_not_acceptable_response(vary_accept_encoding),
+            "not-acceptable",
+            None,
+        ),
         ResolvedRoute::PhpScript {
             script_path,
             path_info,
@@ -356,26 +391,6 @@ pub(crate) async fn handle_parts_admitted(
                 )
             }
         }
-        ResolvedRoute::Forbidden => {
-            emit_request_diagnostic(
-                &state,
-                &parts,
-                Some(&request_id),
-                RequestDiagnostic::new(
-                    "E_PHP_SERVER_OUTSIDE_DOCUMENT_ROOT",
-                    "routing",
-                    "server rejected a path outside the document root",
-                    "resolve_route",
-                    parts.uri.path(),
-                    "",
-                ),
-            );
-            (
-                response::text(StatusCode::FORBIDDEN, "forbidden\n"),
-                "forbidden",
-                None,
-            )
-        }
         ResolvedRoute::BadRequest => {
             emit_request_diagnostic(
                 &state,
@@ -396,7 +411,20 @@ pub(crate) async fn handle_parts_admitted(
                 None,
             )
         }
-        ResolvedRoute::MethodNotAllowed => (method_not_allowed(), "method-not-allowed", None),
+        ResolvedRoute::MethodNotAllowed { allow } => {
+            (method_not_allowed(allow), "method-not-allowed", None)
+        }
+        ResolvedRoute::InternalError(error) => {
+            warn!(%error, "static route resolution failed");
+            (
+                response::text(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "route resolution failed\n",
+                ),
+                "internal-error",
+                None,
+            )
+        }
     };
     if let Some(alt_svc) = &state.transport.http3_alt_svc
         && request_version != hyper::Version::HTTP_3
@@ -565,9 +593,19 @@ async fn execute_builtin_router_before_normal_route(
     execute_builtin_router_if_configured(parts, state, body, peer, request_id, None).await
 }
 
-pub(crate) fn clear_cache_response(state: &AppState, peer: SocketAddr) -> Response<ResponseBody> {
+pub(crate) async fn clear_cache_response(
+    state: &AppState,
+    peer: SocketAddr,
+) -> Response<ResponseBody> {
     if !peer.ip().is_loopback() {
         return response::text(StatusCode::FORBIDDEN, "forbidden\n");
+    }
+    if let Err(error) = state.static_files.rebuild_index().await {
+        warn!(%error, "failed to rebuild immutable static index");
+        return response::text(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "static index rebuild failed\n",
+        );
     }
     state.services.engine.script_cache.clear();
     if let Err(error) = state.services.engine.include_cache.clear() {
@@ -579,11 +617,11 @@ pub(crate) fn clear_cache_response(state: &AppState, peer: SocketAddr) -> Respon
     }
     response::text(StatusCode::OK, "cache cleared\n")
 }
-pub(crate) fn method_not_allowed() -> Response<ResponseBody> {
+pub(crate) fn method_not_allowed(allow: &'static str) -> Response<ResponseBody> {
     let mut response = response::text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n");
     response
         .headers_mut()
-        .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
+        .insert(header::ALLOW, HeaderValue::from_static(allow));
     response
 }
 

@@ -15,7 +15,8 @@ use php_vm::api::{DeploymentRootMode, NativeCacheConfig, NativeCacheMode};
 use crate::routing::RequestRewriteRule;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
-const DEFAULT_INDEX: &str = "index.php";
+const DEFAULT_INDEX: &str = "index.php,index.html";
+const DEFAULT_PHP_EXTENSIONS: &str = "php";
 const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 const DEFAULT_MAX_UPLOAD_FILES: usize = 32;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
@@ -56,7 +57,8 @@ pub struct TransportConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerRoutingConfig {
     pub docroot: PathBuf,
-    pub index: String,
+    pub indexes: Vec<String>,
+    pub php_extensions: Vec<String>,
     pub front_controller: Option<PathBuf>,
     pub builtin_router: Option<PathBuf>,
     pub request_rewrites: Vec<RequestRewriteRule>,
@@ -203,9 +205,21 @@ impl ServerConfig {
             .parse_listen("listen")?
             .unwrap_or(parse_listen(DEFAULT_LISTEN)?);
         let mut docroot = file_config.path("docroot");
-        let mut index = file_config
+        let mut indexes = file_config
             .string("index")
-            .unwrap_or_else(|| DEFAULT_INDEX.to_string());
+            .map(|value| parse_indexes("index", &value))
+            .transpose()?
+            .unwrap_or_else(|| {
+                parse_indexes("index", DEFAULT_INDEX).expect("default indexes are valid")
+            });
+        let mut php_extensions = file_config
+            .string("php_extensions")
+            .map(|value| parse_php_extensions("php_extensions", &value))
+            .transpose()?
+            .unwrap_or_else(|| {
+                parse_php_extensions("php_extensions", DEFAULT_PHP_EXTENSIONS)
+                    .expect("default PHP extensions are valid")
+            });
         let mut front_controller = file_config.path("front_controller");
         let mut request_rewrites = file_config.request_rewrites("rewrite_prefix_query")?;
         let mut max_body_bytes = file_config
@@ -335,8 +349,10 @@ impl ServerConfig {
                 "--listen" => listen = parse_listen(&required_value(&arg, &mut args)?)?,
                 "--docroot" => docroot = Some(PathBuf::from(required_value(&arg, &mut args)?)),
                 "--index" => {
-                    index = required_value(&arg, &mut args)?;
-                    validate_index(&index)?;
+                    indexes = parse_indexes(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--php-extensions" => {
+                    php_extensions = parse_php_extensions(&arg, &required_value(&arg, &mut args)?)?;
                 }
                 "--front-controller" => {
                     let value = required_value(&arg, &mut args)?;
@@ -487,7 +503,8 @@ impl ServerConfig {
             },
             routing: ServerRoutingConfig {
                 docroot,
-                index,
+                indexes,
+                php_extensions,
                 front_controller,
                 builtin_router: None,
                 request_rewrites,
@@ -579,7 +596,9 @@ impl ServerConfig {
             },
             routing: ServerRoutingConfig {
                 docroot,
-                index: DEFAULT_INDEX.to_string(),
+                indexes: parse_indexes("index", DEFAULT_INDEX).expect("default indexes are valid"),
+                php_extensions: parse_php_extensions("php_extensions", DEFAULT_PHP_EXTENSIONS)
+                    .expect("default PHP extensions are valid"),
                 front_controller: None,
                 builtin_router: router,
                 request_rewrites,
@@ -644,7 +663,6 @@ Options:\n\
   --listen <addr>              TCP listen address (default: 127.0.0.1:8080)\n\
   --config <path>              read simple TOML-style server config\n\
   --docroot <path>             document root (required unless --help)\n\
-  --index <name>               directory index file name (default: index.php)\n\
   --front-controller <path>    optional front controller, relative to docroot\n\
   --rewrite-prefix-query <p=q> rewrite matching request paths to /?q=<suffix>\n\
   --max-body-bytes <n>         maximum request body bytes (default: 1048576)\n\
@@ -657,6 +675,9 @@ Options:\n\
   --disable-sessions           disable persistent web sessions\n\
   --max-in-flight <n>          maximum concurrent in-flight requests\n\
   --cpu-execution-limit <n>    maximum concurrent CPU-bound PHP executions (default: available CPUs)\n\
+  --index <csv>                ordered directory indexes (default: index.php,index.html)\n\
+  --php-extensions <csv>       executable PHP suffixes without dots (default: php)\n\
+  --deployment-mode <mode>     dev uses live capability opens; immutable uses a startup asset index\n\
   --request-timeout-ms <n>     body read timeout in milliseconds (default: 30000)\n\
   --max-execution-ms <n>       PHP execution deadline in milliseconds (default: 30000)\n\
   --disable-execution-deadline disable cooperative PHP execution deadline\n\
@@ -707,7 +728,12 @@ Options:\n\
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        validate_index(&self.routing.index)?;
+        if self.routing.indexes.is_empty() {
+            return Err(ConfigError::new("at least one directory index is required"));
+        }
+        if self.routing.php_extensions.is_empty() {
+            return Err(ConfigError::new("at least one PHP extension is required"));
+        }
         if let Some(path) = &self.routing.front_controller {
             validate_relative_path("front_controller", path)?;
         }
@@ -1079,13 +1105,50 @@ fn validate_query_parameter_name(flag: &str, name: &str) -> Result<(), ConfigErr
     Ok(())
 }
 
-fn validate_index(index: &str) -> Result<(), ConfigError> {
-    if index.is_empty() || index.contains('/') || index.contains('\\') || index.contains('\0') {
-        return Err(ConfigError::new(
-            "--index must be a single file name relative to each directory, not an absolute path or nested path",
-        ));
+fn parse_indexes(flag: &str, value: &str) -> Result<Vec<String>, ConfigError> {
+    let indexes = value
+        .split(',')
+        .map(str::trim)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if indexes.is_empty()
+        || indexes.iter().any(|index| {
+            index.is_empty()
+                || matches!(index.as_str(), "." | "..")
+                || index.contains('/')
+                || index.contains('\\')
+                || index.contains('\0')
+        })
+    {
+        return Err(ConfigError::new(format!(
+            "{flag} must be a comma-separated list of file names without paths or dot segments"
+        )));
     }
-    Ok(())
+    Ok(indexes)
+}
+
+fn parse_php_extensions(flag: &str, value: &str) -> Result<Vec<String>, ConfigError> {
+    let mut extensions = Vec::new();
+    for extension in value.split(',').map(str::trim) {
+        if extension.is_empty()
+            || extension.starts_with('.')
+            || !extension
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(ConfigError::new(format!(
+                "{flag} must contain comma-separated extensions without leading dots using only ASCII letters, digits, _ or -"
+            )));
+        }
+        let normalized = extension.to_ascii_lowercase();
+        if !extensions.contains(&normalized) {
+            extensions.push(normalized);
+        }
+    }
+    if extensions.is_empty() {
+        return Err(ConfigError::new(format!("{flag} must not be empty")));
+    }
+    Ok(extensions)
 }
 
 fn validate_cookie_name(flag: &str, name: &str) -> Result<(), ConfigError> {
@@ -1133,4 +1196,82 @@ fn default_max_in_flight() -> usize {
 
 fn default_cpu_execution_limit() -> usize {
     std::thread::available_parallelism().map_or(1, usize::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerConfig;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn static_routing_defaults_and_csv_options_are_validated() {
+        let defaults = ServerConfig::parse_from(["--docroot", "."]).expect("default config");
+        assert_eq!(defaults.routing.indexes, ["index.php", "index.html"]);
+        assert_eq!(defaults.routing.php_extensions, ["php"]);
+
+        let configured = ServerConfig::parse_from([
+            "--docroot",
+            ".",
+            "--index",
+            "index.html,index.php",
+            "--php-extensions",
+            "PHP,phtml,php",
+        ])
+        .expect("configured static routing");
+        assert_eq!(configured.routing.indexes, ["index.html", "index.php"]);
+        assert_eq!(configured.routing.php_extensions, ["php", "phtml"]);
+    }
+
+    #[test]
+    fn invalid_static_routing_values_fail_config_parsing() {
+        for (flag, value) in [
+            ("--index", ""),
+            ("--index", "../index.html"),
+            ("--index", "dir/index.html"),
+            ("--index", "index.html,"),
+            ("--php-extensions", ""),
+            ("--php-extensions", ".php"),
+            ("--php-extensions", "php/phtml"),
+            ("--php-extensions", "php,p html"),
+        ] {
+            assert!(
+                ServerConfig::parse_from(["--docroot", ".", flag, value]).is_err(),
+                "{flag}={value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_file_accepts_static_index_and_php_extension_csv() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "phrust-server-static-config-{}-{unique}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "docroot = \".\"\nindex = \"index.html,index.php\"\nphp_extensions = \"php,phtml\"\n",
+        )
+        .expect("write test config");
+        let path_arg = path.to_string_lossy().into_owned();
+        let config = ServerConfig::parse_from(["--config", path_arg.as_str()])
+            .expect("parse static config file");
+        std::fs::remove_file(path).expect("remove test config");
+
+        assert_eq!(config.routing.indexes, ["index.html", "index.php"]);
+        assert_eq!(config.routing.php_extensions, ["php", "phtml"]);
+    }
+
+    #[test]
+    fn help_describes_static_index_extensions_and_deployment_mode_once() {
+        let help = ServerConfig::help_text();
+        assert_eq!(help.matches("--index <csv>").count(), 1);
+        assert_eq!(help.matches("--php-extensions <csv>").count(), 1);
+        assert_eq!(help.matches("--deployment-mode <mode>").count(), 1);
+        assert!(help.contains("index.php,index.html"));
+        assert!(help.contains("startup asset index"));
+    }
 }

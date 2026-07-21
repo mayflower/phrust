@@ -113,8 +113,8 @@ the server process. It does not use FPM, FastCGI, CGI, Apache, `mod_php`, or an
 external PHP process fallback. The advanced server binary remains available as
 `phrust-server` for explicit server diagnostics and non-PHP-compatible flags.
 
-Static file reads, route filesystem metadata checks, and PHP execution stay on
-the integrated server path. `--request-timeout-ms` bounds request body reads;
+Static files use a capability-rooted, handle-first streaming path; PHP
+execution stays on the integrated server path. `--request-timeout-ms` bounds request body reads;
 PHP execution is bounded by the cooperative `--max-execution-ms` deadline and
 the server in-flight request limit. The default in-flight request limit is 200;
 requests above that limit wait briefly for capacity before receiving `503
