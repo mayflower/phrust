@@ -1476,6 +1476,156 @@ exact_native_path_abi!(jit_native_dirname_abi, 1);
 exact_native_path_abi!(jit_native_realpath_abi, 2);
 exact_native_path_abi!(jit_native_file_exists_abi, 3);
 
+fn exact_callback_control_result(
+    context: &mut NativeRequestColdState<'_>,
+    outcome: Result<i64, String>,
+    span: php_ir::IrSpan,
+) -> php_jit::JitNativeControlResult {
+    match outcome {
+        Ok(value) => php_jit::JitNativeControlResult::returning(value),
+        Err(message) if message == "E_PHP_RETHROW" => {
+            let Some(throwable) = context.take_pending_throwable() else {
+                return exact_builtin_runtime_error(
+                    context,
+                    "native callback rethrow has no pending throwable".to_owned(),
+                );
+            };
+            let throwable = native_throwable_with_call_source(context, throwable, span);
+            match context.encode(throwable) {
+                Ok(value) => php_jit::JitNativeControlResult::control(
+                    php_jit::JitCallStatus::THROW,
+                    0,
+                    value,
+                ),
+                Err(error) => exact_builtin_runtime_error(context, error),
+            }
+        }
+        Err(message) if message.starts_with("E_PHP_THROW:") => {
+            let payload = message.trim_start_matches("E_PHP_THROW:");
+            let (class, message) = payload.split_once(':').unwrap_or(("Error", payload));
+            match encode_native_throwable_at(context, class, message, span) {
+                Ok(value) => php_jit::JitNativeControlResult::control(
+                    php_jit::JitCallStatus::THROW,
+                    0,
+                    value,
+                ),
+                Err(error) => exact_builtin_runtime_error(context, error),
+            }
+        }
+        Err(message) if message == "E_PHP_SUSPEND_FIBER" => {
+            let value = context
+                .pending_fiber_suspension_value
+                .take()
+                .unwrap_or_else(|| php_jit::jit_encode_constant(u32::MAX));
+            php_jit::JitNativeControlResult::control(
+                php_jit::JitCallStatus::SUSPEND_FIBER,
+                0,
+                value,
+            )
+        }
+        Err(message) if message.starts_with("E_PHP_EXIT:") => {
+            let value = message
+                .trim_start_matches("E_PHP_EXIT:")
+                .parse::<i64>()
+                .unwrap_or_else(|_| php_jit::jit_encode_constant(u32::MAX));
+            php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::EXIT, 0, value)
+        }
+        Err(message) if message == NATIVE_RUNTIME_ERROR_MARKER => {
+            php_jit::JitNativeControlResult::control(
+                php_jit::JitCallStatus::RUNTIME_ERROR,
+                0,
+                php_jit::jit_encode_constant(u32::MAX),
+            )
+        }
+        Err(message) => exact_builtin_runtime_error(context, message),
+    }
+}
+
+fn exact_native_callback<const ARRAY_ARGUMENTS: bool>(
+    runtime: *mut NativeRequestFastState,
+    caller_function: u32,
+    source_file: u32,
+    source_start: u32,
+    source_end: u32,
+    argument_count: u32,
+    arguments: [i64; 6],
+) -> php_jit::JitNativeControlResult {
+    let arity_ok = if ARRAY_ARGUMENTS {
+        argument_count == 2
+    } else {
+        (1..=6).contains(&argument_count)
+    };
+    if !arity_ok {
+        return exact_query_baseline();
+    }
+    let span = php_ir::IrSpan::new(php_ir::FileId::new(source_file), source_start, source_end);
+    with_native_context_for(runtime, "exact_callback", |context| {
+        if !exact_native_callback_is_admitted(context, arguments[0]) {
+            return exact_query_baseline();
+        }
+        let instruction = php_ir::Instruction {
+            id: php_ir::InstrId::new(0),
+            span,
+            kind: php_ir::InstructionKind::Nop,
+        };
+        let outcome = if ARRAY_ARGUMENTS {
+            let Some(outcome) = execute_native_call_user_func_array_direct(
+                context,
+                arguments[0],
+                arguments[1],
+                &instruction,
+                Some(caller_function),
+            ) else {
+                return exact_query_baseline();
+            };
+            outcome
+        } else {
+            execute_native_call_user_func_encoded(
+                context,
+                &arguments[..argument_count as usize],
+                &instruction,
+                Some(caller_function),
+            )
+        };
+        exact_callback_control_result(context, outcome, span)
+    })
+    .unwrap_or_else(exact_query_baseline)
+}
+
+macro_rules! exact_native_callback_abi {
+    ($abi:ident, $array_arguments:literal) => {
+        pub(in crate::vm) extern "C" fn $abi(
+            runtime: *mut NativeRequestFastState,
+            caller_function: u32,
+            source_file: u32,
+            source_start: u32,
+            source_end: u32,
+            argument_count: u32,
+            argument_0: i64,
+            argument_1: i64,
+            argument_2: i64,
+            argument_3: i64,
+            argument_4: i64,
+            argument_5: i64,
+        ) -> php_jit::JitNativeControlResult {
+            exact_native_callback::<$array_arguments>(
+                runtime,
+                caller_function,
+                source_file,
+                source_start,
+                source_end,
+                argument_count,
+                [
+                    argument_0, argument_1, argument_2, argument_3, argument_4, argument_5,
+                ],
+            )
+        }
+    };
+}
+
+exact_native_callback_abi!(jit_native_call_user_func_abi, false);
+exact_native_callback_abi!(jit_native_call_user_func_array_abi, true);
+
 // SAFETY: generated code owns the argument/local tables and result record for
 // the complete synchronous helper invocation. Published callsite metadata
 // validates the stable builtin ID before PHP-visible work begins.

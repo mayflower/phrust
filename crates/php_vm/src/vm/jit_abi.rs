@@ -33,6 +33,7 @@ pub(super) use frame_arena::{jit_native_frame_alloc_abi, jit_native_frame_releas
 pub(super) use call_dispatch::{
     jit_baseline_native_builtin_dispatch_abi, jit_baseline_native_builtin_dispatch_diagnostic_abi,
     jit_native_basename_abi, jit_native_call_dispatch_abi, jit_native_call_dispatch_diagnostic_abi,
+    jit_native_call_user_func_abi, jit_native_call_user_func_array_abi,
     jit_native_class_exists_abi, jit_native_defined_abi, jit_native_dirname_abi,
     jit_native_enum_exists_abi, jit_native_file_exists_abi, jit_native_function_exists_abi,
     jit_native_interface_exists_abi, jit_native_json_decode_abi, jit_native_json_encode_abi,
@@ -52,10 +53,11 @@ use internal_classes::*;
 use native_builtins::{
     NativeDimensionOperation, emit_native_array_dimension_conversion_diagnostic,
     emit_native_deprecated_call, emit_native_dimension_conversion_diagnostic,
-    emit_native_php_diagnostic, emit_native_php_warning, execute_baseline_native_builtin,
-    execute_baseline_prepared_runtime_builtin, native_builtin_class_lineage,
-    native_internal_class_constant_exists, native_php_function_exists, native_source_line,
-    native_source_line_for_span, native_string,
+    emit_native_php_diagnostic, emit_native_php_warning, exact_native_callback_is_admitted,
+    execute_baseline_native_builtin, execute_baseline_prepared_runtime_builtin,
+    execute_native_call_user_func_array_direct, execute_native_call_user_func_encoded,
+    native_builtin_class_lineage, native_internal_class_constant_exists,
+    native_php_function_exists, native_source_line, native_source_line_for_span, native_string,
 };
 use object_support::*;
 use request_state::{

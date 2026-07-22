@@ -1270,6 +1270,16 @@ pub(super) fn compile_region_graph_native(
                 })
             })
     });
+    let needs_exact_callback: [bool; StableCallbackBuiltin::COUNT] = std::array::from_fn(|index| {
+        !baseline_helper_imports
+            && regions.values().any(|region| {
+                region_contains(region, |kind| {
+                    matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_callback(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                })
+            })
+    });
     let needs_semantic_dispatch = regions.values().any(|region| {
         region_contains(region, |kind| {
             matches!(kind, RegionInstructionKind::NativeCall(call)
@@ -1839,6 +1849,25 @@ pub(super) fn compile_region_graph_native(
         }
         imports.push((builtin.symbol().to_owned(), address));
     }
+    for builtin in StableCallbackBuiltin::all() {
+        if !needs_exact_callback[builtin.index()] {
+            continue;
+        }
+        let address = match builtin {
+            StableCallbackBuiltin::CallUserFunc => runtime_helpers.native_call_user_func,
+            StableCallbackBuiltin::CallUserFuncArray => runtime_helpers.native_call_user_func_array,
+        };
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_CALLBACK",
+                format!(
+                    "prepared callback builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
     if baseline_helper_imports && needs_semantic_dispatch {
         imports.push((
             native_semantic_dispatch_symbol.clone(),
@@ -2341,6 +2370,27 @@ pub(super) fn compile_region_graph_native(
                 signature.returns.push(AbiParam::new(types::I64));
                 signature.returns.push(AbiParam::new(types::I64));
                 exact_path[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_callback = [None; StableCallbackBuiltin::COUNT];
+            for builtin in StableCallbackBuiltin::all() {
+                if !needs_exact_callback[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                for _ in 0..5 {
+                    signature.params.push(AbiParam::new(types::I32));
+                }
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_callback[builtin.index()] = Some(declare_native_helper(
                     module,
                     builtin.symbol(),
                     &signature,
@@ -2929,6 +2979,7 @@ pub(super) fn compile_region_graph_native(
                         exact_json,
                         exact_format,
                         exact_path,
+                        exact_callback,
                         array_ensure_unique,
                         array_ensure_unique_symbol,
                         array_child_entry,
@@ -3617,6 +3668,8 @@ pub(super) fn compile_region_graph_native(
                                         | "phrust_native_dirname"
                                         | "phrust_native_realpath"
                                         | "phrust_native_file_exists"
+                                        | "phrust_native_call_user_func"
+                                        | "phrust_native_call_user_func_array"
                                 ) =>
                         {
                             None

@@ -205,6 +205,11 @@ pub struct JitRuntimeHelperAddresses {
     pub native_dirname: usize,
     pub native_realpath: usize,
     pub native_file_exists: usize,
+    /// Exact native callback invocation handlers. Dynamic target resolution
+    /// remains inside the named callback capability; no builtin ID or generic
+    /// prepared-builtin dispatcher crosses the optimizing ABI.
+    pub native_call_user_func: usize,
+    pub native_call_user_func_array: usize,
     /// Direct typed PHP semantic operation over packed i64 operands.
     pub native_semantic_dispatch: usize,
     /// Resolves or compiles one statically known PHP callee without invoking it.

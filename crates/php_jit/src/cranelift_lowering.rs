@@ -230,6 +230,7 @@ struct NativeOptimizingOperations {
     exact_json: [Option<NativeHelper>; StableJsonBuiltin::COUNT],
     exact_format: [Option<NativeHelper>; StableFormatBuiltin::COUNT],
     exact_path: [Option<NativeHelper>; StablePathBuiltin::COUNT],
+    exact_callback: [Option<NativeHelper>; StableCallbackBuiltin::COUNT],
     array_ensure_unique: FuncId,
     array_ensure_unique_symbol: FunctionId,
     array_child_entry: FuncId,
@@ -272,6 +273,9 @@ impl NativeOptimizingOperations {
             .map(|helper| helper.map(|helper| helper.with_runtime(runtime)));
         self.exact_path = self
             .exact_path
+            .map(|helper| helper.map(|helper| helper.with_runtime(runtime)));
+        self.exact_callback = self
+            .exact_callback
             .map(|helper| helper.map(|helper| helper.with_runtime(runtime)));
         self
     }
@@ -6473,6 +6477,77 @@ fn lower_optimizing_exact_runtime_builtin(
     // `JitNativeControlResult` is two ABI words: status/detail followed by the
     // encoded value. Both supported product ABIs return this 16-byte record in
     // integer result registers.
+    let control = builder.inst_results(call)[0];
+    let value = builder.inst_results(call)[1];
+    let status = builder.ins().ireduce(types::I32, control);
+    let detail = builder.ins().ushr_imm(control, 32);
+    let detail = builder.ins().ireduce(types::I32, detail);
+    let returned = builder.create_block();
+    let control_exit = builder.create_block();
+    let is_return = builder.ins().icmp_imm(
+        IntCC::Equal,
+        status,
+        i64::from(crate::JitCallStatus::RETURN.0),
+    );
+    builder
+        .ins()
+        .brif(is_return, returned, &[], control_exit, &[]);
+
+    builder.switch_to_block(control_exit);
+    transition.emit_control(builder, status, detail, value)?;
+
+    builder.switch_to_block(returned);
+    Ok(value)
+}
+
+fn lower_optimizing_exact_callback_builtin(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    helper: Option<NativeHelper>,
+    caller: FunctionId,
+    arguments: &[ir::Value],
+    transition: NativeOptimizingTransition<'_>,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    let helper = helper.ok_or_else(|| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_EXACT_CALLBACK",
+            "prepared callback builtin has no exact native handler",
+        )
+    })?;
+    if arguments.len() > 6 {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_EXACT_CALLBACK",
+            "prepared callback builtin exceeds the exact six-argument ABI",
+        ));
+    }
+    let caller = builder.ins().iconst(types::I32, i64::from(caller.raw()));
+    let source_file = builder.ins().iconst(
+        types::I32,
+        i64::from(transition.instruction.span.file.raw()),
+    );
+    let source_start = builder
+        .ins()
+        .iconst(types::I32, i64::from(transition.instruction.span.start));
+    let source_end = builder
+        .ins()
+        .iconst(types::I32, i64::from(transition.instruction.span.end));
+    let argument_count = builder.ins().iconst(
+        types::I32,
+        i64::try_from(arguments.len()).unwrap_or(i64::MAX),
+    );
+    let missing = builder
+        .ins()
+        .iconst(types::I64, crate::jit_encode_constant(u32::MAX));
+    let mut exact_arguments = Vec::with_capacity(11);
+    exact_arguments.extend([
+        caller,
+        source_file,
+        source_start,
+        source_end,
+        argument_count,
+    ]);
+    exact_arguments.extend((0..6).map(|index| arguments.get(index).copied().unwrap_or(missing)));
+    let call = call_native_helper(module, builder, helper, &exact_arguments);
     let control = builder.inst_results(call)[0];
     let value = builder.inst_results(call)[1];
     let status = builder.ins().ireduce(types::I32, control);
@@ -19101,6 +19176,7 @@ fn lower_optimizing_region_instruction(
                 || stable_builtin_json(&call.target).is_some()
                 || stable_builtin_format(&call.target).is_some()
                 || stable_builtin_path(&call.target).is_some()
+                || stable_builtin_callback(&call.target).is_some()
                 || stable_builtin_length(&call.target).is_some()
                 || stable_builtin_string_predicate(&call.target).is_some()
                 || stable_builtin_ascii_case(&call.target).is_some()
@@ -20585,6 +20661,33 @@ fn lower_optimizing_region_instruction(
                     module,
                     builder,
                     optimizing_operations.exact_path[builtin.index()],
+                    &arguments,
+                    transition,
+                )?;
+                define_optimizing_call_result(
+                    builder,
+                    register_variables,
+                    registers,
+                    call.result,
+                    result,
+                )?;
+            } else if let Some(builtin) = stable_builtin_callback(&call.target)
+                && builtin.accepts_arity(call.args.len())
+                && (0..call.args.len()).all(|index| direct_builtin_argument(index).is_some())
+            {
+                emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
+                let arguments = (0..call.args.len())
+                    .map(|index| {
+                        let operand = direct_builtin_argument(index)
+                            .expect("fixed exact callback argument has an operand");
+                        lower_region_operand(builder, locals, registers, operand)
+                    })
+                    .collect::<Result<Vec<_>, CraneliftLoweringError>>()?;
+                let result = lower_optimizing_exact_callback_builtin(
+                    module,
+                    builder,
+                    optimizing_operations.exact_callback[builtin.index()],
+                    function,
                     &arguments,
                     transition,
                 )?;
