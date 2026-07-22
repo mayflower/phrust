@@ -40,6 +40,37 @@ fn activate_direct_test_arena(
     next_entry: &mut u32,
 ) -> crate::JitNativeRuntimeViewGuard {
     let free_value = Box::leak(Box::new(crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE));
+    let states = Box::leak(
+        vec![crate::JitNativeDirectArrayState::default(); slots.len()].into_boxed_slice(),
+    );
+    for (index, slot) in slots.iter().enumerate() {
+        if slot.kind != crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY {
+            continue;
+        }
+        let length = usize::try_from(slot.payload).expect("test array length");
+        // SAFETY: every direct-array fixture points into the `entries` slice
+        // retained by this activation helper.
+        let array_entries = unsafe {
+            std::slice::from_raw_parts(
+                slot.aux as usize as *const crate::JitNativeDirectArrayEntry,
+                length,
+            )
+        };
+        let next_append_key = array_entries
+            .iter()
+            .filter_map(|entry| {
+                (crate::jit_decode_runtime_value(entry.key).is_none()
+                    && crate::jit_decode_constant(entry.key).is_none())
+                .then_some(entry.key)
+            })
+            .map(|key| key.saturating_add(1))
+            .max();
+        states[index] = crate::JitNativeDirectArrayState {
+            next_append_key: next_append_key.unwrap_or(0),
+            has_next_append_key: u32::from(next_append_key.is_some()),
+            reserved: 0,
+        };
+    }
     let free_heads = Box::leak(Box::new(
         [crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE; crate::JIT_NATIVE_DIRECT_ARRAY_FREE_BUCKETS],
     ));
@@ -48,6 +79,7 @@ fn activate_direct_test_arena(
         direct_value_slots: slots.as_mut_ptr() as usize as u64,
         direct_value_next: std::ptr::from_mut(next_slot) as usize as u64,
         direct_value_free_head: std::ptr::from_mut(free_value) as usize as u64,
+        direct_array_states: states.as_mut_ptr() as usize as u64,
         direct_array_entries: entries.as_mut_ptr() as usize as u64,
         direct_array_next: std::ptr::from_mut(next_entry) as usize as u64,
         direct_array_free_heads: free_heads.as_mut_ptr() as usize as u64,
@@ -1222,10 +1254,26 @@ fn optimizing_reference_local_reads_published_scalar_view_without_helper() {
         payload: std::ptr::from_mut(&mut reference_view) as usize as u64,
         ..crate::JitNativeValueSlot::default()
     };
+    let referenced_string =
+        crate::jit_encode_typed_runtime_value(5, crate::JIT_VALUE_RUNTIME_STRING_TAG);
+    slots[5] = crate::JitNativeValueSlot {
+        refcount: 1,
+        kind: crate::JIT_NATIVE_VALUE_VIEW_STRING,
+        ..crate::JitNativeValueSlot::default()
+    };
+    let mut direct_slots = [crate::JitNativeValueSlot {
+        refcount: 1,
+        kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR,
+        flags: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION,
+        reserved: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED,
+        payload: referenced_string as u64,
+        ..crate::JitNativeValueSlot::default()
+    }];
     let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
         value_slot_capacity: slots.len() as u32,
         value_slots: slots.as_mut_ptr() as usize as u64,
+        direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
         ..crate::JitNativeRuntimeView::default()
     });
     let reference =
@@ -1235,6 +1283,20 @@ fn optimizing_reference_local_reads_published_scalar_view_without_helper() {
             .invoke_i64(&[reference], JIT_RUNTIME_ABI_HASH)
             .expect("cached scalar reference read"),
         73
+    );
+    let direct_reference = crate::jit_encode_typed_runtime_value(
+        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
+        crate::JIT_VALUE_RUNTIME_REFERENCE_TAG,
+    );
+    assert_eq!(
+        handle
+            .invoke_i64(&[direct_reference], JIT_RUNTIME_ABI_HASH)
+            .expect("direct reference payload read"),
+        referenced_string
+    );
+    assert_eq!(
+        slots[5].refcount, 2,
+        "direct reference read did not retain its returned runtime payload"
     );
 
     // Reference-capable storage describes a local's lifetime, not the tag of
@@ -8992,6 +9054,9 @@ fn optimizing_array_push_pop_use_authoritative_native_storage() {
     };
     let mut direct_next = 1_u32;
     let mut direct_free = crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE;
+    let mut array_states = vec![crate::JitNativeDirectArrayState::default(); direct_slots.len()];
+    array_states[0].next_append_key = 6;
+    array_states[0].has_next_append_key = 1;
     let mut entry_next = crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY;
     let mut entry_free =
         [crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE; crate::JIT_NATIVE_DIRECT_ARRAY_FREE_BUCKETS];
@@ -9001,6 +9066,7 @@ fn optimizing_array_push_pop_use_authoritative_native_storage() {
         direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
         direct_value_next: std::ptr::from_mut(&mut direct_next) as usize as u64,
         direct_value_free_head: std::ptr::from_mut(&mut direct_free) as usize as u64,
+        direct_array_states: array_states.as_mut_ptr() as usize as u64,
         direct_array_entries: entries.as_mut_ptr() as usize as u64,
         direct_array_next: std::ptr::from_mut(&mut entry_next) as usize as u64,
         direct_array_free_heads: entry_free.as_mut_ptr() as usize as u64,

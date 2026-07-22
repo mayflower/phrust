@@ -264,7 +264,7 @@ fn encode_native_throwable_fields(
             Value::Int(code),
         );
     }
-    context.encode(Value::Array(exception))
+    context.encode_native_array_owner(exception)
 }
 
 pub(super) fn native_throwable_with_frame(

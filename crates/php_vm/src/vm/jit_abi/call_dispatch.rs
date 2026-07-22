@@ -2026,7 +2026,7 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                 {
                     mark_native_function_argument_references(arguments, metadata, parameters);
                 }
-                materialize_native_property_reference_arguments(
+                bind_native_property_reference_arguments(
                     context,
                     arguments,
                     encoded.to_mut(),
@@ -2286,7 +2286,7 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                         instruction,
                     )?;
                     let object = new_native_object(context, None, &class)?;
-                    return context.encode(Value::Object(object));
+                    return context.encode_native_object_owner(object);
                 }
                 if !native_external_class_exists(context, &display_class_name)
                     && context.autoload_in_progress.insert(normalized.clone())
@@ -2469,9 +2469,9 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                         if let Some(magic) =
                             native_method_in_hierarchy(context, &class_name, "__call")
                         {
-                            let method_name = context.encode(Value::String(
+                            let method_name = context.encode_native_string_owner(
                                 PhpString::from_bytes(method.as_bytes().to_vec()),
-                            ))?;
+                            )?;
                             let call_arguments =
                                 encode_native_call_arguments_array(context, &encoded[1..])?;
                             return invoke_native_function(
@@ -2567,9 +2567,9 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     );
                 }
                 if let Some(function) = native_method_in_hierarchy(context, &class_name, "__call") {
-                    let method_name = context.encode(Value::String(PhpString::from_bytes(
+                    let method_name = context.encode_native_string_owner(PhpString::from_bytes(
                         method.as_bytes().to_vec(),
-                    )))?;
+                    ))?;
                     let call_arguments =
                         encode_native_call_arguments_array(context, &encoded[1..])?;
                     return invoke_native_function(
@@ -2589,9 +2589,9 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     ) {
                         return Err(format!("E_PHP_THROW:Error:{error}"));
                     }
-                    let method_name = context.encode(Value::String(PhpString::from_bytes(
+                    let method_name = context.encode_native_string_owner(PhpString::from_bytes(
                         method.as_bytes().to_vec(),
-                    )))?;
+                    ))?;
                     let call_arguments =
                         encode_native_call_arguments_array(context, &encoded[1..])?;
                     return invoke_native_external_function(
@@ -2739,9 +2739,9 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                             && let Some(magic) =
                                 native_method_in_hierarchy(context, class, "__callStatic")
                         {
-                            let method_name = context.encode(Value::String(
+                            let method_name = context.encode_native_string_owner(
                                 PhpString::from_bytes(method.as_bytes().to_vec()),
-                            ))?;
+                            )?;
                             let call_arguments =
                                 encode_native_call_arguments_array(context, &encoded)?;
                             return invoke_native_function(
@@ -2878,9 +2878,9 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     return result;
                 }
                 if let Some(class) = resolved_class {
-                    let method_name = context.encode(Value::String(PhpString::from_bytes(
+                    let method_name = context.encode_native_string_owner(PhpString::from_bytes(
                         method.as_bytes().to_vec(),
-                    )))?;
+                    ))?;
                     let call_arguments = encode_native_call_arguments_array(context, &encoded)?;
                     if let Some(function) =
                         native_method_in_hierarchy(context, &class, "__callStatic")
@@ -3181,7 +3181,7 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                         parameters,
                     );
                 }
-                materialize_native_property_reference_arguments(
+                bind_native_property_reference_arguments(
                     context,
                     arguments,
                     encoded.to_mut(),
@@ -3209,7 +3209,7 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                 {
                     mark_native_function_argument_references(arguments, metadata, parameters);
                 }
-                materialize_native_property_reference_arguments(
+                bind_native_property_reference_arguments(
                     context,
                     arguments,
                     encoded.to_mut(),

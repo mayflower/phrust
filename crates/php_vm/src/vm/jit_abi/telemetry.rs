@@ -1147,23 +1147,6 @@ impl NativeRequestColdState<'_> {
             .or_default() += 1;
     }
 
-    pub(super) fn record_direct_reference_demotion(
-        &self,
-        caller: &'static std::panic::Location<'static>,
-    ) {
-        if !self.options.collect_counters {
-            return;
-        }
-        let site = format!("{}:{}", caller.file(), caller.line());
-        *self
-            .runtime_telemetry
-            .borrow_mut()
-            .counters
-            .native_value_table_materializations_by_kind_and_origin
-            .entry(format!("direct_reference_demotion_site@{site}"))
-            .or_default() += 1;
-    }
-
     pub(super) fn record_native_transition(
         &self,
         reason: &str,

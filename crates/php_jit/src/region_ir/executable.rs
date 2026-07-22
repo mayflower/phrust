@@ -1334,29 +1334,15 @@ impl BaselineRegionBuilder {
                                     instruction.id.raw(),
                                     index
                                 ));
-                                instructions.push(RegionInstruction {
-                                    id: instruction.id,
-                                    span: instruction.span,
-                                    continuation_id: next_continuation,
-                                    live_locals: Vec::new(),
-                                    optimizer_transition_entry: false,
-                                    source_kind: instruction.kind.clone(),
-                                    kind: RegionInstructionKind::StoreLocal {
-                                        local: temporary,
-                                        src: lower_operand(unit, argument.value),
-                                    },
-                                });
-                                next_continuation = next_continuation.saturating_add(1);
                                 argument.by_ref_local = Some(temporary);
-                                Some(RegionInstructionKind::BindReferenceIntoDim {
+                                Some(RegionInstructionKind::BindReferenceDim {
+                                    target: temporary,
                                     array: dimension.local,
                                     keys: dimension
                                         .dims
                                         .iter()
                                         .map(|operand| lower_operand(unit, *operand))
                                         .collect(),
-                                    append: false,
-                                    source: temporary,
                                 })
                             } else if let Some(property) = &argument.by_ref_property {
                                 let temporary = LocalId::new(region_local_count);

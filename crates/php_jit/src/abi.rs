@@ -179,6 +179,22 @@ pub struct JitNativeDirectArrayEntry {
 // SAFETY: both i64 fields admit the all-zero representation.
 unsafe impl php_runtime::api::NativeZeroed for JitNativeDirectArrayEntry {}
 
+/// Slot-parallel PHP auto-index state for an authoritative direct array.
+///
+/// This cannot be reconstructed from the live keys: `unset` preserves the
+/// next auto-index while `array_pop` may move it backwards. Generated code
+/// indexes this stable arena with the direct value-slot index.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitNativeDirectArrayState {
+    pub next_append_key: i64,
+    pub has_next_append_key: u32,
+    pub reserved: u32,
+}
+
+// SAFETY: the sole i64 field admits the all-zero representation.
+unsafe impl php_runtime::api::NativeZeroed for JitNativeDirectArrayState {}
+
 /// One exact `(function, continuation)` declared-property plan. Publication
 /// performs name/visibility/layout resolution once; generated code consumes
 /// only the numeric slot and guarded layout identity.
@@ -417,6 +433,8 @@ pub struct JitNativeRuntimeView {
     /// remain authoritative in the direct slot plane; this table supplies
     /// only the immovable backing identity needed by exact object operations.
     pub direct_object_owners: u64,
+    /// Slot-parallel exact PHP auto-index state for direct arrays.
+    pub direct_array_states: u64,
     pub direct_array_entries: u64,
     pub direct_array_next: u64,
     /// Exact-power-of-two free lists. A released range stores the preceding
@@ -505,12 +523,16 @@ pub struct JitNativeRuntimeView {
 
 thread_local! {
     static ACTIVE_NATIVE_RUNTIME_VIEW: Cell<JitNativeRuntimeView> =
-        const { Cell::new(JitNativeRuntimeView { abi_version: 0, value_slot_capacity: 0, value_slots: 0, direct_value_slots: 0, direct_value_next: 0, direct_value_free_head: 0, direct_value_reused_bytes: 0, direct_object_owners: 0, direct_array_entries: 0, direct_array_next: 0, direct_array_free_heads: 0, direct_array_reused_bytes: 0, direct_string_bytes: 0, direct_string_next: 0, direct_string_free_heads: 0, direct_string_reused_bytes: 0, trusted_globals_proxy: 0, trusted_constant_views: 0, trusted_constant_view_count: 0, trusted_constant_view_reserved: 0, trusted_constant_slots: 0, trusted_constant_slot_count: 0, trusted_constant_slot_reserved: 0, trusted_class_plans: 0, trusted_class_plan_count: 0, trusted_class_plan_reserved: 0, trusted_function_entries: 0, trusted_function_entry_count: 0, trusted_function_entry_reserved: 0, trusted_optimizing_function_entries: 0, trusted_optimizing_function_entry_count: 0, trusted_optimizing_function_entry_reserved: 0, poll_counter: 0, root_mutation_pending: 0, trusted_property_function_offsets: 0, trusted_property_function_count: 0, trusted_property_reserved: 0, trusted_property_slots: 0, trusted_property_slot_count: 0, trusted_property_slot_reserved: 0, trusted_global_reference_slots: 0, trusted_global_reference_slot_count: 0, trusted_global_reference_slot_reserved: 0, trusted_static_local_slots: 0, trusted_static_local_slot_count: 0, trusted_static_local_slot_reserved: 0, static_property_slots: 0, static_property_slot_count: 0, static_property_slot_reserved: 0, trusted_static_property_slots: 0, trusted_static_property_slot_count: 0, trusted_static_property_slot_reserved: 0, trusted_instanceof_plans: 0, trusted_instanceof_plan_count: 0, trusted_instanceof_plan_reserved: 0, trusted_instanceof_entries: 0, trusted_instanceof_entry_count: 0, trusted_instanceof_entry_reserved: 0, error_reporting: 0 }) };
+        const { Cell::new(JitNativeRuntimeView { abi_version: 0, value_slot_capacity: 0, value_slots: 0, direct_value_slots: 0, direct_value_next: 0, direct_value_free_head: 0, direct_value_reused_bytes: 0, direct_object_owners: 0, direct_array_states: 0, direct_array_entries: 0, direct_array_next: 0, direct_array_free_heads: 0, direct_array_reused_bytes: 0, direct_string_bytes: 0, direct_string_next: 0, direct_string_free_heads: 0, direct_string_reused_bytes: 0, trusted_globals_proxy: 0, trusted_constant_views: 0, trusted_constant_view_count: 0, trusted_constant_view_reserved: 0, trusted_constant_slots: 0, trusted_constant_slot_count: 0, trusted_constant_slot_reserved: 0, trusted_class_plans: 0, trusted_class_plan_count: 0, trusted_class_plan_reserved: 0, trusted_function_entries: 0, trusted_function_entry_count: 0, trusted_function_entry_reserved: 0, trusted_optimizing_function_entries: 0, trusted_optimizing_function_entry_count: 0, trusted_optimizing_function_entry_reserved: 0, poll_counter: 0, root_mutation_pending: 0, trusted_property_function_offsets: 0, trusted_property_function_count: 0, trusted_property_reserved: 0, trusted_property_slots: 0, trusted_property_slot_count: 0, trusted_property_slot_reserved: 0, trusted_global_reference_slots: 0, trusted_global_reference_slot_count: 0, trusted_global_reference_slot_reserved: 0, trusted_static_local_slots: 0, trusted_static_local_slot_count: 0, trusted_static_local_slot_reserved: 0, static_property_slots: 0, static_property_slot_count: 0, static_property_slot_reserved: 0, trusted_static_property_slots: 0, trusted_static_property_slot_count: 0, trusted_static_property_slot_reserved: 0, trusted_instanceof_plans: 0, trusted_instanceof_plan_count: 0, trusted_instanceof_plan_reserved: 0, trusted_instanceof_entries: 0, trusted_instanceof_entry_count: 0, trusted_instanceof_entry_reserved: 0, error_reporting: 0 }) };
     // Standalone compiler tests may publish only the arena fields they
     // exercise. Production activation always supplies its request-owned head.
     static FALLBACK_DIRECT_VALUE_FREE_HEAD: Cell<u32> =
         const { Cell::new(JIT_NATIVE_DIRECT_ARRAY_FREE_NONE) };
     static FALLBACK_DIRECT_VALUE_REUSED_BYTES: Cell<u64> = const { Cell::new(0) };
+    static FALLBACK_DIRECT_ARRAY_STATES: std::cell::RefCell<Box<[JitNativeDirectArrayState]>> =
+        std::cell::RefCell::new(
+            vec![JitNativeDirectArrayState::default(); 4_096].into_boxed_slice()
+        );
     static FALLBACK_DIRECT_ARRAY_REUSED_BYTES: Cell<u64> = const { Cell::new(0) };
     static FALLBACK_DIRECT_STRING_REUSED_BYTES: Cell<u64> = const { Cell::new(0) };
 }
@@ -542,6 +564,56 @@ pub fn activate_native_runtime_view(mut view: JitNativeRuntimeView) -> JitNative
         FALLBACK_DIRECT_VALUE_REUSED_BYTES.with(|bytes| {
             bytes.set(0);
             view.direct_value_reused_bytes = bytes.as_ptr() as usize as u64;
+        });
+    }
+    if view.direct_array_states == 0 {
+        FALLBACK_DIRECT_ARRAY_STATES.with(|states| {
+            let mut states = states.borrow_mut();
+            states.fill(JitNativeDirectArrayState::default());
+            if view.direct_value_slots != 0 && view.direct_value_next != 0 {
+                // SAFETY: this compatibility branch exists only for standalone
+                // compiler fixtures that publish the slot arena but predate the
+                // slot-parallel array-state field. Production activation always
+                // supplies its demand-backed state arena explicitly.
+                let used = unsafe { *(view.direct_value_next as usize as *const u32) as usize }
+                    .min(states.len());
+                let slots = unsafe {
+                    std::slice::from_raw_parts(
+                        view.direct_value_slots as usize as *const JitNativeValueSlot,
+                        used,
+                    )
+                };
+                for (index, slot) in slots.iter().enumerate() {
+                    if slot.refcount == 0
+                        || slot.kind != JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY
+                        || slot.aux == 0
+                    {
+                        continue;
+                    }
+                    let length = usize::try_from(slot.payload).unwrap_or(0);
+                    let entries = unsafe {
+                        std::slice::from_raw_parts(
+                            slot.aux as usize as *const JitNativeDirectArrayEntry,
+                            length,
+                        )
+                    };
+                    let next_append_key = entries
+                        .iter()
+                        .filter_map(|entry| {
+                            (crate::jit_decode_runtime_value(entry.key).is_none()
+                                && crate::jit_decode_constant(entry.key).is_none())
+                            .then_some(entry.key)
+                        })
+                        .map(|key| key.saturating_add(1))
+                        .max();
+                    states[index] = JitNativeDirectArrayState {
+                        next_append_key: next_append_key.unwrap_or(0),
+                        has_next_append_key: u32::from(next_append_key.is_some()),
+                        reserved: 0,
+                    };
+                }
+            }
+            view.direct_array_states = states.as_mut_ptr() as usize as u64;
         });
     }
     if view.direct_array_reused_bytes == 0 {

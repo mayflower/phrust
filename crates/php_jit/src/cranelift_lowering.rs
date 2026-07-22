@@ -2806,6 +2806,20 @@ fn lower_direct_new_array(
     let encoded = builder
         .ins()
         .bor_imm(encoded_index, crate::JIT_VALUE_RUNTIME_ARRAY_TAG as i64);
+    let state = lower_direct_array_state_address(builder, encoded, deopt_out);
+    builder.ins().store(
+        MemFlagsData::new(),
+        zero,
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, next_append_key) as i32,
+    );
+    let zero32 = builder.ins().iconst(types::I32, 0);
+    builder.ins().store(
+        MemFlagsData::new(),
+        zero32,
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, has_next_append_key) as i32,
+    );
     builder.ins().jump(merge, &[encoded.into()]);
 
     builder.switch_to_block(merge);
@@ -2835,23 +2849,44 @@ fn lower_direct_array_require_supported_key(
     Ok(())
 }
 
+fn lower_direct_array_state_address(
+    builder: &mut FunctionBuilder<'_>,
+    array: ir::Value,
+    deopt_out: ir::Value,
+) -> ir::Value {
+    let pointer_type = builder.func.dfg.value_type(deopt_out);
+    let view = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
+    let states = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        deopt_out,
+        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_array_states) as i32,
+    );
+    let encoded_index = builder.ins().ireduce(types::I32, array);
+    let index = builder.ins().iadd_imm(
+        encoded_index,
+        -i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+    );
+    let wide_index = builder.ins().uextend(pointer_type, index);
+    let offset = builder.ins().ishl_imm(
+        wide_index,
+        std::mem::size_of::<crate::JitNativeDirectArrayState>().trailing_zeros() as i64,
+    );
+    builder.ins().iadd(states, offset)
+}
+
 fn lower_direct_array_next_integer_key(
     builder: &mut FunctionBuilder<'_>,
     array: ir::Value,
     transition: NativeOptimizingTransition<'_>,
 ) -> Result<ir::Value, CraneliftLoweringError> {
-    let pointer_type = builder.func.dfg.value_type(transition.deopt_out);
     let inspect = builder.create_block();
+    let check = builder.create_block();
     let scan = builder.create_block();
     let scan_entry = builder.create_block();
-    let finish = builder.create_block();
     let rejected = builder.create_block();
     let done = builder.create_block();
     builder.append_block_param(scan, types::I64);
-    builder.append_block_param(scan, types::I64);
-    builder.append_block_param(scan, types::I8);
-    builder.append_block_param(finish, types::I64);
-    builder.append_block_param(finish, types::I8);
     builder.append_block_param(done, types::I64);
 
     let is_array = lower_value_has_tag(builder, array, crate::JIT_VALUE_RUNTIME_ARRAY_TAG);
@@ -2872,56 +2907,65 @@ fn lower_direct_array_next_integer_key(
         slot,
         std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
     );
+    let direct_kind = builder.ins().icmp_imm(
+        IntCC::Equal,
+        kind,
+        i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY),
+    );
+    builder.ins().brif(direct_kind, check, &[], rejected, &[]);
+
+    builder.switch_to_block(check);
+    let state = lower_direct_array_state_address(builder, array, transition.deopt_out);
+    let next = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, next_append_key) as i32,
+    );
+    let has_next = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, has_next_append_key) as i32,
+    );
+    let absent = builder.ins().icmp_imm(IntCC::Equal, has_next, 0);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let next = builder.ins().select(absent, zero, next);
+    let at_maximum = builder.ins().icmp_imm(IntCC::Equal, next, i64::MAX);
+    builder
+        .ins()
+        .brif(at_maximum, scan, &[zero.into()], done, &[next.into()]);
+
+    builder.switch_to_block(scan);
+    let scan_index = builder.block_params(scan)[0];
     let length = builder.ins().load(
         types::I64,
         MemFlagsData::new(),
         slot,
         std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
     );
+    let exhausted = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, scan_index, length);
+    builder
+        .ins()
+        .brif(exhausted, done, &[next.into()], scan_entry, &[]);
+
+    builder.switch_to_block(scan_entry);
+    let pointer_type = builder.func.dfg.value_type(transition.deopt_out);
     let entries = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
         slot,
         std::mem::offset_of!(crate::JitNativeValueSlot, aux) as i32,
     );
-    let direct_kind = builder.ins().icmp_imm(
-        IntCC::Equal,
-        kind,
-        i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY),
-    );
-    let zero = builder.ins().iconst(types::I64, 0);
-    let no = builder.ins().iconst(types::I8, 0);
-    builder.ins().brif(
-        direct_kind,
-        scan,
-        &[zero.into(), zero.into(), no.into()],
-        rejected,
-        &[],
-    );
-
-    builder.switch_to_block(scan);
-    let index = builder.block_params(scan)[0];
-    let greatest = builder.block_params(scan)[1];
-    let found = builder.block_params(scan)[2];
-    let exhausted = builder
-        .ins()
-        .icmp(IntCC::UnsignedGreaterThanOrEqual, index, length);
-    builder.ins().brif(
-        exhausted,
-        finish,
-        &[greatest.into(), found.into()],
-        scan_entry,
-        &[],
-    );
-
-    builder.switch_to_block(scan_entry);
     let wide_index = if pointer_type == types::I64 {
-        index
+        scan_index
     } else {
-        builder.ins().ireduce(pointer_type, index)
+        builder.ins().ireduce(pointer_type, scan_index)
     };
-    let offset = builder.ins().ishl_imm(wide_index, 4);
-    let entry = builder.ins().iadd(entries, offset);
+    let entry_offset = builder.ins().ishl_imm(wide_index, 4);
+    let entry = builder.ins().iadd(entries, entry_offset);
     let candidate = builder
         .ins()
         .load(types::I64, MemFlagsData::new(), entry, 0);
@@ -2929,29 +2973,12 @@ fn lower_direct_array_next_integer_key(
     let constant = lower_value_has_namespace_tag(builder, candidate, crate::JIT_VALUE_CONSTANT_TAG);
     let namespaced = builder.ins().bor(runtime, constant);
     let integer = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
-    let greater = builder
-        .ins()
-        .icmp(IntCC::SignedGreaterThan, candidate, greatest);
-    let first = builder.ins().icmp_imm(IntCC::Equal, found, 0);
-    let first_or_greater = builder.ins().bor(first, greater);
-    let replace = builder.ins().band(integer, first_or_greater);
-    let greatest = builder.ins().select(replace, candidate, greatest);
-    let found = builder.ins().bor(found, integer);
-    let next = builder.ins().iadd_imm(index, 1);
+    let maximum = builder.ins().icmp_imm(IntCC::Equal, candidate, i64::MAX);
+    let occupied = builder.ins().band(integer, maximum);
+    let following = builder.ins().iadd_imm(scan_index, 1);
     builder
         .ins()
-        .jump(scan, &[next.into(), greatest.into(), found.into()]);
-
-    builder.switch_to_block(finish);
-    let greatest = builder.block_params(finish)[0];
-    let found = builder.block_params(finish)[1];
-    let maximum = builder.ins().icmp_imm(IntCC::Equal, greatest, i64::MAX);
-    let overflow = builder.ins().band(found, maximum);
-    let incremented = builder.ins().iadd_imm(greatest, 1);
-    let next = builder.ins().select(found, incremented, zero);
-    builder
-        .ins()
-        .brif(overflow, rejected, &[], done, &[next.into()]);
+        .brif(occupied, rejected, &[], scan, &[following.into()]);
 
     builder.switch_to_block(rejected);
     let placeholder = transition.emit_value(builder)?;
@@ -3250,28 +3277,48 @@ fn lower_direct_array_append(
     if let Some(entry_key) = key {
         builder.ins().jump(append, &[entry_key.into()]);
     } else {
+        let state = lower_direct_array_state_address(builder, array, deopt_out);
+        let next_key = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            state,
+            std::mem::offset_of!(crate::JitNativeDirectArrayState, next_append_key) as i32,
+        );
+        let has_next = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            state,
+            std::mem::offset_of!(crate::JitNativeDirectArrayState, has_next_append_key) as i32,
+        );
+        let absent = builder.ins().icmp_imm(IntCC::Equal, has_next, 0);
         let zero = builder.ins().iconst(types::I64, 0);
+        let next_key = builder.ins().select(absent, zero, next_key);
+        let at_maximum = builder.ins().icmp_imm(IntCC::Equal, next_key, i64::MAX);
         let no = builder.ins().iconst(types::I8, 0);
-        builder
-            .ins()
-            .jump(scan_append_key, &[zero.into(), zero.into(), no.into()]);
+        builder.ins().brif(
+            at_maximum,
+            scan_append_key,
+            &[zero.into(), next_key.into(), no.into()],
+            append,
+            &[next_key.into()],
+        );
     }
 
     if key.is_none() {
-        // PHP's implicit append key is one greater than the greatest existing
-        // integer key, not the physical entry count. Compute it from the direct
-        // records so explicit, sparse, and negative keys stay native-authoritative.
+        // At i64::MAX PHP admits one append only while that exact key is absent.
+        // The authoritative auto-index state handles every ordinary append;
+        // this scan is therefore confined to the terminal-key edge case.
         builder.switch_to_block(scan_append_key);
         let scan_index = builder.block_params(scan_append_key)[0];
-        let greatest = builder.block_params(scan_append_key)[1];
-        let found_integer = builder.block_params(scan_append_key)[2];
+        let next_key = builder.block_params(scan_append_key)[1];
+        let found_maximum = builder.block_params(scan_append_key)[2];
         let scanned_all = builder
             .ins()
             .icmp(IntCC::UnsignedGreaterThanOrEqual, scan_index, length);
         builder.ins().brif(
             scanned_all,
             finish_append_key,
-            &[greatest.into(), found_integer.into()],
+            &[next_key.into(), found_maximum.into()],
             scan_append_entry,
             &[],
         );
@@ -3300,28 +3347,18 @@ fn lower_direct_array_append(
         let candidate_integer = builder
             .ins()
             .icmp_imm(IntCC::Equal, candidate_namespaced, 0);
-        let greater = builder
-            .ins()
-            .icmp(IntCC::SignedGreaterThan, candidate, greatest);
-        let first_integer = builder.ins().icmp_imm(IntCC::Equal, found_integer, 0);
-        let replace = builder.ins().bor(first_integer, greater);
-        let replace = builder.ins().band(candidate_integer, replace);
-        let greatest = builder.ins().select(replace, candidate, greatest);
-        let found_integer = builder.ins().bor(found_integer, candidate_integer);
+        let maximum = builder.ins().icmp_imm(IntCC::Equal, candidate, i64::MAX);
+        let found = builder.ins().band(candidate_integer, maximum);
+        let found_maximum = builder.ins().bor(found_maximum, found);
         let next_scan = builder.ins().iadd_imm(scan_index, 1);
         builder.ins().jump(
             scan_append_key,
-            &[next_scan.into(), greatest.into(), found_integer.into()],
+            &[next_scan.into(), next_key.into(), found_maximum.into()],
         );
 
         builder.switch_to_block(finish_append_key);
-        let greatest = builder.block_params(finish_append_key)[0];
-        let found_integer = builder.block_params(finish_append_key)[1];
-        let maximum = builder.ins().icmp_imm(IntCC::Equal, greatest, i64::MAX);
-        let overflow = builder.ins().band(found_integer, maximum);
-        let incremented = builder.ins().iadd_imm(greatest, 1);
-        let zero = builder.ins().iconst(types::I64, 0);
-        let next_key = builder.ins().select(found_integer, incremented, zero);
+        let next_key = builder.block_params(finish_append_key)[0];
+        let overflow = builder.block_params(finish_append_key)[1];
         builder
             .ins()
             .brif(overflow, rejected, &[], append, &[next_key.into()]);
@@ -3362,6 +3399,52 @@ fn lower_direct_array_append(
         next_length,
         slot,
         std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+    );
+    let state = lower_direct_array_state_address(builder, array, deopt_out);
+    let current_next = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, next_append_key) as i32,
+    );
+    let has_current_next = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, has_next_append_key) as i32,
+    );
+    let runtime_key = lower_is_runtime_handle(builder, entry_key);
+    let constant_key =
+        lower_value_has_namespace_tag(builder, entry_key, crate::JIT_VALUE_CONSTANT_TAG);
+    let namespaced_key = builder.ins().bor(runtime_key, constant_key);
+    let integer_key = builder.ins().icmp_imm(IntCC::Equal, namespaced_key, 0);
+    let maximum_key = builder.ins().icmp_imm(IntCC::Equal, entry_key, i64::MAX);
+    let incremented_key = builder.ins().iadd_imm(entry_key, 1);
+    let candidate_next = builder
+        .ins()
+        .select(maximum_key, entry_key, incremented_key);
+    let advances = builder
+        .ins()
+        .icmp(IntCC::SignedGreaterThan, candidate_next, current_next);
+    let absent = builder.ins().icmp_imm(IntCC::Equal, has_current_next, 0);
+    let advances = builder.ins().bor(absent, advances);
+    let advances = builder.ins().band(integer_key, advances);
+    let next_append_key = builder.ins().select(advances, candidate_next, current_next);
+    builder.ins().store(
+        MemFlagsData::new(),
+        next_append_key,
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, next_append_key) as i32,
+    );
+    let has_next = builder.ins().icmp_imm(IntCC::NotEqual, integer_key, 0);
+    let had_next = builder.ins().icmp_imm(IntCC::NotEqual, has_current_next, 0);
+    let has_next = builder.ins().bor(has_next, had_next);
+    let has_next = builder.ins().uextend(types::I32, has_next);
+    builder.ins().store(
+        MemFlagsData::new(),
+        has_next,
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, has_next_append_key) as i32,
     );
     // PhpArray initializes an absent internal pointer when the first entry is
     // appended (including after the pointer ran past the end). Preserve that
@@ -8846,6 +8929,39 @@ fn lower_optimizing_array_pop(
     builder.switch_to_block(admitted);
     let key = builder.block_params(admitted)[0];
     let value = builder.block_params(admitted)[1];
+    let state = lower_direct_array_state_address(builder, array, transition.deopt_out);
+    let previous_next = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, next_append_key) as i32,
+    );
+    let has_previous_next = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, has_next_append_key) as i32,
+    );
+    let runtime_key = lower_is_runtime_handle(builder, key);
+    let constant_key = lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
+    let namespaced_key = builder.ins().bor(runtime_key, constant_key);
+    let integer_key = builder.ins().icmp_imm(IntCC::Equal, namespaced_key, 0);
+    let maximum_key = builder.ins().icmp_imm(IntCC::Equal, key, i64::MAX);
+    let incremented_key = builder.ins().iadd_imm(key, 1);
+    let key_next = builder.ins().select(maximum_key, key, incremented_key);
+    let latest = builder.ins().icmp(IntCC::Equal, previous_next, key_next);
+    let rewind = builder.ins().band(integer_key, latest);
+    let has_previous_next = builder
+        .ins()
+        .icmp_imm(IntCC::NotEqual, has_previous_next, 0);
+    let rewind = builder.ins().band(rewind, has_previous_next);
+    let next_append_key = builder.ins().select(rewind, key, previous_next);
+    builder.ins().store(
+        MemFlagsData::new(),
+        next_append_key,
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, next_append_key) as i32,
+    );
     lower_optimizing_release(builder, key, transition)?;
     let zero = builder.ins().iconst(types::I64, 0);
     builder.ins().store(MemFlagsData::new(), zero, entry, 0);
@@ -9184,6 +9300,20 @@ fn lower_optimizing_allocate_direct_array(
     let array = builder
         .ins()
         .bor_imm(encoded_index, crate::JIT_VALUE_RUNTIME_ARRAY_TAG as i64);
+    let state = lower_direct_array_state_address(builder, array, transition.deopt_out);
+    builder.ins().store(
+        MemFlagsData::new(),
+        zero,
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, next_append_key) as i32,
+    );
+    let zero32 = builder.ins().iconst(types::I32, 0);
+    builder.ins().store(
+        MemFlagsData::new(),
+        zero32,
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, has_next_append_key) as i32,
+    );
     builder.ins().jump(merge, &[array.into()]);
 
     builder.switch_to_block(rejected);
@@ -16626,13 +16756,16 @@ fn lower_guarded_native_local_fetch(
     let non_reference = builder.create_block();
     let inspect_reference = builder.create_block();
     let inspect_descriptor = builder.create_block();
+    let inspect_direct_reference = builder.create_block();
     let load_reference = builder.create_block();
+    let load_direct_reference = builder.create_block();
     let cached_reference = builder.create_block();
     let direct = builder.create_block();
     let slow = builder.create_block();
     let merge = builder.create_block();
     let pointer_type = module.target_config().pointer_type();
     builder.append_block_param(inspect_descriptor, pointer_type);
+    builder.append_block_param(cached_reference, types::I64);
     builder.append_block_param(merge, types::I64);
 
     let is_reference = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
@@ -16682,6 +16815,11 @@ fn lower_guarded_native_local_fetch(
         kind,
         i64::from(crate::JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR),
     );
+    let direct_kind_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        kind,
+        i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR),
+    );
     let flags_ok = builder.ins().icmp_imm(
         IntCC::Equal,
         flags,
@@ -16690,9 +16828,42 @@ fn lower_guarded_native_local_fetch(
     let address_ok = builder.ins().icmp_imm(IntCC::NotEqual, address, 0);
     let reference_ok = builder.ins().band(kind_ok, flags_ok);
     let reference_ok = builder.ins().band(reference_ok, address_ok);
+    builder.ins().brif(
+        reference_ok,
+        load_reference,
+        &[],
+        inspect_direct_reference,
+        &[],
+    );
+
+    builder.switch_to_block(inspect_direct_reference);
+    let direct_state = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        descriptor,
+        std::mem::offset_of!(crate::JitNativeValueSlot, reserved) as i32,
+    );
+    let direct_published = builder.ins().icmp_imm(
+        IntCC::NotEqual,
+        direct_state,
+        i64::from(crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_EMPTY),
+    );
+    let direct_ok = builder.ins().band(direct_kind_ok, flags_ok);
+    let direct_ok = builder.ins().band(direct_ok, direct_published);
     builder
         .ins()
-        .brif(reference_ok, load_reference, &[], slow, &[]);
+        .brif(direct_ok, load_direct_reference, &[], slow, &[]);
+
+    builder.switch_to_block(load_direct_reference);
+    let direct_encoded = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        descriptor,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+    );
+    builder
+        .ins()
+        .jump(cached_reference, &[direct_encoded.into()]);
 
     builder.switch_to_block(load_reference);
     let reference_view = if pointer_type == types::I64 {
@@ -16729,9 +16900,6 @@ fn lower_guarded_native_local_fetch(
         i64::from(crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_EMPTY),
     );
     let mut cached_ok = builder.ins().band(reference_version_ok, published);
-    let runtime_handle = lower_is_runtime_handle(builder, encoded);
-    let immediate = lower_not_bool(builder, runtime_handle);
-    cached_ok = builder.ins().band(cached_ok, immediate);
     if !quiet {
         let initialized = builder.ins().icmp_imm(
             IntCC::NotEqual,
@@ -16742,9 +16910,10 @@ fn lower_guarded_native_local_fetch(
     }
     builder
         .ins()
-        .brif(cached_ok, cached_reference, &[], slow, &[]);
+        .brif(cached_ok, cached_reference, &[encoded.into()], slow, &[]);
 
     builder.switch_to_block(cached_reference);
+    let encoded = builder.block_params(cached_reference)[0];
     let cached = if quiet {
         let cached_is_uninitialized = builder.ins().icmp_imm(
             IntCC::Equal,
@@ -16757,6 +16926,11 @@ fn lower_guarded_native_local_fetch(
         builder.ins().select(cached_is_uninitialized, null, encoded)
     } else {
         encoded
+    };
+    let cached = if borrowed {
+        cached
+    } else {
+        lower_guarded_value_release(module, builder, lifecycle, 0, cached, result_out, deopt_out)?
     };
     builder.ins().jump(merge, &[cached.into()]);
 
@@ -23995,6 +24169,10 @@ fn lower_baseline_region_instruction(
             quiet,
             mode,
         } => {
+            // An lvalue probe prepares a later write/reference bind. Missing
+            // entries become null without PHP's read-side undefined-key
+            // warning; the subsequent binding operation creates the slot.
+            let quiet = *quiet || *mode == php_ir::instruction::DimFetchMode::Lvalue;
             // The dimension helper borrows and dereferences its target. Passing
             // the encoded local directly avoids manufacturing an owned copy
             // solely to release it again after the helper returns.
@@ -24009,7 +24187,7 @@ fn lower_baseline_region_instruction(
                             builder,
                             native_operations.local_fetch,
                             current,
-                            *quiet,
+                            quiet,
                             false,
                             function,
                             *local,
@@ -24027,7 +24205,7 @@ fn lower_baseline_region_instruction(
             };
             let key = lower_array_key_operand(builder, locals, registers, constants, *key)?;
             let operation =
-                native_dim_operation(u32::from(*quiet), function, instruction.continuation_id);
+                native_dim_operation(u32::from(quiet), function, instruction.continuation_id);
             let value = if *mode == php_ir::instruction::DimFetchMode::Read {
                 lower_cached_array_fetch(
                     module,

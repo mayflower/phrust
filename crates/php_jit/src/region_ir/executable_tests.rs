@@ -2,7 +2,7 @@ use super::*;
 use crate::region_ir::{
     SsaOwnership, analyze_baseline_value_ownership, analyze_executable_value_flow,
 };
-use php_ir::instruction::IrCallPropertyTarget;
+use php_ir::instruction::{IrCallDimTarget, IrCallPropertyTarget};
 use php_ir::{
     ClassEntry, ClassFlags, ClassId, ClassMethodEntry, ClassMethodFlags, FunctionFlags, IrBuilder,
     IrCapture, IrParam, IrSpan, UnitId,
@@ -164,6 +164,109 @@ fn namespaced_builtin_reference_argument_load_is_quiet() {
             } if dst == loaded && local == matches
         )
     }));
+}
+
+#[test]
+fn known_by_reference_dimension_binds_the_existing_slot_identity() {
+    let mut builder = IrBuilder::new(UnitId::new(9_701));
+    let file = builder.add_file("by-reference-dimension.php");
+    let span = IrSpan::new(file, 0, 40);
+
+    let caller = builder.start_function("caller", FunctionFlags::default(), span);
+    let array = builder.intern_local(caller, "array");
+    let caller_block = builder.append_block(caller);
+    let zero = builder.intern_constant(IrConstant::Int(0));
+    let key = builder.alloc_register(caller);
+    builder.emit_load_const(caller, caller_block, key, zero, span);
+    let value = builder.alloc_register(caller);
+    builder.emit(
+        caller,
+        caller_block,
+        InstructionKind::FetchDim {
+            dst: value,
+            array: Operand::Local(array),
+            key: Operand::Register(key),
+            quiet: false,
+            mode: php_ir::instruction::DimFetchMode::Lvalue,
+        },
+        span,
+    );
+
+    let callee = builder.start_function("callee", FunctionFlags::default(), span);
+    builder.register_function_name("callee", callee);
+    let parameter = builder.intern_local(callee, "value");
+    builder.push_param(
+        callee,
+        IrParam {
+            name: "value".to_owned(),
+            local: parameter,
+            required: true,
+            type_: None,
+            by_ref: true,
+            variadic: false,
+            default: None,
+            attributes: Vec::new(),
+        },
+    );
+    let callee_block = builder.append_block(callee);
+    builder.terminate_return(callee, callee_block, None, span);
+
+    let result = builder.alloc_register(caller);
+    builder.emit(
+        caller,
+        caller_block,
+        InstructionKind::CallFunction {
+            dst: result,
+            name: "callee".to_owned(),
+            args: vec![IrCallArg {
+                name: None,
+                value: Operand::Register(value),
+                unpack: false,
+                value_kind: IrCallArgValueKind::Direct,
+                by_ref_local: None,
+                by_ref_dim: Some(IrCallDimTarget {
+                    local: array,
+                    dims: vec![Operand::Register(key)],
+                }),
+                by_ref_property: None,
+                by_ref_property_dim: None,
+            }],
+        },
+        span,
+    );
+    builder.terminate_return(caller, caller_block, None, span);
+
+    let unit = builder.finish();
+    let region = build_baseline_region(&unit, caller).expect("by-reference dimension region");
+    let binding = region.blocks[0]
+        .instructions
+        .iter()
+        .find_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::BindReferenceDim {
+                target,
+                array: bound_array,
+                keys,
+            } => Some((*target, *bound_array, keys.clone())),
+            _ => None,
+        })
+        .expect("dimension reference binding");
+    assert_eq!(binding.1, array);
+    assert_eq!(binding.2, vec![RegionOperand::Register(key)]);
+    assert!(!region.blocks[0].instructions.iter().any(|instruction| {
+        matches!(
+            instruction.kind,
+            RegionInstructionKind::BindReferenceIntoDim { .. }
+        )
+    }));
+    let call = region.blocks[0]
+        .instructions
+        .iter()
+        .find_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::NativeCall(call) => Some(call),
+            _ => None,
+        })
+        .expect("native call");
+    assert_eq!(call.args[0].by_ref_local, Some(binding.0));
 }
 
 #[test]
