@@ -5,7 +5,6 @@ use crate::{
     serve::{admit_request, handle_parts_admitted},
     server::ServerError,
     state::AppState,
-    tls::build_quic_server_config,
     transport::{ConnectionActivity, idle_request_body},
 };
 use bytes::{Buf, Bytes};
@@ -18,7 +17,6 @@ use hyper::{
 };
 use std::{
     net::SocketAddr,
-    path::Path,
     pin::Pin,
     sync::{Arc, atomic::Ordering},
     task::{Context, Poll},
@@ -28,18 +26,9 @@ use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 pub(crate) fn build_http3_endpoint(
-    cert_path: &Path,
-    key_path: &Path,
+    server_config: quinn::ServerConfig,
     listen: SocketAddr,
-    max_streams_per_connection: u32,
-    connection_idle_timeout: Duration,
 ) -> Result<quinn::Endpoint, ServerError> {
-    let server_config = build_quic_server_config(
-        cert_path,
-        key_path,
-        max_streams_per_connection,
-        connection_idle_timeout,
-    )?;
     quinn::Endpoint::server(server_config, listen).map_err(ServerError::Io)
 }
 
@@ -105,6 +94,17 @@ pub(crate) async fn serve_http3_endpoint(endpoint: quinn::Endpoint, state: Arc<A
         let state = Arc::clone(&state);
         tasks.spawn(async move {
             let _connection_permit = connection_permit;
+            let acme_without_certificate = state
+                .acme_status
+                .as_ref()
+                .is_some_and(|status| !status.certificate_available());
+            if acme_without_certificate {
+                state
+                    .services
+                    .metrics
+                    .acme_certificate_resolution_misses_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             match tokio::time::timeout(state.transport.limits.tls_handshake_timeout, incoming).await
             {
                 Ok(Ok(connection)) => {
@@ -115,6 +115,13 @@ pub(crate) async fn serve_http3_endpoint(endpoint: quinn::Endpoint, state: Arc<A
                         .metrics
                         .h3_connections_accepted_total
                         .fetch_add(1, Ordering::Relaxed);
+                    if state.acme_status.is_some() {
+                        state
+                            .services
+                            .metrics
+                            .acme_quic_certificate_resolutions_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     serve_http3_connection(connection, state, peer, local_addr).await
                 }
                 Ok(Err(error)) => warn!(%peer, %error, "HTTP/3 QUIC handshake failed"),

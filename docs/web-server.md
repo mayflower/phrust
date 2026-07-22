@@ -94,6 +94,36 @@ The integrated listener deliberately does not interpret `Forwarded`,
 WebSocket/Upgrade, WebTransport, Extended CONNECT, or a separate admin
 listener.
 
+## Automatic HTTPS With ACME
+
+`phrust-server` can obtain and renew certificates natively with TLS-ALPN-01.
+It remains one server process with one public TCP HTTPS listener: the existing
+listener classifies the TLS ClientHello and completes an active ACME challenge
+there, without sending that connection to Hyper, PHP, static routing, or the
+access log. It does not open port 80, implement HTTP-01, invoke Certbot, or run
+a challenge sidecar. Optional HTTP/3 uses the same dynamically updated
+certificate over UDP, but ACME validation itself remains TCP.
+
+Configure `acme_domains`, a `mailto:` `acme_contact`, and a persistent
+`acme_cache_dir`; do not combine them with `tls_cert`/`tls_key`. Staging is the
+default and `acme_directory = "production"` is always explicit. Custom private
+or test directories must be HTTPS URLs and may supply
+`acme_directory_ca_cert`. The cache directory must be private, writable,
+non-symlinked, and separate from request-body, upload, and session directories.
+Wildcards and IP literals are rejected.
+
+For public issuance, every configured DNS name must resolve to the active
+Phrust instance and TCP 443 must reach that listener unchanged. A
+TLS-terminating proxy in front of Phrust prevents TLS-ALPN-01. Operate only one
+active instance for a domain set unless external routing guarantees that every
+validation reaches the instance holding the current ACME state. Manual PEM TLS
+remains the alternative. Local verification uses the test-only Pebble CA:
+
+```bash
+nix develop -c just server-acme-single-server-smoke
+nix develop -c just server-acme-pebble-integration
+```
+
 Prefix request rewrites are a webserver-only routing feature. Configure them
 with `--rewrite-prefix-query /api=route` or
 `rewrite_prefix_query = "/api=route"` for `phrust-server`, or set

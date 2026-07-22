@@ -40,6 +40,17 @@ pub(crate) struct AppState {
     pub(crate) sessions: SessionServices,
     pub(crate) transport: RequestTransport,
     pub(crate) services: RuntimeServices,
+    pub(crate) acme_status: Option<Arc<crate::acme::AcmeStatus>>,
+}
+
+impl AppState {
+    pub(crate) fn is_ready(&self) -> bool {
+        self.connections.shutdown.is_running()
+            && self
+                .acme_status
+                .as_ref()
+                .is_none_or(|status| status.is_ready())
+    }
 }
 
 #[derive(Clone, Debug)]

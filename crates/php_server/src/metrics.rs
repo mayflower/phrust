@@ -66,6 +66,39 @@ pub(crate) struct ServerMetrics {
     pub(crate) drain_requests_rejected_total: AtomicU64,
     pub(crate) drain_deadline_exceeded_total: AtomicU64,
     pub(crate) readiness_state: AtomicU64,
+    pub(crate) acme_enabled: AtomicU64,
+    pub(crate) acme_certificate_available: AtomicU64,
+    pub(crate) acme_manager_running: AtomicU64,
+    pub(crate) acme_degraded: AtomicU64,
+    pub(crate) acme_events_success_total: AtomicU64,
+    pub(crate) acme_events_error_total: AtomicU64,
+    pub(crate) acme_cache_loads_total: AtomicU64,
+    pub(crate) acme_certificates_issued_total: AtomicU64,
+    pub(crate) acme_renewal_errors_total: AtomicU64,
+    pub(crate) acme_terminal_failures_total: AtomicU64,
+    pub(crate) acme_challenge_client_hellos_total: AtomicU64,
+    pub(crate) acme_challenge_handshakes_completed_total: AtomicU64,
+    pub(crate) acme_challenge_handshake_failures_total: AtomicU64,
+    pub(crate) acme_challenge_unknown_sni_total: AtomicU64,
+    pub(crate) acme_tcp_certificate_resolutions_total: AtomicU64,
+    pub(crate) acme_quic_certificate_resolutions_total: AtomicU64,
+    pub(crate) acme_certificate_resolution_misses_total: AtomicU64,
+    pub(crate) normal_tls_handshakes_without_certificate_total: AtomicU64,
+    pub(crate) acme_readiness: AtomicU64,
+    pub(crate) acme_initialization_nanos_total: AtomicU64,
+    pub(crate) acme_cache_errors_total: AtomicU64,
+    pub(crate) acme_state_stream_ended_total: AtomicU64,
+    pub(crate) acme_shutdown_completions_total: AtomicU64,
+    pub(crate) acme_shutdown_forced_total: AtomicU64,
+    pub(crate) tcp_listener_binds_total: AtomicU64,
+    pub(crate) http_listener_count: AtomicU64,
+    pub(crate) acme_listener_binds_total: AtomicU64,
+    pub(crate) port_80_binds_total: AtomicU64,
+    pub(crate) acme_state_tasks_started_total: AtomicU64,
+    pub(crate) acme_state_tasks_active: AtomicU64,
+    pub(crate) acme_challenge_http_requests_total: AtomicU64,
+    pub(crate) acme_challenge_hyper_requests_total: AtomicU64,
+    pub(crate) quic_endpoint_count: AtomicU64,
     pub(crate) requests_total: AtomicU64,
     pub(crate) static_responses: AtomicU64,
     pub(crate) php_responses: AtomicU64,
@@ -746,9 +779,156 @@ phrust_server_persistent_engine_feedback_template_absorptions_total {}\n",
                 "phrust_server_readiness_state",
                 self.readiness_state.load(Ordering::Relaxed),
             ),
+            (
+                "phrust_server_acme_enabled",
+                self.acme_enabled.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_certificate_available",
+                self.acme_certificate_available.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_manager_running",
+                self.acme_manager_running.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_degraded",
+                self.acme_degraded.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_events_success_total",
+                self.acme_events_success_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_events_error_total",
+                self.acme_events_error_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_cache_loads_total",
+                self.acme_cache_loads_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_certificates_issued_total",
+                self.acme_certificates_issued_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_renewal_errors_total",
+                self.acme_renewal_errors_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_terminal_failures_total",
+                self.acme_terminal_failures_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_challenge_client_hellos_total",
+                self.acme_challenge_client_hellos_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_challenge_handshakes_completed_total",
+                self.acme_challenge_handshakes_completed_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_challenge_handshake_failures_total",
+                self.acme_challenge_handshake_failures_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_challenge_unknown_sni_total",
+                self.acme_challenge_unknown_sni_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_tcp_certificate_resolutions_total",
+                self.acme_tcp_certificate_resolutions_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_quic_certificate_resolutions_total",
+                self.acme_quic_certificate_resolutions_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_certificate_resolution_misses_total",
+                self.acme_certificate_resolution_misses_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_normal_tls_handshakes_without_certificate_total",
+                self.normal_tls_handshakes_without_certificate_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_readiness",
+                self.acme_readiness.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_initialization_nanos_total",
+                self.acme_initialization_nanos_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_cache_errors_total",
+                self.acme_cache_errors_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_state_stream_ended_total",
+                self.acme_state_stream_ended_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_shutdown_completions_total",
+                self.acme_shutdown_completions_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_shutdown_forced_total",
+                self.acme_shutdown_forced_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_tcp_listener_binds_total",
+                self.tcp_listener_binds_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_http_listener_count",
+                self.http_listener_count.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_listener_binds_total",
+                self.acme_listener_binds_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_port_80_binds_total",
+                self.port_80_binds_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_state_tasks_started_total",
+                self.acme_state_tasks_started_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_state_tasks_active",
+                self.acme_state_tasks_active.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_challenge_http_requests_total",
+                self.acme_challenge_http_requests_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_acme_challenge_hyper_requests_total",
+                self.acme_challenge_hyper_requests_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_quic_endpoint_count",
+                self.quic_endpoint_count.load(Ordering::Relaxed),
+            ),
         ] {
             let _ = writeln!(output, "{name} {value}");
         }
+        let _ = writeln!(
+            output,
+            "phrust_server_acme_initialization_seconds {:.9}",
+            self.acme_initialization_nanos_total.load(Ordering::Relaxed) as f64 / 1_000_000_000.0
+        );
         let _ = writeln!(
             output,
             "phrust_server_script_cache_ready {}",

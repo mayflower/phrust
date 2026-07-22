@@ -64,8 +64,7 @@ pub struct ServerConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransportConfig {
     pub listen: SocketAddr,
-    pub tls_cert: Option<PathBuf>,
-    pub tls_key: Option<PathBuf>,
+    pub tls_mode: TlsMode,
     pub http3_enabled: bool,
     pub http3_listen: Option<SocketAddr>,
     pub max_connections: usize,
@@ -77,6 +76,86 @@ pub struct TransportConfig {
     pub max_request_header_bytes: usize,
     pub max_request_target_bytes: usize,
     pub max_streams_per_connection: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TlsMode {
+    Disabled,
+    Manual(ManualTlsConfig),
+    Acme(AcmeTlsConfig),
+}
+
+impl TlsMode {
+    pub(crate) fn is_enabled(&self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManualTlsConfig {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct AcmeTlsConfig {
+    pub domains: Vec<String>,
+    pub contact: String,
+    pub cache_dir: PathBuf,
+    pub directory: AcmeDirectory,
+    pub directory_ca_cert: Option<PathBuf>,
+}
+
+impl fmt::Debug for AcmeTlsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AcmeTlsConfig")
+            .field("domain_count", &self.domains.len())
+            .field("contact_configured", &true)
+            .field("cache_dir", &self.cache_dir)
+            .field("directory_kind", &self.directory.name())
+            .field(
+                "directory_ca_cert_configured",
+                &self.directory_ca_cert.is_some(),
+            )
+            .finish()
+    }
+}
+
+impl AcmeTlsConfig {
+    pub(crate) fn startup_summary(&self) -> String {
+        format!(
+            "acme_startup mode=acme directory_kind={} domain_count={} cache_path={} certificate_available=false",
+            self.directory.name(),
+            self.domains.len(),
+            self.cache_dir.display()
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AcmeDirectory {
+    Staging,
+    Production,
+    Custom(String),
+}
+
+impl AcmeDirectory {
+    pub(crate) fn url(&self) -> &str {
+        match self {
+            Self::Staging => rustls_acme::acme::LETS_ENCRYPT_STAGING_DIRECTORY,
+            Self::Production => rustls_acme::acme::LETS_ENCRYPT_PRODUCTION_DIRECTORY,
+            Self::Custom(url) => url,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::Staging => "staging",
+            Self::Production => "production",
+            Self::Custom(_) => "custom",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -406,6 +485,11 @@ impl ServerConfig {
         let mut metrics_token = file_config.string("metrics_token");
         let mut tls_cert = file_config.path("tls_cert");
         let mut tls_key = file_config.path("tls_key");
+        let mut acme_domains = file_config.string("acme_domains");
+        let mut acme_contact = file_config.string("acme_contact");
+        let mut acme_cache_dir = file_config.path("acme_cache_dir");
+        let mut acme_directory = file_config.string("acme_directory");
+        let mut acme_directory_ca_cert = file_config.path("acme_directory_ca_cert");
         let mut http3_enabled = file_config.bool("http3_enabled")?.unwrap_or(false);
         let mut http3_listen = file_config.parse_listen("http3_listen")?;
         let mut max_connections = file_config
@@ -691,6 +775,15 @@ impl ServerConfig {
                 }
                 "--tls-cert" => tls_cert = Some(PathBuf::from(required_value(&arg, &mut args)?)),
                 "--tls-key" => tls_key = Some(PathBuf::from(required_value(&arg, &mut args)?)),
+                "--acme-domains" => acme_domains = Some(required_value(&arg, &mut args)?),
+                "--acme-contact" => acme_contact = Some(required_value(&arg, &mut args)?),
+                "--acme-cache-dir" => {
+                    acme_cache_dir = Some(PathBuf::from(required_value(&arg, &mut args)?));
+                }
+                "--acme-directory" => acme_directory = Some(required_value(&arg, &mut args)?),
+                "--acme-directory-ca-cert" => {
+                    acme_directory_ca_cert = Some(PathBuf::from(required_value(&arg, &mut args)?));
+                }
                 "--enable-http3" => http3_enabled = true,
                 "--http3-listen" => {
                     http3_listen = Some(parse_listen(&required_value(&arg, &mut args)?)?)
@@ -756,11 +849,19 @@ impl ServerConfig {
                 "--enable-post-data-reading and --disable-post-data-reading are mutually exclusive",
             ));
         }
+        let tls_mode = derive_tls_mode(
+            tls_cert,
+            tls_key,
+            acme_domains,
+            acme_contact,
+            acme_cache_dir,
+            acme_directory,
+            acme_directory_ca_cert,
+        )?;
         let config = Self {
             transport: TransportConfig {
                 listen,
-                tls_cert,
-                tls_key,
+                tls_mode,
                 http3_enabled,
                 http3_listen,
                 max_connections,
@@ -883,8 +984,7 @@ impl ServerConfig {
         let config = Self {
             transport: TransportConfig {
                 listen,
-                tls_cert: None,
-                tls_key: None,
+                tls_mode: TlsMode::Disabled,
                 http3_enabled: false,
                 http3_listen: None,
                 max_connections: DEFAULT_MAX_CONNECTIONS,
@@ -1046,6 +1146,11 @@ Options:\n\
   --metrics-token <token>      require Authorization: Bearer token for metrics\n\
   --tls-cert <path>            PEM certificate chain for HTTPS\n\
   --tls-key <path>             PEM private key for HTTPS\n\
+  --acme-domains <csv>         ACME TLS-ALPN-01 DNS names (enables ACME TLS)\n\
+  --acme-contact <mailto:...>  ACME account contact (required with ACME)\n\
+  --acme-cache-dir <path>      persistent private ACME account/certificate cache\n\
+  --acme-directory <value>     staging (default), production, or custom HTTPS URL\n\
+  --acme-directory-ca-cert <pem> trust only this CA for a custom ACME directory\n\
   --enable-http3               enable HTTP/3 over QUIC using the TLS certificate\n\
   --http3-listen <addr>        UDP listen address for HTTP/3 (default: TCP listen address)\n\
   --access-log <path|->        write compact access logs to file or stdout\n\
@@ -1154,17 +1259,158 @@ Options:\n\
                 "session_save_path must be a plain directory; PHP depth/mode prefixes are not supported",
             ));
         }
-        if self.transport.tls_cert.is_some() != self.transport.tls_key.is_some() {
+        if self.transport.http3_enabled && matches!(self.transport.tls_mode, TlsMode::Disabled) {
             return Err(ConfigError::new(
-                "TLS configuration requires both --tls-cert <path> and --tls-key <path>; provide both flags or neither",
-            ));
-        }
-        if self.transport.http3_enabled && self.transport.tls_cert.is_none() {
-            return Err(ConfigError::new(
-                "HTTP/3 requires TLS; provide --tls-cert <path> and --tls-key <path> with --enable-http3",
+                "HTTP/3 requires Manual or ACME TLS; configure matching PEM files or ACME with --enable-http3",
             ));
         }
         Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn derive_tls_mode(
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    acme_domains: Option<String>,
+    acme_contact: Option<String>,
+    acme_cache_dir: Option<PathBuf>,
+    acme_directory: Option<String>,
+    acme_directory_ca_cert: Option<PathBuf>,
+) -> Result<TlsMode, ConfigError> {
+    if tls_cert.is_some() != tls_key.is_some() {
+        return Err(ConfigError::new(
+            "TLS configuration requires both --tls-cert <path> and --tls-key <path>; provide both flags or neither",
+        ));
+    }
+    if tls_cert.is_some() && acme_domains.is_some() {
+        return Err(ConfigError::new(
+            "manual PEM TLS and ACME TLS are mutually exclusive",
+        ));
+    }
+    if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
+        if acme_contact.is_some()
+            || acme_cache_dir.is_some()
+            || acme_directory.is_some()
+            || acme_directory_ca_cert.is_some()
+        {
+            return Err(ConfigError::new(
+                "ACME options cannot be combined with manual PEM TLS",
+            ));
+        }
+        return Ok(TlsMode::Manual(ManualTlsConfig { cert, key }));
+    }
+    let Some(domains) = acme_domains else {
+        if acme_contact.is_some()
+            || acme_cache_dir.is_some()
+            || acme_directory.is_some()
+            || acme_directory_ca_cert.is_some()
+        {
+            return Err(ConfigError::new(
+                "ACME options require --acme-domains <csv>",
+            ));
+        }
+        return Ok(TlsMode::Disabled);
+    };
+    let domains = parse_acme_domains(&domains)?;
+    let contact = acme_contact
+        .ok_or_else(|| ConfigError::new("ACME requires --acme-contact <mailto:...>"))?;
+    if !contact.starts_with("mailto:") || contact.len() == "mailto:".len() {
+        return Err(ConfigError::new(
+            "acme_contact must begin with mailto: and include an address",
+        ));
+    }
+    if contact
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(ConfigError::new(
+            "acme_contact must not contain controls or whitespace",
+        ));
+    }
+    let cache_dir =
+        acme_cache_dir.ok_or_else(|| ConfigError::new("ACME requires --acme-cache-dir <path>"))?;
+    let directory = parse_acme_directory(acme_directory.as_deref().unwrap_or("staging"))?;
+    if acme_directory_ca_cert.is_some() && !matches!(directory, AcmeDirectory::Custom(_)) {
+        return Err(ConfigError::new(
+            "acme_directory_ca_cert is allowed only with a custom HTTPS ACME directory",
+        ));
+    }
+    Ok(TlsMode::Acme(AcmeTlsConfig {
+        domains,
+        contact,
+        cache_dir,
+        directory,
+        directory_ca_cert: acme_directory_ca_cert,
+    }))
+}
+
+fn parse_acme_domains(value: &str) -> Result<Vec<String>, ConfigError> {
+    let raw = value.split(',').collect::<Vec<_>>();
+    if raw.is_empty() || raw.len() > 100 {
+        return Err(ConfigError::new(
+            "acme_domains must contain between 1 and 100 DNS names",
+        ));
+    }
+    let mut domains = Vec::with_capacity(raw.len());
+    for value in raw {
+        if value.is_empty()
+            || !value.is_ascii()
+            || value
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        {
+            return Err(ConfigError::new(
+                "acme_domains must contain non-empty ASCII DNS names without whitespace",
+            ));
+        }
+        let domain = value.to_ascii_lowercase();
+        if domain.contains('*') || domain.parse::<std::net::IpAddr>().is_ok() {
+            return Err(ConfigError::new(
+                "acme_domains does not accept wildcards or IP literals",
+            ));
+        }
+        if domain.len() > 253
+            || domain.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+            || rustls_pki_types::DnsName::try_from(domain.as_str()).is_err()
+        {
+            return Err(ConfigError::new(format!(
+                "invalid ASCII DNS name in acme_domains: `{value}`"
+            )));
+        }
+        if domains.iter().any(|existing| existing == &domain) {
+            return Err(ConfigError::new(format!(
+                "duplicate DNS name in acme_domains: `{value}`"
+            )));
+        }
+        domains.push(domain);
+    }
+    Ok(domains)
+}
+
+fn parse_acme_directory(value: &str) -> Result<AcmeDirectory, ConfigError> {
+    match value {
+        "staging" => Ok(AcmeDirectory::Staging),
+        "production" => Ok(AcmeDirectory::Production),
+        value => {
+            let uri = value.parse::<hyper::Uri>().map_err(|_| {
+                ConfigError::new("acme_directory must be staging, production, or an HTTPS URL")
+            })?;
+            if uri.scheme_str() != Some("https") || uri.authority().is_none() {
+                return Err(ConfigError::new(
+                    "a custom acme_directory must be an absolute HTTPS URL",
+                ));
+            }
+            Ok(AcmeDirectory::Custom(value.to_string()))
+        }
     }
 }
 
@@ -1625,7 +1871,7 @@ fn default_cpu_execution_limit() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::ServerConfig;
+    use super::{AcmeDirectory, ServerConfig, TlsMode};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1740,5 +1986,239 @@ mod tests {
             .expect_err("retired file setting must fail");
         std::fs::remove_file(path).expect("remove test config");
         assert!(error.to_string().contains("cpu_queue_timeout_ms"));
+    }
+
+    #[test]
+    fn tls_mode_is_derived_without_an_extra_mode_flag() {
+        let disabled = ServerConfig::parse_from(["--docroot", "."]).unwrap();
+        assert_eq!(disabled.transport.tls_mode, TlsMode::Disabled);
+
+        let manual = ServerConfig::parse_from([
+            "--docroot",
+            ".",
+            "--tls-cert",
+            "cert.pem",
+            "--tls-key",
+            "key.pem",
+        ])
+        .unwrap();
+        assert!(matches!(manual.transport.tls_mode, TlsMode::Manual(_)));
+
+        let acme = ServerConfig::parse_from([
+            "--docroot",
+            ".",
+            "--acme-domains",
+            "Example.ORG,www.example.org",
+            "--acme-contact",
+            "mailto:admin@example.org",
+            "--acme-cache-dir",
+            "acme-cache",
+        ])
+        .unwrap();
+        let TlsMode::Acme(acme) = acme.transport.tls_mode else {
+            panic!("expected ACME TLS mode");
+        };
+        assert_eq!(acme.domains, ["example.org", "www.example.org"]);
+        assert_eq!(acme.directory, AcmeDirectory::Staging);
+    }
+
+    #[test]
+    fn partial_and_mixed_tls_modes_are_rejected() {
+        for args in [
+            vec!["--docroot", ".", "--tls-cert", "cert.pem"],
+            vec!["--docroot", ".", "--tls-key", "key.pem"],
+            vec![
+                "--docroot",
+                ".",
+                "--tls-cert",
+                "cert.pem",
+                "--tls-key",
+                "key.pem",
+                "--acme-domains",
+                "example.org",
+            ],
+            vec![
+                "--docroot",
+                ".",
+                "--acme-domains",
+                "example.org",
+                "--acme-cache-dir",
+                "cache",
+            ],
+            vec![
+                "--docroot",
+                ".",
+                "--acme-domains",
+                "example.org",
+                "--acme-contact",
+                "mailto:a@example.org",
+            ],
+        ] {
+            assert!(ServerConfig::parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn acme_domain_policy_rejects_duplicates_wildcards_ips_and_invalid_dns() {
+        for domains in [
+            "example.org,EXAMPLE.ORG",
+            "*.example.org",
+            "127.0.0.1",
+            "::1",
+            "bad name.example",
+            "-bad.example",
+            "bad-.example",
+            "bad..example",
+            "example.org,",
+        ] {
+            let error = ServerConfig::parse_from([
+                "--docroot",
+                ".",
+                "--acme-domains",
+                domains,
+                "--acme-contact",
+                "mailto:a@example.org",
+                "--acme-cache-dir",
+                "cache",
+            ]);
+            assert!(error.is_err(), "accepted {domains:?}");
+        }
+    }
+
+    #[test]
+    fn acme_directory_requires_explicit_production_and_https_custom_urls() {
+        let production = ServerConfig::parse_from([
+            "--docroot",
+            ".",
+            "--acme-domains",
+            "example.org",
+            "--acme-contact",
+            "mailto:a@example.org",
+            "--acme-cache-dir",
+            "cache",
+            "--acme-directory",
+            "production",
+        ])
+        .unwrap();
+        assert!(matches!(
+            production.transport.tls_mode,
+            TlsMode::Acme(super::AcmeTlsConfig {
+                directory: AcmeDirectory::Production,
+                ..
+            })
+        ));
+
+        for directory in [
+            "http://localhost/directory",
+            "ftp://example.org/directory",
+            "custom",
+        ] {
+            assert!(
+                ServerConfig::parse_from([
+                    "--docroot",
+                    ".",
+                    "--acme-domains",
+                    "example.org",
+                    "--acme-contact",
+                    "mailto:a@example.org",
+                    "--acme-cache-dir",
+                    "cache",
+                    "--acme-directory",
+                    directory,
+                ])
+                .is_err(),
+                "accepted {directory}"
+            );
+        }
+        assert!(
+            ServerConfig::parse_from([
+                "--docroot",
+                ".",
+                "--acme-domains",
+                "example.org",
+                "--acme-contact",
+                "mailto:a@example.org",
+                "--acme-cache-dir",
+                "cache",
+                "--acme-directory-ca-cert",
+                "ca.pem",
+            ])
+            .is_err()
+        );
+
+        let custom = ServerConfig::parse_from([
+            "--docroot",
+            ".",
+            "--acme-domains",
+            "example.org",
+            "--acme-contact",
+            "mailto:a@example.org",
+            "--acme-cache-dir",
+            "cache",
+            "--acme-directory",
+            "https://pebble.test:14000/dir",
+            "--acme-directory-ca-cert",
+            "pebble-ca.pem",
+        ])
+        .unwrap();
+        assert!(matches!(
+            custom.transport.tls_mode,
+            TlsMode::Acme(super::AcmeTlsConfig {
+                directory: AcmeDirectory::Custom(_),
+                directory_ca_cert: Some(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn help_and_config_file_expose_the_same_acme_surface() {
+        let help = ServerConfig::help_text();
+        for flag in [
+            "--acme-domains",
+            "--acme-contact",
+            "--acme-cache-dir",
+            "--acme-directory",
+            "--acme-directory-ca-cert",
+        ] {
+            assert_eq!(help.matches(&format!("{flag} ")).count(), 1, "{flag}");
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("server.toml");
+        std::fs::write(
+            &path,
+            "docroot = \".\"\nacme_domains = \"Example.ORG\"\nacme_contact = \"mailto:a@example.org\"\nacme_cache_dir = \"cache\"\nacme_directory = \"staging\"\n",
+        )
+        .unwrap();
+        let config = ServerConfig::parse_from(["--config", path.to_str().unwrap()]).unwrap();
+        assert!(matches!(
+            config.transport.tls_mode,
+            TlsMode::Acme(super::AcmeTlsConfig {
+                directory: AcmeDirectory::Staging,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn production_startup_summary_is_explicit_and_contains_no_identity_values() {
+        let config = super::AcmeTlsConfig {
+            domains: vec!["secret.example".to_string()],
+            contact: "mailto:secret@example.org".to_string(),
+            cache_dir: "acme-cache".into(),
+            directory: AcmeDirectory::Production,
+            directory_ca_cert: None,
+        };
+        let summary = config.startup_summary();
+        assert!(summary.contains("mode=acme"));
+        assert!(summary.contains("directory_kind=production"));
+        assert!(summary.contains("domain_count=1"));
+        assert!(!summary.contains("secret.example"));
+        assert!(!summary.contains("secret@example.org"));
+        assert!(!summary.contains(config.directory.url()));
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("secret.example"));
+        assert!(!debug.contains("secret@example.org"));
     }
 }

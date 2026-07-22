@@ -7,6 +7,7 @@
 //! `php`, or `php-vm` subprocesses.
 
 mod access_log;
+mod acme;
 pub mod config;
 mod diagnostics;
 mod http3;

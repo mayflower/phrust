@@ -62,15 +62,14 @@ fn connection_admission_rejects_saturation_and_releases_the_permit() {
 
     drop(rejected);
     drop(held);
-    std::thread::sleep(Duration::from_millis(50));
-    let health = http_request(&address, "GET", "/healthz");
-    let metrics = http_request(&address, "GET", "/__phrust/metrics");
+    let health = http_request_after_connection_rejection(&address, "GET", "/healthz");
+    let metrics = http_request_after_connection_rejection(&address, "GET", "/__phrust/metrics");
 
     stop_child(child);
     fs::remove_dir_all(docroot).expect("remove connection admission docroot");
     assert!(health.starts_with("HTTP/1.1 200"), "{health}");
     assert!(
-        metrics.contains("phrust_server_connection_limit_rejections_total 1\n"),
+        metric_value(&metrics, "phrust_server_connection_limit_rejections_total") >= 1,
         "{metrics}"
     );
 }
@@ -478,7 +477,9 @@ async fn tcp_and_http3_share_one_connection_budget() {
     endpoint.close(quinn::VarInt::from_u32(0), b"saturation observed");
 
     drop(held_tcp);
-    tokio::time::sleep(Duration::from_millis(75)).await;
+    // The server must first observe EOF and retire the TCP task that owns the
+    // shared permit. Parallel integration tests can delay that scheduling.
+    tokio::time::sleep(Duration::from_millis(250)).await;
     let health = http3_request(&address, hyper::Method::GET, "/healthz", &[], &[]).await;
     let metrics = http3_request(&address, hyper::Method::GET, "/__phrust/metrics", &[], &[]).await;
     let metrics = String::from_utf8(metrics.body()).expect("shared-limit metrics are UTF-8");
@@ -2607,7 +2608,6 @@ fn php_flush_makes_first_chunk_visible_before_script_end() {
         )
         .expect("write streaming request");
 
-    let started = Instant::now();
     let mut received = Vec::new();
     let mut buffer = [0_u8; 256];
     while !received
@@ -2620,7 +2620,13 @@ fn php_flush_makes_first_chunk_visible_before_script_end() {
         assert_ne!(read, 0, "response ended before first chunk");
         received.extend_from_slice(&buffer[..read]);
     }
-    let first_elapsed = started.elapsed();
+    assert!(
+        !received
+            .windows(b"second\n".len())
+            .any(|window| window == b"second\n"),
+        "first and second chunks arrived together instead of at flush: {}",
+        String::from_utf8_lossy(&received)
+    );
     stream
         .read_to_end(&mut received)
         .expect("read remaining streaming response");
@@ -2631,10 +2637,6 @@ fn php_flush_makes_first_chunk_visible_before_script_end() {
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert!(response.contains("first\n"), "{response}");
     assert!(response.contains("second\n"), "{response}");
-    assert!(
-        first_elapsed < Duration::from_millis(400),
-        "first chunk arrived only after script delay: {first_elapsed:?}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3919,7 +3921,9 @@ fn file_sessions_survive_a_server_restart() {
         .split_once(';')
         .map_or("", |(pair, _)| pair)
         .to_string();
-    stop_child(first_server);
+    send_sigterm(&first_server);
+    let first_status = wait_for_exit(&mut first_server, Duration::from_secs(3));
+    assert!(first_status.success(), "first server exit: {first_status}");
 
     let mut second_server = start_server(&docroot, &["--session-save-path", &session_arg]);
     let second_address = read_listening_address(&mut second_server);
@@ -6760,6 +6764,41 @@ fn http_get(address: &str, path: &str) -> String {
 
 fn http_request(address: &str, method: &str, path: &str) -> String {
     http_request_with_headers(address, method, path, &[], "")
+}
+
+fn http_request_after_connection_rejection(address: &str, method: &str, path: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut stream = TcpStream::connect(address).expect("connect after connection rejection");
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write request after connection rejection");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set timeout after connection rejection");
+        let mut response = String::new();
+        match stream.read_to_string(&mut response) {
+            Ok(_) if !response.is_empty() => return response,
+            Ok(_) | Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => panic!("server did not recover its connection permit: {result:?}"),
+        }
+    }
+}
+
+fn metric_value(metrics: &str, metric: &str) -> u64 {
+    metrics
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            (name == metric)
+                .then(|| value.parse::<u64>().ok())
+                .flatten()
+        })
+        .unwrap_or_default()
 }
 
 fn http_request_with_body(

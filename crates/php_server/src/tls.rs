@@ -1,34 +1,111 @@
-use crate::server::ServerError;
+use crate::{
+    acme::{AcmeManager, AcmeTls, prepare_acme},
+    config::TlsMode,
+    server::ServerError,
+};
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls_pki_types::pem::PemObject;
 use std::{path::Path, sync::Arc, time::Duration};
-use tokio_rustls::{
-    TlsAcceptor,
-    rustls::{
-        ServerConfig as RustlsServerConfig,
-        pki_types::{CertificateDer, PrivateKeyDer},
-    },
+use tokio_rustls::rustls::{
+    ServerConfig as RustlsServerConfig,
+    pki_types::{CertificateDer, PrivateKeyDer},
 };
 
-pub(crate) fn build_tls_acceptor(
-    cert_path: Option<&Path>,
-    key_path: Option<&Path>,
-) -> Result<Option<TlsAcceptor>, ServerError> {
-    let (Some(cert_path), Some(key_path)) = (cert_path, key_path) else {
-        return Ok(None);
-    };
-    let certs = load_tls_certs(cert_path)?;
-    let key = load_tls_private_key(key_path)?;
-    let mut config = RustlsServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|error| {
-            ServerError::Tls(format!(
-                "TLS certificate/key configuration is invalid: {error}"
-            ))
-        })?;
-    config.alpn_protocols = tls_alpn_protocols();
-    Ok(Some(TlsAcceptor::from(Arc::new(config))))
+#[derive(Clone, Debug)]
+pub(crate) enum TcpTls {
+    Manual(Arc<RustlsServerConfig>),
+    Acme(Arc<AcmeTls>),
+}
+
+pub(crate) struct PreparedTls {
+    pub(crate) tcp: Option<TcpTls>,
+    pub(crate) quic: Option<quinn::ServerConfig>,
+    pub(crate) acme_manager: Option<AcmeManager>,
+}
+
+pub(crate) fn build_tls(
+    mode: &TlsMode,
+    http3_enabled: bool,
+    max_streams_per_connection: u32,
+    connection_idle_timeout: Duration,
+) -> Result<PreparedTls, ServerError> {
+    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    match mode {
+        TlsMode::Disabled => Ok(PreparedTls {
+            tcp: None,
+            quic: None,
+            acme_manager: None,
+        }),
+        TlsMode::Manual(manual) => {
+            let certs = load_tls_certs(&manual.cert)?;
+            let key = load_tls_private_key(&manual.key)?;
+            let mut tcp = RustlsServerConfig::builder_with_provider(Arc::clone(&provider))
+                .with_safe_default_protocol_versions()
+                .map_err(|error| ServerError::Tls(format!("TLS setup failed: {error}")))?
+                .with_no_client_auth()
+                .with_single_cert(certs.clone(), key.clone_key())
+                .map_err(|error| {
+                    ServerError::Tls(format!(
+                        "TLS certificate/key configuration is invalid: {error}"
+                    ))
+                })?;
+            tcp.alpn_protocols = tls_alpn_protocols();
+            let quic = http3_enabled
+                .then(|| {
+                    let mut quic = RustlsServerConfig::builder_with_provider(provider)
+                        .with_protocol_versions(&[&tokio_rustls::rustls::version::TLS13])
+                        .map_err(|error| {
+                            ServerError::Tls(format!("HTTP/3 TLS 1.3 setup failed: {error}"))
+                        })?
+                        .with_no_client_auth()
+                        .with_single_cert(certs, key)
+                        .map_err(|error| {
+                            ServerError::Tls(format!(
+                                "HTTP/3 TLS certificate/key configuration is invalid: {error}"
+                            ))
+                        })?;
+                    quic.alpn_protocols = http3_alpn_protocols();
+                    build_quic_server_config(
+                        quic,
+                        max_streams_per_connection,
+                        connection_idle_timeout,
+                    )
+                })
+                .transpose()?;
+            Ok(PreparedTls {
+                tcp: Some(TcpTls::Manual(Arc::new(tcp))),
+                quic,
+                acme_manager: None,
+            })
+        }
+        TlsMode::Acme(config) => {
+            let prepared = prepare_acme(config, Arc::clone(&provider))?;
+            let quic = http3_enabled
+                .then(|| {
+                    let cert_resolver: Arc<dyn tokio_rustls::rustls::server::ResolvesServerCert> =
+                        prepared.tls.resolver.clone();
+                    let mut quic = RustlsServerConfig::builder_with_provider(provider)
+                        .with_protocol_versions(&[&tokio_rustls::rustls::version::TLS13])
+                        .map_err(|error| {
+                            ServerError::Tls(format!("HTTP/3 TLS 1.3 setup failed: {error}"))
+                        })?
+                        .with_no_client_auth()
+                        .with_cert_resolver(cert_resolver);
+                    quic.alpn_protocols = http3_alpn_protocols();
+                    build_quic_server_config(
+                        quic,
+                        max_streams_per_connection,
+                        connection_idle_timeout,
+                    )
+                })
+                .transpose()?;
+            Ok(PreparedTls {
+                tcp: Some(TcpTls::Acme(prepared.tls)),
+                quic,
+                acme_manager: Some(prepared.manager),
+            })
+        }
+    }
 }
 
 pub(crate) fn tls_alpn_protocols() -> Vec<Vec<u8>> {
@@ -39,27 +116,11 @@ pub(crate) fn http3_alpn_protocols() -> Vec<Vec<u8>> {
     vec![b"h3".to_vec()]
 }
 
-pub(crate) fn build_quic_server_config(
-    cert_path: &Path,
-    key_path: &Path,
+fn build_quic_server_config(
+    crypto: RustlsServerConfig,
     max_streams_per_connection: u32,
     connection_idle_timeout: Duration,
 ) -> Result<quinn::ServerConfig, ServerError> {
-    let certs = load_tls_certs(cert_path)?;
-    let key = load_tls_private_key(key_path)?;
-    let mut crypto = RustlsServerConfig::builder_with_provider(Arc::new(
-        tokio_rustls::rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&tokio_rustls::rustls::version::TLS13])
-    .map_err(|error| ServerError::Tls(format!("HTTP/3 TLS 1.3 setup failed: {error}")))?
-    .with_no_client_auth()
-    .with_single_cert(certs, key)
-    .map_err(|error| {
-        ServerError::Tls(format!(
-            "HTTP/3 TLS certificate/key configuration is invalid: {error}"
-        ))
-    })?;
-    crypto.alpn_protocols = http3_alpn_protocols();
     let mut server =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto).map_err(
             |error| ServerError::Tls(format!("HTTP/3 QUIC TLS configuration is invalid: {error}")),

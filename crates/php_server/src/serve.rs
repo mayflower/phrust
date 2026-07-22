@@ -21,8 +21,10 @@ use super::{
     },
 };
 use crate::{
+    acme::AcmeManager,
     response::{self, RequestBody, ResponseBody},
     routing::{ResolvedRoute, resolve_route},
+    tls::TcpTls,
 };
 use http_body_util::BodyExt;
 use hyper::{
@@ -44,21 +46,29 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    net::TcpListener,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
     task::JoinSet,
     time::timeout,
 };
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{LazyConfigAcceptor, server::TlsStream};
 use tracing::{debug, warn};
 
 pub(crate) async fn serve_until_shutdown(
     listener: TcpListener,
     state: Arc<AppState>,
-    tls_acceptor: Option<TlsAcceptor>,
+    tls: Option<TcpTls>,
     http3_endpoint: Option<quinn::Endpoint>,
+    acme_manager: Option<AcmeManager>,
 ) {
     let mut tasks = JoinSet::new();
+    if let Some(manager) = acme_manager {
+        let metrics = Arc::clone(&state.services.metrics);
+        let shutdown = state.connections.shutdown.clone();
+        tasks.spawn(async move {
+            manager.run(metrics, shutdown).await;
+        });
+    }
     if let Some(endpoint) = http3_endpoint.clone() {
         let http3_state = Arc::clone(&state);
         tasks.spawn(async move {
@@ -74,12 +84,17 @@ pub(crate) async fn serve_until_shutdown(
         }
     };
     if let Some(signals) = signals.as_mut() {
+        let mut shutdown = state.connections.shutdown.subscribe();
         loop {
             tokio::select! {
                 accept = listener.accept() => {
                     let Ok((stream, peer)) = accept else {
                         continue;
                     };
+                    if !state.connections.shutdown.is_running() {
+                        drop(stream);
+                        break;
+                    }
                     let local_addr = stream.local_addr().unwrap_or(state.transport.local_addr);
                     state.services.metrics.tcp_connections_accepted_total.fetch_add(1, Ordering::Relaxed);
                     if let Err(error) = stream.set_nodelay(true) {
@@ -91,11 +106,11 @@ pub(crate) async fn serve_until_shutdown(
                         continue;
                     };
                     let state = Arc::clone(&state);
-                    let tls_acceptor = tls_acceptor.clone();
+                    let tls = tls.clone();
                     tasks.spawn(async move {
                         let _connection_permit = connection_permit;
                         let _active = ActiveTcpConnection::new(Arc::clone(&state.services.metrics));
-                        if let Some(tls_acceptor) = tls_acceptor {
+                        if let Some(tls) = tls {
                             let Ok(handshake_permit) = Arc::clone(&state.connections.handshake_permits).try_acquire_owned() else {
                                 state.services.metrics.connection_limit_rejections_total.fetch_add(1, Ordering::Relaxed);
                                 return;
@@ -103,12 +118,18 @@ pub(crate) async fn serve_until_shutdown(
                             let handshake_guard = ActiveTlsHandshake::new(Arc::clone(&state.services.metrics));
                             match timeout(
                                 state.transport.limits.tls_handshake_timeout,
-                                tls_acceptor.accept(stream),
+                                accept_tls(stream, &tls, &state.services.metrics),
                             ).await {
-                                Ok(Ok(stream)) => {
+                                Ok(Ok(AcceptedTls::Normal(stream))) => {
                                     drop(handshake_permit);
                                     drop(handshake_guard);
                                     serve_connection(stream, state, peer, local_addr).await
+                                }
+                                Ok(Ok(AcceptedTls::Challenge(mut stream))) => {
+                                    drop(handshake_permit);
+                                    drop(handshake_guard);
+                                    state.services.metrics.acme_challenge_handshakes_completed_total.fetch_add(1, Ordering::Relaxed);
+                                    let _ = stream.shutdown().await;
                                 }
                                 Ok(Err(error)) => {
                                     state.services.metrics.tls_handshake_failures_total.fetch_add(1, Ordering::Relaxed);
@@ -133,6 +154,12 @@ pub(crate) async fn serve_until_shutdown(
                 _ = signals.recv() => {
                     begin_graceful_drain(&state, http3_endpoint.as_ref());
                     break;
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow_and_update() != crate::shutdown::ShutdownPhase::Running {
+                        begin_graceful_drain(&state, http3_endpoint.as_ref());
+                        break;
+                    }
                 }
             }
         }
@@ -172,6 +199,73 @@ pub(crate) async fn serve_until_shutdown(
     if let Some(endpoint) = http3_endpoint {
         endpoint.close(quinn::VarInt::from_u32(0), b"server shutdown");
         let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+    }
+}
+
+enum AcceptedTls {
+    Normal(TlsStream<TcpStream>),
+    Challenge(TlsStream<TcpStream>),
+}
+
+async fn accept_tls(
+    stream: TcpStream,
+    tls: &TcpTls,
+    metrics: &ServerMetrics,
+) -> Result<AcceptedTls, std::io::Error> {
+    let start =
+        LazyConfigAcceptor::new(tokio_rustls::rustls::server::Acceptor::default(), stream).await?;
+    match tls {
+        TcpTls::Manual(config) => start
+            .into_stream(Arc::clone(config))
+            .await
+            .map(AcceptedTls::Normal),
+        TcpTls::Acme(acme) => {
+            let challenge = rustls_acme::is_tls_alpn_challenge(&start.client_hello());
+            if challenge {
+                metrics
+                    .acme_challenge_client_hellos_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if !acme.permits_challenge_sni(start.client_hello().server_name()) {
+                    metrics
+                        .acme_challenge_unknown_sni_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .acme_challenge_handshake_failures_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "TLS-ALPN-01 SNI is not configured",
+                    ));
+                }
+                return start
+                    .into_stream(Arc::clone(&acme.challenge_config))
+                    .await
+                    .map(AcceptedTls::Challenge)
+                    .inspect_err(|_| {
+                        metrics
+                            .acme_challenge_handshake_failures_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    });
+            }
+            if !acme.status.certificate_available() {
+                metrics
+                    .acme_certificate_resolution_misses_total
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .normal_tls_handshakes_without_certificate_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            let result = start
+                .into_stream(acme.normal_config.clone())
+                .await
+                .map(AcceptedTls::Normal);
+            if result.is_ok() {
+                metrics
+                    .acme_tcp_certificate_resolutions_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            result
+        }
     }
 }
 
@@ -661,7 +755,7 @@ pub(crate) async fn handle_parts_admitted(
             _ => (method_not_allowed("GET, HEAD"), "health", None),
         },
         ResolvedRoute::Ready => {
-            let running = state.connections.shutdown.is_running();
+            let running = state.is_ready();
             match method {
                 Method::GET if running => {
                     (response::text(StatusCode::OK, "ready\n"), "readiness", None)

@@ -1,6 +1,7 @@
 use crate::{
     access_log::AccessLogger,
-    config::{ConfigError, ServerConfig},
+    acme::prepare_acme_cache_dir,
+    config::{ConfigError, ServerConfig, TlsMode},
     http3::build_http3_endpoint,
     metrics::ServerMetrics,
     multipart::MultipartConfig,
@@ -14,7 +15,7 @@ use crate::{
         SessionServices, TransportLimits, preload_script_cache, server_env_snapshot,
     },
     static_files::StaticFileService,
-    tls::build_tls_acceptor,
+    tls::{TcpTls, build_tls},
 };
 use php_diagnostics::{
     DiagnosticCause, DiagnosticEnvelope, DiagnosticLayer, DiagnosticPhase, DiagnosticSeverity,
@@ -98,7 +99,7 @@ impl ServerError {
                     message.clone(),
                 );
                 diagnostic.suggestion = Some(DiagnosticSuggestion::new(
-                    "provide matching --tls-cert and --tls-key PEM files",
+                    "provide matching manual PEM files or validate the ACME directory/CA configuration",
                 ));
                 diagnostic
             }
@@ -262,14 +263,15 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let startup_access_log = config.observability.access_log.clone();
     let startup_perf_trace = config.observability.perf_trace.clone();
     let startup_request_profile = config.observability.request_profile.clone();
-    let startup_tls_enabled = config.transport.tls_cert.is_some();
+    let startup_tls_enabled = config.transport.tls_mode.is_enabled();
+    let startup_tls_mode = match &config.transport.tls_mode {
+        TlsMode::Disabled => "disabled",
+        TlsMode::Manual(_) => "manual",
+        TlsMode::Acme(_) => "acme",
+    };
     let startup_http3_enabled = config.transport.http3_enabled;
     let max_connections = config.transport.max_connections;
     let engine_profile = config.engine.engine_preset;
-    let tls_acceptor = build_tls_acceptor(
-        config.transport.tls_cert.as_deref(),
-        config.transport.tls_key.as_deref(),
-    )?;
     let access_log = config
         .observability
         .access_log
@@ -297,6 +299,21 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         session_store
             .ensure_ready()
             .map_err(std::io::Error::other)?;
+    }
+    if let TlsMode::Acme(acme) = &config.transport.tls_mode {
+        let cache = prepare_acme_cache_dir(&acme.cache_dir)?;
+        for (name, path) in [
+            ("request body", &config.limits.request_body_temp_dir),
+            ("upload", &config.sessions_uploads.upload_temp_dir),
+            ("session", &config.sessions_uploads.session_save_path),
+        ] {
+            if path.canonicalize().ok().as_ref() == Some(&cache) {
+                return Err(ConfigError::new(format!(
+                    "ACME cache directory must not be the {name} directory"
+                ))
+                .into());
+            }
+        }
     }
     debug!(docroot=%docroot.display(), "initializing phrust server");
     let script_cache = Arc::new(if config.engine.script_cache_enabled {
@@ -332,7 +349,27 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         config.engine.perf_ablation,
     ));
     let metrics = Arc::new(ServerMetrics::default());
-    metrics.readiness_state.store(1, Ordering::Release);
+    let mut prepared_tls = build_tls(
+        &config.transport.tls_mode,
+        config.transport.http3_enabled,
+        u32::try_from(config.transport.max_streams_per_connection)
+            .expect("validated max_streams_per_connection fits u32"),
+        Duration::from_millis(config.transport.connection_idle_timeout_ms),
+    )?;
+    let acme_status = match prepared_tls.tcp.as_ref() {
+        Some(TcpTls::Acme(acme)) => Some(Arc::clone(&acme.status)),
+        _ => None,
+    };
+    let acme_enabled = acme_status.is_some();
+    if let TlsMode::Acme(acme) = &config.transport.tls_mode {
+        eprintln!("{}", acme.startup_summary());
+    }
+    metrics
+        .readiness_state
+        .store(u64::from(!acme_enabled), Ordering::Release);
+    metrics
+        .acme_enabled
+        .store(u64::from(acme_enabled), Ordering::Release);
     let static_files = Arc::new(
         StaticFileService::new(
             docroot.clone(),
@@ -344,28 +381,18 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         .map_err(ServerError::Io)?,
     );
     let listener = TcpListener::bind(config.transport.listen).await?;
+    metrics
+        .tcp_listener_binds_total
+        .fetch_add(1, Ordering::Relaxed);
+    metrics.http_listener_count.store(1, Ordering::Release);
     let local_addr = listener.local_addr()?;
     debug!(%local_addr, docroot=%docroot.display(), "starting phrust server listener");
     let http3_listen = config.transport.http3_listen.unwrap_or(local_addr);
     let http3_endpoint = if config.transport.http3_enabled {
-        let cert_path = config.transport.tls_cert.as_deref().ok_or_else(|| {
-            ConfigError::new(
-                "HTTP/3 requires TLS; provide --tls-cert <path> and --tls-key <path> with --enable-http3",
-            )
+        let quic = prepared_tls.quic.take().ok_or_else(|| {
+            ConfigError::new("HTTP/3 requires a prepared Manual or ACME TLS configuration")
         })?;
-        let key_path = config.transport.tls_key.as_deref().ok_or_else(|| {
-            ConfigError::new(
-                "HTTP/3 requires TLS; provide --tls-cert <path> and --tls-key <path> with --enable-http3",
-            )
-        })?;
-        Some(build_http3_endpoint(
-            cert_path,
-            key_path,
-            http3_listen,
-            u32::try_from(config.transport.max_streams_per_connection)
-                .expect("validated max_streams_per_connection fits u32"),
-            Duration::from_millis(config.transport.connection_idle_timeout_ms),
-        )?)
+        Some(build_http3_endpoint(quic, http3_listen)?)
     } else {
         None
     };
@@ -373,6 +400,9 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         .as_ref()
         .map(|endpoint| endpoint.local_addr())
         .transpose()?;
+    metrics
+        .quic_endpoint_count
+        .store(u64::from(http3_endpoint.is_some()), Ordering::Release);
     let http3_alt_svc = http3_local_addr.map(|addr| format!("h3=\":{}\"; ma=86400", addr.port()));
     let state = Arc::new(AppState {
         route_config: RouteConfig {
@@ -498,6 +528,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
             request_counter: Arc::new(AtomicU64::new(0)),
             tokio_handle: tokio::runtime::Handle::current(),
         },
+        acme_status,
     });
     preload_script_cache(&state, script_cache_preload.as_deref(), strict_preload)?;
     debug!(
@@ -507,7 +538,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let startup_scheme = if startup_tls_enabled { "https" } else { "http" };
     println!("listening {startup_scheme}://{local_addr}");
     eprintln!(
-        "startup docroot={} front_controller={} engine_preset={} script_cache={} script_cache_shards={} script_cache_max_entries={} upload_temp_dir={} session_save_path={} metrics_endpoint={} metrics_token={} access_log={} perf_trace={} request_profile={} tls={} tls_alpn={} http3={} http3_addr={}",
+        "startup docroot={} front_controller={} engine_preset={} script_cache={} script_cache_shards={} script_cache_max_entries={} upload_temp_dir={} session_save_path={} metrics_endpoint={} metrics_token={} access_log={} perf_trace={} request_profile={} tls={} tls_mode={} tls_alpn={} http3={} http3_addr={}",
         state.route_config.docroot.display(),
         startup_front_controller
             .as_ref()
@@ -528,6 +559,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
             .as_ref()
             .map_or("-", |path| path.to_str().unwrap_or("<non-utf8>")),
         startup_tls_enabled,
+        startup_tls_mode,
         if startup_tls_enabled {
             "h2,http/1.1"
         } else {
@@ -557,7 +589,14 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
             .native_prewarm_entries
             .load(Ordering::Relaxed),
     );
-    serve_until_shutdown(listener, state, tls_acceptor, http3_endpoint).await;
+    serve_until_shutdown(
+        listener,
+        state,
+        prepared_tls.tcp,
+        http3_endpoint,
+        prepared_tls.acme_manager,
+    )
+    .await;
     Ok(())
 }
 

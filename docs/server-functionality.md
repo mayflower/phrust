@@ -376,6 +376,32 @@ localhost fixture under `fixtures/server/tls/` and `curl -k`:
 nix develop -c just server-tls-smoke
 ```
 
+Native ACME is the mutually exclusive alternative to manual PEM files:
+
+```toml
+acme_domains = "example.org,www.example.org"
+acme_contact = "mailto:admin@example.org"
+acme_cache_dir = "/var/lib/phrust/acme"
+acme_directory = "staging"
+# acme_directory_ca_cert = "/path/to/private-test-ca.pem" # custom HTTPS only
+```
+
+The default directory is Let's Encrypt staging; production must be selected
+with the literal `production`. Domains are canonicalized to lowercase and must
+be 1–100 unique ASCII DNS names without wildcards or IP literals. Contact and
+the private persistent cache are mandatory. Manual PEM plus ACME, partial PEM,
+custom non-HTTPS directories, and CA files outside custom-directory mode are
+startup errors.
+
+TLS-ALPN-01 shares the one public TCP TLS listener, connection limit,
+handshake budget, and timeout with normal HTTPS. Challenge handshakes for
+configured SNI names close before HTTP dispatch. There is no port-80/HTTP-01
+path or external certificate process. The one ACME state task updates the same
+resolver used by normal TCP and optional QUIC, so renewals need no listener or
+server restart. With an empty cache the listener remains available for the
+challenge while `/readyz` is logically false and normal TLS has no fallback
+certificate.
+
 ## Validation
 
 ```bash
@@ -387,6 +413,8 @@ nix develop -c just server-compat-smoke all
 nix develop -c just server-tls-smoke
 nix develop -c just server-transport-hardening-smoke
 nix develop -c just server-graceful-shutdown-smoke
+nix develop -c just server-acme-single-server-smoke
+nix develop -c just server-acme-pebble-integration
 nix develop -c just server-benchmark-smoke
 nix develop -c rg "FastCGI|php-fpm|mod_php|CGI|std::process::Command|Command::new" crates/php_server crates/php_executor docs README.md
 ```

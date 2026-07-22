@@ -13,9 +13,13 @@ CGI, Apache module, `mod_php`, or external PHP process compatibility.
 - `crates/php_server/src/response.rs` and `transfer.rs` own the shared
   frame-streaming body, emitted-byte accounting, and exact-once transfer
   lifecycle.
-- `crates/php_server/src/server.rs` owns Hyper/Tokio request handling, optional
-  Rustls termination, limits, metrics, graceful shutdown, and executor/cache
-  wiring.
+- `crates/php_server/src/server.rs` owns listener/endpoint startup and
+  executor/cache wiring; `serve.rs` owns the single TCP accept loop and the
+  bounded handshake/connection tasks.
+- `crates/php_server/src/tls.rs` owns the exclusive disabled/manual/ACME TLS
+  modes and builds TCP plus optional QUIC configurations. `acme.rs` owns the
+  one `AcmeState` polling task, secure persistent cache, resolver, status, and
+  event classification.
 - `crates/php_server/src/multipart.rs` owns bounded multipart parsing and
   upload temp-file cleanup.
 - `crates/php_server/src/session_store.rs` owns process-local web session
@@ -53,6 +57,22 @@ same Hyper service is wrapped in Rustls and the startup handshake prints
 `listening https://<addr>`. TLS advertises `h2` and `http/1.1` through ALPN.
 HTTP/3 can be enabled over QUIC with `--enable-http3`; it consumes the same
 response body frame by frame and does not collect the body first.
+
+ACME is an exclusive alternative to manual PEM files. With `acme_domains`, the
+same TCP listener uses `LazyConfigAcceptor` to distinguish an exact
+`acme-tls/1` ClientHello from normal HTTPS. Only configured SNI names may use
+the challenge configuration, and completed challenge TLS connections close
+before Hyper. One owned `AcmeState` task supplies one dynamic resolver shared
+by normal TCP and QUIC configurations. Empty cache keeps the listener and
+challenge path active but readiness false until a cached or newly issued
+certificate is deployed. Terminal cache/state failures make readiness false
+and enter the normal graceful drain.
+
+There is no ACME listener, port-80 bind, HTTP-01 route, Certbot process,
+self-signed normal fallback, or detached renewal task. The mandatory
+non-symlink cache is created private and stores files as mode 0600 on Unix.
+Let's Encrypt staging is the default; production requires the explicit
+`production` directory selection.
 
 Server configuration can come from CLI flags or a simple TOML-style
 `--config <path>` file, with CLI flags taking precedence. Production-oriented
@@ -113,6 +133,8 @@ nix develop -c cargo test -p php_server -p php_executor
 nix develop -c just server-smoke
 nix develop -c just server-compat-smoke all
 nix develop -c just server-tls-smoke
+nix develop -c just server-acme-single-server-smoke
+nix develop -c just server-acme-pebble-integration
 nix develop -c just server-benchmark-smoke
 nix develop -c just verify-server
 ```

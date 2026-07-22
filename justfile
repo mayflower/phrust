@@ -122,6 +122,8 @@ help:
       '  just server-tls-smoke     Run integrated HTTPS server smoke checks' \
       '  just server-transport-hardening-smoke Run bounded H1/H2/H3 transport checks' \
       '  just server-graceful-shutdown-smoke Run SIGINT/SIGTERM drain checks' \
+      '  just server-acme-single-server-smoke Check ACME one-listener/task/provider invariants' \
+      '  just server-acme-pebble-integration Run local Pebble issuance/renewal/restart E2E' \
       '  just server-benchmark-smoke Run short optional server benchmark smoke' \
       '' \
       'Standard library and compatibility:' \
@@ -270,6 +272,7 @@ verify-server:
     just server-session-files-smoke
     just server-transport-hardening-smoke
     just server-graceful-shutdown-smoke
+    just server-acme-single-server-smoke
 
 server-request-input-smoke:
     cargo build -p php_server --bin phrust-server
@@ -295,6 +298,12 @@ server-graceful-shutdown-smoke:
     cargo test -p php_server --test health sigterm_
     cargo test -p php_server --test health shutdown
     cargo test -p php_server --test health drain_deadline_forces_incomplete_upload_and_removes_spool_file -- --exact
+
+server-acme-single-server-smoke:
+    scripts/server/acme_single_server_smoke.sh
+
+server-acme-pebble-integration:
+    scripts/server/acme_pebble_integration.sh
 
 server-benchmark-smoke:
     scripts/server/benchmark_smoke.sh

@@ -108,6 +108,10 @@ jobs:
             nix develop -c just ${{ matrix.gate }}
           fi
 
+      - name: Run local Pebble ACME integration
+        if: runner.os == 'Linux' && matrix.gate == 'verify-server'
+        run: nix develop -c just server-acme-pebble-integration
+
       - name: Upload gate reports
         if: always()
         uses: actions/upload-artifact@v7
