@@ -49,7 +49,9 @@ pub(super) fn authoritative_native_call_value_is_admitted(
             php_jit::JIT_NATIVE_VALUE_VIEW_STRING
             | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY
             | php_jit::JIT_NATIVE_VALUE_VIEW_FLOAT
-            | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT => return true,
+            | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT
+            | php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE
+            | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER => return true,
             php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR
                 if slot.flags == php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION
                     && slot.reserved != php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_EMPTY =>
@@ -899,7 +901,38 @@ pub(super) fn exact_native_callable_requires_baseline(
                 true
             }
         }
-        _ => context.prepared_closure_invocation(callee).is_none(),
+        Some(NativeEncodedValueKind::Callable) => {
+            match context.prepared_callable_dispatch(direct_callee) {
+                Some(NativePreparedCallableDispatch::Closure) => context
+                    .prepared_closure_payload(direct_callee)
+                    .is_none_or(|closure| {
+                        let function = php_ir::FunctionId::new(closure.function);
+                        closure.context.owner_unit.map_or_else(
+                            || native_function_is_generator(context, function),
+                            |unit| {
+                                external_function_is_generator(
+                                    context,
+                                    NativeDynamicFunction { unit, function },
+                                )
+                            },
+                        )
+                    }),
+                Some(NativePreparedCallableDispatch::Named(name)) => {
+                    named_callable_requires_baseline(context, &name)
+                }
+                Some(NativePreparedCallableDispatch::BoundMethod { target, method }) => {
+                    let class = match target {
+                        php_runtime::api::CallableMethodTarget::Object(object) => {
+                            object.class_name()
+                        }
+                        php_runtime::api::CallableMethodTarget::Class(class) => class,
+                    };
+                    method_callable_requires_baseline(context, &class, &method)
+                }
+                Some(NativePreparedCallableDispatch::Invalid(_)) | None => true,
+            }
+        }
+        _ => true,
     }
 }
 
@@ -1310,7 +1343,12 @@ fn invoke_native_closure_payload(
     arguments: &[i64],
     instruction: &php_ir::Instruction,
     metadata: Option<&[php_ir::instruction::IrCallArg]>,
+    builtin_policy: NativeCallableBuiltinPolicy,
 ) -> NativeCallResult {
+    if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline && prepared_captures.is_none()
+    {
+        return Err(NativeCallControl::BaselineRequired);
+    }
     let function = php_ir::FunctionId::new(closure.function);
     let has_implicit_this = closure
         .context
@@ -1344,8 +1382,7 @@ fn invoke_native_closure_payload(
         closure_arguments.extend_from_slice(captures);
     } else {
         // Compatibility for a closure reached through a baseline
-        // ReferenceCell. Native closures always carry encoded captures in
-        // NativePreparedClosure and do not enter this branch.
+        // ReferenceCell. Direct native closures never enter this branch.
         for capture in &closure.captures {
             let encoded = if capture.name.eq_ignore_ascii_case("this")
                 && let Some(object) = &closure.bound_this
@@ -1367,53 +1404,61 @@ fn invoke_native_closure_payload(
     if let Some(scope_class) = &closure.context.scope_class {
         context.lexical_scope_classes.push(scope_class.to_string());
     }
-    let generator_owner_is_current = closure.context.owner_unit.is_none_or(|unit| {
-        context
-            .dynamic_units
-            .get(unit)
-            .is_some_and(|package| package.compiled.ptr_eq(&context.compiled))
-    });
-    let result =
-        (|| -> NativeCallResult {
-            if generator_owner_is_current && native_function_is_generator(context, function) {
-                let arguments = closure_arguments
-                    .iter()
-                    .map(|value| context.decode(*value))
-                    .collect::<Result<Vec<_>, _>>()?;
-                return Ok(context.encode(Value::Generator(
-                    php_runtime::api::GeneratorRef::new(function.raw(), arguments),
-                ))?);
+    let result = (|| -> NativeCallResult {
+        let generator = closure.context.owner_unit.map_or_else(
+            || native_function_is_generator(context, function),
+            |unit| {
+                external_function_is_generator(context, NativeDynamicFunction { unit, function })
+            },
+        );
+        if generator {
+            if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
+                return Err(NativeCallControl::BaselineRequired);
             }
-            if let Some(unit) = closure.context.owner_unit {
-                return invoke_native_external_function_with_metadata(
-                    context,
-                    NativeDynamicFunction { unit, function },
-                    &closure_arguments,
-                    metadata,
-                    closure
-                        .context
-                        .called_class
-                        .as_ref()
-                        .map(|class| class.to_string()),
-                    context.unit.strict_types_for_span(instruction.span),
-                );
-            }
-            let pushed_called_class = closure.context.called_class.is_some();
-            if let Some(called_class) = &closure.context.called_class {
-                context.called_classes.push(Arc::clone(called_class));
-            }
-            let result = invoke_native_function_with_metadata_strict(
+            let arguments = closure_arguments
+                .iter()
+                .map(|value| context.decode(*value))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(
+                context.encode(Value::Generator(php_runtime::api::GeneratorRef::new(
+                    function.raw(),
+                    arguments,
+                )))?,
+            );
+        }
+        if let Some(unit) = closure.context.owner_unit {
+            return invoke_native_external_function_with_metadata_policy(
                 context,
-                function,
+                NativeDynamicFunction { unit, function },
                 &closure_arguments,
                 metadata,
+                closure
+                    .context
+                    .called_class
+                    .as_ref()
+                    .map(|class| class.to_string()),
                 context.unit.strict_types_for_span(instruction.span),
+                builtin_policy,
             );
-            if pushed_called_class {
-                context.called_classes.pop();
-            }
-            result
-        })();
+        }
+        let pushed_called_class = closure.context.called_class.is_some();
+        if let Some(called_class) = &closure.context.called_class {
+            context.called_classes.push(Arc::clone(called_class));
+        }
+        let result = invoke_native_function_with_metadata_strict_at_tier(
+            context,
+            function,
+            &closure_arguments,
+            metadata,
+            context.unit.strict_types_for_span(instruction.span),
+            false,
+            builtin_policy,
+        );
+        if pushed_called_class {
+            context.called_classes.pop();
+        }
+        result
+    })();
     if pushed_scope {
         context.lexical_scope_classes.pop();
     }
@@ -1562,12 +1607,9 @@ pub(super) fn execute_native_dynamic_callable(
         }
         _ => {}
     }
-    if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
-        // Prepared/boxed closures and compatibility callables are baseline
-        // carriers. Exact native callback handlers never decode them.
-        return Some(Err(NativeCallControl::BaselineRequired));
-    }
-    if let Some((closure, implicit_this, captures)) = context.prepared_closure_invocation(*callee) {
+    if let Some((closure, implicit_this, captures)) =
+        context.prepared_closure_invocation(direct_callee)
+    {
         return Some(invoke_native_closure_payload(
             context,
             &closure,
@@ -1576,7 +1618,44 @@ pub(super) fn execute_native_dynamic_callable(
             arguments,
             instruction,
             metadata,
+            builtin_policy,
         ));
+    }
+    if let Some(callable) = context.prepared_callable_dispatch(direct_callee) {
+        let result = match callable {
+            NativePreparedCallableDispatch::Named(name) => invoke_native_named_callable(
+                context,
+                &name,
+                arguments,
+                instruction,
+                metadata,
+                builtin_policy,
+            ),
+            NativePreparedCallableDispatch::BoundMethod { target, method } => {
+                invoke_native_bound_method(
+                    context,
+                    &target,
+                    &method,
+                    arguments,
+                    metadata,
+                    context.unit.strict_types_for_span(instruction.span),
+                    caller_function,
+                    builtin_policy,
+                )
+            }
+            NativePreparedCallableDispatch::Invalid(target) => {
+                Err(format!("{target} is not callable").into())
+            }
+            NativePreparedCallableDispatch::Closure => {
+                Err("direct native closure record is invalid".into())
+            }
+        };
+        return Some(result);
+    }
+    if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
+        // Boxed compatibility callables are baseline carriers. Exact native
+        // callback handlers never decode them.
+        return Some(Err(NativeCallControl::BaselineRequired));
     }
     let callee = match context.decode(*callee) {
         Ok(value) => dereference_native_callable_value(value),
@@ -1604,6 +1683,7 @@ pub(super) fn execute_native_dynamic_callable(
                     arguments,
                     instruction,
                     metadata,
+                    builtin_policy,
                 ),
                 php_runtime::api::CallableValue::BoundMethod { target, method, .. } => {
                     invoke_native_bound_method(
@@ -1887,7 +1967,7 @@ pub(super) fn execute_native_generator_method(
 
 pub(super) fn finish_native_fiber_outcome(
     context: &mut NativeRequestColdState<'_>,
-    fiber: &php_runtime::api::FiberRef,
+    fiber: &NativeFiberReceiver,
     handle: php_jit::JitFunctionHandle,
     arguments: Vec<i64>,
     outcome: php_jit::JitI64InvokeOutcome,
@@ -1899,8 +1979,12 @@ pub(super) fn finish_native_fiber_outcome(
             value,
             ..
         } => {
-            fiber.terminate(Some(context.decode(value)?));
-            context.fiber_executions.remove(&fiber.id());
+            context.terminate_fiber_receiver(fiber, Some(value))?;
+            let fiber_id = context.fiber_receiver_id(fiber)?;
+            context.fiber_executions.remove(&fiber_id);
+            for argument in arguments {
+                context.release_if_live(argument)?;
+            }
             context.encode(Value::Null)
         }
         php_jit::JitI64InvokeOutcome::SideExit {
@@ -1908,9 +1992,10 @@ pub(super) fn finish_native_fiber_outcome(
             value,
             state,
         } if status == php_jit::JitCallStatus::SUSPEND_FIBER.0 as i32 => {
-            fiber.set_state(php_runtime::api::FiberState::Suspended);
+            context.set_fiber_receiver_state(fiber, php_runtime::api::FiberState::Suspended)?;
+            let fiber_id = context.fiber_receiver_id(fiber)?;
             context.fiber_executions.insert(
-                fiber.id(),
+                fiber_id,
                 NativeFiberExecution {
                     handle,
                     arguments,
@@ -1918,13 +2003,15 @@ pub(super) fn finish_native_fiber_outcome(
                     nested: context.pending_nested_fiber_execution.take().map(Box::new),
                 },
             );
-            let value = context.decode(value)?;
-            context.encode(value)
+            Ok(value)
         }
         php_jit::JitI64InvokeOutcome::SideExit { status, value, .. }
             if status == php_jit::JitCallStatus::THROW.0 as i32 =>
         {
-            fiber.set_state(php_runtime::api::FiberState::Errored);
+            context.set_fiber_receiver_state(fiber, php_runtime::api::FiberState::Errored)?;
+            for argument in arguments {
+                context.release_if_live(argument)?;
+            }
             let (class, message, _) = context
                 .decode(value)
                 .ok()
@@ -1939,7 +2026,10 @@ pub(super) fn finish_native_fiber_outcome(
             Err(format!("E_PHP_THROW:{class}:{message}"))
         }
         php_jit::JitI64InvokeOutcome::SideExit { status, .. } => {
-            fiber.set_state(php_runtime::api::FiberState::Errored);
+            context.set_fiber_receiver_state(fiber, php_runtime::api::FiberState::Errored)?;
+            for argument in arguments {
+                context.release_if_live(argument)?;
+            }
             Err(format!("native fiber returned status {status}"))
         }
     }
@@ -1982,28 +2072,29 @@ pub(super) fn execute_native_fiber_method(
         return None;
     };
     let receiver = encoded.first()?;
-    let fiber = match context.decode(*receiver) {
-        Ok(Value::Fiber(fiber)) => fiber,
-        Ok(_) => return None,
+    let fiber = match context.native_fiber_receiver(*receiver) {
+        Ok(Some(fiber)) => fiber,
+        Ok(None) => return None,
         Err(error) => return Some(Err(error)),
     };
     let result = (|| -> Result<i64, String> {
         match method.to_ascii_lowercase().as_str() {
             "isstarted" => context.encode(Value::Bool(
-                fiber.state() != php_runtime::api::FiberState::NotStarted,
+                context.fiber_receiver_state(&fiber)? != php_runtime::api::FiberState::NotStarted,
             )),
             "issuspended" => context.encode(Value::Bool(
-                fiber.state() == php_runtime::api::FiberState::Suspended,
+                context.fiber_receiver_state(&fiber)? == php_runtime::api::FiberState::Suspended,
             )),
             "isrunning" => context.encode(Value::Bool(
-                fiber.state() == php_runtime::api::FiberState::Running,
+                context.fiber_receiver_state(&fiber)? == php_runtime::api::FiberState::Running,
             )),
             "isterminated" => context.encode(Value::Bool(
-                fiber.state() == php_runtime::api::FiberState::Terminated,
+                context.fiber_receiver_state(&fiber)? == php_runtime::api::FiberState::Terminated,
             )),
             "getreturn" => {
-                if fiber.state() != php_runtime::api::FiberState::Terminated {
-                    let state = if fiber.state() == php_runtime::api::FiberState::NotStarted {
+                let fiber_state = context.fiber_receiver_state(&fiber)?;
+                if fiber_state != php_runtime::api::FiberState::Terminated {
+                    let state = if fiber_state == php_runtime::api::FiberState::NotStarted {
                         "been started"
                     } else {
                         "returned"
@@ -2012,40 +2103,41 @@ pub(super) fn execute_native_fiber_method(
                         "E_PHP_THROW:FiberError:Cannot get fiber return value: The fiber has not {state}"
                     ));
                 }
-                context.encode(fiber.return_value().unwrap_or(Value::Null))
+                context
+                    .fiber_receiver_return_value(&fiber)?
+                    .map_or_else(|| context.encode(Value::Null), Ok)
             }
             "start" => {
-                if fiber.state() != php_runtime::api::FiberState::NotStarted {
+                if context.fiber_receiver_state(&fiber)? != php_runtime::api::FiberState::NotStarted
+                {
                     return Err(
                         "E_PHP_THROW:FiberError:Cannot start a fiber that has already been started"
                             .to_owned(),
                     );
                 }
-                let Value::Callable(callable) = fiber.callable() else {
-                    return Err(
-                        "Fiber::__construct(): Argument #1 ($callback) must be of type callable"
-                            .to_owned(),
-                    );
-                };
-                let php_runtime::api::CallableValue::Closure(closure) = callable.as_ref() else {
+                let callable = context.fiber_receiver_callable(&fiber)?;
+                let Some((closure, _implicit_this, captures)) =
+                    context.prepared_closure_invocation(callable)
+                else {
                     return Err("Fiber callback must resolve to a native closure".to_owned());
                 };
                 let function = php_ir::FunctionId::new(closure.function);
                 let handle = ensure_native_entry(context, function)?;
-                let mut arguments = closure
-                    .captures
-                    .iter()
-                    .map(|capture| {
-                        if let Some(reference) = capture.reference() {
-                            context.encode_native_reference_owner(reference)
-                        } else {
-                            context.encode(capture.value().cloned().unwrap_or(Value::Null))
+                let mut arguments = Vec::with_capacity(captures.len() + encoded.len() - 1);
+                for argument in captures.iter().copied().chain(encoded[1..].iter().copied()) {
+                    match context.duplicate_baseline_call_argument(argument) {
+                        Ok(argument) => arguments.push(argument),
+                        Err(error) => {
+                            for argument in arguments {
+                                let _ = context.release_if_live(argument);
+                            }
+                            return Err(error);
                         }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                arguments.extend_from_slice(&encoded[1..]);
-                fiber.set_state(php_runtime::api::FiberState::Running);
-                let previous_fiber = context.active_fiber.replace(fiber.id());
+                    }
+                }
+                context.set_fiber_receiver_state(&fiber, php_runtime::api::FiberState::Running)?;
+                let fiber_id = context.fiber_receiver_id(&fiber)?;
+                let previous_fiber = context.active_fiber.replace(fiber_id);
                 let runtime = context.native_runtime_ptr();
                 let outcome = handle
                     .invoke_i64_with_deopt_runtime(
@@ -2058,28 +2150,30 @@ pub(super) fn execute_native_fiber_method(
                 finish_native_fiber_outcome(context, &fiber, handle, arguments, outcome)
             }
             "resume" | "throw" => {
-                if fiber.state() != php_runtime::api::FiberState::Suspended {
+                if context.fiber_receiver_state(&fiber)? != php_runtime::api::FiberState::Suspended
+                {
                     return Err(
                         "E_PHP_THROW:FiberError:Cannot resume a fiber that is not suspended"
                             .to_owned(),
                     );
                 }
+                let fiber_id = context.fiber_receiver_id(&fiber)?;
                 let mut execution = context
                     .fiber_executions
-                    .remove(&fiber.id())
+                    .remove(&fiber_id)
                     .ok_or_else(|| "native fiber suspension state is missing".to_owned())?;
                 let value = encoded
                     .get(1)
                     .copied()
                     .unwrap_or_else(|| php_jit::jit_encode_constant(u32::MAX));
-                fiber.set_state(php_runtime::api::FiberState::Running);
+                context.set_fiber_receiver_state(&fiber, php_runtime::api::FiberState::Running)?;
                 let kind = if method.eq_ignore_ascii_case("throw") {
                     php_jit::JitNativeResumeInputKind::THROW
                 } else {
                     php_jit::JitNativeResumeInputKind::VALUE
                 };
                 if let Some(mut nested) = execution.nested.take() {
-                    let previous_fiber = context.active_fiber.replace(fiber.id());
+                    let previous_fiber = context.active_fiber.replace(fiber_id);
                     let runtime = context.native_runtime_ptr();
                     let nested_outcome = nested
                         .handle
@@ -2106,7 +2200,7 @@ pub(super) fn execute_native_fiber_method(
                                 execution.state.continuation_id,
                                 value,
                             ));
-                            let previous_fiber = context.active_fiber.replace(fiber.id());
+                            let previous_fiber = context.active_fiber.replace(fiber_id);
                             let runtime = context.native_runtime_ptr();
                             let outcome = execution
                                 .handle
@@ -2134,17 +2228,19 @@ pub(super) fn execute_native_fiber_method(
                         } if status == php_jit::JitCallStatus::SUSPEND_FIBER.0 as i32 => {
                             nested.state = state;
                             execution.nested = Some(nested);
-                            context.fiber_executions.insert(fiber.id(), execution);
-                            fiber.set_state(php_runtime::api::FiberState::Suspended);
-                            let value = context.decode(value)?;
-                            return context.encode(value);
+                            context.fiber_executions.insert(fiber_id, execution);
+                            context.set_fiber_receiver_state(
+                                &fiber,
+                                php_runtime::api::FiberState::Suspended,
+                            )?;
+                            return Ok(value);
                         }
                         php_jit::JitI64InvokeOutcome::SideExit { status, .. } => {
                             return Err(format!("native nested fiber returned status {status}"));
                         }
                     }
                 }
-                let previous_fiber = context.active_fiber.replace(fiber.id());
+                let previous_fiber = context.active_fiber.replace(fiber_id);
                 let runtime = context.native_runtime_ptr();
                 let outcome = execution
                     .handle

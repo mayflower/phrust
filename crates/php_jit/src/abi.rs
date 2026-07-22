@@ -11,13 +11,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use php_ir::{FunctionId, LocalId, RegId};
 
 /// Version for the C-compatible runtime ABI records.
-pub const JIT_RUNTIME_ABI_VERSION: u32 = 75;
+pub const JIT_RUNTIME_ABI_VERSION: u32 = 76;
 
 /// Stable ABI fingerprint for Cranelift ABI.
 ///
 /// This is updated only when a `repr(C)` boundary type changes layout or tag
 /// meaning. It is intentionally independent from Rust type names.
-pub const JIT_RUNTIME_ABI_HASH: u64 = 0x0dc1_a843_0000_006b;
+pub const JIT_RUNTIME_ABI_HASH: u64 = 0x0dc1_a843_0000_006c;
 
 /// No stable length is published for this runtime value slot.
 pub const JIT_NATIVE_VALUE_VIEW_NONE: u32 = 0;
@@ -50,6 +50,17 @@ pub const JIT_NATIVE_VALUE_VIEW_FLOAT: u32 = 12;
 /// Request-owned object identity backed by the stable slot-parallel owner
 /// arena published in the native runtime view.
 pub const JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT: u32 = 13;
+/// Request-owned callable record with authoritative encoded object/capture owners.
+pub const JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE: u32 = 14;
+/// Layout/meaning version for a prepared callable direct value slot.
+pub const JIT_NATIVE_PREPARED_CALLABLE_ABI_VERSION: u32 = 1;
+/// Request-owned Fiber lifecycle with encoded callable and return owners.
+pub const JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER: u32 = 15;
+/// Layout/meaning version for a direct Fiber value slot.
+pub const JIT_NATIVE_DIRECT_FIBER_ABI_VERSION: u32 = 1;
+/// Fiber that crossed an explicit cold boundary and is now backed by a
+/// cached runtime `FiberRef`; optimizing handlers do not admit this kind.
+pub const JIT_NATIVE_VALUE_VIEW_MATERIALIZED_FIBER: u32 = 16;
 pub const JIT_NATIVE_SHARED_ARRAY_ABI_VERSION: u32 = 1;
 pub const JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_VERSION: u32 = 1;
 pub const JIT_NATIVE_TRUSTED_PROPERTY_SLOT_EMPTY: u32 = 0;
@@ -2112,7 +2123,7 @@ mod tests {
 
     #[test]
     fn c_abi_layout_is_stable() {
-        assert_eq!(JIT_RUNTIME_ABI_VERSION, 75);
+        assert_eq!(JIT_RUNTIME_ABI_VERSION, 76);
         assert_ne!(JIT_RUNTIME_ABI_HASH, 0);
         assert_eq!(size_of::<JitOpaqueHandle>(), 8);
         assert_eq!(size_of::<JitCValueTag>(), 4);

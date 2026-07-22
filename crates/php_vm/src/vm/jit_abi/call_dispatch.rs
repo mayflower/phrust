@@ -2356,14 +2356,17 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     .first()
                     .copied()
                     .ok_or_else(|| "Fiber::__construct() expects a callback".to_owned())?;
-                let callback = context.decode(callback)?;
-                if !matches!(callback, Value::Callable(_)) {
+                let callback = context.dereference_direct_encoding(callback);
+                if context.native_encoded_value_kind(callback)
+                    != Some(NativeEncodedValueKind::Callable)
+                    || context.prepared_callable_dispatch(callback).is_none()
+                {
                     return Err(
                         "Fiber::__construct(): Argument #1 ($callback) must be of type callable"
                             .into(),
                     );
                 }
-                return Ok(context.encode(Value::Fiber(php_runtime::api::FiberRef::new(callback)))?);
+                return Ok(context.encode_native_fiber(callback)?);
             }
             if let php_ir::InstructionKind::NewObject {
                 display_class_name, ..

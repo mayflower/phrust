@@ -1446,6 +1446,14 @@ pub(super) struct NativeRequestColdState<'a> {
     /// writes use the direct reference payload without rebuilding its graph.
     native_global_reference_handles: std::collections::BTreeMap<String, i64>,
     direct_object_handles: std::collections::HashMap<u64, u32>,
+    /// Request-wide identity for authoritative direct closure records. The
+    /// record itself is owned by the direct value slot's `aux` pointer.
+    direct_closure_handles: std::collections::HashMap<u64, u32>,
+    /// Cold Fiber identities that have crossed into or originated in the
+    /// runtime value API. Ordinary native Fibers are identified by their
+    /// direct slot and never enter these maps.
+    direct_fiber_handles: std::collections::HashMap<u64, u32>,
+    direct_fiber_cells: std::collections::HashMap<usize, php_runtime::api::FiberRef>,
     /// Request-wide content identity for immutable direct strings. Array keys
     /// and values reuse one authoritative native slot instead of rebuilding
     /// the same byte value for every materialized array graph.
@@ -1670,10 +1678,6 @@ fn stored_value_slot(value: &NativeStoredValue) -> php_jit::JitNativeValueSlot {
 
 enum NativeStoredValue {
     Php(Value),
-    /// Native closure record published once with request-owned encoded
-    /// capture handles. Invocation borrows these handles and never rebuilds
-    /// captured arrays through Rust `Value`.
-    PreparedClosure(Box<NativePreparedClosure>),
     GlobalsProxy,
     ArrayIterator(Box<NativeArrayIteratorState>),
     Iterator(Box<NativeIteratorState>),
@@ -1790,9 +1794,59 @@ impl From<NativeCallControl> for String {
 }
 
 struct NativePreparedClosure {
-    callable: Box<php_runtime::api::CallableValue>,
+    /// PHP closure metadata only. `captures` and `bound_this` are always
+    /// empty here; their authoritative owners are the encoded fields below.
+    closure: php_runtime::api::ClosurePayload,
+    capture_descriptors: Box<[(String, bool)]>,
     implicit_this: Option<i64>,
     captures: Box<[i64]>,
+}
+
+enum NativePreparedCallable {
+    UserFunction {
+        name: String,
+    },
+    Closure(NativePreparedClosure),
+    InternalBuiltin {
+        name: String,
+    },
+    BoundMethod {
+        target: NativePreparedCallableMethodTarget,
+        method: String,
+        scope: Option<String>,
+    },
+    MethodPlaceholder {
+        target: String,
+    },
+    UnresolvedDynamic {
+        target: String,
+    },
+}
+
+enum NativePreparedCallableMethodTarget {
+    Object(i64),
+    Class(String),
+}
+
+enum NativePreparedCallableDispatch {
+    Closure,
+    Named(String),
+    BoundMethod {
+        target: php_runtime::api::CallableMethodTarget,
+        method: String,
+    },
+    Invalid(String),
+}
+
+struct NativeDirectFiber {
+    state: php_runtime::api::FiberState,
+    callable: i64,
+    return_value: Option<i64>,
+}
+
+enum NativeFiberReceiver {
+    Direct(i64),
+    Materialized(php_runtime::api::FiberRef),
 }
 
 struct NativeArrayIteratorState {
@@ -1831,7 +1885,6 @@ enum NativeValueIdentity {
     Object(u64),
     Reference(u64),
     String(php_runtime::api::PhpString),
-    Closure(u64),
     GlobalsProxy,
 }
 
@@ -2015,12 +2068,6 @@ fn stored_value_identity(value: &NativeStoredValue) -> Option<NativeValueIdentit
         NativeStoredValue::Php(Value::String(string)) => {
             Some(NativeValueIdentity::String(string.clone()))
         }
-        NativeStoredValue::PreparedClosure(closure) => match closure.callable.as_ref() {
-            php_runtime::api::CallableValue::Closure(closure) => {
-                Some(NativeValueIdentity::Closure(closure.id))
-            }
-            _ => None,
-        },
         NativeStoredValue::GlobalsProxy => Some(NativeValueIdentity::GlobalsProxy),
         _ => None,
     }
@@ -2034,7 +2081,6 @@ fn stored_value_tag(value: &NativeStoredValue) -> u64 {
         NativeStoredValue::Php(Value::String(_)) => php_jit::JIT_VALUE_RUNTIME_STRING_TAG,
         NativeStoredValue::Php(Value::Float(_)) => php_jit::JIT_VALUE_RUNTIME_FLOAT_TAG,
         NativeStoredValue::Php(Value::Callable(_)) => php_jit::JIT_VALUE_RUNTIME_CALLABLE_TAG,
-        NativeStoredValue::PreparedClosure(_) => php_jit::JIT_VALUE_RUNTIME_CALLABLE_TAG,
         NativeStoredValue::Php(Value::Resource(_)) => php_jit::JIT_VALUE_RUNTIME_RESOURCE_TAG,
         NativeStoredValue::Php(Value::Generator(_)) => php_jit::JIT_VALUE_RUNTIME_GENERATOR_TAG,
         NativeStoredValue::Php(Value::Fiber(_)) => php_jit::JIT_VALUE_RUNTIME_FIBER_TAG,
@@ -2060,7 +2106,6 @@ fn stored_value_kind(value: &NativeStoredValue) -> &'static str {
         NativeStoredValue::Php(Value::Resource(_)) => "resource",
         NativeStoredValue::Php(Value::Reference(_)) => "reference",
         NativeStoredValue::Php(Value::Callable(_)) => "callable",
-        NativeStoredValue::PreparedClosure(_) => "prepared_closure",
         NativeStoredValue::Php(Value::Generator(_)) => "generator",
         NativeStoredValue::Php(Value::Fiber(_)) => "fiber",
         NativeStoredValue::Php(Value::Uninitialized) => "uninitialized",
@@ -2362,6 +2407,9 @@ impl<'a> NativeRequestColdState<'a> {
             direct_reference_cells: std::collections::HashMap::new(),
             native_global_reference_handles: std::collections::BTreeMap::new(),
             direct_object_handles: std::collections::HashMap::new(),
+            direct_closure_handles: std::collections::HashMap::new(),
+            direct_fiber_handles: std::collections::HashMap::new(),
+            direct_fiber_cells: std::collections::HashMap::new(),
             direct_string_handles: std::collections::HashMap::new(),
             direct_string_keys: std::collections::HashMap::new(),
             direct_array_handles: std::collections::HashMap::new(),
@@ -3269,6 +3317,10 @@ impl<'a> NativeRequestColdState<'a> {
         self.direct_reference_cells.clear();
         self.native_global_reference_handles.clear();
         self.direct_object_handles.clear();
+        debug_assert!(self.direct_closure_handles.is_empty());
+        self.direct_closure_handles.clear();
+        self.direct_fiber_handles.clear();
+        self.direct_fiber_cells.clear();
         self.direct_string_handles.clear();
         self.direct_string_keys.clear();
         self.direct_array_handles.clear();
@@ -4145,6 +4197,235 @@ impl<'a> NativeRequestColdState<'a> {
         // SAFETY: encode/publish stores a Box<ObjectRef> before exposing the
         // descriptor, and release clears the pointer only after refcount zero.
         unsafe { owner.as_ref().cloned() }
+    }
+
+    /// Borrows the authoritative closure record published directly by this
+    /// value slot. The pointer is stable until the final encoded owner is
+    /// released; no `NativeStoredValue` mirror participates in lookup.
+    #[allow(unsafe_code)]
+    fn direct_prepared_callable(&self, index: usize) -> Option<&NativePreparedCallable> {
+        let slot = *self.direct_value_slots.get(index)?;
+        if slot.refcount == 0
+            || slot.kind != php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE
+            || slot.flags != php_jit::JIT_NATIVE_PREPARED_CALLABLE_ABI_VERSION
+        {
+            return None;
+        }
+        let owner = slot.aux as usize as *const NativePreparedCallable;
+        // SAFETY: publication installs exactly one boxed record before the
+        // descriptor becomes visible, and final release reclaims both.
+        unsafe { owner.as_ref() }
+    }
+
+    #[allow(unsafe_code)]
+    fn direct_prepared_callable_mut(
+        &mut self,
+        index: usize,
+    ) -> Option<&mut NativePreparedCallable> {
+        let slot = *self.direct_value_slots.get(index)?;
+        if slot.refcount == 0
+            || slot.kind != php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE
+            || slot.flags != php_jit::JIT_NATIVE_PREPARED_CALLABLE_ABI_VERSION
+        {
+            return None;
+        }
+        let owner = slot.aux as usize as *mut NativePreparedCallable;
+        // SAFETY: mutation requires `&mut self`, so no competing record
+        // borrow can exist on this request thread.
+        unsafe { owner.as_mut() }
+    }
+
+    #[allow(unsafe_code)]
+    fn fiber_record(&self, index: usize) -> Option<&NativeDirectFiber> {
+        let slot = self.direct_value_slots.get(index)?;
+        if slot.refcount == 0
+            || !matches!(
+                slot.kind,
+                php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER
+                    | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_FIBER
+            )
+            || slot.flags != php_jit::JIT_NATIVE_DIRECT_FIBER_ABI_VERSION
+        {
+            return None;
+        }
+        let owner = slot.aux as usize as *const NativeDirectFiber;
+        // SAFETY: direct Fiber publication owns one boxed record until the
+        // slot's final encoded owner is released.
+        unsafe { owner.as_ref() }
+    }
+
+    fn direct_fiber(&self, index: usize) -> Option<&NativeDirectFiber> {
+        (self.direct_value_slots.get(index)?.kind == php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER)
+            .then(|| self.fiber_record(index))
+            .flatten()
+    }
+
+    #[allow(unsafe_code)]
+    fn direct_fiber_mut(&mut self, index: usize) -> Option<&mut NativeDirectFiber> {
+        let slot = self.direct_value_slots.get(index)?;
+        if slot.refcount == 0
+            || slot.kind != php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER
+            || slot.flags != php_jit::JIT_NATIVE_DIRECT_FIBER_ABI_VERSION
+        {
+            return None;
+        }
+        let owner = slot.aux as usize as *mut NativeDirectFiber;
+        // SAFETY: `&mut self` excludes a competing record borrow on the
+        // request thread.
+        unsafe { owner.as_mut() }
+    }
+
+    fn direct_fiber_index(&self, encoded: i64) -> Option<usize> {
+        let index = Self::direct_value_index(encoded)?;
+        self.direct_fiber(index).map(|_| index)
+    }
+
+    fn native_fiber_state(&self, encoded: i64) -> Option<php_runtime::api::FiberState> {
+        let index = self.direct_fiber_index(encoded)?;
+        self.direct_fiber(index).map(|fiber| fiber.state)
+    }
+
+    fn native_fiber_callable(&self, encoded: i64) -> Option<i64> {
+        let index = self.direct_fiber_index(encoded)?;
+        self.direct_fiber(index).map(|fiber| fiber.callable)
+    }
+
+    fn native_fiber_return_value(&self, encoded: i64) -> Option<Option<i64>> {
+        let index = self.direct_fiber_index(encoded)?;
+        self.direct_fiber(index).map(|fiber| fiber.return_value)
+    }
+
+    fn set_native_fiber_state(
+        &mut self,
+        encoded: i64,
+        state: php_runtime::api::FiberState,
+    ) -> Result<(), String> {
+        let index = self
+            .direct_fiber_index(encoded)
+            .ok_or_else(|| "native Fiber has no direct record".to_owned())?;
+        self.direct_fiber_mut(index)
+            .ok_or_else(|| "native Fiber record disappeared".to_owned())?
+            .state = state;
+        Ok(())
+    }
+
+    fn terminate_native_fiber(
+        &mut self,
+        encoded: i64,
+        return_value: Option<i64>,
+    ) -> Result<(), String> {
+        let index = self
+            .direct_fiber_index(encoded)
+            .ok_or_else(|| "native Fiber has no direct record".to_owned())?;
+        let previous = {
+            let fiber = self
+                .direct_fiber_mut(index)
+                .ok_or_else(|| "native Fiber record disappeared".to_owned())?;
+            fiber.state = php_runtime::api::FiberState::Terminated;
+            std::mem::replace(&mut fiber.return_value, return_value)
+        };
+        if let Some(previous) = previous {
+            self.release(previous)?;
+        }
+        Ok(())
+    }
+
+    fn native_fiber_receiver(
+        &mut self,
+        encoded: i64,
+    ) -> Result<Option<NativeFiberReceiver>, String> {
+        let encoded = self.dereference_direct_encoding(encoded);
+        if self.direct_fiber_index(encoded).is_some() {
+            return Ok(Some(NativeFiberReceiver::Direct(encoded)));
+        }
+        if self.native_encoded_value_kind(encoded) != Some(NativeEncodedValueKind::Fiber) {
+            return Ok(None);
+        }
+        match self.decode(encoded)? {
+            Value::Fiber(fiber) => Ok(Some(NativeFiberReceiver::Materialized(fiber))),
+            _ => Ok(None),
+        }
+    }
+
+    fn fiber_receiver_id(&self, fiber: &NativeFiberReceiver) -> Result<u64, String> {
+        match fiber {
+            NativeFiberReceiver::Direct(encoded) => Self::direct_value_index(*encoded)
+                .map(|index| index as u64)
+                .ok_or_else(|| "native Fiber identity is missing".to_owned()),
+            NativeFiberReceiver::Materialized(fiber) => Ok(fiber.id()),
+        }
+    }
+
+    fn fiber_receiver_state(
+        &self,
+        fiber: &NativeFiberReceiver,
+    ) -> Result<php_runtime::api::FiberState, String> {
+        match fiber {
+            NativeFiberReceiver::Direct(encoded) => self
+                .native_fiber_state(*encoded)
+                .ok_or_else(|| "native Fiber state is missing".to_owned()),
+            NativeFiberReceiver::Materialized(fiber) => Ok(fiber.state()),
+        }
+    }
+
+    fn set_fiber_receiver_state(
+        &mut self,
+        fiber: &NativeFiberReceiver,
+        state: php_runtime::api::FiberState,
+    ) -> Result<(), String> {
+        match fiber {
+            NativeFiberReceiver::Direct(encoded) => self.set_native_fiber_state(*encoded, state),
+            NativeFiberReceiver::Materialized(fiber) => {
+                fiber.set_state(state);
+                Ok(())
+            }
+        }
+    }
+
+    fn fiber_receiver_callable(&mut self, fiber: &NativeFiberReceiver) -> Result<i64, String> {
+        match fiber {
+            NativeFiberReceiver::Direct(encoded) => self
+                .native_fiber_callable(*encoded)
+                .ok_or_else(|| "native Fiber callable is missing".to_owned()),
+            NativeFiberReceiver::Materialized(fiber) => self.encode(fiber.callable()),
+        }
+    }
+
+    fn fiber_receiver_return_value(
+        &mut self,
+        fiber: &NativeFiberReceiver,
+    ) -> Result<Option<i64>, String> {
+        match fiber {
+            NativeFiberReceiver::Direct(encoded) => {
+                let value = self
+                    .native_fiber_return_value(*encoded)
+                    .ok_or_else(|| "native Fiber return slot is missing".to_owned())?;
+                value
+                    .map(|value| self.duplicate_baseline_call_argument(value))
+                    .transpose()
+            }
+            NativeFiberReceiver::Materialized(fiber) => fiber
+                .return_value()
+                .map(|value| self.encode(value))
+                .transpose(),
+        }
+    }
+
+    fn terminate_fiber_receiver(
+        &mut self,
+        fiber: &NativeFiberReceiver,
+        return_value: Option<i64>,
+    ) -> Result<(), String> {
+        match fiber {
+            NativeFiberReceiver::Direct(encoded) => {
+                self.terminate_native_fiber(*encoded, return_value)
+            }
+            NativeFiberReceiver::Materialized(fiber) => {
+                let return_value = return_value.map(|value| self.decode(value)).transpose()?;
+                fiber.terminate(return_value);
+                Ok(())
+            }
+        }
     }
 
     /// A materialized ReferenceCell can outlive a direct object handle and can
@@ -5335,6 +5616,169 @@ impl<'a> NativeRequestColdState<'a> {
             .ok_or_else(|| format!("shared native array {index} storage is unavailable"))?;
             return Ok(Value::Array(array));
         }
+        if matches!(
+            slot.kind,
+            php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER
+                | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_FIBER
+        ) {
+            if let Some(fiber) = self.direct_fiber_cells.get(&index) {
+                return Ok(Value::Fiber(fiber.clone()));
+            }
+            let (state, callable, return_value) = {
+                let fiber = self
+                    .fiber_record(index)
+                    .ok_or_else(|| format!("direct native Fiber {index} has no stable record"))?;
+                (fiber.state, fiber.callable, fiber.return_value)
+            };
+            let callable = self.decode(callable)?;
+            if !matches!(callable, Value::Callable(_)) {
+                return Err(format!(
+                    "direct native Fiber {index} callable became {}",
+                    native_value_type_name(&callable)
+                ));
+            }
+            let fiber = php_runtime::api::FiberRef::new(callable);
+            match state {
+                php_runtime::api::FiberState::NotStarted => {}
+                php_runtime::api::FiberState::Terminated => {
+                    let return_value = return_value.map(|value| self.decode(value)).transpose()?;
+                    fiber.terminate(return_value);
+                }
+                state => fiber.set_state(state),
+            }
+            self.direct_value_slots[index].kind = php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_FIBER;
+            self.direct_value_slots[index].payload = fiber.id();
+            self.direct_fiber_handles.insert(fiber.id(), index as u32);
+            self.direct_fiber_cells.insert(index, fiber.clone());
+            return Ok(Value::Fiber(fiber));
+        }
+        if slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE {
+            let prepared = self
+                .direct_prepared_callable(index)
+                .ok_or_else(|| format!("direct native callable {index} has no stable record"))?;
+            match prepared {
+                NativePreparedCallable::UserFunction { name } => {
+                    return Ok(Value::Callable(Box::new(
+                        php_runtime::api::CallableValue::UserFunction { name: name.clone() },
+                    )));
+                }
+                NativePreparedCallable::InternalBuiltin { name } => {
+                    return Ok(Value::Callable(Box::new(
+                        php_runtime::api::CallableValue::InternalBuiltin { name: name.clone() },
+                    )));
+                }
+                NativePreparedCallable::MethodPlaceholder { target } => {
+                    return Ok(Value::Callable(Box::new(
+                        php_runtime::api::CallableValue::MethodPlaceholder {
+                            target: target.clone(),
+                        },
+                    )));
+                }
+                NativePreparedCallable::UnresolvedDynamic { target } => {
+                    return Ok(Value::Callable(Box::new(
+                        php_runtime::api::CallableValue::UnresolvedDynamic {
+                            target: target.clone(),
+                        },
+                    )));
+                }
+                NativePreparedCallable::BoundMethod {
+                    target: NativePreparedCallableMethodTarget::Class(class),
+                    method,
+                    scope,
+                } => {
+                    return Ok(Value::Callable(Box::new(
+                        php_runtime::api::CallableValue::BoundMethod {
+                            target: php_runtime::api::CallableMethodTarget::Class(class.clone()),
+                            method: method.clone(),
+                            scope: scope.clone(),
+                        },
+                    )));
+                }
+                NativePreparedCallable::Closure(_) | NativePreparedCallable::BoundMethod { .. } => {
+                }
+            }
+            if let NativePreparedCallable::BoundMethod {
+                target: NativePreparedCallableMethodTarget::Object(object),
+                method,
+                scope,
+            } = prepared
+            {
+                let (object, method, scope) = (*object, method.clone(), scope.clone());
+                let Value::Object(object) = self.decode(object)? else {
+                    return Err(format!(
+                        "direct native callable {index} lost its bound object"
+                    ));
+                };
+                return Ok(Value::Callable(Box::new(
+                    php_runtime::api::CallableValue::BoundMethod {
+                        target: php_runtime::api::CallableMethodTarget::Object(object),
+                        method,
+                        scope,
+                    },
+                )));
+            }
+            let (mut closure, capture_descriptors, captures, implicit_this) = {
+                let NativePreparedCallable::Closure(prepared) = self
+                    .direct_prepared_callable(index)
+                    .ok_or_else(|| format!("direct native closure {index} has no stable record"))?
+                else {
+                    return Err(format!(
+                        "direct native callable {index} has an invalid target"
+                    ));
+                };
+                if prepared.closure.id != slot.payload
+                    || prepared.capture_descriptors.len() != prepared.captures.len()
+                {
+                    return Err(format!(
+                        "direct native closure {index} record is inconsistent"
+                    ));
+                }
+                (
+                    prepared.closure.clone(),
+                    prepared.capture_descriptors.clone(),
+                    prepared.captures.clone(),
+                    prepared.implicit_this,
+                )
+            };
+            closure.bound_this = match implicit_this {
+                Some(encoded) => match self.decode(encoded)? {
+                    Value::Object(object) => Some(object),
+                    value => {
+                        return Err(format!(
+                            "direct native closure {index} bound object became {}",
+                            native_value_type_name(&value)
+                        ));
+                    }
+                },
+                None => None,
+            };
+            closure.captures = capture_descriptors
+                .iter()
+                .zip(captures.iter().copied())
+                .map(|((name, by_reference), encoded)| {
+                    let value = self.decode(encoded)?;
+                    if *by_reference {
+                        let Value::Reference(reference) = value else {
+                            return Err(format!(
+                                "direct native closure {index} capture ${name} lost reference identity"
+                            ));
+                        };
+                        Ok(php_runtime::api::ClosureCaptureValue::by_reference(
+                            name.clone(),
+                            reference,
+                        ))
+                    } else {
+                        Ok(php_runtime::api::ClosureCaptureValue::by_value(
+                            name.clone(),
+                            value,
+                        ))
+                    }
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            return Ok(Value::Callable(Box::new(
+                php_runtime::api::CallableValue::Closure(closure),
+            )));
+        }
         if slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT {
             self.demote_direct_object_declared_slots(index)?;
             let object = self
@@ -5470,9 +5914,6 @@ impl<'a> NativeRequestColdState<'a> {
             }
             return match self.values.get(index as usize).and_then(Option::as_ref) {
                 Some(NativeStoredValue::Php(value)) => Ok(value.clone()),
-                Some(NativeStoredValue::PreparedClosure(closure)) => {
-                    Ok(Value::Callable(closure.callable.clone()))
-                }
                 Some(NativeStoredValue::GlobalsProxy) => self.materialize_native_globals_array(),
                 Some(
                     NativeStoredValue::ArrayIterator(_)
@@ -5487,18 +5928,210 @@ impl<'a> NativeRequestColdState<'a> {
         Ok(Value::Int(encoded))
     }
 
+    fn encode_prepared_callable(
+        &mut self,
+        callable: Box<php_runtime::api::CallableValue>,
+    ) -> Result<i64, String> {
+        if matches!(
+            callable.as_ref(),
+            php_runtime::api::CallableValue::Closure(_)
+        ) {
+            return self.encode_prepared_closure(callable);
+        }
+        let prepared = match *callable {
+            php_runtime::api::CallableValue::UserFunction { name } => {
+                NativePreparedCallable::UserFunction { name }
+            }
+            php_runtime::api::CallableValue::InternalBuiltin { name } => {
+                NativePreparedCallable::InternalBuiltin { name }
+            }
+            php_runtime::api::CallableValue::BoundMethod {
+                target,
+                method,
+                scope,
+            } => {
+                let target = match target {
+                    php_runtime::api::CallableMethodTarget::Object(object) => {
+                        NativePreparedCallableMethodTarget::Object(
+                            self.encode_native_object_owner(object)?,
+                        )
+                    }
+                    php_runtime::api::CallableMethodTarget::Class(class) => {
+                        NativePreparedCallableMethodTarget::Class(class)
+                    }
+                };
+                NativePreparedCallable::BoundMethod {
+                    target,
+                    method,
+                    scope,
+                }
+            }
+            php_runtime::api::CallableValue::MethodPlaceholder { target } => {
+                NativePreparedCallable::MethodPlaceholder { target }
+            }
+            php_runtime::api::CallableValue::UnresolvedDynamic { target } => {
+                NativePreparedCallable::UnresolvedDynamic { target }
+            }
+            php_runtime::api::CallableValue::Closure(_) => unreachable!(),
+        };
+        let index = match self.reserve_direct_value_slot() {
+            Ok(index) => index,
+            Err(error) => {
+                if let NativePreparedCallable::BoundMethod {
+                    target: NativePreparedCallableMethodTarget::Object(object),
+                    ..
+                } = &prepared
+                {
+                    let _ = self.release(*object);
+                }
+                return Err(error);
+            }
+        };
+        let runtime_index = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE))
+            .expect("direct callable index is bounded by the native value arena");
+        let owner = Box::into_raw(Box::new(prepared));
+        self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
+            refcount: 1,
+            kind: php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE,
+            flags: php_jit::JIT_NATIVE_PREPARED_CALLABLE_ABI_VERSION,
+            aux: owner as usize as u64,
+            ..php_jit::JitNativeValueSlot::default()
+        };
+        Ok(php_jit::jit_encode_typed_runtime_value(
+            runtime_index,
+            php_jit::JIT_VALUE_RUNTIME_CALLABLE_TAG,
+        ))
+    }
+
+    fn publish_native_fiber(
+        &mut self,
+        callable: i64,
+        state: php_runtime::api::FiberState,
+        return_value: Option<i64>,
+        materialized: Option<php_runtime::api::FiberRef>,
+    ) -> Result<i64, String> {
+        let index = match self.reserve_direct_value_slot() {
+            Ok(index) => index,
+            Err(error) => {
+                let _ = self.release(callable);
+                if let Some(return_value) = return_value {
+                    let _ = self.release(return_value);
+                }
+                return Err(error);
+            }
+        };
+        let runtime_index = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE))
+            .expect("direct Fiber index is bounded by the native value arena");
+        let identity = materialized.as_ref().map(php_runtime::api::FiberRef::id);
+        let owner = Box::into_raw(Box::new(NativeDirectFiber {
+            state,
+            callable,
+            return_value,
+        }));
+        self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
+            refcount: 1,
+            kind: if materialized.is_some() {
+                php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_FIBER
+            } else {
+                php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER
+            },
+            flags: php_jit::JIT_NATIVE_DIRECT_FIBER_ABI_VERSION,
+            payload: identity.unwrap_or(0),
+            aux: owner as usize as u64,
+            ..php_jit::JitNativeValueSlot::default()
+        };
+        if let Some(fiber) = materialized {
+            self.direct_fiber_handles.insert(fiber.id(), index as u32);
+            self.direct_fiber_cells.insert(index, fiber);
+        }
+        Ok(php_jit::jit_encode_typed_runtime_value(
+            runtime_index,
+            php_jit::JIT_VALUE_RUNTIME_FIBER_TAG,
+        ))
+    }
+
+    fn encode_native_fiber(&mut self, callable: i64) -> Result<i64, String> {
+        self.retain(callable)?;
+        self.publish_native_fiber(
+            callable,
+            php_runtime::api::FiberState::NotStarted,
+            None,
+            None,
+        )
+    }
+
+    fn encode_native_fiber_owner(
+        &mut self,
+        fiber: php_runtime::api::FiberRef,
+    ) -> Result<i64, String> {
+        if let Some(index) = self.direct_fiber_handles.get(&fiber.id()).copied() {
+            let slot = self
+                .direct_value_slots
+                .get_mut(index as usize)
+                .filter(|slot| {
+                    slot.refcount != 0
+                        && matches!(
+                            slot.kind,
+                            php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER
+                                | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_FIBER
+                        )
+                })
+                .ok_or_else(|| "native Fiber identity points at a dead slot".to_owned())?;
+            slot.refcount = slot
+                .refcount
+                .checked_add(1)
+                .ok_or_else(|| "native Fiber refcount overflow".to_owned())?;
+            let runtime_index = index
+                .checked_add(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE)
+                .ok_or_else(|| "native Fiber handle overflow".to_owned())?;
+            return Ok(php_jit::jit_encode_typed_runtime_value(
+                runtime_index,
+                php_jit::JIT_VALUE_RUNTIME_FIBER_TAG,
+            ));
+        }
+        let callable = self.encode(fiber.callable())?;
+        let return_value = match fiber.return_value().map(|value| self.encode(value)) {
+            Some(Ok(value)) => Some(value),
+            Some(Err(error)) => {
+                let _ = self.release(callable);
+                return Err(error);
+            }
+            None => None,
+        };
+        self.publish_native_fiber(callable, fiber.state(), return_value, Some(fiber))
+    }
+
     fn encode_prepared_closure(
         &mut self,
         callable: Box<php_runtime::api::CallableValue>,
     ) -> Result<i64, String> {
-        let php_runtime::api::CallableValue::Closure(closure) = callable.as_ref() else {
-            return self.encode_stored_value(NativeStoredValue::Php(Value::Callable(callable)));
+        let closure = match *callable {
+            php_runtime::api::CallableValue::Closure(closure) => closure,
+            _ => unreachable!(),
         };
-        let identity = NativeValueIdentity::Closure(closure.id);
-        if let Some(index) = self.interned_value_handles.get(&identity).copied() {
-            self.retain_runtime_value_index(index as usize)?;
+        if let Some(index) = self.direct_closure_handles.get(&closure.id).copied() {
+            let slot = self
+                .direct_value_slots
+                .get_mut(index as usize)
+                .filter(|slot| {
+                    slot.refcount != 0
+                        && slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE
+                        && slot.payload == closure.id
+                })
+                .ok_or_else(|| "direct native closure identity points at a dead slot".to_owned())?;
+            slot.refcount = slot
+                .refcount
+                .checked_add(1)
+                .ok_or_else(|| "direct native closure refcount overflow".to_owned())?;
+            let runtime_index = index
+                .checked_add(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE)
+                .ok_or_else(|| "direct native closure handle overflow".to_owned())?;
             return Ok(php_jit::jit_encode_typed_runtime_value(
-                index,
+                runtime_index,
                 php_jit::JIT_VALUE_RUNTIME_CALLABLE_TAG,
             ));
         }
@@ -5507,6 +6140,11 @@ impl<'a> NativeRequestColdState<'a> {
             .as_ref()
             .map(|object| self.encode_native_object_owner(object.clone()))
             .transpose()?;
+        let capture_descriptors = closure
+            .captures
+            .iter()
+            .map(|capture| (capture.name.clone(), capture.reference.is_some()))
+            .collect::<Vec<_>>();
         let mut capture_values = Vec::with_capacity(closure.captures.len());
         for capture in &closure.captures {
             let encoded = (|| {
@@ -5533,14 +6171,8 @@ impl<'a> NativeRequestColdState<'a> {
                 }
             }
         }
-        match self.encode_stored_value(NativeStoredValue::PreparedClosure(Box::new(
-            NativePreparedClosure {
-                callable,
-                implicit_this,
-                captures: capture_values.clone().into_boxed_slice(),
-            },
-        ))) {
-            Ok(encoded) => Ok(encoded),
+        let index = match self.reserve_direct_value_slot() {
+            Ok(index) => index,
             Err(error) => {
                 if let Some(implicit_this) = implicit_this {
                     let _ = self.release(implicit_this);
@@ -5548,9 +6180,38 @@ impl<'a> NativeRequestColdState<'a> {
                 for capture in capture_values {
                     let _ = self.release(capture);
                 }
-                Err(error)
+                return Err(error);
             }
-        }
+        };
+        let runtime_index = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE))
+            .expect("direct closure index is bounded by the native value arena");
+        let closure_id = closure.id;
+        let mut closure = closure;
+        closure.bound_this = None;
+        closure.captures.clear();
+        let owner = Box::into_raw(Box::new(NativePreparedCallable::Closure(
+            NativePreparedClosure {
+                closure,
+                capture_descriptors: capture_descriptors.into_boxed_slice(),
+                implicit_this,
+                captures: capture_values.into_boxed_slice(),
+            },
+        )));
+        self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
+            refcount: 1,
+            kind: php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE,
+            flags: php_jit::JIT_NATIVE_PREPARED_CALLABLE_ABI_VERSION,
+            payload: closure_id,
+            aux: owner as usize as u64,
+            ..php_jit::JitNativeValueSlot::default()
+        };
+        self.direct_closure_handles.insert(closure_id, index as u32);
+        Ok(php_jit::jit_encode_typed_runtime_value(
+            runtime_index,
+            php_jit::JIT_VALUE_RUNTIME_CALLABLE_TAG,
+        ))
     }
 
     #[track_caller]
@@ -5568,14 +6229,8 @@ impl<'a> NativeRequestColdState<'a> {
             Value::Float(value) => return self.encode_native_float_owner(value),
             Value::Object(object) => return self.encode_native_object_owner(object),
             Value::Reference(reference) => return self.encode_native_reference_owner(reference),
-            Value::Callable(callable)
-                if matches!(
-                    callable.as_ref(),
-                    php_runtime::api::CallableValue::Closure(_)
-                ) =>
-            {
-                return self.encode_prepared_closure(callable);
-            }
+            Value::Callable(callable) => return self.encode_prepared_callable(callable),
+            Value::Fiber(fiber) => return self.encode_native_fiber_owner(fiber),
             value => value,
         };
         match &value {
@@ -5696,7 +6351,7 @@ impl<'a> NativeRequestColdState<'a> {
                     // create this representation.
                     return self.encode_native_array_owner(array.clone());
                 }
-                Some(NativeStoredValue::Php(_) | NativeStoredValue::PreparedClosure(_)) => {}
+                Some(NativeStoredValue::Php(_)) => {}
                 Some(NativeStoredValue::GlobalsProxy) => unreachable!(),
                 Some(
                     NativeStoredValue::ArrayIterator(_)
@@ -5728,8 +6383,8 @@ impl<'a> NativeRequestColdState<'a> {
 
     /// Gives an encoded value one additional request-arena owner without
     /// decoding or reconstructing it. Direct values are authoritative;
-    /// compatibility scalars, objects, references, and prepared closures can
-    /// still retain their stable request slot until they naturally retire.
+    /// compatibility scalars, objects, and references can still retain their
+    /// stable request slot until they naturally retire.
     /// `None` is reserved for baseline-only arrays/proxies/iterators whose
     /// legacy facade semantics require an explicit cold operation.
     fn duplicate_authoritative_native_value(
@@ -5746,7 +6401,7 @@ impl<'a> NativeRequestColdState<'a> {
                 Some(NativeStoredValue::Php(Value::Array(_)) | NativeStoredValue::GlobalsProxy) => {
                     Ok(None)
                 }
-                Some(NativeStoredValue::Php(_) | NativeStoredValue::PreparedClosure(_)) => {
+                Some(NativeStoredValue::Php(_)) => {
                     self.retain_runtime_value_index(index)?;
                     Ok(Some(encoded))
                 }
@@ -5780,20 +6435,62 @@ impl<'a> NativeRequestColdState<'a> {
         Option<i64>,
         smallvec::SmallVec<[i64; 8]>,
     )> {
-        let index = php_jit::jit_decode_runtime_value(encoded)? as usize;
-        match self.values.get(index)?.as_ref()? {
-            NativeStoredValue::PreparedClosure(prepared) => {
-                let php_runtime::api::CallableValue::Closure(closure) = prepared.callable.as_ref()
-                else {
-                    return None;
-                };
-                Some((
-                    closure.clone(),
-                    prepared.implicit_this,
-                    smallvec::SmallVec::from_slice(&prepared.captures),
-                ))
+        let index = Self::direct_value_index(encoded)?;
+        let NativePreparedCallable::Closure(prepared) = self.direct_prepared_callable(index)?
+        else {
+            return None;
+        };
+        if prepared.closure.id != self.direct_value_slots.get(index)?.payload
+            || prepared.capture_descriptors.len() != prepared.captures.len()
+        {
+            return None;
+        }
+        Some((
+            prepared.closure.clone(),
+            prepared.implicit_this,
+            smallvec::SmallVec::from_slice(&prepared.captures),
+        ))
+    }
+
+    fn prepared_closure_payload(&self, encoded: i64) -> Option<&php_runtime::api::ClosurePayload> {
+        let index = Self::direct_value_index(encoded)?;
+        let NativePreparedCallable::Closure(prepared) = self.direct_prepared_callable(index)?
+        else {
+            return None;
+        };
+        (prepared.closure.id == self.direct_value_slots.get(index)?.payload
+            && prepared.capture_descriptors.len() == prepared.captures.len())
+        .then_some(&prepared.closure)
+    }
+
+    fn prepared_callable_dispatch(&self, encoded: i64) -> Option<NativePreparedCallableDispatch> {
+        let index = Self::direct_value_index(encoded)?;
+        match self.direct_prepared_callable(index)? {
+            NativePreparedCallable::Closure(_) => Some(NativePreparedCallableDispatch::Closure),
+            NativePreparedCallable::UserFunction { name }
+            | NativePreparedCallable::InternalBuiltin { name } => {
+                Some(NativePreparedCallableDispatch::Named(name.clone()))
             }
-            _ => None,
+            NativePreparedCallable::BoundMethod { target, method, .. } => {
+                let target = match target {
+                    NativePreparedCallableMethodTarget::Object(object) => {
+                        php_runtime::api::CallableMethodTarget::Object(
+                            self.native_query_object(*object)?,
+                        )
+                    }
+                    NativePreparedCallableMethodTarget::Class(class) => {
+                        php_runtime::api::CallableMethodTarget::Class(class.clone())
+                    }
+                };
+                Some(NativePreparedCallableDispatch::BoundMethod {
+                    target,
+                    method: method.clone(),
+                })
+            }
+            NativePreparedCallable::MethodPlaceholder { target }
+            | NativePreparedCallable::UnresolvedDynamic { target } => {
+                Some(NativePreparedCallableDispatch::Invalid(target.clone()))
+            }
         }
     }
 
@@ -5802,7 +6499,14 @@ impl<'a> NativeRequestColdState<'a> {
     /// clone or replacement slot. Only unit-indexed constants and an unowned
     /// closure require translation.
     fn transfer_external_return(&mut self, encoded: i64, owner_unit: usize) -> Result<i64, String> {
-        if Self::direct_value_index(encoded).is_some() {
+        if let Some(index) = Self::direct_value_index(encoded) {
+            if let Some(NativePreparedCallable::Closure(prepared)) =
+                self.direct_prepared_callable_mut(index)
+                && prepared.closure.context.owner_unit.is_none()
+            {
+                prepared.closure.context.owner_unit = Some(owner_unit);
+                return Ok(encoded);
+            }
             // Direct arrays may still contain constants indexed by the
             // callee's IrUnit. Rewrite only those embedded constants while
             // the callee unit is active; otherwise the caller can interpret
@@ -5812,31 +6516,8 @@ impl<'a> NativeRequestColdState<'a> {
             self.stabilize_direct_array_for_cross_unit(encoded)?;
             return Ok(encoded);
         }
-        if let Some(index) = php_jit::jit_decode_runtime_value(encoded) {
-            let needs_closure_owner = matches!(
-                self.values.get(index as usize).and_then(Option::as_ref),
-                Some(NativeStoredValue::Php(Value::Callable(callable)))
-                    if matches!(
-                        callable.as_ref(),
-                        php_runtime::api::CallableValue::Closure(closure)
-                            if closure.context.owner_unit.is_none()
-                    )
-            ) || matches!(
-                self.values.get(index as usize).and_then(Option::as_ref),
-                Some(NativeStoredValue::PreparedClosure(closure))
-                    if matches!(
-                        closure.callable.as_ref(),
-                        php_runtime::api::CallableValue::Closure(closure)
-                            if closure.context.owner_unit.is_none()
-                    )
-            );
-            if !needs_closure_owner {
-                return Ok(encoded);
-            }
-            let value = self.decode(encoded)?;
-            let transferred = self.encode(native_external_return_value(value, owner_unit))?;
-            self.release(encoded)?;
-            return Ok(transferred);
+        if php_jit::jit_decode_runtime_value(encoded).is_some() {
+            return Ok(encoded);
         }
         if let Some(constant) = php_jit::jit_decode_constant(encoded)
             && !matches!(
@@ -5909,11 +6590,7 @@ impl<'a> NativeRequestColdState<'a> {
         };
         match self.values.get(index as usize).and_then(Option::as_ref) {
             Some(NativeStoredValue::Php(Value::Reference(_))) => Some(true),
-            Some(
-                NativeStoredValue::Php(_)
-                | NativeStoredValue::PreparedClosure(_)
-                | NativeStoredValue::GlobalsProxy,
-            ) => Some(false),
+            Some(NativeStoredValue::Php(_) | NativeStoredValue::GlobalsProxy) => Some(false),
             Some(
                 NativeStoredValue::ArrayIterator(_)
                 | NativeStoredValue::Iterator(_)
@@ -5954,9 +6631,7 @@ impl<'a> NativeRequestColdState<'a> {
                 | NativeStoredValue::GeneratorIterator(_),
             )
             | None => None,
-            Some(NativeStoredValue::Php(_) | NativeStoredValue::PreparedClosure(_)) => {
-                Some(Some(index))
-            }
+            Some(NativeStoredValue::Php(_)) => Some(Some(index)),
         }
     }
 
@@ -5964,7 +6639,7 @@ impl<'a> NativeRequestColdState<'a> {
         let index = php_jit::jit_decode_runtime_value(encoded)? as usize;
         match self.values.get(index).and_then(Option::as_ref) {
             Some(NativeStoredValue::Php(value)) => Some(value),
-            Some(NativeStoredValue::PreparedClosure(_) | NativeStoredValue::GlobalsProxy) => None,
+            Some(NativeStoredValue::GlobalsProxy) => None,
             Some(
                 NativeStoredValue::ArrayIterator(_)
                 | NativeStoredValue::Iterator(_)
@@ -6339,6 +7014,13 @@ impl<'a> NativeRequestColdState<'a> {
                 php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT => {
                     Some(NativeEncodedValueKind::Object)
                 }
+                php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE => {
+                    Some(NativeEncodedValueKind::Callable)
+                }
+                php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER
+                | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_FIBER => {
+                    Some(NativeEncodedValueKind::Fiber)
+                }
                 php_jit::JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR
                 | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR => {
                     Some(NativeEncodedValueKind::Reference)
@@ -6360,9 +7042,7 @@ impl<'a> NativeRequestColdState<'a> {
             NativeStoredValue::Php(Value::String(_)) => Some(NativeEncodedValueKind::String),
             NativeStoredValue::Php(Value::Array(_)) => Some(NativeEncodedValueKind::Array),
             NativeStoredValue::Php(Value::Object(_)) => Some(NativeEncodedValueKind::Object),
-            NativeStoredValue::Php(Value::Callable(_)) | NativeStoredValue::PreparedClosure(_) => {
-                Some(NativeEncodedValueKind::Callable)
-            }
+            NativeStoredValue::Php(Value::Callable(_)) => Some(NativeEncodedValueKind::Callable),
             NativeStoredValue::Php(Value::Resource(_)) => Some(NativeEncodedValueKind::Resource),
             NativeStoredValue::Php(Value::Generator(_)) => Some(NativeEncodedValueKind::Generator),
             NativeStoredValue::Php(Value::Fiber(_)) => Some(NativeEncodedValueKind::Fiber),
@@ -6745,9 +7425,7 @@ impl<'a> NativeRequestColdState<'a> {
         match self.values.get(index)?.as_ref()? {
             NativeStoredValue::Php(Value::Null | Value::Uninitialized) => Some(false),
             NativeStoredValue::Php(Value::Reference(_)) => None,
-            NativeStoredValue::Php(_)
-            | NativeStoredValue::PreparedClosure(_)
-            | NativeStoredValue::GlobalsProxy => Some(true),
+            NativeStoredValue::Php(_) | NativeStoredValue::GlobalsProxy => Some(true),
             NativeStoredValue::ArrayIterator(_)
             | NativeStoredValue::Iterator(_)
             | NativeStoredValue::GeneratorIterator(_) => None,
@@ -6801,7 +7479,6 @@ impl<'a> NativeRequestColdState<'a> {
         match self.values.get(index)?.as_ref()? {
             NativeStoredValue::Php(Value::Object(_) | Value::Reference(_)) => None,
             NativeStoredValue::Php(value) => Some(native_property_truthy(value)),
-            NativeStoredValue::PreparedClosure(_) => Some(true),
             NativeStoredValue::GlobalsProxy
             | NativeStoredValue::ArrayIterator(_)
             | NativeStoredValue::Iterator(_)
@@ -6938,6 +7615,47 @@ impl<'a> NativeRequestColdState<'a> {
         } else {
             None
         };
+        let released_callable = if slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE {
+            if slot.aux == 0 {
+                return Err(format!(
+                    "direct native callable {index} lost its stable record"
+                ));
+            }
+            // SAFETY: callable publication created exactly one boxed record
+            // for this slot and final release reclaims it exactly once.
+            #[allow(unsafe_code)]
+            let callable =
+                unsafe { Box::from_raw(slot.aux as usize as *mut NativePreparedCallable) };
+            if let NativePreparedCallable::Closure(closure) = callable.as_ref()
+                && self.direct_closure_handles.get(&closure.closure.id) == Some(&(index as u32))
+            {
+                self.direct_closure_handles.remove(&closure.closure.id);
+            }
+            Some(callable)
+        } else {
+            None
+        };
+        let released_fiber = if matches!(
+            slot.kind,
+            php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER
+                | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_FIBER
+        ) {
+            if slot.aux == 0 {
+                return Err(format!(
+                    "direct native Fiber {index} lost its stable record"
+                ));
+            }
+            // SAFETY: Fiber publication created exactly one boxed record and
+            // final direct-slot release reclaims it exactly once.
+            #[allow(unsafe_code)]
+            let fiber = unsafe { Box::from_raw(slot.aux as usize as *mut NativeDirectFiber) };
+            self.direct_fiber_handles
+                .retain(|_, mapped| *mapped as usize != index);
+            self.direct_fiber_cells.remove(&index);
+            Some(fiber)
+        } else {
+            None
+        };
         if slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_SHARED_ARRAY
             && !php_runtime::api::PhpArray::release_native_storage_refcount(slot.payload as usize)
         {
@@ -6990,6 +7708,23 @@ impl<'a> NativeRequestColdState<'a> {
             } else {
                 (Vec::new(), None)
             };
+        if let Some(callable) = released_callable {
+            match callable.as_ref() {
+                NativePreparedCallable::Closure(closure) => {
+                    children.extend(closure.implicit_this);
+                    children.extend(closure.captures.iter().copied());
+                }
+                NativePreparedCallable::BoundMethod {
+                    target: NativePreparedCallableMethodTarget::Object(object),
+                    ..
+                } => children.push(*object),
+                _ => {}
+            }
+        }
+        if let Some(fiber) = released_fiber {
+            children.push(fiber.callable);
+            children.extend(fiber.return_value);
+        }
         children.extend(direct_object_children);
         self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
             reserved: *self.direct_value_free_head,
@@ -7066,14 +7801,6 @@ impl<'a> NativeRequestColdState<'a> {
                         }
                     }
                 }
-                Some(NativeStoredValue::PreparedClosure(closure)) => {
-                    if let Some(implicit_this) = closure.implicit_this {
-                        self.release(implicit_this)?;
-                    }
-                    for capture in closure.captures {
-                        self.release(capture)?;
-                    }
-                }
                 _ => {}
             }
             self.free_value_slots.push(index as u32);
@@ -7121,25 +7848,6 @@ impl<'a> NativeRequestColdState<'a> {
     fn live_native_values_contain_object(&self, object_id: u64) -> bool {
         let cold_contains = self.values.iter().flatten().any(|stored| match stored {
             NativeStoredValue::Php(value) => values_contain_object([value], object_id),
-            NativeStoredValue::PreparedClosure(prepared) => {
-                let php_runtime::api::CallableValue::Closure(closure) = prepared.callable.as_ref()
-                else {
-                    return false;
-                };
-                closure
-                    .bound_this
-                    .as_ref()
-                    .is_some_and(|object| object.id() == object_id)
-                    || closure.captures.iter().any(|capture| {
-                        capture
-                            .value()
-                            .is_some_and(|value| values_contain_object([value], object_id))
-                            || capture.reference().is_some_and(|reference| {
-                                let value = reference.get();
-                                values_contain_object([&value], object_id)
-                            })
-                    })
-            }
             NativeStoredValue::GlobalsProxy => false,
             NativeStoredValue::ArrayIterator(iterator) => {
                 values_contain_object(iterator.source.iter().map(|(_, value)| value), object_id)
@@ -7258,6 +7966,39 @@ impl<'a> NativeRequestColdState<'a> {
             php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR
             | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_FOREACH => {
                 self.encoded_value_contains_object(slot.payload as i64, object_id, visited)
+            }
+            php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE => self
+                .direct_prepared_callable(index)
+                .is_some_and(|callable| match callable {
+                    NativePreparedCallable::Closure(closure) => {
+                        closure.implicit_this.is_some_and(|value| {
+                            self.encoded_value_contains_object(value, object_id, visited)
+                        }) || closure.captures.iter().copied().any(|value| {
+                            self.encoded_value_contains_object(value, object_id, visited)
+                        })
+                    }
+                    NativePreparedCallable::BoundMethod {
+                        target: NativePreparedCallableMethodTarget::Object(object),
+                        ..
+                    } => self.encoded_value_contains_object(*object, object_id, visited),
+                    _ => false,
+                }),
+            php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER
+            | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_FIBER => {
+                let native_contains = self.fiber_record(index).is_some_and(|fiber| {
+                    self.encoded_value_contains_object(fiber.callable, object_id, visited)
+                        || fiber.return_value.is_some_and(|value| {
+                            self.encoded_value_contains_object(value, object_id, visited)
+                        })
+                });
+                native_contains
+                    || self.direct_fiber_cells.get(&index).is_some_and(|fiber| {
+                        let callable = fiber.callable();
+                        values_contain_object([&callable], object_id)
+                            || fiber
+                                .return_value()
+                                .is_some_and(|value| values_contain_object([&value], object_id))
+                    })
             }
             php_jit::JIT_NATIVE_VALUE_VIEW_SHARED_ARRAY
             | php_jit::JIT_NATIVE_VALUE_VIEW_BORROWED_REFERENCE_ARRAY => {
@@ -11302,22 +12043,6 @@ fn invoke_native_external_function_with_metadata_at_tier(
     })?
 }
 
-fn native_external_return_value(value: Value, owner_unit: usize) -> Value {
-    match value {
-        Value::Callable(callable) => match callable.as_ref() {
-            php_runtime::api::CallableValue::Closure(closure)
-                if closure.context.owner_unit.is_none() =>
-            {
-                Value::Callable(Box::new(php_runtime::api::CallableValue::Closure(
-                    closure.clone().with_owner_unit(Some(owner_unit)),
-                )))
-            }
-            _ => Value::Callable(callable),
-        },
-        value => value,
-    }
-}
-
 fn native_value_with_owner_unit(value: Value, owner_unit: Option<usize>) -> Value {
     match value {
         Value::Callable(callable) => match callable.as_ref() {
@@ -11817,6 +12542,13 @@ fn native_transition_stored_value_kind(
     context: &NativeRequestColdState<'_>,
     encoded: i64,
 ) -> &'static str {
+    if let Some(index) = NativeRequestColdState::direct_value_index(encoded)
+        && context.direct_value_slots.get(index).is_some_and(|slot| {
+            slot.refcount != 0 && slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE
+        })
+    {
+        return "prepared_callable";
+    }
     let Some(index) = php_jit::jit_decode_runtime_value(encoded) else {
         return native_transition_value_kind(encoded);
     };
@@ -11829,7 +12561,6 @@ fn native_transition_stored_value_kind(
         Some(NativeStoredValue::ArrayIterator(_)) => "array_iterator",
         Some(NativeStoredValue::Iterator(_)) => "iterator",
         Some(NativeStoredValue::GeneratorIterator(_)) => "generator_iterator",
-        Some(NativeStoredValue::PreparedClosure(_)) => "prepared_closure",
         None => "missing",
     }
 }
@@ -13368,44 +14099,63 @@ fn execute_native_instanceof(
         let Some(target) = arguments.get(1) else {
             return Some(Err("instanceof target is missing".to_owned()));
         };
-        match context.decode(*target) {
-            Ok(Value::String(value)) => value.to_string_lossy(),
-            Ok(Value::Object(object)) => object.class_name(),
-            Ok(value) => {
-                return Some(Err(format!(
-                    "instanceof target must be a class name, {} given",
-                    native_value_type_name(&value)
-                )));
+        let direct_target = context.dereference_direct_encoding(*target);
+        if let Some(bytes) = context.native_string_name_bytes(direct_target) {
+            String::from_utf8_lossy(&bytes).into_owned()
+        } else if let Some(object) = context.native_query_object(direct_target) {
+            object.class_name()
+        } else {
+            match context.decode(*target) {
+                Ok(Value::String(value)) => value.to_string_lossy(),
+                Ok(Value::Object(object)) => object.class_name(),
+                Ok(value) => {
+                    return Some(Err(format!(
+                        "instanceof target must be a class name, {} given",
+                        native_value_type_name(&value)
+                    )));
+                }
+                Err(error) => return Some(Err(error)),
             }
-            Err(error) => return Some(Err(error)),
         }
     };
-    let result = match context.decode(object) {
-        Ok(Value::Object(object)) => native_internal_instanceof(&object.class_name(), &target)
-            .unwrap_or_else(|| native_class_is_a(context, &object.class_name(), &target)),
-        Ok(Value::Callable(_)) => target.eq_ignore_ascii_case("Closure"),
-        Ok(Value::Fiber(_)) => target.eq_ignore_ascii_case("Fiber"),
-        Ok(Value::Generator(_)) => target.eq_ignore_ascii_case("Generator"),
-        Ok(Value::Array(array)) => {
-            super::native_exception_fields(Value::Array(array)).is_some_and(|(class, _, _)| {
-                let normalized = class.to_ascii_lowercase();
-                target.eq_ignore_ascii_case(&class)
-                    || target.eq_ignore_ascii_case("Throwable")
-                    || (target.eq_ignore_ascii_case("Exception")
-                        && normalized.ends_with("exception"))
-                    || (target.eq_ignore_ascii_case("Error") && normalized.ends_with("error"))
-            })
+    let direct_object = context.dereference_direct_encoding(object);
+    let result = match context.native_encoded_value_kind(direct_object) {
+        Some(NativeEncodedValueKind::Callable) => target.eq_ignore_ascii_case("Closure"),
+        Some(NativeEncodedValueKind::Fiber) => target.eq_ignore_ascii_case("Fiber"),
+        Some(NativeEncodedValueKind::Generator) => target.eq_ignore_ascii_case("Generator"),
+        Some(NativeEncodedValueKind::Object) => {
+            let Some(object) = context.native_query_object(direct_object) else {
+                return Some(Err("instanceof receiver lost its native object".to_owned()));
+            };
+            native_internal_instanceof(&object.class_name(), &target)
+                .unwrap_or_else(|| native_class_is_a(context, &object.class_name(), &target))
         }
-        Ok(Value::Reference(reference)) => match reference.get() {
-            Value::Object(object) => native_internal_instanceof(&object.class_name(), &target)
+        _ => match context.decode(object) {
+            Ok(Value::Object(object)) => native_internal_instanceof(&object.class_name(), &target)
                 .unwrap_or_else(|| native_class_is_a(context, &object.class_name(), &target)),
-            Value::Callable(_) => target.eq_ignore_ascii_case("Closure"),
-            Value::Fiber(_) => target.eq_ignore_ascii_case("Fiber"),
-            Value::Generator(_) => target.eq_ignore_ascii_case("Generator"),
-            _ => false,
+            Ok(Value::Callable(_)) => target.eq_ignore_ascii_case("Closure"),
+            Ok(Value::Fiber(_)) => target.eq_ignore_ascii_case("Fiber"),
+            Ok(Value::Generator(_)) => target.eq_ignore_ascii_case("Generator"),
+            Ok(Value::Array(array)) => super::native_exception_fields(Value::Array(array))
+                .is_some_and(|(class, _, _)| {
+                    let normalized = class.to_ascii_lowercase();
+                    target.eq_ignore_ascii_case(&class)
+                        || target.eq_ignore_ascii_case("Throwable")
+                        || (target.eq_ignore_ascii_case("Exception")
+                            && normalized.ends_with("exception"))
+                        || (target.eq_ignore_ascii_case("Error") && normalized.ends_with("error"))
+                }),
+            Ok(Value::Reference(reference)) => match reference.get() {
+                Value::Object(object) => native_internal_instanceof(&object.class_name(), &target)
+                    .unwrap_or_else(|| native_class_is_a(context, &object.class_name(), &target)),
+                Value::Callable(_) => target.eq_ignore_ascii_case("Closure"),
+                Value::Fiber(_) => target.eq_ignore_ascii_case("Fiber"),
+                Value::Generator(_) => target.eq_ignore_ascii_case("Generator"),
+                _ => false,
+            },
+            Ok(_) => false,
+            Err(error) => return Some(Err(error)),
         },
-        Ok(_) => false,
-        Err(error) => return Some(Err(error)),
     };
     Some(context.encode(Value::Bool(result)))
 }
@@ -13424,6 +14174,80 @@ fn execute_native_acquire_callable(
     let Some(value) = arguments.first() else {
         return Some(Err("callable value is missing".to_owned()));
     };
+    let direct = context.dereference_direct_encoding(*value);
+    match context.native_encoded_value_kind(direct) {
+        Some(NativeEncodedValueKind::Callable)
+            if context.prepared_callable_dispatch(direct).is_some() =>
+        {
+            return Some(context.retain(direct).map(|()| direct));
+        }
+        Some(NativeEncodedValueKind::String) => {
+            let Some(name) = context.native_string_name_bytes(direct) else {
+                return Some(Err("callable string has no native bytes".to_owned()));
+            };
+            return Some(context.encode_prepared_callable(Box::new(
+                php_runtime::api::CallableValue::UserFunction {
+                    name: String::from_utf8_lossy(&name).into_owned(),
+                },
+            )));
+        }
+        Some(NativeEncodedValueKind::Object) => {
+            let Some(object) = context.native_query_object(direct) else {
+                return Some(Err("callable object has no native owner".to_owned()));
+            };
+            return Some(context.encode_prepared_callable(Box::new(
+                php_runtime::api::CallableValue::BoundMethod {
+                    target: php_runtime::api::CallableMethodTarget::Object(object),
+                    method: "__invoke".to_owned(),
+                    scope: None,
+                },
+            )));
+        }
+        Some(NativeEncodedValueKind::Array) => {
+            if let Some(entries) = context.direct_array_entries_for(direct) {
+                let mut target = None;
+                let mut method = None;
+                for entry in entries {
+                    match context.native_encoded_int(entry.key) {
+                        Some(0) => target = Some(context.dereference_direct_encoding(entry.value)),
+                        Some(1) => method = Some(context.dereference_direct_encoding(entry.value)),
+                        _ => {}
+                    }
+                }
+                let Some(target) = target else {
+                    return Some(Err("callable array target is missing".to_owned()));
+                };
+                let Some(method) = method
+                    .and_then(|method| context.native_string_name_bytes(method))
+                    .map(|method| String::from_utf8_lossy(&method).into_owned())
+                else {
+                    return Some(Err("callable array method must be a string".to_owned()));
+                };
+                let target = if let Some(object) = context.native_query_object(target) {
+                    php_runtime::api::CallableMethodTarget::Object(object)
+                } else if let Some(class) = context.native_string_name_bytes(target) {
+                    php_runtime::api::CallableMethodTarget::Class(
+                        String::from_utf8_lossy(&class).into_owned(),
+                    )
+                } else {
+                    return Some(Err(format!(
+                        "callable array target must be object or class-string, {} given",
+                        context.native_encoded_type_name(target)
+                    )));
+                };
+                return Some(context.encode_prepared_callable(Box::new(
+                    php_runtime::api::CallableValue::BoundMethod {
+                        target,
+                        method,
+                        scope: None,
+                    },
+                )));
+            }
+        }
+        _ => {}
+    }
+    // Baseline-only compatibility values may still reach acquisition from a
+    // materialized ReferenceCell. Direct producers above never decode.
     let value = match context.decode(*value) {
         Ok(value) => dereference_native_callable_value(value),
         Err(error) => return Some(Err(error)),

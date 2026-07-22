@@ -2063,17 +2063,55 @@ fn native_encoded_callable_by_ref_parameter_at(
             }
         }
         NativeEncodedValueKind::Callable => {
+            if let Some(closure) = context.prepared_closure_payload(encoded) {
+                let function = php_ir::FunctionId::new(closure.function);
+                let function = closure
+                    .context
+                    .owner_unit
+                    .and_then(|unit| context.dynamic_units.get(unit))
+                    .map(|unit| unit.compiled.unit())
+                    .unwrap_or(&context.unit)
+                    .functions
+                    .get(function.index())?;
+                return native_ir_by_ref_parameter_at(function, index)
+                    .map(|parameter| ("{closure}".to_owned(), parameter));
+            }
+            if let Some(callable) = context.prepared_callable_dispatch(encoded) {
+                return match callable {
+                    NativePreparedCallableDispatch::Named(name) => {
+                        native_named_callable_by_ref_parameter_at(context, &name, index).map(
+                            |parameter| {
+                                (
+                                    native_named_callable_display_name(context, &name),
+                                    parameter,
+                                )
+                            },
+                        )
+                    }
+                    NativePreparedCallableDispatch::BoundMethod { target, method } => {
+                        let class = match target {
+                            php_runtime::api::CallableMethodTarget::Object(object) => {
+                                object.class_name()
+                            }
+                            php_runtime::api::CallableMethodTarget::Class(class) => class,
+                        };
+                        native_method_by_ref_parameter_at(context, &class, &method, index).map(
+                            |parameter| {
+                                (
+                                    native_method_callable_display_name(context, &class, &method),
+                                    parameter,
+                                )
+                            },
+                        )
+                    }
+                    NativePreparedCallableDispatch::Closure
+                    | NativePreparedCallableDispatch::Invalid(_) => None,
+                };
+            }
             let runtime = php_jit::jit_decode_runtime_value(encoded)? as usize;
             match context.values.get(runtime)?.as_ref()? {
                 NativeStoredValue::Php(value) => {
                     native_callable_value_by_ref_parameter_at(context, value, index)
-                }
-                NativeStoredValue::PreparedClosure(closure) => {
-                    native_callable_value_by_ref_parameter_at(
-                        context,
-                        &Value::Callable(closure.callable.clone()),
-                        index,
-                    )
                 }
                 _ => None,
             }
@@ -2167,6 +2205,9 @@ pub(super) fn exact_native_callback_is_admitted(
         Some(NativeEncodedValueKind::String) => context.native_string_name_bytes(encoded).is_some(),
         Some(NativeEncodedValueKind::Object) => context.native_query_object(encoded).is_some(),
         Some(NativeEncodedValueKind::Array) => context.direct_array_entries_for(encoded).is_some(),
+        Some(NativeEncodedValueKind::Callable) => {
+            context.prepared_callable_dispatch(encoded).is_some()
+        }
         _ => false,
     }
 }
