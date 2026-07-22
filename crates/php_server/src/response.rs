@@ -20,6 +20,14 @@ use php_runtime::api::RuntimeCancellationState;
 pub type ResponseBody = ServerBody;
 pub type RequestBody = BoxBody<Bytes, std::io::Error>;
 
+pub(crate) fn request_reader_body<R>(reader: R) -> RequestBody
+where
+    R: AsyncRead + Send + Sync + 'static,
+{
+    let stream = ReaderStream::new(reader).map_ok(Frame::data);
+    StreamBody::new(stream).boxed()
+}
+
 pub struct ServerBody {
     inner: BoxBody<Bytes, std::io::Error>,
     lifecycle: Option<TransferLifecycle>,
@@ -208,12 +216,6 @@ pub fn full_body(body: Bytes) -> ResponseBody {
     );
     body.set_expected_bytes(length);
     body
-}
-
-pub fn request_body_from_bytes(body: Bytes) -> RequestBody {
-    Full::new(body)
-        .map_err(|never: Infallible| match never {})
-        .boxed()
 }
 
 pub fn reader_body<R>(reader: R) -> ResponseBody

@@ -4955,6 +4955,20 @@
       "implementations": [
         {
           "kind": "runtime",
+          "module": "core"
+        }
+      ],
+      "name": "request_parse_body",
+      "visibility": "php"
+    },
+    {
+      "arginfo": {
+        "extension": "standard",
+        "source": "ext/standard/basic_functions.stub.php"
+      },
+      "implementations": [
+        {
+          "kind": "runtime",
           "module": "arrays"
         }
       ],

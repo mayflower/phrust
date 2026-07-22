@@ -6,12 +6,17 @@ use crate::{
 };
 use std::collections::HashSet;
 use std::fs;
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tempfile::TempPath;
+use tokio::io::{AsyncRead, ReadBuf};
 
 /// Minimal ini-like runtime options carried by the VM.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,6 +108,319 @@ pub enum RuntimeRequestMode {
     Http(Box<RuntimeHttpRequestContext>),
 }
 
+const BODY_AVAILABLE: u8 = 0;
+const BODY_RAW_OBSERVED: u8 = 1;
+const BODY_PARSE_CONSUMED: u8 = 2;
+const BODY_AUTO_MULTIPART: u8 = 3;
+
+/// Stable request-body storage shared directly by HTTP transport and runtime.
+#[derive(Clone)]
+pub struct RuntimeRequestBody {
+    inner: Arc<RuntimeRequestBodyInner>,
+}
+
+struct RuntimeRequestBodyInner {
+    storage: RuntimeRequestBodyStorage,
+    state: AtomicU8,
+}
+
+enum RuntimeRequestBodyStorage {
+    Empty,
+    Memory(Arc<[u8]>),
+    File(RuntimeRequestBodyFile),
+    Unavailable,
+}
+
+struct RuntimeRequestBodyFile {
+    path: TempPath,
+    length: u64,
+    on_drop: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
+}
+
+impl Drop for RuntimeRequestBodyFile {
+    fn drop(&mut self) {
+        if let Some(on_drop) = &self.on_drop {
+            on_drop(self.length);
+        }
+    }
+}
+
+/// Independent synchronous reader over a request-body snapshot.
+pub enum RuntimeRequestBodyReader {
+    Memory(Cursor<Arc<[u8]>>),
+    File(fs::File),
+}
+
+impl Read for RuntimeRequestBodyReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Memory(reader) => reader.read(buffer),
+            Self::File(reader) => reader.read(buffer),
+        }
+    }
+}
+
+impl Seek for RuntimeRequestBodyReader {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::Memory(reader) => reader.seek(position),
+            Self::File(reader) => reader.seek(position),
+        }
+    }
+}
+
+/// Independent asynchronous reader over a request-body snapshot.
+pub enum RuntimeRequestBodyAsyncReader {
+    Memory(Cursor<Arc<[u8]>>),
+    File(tokio::fs::File),
+}
+
+impl AsyncRead for RuntimeRequestBodyAsyncReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match &mut *self {
+            Self::Memory(reader) => Pin::new(reader).poll_read(context, buffer),
+            Self::File(reader) => Pin::new(reader).poll_read(context, buffer),
+        }
+    }
+}
+
+/// Why a body cannot be consumed by `request_parse_body()`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeRequestBodyConsumeError {
+    RawInputObserved,
+    AutoParsedMultipart,
+    Unavailable,
+}
+
+impl RuntimeRequestBody {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::new(RuntimeRequestBodyStorage::Empty, BODY_AVAILABLE)
+    }
+
+    #[must_use]
+    pub fn memory(bytes: impl Into<Arc<[u8]>>) -> Self {
+        let bytes = bytes.into();
+        if bytes.is_empty() {
+            Self::empty()
+        } else {
+            Self::new(RuntimeRequestBodyStorage::Memory(bytes), BODY_AVAILABLE)
+        }
+    }
+
+    #[must_use]
+    pub fn file(
+        path: TempPath,
+        length: u64,
+        on_drop: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
+    ) -> Self {
+        Self::new(
+            RuntimeRequestBodyStorage::File(RuntimeRequestBodyFile {
+                path,
+                length,
+                on_drop,
+            }),
+            BODY_AVAILABLE,
+        )
+    }
+
+    #[must_use]
+    pub fn auto_parsed_multipart() -> Self {
+        Self::new(RuntimeRequestBodyStorage::Unavailable, BODY_AUTO_MULTIPART)
+    }
+
+    #[must_use]
+    pub fn unavailable() -> Self {
+        Self::new(RuntimeRequestBodyStorage::Unavailable, BODY_PARSE_CONSUMED)
+    }
+
+    fn new(storage: RuntimeRequestBodyStorage, state: u8) -> Self {
+        Self {
+            inner: Arc::new(RuntimeRequestBodyInner {
+                storage,
+                state: AtomicU8::new(state),
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        match &self.inner.storage {
+            RuntimeRequestBodyStorage::Empty | RuntimeRequestBodyStorage::Unavailable => 0,
+            RuntimeRequestBodyStorage::Memory(bytes) => bytes.len() as u64,
+            RuntimeRequestBodyStorage::File(file) => file.length,
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[must_use]
+    pub fn is_memory(&self) -> bool {
+        matches!(&self.inner.storage, RuntimeRequestBodyStorage::Memory(_))
+    }
+
+    #[must_use]
+    pub fn is_file(&self) -> bool {
+        matches!(&self.inner.storage, RuntimeRequestBodyStorage::File(_))
+    }
+
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        matches!(
+            self.inner.state.load(Ordering::Acquire),
+            BODY_AVAILABLE | BODY_RAW_OBSERVED | BODY_PARSE_CONSUMED
+        ) && !matches!(&self.inner.storage, RuntimeRequestBodyStorage::Unavailable)
+    }
+
+    #[must_use]
+    pub fn raw_was_observed(&self) -> bool {
+        self.inner.state.load(Ordering::Acquire) == BODY_RAW_OBSERVED
+    }
+
+    pub fn mark_raw_observed(&self) {
+        let _ = self.inner.state.compare_exchange(
+            BODY_AVAILABLE,
+            BODY_RAW_OBSERVED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub fn consume_for_request_parse(&self) -> Result<(), RuntimeRequestBodyConsumeError> {
+        match self.inner.state.compare_exchange(
+            BODY_AVAILABLE,
+            BODY_PARSE_CONSUMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(BODY_RAW_OBSERVED) => Err(RuntimeRequestBodyConsumeError::RawInputObserved),
+            // PHP 8.5.7 reparses the retained SAPI request body on subsequent
+            // request_parse_body() calls.
+            Err(BODY_PARSE_CONSUMED) => Ok(()),
+            Err(BODY_AUTO_MULTIPART) => Err(RuntimeRequestBodyConsumeError::AutoParsedMultipart),
+            Err(_) => Err(RuntimeRequestBodyConsumeError::Unavailable),
+        }
+    }
+
+    pub fn independent_reader(&self) -> io::Result<RuntimeRequestBodyReader> {
+        if !self.is_available() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "request body is unavailable",
+            ));
+        }
+        self.reader_for_parser()
+    }
+
+    /// Opens the storage after `consume_for_request_parse()` atomically claimed it.
+    pub fn reader_for_parser(&self) -> io::Result<RuntimeRequestBodyReader> {
+        match &self.inner.storage {
+            RuntimeRequestBodyStorage::Empty => {
+                Ok(RuntimeRequestBodyReader::Memory(Cursor::new(Arc::from([]))))
+            }
+            RuntimeRequestBodyStorage::Memory(bytes) => Ok(RuntimeRequestBodyReader::Memory(
+                Cursor::new(Arc::clone(bytes)),
+            )),
+            RuntimeRequestBodyStorage::File(file) => {
+                fs::File::open(&file.path).map(RuntimeRequestBodyReader::File)
+            }
+            RuntimeRequestBodyStorage::Unavailable => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "request body is unavailable",
+            )),
+        }
+    }
+
+    pub async fn independent_async_reader(&self) -> io::Result<RuntimeRequestBodyAsyncReader> {
+        if !self.is_available() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "request body is unavailable",
+            ));
+        }
+        self.async_reader_for_parser().await
+    }
+
+    /// Opens async storage after `consume_for_request_parse()` claimed it.
+    pub async fn async_reader_for_parser(&self) -> io::Result<RuntimeRequestBodyAsyncReader> {
+        match &self.inner.storage {
+            RuntimeRequestBodyStorage::Empty => Ok(RuntimeRequestBodyAsyncReader::Memory(
+                Cursor::new(Arc::from([])),
+            )),
+            RuntimeRequestBodyStorage::Memory(bytes) => Ok(RuntimeRequestBodyAsyncReader::Memory(
+                Cursor::new(Arc::clone(bytes)),
+            )),
+            RuntimeRequestBodyStorage::File(file) => tokio::fs::File::open(&file.path)
+                .await
+                .map(RuntimeRequestBodyAsyncReader::File),
+            RuntimeRequestBodyStorage::Unavailable => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "request body is unavailable",
+            )),
+        }
+    }
+
+    #[must_use]
+    pub fn memory_bytes(&self) -> Option<Arc<[u8]>> {
+        match &self.inner.storage {
+            RuntimeRequestBodyStorage::Empty => Some(Arc::from([])),
+            RuntimeRequestBodyStorage::Memory(bytes) => Some(Arc::clone(bytes)),
+            RuntimeRequestBodyStorage::File(_) | RuntimeRequestBodyStorage::Unavailable => None,
+        }
+    }
+}
+
+impl Default for RuntimeRequestBody {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl From<Vec<u8>> for RuntimeRequestBody {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::memory(bytes)
+    }
+}
+
+impl From<Arc<[u8]>> for RuntimeRequestBody {
+    fn from(bytes: Arc<[u8]>) -> Self {
+        Self::memory(bytes)
+    }
+}
+
+impl std::fmt::Debug for RuntimeRequestBody {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match &self.inner.storage {
+            RuntimeRequestBodyStorage::Empty => "Empty",
+            RuntimeRequestBodyStorage::Memory(_) => "Memory",
+            RuntimeRequestBodyStorage::File(_) => "File",
+            RuntimeRequestBodyStorage::Unavailable => "Unavailable",
+        };
+        formatter
+            .debug_struct("RuntimeRequestBody")
+            .field("kind", &kind)
+            .field("length", &self.len())
+            .field("state", &self.inner.state.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl PartialEq for RuntimeRequestBody {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Eq for RuntimeRequestBody {}
+
 /// Owned HTTP request metadata carried by the runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeHttpRequestContext {
@@ -136,10 +454,12 @@ pub struct RuntimeHttpRequestContext {
     pub content_type: Option<String>,
     pub content_length: Option<u64>,
     pub parsed_get: Vec<(String, String)>,
-    pub parsed_post: Vec<(String, String)>,
+    pub parsed_post: Vec<RuntimeInputPair>,
     pub parsed_cookie: Vec<(String, String)>,
     pub uploaded_files: Vec<RuntimeUploadedFile>,
-    pub raw_body: Arc<[u8]>,
+    /// PHP request-startup warnings raised by SAPI body preparation.
+    pub startup_warnings: Vec<String>,
+    pub raw_body: RuntimeRequestBody,
 }
 
 /// One uploaded file accepted by the integrated HTTP server.
@@ -147,10 +467,28 @@ pub struct RuntimeHttpRequestContext {
 pub struct RuntimeUploadedFile {
     pub field_name: String,
     pub client_filename: String,
+    pub full_path: String,
     pub content_type: String,
     pub temp_path: String,
     pub error: i64,
     pub size: u64,
+}
+
+/// One byte-exact name/value pair produced by request-body parsing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeInputPair {
+    pub name: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+impl RuntimeInputPair {
+    #[must_use]
+    pub fn new(name: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -251,6 +589,18 @@ impl UploadRegistry {
         };
         entry.moved = true;
         true
+    }
+
+    pub fn register_uploaded_files(&mut self, files: &[RuntimeUploadedFile]) {
+        self.entries.extend(
+            files
+                .iter()
+                .filter(|file| file.error == 0 && !file.temp_path.is_empty())
+                .map(|file| UploadRegistryEntry {
+                    temp_path: file.temp_path.clone(),
+                    moved: false,
+                }),
+        );
     }
 
     #[must_use]
@@ -423,7 +773,8 @@ impl RuntimeHttpRequestContext {
             parsed_post: Vec::new(),
             parsed_cookie: Vec::new(),
             uploaded_files: Vec::new(),
-            raw_body: Arc::from([]),
+            startup_warnings: Vec::new(),
+            raw_body: RuntimeRequestBody::empty(),
         }
     }
 
@@ -503,8 +854,86 @@ pub enum ProcessCapability {
 }
 
 /// Callback signature for loading web-session data by session id.
-type SessionLoadFn = dyn Fn(&str) -> Result<PhpArray, String> + Send + Sync + 'static;
-type SessionIdGenerateFn = dyn Fn() -> Result<String, String> + Send + Sync + 'static;
+type SessionLoadFn =
+    dyn Fn(&str, bool) -> Result<SessionLoadResult, String> + Send + Sync + 'static;
+type SessionIdGenerateFn =
+    dyn Fn(usize, u8, &str) -> Result<String, String> + Send + Sync + 'static;
+type SessionWriteFn = dyn Fn(&str, &[u8], bool) -> Result<(), String> + Send + Sync + 'static;
+type SessionDestroyFn = dyn Fn(&str) -> Result<(), String> + Send + Sync + 'static;
+type SessionAbortFn = dyn Fn(&str) -> Result<(), String> + Send + Sync + 'static;
+type SessionRegenerateFn =
+    dyn Fn(&str, &str, &[u8], bool) -> Result<(), String> + Send + Sync + 'static;
+type SessionGcFn = dyn Fn(u64) -> Result<usize, String> + Send + Sync + 'static;
+type RequestParserFn = dyn Fn(RequestParseBodyOptions) -> Result<RuntimeParsedRequestData, RequestParseBodyError>
+    + Send
+    + Sync
+    + 'static;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RequestParseBodyOptions {
+    pub max_file_uploads: Option<usize>,
+    pub max_input_vars: Option<usize>,
+    pub max_multipart_body_parts: Option<usize>,
+    pub post_max_size: Option<usize>,
+    pub upload_max_filesize: Option<usize>,
+    pub arg_separator_input: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeParsedRequestData {
+    pub post: Vec<RuntimeInputPair>,
+    pub files: Vec<RuntimeUploadedFile>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionLoadResult {
+    pub payload: Vec<u8>,
+    pub existed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RequestParseBodyError {
+    InvalidOptions(String),
+    Parse(String),
+}
+
+#[derive(Clone)]
+pub struct RequestParserCallback(Arc<RequestParserFn>);
+
+impl RequestParserCallback {
+    #[must_use]
+    pub fn new(
+        callback: impl Fn(
+            RequestParseBodyOptions,
+        ) -> Result<RuntimeParsedRequestData, RequestParseBodyError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn parse(
+        &self,
+        options: RequestParseBodyOptions,
+    ) -> Result<RuntimeParsedRequestData, RequestParseBodyError> {
+        (self.0)(options)
+    }
+}
+
+impl std::fmt::Debug for RequestParserCallback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RequestParserCallback")
+    }
+}
+
+impl PartialEq for RequestParserCallback {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for RequestParserCallback {}
 
 /// Optional transport callback for loading web-session data on `session_start()`.
 #[derive(Clone)]
@@ -512,14 +941,31 @@ pub struct SessionLoadCallback(Arc<SessionLoadFn>);
 
 impl SessionLoadCallback {
     #[must_use]
-    pub fn new(
-        callback: impl Fn(&str) -> Result<PhpArray, String> + Send + Sync + 'static,
+    pub fn new(callback: impl Fn(&str) -> Result<Vec<u8>, String> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(move |id, _strict_mode| {
+            callback(id).map(|payload| SessionLoadResult {
+                payload,
+                existed: true,
+            })
+        }))
+    }
+
+    #[must_use]
+    pub fn new_with_existence(
+        callback: impl Fn(&str, bool) -> Result<SessionLoadResult, String> + Send + Sync + 'static,
     ) -> Self {
         Self(Arc::new(callback))
     }
 
-    pub fn load(&self, id: &str) -> Result<PhpArray, String> {
-        (self.0)(id)
+    #[must_use]
+    pub fn new_with_policy(
+        callback: impl Fn(&str, bool) -> Result<SessionLoadResult, String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn load(&self, id: &str, strict_mode: bool) -> Result<SessionLoadResult, String> {
+        (self.0)(id, strict_mode)
     }
 }
 
@@ -545,11 +991,20 @@ pub struct SessionIdGenerateCallback(Arc<SessionIdGenerateFn>);
 impl SessionIdGenerateCallback {
     #[must_use]
     pub fn new(callback: impl Fn() -> Result<String, String> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(move |_, _, prefix| {
+            callback().map(|id| format!("{prefix}{id}"))
+        }))
+    }
+
+    #[must_use]
+    pub fn new_with_policy(
+        callback: impl Fn(usize, u8, &str) -> Result<String, String> + Send + Sync + 'static,
+    ) -> Self {
         Self(Arc::new(callback))
     }
 
-    pub fn generate(&self) -> Result<String, String> {
-        (self.0)()
+    pub fn generate(&self, length: usize, bits: u8, prefix: &str) -> Result<String, String> {
+        (self.0)(length, bits, prefix)
     }
 }
 
@@ -566,6 +1021,179 @@ impl PartialEq for SessionIdGenerateCallback {
 }
 
 impl Eq for SessionIdGenerateCallback {}
+
+#[derive(Clone)]
+pub struct SessionWriteCallback(Arc<SessionWriteFn>);
+
+impl SessionWriteCallback {
+    #[must_use]
+    pub fn new(
+        callback: impl Fn(&str, &[u8]) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(move |id, payload, _lazy_write| {
+            callback(id, payload)
+        }))
+    }
+
+    #[must_use]
+    pub fn new_with_lazy_write(
+        callback: impl Fn(&str, &[u8], bool) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    #[must_use]
+    pub fn new_with_policy(
+        callback: impl Fn(&str, &[u8], bool) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn write(&self, id: &str, payload: &[u8], lazy_write: bool) -> Result<(), String> {
+        (self.0)(id, payload, lazy_write)
+    }
+}
+
+impl std::fmt::Debug for SessionWriteCallback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionWriteCallback")
+    }
+}
+
+impl PartialEq for SessionWriteCallback {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SessionWriteCallback {}
+
+#[derive(Clone)]
+pub struct SessionDestroyCallback(Arc<SessionDestroyFn>);
+
+impl SessionDestroyCallback {
+    #[must_use]
+    pub fn new(callback: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn destroy(&self, id: &str) -> Result<(), String> {
+        (self.0)(id)
+    }
+}
+
+impl std::fmt::Debug for SessionDestroyCallback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionDestroyCallback")
+    }
+}
+
+impl PartialEq for SessionDestroyCallback {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SessionDestroyCallback {}
+
+#[derive(Clone)]
+pub struct SessionAbortCallback(Arc<SessionAbortFn>);
+
+impl SessionAbortCallback {
+    #[must_use]
+    pub fn new(callback: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn abort(&self, id: &str) -> Result<(), String> {
+        (self.0)(id)
+    }
+}
+
+impl std::fmt::Debug for SessionAbortCallback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionAbortCallback")
+    }
+}
+
+impl PartialEq for SessionAbortCallback {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SessionAbortCallback {}
+
+#[derive(Clone)]
+pub struct SessionRegenerateCallback(Arc<SessionRegenerateFn>);
+
+impl SessionRegenerateCallback {
+    #[must_use]
+    pub fn new(
+        callback: impl Fn(&str, &str, &[u8], bool) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    #[must_use]
+    pub fn new_with_policy(
+        callback: impl Fn(&str, &str, &[u8], bool) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn regenerate(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        payload: &[u8],
+        delete_old: bool,
+    ) -> Result<(), String> {
+        (self.0)(old_id, new_id, payload, delete_old)
+    }
+}
+
+impl std::fmt::Debug for SessionRegenerateCallback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionRegenerateCallback")
+    }
+}
+
+impl PartialEq for SessionRegenerateCallback {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SessionRegenerateCallback {}
+
+#[derive(Clone)]
+pub struct SessionGcCallback(Arc<SessionGcFn>);
+
+impl SessionGcCallback {
+    #[must_use]
+    pub fn new(callback: impl Fn(u64) -> Result<usize, String> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn gc(&self, max_lifetime_seconds: u64) -> Result<usize, String> {
+        (self.0)(max_lifetime_seconds)
+    }
+}
+
+impl std::fmt::Debug for SessionGcCallback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionGcCallback")
+    }
+}
+
+impl PartialEq for SessionGcCallback {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SessionGcCallback {}
 
 /// Owned deterministic runtime context.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -599,6 +1227,13 @@ pub struct RuntimeContext {
     pub session_loader: Option<SessionLoadCallback>,
     /// Optional transport session-id generator used only when PHP needs a new id.
     pub session_id_generator: Option<SessionIdGenerateCallback>,
+    pub session_writer: Option<SessionWriteCallback>,
+    pub session_destroyer: Option<SessionDestroyCallback>,
+    pub session_aborter: Option<SessionAbortCallback>,
+    pub session_regenerator: Option<SessionRegenerateCallback>,
+    pub session_gc: Option<SessionGcCallback>,
+    /// Optional request-local implementation behind `request_parse_body()`.
+    pub request_parser: Option<RequestParserCallback>,
     /// Optional cooperative PHP execution budget for the VM.
     pub execution_time_limit: Option<Duration>,
     /// Optional synchronous root-output destination. `None` selects exact
@@ -629,6 +1264,12 @@ impl Default for RuntimeContext {
             session: SessionState::default(),
             session_loader: None,
             session_id_generator: None,
+            session_writer: None,
+            session_destroyer: None,
+            session_aborter: None,
+            session_regenerator: None,
+            session_gc: None,
+            request_parser: None,
             execution_time_limit: None,
             output_sink: None,
             cancellation: RuntimeCancellationState::new(),
@@ -794,6 +1435,42 @@ impl RuntimeContext {
         self
     }
 
+    #[must_use]
+    pub fn with_session_writer(mut self, writer: SessionWriteCallback) -> Self {
+        self.session_writer = Some(writer);
+        self
+    }
+
+    #[must_use]
+    pub fn with_session_destroyer(mut self, destroyer: SessionDestroyCallback) -> Self {
+        self.session_destroyer = Some(destroyer);
+        self
+    }
+
+    #[must_use]
+    pub fn with_session_aborter(mut self, aborter: SessionAbortCallback) -> Self {
+        self.session_aborter = Some(aborter);
+        self
+    }
+
+    #[must_use]
+    pub fn with_session_regenerator(mut self, regenerator: SessionRegenerateCallback) -> Self {
+        self.session_regenerator = Some(regenerator);
+        self
+    }
+
+    #[must_use]
+    pub fn with_session_gc(mut self, gc: SessionGcCallback) -> Self {
+        self.session_gc = Some(gc);
+        self
+    }
+
+    #[must_use]
+    pub fn with_request_parser(mut self, parser: RequestParserCallback) -> Self {
+        self.request_parser = Some(parser);
+        self
+    }
+
     /// Sets an optional cooperative PHP execution budget for this request.
     #[must_use]
     pub fn with_execution_time_limit(mut self, limit: Option<Duration>) -> Self {
@@ -923,7 +1600,7 @@ impl RuntimeContext {
     fn filter_post_array(&self) -> PhpArray {
         match &self.request_mode {
             RuntimeRequestMode::Http(request) => {
-                raw_input_pairs_array(&request.parsed_post, &self.ini)
+                raw_input_byte_pairs_array(&request.parsed_post, &self.ini)
             }
             RuntimeRequestMode::Cli => {
                 self.env_value("PHPT_REQUEST_BODY")
@@ -994,7 +1671,9 @@ impl RuntimeContext {
 
     fn post_array(&self) -> PhpArray {
         match &self.request_mode {
-            RuntimeRequestMode::Http(request) => input_pairs_array(&request.parsed_post, &self.ini),
+            RuntimeRequestMode::Http(request) => {
+                input_byte_pairs_array(&request.parsed_post, &self.ini)
+            }
             RuntimeRequestMode::Cli => self
                 .env_value("PHPT_REQUEST_BODY")
                 .map_or_else(PhpArray::new, |body| {
@@ -1022,7 +1701,7 @@ impl RuntimeContext {
                 let mut array = PhpArray::new();
                 let mut builder = InputArrayBuilder::new(&self.ini);
                 builder.insert_pairs(&mut array, &request.parsed_get);
-                builder.insert_pairs(&mut array, &request.parsed_post);
+                builder.insert_byte_pairs(&mut array, &request.parsed_post);
                 builder.insert_flat_pairs(&mut array, &request.parsed_cookie);
                 array
             }
@@ -1185,6 +1864,19 @@ pub fn input_pairs_array(pairs: &[(String, String)], ini: &RuntimeIniOptions) ->
     array
 }
 
+#[must_use]
+pub fn input_byte_pairs_array(pairs: &[RuntimeInputPair], ini: &RuntimeIniOptions) -> PhpArray {
+    let mut array = PhpArray::new();
+    InputArrayBuilder::new(ini).insert_byte_pairs(&mut array, pairs);
+    array
+}
+
+fn raw_input_byte_pairs_array(pairs: &[RuntimeInputPair], ini: &RuntimeIniOptions) -> PhpArray {
+    let mut array = PhpArray::new();
+    InputArrayBuilder::raw(ini).insert_byte_pairs(&mut array, pairs);
+    array
+}
+
 fn raw_input_pairs_array(pairs: &[(String, String)], ini: &RuntimeIniOptions) -> PhpArray {
     let mut array = PhpArray::new();
     InputArrayBuilder::raw(ini).insert_pairs(&mut array, pairs);
@@ -1246,6 +1938,20 @@ impl InputArrayBuilder {
         }
     }
 
+    fn insert_byte_pairs(&mut self, array: &mut PhpArray, pairs: &[RuntimeInputPair]) {
+        for pair in pairs {
+            if !self.consume_var() {
+                break;
+            }
+            let Some(segments) =
+                parse_input_key_segments_bytes(&pair.name, self.max_input_nesting_level)
+            else {
+                continue;
+            };
+            insert_input_value(array, &segments, self.filter_value_bytes(&pair.value));
+        }
+    }
+
     fn insert_flat_pairs(&mut self, array: &mut PhpArray, pairs: &[(String, String)]) {
         let mut seen = HashSet::new();
         for (key, value) in pairs {
@@ -1267,13 +1973,19 @@ impl InputArrayBuilder {
     }
 
     fn filter_value(&self, value: &str) -> Value {
+        self.filter_value_bytes(value.as_bytes())
+    }
+
+    fn filter_value_bytes(&self, value: &[u8]) -> Value {
         match self.default_filter {
-            RuntimeInputFilter::UnsafeRaw => Value::string(filter_unsafe_raw_input(
+            RuntimeInputFilter::UnsafeRaw => Value::string(filter_unsafe_raw_input_bytes(
                 value,
                 self.default_input_filter_flags(),
             )),
-            RuntimeInputFilter::Stripped => Value::string(encode_input_stripped(value)),
-            RuntimeInputFilter::SpecialChars => Value::string(encode_input_special_chars(value)),
+            RuntimeInputFilter::Stripped => Value::string(encode_input_stripped_bytes(value)),
+            RuntimeInputFilter::SpecialChars => {
+                Value::string(encode_input_special_chars_bytes(value))
+            }
         }
     }
 
@@ -1289,7 +2001,7 @@ const FILTER_FLAG_ENCODE_HIGH: i64 = 32;
 const FILTER_FLAG_ENCODE_AMP: i64 = 64;
 const FILTER_FLAG_STRIP_BACKTICK: i64 = 512;
 
-fn filter_unsafe_raw_input(value: &str, flags: i64) -> Vec<u8> {
+fn filter_unsafe_raw_input_bytes(value: &[u8], flags: i64) -> Vec<u8> {
     let relevant_flags = FILTER_FLAG_STRIP_LOW
         | FILTER_FLAG_STRIP_HIGH
         | FILTER_FLAG_ENCODE_LOW
@@ -1297,13 +2009,13 @@ fn filter_unsafe_raw_input(value: &str, flags: i64) -> Vec<u8> {
         | FILTER_FLAG_ENCODE_AMP
         | FILTER_FLAG_STRIP_BACKTICK;
     if flags & relevant_flags == 0 {
-        return value.as_bytes().to_vec();
+        return value.to_vec();
     }
     let strip_low = flags & FILTER_FLAG_STRIP_LOW != 0;
     let strip_high = flags & FILTER_FLAG_STRIP_HIGH != 0;
     let strip_backtick = flags & FILTER_FLAG_STRIP_BACKTICK != 0;
     let mut output = Vec::with_capacity(value.len());
-    for byte in value.bytes() {
+    for &byte in value {
         if strip_low && byte < 0x20 || strip_high && byte >= 0x7f || strip_backtick && byte == b'`'
         {
             continue;
@@ -1361,14 +2073,64 @@ fn parse_input_key_segments(key: &str, max_nesting_level: usize) -> Option<Vec<I
     Some(segments)
 }
 
+fn parse_input_key_segments_bytes(
+    key: &[u8],
+    max_nesting_level: usize,
+) -> Option<Vec<InputKeySegment>> {
+    if key.is_empty() {
+        return None;
+    }
+    let input_key = |bytes: &[u8]| ArrayKey::from_php_string(PhpString::from_bytes(bytes.to_vec()));
+    let root_key = |bytes: &[u8]| {
+        let normalized = bytes
+            .iter()
+            .map(|byte| match byte {
+                b' ' | b'.' | b'[' => b'_',
+                byte => *byte,
+            })
+            .collect::<Vec<_>>();
+        input_key(&normalized)
+    };
+    let Some(first_bracket) = key.iter().position(|byte| *byte == b'[') else {
+        return Some(vec![InputKeySegment::Key(root_key(key))]);
+    };
+    if first_bracket == 0 {
+        return None;
+    }
+    let mut segments = vec![InputKeySegment::Key(root_key(&key[..first_bracket]))];
+    let mut rest = &key[first_bracket..];
+    while !rest.is_empty() {
+        if rest[0] != b'[' {
+            return Some(segments);
+        }
+        let Some(close) = rest.iter().position(|byte| *byte == b']') else {
+            if segments.len() == 1 {
+                return Some(vec![InputKeySegment::Key(root_key(key))]);
+            }
+            return Some(segments);
+        };
+        let part = &rest[1..close];
+        segments.push(if part.is_empty() {
+            InputKeySegment::Append
+        } else {
+            InputKeySegment::Key(input_key(part))
+        });
+        if segments.len().saturating_sub(1) > max_nesting_level {
+            return None;
+        }
+        rest = &rest[close + 1..];
+    }
+    Some(segments)
+}
+
 fn insert_input_value(array: &mut PhpArray, segments: &[InputKeySegment], value: Value) {
     insert_input_at(array, segments, value);
 }
 
-fn strip_input_tags(value: &str) -> Vec<u8> {
+fn strip_input_tags_bytes(value: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(value.len());
     let mut in_tag = false;
-    for byte in value.bytes() {
+    for &byte in value {
         match byte {
             b'<' => in_tag = true,
             b'>' if in_tag => in_tag = false,
@@ -1379,8 +2141,8 @@ fn strip_input_tags(value: &str) -> Vec<u8> {
     output
 }
 
-fn encode_input_stripped(value: &str) -> Vec<u8> {
-    let stripped = strip_input_tags(value);
+fn encode_input_stripped_bytes(value: &[u8]) -> Vec<u8> {
+    let stripped = strip_input_tags_bytes(value);
     let mut output = Vec::with_capacity(stripped.len());
     for byte in stripped {
         match byte {
@@ -1393,9 +2155,9 @@ fn encode_input_stripped(value: &str) -> Vec<u8> {
     output
 }
 
-fn encode_input_special_chars(value: &str) -> Vec<u8> {
+fn encode_input_special_chars_bytes(value: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(value.len());
-    for byte in value.bytes() {
+    for &byte in value {
         match byte {
             b'"' | b'\'' | b'<' | b'>' | b'&' => {
                 output.extend_from_slice(format!("&#{};", byte).as_bytes());
@@ -1448,7 +2210,7 @@ fn insert_input_at(array: &mut PhpArray, segments: &[InputKeySegment], value: Va
     }
 }
 
-fn uploaded_files_array(files: &[RuntimeUploadedFile], ini: &RuntimeIniOptions) -> PhpArray {
+pub fn uploaded_files_array(files: &[RuntimeUploadedFile], ini: &RuntimeIniOptions) -> PhpArray {
     let mut array = PhpArray::new();
     let mut builder = InputArrayBuilder::new(ini);
     for file in files {
@@ -1504,6 +2266,12 @@ fn insert_uploaded_file(
     );
     insert_uploaded_file_attribute(
         group,
+        "full_path",
+        tail,
+        Value::string(file.full_path.as_bytes().to_vec()),
+    );
+    insert_uploaded_file_attribute(
+        group,
         "tmp_name",
         tail,
         Value::string(file.temp_path.as_bytes().to_vec()),
@@ -1516,6 +2284,7 @@ fn uploaded_file_group() -> PhpArray {
     let mut array = PhpArray::new();
     array.insert(string_key("name"), Value::Array(PhpArray::new()));
     array.insert(string_key("type"), Value::Array(PhpArray::new()));
+    array.insert(string_key("full_path"), Value::Array(PhpArray::new()));
     array.insert(string_key("tmp_name"), Value::Array(PhpArray::new()));
     array.insert(string_key("error"), Value::Array(PhpArray::new()));
     array.insert(string_key("size"), Value::Array(PhpArray::new()));
@@ -1531,6 +2300,10 @@ fn uploaded_file_entry(file: &RuntimeUploadedFile) -> PhpArray {
     array.insert(
         string_key("type"),
         Value::string(file.content_type.as_bytes().to_vec()),
+    );
+    array.insert(
+        string_key("full_path"),
+        Value::string(file.full_path.as_bytes().to_vec()),
     );
     array.insert(
         string_key("tmp_name"),
@@ -1578,6 +2351,55 @@ pub fn parse_form_urlencoded_body(body: &[u8]) -> Vec<(String, String)> {
     parse_form_urlencoded(body, b"&")
 }
 
+/// Parses URL-encoded input without requiring UTF-8 names or values.
+#[must_use]
+pub fn parse_form_urlencoded_body_bytes(body: &[u8]) -> Vec<RuntimeInputPair> {
+    parse_form_urlencoded_bytes(body, b"&")
+}
+
+/// Incrementally parses URL-encoded input from a replayable request-body reader.
+pub fn parse_form_urlencoded_reader(
+    reader: impl Read,
+    max_input_vars: usize,
+) -> io::Result<Vec<RuntimeInputPair>> {
+    parse_form_urlencoded_reader_with_separators(reader, max_input_vars, b"&")
+}
+
+pub fn parse_form_urlencoded_reader_with_separators(
+    mut reader: impl Read,
+    max_input_vars: usize,
+    separators: &[u8],
+) -> io::Result<Vec<RuntimeInputPair>> {
+    let separators = if separators.is_empty() {
+        b"&"
+    } else {
+        separators
+    };
+    let mut pairs = Vec::with_capacity(max_input_vars.min(64));
+    let mut pending = Vec::new();
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        for &byte in &chunk[..read] {
+            if separators.contains(&byte) {
+                if !pending.is_empty() && pairs.len() < max_input_vars {
+                    pairs.push(decode_urlencoded_pair(&pending));
+                }
+                pending.clear();
+            } else if pairs.len() < max_input_vars {
+                pending.push(byte);
+            }
+        }
+    }
+    if !pending.is_empty() && pairs.len() < max_input_vars {
+        pairs.push(decode_urlencoded_pair(&pending));
+    }
+    Ok(pairs)
+}
+
 fn input_separator_bytes(arg_separator_input: &str) -> &[u8] {
     let separators = arg_separator_input.as_bytes();
     if separators.is_empty() {
@@ -1596,6 +2418,42 @@ fn parse_form_urlencoded(input: &[u8], separators: &[u8]) -> Vec<(String, String
             Some((decode_component(name)?, decode_component(value)?))
         })
         .collect()
+}
+
+fn parse_form_urlencoded_bytes(input: &[u8], separators: &[u8]) -> Vec<RuntimeInputPair> {
+    input
+        .split(|byte| separators.contains(byte))
+        .filter(|part| !part.is_empty())
+        .map(decode_urlencoded_pair)
+        .collect()
+}
+
+fn decode_urlencoded_pair(part: &[u8]) -> RuntimeInputPair {
+    let (name, value) = split_bytes_once(part, b'=').unwrap_or((part, &[]));
+    RuntimeInputPair::new(decode_component_bytes(name), decode_component_bytes(value))
+}
+
+fn decode_component_bytes(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        match input[index] {
+            b'+' => output.push(b' '),
+            b'%' if index + 2 < input.len() => {
+                if let (Some(high), Some(low)) =
+                    (hex_value(input[index + 1]), hex_value(input[index + 2]))
+                {
+                    output.push(high << 4 | low);
+                    index += 2;
+                } else {
+                    output.push(b'%');
+                }
+            }
+            byte => output.push(byte),
+        }
+        index += 1;
+    }
+    output
 }
 
 fn split_bytes_once(input: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
@@ -1679,12 +2537,52 @@ fn hex_value(byte: u8) -> Option<u8> {
 mod tests {
     use super::{
         RuntimeContext, RuntimeHttpRequestContext, RuntimeHttpResponseState, RuntimeIniOptions,
-        RuntimeInputFilter, RuntimeUploadedFile, StrictTypesInfo, UploadRegistry,
-        input_pairs_array, parse_cookie_header, parse_form_urlencoded_body, parse_query_string,
-        parse_query_string_with_separators,
+        RuntimeInputFilter, RuntimeInputPair, RuntimeRequestBody, RuntimeUploadedFile,
+        StrictTypesInfo, UploadRegistry, input_pairs_array, parse_cookie_header,
+        parse_form_urlencoded_body_bytes, parse_query_string, parse_query_string_with_separators,
     };
     use crate::{ArrayKey, PhpString, Value};
-    use std::sync::Arc;
+    use std::{io::Read, sync::Arc};
+
+    #[test]
+    fn request_body_can_be_reparsed_and_keeps_php_input_replayable() {
+        let body = RuntimeRequestBody::from(b"name=phrust".to_vec());
+        body.consume_for_request_parse().expect("claim body");
+        body.consume_for_request_parse().expect("reclaim body");
+        assert!(body.is_available());
+        let mut php_input = body.independent_reader().expect("php input reader");
+        let mut php_input_bytes = Vec::new();
+        php_input
+            .read_to_end(&mut php_input_bytes)
+            .expect("read php input");
+        assert_eq!(php_input_bytes, b"name=phrust");
+        let mut reader = body.reader_for_parser().expect("parser reader");
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).expect("read parser body");
+        assert_eq!(bytes, b"name=phrust");
+    }
+
+    #[test]
+    fn raw_input_observation_prevents_request_parser_claim() {
+        let body = RuntimeRequestBody::from(b"x=1".to_vec());
+        body.mark_raw_observed();
+        assert_eq!(
+            body.consume_for_request_parse(),
+            Err(super::RuntimeRequestBodyConsumeError::RawInputObserved)
+        );
+    }
+
+    #[test]
+    fn byte_form_parser_preserves_non_utf8_values() {
+        let parsed = parse_form_urlencoded_body_bytes(b"key=%ff%00+ok");
+        assert_eq!(
+            parsed,
+            [RuntimeInputPair::new(
+                b"key".to_vec(),
+                vec![0xff, 0, b' ', b'o', b'k']
+            )]
+        );
+    }
 
     #[test]
     fn context_defaults_are_deterministic() {
@@ -2008,7 +2906,7 @@ mod tests {
     fn http_request_merge_order_is_get_post_cookie() {
         let mut request = http_request();
         request.parsed_get = vec![("same".to_string(), "get".to_string())];
-        request.parsed_post = vec![("same".to_string(), "post".to_string())];
+        request.parsed_post = vec![RuntimeInputPair::new("same", "post")];
         request.parsed_cookie = vec![("same".to_string(), "cookie".to_string())];
         let context = RuntimeContext::controlled_http(request);
 
@@ -2021,7 +2919,7 @@ mod tests {
         let mut request = http_request();
         request.parsed_get =
             parse_query_string("user[name]=Ada&ids[]=1&ids[]=2&user[address][city]=Berlin");
-        request.parsed_post = parse_form_urlencoded_body(b"form[title]=Hello");
+        request.parsed_post = parse_form_urlencoded_body_bytes(b"form[title]=Hello");
         let context = RuntimeContext::controlled_http(request);
 
         let get = global_array(&context, "_GET");
@@ -2404,7 +3302,7 @@ mod tests {
             ("Bad Header".to_string(), "ignored".to_string()),
         ];
         request.raw_body = b"posted=yes".to_vec().into();
-        request.parsed_post = parse_form_urlencoded_body(&request.raw_body);
+        request.parsed_post = parse_form_urlencoded_body_bytes(b"posted=yes");
         request.parsed_cookie = parse_cookie_header("sid=abc; theme=dark");
         request
     }
@@ -2413,6 +3311,7 @@ mod tests {
         RuntimeUploadedFile {
             field_name: field_name.to_string(),
             client_filename: client_filename.to_string(),
+            full_path: client_filename.to_string(),
             content_type: "image/png".to_string(),
             temp_path: "/tmp/phrust-upload".to_string(),
             error: 0,

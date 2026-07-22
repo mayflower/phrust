@@ -693,6 +693,14 @@ pub const FUNCTIONS: &[GeneratedBuiltinDescriptor] = &[
         variadic: false,
     },
     GeneratedBuiltinDescriptor {
+        name: "request_parse_body",
+        extension: "standard",
+        return_type: Some("array"),
+        required_parameters: 0,
+        total_parameters: 1,
+        variadic: false,
+    },
+    GeneratedBuiltinDescriptor {
         name: "restore_error_handler",
         extension: "core",
         return_type: Some("true"),

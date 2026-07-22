@@ -31,6 +31,11 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
 
+[workspace.dependencies]
+getrandom = "0.4.3"
+multer = "3.1.0"
+tempfile = "3.27.0"
+
 [patch.crates-io]
 pcre2 = { path = "third_party/rust/pcre2" }
 tiger = { path = "third_party/rust/tiger" }

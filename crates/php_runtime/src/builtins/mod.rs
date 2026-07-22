@@ -37,6 +37,7 @@ pub use modules::intl::{
 pub use modules::msgpack::{
     pack_value as msgpack_pack_value, unpack_value as msgpack_unpack_value,
 };
+pub use modules::session::{decode_runtime_session_payload, encode_runtime_session_payload};
 #[doc(hidden)]
 pub use modules::soap::{
     SoapParsedBody, build_soap_envelope, load_wsdl, parse_soap_response, parse_wsdl, soap_http_post,

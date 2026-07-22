@@ -23,6 +23,9 @@ mod serialization;
 mod snefru;
 mod snefru_tables;
 
+use crate::context::{
+    RequestParseBodyError, RequestParseBodyOptions, input_byte_pairs_array, uploaded_files_array,
+};
 use crate::convert::float_to_php_string;
 use crate::layout_stats;
 use crate::numeric_string::{NumericStringKind, NumericStringValue, classify_php_string};
@@ -63,6 +66,11 @@ pub(in crate::builtins::modules) const SORT_NATURAL: i64 = 6;
 pub(in crate::builtins::modules) const SORT_FLAG_CASE: i64 = 8;
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
+    BuiltinEntry::new(
+        "request_parse_body",
+        builtin_request_parse_body,
+        BuiltinCompatibility::Php,
+    ),
     BuiltinEntry::new("assert", builtin_assert, BuiltinCompatibility::Php),
     BuiltinEntry::new("boolval", builtin_boolval, BuiltinCompatibility::Php),
     BuiltinEntry::new("uniqid", builtin_uniqid, BuiltinCompatibility::Php),
@@ -441,6 +449,141 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new("var_export", builtin_var_export, BuiltinCompatibility::Php),
 ];
 
+fn builtin_request_parse_body(
+    context: &mut BuiltinContext<'_>,
+    args: Vec<Value>,
+    _span: RuntimeSourceSpan,
+) -> BuiltinResult {
+    if args.len() > 1 {
+        return Err(arity_error("request_parse_body", "at most 1 argument"));
+    }
+    let mut options = match args.first().map(deref_value) {
+        None | Some(Value::Null) => RequestParseBodyOptions::default(),
+        Some(Value::Array(options)) => parse_request_body_options(&options)?,
+        Some(value) => {
+            return Err(argument_type_error(
+                "request_parse_body",
+                "#1 ($options)",
+                "?array",
+                &value,
+            ));
+        }
+    };
+    options.arg_separator_input = context
+        .ini_registry()
+        .get("arg_separator.input")
+        .unwrap_or("&")
+        .to_string();
+    let parser = context.request_parser().cloned().ok_or_else(|| {
+        BuiltinError::new(
+            "E_PHP_RUNTIME_REQUEST_PARSE_BODY",
+            "request_parse_body(): request body parser is unavailable",
+        )
+    })?;
+    let parsed = parser.parse(options).map_err(|error| match error {
+        RequestParseBodyError::InvalidOptions(message) => {
+            value_error("request_parse_body", &message)
+        }
+        RequestParseBodyError::Parse(message) => BuiltinError::new(
+            "E_PHP_RUNTIME_REQUEST_PARSE_BODY",
+            format!("request_parse_body(): {message}"),
+        ),
+    })?;
+    if let Some(registry) = context.upload_registry_mut() {
+        registry.register_uploaded_files(&parsed.files);
+    }
+    let mut ini = crate::context::RuntimeIniOptions::default();
+    ini.max_input_vars = context
+        .ini_registry()
+        .get("max_input_vars")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(ini.max_input_vars);
+    ini.max_input_nesting_level = context
+        .ini_registry()
+        .get("max_input_nesting_level")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(ini.max_input_nesting_level);
+    let post = input_byte_pairs_array(&parsed.post, &ini);
+    let files = uploaded_files_array(&parsed.files, &ini);
+    Ok(Value::packed_array(vec![
+        Value::Array(post),
+        Value::Array(files),
+    ]))
+}
+
+fn parse_request_body_options(options: &PhpArray) -> Result<RequestParseBodyOptions, BuiltinError> {
+    let mut parsed = RequestParseBodyOptions::default();
+    for (key, value) in options.iter() {
+        let ArrayKey::String(key) = key else {
+            return Err(value_error(
+                "request_parse_body",
+                "option keys must be strings",
+            ));
+        };
+        let key = key.to_string_lossy();
+        let value = deref_value(value);
+        match key.as_str() {
+            "max_file_uploads" => {
+                parsed.max_file_uploads = Some(nonnegative_option_integer(&key, &value)?)
+            }
+            "max_input_vars" => {
+                parsed.max_input_vars = Some(nonnegative_option_integer(&key, &value)?)
+            }
+            "max_multipart_body_parts" => {
+                parsed.max_multipart_body_parts = Some(nonnegative_option_integer(&key, &value)?)
+            }
+            "post_max_size" => parsed.post_max_size = Some(ini_size_option(&key, &value)?),
+            "upload_max_filesize" => {
+                parsed.upload_max_filesize = Some(ini_size_option(&key, &value)?)
+            }
+            _ => {
+                return Err(value_error(
+                    "request_parse_body",
+                    &format!("unknown option {key}"),
+                ));
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+fn nonnegative_option_integer(key: &str, value: &Value) -> Result<usize, BuiltinError> {
+    match value {
+        Value::Int(value) if *value >= 0 => Ok(*value as usize),
+        _ => Err(value_error(
+            "request_parse_body",
+            &format!("option {key} must be a non-negative integer"),
+        )),
+    }
+}
+
+fn ini_size_option(key: &str, value: &Value) -> Result<usize, BuiltinError> {
+    let Value::String(value) = value else {
+        return Err(value_error(
+            "request_parse_body",
+            &format!("option {key} must be a valid INI size string"),
+        ));
+    };
+    let value = value.to_string_lossy();
+    let trimmed = value.trim();
+    let (digits, multiplier) = match trimmed.as_bytes().last().copied() {
+        Some(b'k' | b'K') => (&trimmed[..trimmed.len() - 1], 1024usize),
+        Some(b'm' | b'M') => (&trimmed[..trimmed.len() - 1], 1024usize.pow(2)),
+        Some(b'g' | b'G') => (&trimmed[..trimmed.len() - 1], 1024usize.pow(3)),
+        _ => (trimmed, 1),
+    };
+    digits
+        .parse::<usize>()
+        .ok()
+        .and_then(|quantity| quantity.checked_mul(multiplier))
+        .ok_or_else(|| {
+            value_error(
+                "request_parse_body",
+                &format!("option {key} must be a valid INI size string"),
+            )
+        })
+}
+
 pub(in crate::builtins::modules) fn expect_arity(
     name: &str,
     args: &[Value],
@@ -748,7 +891,7 @@ pub(in crate::builtins::modules) fn builtin_gc_status(
 }
 
 pub(in crate::builtins::modules) fn builtin_usleep(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -760,12 +903,17 @@ pub(in crate::builtins::modules) fn builtin_usleep(
             "Argument #1 ($microseconds) must be greater than or equal to 0",
         ));
     }
-    std::thread::sleep(std::time::Duration::from_micros(micros as u64));
+    if !context.sleep_interruptibly(std::time::Duration::from_micros(micros as u64)) {
+        return Err(BuiltinError::new(
+            "E_PHP_CLIENT_DISCONNECTED",
+            "client disconnected during PHP execution",
+        ));
+    }
     Ok(Value::Null)
 }
 
 pub(in crate::builtins::modules) fn builtin_sleep(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
@@ -777,7 +925,12 @@ pub(in crate::builtins::modules) fn builtin_sleep(
             "Argument #1 ($seconds) must be greater than or equal to 0",
         ));
     }
-    std::thread::sleep(std::time::Duration::from_secs(seconds as u64));
+    if !context.sleep_interruptibly(std::time::Duration::from_secs(seconds as u64)) {
+        return Err(BuiltinError::new(
+            "E_PHP_CLIENT_DISCONNECTED",
+            "client disconnected during PHP execution",
+        ));
+    }
     Ok(Value::Int(0))
 }
 
@@ -2240,7 +2393,7 @@ pub(in crate::builtins::modules) fn read_file_value(
     if path.starts_with("php://") {
         let cwd = context.cwd().to_path_buf();
         let filesystem = context.filesystem_capabilities().clone();
-        let php_input = context.php_input().to_vec();
+        let php_input = context.php_input().clone();
         let Some(resources) = context.resources() else {
             context.php_warning(
                 "E_PHP_RUNTIME_STREAM_RESOURCE_TABLE",
@@ -6526,7 +6679,7 @@ mod tests {
     use super::{
         BuiltinCompatibility, BuiltinContext, JSON_ERROR_SYNTAX, JSON_PRESERVE_ZERO_FRACTION,
         JSON_UNESCAPED_SLASHES, JSON_UNESCAPED_UNICODE, PHP_QUERY_RFC3986, PHP_RAND_MAX,
-        RuntimeSourceSpan, SORT_FLAG_CASE, SORT_NUMERIC, SORT_REGULAR, SORT_STRING,
+        RuntimeSourceSpan, SORT_FLAG_CASE, SORT_NUMERIC, SORT_REGULAR, SORT_STRING, builtin_usleep,
     };
     use crate::api::*;
     use crate::builtins::context::{
@@ -6551,6 +6704,25 @@ mod tests {
             .expect_err("builtin should fail")
             .message()
             .to_owned()
+    }
+
+    #[test]
+    fn usleep_returns_promptly_when_the_request_is_cancelled() {
+        let mut output = OutputBuffer::new();
+        let cancellation = RuntimeCancellationState::new();
+        cancellation.cancel();
+        let mut context = BuiltinContext::new(&mut output);
+        context.set_cancellation(Some(&cancellation));
+        let started = std::time::Instant::now();
+        let error = builtin_usleep(
+            &mut context,
+            vec![Value::Int(1_000_000)],
+            RuntimeSourceSpan::default(),
+        )
+        .expect_err("cancelled usleep");
+
+        assert_eq!(error.diagnostic_id(), "E_PHP_CLIENT_DISCONNECTED");
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
     }
 
     #[test]

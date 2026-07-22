@@ -137,21 +137,28 @@ pub mod api {
         ReadlineState, SYSVMSG_EAGAIN, SYSVMSG_EINVAL, SYSVMSG_IPC_NOWAIT, ShmopState,
         SoapParsedBody, SoapState, SocketState, Ssh2FingerprintHash, Ssh2State, StreamContextState,
         StrtokState, SysvMessageQueueState, SysvSemaphoreError, SysvSemaphoreState,
-        SysvSharedMemoryState, build_soap_envelope, hash_algorithm_exists,
-        igbinary_serialize_value, igbinary_unserialize_value, is_normalized_string, load_wsdl,
-        msgpack_pack_value, msgpack_unpack_value, normalize_string, parse_soap_response,
-        parse_wsdl, soap_http_post, validate_fileinfo_options,
+        SysvSharedMemoryState, build_soap_envelope, decode_runtime_session_payload,
+        encode_runtime_session_payload, hash_algorithm_exists, igbinary_serialize_value,
+        igbinary_unserialize_value, is_normalized_string, load_wsdl, msgpack_pack_value,
+        msgpack_unpack_value, normalize_string, parse_soap_response, parse_wsdl, soap_http_post,
+        validate_fileinfo_options,
     };
     pub use crate::callable::{
         CallableMethodTarget, CallableValue, ClosureCaptureValue, ClosureContext, ClosureDebugInfo,
         ClosureDebugParameter, ClosurePayload,
     };
     pub use crate::context::{
-        ErrorReporting, ProcessCapability, RuntimeCancellationState, RuntimeContext,
-        RuntimeHttpHeader, RuntimeHttpRequestContext, RuntimeHttpResponseState, RuntimeIniOptions,
-        RuntimeInputFilter, RuntimeRequestMode, RuntimeUploadedFile, SessionIdGenerateCallback,
-        SessionLoadCallback, StrictTypesInfo, UploadRegistry, UploadRegistryEntry,
-        parse_cookie_header, parse_form_urlencoded_body, parse_query_string,
+        ErrorReporting, ProcessCapability, RequestParseBodyError, RequestParseBodyOptions,
+        RequestParserCallback, RuntimeCancellationState, RuntimeContext, RuntimeHttpHeader,
+        RuntimeHttpRequestContext, RuntimeHttpResponseState, RuntimeIniOptions, RuntimeInputFilter,
+        RuntimeInputPair, RuntimeParsedRequestData, RuntimeRequestBody,
+        RuntimeRequestBodyAsyncReader, RuntimeRequestBodyConsumeError, RuntimeRequestBodyReader,
+        RuntimeRequestMode, RuntimeUploadedFile, SessionAbortCallback, SessionDestroyCallback,
+        SessionGcCallback, SessionIdGenerateCallback, SessionLoadCallback, SessionLoadResult,
+        SessionRegenerateCallback, SessionWriteCallback, StrictTypesInfo, UploadRegistry,
+        UploadRegistryEntry, parse_cookie_header, parse_form_urlencoded_body,
+        parse_form_urlencoded_body_bytes, parse_form_urlencoded_reader,
+        parse_form_urlencoded_reader_with_separators, parse_query_string,
         parse_query_string_with_separators,
     };
     pub use crate::convert::{
@@ -161,6 +168,8 @@ pub mod api {
         to_bool, to_bool_php, to_float, to_float_php, to_int, to_int_php, to_number, to_number_php,
         to_object_php, to_string, to_string_php,
     };
+    #[cfg(feature = "full-runtime")]
+    pub use crate::datetime::format_timestamp;
     #[cfg(feature = "full-runtime")]
     pub use crate::db::mysql::{
         MYSQL_TEST_DSN_ENV, MYSQLI_ASSOC, MYSQLI_BOTH, MYSQLI_NUM, MYSQLI_REPORT_ERROR,
@@ -350,8 +359,9 @@ pub(crate) use callable::{
     CallableMethodTarget, CallableValue, ClosureCaptureValue, ClosureDebugParameter, ClosurePayload,
 };
 pub(crate) use context::{
-    RuntimeHttpResponseState, RuntimeIniOptions, RuntimeInputFilter, SessionIdGenerateCallback,
-    SessionLoadCallback, UploadRegistry, parse_query_string_with_separators,
+    RuntimeHttpResponseState, RuntimeIniOptions, RuntimeInputFilter, RuntimeRequestBody,
+    SessionIdGenerateCallback, SessionLoadCallback, UploadRegistry,
+    parse_query_string_with_separators,
 };
 pub(crate) use convert::{
     NumericValue, compare, equal, identical, to_bool, to_float, to_int, to_number, to_string,

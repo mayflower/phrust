@@ -43,6 +43,10 @@ pub(crate) struct AppState {
 #[derive(Clone, Debug)]
 pub(crate) struct RequestRuntimeConfig {
     pub(crate) max_body_bytes: usize,
+    pub(crate) post_max_bytes: usize,
+    pub(crate) request_body_memory_bytes: usize,
+    pub(crate) request_body_temp_dir: PathBuf,
+    pub(crate) enable_post_data_reading: bool,
     pub(crate) multipart_config: MultipartConfig,
     pub(crate) request_timeout: Duration,
     pub(crate) execution_time_limit: Option<Duration>,
@@ -97,6 +101,7 @@ pub(crate) struct RuntimeServices {
     pub(crate) metrics: Arc<ServerMetrics>,
     pub(crate) engine: Arc<ServerEngineState>,
     pub(crate) request_counter: Arc<AtomicU64>,
+    pub(crate) tokio_handle: tokio::runtime::Handle,
 }
 
 pub(crate) fn server_env_snapshot<I>(env: I) -> Arc<Vec<(String, String)>>
@@ -276,7 +281,18 @@ impl AppState {
 pub(crate) struct SessionConfig {
     pub(crate) enabled: bool,
     pub(crate) cookie_name: String,
+    pub(crate) serialize_handler: String,
+    pub(crate) use_strict_mode: bool,
+    pub(crate) cookie_lifetime: u64,
     pub(crate) cookie_path: String,
+    pub(crate) cookie_domain: String,
+    pub(crate) cookie_secure: bool,
+    pub(crate) cookie_httponly: bool,
+    pub(crate) cookie_samesite: String,
+    pub(crate) cookie_partitioned: bool,
+    pub(crate) use_cookies: bool,
+    pub(crate) use_only_cookies: bool,
+    pub(crate) save_path: PathBuf,
 }
 pub(crate) fn preload_script_cache(
     state: &AppState,

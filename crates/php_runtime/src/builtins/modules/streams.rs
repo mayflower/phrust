@@ -188,7 +188,7 @@ pub(in crate::builtins::modules) fn builtin_fopen(
     let mode = string_arg("fopen", &args[1])?.to_string_lossy();
     let cwd = context.cwd().to_path_buf();
     let filesystem = context.filesystem_capabilities().clone();
-    let php_input = context.php_input().to_vec();
+    let php_input = context.php_input().clone();
     let open_result = {
         let Some(resources) = context.resources() else {
             return Ok(Value::Bool(false));

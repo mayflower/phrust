@@ -27,6 +27,13 @@ pub(crate) struct ServerMetrics {
     pub(crate) four_xx: AtomicU64,
     pub(crate) five_xx: AtomicU64,
     pub(crate) body_too_large: AtomicU64,
+    pub(crate) request_body_memory_total: AtomicU64,
+    pub(crate) request_body_spooled_total: AtomicU64,
+    pub(crate) request_body_spooled_bytes_total: AtomicU64,
+    pub(crate) request_body_tempfiles_active: AtomicU64,
+    pub(crate) request_body_tempfile_bytes_active: AtomicU64,
+    pub(crate) request_body_hard_limit_rejections_total: AtomicU64,
+    pub(crate) request_body_tempfile_failures_total: AtomicU64,
     pub(crate) overload: AtomicU64,
     pub(crate) cpu_execution_admitted: AtomicU64,
     pub(crate) cpu_execution_queued: AtomicU64,
@@ -37,7 +44,17 @@ pub(crate) struct ServerMetrics {
     pub(crate) uploads_total: AtomicU64,
     pub(crate) upload_parse_errors: AtomicU64,
     pub(crate) upload_bytes_accepted: AtomicU64,
+    pub(crate) upload_bytes_written_total: AtomicU64,
     pub(crate) upload_files_rejected: AtomicU64,
+    pub(crate) upload_tempfiles_active: AtomicU64,
+    pub(crate) upload_tempfile_bytes_active: AtomicU64,
+    pub(crate) upload_tempfile_failures_total: AtomicU64,
+    pub(crate) upload_limit_errors_total: AtomicU64,
+    pub(crate) multipart_requests_total: AtomicU64,
+    pub(crate) multipart_parts_total: AtomicU64,
+    pub(crate) multipart_fields_total: AtomicU64,
+    pub(crate) request_parse_body_calls_total: AtomicU64,
+    pub(crate) request_parse_body_errors_total: AtomicU64,
     pub(crate) execution_timeouts: AtomicU64,
     pub(crate) execution_deadline_disabled: AtomicU64,
     pub(crate) static_streamed_bytes: AtomicU64,
@@ -90,6 +107,16 @@ pub(crate) struct ServerMetrics {
     pub(crate) session_store_writes: AtomicU64,
     pub(crate) session_store_deletes: AtomicU64,
     pub(crate) session_finalize_skipped_inactive: AtomicU64,
+    pub(crate) session_lock_waits_total: AtomicU64,
+    pub(crate) session_lock_wait_nanos_total: AtomicU64,
+    pub(crate) session_lock_timeouts_total: AtomicU64,
+    pub(crate) session_file_reads_total: AtomicU64,
+    pub(crate) session_file_writes_total: AtomicU64,
+    pub(crate) session_lazy_touches_total: AtomicU64,
+    pub(crate) session_aborts_total: AtomicU64,
+    pub(crate) session_gc_runs_total: AtomicU64,
+    pub(crate) session_gc_deleted_total: AtomicU64,
+    pub(crate) session_regenerations_total: AtomicU64,
     pub(crate) request_headers_seen: AtomicU64,
     pub(crate) request_headers_materialized: AtomicU64,
     pub(crate) request_headers_skipped_direct: AtomicU64,
@@ -198,11 +225,28 @@ phrust_server_cpu_execution_rejected_total {}\n\
 phrust_server_cpu_execution_cancelled_total {}\n\
 phrust_server_cpu_execution_timeouts_total {}\n\
 phrust_server_body_too_large_total {}\n\
+phrust_server_request_body_memory_total {}\n\
+phrust_server_request_body_spooled_total {}\n\
+phrust_server_request_body_spooled_bytes_total {}\n\
+phrust_server_request_body_tempfiles_active {}\n\
+phrust_server_request_body_tempfile_bytes_active {}\n\
+phrust_server_request_body_hard_limit_rejections_total {}\n\
+phrust_server_request_body_tempfile_failures_total {}\n\
 phrust_server_overload_total {}\n\
 phrust_server_uploads_total {}\n\
 phrust_server_upload_parse_errors_total {}\n\
 phrust_server_upload_bytes_accepted_total {}\n\
+phrust_server_upload_bytes_written_total {}\n\
 phrust_server_upload_files_rejected_total {}\n\
+phrust_server_upload_tempfiles_active {}\n\
+phrust_server_upload_tempfile_bytes_active {}\n\
+phrust_server_upload_tempfile_failures_total {}\n\
+phrust_server_upload_limit_errors_total {}\n\
+phrust_server_multipart_requests_total {}\n\
+phrust_server_multipart_parts_total {}\n\
+phrust_server_multipart_fields_total {}\n\
+phrust_server_request_parse_body_calls_total {}\n\
+phrust_server_request_parse_body_errors_total {}\n\
 phrust_server_execution_timeouts_total {}\n\
 phrust_server_execution_deadline_disabled_total {}\n\
 phrust_server_static_streamed_bytes_total {}\n\
@@ -267,6 +311,16 @@ phrust_server_session_finalizations_total {}\n\
 phrust_server_session_store_writes_total {}\n\
 phrust_server_session_store_deletes_total {}\n\
 phrust_server_session_finalize_skipped_inactive_total {}\n\
+phrust_server_session_lock_waits_total {}\n\
+phrust_server_session_lock_wait_nanos_total {}\n\
+phrust_server_session_lock_timeouts_total {}\n\
+phrust_server_session_file_reads_total {}\n\
+phrust_server_session_file_writes_total {}\n\
+phrust_server_session_lazy_touches_total {}\n\
+phrust_server_session_aborts_total {}\n\
+phrust_server_session_gc_runs_total {}\n\
+phrust_server_session_gc_deleted_total {}\n\
+phrust_server_session_regenerations_total {}\n\
 phrust_server_request_headers_seen_total {}\n\
 phrust_server_request_headers_materialized_total {}\n\
 phrust_server_request_headers_skipped_direct_total {}\n\
@@ -312,11 +366,32 @@ phrust_server_persistent_engine_feedback_template_absorptions_total {}\n",
             self.cpu_execution_cancelled.load(Ordering::Relaxed),
             self.cpu_execution_timeouts.load(Ordering::Relaxed),
             self.body_too_large.load(Ordering::Relaxed),
+            self.request_body_memory_total.load(Ordering::Relaxed),
+            self.request_body_spooled_total.load(Ordering::Relaxed),
+            self.request_body_spooled_bytes_total
+                .load(Ordering::Relaxed),
+            self.request_body_tempfiles_active.load(Ordering::Relaxed),
+            self.request_body_tempfile_bytes_active
+                .load(Ordering::Relaxed),
+            self.request_body_hard_limit_rejections_total
+                .load(Ordering::Relaxed),
+            self.request_body_tempfile_failures_total
+                .load(Ordering::Relaxed),
             self.overload.load(Ordering::Relaxed),
             self.uploads_total.load(Ordering::Relaxed),
             self.upload_parse_errors.load(Ordering::Relaxed),
             self.upload_bytes_accepted.load(Ordering::Relaxed),
+            self.upload_bytes_written_total.load(Ordering::Relaxed),
             self.upload_files_rejected.load(Ordering::Relaxed),
+            self.upload_tempfiles_active.load(Ordering::Relaxed),
+            self.upload_tempfile_bytes_active.load(Ordering::Relaxed),
+            self.upload_tempfile_failures_total.load(Ordering::Relaxed),
+            self.upload_limit_errors_total.load(Ordering::Relaxed),
+            self.multipart_requests_total.load(Ordering::Relaxed),
+            self.multipart_parts_total.load(Ordering::Relaxed),
+            self.multipart_fields_total.load(Ordering::Relaxed),
+            self.request_parse_body_calls_total.load(Ordering::Relaxed),
+            self.request_parse_body_errors_total.load(Ordering::Relaxed),
             self.execution_timeouts.load(Ordering::Relaxed),
             self.execution_deadline_disabled.load(Ordering::Relaxed),
             self.static_streamed_bytes.load(Ordering::Relaxed),
@@ -382,6 +457,16 @@ phrust_server_persistent_engine_feedback_template_absorptions_total {}\n",
             self.session_store_deletes.load(Ordering::Relaxed),
             self.session_finalize_skipped_inactive
                 .load(Ordering::Relaxed),
+            self.session_lock_waits_total.load(Ordering::Relaxed),
+            self.session_lock_wait_nanos_total.load(Ordering::Relaxed),
+            self.session_lock_timeouts_total.load(Ordering::Relaxed),
+            self.session_file_reads_total.load(Ordering::Relaxed),
+            self.session_file_writes_total.load(Ordering::Relaxed),
+            self.session_lazy_touches_total.load(Ordering::Relaxed),
+            self.session_aborts_total.load(Ordering::Relaxed),
+            self.session_gc_runs_total.load(Ordering::Relaxed),
+            self.session_gc_deleted_total.load(Ordering::Relaxed),
+            self.session_regenerations_total.load(Ordering::Relaxed),
             self.request_headers_seen.load(Ordering::Relaxed),
             self.request_headers_materialized.load(Ordering::Relaxed),
             self.request_headers_skipped_direct.load(Ordering::Relaxed),

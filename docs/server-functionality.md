@@ -85,23 +85,37 @@ multipart package upload handling.
 ## Persistent Web Sessions
 
 The integrated server owns web session persistence. By default sessions are
-enabled with cookie name `PHPSESSID` and cookie path `/`. Session data is held
-in a bounded in-memory store owned by the server process, keyed by validated
-session id, and serialized with the phrust-owned PHP-serialize-compatible
-encoding of the whole `$_SESSION` array. It is intentionally not PHP's
-historical `name|serialized-value` session module format.
+enabled with cookie name `PHPSESSID` and cookie path `/`. The files handler
+stores `sess_<validated-id>` beneath `session_save_path` and uses the selected
+PHP-compatible `php`, `php_binary`, or `php_serialize` payload codec. Files
+survive restarts and can be shared by multiple server processes.
 
-`--session-save-path` and the `session_save_path` config key are retained as
-compatibility knobs for existing launch scripts, but the development server no
-longer creates `sess_<id>` files there. Operators can override cookie behavior
-with `--session-cookie-name` and `--session-cookie-path`, or disable the feature
-with `--disable-sessions`.
+Each active session holds a capability-relative exclusive file lock from
+`session_start()` until write-close, read-and-close, abort, destroy, or request
+finalization. Requests for one ID therefore serialize without a global mutex;
+different IDs remain independent. `session_lock_timeout_ms` bounds lock waits.
+Cookie name, lifetime, path, domain, Secure, HttpOnly, SameSite, Partitioned,
+and cookie-use policy are available through their corresponding
+`session_cookie_*` / `session_use_*` config keys and hyphenated CLI flags.
 
-Session state is loaded and finalized per request without a global execution
-mutex. Requests can run concurrently up to the server in-flight request limit;
-concurrent writes for the same session id use last-completing-request-wins
-semantics. The store is not cross-process, so sessions do not persist across
-server restarts and are not shared between multiple server processes.
+## Bounded Request Input and Uploads
+
+The transport hard limit `max_body_bytes` defaults to 33,554,432 bytes (32
+MiB). PHP automatic POST parsing uses the separate `post_max_bytes` default of
+8,388,608 bytes (8 MiB). Replayable raw bodies keep at most
+`request_body_memory_bytes` (262,144 bytes / 256 KiB by default) in memory and
+then spill once to `request_body_temp_dir`. Multipart uploads stream directly
+to random files below `upload_temp_dir`; `max_upload_files`,
+`max_upload_file_bytes`, and `max_multipart_parts` map to PHP's
+`max_file_uploads`, `upload_max_filesize`, and `max_multipart_body_parts`.
+Automatic parsing can be disabled with `enable_post_data_reading = false` or
+`--disable-post-data-reading`.
+
+The body-spool and upload roots are immutable operator-controlled startup
+capabilities. Symlink roots are rejected. Their parent directories must not be
+replaceable by unprivileged request code while the server is running. Session
+access uses a separately opened directory capability and no ambient request-time
+path resolution.
 
 ## PHP Execution Deadlines
 
@@ -247,9 +261,17 @@ index = "index.php,index.html"
 php_extensions = "php"
 deployment_mode = "immutable"
 front_controller = "index.php"
-max_body_bytes = 1048576
+max_body_bytes = 33554432
+post_max_bytes = 8388608
+request_body_memory_bytes = 262144
+request_body_temp_dir = "/var/tmp/phrust-bodies"
+max_upload_files = 20
+max_upload_file_bytes = 2097152
+max_multipart_parts = -1
 upload_temp_dir = "/var/tmp/phrust-uploads"
+enable_post_data_reading = true
 session_save_path = "/var/tmp/phrust-sessions"
+session_lock_timeout_ms = 5000
 max_in_flight = 200
 cpu_execution_limit = 8
 request_timeout_ms = 30000

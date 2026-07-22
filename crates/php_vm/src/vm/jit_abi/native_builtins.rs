@@ -453,6 +453,24 @@ pub(super) fn emit_native_php_diagnostic(
     Ok(())
 }
 
+pub(in crate::vm) fn emit_native_php_startup_warning(
+    context: &mut NativeExecutionContext<'_>,
+    message: &str,
+) {
+    let errno = php_runtime::api::PHP_E_WARNING;
+    context.record_last_error(errno, message, "Unknown", 0);
+    if context.error_reporting & errno == 0 || !context.display_errors {
+        return;
+    }
+    let html = matches!(
+        context.options.runtime_context.request_mode,
+        php_runtime::api::RuntimeRequestMode::Http(_)
+    );
+    context.output.write_bytes(format_native_php_diagnostic(
+        "Warning", message, "Unknown", 0, true, html,
+    ));
+}
+
 pub(super) fn format_native_php_diagnostic(
     label: &str,
     message: &str,
@@ -2060,6 +2078,7 @@ pub(super) fn execute_prepared_runtime_builtin(
             error_reporting: context.error_reporting,
             leading_newline: true,
         });
+        builtin.set_cancellation(Some(&context.options.runtime_context.cancellation));
         let result = (entry.function())(&mut builtin, values, span);
         let diagnostics = builtin.take_diagnostics();
         (result, diagnostics)
@@ -2080,11 +2099,13 @@ pub(super) fn execute_prepared_runtime_builtin(
             error_reporting: context.error_reporting,
             leading_newline: true,
         });
+        builtin.set_cancellation(Some(&context.options.runtime_context.cancellation));
         if let php_runtime::api::RuntimeRequestMode::Http(request) =
             &context.options.runtime_context.request_mode
         {
-            builtin.set_php_input(Arc::clone(&request.raw_body));
+            builtin.set_php_input(request.raw_body.clone());
         }
+        builtin.set_request_parser(context.options.runtime_context.request_parser.as_ref());
         builtin.set_filter_input_arrays_shared(Rc::clone(&context.filter_input_arrays));
         builtin.set_http_response_state(&mut context.http_response);
         builtin.set_upload_registry(&mut context.upload_registry);
@@ -2097,6 +2118,12 @@ pub(super) fn execute_prepared_runtime_builtin(
                 .session_id_generator
                 .as_ref(),
         );
+        builtin.set_session_writer(context.options.runtime_context.session_writer.as_ref());
+        builtin.set_session_destroyer(context.options.runtime_context.session_destroyer.as_ref());
+        builtin.set_session_aborter(context.options.runtime_context.session_aborter.as_ref());
+        builtin
+            .set_session_regenerator(context.options.runtime_context.session_regenerator.as_ref());
+        builtin.set_session_gc(context.options.runtime_context.session_gc.as_ref());
         builtin.sync_session_state_from_global();
         let mut mysql_state = context.mysql_state.borrow_mut();
         builtin.set_mysql_state(&mut mysql_state);
@@ -2106,7 +2133,7 @@ pub(super) fn execute_prepared_runtime_builtin(
         let diagnostics = builtin.take_diagnostics();
         (result, diagnostics)
     };
-    if name == "session_start" {
+    if result.is_ok() && matches!(name, "session_start" | "session_regenerate_id") {
         publish_native_session_cookie(context)?;
     }
     context
@@ -2142,7 +2169,9 @@ pub(super) fn execute_prepared_runtime_builtin(
         Ok(value) => context.encode(value),
         Err(error) => {
             let id = error.diagnostic_id().to_ascii_uppercase();
-            let class = if id.contains("ARITY") || id.contains("ARGUMENT_COUNT") {
+            let class = if id.contains("REQUEST_PARSE_BODY") {
+                "RequestParseBodyException"
+            } else if id.contains("ARITY") || id.contains("ARGUMENT_COUNT") {
                 "ArgumentCountError"
             } else if id.contains("VALUE") {
                 "ValueError"
@@ -2877,6 +2906,22 @@ pub(super) fn execute_native_builtin(
                 String::from_utf8_lossy(&native_string(value)?).into_owned()
             };
             let previous = context.ini_registry.set(&name, &value);
+            let deprecated_session_ini = match name.to_ascii_lowercase().as_str() {
+                "session.sid_length" => Some("session.sid_length"),
+                "session.sid_bits_per_character" => Some("session.sid_bits_per_character"),
+                _ => None,
+            };
+            if previous.is_some()
+                && let Some(deprecated_name) = deprecated_session_ini
+            {
+                emit_native_php_diagnostic(
+                    context,
+                    php_runtime::api::PHP_E_DEPRECATED,
+                    &format!("ini_set(): {deprecated_name} INI setting is deprecated"),
+                    source,
+                    true,
+                )?;
+            }
             if name.eq_ignore_ascii_case("include_path") && previous.is_some() {
                 context.include_path =
                     Arc::new(std::env::split_paths(std::ffi::OsStr::new(&value)).collect());
@@ -3034,6 +3079,14 @@ pub(super) fn execute_native_builtin(
             let mode = native_string(context.decode(*mode)?)?;
             let path_text = String::from_utf8_lossy(&path).into_owned();
             let mode = String::from_utf8_lossy(&mode);
+            let php_input = match &context.options.runtime_context.request_mode {
+                php_runtime::api::RuntimeRequestMode::Http(request) => request.raw_body.clone(),
+                php_runtime::api::RuntimeRequestMode::Cli => {
+                    php_runtime::api::RuntimeRequestBody::memory(Arc::clone(
+                        &context.options.runtime_context.stdin,
+                    ))
+                }
+            };
             let resource = php_runtime::api::StreamWrapperRegistry::new()
                 .open(
                     &mut context.resources,
@@ -3041,7 +3094,7 @@ pub(super) fn execute_native_builtin(
                     &mode,
                     &context.cwd,
                     &context.options.runtime_context.filesystem,
-                    &context.options.runtime_context.stdin,
+                    &php_input,
                 )
                 .map_err(|error| error.message().to_owned())?;
             context.encode(Value::Resource(resource))
@@ -4346,11 +4399,13 @@ pub(super) fn execute_native_builtin(
                     error_reporting: context.error_reporting,
                     leading_newline: true,
                 });
+                builtin.set_cancellation(Some(&context.options.runtime_context.cancellation));
                 if let php_runtime::api::RuntimeRequestMode::Http(request) =
                     &context.options.runtime_context.request_mode
                 {
-                    builtin.set_php_input(Arc::clone(&request.raw_body));
+                    builtin.set_php_input(request.raw_body.clone());
                 }
+                builtin.set_request_parser(context.options.runtime_context.request_parser.as_ref());
                 builtin.set_filter_input_arrays_shared(Rc::clone(&context.filter_input_arrays));
                 builtin.set_http_response_state(&mut context.http_response);
                 builtin.set_upload_registry(&mut context.upload_registry);
@@ -4363,6 +4418,16 @@ pub(super) fn execute_native_builtin(
                         .session_id_generator
                         .as_ref(),
                 );
+                builtin.set_session_writer(context.options.runtime_context.session_writer.as_ref());
+                builtin.set_session_destroyer(
+                    context.options.runtime_context.session_destroyer.as_ref(),
+                );
+                builtin
+                    .set_session_aborter(context.options.runtime_context.session_aborter.as_ref());
+                builtin.set_session_regenerator(
+                    context.options.runtime_context.session_regenerator.as_ref(),
+                );
+                builtin.set_session_gc(context.options.runtime_context.session_gc.as_ref());
                 builtin.sync_session_state_from_global();
                 let mut mysql_state = context.mysql_state.borrow_mut();
                 builtin.set_mysql_state(&mut mysql_state);
@@ -4372,7 +4437,12 @@ pub(super) fn execute_native_builtin(
                 let diagnostics = builtin.take_diagnostics();
                 (result, diagnostics)
             };
-            if normalized == "session_start" {
+            if result.is_ok()
+                && matches!(
+                    normalized.as_ref(),
+                    "session_start" | "session_regenerate_id"
+                )
+            {
                 publish_native_session_cookie(context)?;
             }
             context
@@ -4395,7 +4465,9 @@ pub(super) fn execute_native_builtin(
                 Ok(value) => context.encode(value),
                 Err(error) => {
                     let id = error.diagnostic_id().to_ascii_uppercase();
-                    let class = if id.contains("ARITY") || id.contains("ARGUMENT_COUNT") {
+                    let class = if id.contains("REQUEST_PARSE_BODY") {
+                        "RequestParseBodyException"
+                    } else if id.contains("ARITY") || id.contains("ARGUMENT_COUNT") {
                         "ArgumentCountError"
                     } else if id.contains("VALUE") {
                         "ValueError"
@@ -4426,25 +4498,73 @@ fn publish_native_session_cookie(context: &mut NativeExecutionContext<'_>) -> Re
     }
     let name = context.session.name();
     let prefix = format!("{name}=");
-    if context.http_response.headers.iter().any(|header| {
-        header.name.eq_ignore_ascii_case("Set-Cookie") && header.value.starts_with(&prefix)
-    }) {
-        return Ok(());
-    }
+    context.http_response.headers.retain(|header| {
+        !(header.name.eq_ignore_ascii_case("Set-Cookie") && header.value.starts_with(&prefix))
+    });
     let path = context
         .ini_registry
         .get("session.cookie_path")
         .unwrap_or("/");
-    context.http_response.add_header_line(
-        &format!(
-            "Set-Cookie: {}={}; Path={}; HttpOnly",
-            context.session.name(),
-            context.session.id(),
-            path
-        ),
-        false,
-        None,
-    )
+    let mut cookie = format!(
+        "Set-Cookie: {}={}",
+        context.session.name(),
+        context.session.id()
+    );
+    let ini_true = |name: &str| {
+        context.ini_registry.get(name).is_some_and(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no"
+            )
+        })
+    };
+    if let Some(lifetime) = context
+        .ini_registry
+        .get("session.cookie_lifetime")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    {
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(lifetime, |now| now.as_secs().saturating_add(lifetime))
+            .min(i64::MAX as u64) as i64;
+        cookie.push_str("; Expires=");
+        cookie.push_str(&php_runtime::api::format_timestamp(
+            expires,
+            "GMT",
+            "D, d M Y H:i:s \\G\\M\\T",
+        ));
+        cookie.push_str("; Max-Age=");
+        cookie.push_str(&lifetime.to_string());
+    }
+    cookie.push_str("; Path=");
+    cookie.push_str(path);
+    if let Some(domain) = context
+        .ini_registry
+        .get("session.cookie_domain")
+        .filter(|value| !value.is_empty())
+    {
+        cookie.push_str("; Domain=");
+        cookie.push_str(domain);
+    }
+    if ini_true("session.cookie_secure") {
+        cookie.push_str("; Secure");
+    }
+    if ini_true("session.cookie_httponly") {
+        cookie.push_str("; HttpOnly");
+    }
+    if let Some(samesite) = context
+        .ini_registry
+        .get("session.cookie_samesite")
+        .filter(|value| !value.is_empty())
+    {
+        cookie.push_str("; SameSite=");
+        cookie.push_str(samesite);
+    }
+    if ini_true("session.cookie_partitioned") {
+        cookie.push_str("; Partitioned");
+    }
+    context.http_response.add_header_line(&cookie, false, None)
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ crc32fast = { version = "1.4", optional = true }
 ed25519-dalek = { version = "2", optional = true }
 encoding_rs = { version = "0.8", optional = true }
 flate2 = "1"
-getrandom = { version = "0.3", optional = true }
+getrandom = { workspace = true, optional = true }
 gost94 = { version = "0.11.0", optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
 exif = { package = "kamadak-exif", version = "0.6.1", optional = true }
@@ -41,6 +41,8 @@ rmp = { version = "0.8", optional = true }
 rusqlite = { version = "0.32", optional = true }
 rustyline = { version = "18.0.1", default-features = false, optional = true }
 serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
+tempfile.workspace = true
+tokio = { version = "1", features = ["fs", "io-util"] }
 socket2 = { version = "0.6", optional = true }
 sha1 = { version = "0.10", optional = true }
 sha2 = { version = "0.10", optional = true }

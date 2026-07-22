@@ -232,6 +232,15 @@ pub(in crate::builtins::modules) fn builtin_session_abort(
     let Some(state) = context.session_state() else {
         return Err(session_context_error("session_abort"));
     };
+    let id = state.id().to_owned();
+    if state.status() == PHP_SESSION_ACTIVE {
+        context
+            .abort_session(&id)
+            .map_err(|message| session_store_error("session_abort", message))?;
+    }
+    let Some(state) = context.session_state() else {
+        return Err(session_context_error("session_abort"));
+    };
     let aborted = state.abort();
     if aborted {
         context.sync_session_global_from_state();
@@ -288,7 +297,14 @@ pub(in crate::builtins::modules) fn builtin_session_gc(
         );
         return Ok(Value::Bool(false));
     }
-    Ok(Value::Int(0))
+    let max_lifetime = context
+        .ini_get("session.gc_maxlifetime")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1440);
+    let deleted = context
+        .gc_sessions(max_lifetime)
+        .map_err(|message| session_store_error("session_gc", message))?;
+    Ok(Value::Int(deleted as i64))
 }
 
 pub(in crate::builtins::modules) fn builtin_session_register_shutdown(
@@ -680,6 +696,72 @@ fn session_decode_error() -> BuiltinError {
     BuiltinError::new("E_PHP_RUNTIME_SESSION_DECODE_FAILED", "decode failed")
 }
 
+pub fn encode_runtime_session_payload(
+    handler: &str,
+    data: &crate::PhpArray,
+    serialize_precision: i32,
+) -> Result<Vec<u8>, String> {
+    match handler {
+        "php" => {
+            let mut output = Vec::new();
+            let mut serializer = SessionReferenceSerializer::new(serialize_precision);
+            for (key, value) in data.iter() {
+                let Some(name) = key.as_string() else {
+                    continue;
+                };
+                output.extend_from_slice(name.as_bytes());
+                output.push(b'|');
+                serializer
+                    .write_value(&mut output, value, 0)
+                    .map_err(|error| error.message().to_string())?;
+            }
+            Ok(output)
+        }
+        "php_binary" => {
+            let mut output = Vec::new();
+            let mut serializer = SessionReferenceSerializer::new(serialize_precision);
+            for (key, value) in data.iter() {
+                let Some(name) = key
+                    .as_string()
+                    .filter(|name| name.len() <= u8::MAX as usize)
+                else {
+                    continue;
+                };
+                output.push(name.len() as u8);
+                output.extend_from_slice(name.as_bytes());
+                serializer
+                    .write_value(&mut output, value, 0)
+                    .map_err(|error| error.message().to_string())?;
+            }
+            Ok(output)
+        }
+        "php_serialize" => php_serialize_value(&Value::Array(data.clone()), serialize_precision)
+            .map(PhpString::into_bytes)
+            .map_err(|error| error.message().to_string()),
+        _ => Err(format!("unknown session serializer {handler}")),
+    }
+}
+
+pub fn decode_runtime_session_payload(
+    handler: &str,
+    payload: &[u8],
+) -> Result<crate::PhpArray, String> {
+    if payload.is_empty() {
+        return match handler {
+            "php" | "php_binary" | "php_serialize" => Ok(crate::PhpArray::new()),
+            _ => Err(format!("unknown session serializer {handler}")),
+        };
+    }
+    let payload = PhpString::from_bytes(payload.to_vec());
+    match handler {
+        "php" => session_decode_php(&payload),
+        "php_binary" => session_decode_php_binary(&payload),
+        "php_serialize" => session_decode_php_serialize(&payload),
+        _ => return Err(format!("unknown session serializer {handler}")),
+    }
+    .map_err(|error| error.message().to_string())
+}
+
 fn session_serialize_handler(context: &BuiltinContext<'_>) -> String {
     context
         .ini_get("session.serialize_handler")
@@ -702,7 +784,7 @@ fn session_save_handler(context: &BuiltinContext<'_>) -> String {
 }
 
 fn session_save_handler_is_supported(context: &BuiltinContext<'_>) -> bool {
-    matches!(session_save_handler(context).as_str(), "files" | "user")
+    session_save_handler(context) == "files"
 }
 
 fn session_files_save_path_is_unreadable(
@@ -1513,9 +1595,13 @@ pub(in crate::builtins::modules) fn builtin_session_create_id(
         return Ok(Value::Bool(false));
     }
     let id_length = session_sid_length(context);
-    context
-        .prepare_new_session_id()
-        .map_err(|message| session_store_error("session_create_id", message))?;
+    let sid_bits = session_sid_bits_per_character(context);
+    if let Some(id) = context
+        .generate_transport_session_id(id_length, sid_bits, &prefix)
+        .map_err(|message| session_store_error("session_create_id", message))?
+    {
+        return Ok(Value::string(id));
+    }
     let Some(state) = context.session_state() else {
         return Err(session_context_error("session_create_id"));
     };
@@ -1541,23 +1627,18 @@ pub(in crate::builtins::modules) fn builtin_session_regenerate_id(
             "zero or one argument(s)",
         ));
     }
-    if let Some(delete_old_session) = args.first() {
-        to_bool(delete_old_session)
-            .map_err(|message| conversion_error("session_regenerate_id", message))?;
-    }
+    let delete_old_session = args
+        .first()
+        .map(to_bool)
+        .transpose()
+        .map_err(|message| conversion_error("session_regenerate_id", message))?
+        .unwrap_or(false);
     let id_length = session_sid_length(context);
+    let sid_bits = session_sid_bits_per_character(context);
     let session_is_active = context
         .session_state()
         .is_some_and(|state| state.status() == PHP_SESSION_ACTIVE);
-    if session_is_active {
-        context
-            .prepare_new_session_id()
-            .map_err(|message| session_store_error("session_regenerate_id", message))?;
-    }
-    let Some(state) = context.session_state() else {
-        return Err(session_context_error("session_regenerate_id"));
-    };
-    if !state.regenerate_id_with_length(id_length) {
+    if !session_is_active {
         context.php_warning(
             "E_PHP_RUNTIME_SESSION_REGENERATE_ID_INACTIVE",
             "session_regenerate_id(): Session ID cannot be regenerated when there is no active session",
@@ -1565,6 +1646,35 @@ pub(in crate::builtins::modules) fn builtin_session_regenerate_id(
         );
         return Ok(Value::Bool(false));
     }
+    let Some(state) = context.session_state() else {
+        return Err(session_context_error("session_regenerate_id"));
+    };
+    let old_id = state.id().to_owned();
+    let data = state.data();
+    let new_id = match context
+        .generate_transport_session_id(id_length, sid_bits, "")
+        .map_err(|message| session_store_error("session_regenerate_id", message))?
+    {
+        Some(id) => id,
+        None => context
+            .session_state()
+            .ok_or_else(|| session_context_error("session_regenerate_id"))?
+            .create_id_with_prefix("", id_length),
+    };
+    let serialize_handler = session_serialize_handler(context);
+    context
+        .regenerate_session(
+            &old_id,
+            &new_id,
+            &data,
+            &serialize_handler,
+            delete_old_session,
+        )
+        .map_err(|message| session_store_error("session_regenerate_id", message))?;
+    context
+        .session_state()
+        .ok_or_else(|| session_context_error("session_regenerate_id"))?
+        .install_regenerated_id(new_id);
     Ok(Value::Bool(true))
 }
 
@@ -1621,6 +1731,8 @@ pub(in crate::builtins::modules) fn builtin_session_start(
     if session_files_save_path_is_unreadable(context, span.clone()) {
         return Ok(Value::Bool(false));
     }
+    let strict_mode = session_ini_bool(context, "session.use_strict_mode");
+    let serialize_handler = session_serialize_handler(context);
     let needs_lazy_load = {
         let Some(state) = context.session_state() else {
             return Err(session_context_error("session_start"));
@@ -1629,32 +1741,73 @@ pub(in crate::builtins::modules) fn builtin_session_start(
     };
     if needs_lazy_load {
         context
-            .load_pending_session_data()
+            .load_pending_session_data(strict_mode, &serialize_handler)
             .map_err(|message| session_store_error("session_start", message))?;
     }
     let id_length = session_sid_length(context);
-    let strict_mode = session_ini_bool(context, "session.use_strict_mode");
-    let needs_new_id = context
-        .session_state()
-        .is_some_and(|state| state.id().is_empty() || strict_mode);
+    let sid_bits = session_sid_bits_per_character(context);
+    let needs_new_id = context.session_state().is_some_and(|state| {
+        state.id().is_empty() || (strict_mode && !state.backing_store_existed())
+    });
     if needs_new_id {
         context
-            .prepare_new_session_id()
+            .prepare_new_session_id(id_length, sid_bits, "")
             .map_err(|message| session_store_error("session_start", message))?;
     }
-    {
+    let generated = {
+        let lazy_write = session_ini_bool(context, "session.lazy_write");
         let Some(state) = context.session_state() else {
             return Err(session_context_error("session_start"));
         };
+        state.set_lazy_write(lazy_write);
+        state.set_serialize_handler(serialize_handler.clone());
         if state.destroyed() || (!state.started() && !needs_lazy_load && state.id().is_empty()) {
             state.set_data(crate::PhpArray::new());
         }
         let location = PhpDiagnosticLocation::from_span(&span);
-        state.start_with_policy(id_length, strict_mode);
+        let generated = state.start_with_policy(id_length, strict_mode);
         state.record_start_location(location.file, location.line);
+        generated
+    };
+    if generated {
+        context
+            .open_current_session_data(&serialize_handler)
+            .map_err(|message| session_store_error("session_start", message))?;
+    }
+    let read_and_close_payload = {
+        let Some(state) = context.session_state() else {
+            return Err(session_context_error("session_start"));
+        };
         if options.read_and_close {
+            let payload = (state.id().to_owned(), state.data());
             state.write_close();
+            Some(payload)
+        } else {
+            None
         }
+    };
+    if let Some((id, _data)) = read_and_close_payload {
+        context
+            .abort_session(&id)
+            .map_err(|message| session_store_error("session_start", message))?;
+    }
+    let gc_probability = context
+        .ini_get("session.gc_probability")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1);
+    let gc_divisor = context
+        .ini_get("session.gc_divisor")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(100);
+    if gc_probability > 0 && session_gc_selected(gc_probability, gc_divisor) {
+        let max_lifetime = context
+            .ini_get("session.gc_maxlifetime")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1440);
+        context
+            .gc_sessions(max_lifetime)
+            .map_err(|message| session_store_error("session_start", message))?;
     }
     context.sync_session_global_from_state();
     Ok(Value::Bool(true))
@@ -1791,6 +1944,15 @@ pub(in crate::builtins::modules) fn builtin_session_destroy(
     let Some(state) = context.session_state() else {
         return Err(session_context_error("session_destroy"));
     };
+    let active_id = (state.status() == PHP_SESSION_ACTIVE).then(|| state.id().to_owned());
+    if let Some(id) = active_id.as_deref() {
+        context
+            .destroy_session(id)
+            .map_err(|message| session_store_error("session_destroy", message))?;
+    }
+    let Some(state) = context.session_state() else {
+        return Err(session_context_error("session_destroy"));
+    };
     let destroyed = state.destroy();
     if !destroyed {
         context.php_warning(
@@ -1808,6 +1970,19 @@ pub(in crate::builtins::modules) fn builtin_session_write_close(
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("session_write_close", &args, 0)?;
+    let Some(state) = context.session_state() else {
+        return Err(session_context_error("session_write_close"));
+    };
+    if state.status() != PHP_SESSION_ACTIVE {
+        return Ok(Value::Bool(false));
+    }
+    let id = state.id().to_owned();
+    let data = state.data();
+    let lazy_write = session_ini_bool(context, "session.lazy_write");
+    let serialize_handler = session_serialize_handler(context);
+    context
+        .write_session(&id, &data, &serialize_handler, lazy_write)
+        .map_err(|message| session_store_error("session_write_close", message))?;
     let Some(state) = context.session_state() else {
         return Err(session_context_error("session_write_close"));
     };
@@ -1836,9 +2011,36 @@ fn session_sid_length(context: &BuiltinContext<'_>) -> usize {
         .unwrap_or(32)
 }
 
+fn session_sid_bits_per_character(context: &BuiltinContext<'_>) -> u8 {
+    context
+        .ini_get("session.sid_bits_per_character")
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|value| matches!(value, 4..=6))
+        .unwrap_or(4)
+}
+
+fn session_gc_selected(probability: u64, divisor: u64) -> bool {
+    session_gc_selected_with(probability, divisor, |random| {
+        getrandom::fill(random).map_err(|_| ())
+    })
+}
+
+fn session_gc_selected_with(
+    probability: u64,
+    divisor: u64,
+    mut fill_random: impl FnMut(&mut [u8]) -> Result<(), ()>,
+) -> bool {
+    if probability >= divisor {
+        return true;
+    }
+    let mut random = [0_u8; 8];
+    fill_random(&mut random).is_ok() && u64::from_le_bytes(random) % divisor < probability
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::SessionRegenerateCallback;
     use crate::{
         ArrayKey, IniRegistry, OutputBuffer, PHP_SESSION_ACTIVE, PhpArray, PhpString,
         ReferenceCell, SessionIdGenerateCallback, SessionLoadCallback, SessionState,
@@ -1847,6 +2049,55 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn empty_files_payload_decodes_as_an_empty_session_for_every_handler() {
+        for handler in ["php", "php_binary", "php_serialize"] {
+            assert_eq!(
+                decode_runtime_session_payload(handler, b"").expect("decode empty payload"),
+                PhpArray::new(),
+                "handler={handler}"
+            );
+        }
+    }
+
+    #[test]
+    fn probabilistic_gc_selection_uses_the_injected_random_source() {
+        let mut fills = 0;
+        assert!(session_gc_selected_with(1, 100, |bytes| {
+            fills += 1;
+            bytes.copy_from_slice(&0_u64.to_le_bytes());
+            Ok(())
+        }));
+        assert_eq!(fills, 1);
+
+        assert!(!session_gc_selected_with(1, 100, |bytes| {
+            bytes.copy_from_slice(&99_u64.to_le_bytes());
+            Ok(())
+        }));
+        assert!(session_gc_selected_with(100, 100, |_| {
+            panic!("certain GC must not request randomness")
+        }));
+    }
+
+    #[test]
+    fn session_gc_without_an_active_session_warns_and_returns_false() {
+        let mut output = OutputBuffer::new();
+        let mut state = SessionState::default();
+        let global = ReferenceCell::new(Value::Array(PhpArray::new()));
+        let mut context = context_with_session(&mut output, &mut state, global);
+
+        assert_eq!(
+            builtin_session_gc(&mut context, Vec::new(), RuntimeSourceSpan::default())
+                .expect("inactive GC result"),
+            Value::Bool(false)
+        );
+        assert!(context.take_diagnostics().iter().any(|diagnostic| {
+            diagnostic
+                .message()
+                .contains("Session cannot be garbage collected")
+        }));
+    }
 
     fn context_with_session<'a>(
         output: &'a mut OutputBuffer,
@@ -2419,6 +2670,37 @@ mod tests {
     }
 
     #[test]
+    fn failed_transport_regeneration_keeps_the_active_runtime_id() {
+        let mut output = OutputBuffer::new();
+        let mut state = SessionState::default();
+        let global = ReferenceCell::new(Value::Array(PhpArray::new()));
+        let mut context = context_with_session(&mut output, &mut state, global);
+        assert_eq!(
+            builtin_session_start(&mut context, Vec::new(), RuntimeSourceSpan::default())
+                .expect("start"),
+            Value::Bool(true)
+        );
+        let original_id = context
+            .session_state()
+            .expect("session state")
+            .id()
+            .to_owned();
+        let regenerator = SessionRegenerateCallback::new(|_, _, _, _| {
+            Err("regeneration write failed".to_string())
+        });
+        context.set_session_regenerator(Some(&regenerator));
+
+        let error =
+            builtin_session_regenerate_id(&mut context, Vec::new(), RuntimeSourceSpan::default())
+                .expect_err("transport failure");
+        assert!(error.message().contains("regeneration write failed"));
+        assert_eq!(
+            context.session_state().expect("session state").id(),
+            original_id
+        );
+    }
+
+    #[test]
     fn session_get_cookie_params_reads_request_ini_values() {
         let mut output = OutputBuffer::new();
         let mut state = SessionState::default();
@@ -2634,9 +2916,7 @@ mod tests {
         let global = ReferenceCell::new(Value::Array(PhpArray::new()));
         let loader = SessionLoadCallback::new(|id| {
             assert_eq!(id, "incoming123");
-            let mut data = PhpArray::new();
-            data.insert(ArrayKey::String(PhpString::from("n")), Value::Int(7));
-            Ok(data)
+            Ok(b"n|i:7;".to_vec())
         });
         let mut context = context_with_session(&mut output, &mut state, global.clone());
         context.set_session_loader(Some(&loader));

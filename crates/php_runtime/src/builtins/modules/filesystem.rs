@@ -1138,7 +1138,7 @@ pub(in crate::builtins::modules) fn builtin_tmpfile(
             "c+",
             &cwd,
             &filesystem,
-            &[],
+            &crate::RuntimeRequestBody::empty(),
         )
         .map_or(Value::Bool(false), Value::Resource))
 }
@@ -1601,6 +1601,7 @@ mod tests {
         RuntimeUploadedFile {
             field_name: "avatar".to_string(),
             client_filename: "avatar.txt".to_string(),
+            full_path: "avatar.txt".to_string(),
             content_type: "text/plain".to_string(),
             temp_path: temp_path.to_string(),
             error: 0,

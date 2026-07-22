@@ -3,17 +3,19 @@ use super::{
     metrics::RequestPhase,
     perf_trace::PerfTraceEvent,
     request_pipeline::{PhpTransferCompletion, RequestCleanup, RequestOutcome, RequestStage},
-    sessions::seed_session_state,
+    sessions::{SessionRequestCallbacks, seed_session_state},
     state::{AppState, RequestExecutorCacheKey},
 };
 use crate::{
-    multipart::{MultipartError, MultipartStats, multipart_boundary, parse_multipart_into_context},
+    multipart::{
+        MultipartError, ParsedRequestData, parse_multipart_stream, validated_multipart_boundary,
+    },
     response::{self, RequestBody, ResponseBody},
     routing::RequestRewriteRule,
     transfer::PhpExecutionCoordinator,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http_body_util::BodyExt;
 use hyper::{
     Method, Response, StatusCode,
@@ -25,9 +27,11 @@ use php_executor::{
     PhpExecutionStatus, PhpExecutor, PhpRequestExecutionInput,
 };
 use php_runtime::api::{
-    OutputDeliveryError, OutputSink, OutputSinkHandle, RuntimeCancellationState, RuntimeContext,
-    RuntimeHttpRequestContext, RuntimeHttpResponseState, SessionIdGenerateCallback,
-    SessionLoadCallback, SessionState, Value, parse_cookie_header, parse_form_urlencoded_body,
+    OutputDeliveryError, OutputSink, OutputSinkHandle, RequestParseBodyError,
+    RequestParseBodyOptions, RequestParserCallback, RuntimeCancellationState, RuntimeContext,
+    RuntimeHttpRequestContext, RuntimeHttpResponseState, RuntimeParsedRequestData,
+    RuntimeRequestBody, SessionState, Value, parse_cookie_header, parse_form_urlencoded_reader,
+    parse_form_urlencoded_reader_with_separators,
 };
 use std::{
     cell::RefCell,
@@ -43,6 +47,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
+    io::AsyncWriteExt,
     sync::{OwnedSemaphorePermit, TryAcquireError, mpsc, oneshot},
     time::timeout,
 };
@@ -541,7 +546,7 @@ pub(crate) async fn execute_php_request(
         },
     );
     let body_started = Instant::now();
-    let body = match body_and_multipart_stage(&state, body).await {
+    let prepared = match body_and_multipart_stage(&state, &parts, body).await {
         Err(_) => {
             emit_server_debug_lazy(
                 &state,
@@ -572,7 +577,7 @@ pub(crate) async fn execute_php_request(
                 Some(RequestStage::BodyAndMultipart),
             );
         }
-        Ok(Ok(body)) => body,
+        Ok(Ok(prepared)) => prepared,
         Ok(Err(BodyReadError::TooLarge)) => {
             state
                 .services
@@ -627,7 +632,7 @@ pub(crate) async fn execute_php_request(
                     "E_PHP_REQUEST_BODY_PARSE_FAILED",
                     "body_read",
                     "server could not read the request body",
-                    "read_limited_body",
+                    "request_body_ingest",
                     parts.uri.path(),
                     &script_filename,
                 ),
@@ -649,7 +654,25 @@ pub(crate) async fn execute_php_request(
                 Some(RequestStage::BodyAndMultipart),
             );
         }
+        Ok(Err(BodyReadError::Internal)) => {
+            warn!(%peer, "request body temporary storage failed");
+            record_phase(
+                &state,
+                &mut trace,
+                RequestPhase::BodyRead,
+                "body_read",
+                body_started.elapsed(),
+            );
+            return finish_php_request(
+                &state,
+                trace,
+                response::text(StatusCode::INTERNAL_SERVER_ERROR, "body storage failed\n"),
+                None,
+                Some(RequestStage::BodyAndMultipart),
+            );
+        }
     };
+    let PreparedRequestData { body, parsed } = prepared;
     record_phase(
         &state,
         &mut trace,
@@ -658,7 +681,7 @@ pub(crate) async fn execute_php_request(
         body_started.elapsed(),
     );
     if let Some(trace) = trace.as_mut() {
-        trace.body_bytes = body.len() as u64;
+        trace.body_bytes = body.len();
     }
     emit_server_debug_lazy(
         &state,
@@ -671,7 +694,8 @@ pub(crate) async fn execute_php_request(
     if let Some(response) = execute_builtin_router_if_configured(
         &parts,
         Arc::clone(&state),
-        Arc::clone(&body),
+        body.clone(),
+        parsed.clone(),
         peer,
         &request_id,
         Some(&script_path),
@@ -848,6 +872,7 @@ pub(crate) async fn execute_php_request(
                 worker_state,
                 parts,
                 body,
+                parsed,
                 script_path,
                 path_info,
                 peer,
@@ -1003,7 +1028,8 @@ fn worker_result_response(
 fn run_php_request_on_worker(
     state: Arc<AppState>,
     parts: Parts,
-    body: Arc<[u8]>,
+    body: RuntimeRequestBody,
+    parsed: ParsedRequestData,
     script_path: PathBuf,
     path_info: Option<String>,
     peer: SocketAddr,
@@ -1025,50 +1051,39 @@ fn run_php_request_on_worker(
         &script_path,
         &script_name,
         path_info,
-        Arc::clone(&body),
+        body.clone(),
         peer,
     );
-    match multipart_handling_stage(&mut request_context, &body, &state) {
-        Ok(Some(stats)) => {
-            emit_server_debug_lazy(
-                &state,
-                Some(&request_id),
-                "D_PHRUST_SERVER_MULTIPART_PARSED",
-                "multipart",
-                "multipart body parsed",
-                || {
-                    BTreeMap::from([
-                        ("upload_count".to_string(), stats.uploads_total.to_string()),
-                        (
-                            "upload_bytes".to_string(),
-                            stats.upload_bytes_accepted.to_string(),
-                        ),
-                    ])
-                },
-            );
-            state
-                .services
-                .metrics
-                .uploads_total
-                .fetch_add(stats.uploads_total, Ordering::Relaxed);
-            state
-                .services
-                .metrics
-                .upload_bytes_accepted
-                .fetch_add(stats.upload_bytes_accepted, Ordering::Relaxed);
-        }
-        Ok(None) => {}
-        Err(error) => {
-            let response =
-                multipart_error_response(error, &state, &parts, &request_id, &script_path, peer);
-            return worker_response_result(finish_php_request(
-                &state,
-                trace,
-                response,
-                script_cache_hit,
-                Some(RequestStage::BodyAndMultipart),
-            ));
-        }
+    request_context
+        .startup_warnings
+        .extend(parsed.startup_warnings);
+    request_context.parsed_post.extend(parsed.post);
+    request_context.uploaded_files.extend(parsed.files);
+    if parsed.stats.parts_total > 0 {
+        emit_server_debug_lazy(
+            &state,
+            Some(&request_id),
+            "D_PHRUST_SERVER_MULTIPART_PARSED",
+            "multipart",
+            "multipart body parsed",
+            || {
+                BTreeMap::from([
+                    ("parts".to_string(), parsed.stats.parts_total.to_string()),
+                    (
+                        "upload_count".to_string(),
+                        parsed.stats.uploads_total.to_string(),
+                    ),
+                    (
+                        "upload_bytes".to_string(),
+                        parsed.stats.upload_bytes_accepted.to_string(),
+                    ),
+                    (
+                        "post_limit_exceeded".to_string(),
+                        parsed.post_limit_exceeded.to_string(),
+                    ),
+                ])
+            },
+        );
     }
     record_phase(
         &state,
@@ -1077,7 +1092,8 @@ fn run_php_request_on_worker(
         "request_context",
         request_context_started.elapsed(),
     );
-    let cleanup = RequestCleanup::new(request_context.uploaded_files.clone());
+    let session_callbacks = SessionRequestCallbacks::new(&state, cancellation.clone());
+    let cleanup = RequestCleanup::new(parsed.uploads, Some(session_callbacks.clone()));
     emit_server_debug_lazy(
         &state,
         Some(&request_id),
@@ -1154,8 +1170,8 @@ fn run_php_request_on_worker(
         &state,
         request_context,
         session_state,
-        Arc::clone(&body),
         server_env_for_request(&state),
+        &session_callbacks,
     );
     runtime_context = runtime_context.with_output_sink(output_sink);
     runtime_context = runtime_context.with_cancellation(cancellation);
@@ -1448,7 +1464,8 @@ fn run_php_request_on_worker(
 pub(crate) async fn execute_builtin_router_if_configured(
     parts: &Parts,
     state: Arc<AppState>,
-    body: Arc<[u8]>,
+    body: RuntimeRequestBody,
+    parsed: ParsedRequestData,
     peer: SocketAddr,
     request_id: &str,
     target_script_path: Option<&Path>,
@@ -1477,15 +1494,21 @@ pub(crate) async fn execute_builtin_router_if_configured(
         ));
     };
     let script_name = script_name_for(&state.route_config.docroot, &router_path);
-    let request_context = http_runtime_context(
+    let mut request_context = http_runtime_context(
         parts,
         &state,
         &router_path,
         &script_name,
         None,
-        Arc::clone(&body),
+        body.clone(),
         peer,
     );
+    request_context
+        .startup_warnings
+        .extend(parsed.startup_warnings);
+    request_context.parsed_post.extend(parsed.post);
+    request_context.uploaded_files.extend(parsed.files);
+    let router_uploads = parsed.uploads;
     let router_env = server_env_for_request(&state);
     let lookup = match executor_acquisition_stage(&state, &router_path) {
         Ok(lookup) => lookup,
@@ -1507,6 +1530,10 @@ pub(crate) async fn execute_builtin_router_if_configured(
     let workers = Arc::clone(&state.concurrency.php_workers);
     let router_response = match workers
         .execute(move || {
+            let router_cancellation = RuntimeCancellationState::new();
+            let session_callbacks =
+                SessionRequestCallbacks::new(&runtime_state, router_cancellation.clone());
+            let _cleanup = RequestCleanup::new(router_uploads, Some(session_callbacks.clone()));
             let deferred_sink = DeferredRouterSink::new(is_head);
             let result = session_load_stage(&request_context, &runtime_state)
                 .map_err(|error| format!("router session state preparation failed: {error}"))
@@ -1515,11 +1542,11 @@ pub(crate) async fn execute_builtin_router_if_configured(
                         &runtime_state,
                         request_context,
                         session_state,
-                        body,
                         router_env,
+                        &session_callbacks,
                     )
                     .with_output_sink(OutputSinkHandle::new(deferred_sink.clone()))
-                    .with_cancellation(RuntimeCancellationState::new());
+                    .with_cancellation(router_cancellation);
                     execution_stage(
                         execution_state,
                         lookup,
@@ -1964,53 +1991,6 @@ fn truncate_debug_value(value: &str, max_chars: usize) -> String {
     }
     out
 }
-pub(crate) fn multipart_error_response(
-    error: MultipartError,
-    state: &AppState,
-    parts: &Parts,
-    request_id: &str,
-    script_path: &Path,
-    peer: SocketAddr,
-) -> Response<ResponseBody> {
-    emit_request_diagnostic(
-        state,
-        parts,
-        Some(request_id),
-        RequestDiagnostic::new(
-            "E_PHP_REQUEST_BODY_PARSE_FAILED",
-            "multipart",
-            "server could not parse multipart request body",
-            "parse_multipart_into_context",
-            parts.uri.path(),
-            &script_path.display().to_string(),
-        ),
-    );
-    match error {
-        MultipartError::Malformed => {
-            state
-                .services
-                .metrics
-                .upload_parse_errors
-                .fetch_add(1, Ordering::Relaxed);
-            debug!(%peer, "multipart request rejected as malformed");
-            response::text(StatusCode::BAD_REQUEST, "bad multipart request\n")
-        }
-        MultipartError::TooManyFiles | MultipartError::FileTooLarge => {
-            state
-                .services
-                .metrics
-                .upload_files_rejected
-                .fetch_add(1, Ordering::Relaxed);
-            debug!(%peer, ?error, "multipart upload rejected by configured limits");
-            response::text(StatusCode::PAYLOAD_TOO_LARGE, "upload rejected\n")
-        }
-        MultipartError::Storage => {
-            warn!(%peer, "multipart upload temp storage failed");
-            response::text(StatusCode::INTERNAL_SERVER_ERROR, "upload storage failed\n")
-        }
-    }
-}
-
 fn php_streaming_response(
     head: PhpResponseHead,
     is_head: bool,
@@ -2100,35 +2080,263 @@ pub(crate) const PHP_CONTENT_TYPE: &str = "text/html; charset=UTF-8";
 pub(crate) enum BodyReadError {
     TooLarge,
     Invalid,
+    Internal,
 }
 
 async fn body_and_multipart_stage(
     state: &AppState,
+    parts: &Parts,
     body: RequestBody,
-) -> Result<Result<Arc<[u8]>, BodyReadError>, tokio::time::error::Elapsed> {
+) -> Result<Result<PreparedRequestData, BodyReadError>, tokio::time::error::Elapsed> {
     timeout(
         state.request.request_timeout,
-        read_limited_body(body, state.request.max_body_bytes),
+        prepare_request_data(body, parts, state),
     )
     .await
 }
 
-pub(crate) async fn read_limited_body(
-    mut body: RequestBody,
-    max_body_bytes: usize,
-) -> Result<Arc<[u8]>, BodyReadError> {
-    let mut bytes = Vec::new();
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|_| BodyReadError::Invalid)?;
-        let Ok(data) = frame.into_data() else {
-            continue;
-        };
-        if bytes.len().saturating_add(data.len()) > max_body_bytes {
-            return Err(BodyReadError::TooLarge);
-        }
-        bytes.extend_from_slice(&data);
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedRequestData {
+    pub(crate) body: RuntimeRequestBody,
+    pub(crate) parsed: ParsedRequestData,
+}
+
+pub(crate) async fn prepare_request_data(
+    body: RequestBody,
+    parts: &Parts,
+    state: &AppState,
+) -> Result<PreparedRequestData, BodyReadError> {
+    let content_type = header_value(&parts.headers, header::CONTENT_TYPE);
+    let automatic_post = state.request.enable_post_data_reading && parts.method == Method::POST;
+    let declared_length = header_value(&parts.headers, header::CONTENT_LENGTH)
+        .and_then(|value| value.parse::<u64>().ok());
+    if automatic_post
+        && declared_length.is_some_and(|length| length > state.request.post_max_bytes as u64)
+    {
+        let body = ingest_request_body(body, state).await?;
+        let mut parsed = ParsedRequestData::empty(&state.services.metrics);
+        parsed.startup_warnings.push(format!(
+            "PHP Request Startup: POST Content-Length of {} bytes exceeds the limit of {} bytes",
+            declared_length.unwrap_or_default(),
+            state.request.post_max_bytes
+        ));
+        return Ok(PreparedRequestData { body, parsed });
     }
-    Ok(Arc::from(bytes))
+    let boundary = validated_multipart_boundary(content_type.as_deref());
+    let automatic_multipart = automatic_post && matches!(boundary, Ok(Some(_)));
+    if automatic_post && boundary.is_err() {
+        state
+            .services
+            .metrics
+            .upload_parse_errors
+            .fetch_add(1, Ordering::Relaxed);
+        // PHP does not consume a multipart POST that lacks its boundary. Keep
+        // the raw body replayable while exposing empty automatic inputs.
+        let body = ingest_request_body(body, state).await?;
+        let mut parsed = ParsedRequestData::empty(&state.services.metrics);
+        parsed.startup_warnings.push(
+            "PHP Request Startup: Missing boundary in multipart/form-data POST data".to_string(),
+        );
+        return Ok(PreparedRequestData { body, parsed });
+    }
+    if automatic_multipart {
+        let parsed = match parse_multipart_stream(
+            body,
+            content_type.as_deref().unwrap_or_default(),
+            &state.request.multipart_config,
+            &state.services.metrics,
+        )
+        .await
+        {
+            Ok(parsed) => parsed,
+            Err(MultipartError::TooLarge) => return Err(BodyReadError::TooLarge),
+            Err(MultipartError::Malformed(_) | MultipartError::Limit(_)) => {
+                state
+                    .services
+                    .metrics
+                    .upload_parse_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                ParsedRequestData::empty(&state.services.metrics)
+            }
+        };
+        return Ok(PreparedRequestData {
+            body: RuntimeRequestBody::auto_parsed_multipart(),
+            parsed,
+        });
+    }
+    let body = ingest_request_body(body, state).await?;
+    Ok(PreparedRequestData {
+        body,
+        parsed: ParsedRequestData::empty(&state.services.metrics),
+    })
+}
+
+pub(crate) struct RequestBodyIngest<'a> {
+    state: &'a AppState,
+}
+
+struct RequestBodyTempGauge {
+    metrics: std::sync::Weak<super::metrics::ServerMetrics>,
+    bytes: u64,
+    transferred: bool,
+}
+
+impl RequestBodyTempGauge {
+    fn new(metrics: &Arc<super::metrics::ServerMetrics>) -> Self {
+        metrics
+            .request_body_tempfiles_active
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            metrics: Arc::downgrade(metrics),
+            bytes: 0,
+            transferred: false,
+        }
+    }
+
+    fn wrote(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+        if let Some(metrics) = self.metrics.upgrade() {
+            metrics
+                .request_body_tempfile_bytes_active
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    fn transfer(mut self) -> Arc<dyn Fn(u64) + Send + Sync + 'static> {
+        self.transferred = true;
+        let metrics = self.metrics.clone();
+        Arc::new(move |length| {
+            if let Some(metrics) = metrics.upgrade() {
+                metrics
+                    .request_body_tempfiles_active
+                    .fetch_sub(1, Ordering::Relaxed);
+                metrics
+                    .request_body_tempfile_bytes_active
+                    .fetch_sub(length, Ordering::Relaxed);
+            }
+        })
+    }
+}
+
+impl Drop for RequestBodyTempGauge {
+    fn drop(&mut self) {
+        if self.transferred {
+            return;
+        }
+        if let Some(metrics) = self.metrics.upgrade() {
+            metrics
+                .request_body_tempfiles_active
+                .fetch_sub(1, Ordering::Relaxed);
+            metrics
+                .request_body_tempfile_bytes_active
+                .fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+impl<'a> RequestBodyIngest<'a> {
+    #[must_use]
+    pub(crate) fn new(state: &'a AppState) -> Self {
+        Self { state }
+    }
+
+    pub(crate) async fn ingest(
+        &self,
+        mut body: RequestBody,
+    ) -> Result<RuntimeRequestBody, BodyReadError> {
+        let memory_limit = self.state.request.request_body_memory_bytes;
+        let hard_limit = self.state.request.max_body_bytes;
+        let mut total = 0usize;
+        let mut memory = BytesMut::with_capacity(memory_limit.min(16 * 1024));
+        let mut spool: Option<(tokio::fs::File, tempfile::TempPath, RequestBodyTempGauge)> = None;
+
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|_| BodyReadError::Invalid)?;
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            if data.len() > hard_limit.saturating_sub(total) {
+                self.state
+                    .services
+                    .metrics
+                    .request_body_hard_limit_rejections_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(BodyReadError::TooLarge);
+            }
+            total += data.len();
+
+            if spool.is_none() && total <= memory_limit {
+                memory.extend_from_slice(&data);
+                continue;
+            }
+
+            if spool.is_none() {
+                let named = tempfile::Builder::new()
+                    .prefix("phrust-body-")
+                    .tempfile_in(&self.state.request.request_body_temp_dir)
+                    .map_err(|_| {
+                        self.state
+                            .services
+                            .metrics
+                            .request_body_tempfile_failures_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        BodyReadError::Internal
+                    })?;
+                let (file, path) = named.into_parts();
+                let mut file = tokio::fs::File::from_std(file);
+                let mut gauge = RequestBodyTempGauge::new(&self.state.services.metrics);
+                if !memory.is_empty() {
+                    file.write_all(&memory)
+                        .await
+                        .map_err(|_| BodyReadError::Internal)?;
+                    gauge.wrote(memory.len() as u64);
+                    memory.clear();
+                }
+                spool = Some((file, path, gauge));
+            }
+            if let Some((file, _, gauge)) = spool.as_mut() {
+                file.write_all(&data)
+                    .await
+                    .map_err(|_| BodyReadError::Internal)?;
+                gauge.wrote(data.len() as u64);
+            }
+        }
+
+        let Some((mut file, path, gauge)) = spool else {
+            self.state
+                .services
+                .metrics
+                .request_body_memory_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(RuntimeRequestBody::memory(memory.freeze().to_vec()));
+        };
+        file.flush().await.map_err(|_| BodyReadError::Internal)?;
+        drop(file);
+
+        let length = total as u64;
+        self.state
+            .services
+            .metrics
+            .request_body_spooled_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.state
+            .services
+            .metrics
+            .request_body_spooled_bytes_total
+            .fetch_add(length, Ordering::Relaxed);
+        Ok(RuntimeRequestBody::file(
+            path,
+            length,
+            Some(gauge.transfer()),
+        ))
+    }
+}
+
+pub(crate) async fn ingest_request_body(
+    body: RequestBody,
+    state: &AppState,
+) -> Result<RuntimeRequestBody, BodyReadError> {
+    RequestBodyIngest::new(state).ingest(body).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2138,7 +2346,7 @@ fn request_globals_stage(
     script_path: &Path,
     script_name: &str,
     path_info: Option<String>,
-    body: Arc<[u8]>,
+    body: RuntimeRequestBody,
     peer: SocketAddr,
 ) -> RuntimeHttpRequestContext {
     http_runtime_context(
@@ -2150,18 +2358,6 @@ fn request_globals_stage(
         body,
         peer,
     )
-}
-
-fn multipart_handling_stage(
-    context: &mut RuntimeHttpRequestContext,
-    body: &[u8],
-    state: &AppState,
-) -> Result<Option<MultipartStats>, MultipartError> {
-    let Some(boundary) = multipart_boundary(context.content_type.as_deref())? else {
-        return Ok(None);
-    };
-    parse_multipart_into_context(context, body, &boundary, &state.request.multipart_config)
-        .map(Some)
 }
 
 fn session_load_stage(
@@ -2177,7 +2373,7 @@ pub(crate) fn http_runtime_context(
     script_path: &Path,
     script_name: &str,
     path_info: Option<String>,
-    body: Arc<[u8]>,
+    body: RuntimeRequestBody,
     peer: SocketAddr,
 ) -> RuntimeHttpRequestContext {
     let request_uri = parts.uri.path_and_query().map_or_else(
@@ -2239,13 +2435,30 @@ pub(crate) fn http_runtime_context(
     context.content_type = header_value(&parts.headers, header::CONTENT_TYPE);
     context.content_length = header_value(&parts.headers, header::CONTENT_LENGTH)
         .and_then(|value| value.parse::<u64>().ok());
-    context.raw_body = Arc::clone(&body);
-    if context
-        .content_type
-        .as_deref()
-        .is_some_and(is_form_urlencoded_content_type)
+    context.raw_body = body.clone();
+    if state.request.enable_post_data_reading
+        && parts.method == Method::POST
+        && context.content_length.is_none()
+        && body.len() > state.request.post_max_bytes as u64
     {
-        context.parsed_post = parse_form_urlencoded_body(&body);
+        context.startup_warnings.push(format!(
+            "PHP Request Startup: POST data of {} bytes exceeds the limit of {} bytes",
+            body.len(),
+            state.request.post_max_bytes
+        ));
+    }
+    if state.request.enable_post_data_reading
+        && parts.method == Method::POST
+        && context
+            .content_type
+            .as_deref()
+            .is_some_and(is_form_urlencoded_content_type)
+        && body.len() <= state.request.post_max_bytes as u64
+        && let Ok(reader) = body.independent_reader()
+    {
+        context.parsed_post =
+            parse_form_urlencoded_reader(reader, state.request.multipart_config.max_input_vars)
+                .unwrap_or_default();
     }
     if let Some(cookie) = header_value(&parts.headers, header::COOKIE) {
         context.parsed_cookie = parse_cookie_header(&cookie);
@@ -2343,45 +2556,194 @@ pub(crate) fn php_runtime_context_for_http(
     state: &AppState,
     request_context: RuntimeHttpRequestContext,
     session_state: SessionState,
-    body: Arc<[u8]>,
     env: Arc<Vec<(String, String)>>,
+    sessions: &SessionRequestCallbacks,
 ) -> RuntimeContext {
+    let request_parser = request_parser_callback(state, &request_context);
     RuntimeContext::controlled_http(request_context)
         .with_cwd(state.route_config.docroot.clone())
         .with_include_path(vec![state.route_config.docroot.clone()])
-        .with_ini_overrides(vec![(
-            "session.cookie_path".to_owned(),
-            state.sessions.config.cookie_path.clone(),
-        )])
+        .with_ini_overrides(vec![
+            (
+                "session.name".to_owned(),
+                state.sessions.config.cookie_name.clone(),
+            ),
+            (
+                "session.cookie_path".to_owned(),
+                state.sessions.config.cookie_path.clone(),
+            ),
+            (
+                "session.cookie_domain".to_owned(),
+                state.sessions.config.cookie_domain.clone(),
+            ),
+            (
+                "session.cookie_lifetime".to_owned(),
+                state.sessions.config.cookie_lifetime.to_string(),
+            ),
+            (
+                "session.cookie_secure".to_owned(),
+                u8::from(state.sessions.config.cookie_secure).to_string(),
+            ),
+            (
+                "session.cookie_httponly".to_owned(),
+                u8::from(state.sessions.config.cookie_httponly).to_string(),
+            ),
+            (
+                "session.cookie_samesite".to_owned(),
+                state.sessions.config.cookie_samesite.clone(),
+            ),
+            (
+                "session.cookie_partitioned".to_owned(),
+                u8::from(state.sessions.config.cookie_partitioned).to_string(),
+            ),
+            (
+                "session.use_cookies".to_owned(),
+                u8::from(state.sessions.config.use_cookies).to_string(),
+            ),
+            (
+                "session.use_only_cookies".to_owned(),
+                u8::from(state.sessions.config.use_only_cookies).to_string(),
+            ),
+            (
+                "session.use_strict_mode".to_owned(),
+                u8::from(state.sessions.config.use_strict_mode).to_string(),
+            ),
+            (
+                "session.save_path".to_owned(),
+                state.sessions.config.save_path.display().to_string(),
+            ),
+            (
+                "session.serialize_handler".to_owned(),
+                state.sessions.config.serialize_handler.clone(),
+            ),
+        ])
         .with_session_state(session_state)
-        .with_session_loader(session_load_callback(state))
-        .with_session_id_generator(session_id_generate_callback(state))
+        .with_session_loader(sessions.loader.clone())
+        .with_session_id_generator(sessions.id_generator.clone())
+        .with_session_writer(sessions.writer.clone())
+        .with_session_destroyer(sessions.destroyer.clone())
+        .with_session_aborter(sessions.aborter.clone())
+        .with_session_regenerator(sessions.regenerator.clone())
+        .with_session_gc(sessions.gc.clone())
+        .with_request_parser(request_parser)
         .with_execution_time_limit(state.request.execution_time_limit)
         .with_sorted_env_arc(env)
-        .with_stdin(body)
 }
 
-fn session_load_callback(state: &AppState) -> SessionLoadCallback {
+fn request_parser_callback(
+    state: &AppState,
+    request: &RuntimeHttpRequestContext,
+) -> RequestParserCallback {
+    let body = request.raw_body.clone();
+    let content_type = request.content_type.clone().unwrap_or_default();
+    let base_config = state.request.multipart_config.clone();
     let metrics = Arc::clone(&state.services.metrics);
-    let store = Arc::clone(&state.sessions.session_store);
-    SessionLoadCallback::new(move |id| {
-        metrics.session_lazy_loads.fetch_add(1, Ordering::Relaxed);
-        metrics.session_store_loads.fetch_add(1, Ordering::Relaxed);
-        store.load(id).map_err(|error| {
-            format!("E_PHP_SESSION_STORE_UNAVAILABLE: failed to load session: {error}")
-        })
-    })
-}
-
-fn session_id_generate_callback(state: &AppState) -> SessionIdGenerateCallback {
-    let metrics = Arc::clone(&state.services.metrics);
-    SessionIdGenerateCallback::new(move || {
+    let tokio_handle = state.services.tokio_handle.clone();
+    let retained_uploads = Arc::new(Mutex::new(Vec::new()));
+    RequestParserCallback::new(move |options: RequestParseBodyOptions| {
         metrics
-            .session_id_generations
+            .request_parse_body_calls_total
             .fetch_add(1, Ordering::Relaxed);
-        crate::session_store::generate_session_id().map_err(|error| {
-            format!("E_PHP_SESSION_STORE_UNAVAILABLE: failed to generate session id: {error}")
-        })
+        let parse = || {
+            let mut config = base_config.clone();
+            if let Some(value) = options.max_file_uploads {
+                config.max_upload_files = value;
+            }
+            if let Some(value) = options.max_input_vars {
+                config.max_input_vars = value;
+            }
+            if let Some(value) = options.max_multipart_body_parts {
+                config.max_multipart_parts = Some(value);
+            }
+            if let Some(value) = options.post_max_size {
+                if value > config.max_body_bytes {
+                    return Err(RequestParseBodyError::InvalidOptions(
+                        "post_max_size exceeds the server hard body limit".to_string(),
+                    ));
+                }
+                config.post_max_bytes = value;
+            }
+            if let Some(value) = options.upload_max_filesize {
+                if value > config.max_body_bytes {
+                    return Err(RequestParseBodyError::InvalidOptions(
+                        "upload_max_filesize exceeds the server hard body limit".to_string(),
+                    ));
+                }
+                config.max_upload_file_bytes = value;
+            }
+            config.throw_limit_errors = true;
+            match body.consume_for_request_parse() {
+                Ok(()) => {}
+                Err(php_runtime::api::RuntimeRequestBodyConsumeError::RawInputObserved) => {
+                    return Ok(RuntimeParsedRequestData::default());
+                }
+                Err(error) => {
+                    return Err(RequestParseBodyError::Parse(format!(
+                        "request body is not available: {error:?}"
+                    )));
+                }
+            }
+            if is_form_urlencoded_content_type(&content_type) {
+                if body.len() > config.post_max_bytes as u64 {
+                    return Err(RequestParseBodyError::Parse(format!(
+                        "POST Content-Length of {} bytes exceeds the limit of {} bytes",
+                        body.len(),
+                        config.post_max_bytes
+                    )));
+                }
+                let reader = body
+                    .reader_for_parser()
+                    .map_err(|error| RequestParseBodyError::Parse(error.to_string()))?;
+                let post = parse_form_urlencoded_reader_with_separators(
+                    reader,
+                    config.max_input_vars,
+                    options.arg_separator_input.as_bytes(),
+                )
+                .map_err(|error| RequestParseBodyError::Parse(error.to_string()))?;
+                return Ok(RuntimeParsedRequestData {
+                    post,
+                    files: Vec::new(),
+                });
+            }
+            if validated_multipart_boundary(Some(&content_type))
+                .map_err(|error| RequestParseBodyError::Parse(error.to_string()))?
+                .is_none()
+            {
+                return Err(RequestParseBodyError::Parse(
+                    "Content-Type is not application/x-www-form-urlencoded or multipart/form-data"
+                        .to_string(),
+                ));
+            }
+            let reader = tokio_handle
+                .block_on(body.async_reader_for_parser())
+                .map_err(|error| RequestParseBodyError::Parse(error.to_string()))?;
+            let request_body = response::request_reader_body(reader);
+            let parsed = tokio_handle
+                .block_on(parse_multipart_stream(
+                    request_body,
+                    &content_type,
+                    &config,
+                    &metrics,
+                ))
+                .map_err(|error| RequestParseBodyError::Parse(error.to_string()))?;
+            retained_uploads
+                .lock()
+                .map_err(|_| {
+                    RequestParseBodyError::Parse("upload owner lock poisoned".to_string())
+                })?
+                .push(Arc::clone(&parsed.uploads));
+            Ok(RuntimeParsedRequestData {
+                post: parsed.post,
+                files: parsed.files,
+            })
+        };
+        let result = parse();
+        if result.is_err() {
+            metrics
+                .request_parse_body_errors_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
     })
 }
 

@@ -31,6 +31,9 @@ pub struct SessionState {
     started_automatically: bool,
     destroyed: bool,
     newly_created: bool,
+    backing_store_existed: bool,
+    lazy_write: bool,
+    serialize_handler: String,
     destroyed_id: Option<String>,
 }
 
@@ -56,6 +59,9 @@ impl Default for SessionState {
             started_automatically: false,
             destroyed: false,
             newly_created: false,
+            backing_store_existed: false,
+            lazy_write: true,
+            serialize_handler: "php".to_string(),
             destroyed_id: None,
         }
     }
@@ -91,6 +97,9 @@ impl SessionState {
             started_automatically: false,
             destroyed: false,
             newly_created: false,
+            backing_store_existed: false,
+            lazy_write: true,
+            serialize_handler: String::new(),
             destroyed_id: None,
         }
     }
@@ -218,9 +227,39 @@ impl SessionState {
 
     /// Installs session data loaded from the transport session store.
     pub fn load_data(&mut self, data: PhpArray) {
+        self.load_data_with_existence(data, true);
+    }
+
+    /// Installs data and records whether the transport opened an existing
+    /// session entry. Strict mode uses this instead of guessing from the ID.
+    pub fn load_data_with_existence(&mut self, data: PhpArray, existed: bool) {
         self.committed_data = data.clone();
         self.data = data;
         self.data_loaded = true;
+        self.backing_store_existed = existed;
+    }
+
+    #[must_use]
+    pub const fn backing_store_existed(&self) -> bool {
+        self.backing_store_existed
+    }
+
+    pub fn set_lazy_write(&mut self, lazy_write: bool) {
+        self.lazy_write = lazy_write;
+    }
+
+    #[must_use]
+    pub const fn lazy_write(&self) -> bool {
+        self.lazy_write
+    }
+
+    pub fn set_serialize_handler(&mut self, serialize_handler: impl Into<String>) {
+        self.serialize_handler = serialize_handler.into();
+    }
+
+    #[must_use]
+    pub fn serialize_handler(&self) -> &str {
+        &self.serialize_handler
     }
 
     /// Returns true when session_start() was called in this request.
@@ -292,10 +331,11 @@ impl SessionState {
 
     /// Starts a deterministic request-local session with PHP strict-ID policy.
     pub fn start_with_policy(&mut self, id_length: usize, strict_mode: bool) -> bool {
-        let generated = self.id.is_empty() || strict_mode;
+        let generated = self.id.is_empty() || (strict_mode && !self.backing_store_existed);
         if generated {
             self.id = self.next_session_id(id_length);
             self.newly_created = true;
+            self.backing_store_existed = false;
             self.data_loaded = true;
             self.committed_data = PhpArray::new();
         } else {
@@ -314,11 +354,20 @@ impl SessionState {
         if self.status != PHP_SESSION_ACTIVE {
             return false;
         }
-        self.id = self.next_session_id(id_length);
+        let id = self.next_session_id(id_length);
+        self.install_regenerated_id(id);
+        true
+    }
+
+    /// Publishes a session id after the transport has atomically transferred
+    /// the active session lease to its new backing-store entry.
+    pub fn install_regenerated_id(&mut self, id: impl Into<String>) {
+        self.id = id.into();
+        self.newly_created = true;
+        self.backing_store_existed = false;
         self.destroyed = false;
         self.destroyed_id = None;
         self.started_automatically = false;
-        true
     }
 
     /// Creates a new deterministic session id without activating it.

@@ -17,8 +17,12 @@ use crate::routing::RequestRewriteRule;
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 const DEFAULT_INDEX: &str = "index.php,index.html";
 const DEFAULT_PHP_EXTENSIONS: &str = "php";
-const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
-const DEFAULT_MAX_UPLOAD_FILES: usize = 32;
+const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_POST_MAX_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_REQUEST_BODY_MEMORY_BYTES: usize = 256 * 1024;
+const DEFAULT_MAX_UPLOAD_FILES: usize = 20;
+const DEFAULT_MAX_UPLOAD_FILE_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_MAX_INPUT_VARS: usize = 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MAX_EXECUTION_MS: u64 = 30_000;
 const DEFAULT_SCRIPT_CACHE_SHARDS: usize = 16;
@@ -69,6 +73,10 @@ pub struct ServerRoutingConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestLimitsConfig {
     pub max_body_bytes: usize,
+    pub post_max_bytes: usize,
+    pub request_body_memory_bytes: usize,
+    pub request_body_temp_dir: PathBuf,
+    pub enable_post_data_reading: bool,
     pub max_in_flight: usize,
     pub cpu_execution_limit: usize,
     pub request_timeout_ms: u64,
@@ -115,10 +123,24 @@ pub struct SessionsUploadsConfig {
     pub upload_temp_dir: PathBuf,
     pub max_upload_files: usize,
     pub max_upload_file_bytes: usize,
+    pub max_multipart_parts: Option<usize>,
+    pub max_input_vars: usize,
+    pub file_uploads: bool,
     pub session_save_path: PathBuf,
     pub session_cookie_name: String,
+    pub session_serialize_handler: String,
+    pub session_use_strict_mode: bool,
+    pub session_cookie_lifetime: u64,
     pub session_cookie_path: String,
+    pub session_cookie_domain: String,
+    pub session_cookie_secure: bool,
+    pub session_cookie_httponly: bool,
+    pub session_cookie_samesite: String,
+    pub session_cookie_partitioned: bool,
+    pub session_use_cookies: bool,
+    pub session_use_only_cookies: bool,
     pub sessions_enabled: bool,
+    pub session_lock_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -225,6 +247,23 @@ impl ServerConfig {
         let mut max_body_bytes = file_config
             .positive_usize("max_body_bytes")?
             .unwrap_or(DEFAULT_MAX_BODY_BYTES);
+        let mut post_max_bytes_explicit = file_config.values.contains_key("post_max_bytes");
+        let mut post_max_bytes = file_config
+            .positive_usize("post_max_bytes")?
+            .unwrap_or(DEFAULT_POST_MAX_BYTES.min(max_body_bytes));
+        let mut request_body_memory_bytes_explicit =
+            file_config.values.contains_key("request_body_memory_bytes");
+        let mut request_body_memory_bytes = file_config
+            .positive_usize("request_body_memory_bytes")?
+            .unwrap_or(DEFAULT_REQUEST_BODY_MEMORY_BYTES.min(max_body_bytes));
+        let mut request_body_temp_dir = file_config
+            .path("request_body_temp_dir")
+            .unwrap_or_else(|| std::env::temp_dir().join("phrust-request-bodies"));
+        let mut enable_post_data_reading = file_config
+            .bool("enable_post_data_reading")?
+            .unwrap_or(true);
+        let mut enable_post_data_reading_flag = false;
+        let mut disable_post_data_reading_flag = false;
         let mut upload_temp_dir = file_config
             .path("upload_temp_dir")
             .unwrap_or_else(|| std::env::temp_dir().join("phrust-uploads"));
@@ -232,16 +271,53 @@ impl ServerConfig {
             .positive_usize("max_upload_files")?
             .unwrap_or(DEFAULT_MAX_UPLOAD_FILES);
         let mut max_upload_file_bytes = file_config.positive_usize("max_upload_file_bytes")?;
+        let mut max_multipart_parts = file_config
+            .string("max_multipart_parts")
+            .map(|value| parse_max_multipart_parts("max_multipart_parts", &value))
+            .transpose()?
+            .flatten();
+        let mut max_input_vars = file_config
+            .positive_usize("max_input_vars")?
+            .unwrap_or(DEFAULT_MAX_INPUT_VARS);
+        let mut file_uploads = file_config.bool("file_uploads")?.unwrap_or(true);
         let mut session_save_path = file_config
             .path("session_save_path")
             .unwrap_or_else(|| std::env::temp_dir().join("phrust-sessions"));
         let mut session_cookie_name = file_config
             .string("session_cookie_name")
             .unwrap_or_else(|| DEFAULT_SESSION_COOKIE_NAME.to_string());
+        let mut session_serialize_handler = file_config
+            .string("session_serialize_handler")
+            .unwrap_or_else(|| "php".to_string());
+        let mut session_use_strict_mode = file_config
+            .bool("session_use_strict_mode")?
+            .unwrap_or(false);
+        let mut session_cookie_lifetime = file_config
+            .nonnegative_u64("session_cookie_lifetime")?
+            .unwrap_or(0);
         let mut session_cookie_path = file_config
             .string("session_cookie_path")
             .unwrap_or_else(|| DEFAULT_SESSION_COOKIE_PATH.to_string());
+        let mut session_cookie_domain = file_config
+            .string("session_cookie_domain")
+            .unwrap_or_default();
+        let mut session_cookie_secure = file_config.bool("session_cookie_secure")?.unwrap_or(false);
+        let mut session_cookie_httponly =
+            file_config.bool("session_cookie_httponly")?.unwrap_or(true);
+        let mut session_cookie_samesite = file_config
+            .string("session_cookie_samesite")
+            .unwrap_or_default();
+        let mut session_cookie_partitioned = file_config
+            .bool("session_cookie_partitioned")?
+            .unwrap_or(false);
+        let mut session_use_cookies = file_config.bool("session_use_cookies")?.unwrap_or(true);
+        let mut session_use_only_cookies = file_config
+            .bool("session_use_only_cookies")?
+            .unwrap_or(true);
         let mut sessions_enabled = file_config.bool("sessions_enabled")?.unwrap_or(true);
+        let mut session_lock_timeout_ms = file_config
+            .positive_u64("session_lock_timeout_ms")?
+            .unwrap_or(5_000);
         let mut max_in_flight = file_config
             .positive_usize("max_in_flight")?
             .unwrap_or_else(default_max_in_flight);
@@ -369,6 +445,26 @@ impl ServerConfig {
                 "--max-body-bytes" => {
                     max_body_bytes = parse_positive_usize(&arg, &required_value(&arg, &mut args)?)?;
                 }
+                "--post-max-bytes" => {
+                    post_max_bytes = parse_positive_usize(&arg, &required_value(&arg, &mut args)?)?;
+                    post_max_bytes_explicit = true;
+                }
+                "--request-body-memory-bytes" => {
+                    request_body_memory_bytes =
+                        parse_positive_usize(&arg, &required_value(&arg, &mut args)?)?;
+                    request_body_memory_bytes_explicit = true;
+                }
+                "--request-body-temp-dir" => {
+                    request_body_temp_dir = PathBuf::from(required_value(&arg, &mut args)?);
+                }
+                "--enable-post-data-reading" => {
+                    enable_post_data_reading = true;
+                    enable_post_data_reading_flag = true;
+                }
+                "--disable-post-data-reading" => {
+                    enable_post_data_reading = false;
+                    disable_post_data_reading_flag = true;
+                }
                 "--upload-temp-dir" => {
                     upload_temp_dir = PathBuf::from(required_value(&arg, &mut args)?);
                 }
@@ -382,6 +478,15 @@ impl ServerConfig {
                         &required_value(&arg, &mut args)?,
                     )?);
                 }
+                "--max-multipart-parts" => {
+                    max_multipart_parts =
+                        parse_max_multipart_parts(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--max-input-vars" => {
+                    max_input_vars = parse_positive_usize(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--enable-file-uploads" => file_uploads = true,
+                "--disable-file-uploads" => file_uploads = false,
                 "--session-save-path" => {
                     session_save_path = PathBuf::from(required_value(&arg, &mut args)?);
                 }
@@ -389,10 +494,39 @@ impl ServerConfig {
                     session_cookie_name = required_value(&arg, &mut args)?;
                     validate_cookie_name("--session-cookie-name", &session_cookie_name)?;
                 }
+                "--session-serialize-handler" => {
+                    session_serialize_handler = required_value(&arg, &mut args)?;
+                }
+                "--enable-session-strict-mode" => session_use_strict_mode = true,
+                "--disable-session-strict-mode" => session_use_strict_mode = false,
+                "--session-cookie-lifetime" => {
+                    session_cookie_lifetime =
+                        parse_nonnegative_u64(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--session-lock-timeout-ms" => {
+                    session_lock_timeout_ms =
+                        parse_positive_u64(&arg, &required_value(&arg, &mut args)?)?;
+                }
                 "--session-cookie-path" => {
                     session_cookie_path = required_value(&arg, &mut args)?;
                     validate_cookie_path("--session-cookie-path", &session_cookie_path)?;
                 }
+                "--session-cookie-domain" => {
+                    session_cookie_domain = required_value(&arg, &mut args)?;
+                }
+                "--enable-session-cookie-secure" => session_cookie_secure = true,
+                "--disable-session-cookie-secure" => session_cookie_secure = false,
+                "--enable-session-cookie-httponly" => session_cookie_httponly = true,
+                "--disable-session-cookie-httponly" => session_cookie_httponly = false,
+                "--session-cookie-samesite" => {
+                    session_cookie_samesite = required_value(&arg, &mut args)?;
+                }
+                "--enable-session-cookie-partitioned" => session_cookie_partitioned = true,
+                "--disable-session-cookie-partitioned" => session_cookie_partitioned = false,
+                "--enable-session-cookies" => session_use_cookies = true,
+                "--disable-session-cookies" => session_use_cookies = false,
+                "--enable-session-only-cookies" => session_use_only_cookies = true,
+                "--disable-session-only-cookies" => session_use_only_cookies = false,
                 "--disable-sessions" => sessions_enabled = false,
                 "--max-in-flight" => {
                     max_in_flight = parse_positive_usize(&arg, &required_value(&arg, &mut args)?)?;
@@ -493,6 +627,17 @@ impl ServerConfig {
                 ConfigError::new("--docroot is required; example: phrust-server --docroot public")
             })?
         };
+        if !post_max_bytes_explicit {
+            post_max_bytes = DEFAULT_POST_MAX_BYTES.min(max_body_bytes);
+        }
+        if !request_body_memory_bytes_explicit {
+            request_body_memory_bytes = DEFAULT_REQUEST_BODY_MEMORY_BYTES.min(max_body_bytes);
+        }
+        if enable_post_data_reading_flag && disable_post_data_reading_flag {
+            return Err(ConfigError::new(
+                "--enable-post-data-reading and --disable-post-data-reading are mutually exclusive",
+            ));
+        }
         let config = Self {
             transport: TransportConfig {
                 listen,
@@ -513,6 +658,10 @@ impl ServerConfig {
             },
             limits: RequestLimitsConfig {
                 max_body_bytes,
+                post_max_bytes,
+                request_body_memory_bytes,
+                request_body_temp_dir,
+                enable_post_data_reading,
                 max_in_flight,
                 cpu_execution_limit,
                 request_timeout_ms,
@@ -547,11 +696,26 @@ impl ServerConfig {
             sessions_uploads: SessionsUploadsConfig {
                 upload_temp_dir,
                 max_upload_files,
-                max_upload_file_bytes: max_upload_file_bytes.unwrap_or(max_body_bytes),
+                max_upload_file_bytes: max_upload_file_bytes
+                    .unwrap_or(DEFAULT_MAX_UPLOAD_FILE_BYTES),
+                max_multipart_parts,
+                max_input_vars,
+                file_uploads,
                 session_save_path,
                 session_cookie_name,
+                session_serialize_handler,
+                session_use_strict_mode,
+                session_cookie_lifetime,
                 session_cookie_path,
+                session_cookie_domain,
+                session_cookie_secure,
+                session_cookie_httponly,
+                session_cookie_samesite,
+                session_cookie_partitioned,
+                session_use_cookies,
+                session_use_only_cookies,
                 sessions_enabled,
+                session_lock_timeout_ms,
             },
             capabilities: CapabilityConfig {
                 network_requests_enabled,
@@ -607,6 +771,10 @@ impl ServerConfig {
             },
             limits: RequestLimitsConfig {
                 max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+                post_max_bytes: DEFAULT_POST_MAX_BYTES,
+                request_body_memory_bytes: DEFAULT_REQUEST_BODY_MEMORY_BYTES,
+                request_body_temp_dir: std::env::temp_dir().join("phrust-request-bodies"),
+                enable_post_data_reading: true,
                 max_in_flight: default_max_in_flight(),
                 cpu_execution_limit: default_cpu_execution_limit(),
                 request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
@@ -641,11 +809,25 @@ impl ServerConfig {
             sessions_uploads: SessionsUploadsConfig {
                 upload_temp_dir: std::env::temp_dir().join("phrust-uploads"),
                 max_upload_files: DEFAULT_MAX_UPLOAD_FILES,
-                max_upload_file_bytes: DEFAULT_MAX_BODY_BYTES,
+                max_upload_file_bytes: DEFAULT_MAX_UPLOAD_FILE_BYTES,
+                max_multipart_parts: None,
+                max_input_vars: DEFAULT_MAX_INPUT_VARS,
+                file_uploads: true,
                 session_save_path: std::env::temp_dir().join("phrust-sessions"),
                 session_cookie_name: DEFAULT_SESSION_COOKIE_NAME.to_string(),
+                session_serialize_handler: "php".to_string(),
+                session_use_strict_mode: false,
+                session_cookie_lifetime: 0,
                 session_cookie_path: DEFAULT_SESSION_COOKIE_PATH.to_string(),
+                session_cookie_domain: String::new(),
+                session_cookie_secure: false,
+                session_cookie_httponly: true,
+                session_cookie_samesite: String::new(),
+                session_cookie_partitioned: false,
+                session_use_cookies: true,
+                session_use_only_cookies: true,
                 sessions_enabled: true,
+                session_lock_timeout_ms: 5_000,
             },
             capabilities: CapabilityConfig {
                 network_requests_enabled: false,
@@ -665,13 +847,34 @@ Options:\n\
   --docroot <path>             document root (required unless --help)\n\
   --front-controller <path>    optional front controller, relative to docroot\n\
   --rewrite-prefix-query <p=q> rewrite matching request paths to /?q=<suffix>\n\
-  --max-body-bytes <n>         maximum request body bytes (default: 1048576)\n\
+  --max-body-bytes <n>         transport hard limit (default: 33554432)\n\
+  --post-max-bytes <n>         PHP post_max_size bytes (default: 8388608)\n\
+  --request-body-memory-bytes <n> in-memory body threshold (default: 262144)\n\
+  --request-body-temp-dir <path> request body spool directory\n\
+  --enable-post-data-reading   enable automatic PHP POST parsing (default)\n\
+  --disable-post-data-reading  leave POST bodies for php://input/request_parse_body\n\
   --upload-temp-dir <path>     upload temp directory (default: OS temp/phrust-uploads)\n\
-  --max-upload-files <n>       maximum uploaded files per request (default: 32)\n\
-  --max-upload-file-bytes <n>  maximum bytes per uploaded file (default: max body bytes)\n\
-  --session-save-path <path>   compatibility path for session config\n\
+  --max-upload-files <n>       maximum uploaded files per request (default: 20)\n\
+  --max-upload-file-bytes <n>  maximum bytes per uploaded file (default: 2097152)\n\
+  --max-multipart-parts <n|-1> maximum multipart parts (-1 uses PHP policy)\n\
+  --max-input-vars <n>         maximum parsed input variables (default: 1000)\n\
+  --enable-file-uploads        enable multipart file uploads (default)\n\
+  --disable-file-uploads       ignore multipart file uploads\n\
+  --session-save-path <path>   persistent files-session directory\n\
   --session-cookie-name <name> session cookie name (default: PHPSESSID)\n\
+  --session-serialize-handler <name> php, php_binary, or php_serialize\n\
+  --enable-session-strict-mode require incoming IDs to exist in the files store\n\
+  --disable-session-strict-mode accept valid incoming IDs (default)\n\
+  --session-cookie-lifetime <seconds> session cookie lifetime (default: 0)\n\
   --session-cookie-path <path> session cookie path (default: /)\n\
+  --session-cookie-domain <domain> session cookie domain\n\
+  --enable-session-cookie-secure / --disable-session-cookie-secure\n\
+  --enable-session-cookie-httponly / --disable-session-cookie-httponly\n\
+  --session-cookie-samesite <value> session cookie SameSite attribute\n\
+  --enable-session-cookie-partitioned / --disable-session-cookie-partitioned\n\
+  --enable-session-cookies / --disable-session-cookies\n\
+  --enable-session-only-cookies / --disable-session-only-cookies\n\
+  --session-lock-timeout-ms <n> maximum wait for a session file lock (default: 5000)\n\
   --disable-sessions           disable persistent web sessions\n\
   --max-in-flight <n>          maximum concurrent in-flight requests\n\
   --cpu-execution-limit <n>    maximum concurrent CPU-bound PHP executions (default: available CPUs)\n\
@@ -728,6 +931,16 @@ Options:\n\
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.limits.request_body_memory_bytes > self.limits.max_body_bytes {
+            return Err(ConfigError::new(
+                "request_body_memory_bytes must not exceed max_body_bytes",
+            ));
+        }
+        if self.limits.post_max_bytes > self.limits.max_body_bytes {
+            return Err(ConfigError::new(
+                "post_max_bytes must not exceed max_body_bytes",
+            ));
+        }
         if self.routing.indexes.is_empty() {
             return Err(ConfigError::new("at least one directory index is required"));
         }
@@ -745,6 +958,32 @@ Options:\n\
             "session_cookie_path",
             &self.sessions_uploads.session_cookie_path,
         )?;
+        if !matches!(
+            self.sessions_uploads.session_serialize_handler.as_str(),
+            "php" | "php_binary" | "php_serialize"
+        ) {
+            return Err(ConfigError::new(
+                "session_serialize_handler must be php, php_binary, or php_serialize",
+            ));
+        }
+        validate_cookie_attribute(
+            "session_cookie_domain",
+            &self.sessions_uploads.session_cookie_domain,
+        )?;
+        validate_cookie_attribute(
+            "session_cookie_samesite",
+            &self.sessions_uploads.session_cookie_samesite,
+        )?;
+        if self
+            .sessions_uploads
+            .session_save_path
+            .to_string_lossy()
+            .contains(';')
+        {
+            return Err(ConfigError::new(
+                "session_save_path must be a plain directory; PHP depth/mode prefixes are not supported",
+            ));
+        }
         if self.transport.tls_cert.is_some() != self.transport.tls_key.is_some() {
             return Err(ConfigError::new(
                 "TLS configuration requires both --tls-cert <path> and --tls-key <path>; provide both flags or neither",
@@ -1031,6 +1270,13 @@ fn parse_positive_usize(flag: &str, value: &str) -> Result<usize, ConfigError> {
     Ok(parsed)
 }
 
+fn parse_max_multipart_parts(flag: &str, value: &str) -> Result<Option<usize>, ConfigError> {
+    if value == "-1" {
+        return Ok(None);
+    }
+    parse_positive_usize(flag, value).map(Some)
+}
+
 fn parse_positive_u64(flag: &str, value: &str) -> Result<u64, ConfigError> {
     let parsed = value
         .parse::<u64>()
@@ -1168,6 +1414,15 @@ fn validate_cookie_path(flag: &str, path: &str) -> Result<(), ConfigError> {
     if path.is_empty() || path.contains(['\r', '\n', ';']) {
         return Err(ConfigError::new(format!(
             "{flag} must be a non-empty cookie path without response separators"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_cookie_attribute(flag: &str, value: &str) -> Result<(), ConfigError> {
+    if value.contains(['\r', '\n', ';']) {
+        return Err(ConfigError::new(format!(
+            "{flag} must not contain cookie response separators"
         )));
     }
     Ok(())

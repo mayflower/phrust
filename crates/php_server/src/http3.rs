@@ -1,23 +1,32 @@
 use super::php_request::RequestLocalAddr;
 use crate::{
-    response::{self, ResponseBody},
-    serve::{admit_request, bytes_request_body, finish_admitted_response, handle_parts_admitted},
+    response::ResponseBody,
+    serve::{admit_request, handle_parts_admitted},
     server::ServerError,
     state::AppState,
     tls::build_quic_server_config,
 };
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
+use h3::error::Code;
 use h3::server::RequestStream;
 use http_body_util::BodyExt;
 use hyper::{
-    Response, StatusCode,
+    Response,
+    body::{Body, Frame, SizeHint},
     header::{self, HeaderName},
 };
 use std::{
     net::SocketAddr,
     path::Path,
-    sync::{Arc, atomic::Ordering},
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context, Poll},
+    time::Duration,
 };
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
@@ -95,7 +104,7 @@ async fn serve_http3_connection(
 
 async fn handle_http3_request(
     request: hyper::Request<()>,
-    mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     state: Arc<AppState>,
     peer: SocketAddr,
     local_addr: SocketAddr,
@@ -105,90 +114,137 @@ async fn handle_http3_request(
     let admission = match admit_request(&parts, &state, peer).await {
         Ok(admission) => admission,
         Err(response) => {
-            if let Err(error) = send_http3_response(stream, response).await {
+            let (send, mut recv) = stream.split();
+            if let Err(error) = send_http3_response(send, response, None).await {
                 warn!(%peer, %error, "HTTP/3 overload response failed");
             }
+            recv.stop_sending(Code::H3_REQUEST_CANCELLED);
             return;
         }
     };
-    let body = match read_http3_request_body(&mut stream, state.request.max_body_bytes).await {
-        Ok(body) => body,
-        Err(Http3BodyReadError::Invalid(error)) => {
-            warn!(%peer, %error, "HTTP/3 request body read failed");
-            let response = finish_admitted_response(
-                admission,
-                state,
-                response::text(StatusCode::BAD_REQUEST, "bad request\n"),
-                "bad-request",
-                None,
-            );
-            if let Err(error) = send_http3_response(stream, response).await {
-                warn!(%peer, %error, "HTTP/3 bad-request response failed");
-            }
-            return;
-        }
-        Err(Http3BodyReadError::TooLarge) => {
-            state
-                .services
-                .metrics
-                .body_too_large
-                .fetch_add(1, Ordering::Relaxed);
-            let response = finish_admitted_response(
-                admission,
-                state,
-                response::text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large\n"),
-                "body-too-large",
-                None,
-            );
-            if let Err(error) = send_http3_response(stream, response).await {
-                warn!(%peer, %error, "HTTP/3 payload-too-large response failed");
-            }
-            return;
-        }
-    };
-    let response =
-        handle_parts_admitted(parts, bytes_request_body(body), state, peer, admission).await;
-    if let Err(error) = send_http3_response(stream, response).await {
+    let (send, recv) = stream.split();
+    let control = Arc::new(Http3RequestControl::default());
+    let body = Http3RequestBody::new(recv, Arc::clone(&control)).boxed();
+    let response = handle_parts_admitted(parts, body, state, peer, admission).await;
+    if let Err(error) = send_http3_response(send, response, Some(&control)).await {
         warn!(%peer, %error, "HTTP/3 response send failed");
     }
 }
 
-#[derive(Debug)]
-enum Http3BodyReadError {
-    Invalid(String),
-    TooLarge,
+#[derive(Default)]
+struct Http3RequestControl {
+    response_started: AtomicBool,
+    response_started_notify: Notify,
 }
 
-async fn read_http3_request_body(
-    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    max_body_bytes: usize,
-) -> Result<Bytes, Http3BodyReadError> {
-    let mut body = BytesMut::new();
-    while let Some(mut chunk) = stream
-        .recv_data()
-        .await
-        .map_err(|error| Http3BodyReadError::Invalid(error.to_string()))?
-    {
-        while chunk.has_remaining() {
-            let remaining = chunk.remaining();
-            if remaining > max_body_bytes.saturating_sub(body.len()) {
-                return Err(Http3BodyReadError::TooLarge);
+impl Http3RequestControl {
+    fn mark_response_started(&self) {
+        self.response_started.store(true, Ordering::Release);
+        self.response_started_notify.notify_waiters();
+    }
+
+    async fn wait_for_response_start(&self) {
+        loop {
+            let notified = self.response_started_notify.notified();
+            if self.response_started.load(Ordering::Acquire) {
+                return;
             }
-            let bytes = chunk.copy_to_bytes(remaining);
-            body.extend_from_slice(&bytes);
+            notified.await;
         }
     }
-    Ok(body.freeze())
 }
 
-async fn send_http3_response(
-    mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+struct Http3RequestBody<S>
+where
+    S: h3::quic::RecvStream + Send + 'static,
+{
+    stream: Option<RequestStream<S, Bytes>>,
+    control: Arc<Http3RequestControl>,
+    complete: bool,
+}
+
+impl<S> Http3RequestBody<S>
+where
+    S: h3::quic::RecvStream + Send + 'static,
+{
+    fn new(stream: RequestStream<S, Bytes>, control: Arc<Http3RequestControl>) -> Self {
+        Self {
+            stream: Some(stream),
+            control,
+            complete: false,
+        }
+    }
+}
+
+impl<S> Body for Http3RequestBody<S>
+where
+    S: h3::quic::RecvStream + Send + Sync + Unpin + 'static,
+{
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let stream = self.stream.as_mut().expect("HTTP/3 receive stream");
+        match stream.poll_recv_data(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(Some(mut data))) => {
+                let bytes = data.copy_to_bytes(data.remaining());
+                Poll::Ready(Some(Ok(Frame::data(bytes))))
+            }
+            Poll::Ready(Ok(None)) => {
+                self.complete = true;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Err(error)) => {
+                self.complete = true;
+                Poll::Ready(Some(Err(std::io::Error::other(error.to_string()))))
+            }
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+impl<S> Drop for Http3RequestBody<S>
+where
+    S: h3::quic::RecvStream + Send + 'static,
+{
+    fn drop(&mut self) {
+        if !self.complete
+            && let Some(mut stream) = self.stream.take()
+        {
+            let control = Arc::clone(&self.control);
+            tokio::spawn(async move {
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(5), control.wait_for_response_start())
+                        .await;
+                stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+            });
+        }
+    }
+}
+
+async fn send_http3_response<S>(
+    mut stream: RequestStream<S, Bytes>,
     response: Response<ResponseBody>,
-) -> Result<(), String> {
+    request_control: Option<&Http3RequestControl>,
+) -> Result<(), String>
+where
+    S: h3::quic::SendStream<Bytes>,
+{
     let (mut parts, mut body) = response.into_parts();
     body.defer_completion();
     strip_http3_forbidden_headers(&mut parts.headers);
-    if let Err(error) = stream.send_response(Response::from_parts(parts, ())).await {
+    let response_result = stream.send_response(Response::from_parts(parts, ())).await;
+    if let Some(control) = request_control {
+        control.mark_response_started();
+    }
+    if let Err(error) = response_result {
         body.error();
         return Err(error.to_string());
     }

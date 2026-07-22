@@ -1,13 +1,18 @@
 //! Runtime services passed to internal builtins.
 
+use super::modules::session::{decode_runtime_session_payload, encode_runtime_session_payload};
 use super::request_state::BuiltinRequestState;
+use crate::context::{
+    RequestParserCallback, RuntimeCancellationState, SessionAbortCallback, SessionDestroyCallback,
+    SessionGcCallback, SessionRegenerateCallback, SessionWriteCallback,
+};
 use crate::{
     ExtensionStateSlot, FilesystemCapabilities, IniRegistry, MysqlState, ObjectRef, OutputBuffer,
     PHP_E_DEPRECATED, PHP_E_NOTICE, PHP_E_WARNING, PcreCache, PhpArray, PhpDiagnosticChannel,
     PhpDiagnosticDisplayOptions, PostgresState, ReferenceCell, RequestState, ResourceTable,
-    RuntimeDiagnostic, RuntimeHttpResponseState, RuntimeSeverity, SessionIdGenerateCallback,
-    SessionLoadCallback, SessionState, UploadRegistry, Value, datetime, emit_php_diagnostic,
-    source_span::RuntimeSourceSpan,
+    RuntimeDiagnostic, RuntimeHttpResponseState, RuntimeRequestBody, RuntimeSeverity,
+    SessionIdGenerateCallback, SessionLoadCallback, SessionState, UploadRegistry, Value, datetime,
+    emit_php_diagnostic, source_span::RuntimeSourceSpan,
 };
 use curl::easy::{Handler, WriteError};
 use curl::multi::{Easy2Handle, Multi};
@@ -48,7 +53,8 @@ pub use text_state::*;
 
 pub(in crate::builtins) struct BuiltinIoContext<'a> {
     output: &'a mut OutputBuffer,
-    php_input: Arc<[u8]>,
+    php_input: RuntimeRequestBody,
+    request_parser: Option<&'a RequestParserCallback>,
     diagnostic_display: PhpDiagnosticDisplayOptions,
     diagnostics: Vec<RuntimeDiagnostic>,
     php_diagnostics: Vec<RuntimeDiagnostic>,
@@ -58,7 +64,8 @@ impl<'a> BuiltinIoContext<'a> {
     fn new(output: &'a mut OutputBuffer) -> Self {
         Self {
             output,
-            php_input: Arc::from([]),
+            php_input: RuntimeRequestBody::empty(),
+            request_parser: None,
             diagnostic_display: PhpDiagnosticDisplayOptions::default(),
             diagnostics: Vec::new(),
             php_diagnostics: Vec::new(),
@@ -339,6 +346,11 @@ pub(in crate::builtins) struct BuiltinSessionContext<'a> {
     session_global: Option<ReferenceCell>,
     session_loader: Option<&'a SessionLoadCallback>,
     session_id_generator: Option<&'a SessionIdGenerateCallback>,
+    session_writer: Option<&'a SessionWriteCallback>,
+    session_destroyer: Option<&'a SessionDestroyCallback>,
+    session_aborter: Option<&'a SessionAbortCallback>,
+    session_regenerator: Option<&'a SessionRegenerateCallback>,
+    session_gc: Option<&'a SessionGcCallback>,
 }
 
 enum BuiltinRequestStateAccess<'a> {
@@ -376,6 +388,7 @@ pub struct BuiltinContext<'a> {
     default_timezone_slot: Option<&'a mut String>,
     env: Arc<Vec<(String, String)>>,
     network_requests_enabled: bool,
+    cancellation: Option<&'a RuntimeCancellationState>,
 }
 
 impl<'a> BuiltinContext<'a> {
@@ -399,6 +412,7 @@ impl<'a> BuiltinContext<'a> {
             default_timezone_slot: None,
             env: Arc::new(Vec::new()),
             network_requests_enabled: false,
+            cancellation: None,
         }
     }
 
@@ -438,6 +452,7 @@ impl<'a> BuiltinContext<'a> {
             default_timezone_slot: None,
             env: Arc::new(Vec::new()),
             network_requests_enabled: false,
+            cancellation: None,
         }
     }
 
@@ -463,6 +478,7 @@ impl<'a> BuiltinContext<'a> {
             default_timezone_slot: None,
             env: Arc::new(Vec::new()),
             network_requests_enabled: false,
+            cancellation: None,
         }
     }
 
@@ -501,6 +517,33 @@ impl<'a> BuiltinContext<'a> {
             default_timezone_slot: Some(default_timezone),
             env,
             network_requests_enabled: false,
+            cancellation: None,
+        }
+    }
+
+    pub fn set_cancellation(&mut self, cancellation: Option<&'a RuntimeCancellationState>) {
+        self.cancellation = cancellation;
+    }
+
+    pub fn sleep_interruptibly(&self, duration: std::time::Duration) -> bool {
+        let Some(cancellation) = self.cancellation else {
+            std::thread::sleep(duration);
+            return true;
+        };
+        if cancellation.ignore_user_abort() {
+            std::thread::sleep(duration);
+            return true;
+        }
+        let deadline = std::time::Instant::now() + duration;
+        loop {
+            if cancellation.is_cancelled() {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
         }
     }
 
@@ -743,14 +786,23 @@ impl<'a> BuiltinContext<'a> {
     }
 
     /// Sets deterministic bytes exposed through `php://input`.
-    pub fn set_php_input(&mut self, input: impl Into<Arc<[u8]>>) {
+    pub fn set_php_input(&mut self, input: impl Into<RuntimeRequestBody>) {
         self.io.php_input = input.into();
     }
 
     /// Deterministic bytes exposed through `php://input`.
     #[must_use]
-    pub fn php_input(&self) -> &[u8] {
+    pub fn php_input(&self) -> &RuntimeRequestBody {
         &self.io.php_input
+    }
+
+    pub fn set_request_parser(&mut self, parser: Option<&'a RequestParserCallback>) {
+        self.io.request_parser = parser;
+    }
+
+    #[must_use]
+    pub fn request_parser(&self) -> Option<&RequestParserCallback> {
+        self.io.request_parser
     }
 
     /// Request-local resource table for stream builtins.
@@ -1264,16 +1316,96 @@ impl<'a> BuiltinContext<'a> {
         self.sessions.session_id_generator = generator;
     }
 
+    pub fn set_session_writer(&mut self, writer: Option<&'a SessionWriteCallback>) {
+        self.sessions.session_writer = writer;
+    }
+
+    pub fn set_session_destroyer(&mut self, destroyer: Option<&'a SessionDestroyCallback>) {
+        self.sessions.session_destroyer = destroyer;
+    }
+
+    pub fn set_session_aborter(&mut self, aborter: Option<&'a SessionAbortCallback>) {
+        self.sessions.session_aborter = aborter;
+    }
+
+    pub fn set_session_regenerator(&mut self, regenerator: Option<&'a SessionRegenerateCallback>) {
+        self.sessions.session_regenerator = regenerator;
+    }
+
+    pub fn set_session_gc(&mut self, gc: Option<&'a SessionGcCallback>) {
+        self.sessions.session_gc = gc;
+    }
+
+    pub fn write_session(
+        &self,
+        id: &str,
+        data: &PhpArray,
+        serialize_handler: &str,
+        lazy_write: bool,
+    ) -> Result<(), String> {
+        let Some(writer) = self.sessions.session_writer else {
+            return Ok(());
+        };
+        let payload = encode_runtime_session_payload(
+            serialize_handler,
+            data,
+            self.session_serialize_precision(),
+        )?;
+        writer.write(id, &payload, lazy_write)
+    }
+
+    pub fn destroy_session(&self, id: &str) -> Result<(), String> {
+        self.sessions
+            .session_destroyer
+            .map_or(Ok(()), |destroyer| destroyer.destroy(id))
+    }
+
+    pub fn abort_session(&self, id: &str) -> Result<(), String> {
+        self.sessions
+            .session_aborter
+            .map_or(Ok(()), |aborter| aborter.abort(id))
+    }
+
+    pub fn regenerate_session(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        data: &PhpArray,
+        serialize_handler: &str,
+        delete_old: bool,
+    ) -> Result<(), String> {
+        let Some(regenerator) = self.sessions.session_regenerator else {
+            return Ok(());
+        };
+        let payload = encode_runtime_session_payload(
+            serialize_handler,
+            data,
+            self.session_serialize_precision(),
+        )?;
+        regenerator.regenerate(old_id, new_id, &payload, delete_old)
+    }
+
+    pub fn gc_sessions(&self, max_lifetime_seconds: u64) -> Result<usize, String> {
+        self.sessions
+            .session_gc
+            .map_or(Ok(0), |gc| gc.gc(max_lifetime_seconds))
+    }
+
     /// Generates and stages a transport session id when the active operation
     /// needs to create one. CLI contexts retain their deterministic fallback.
-    pub fn prepare_new_session_id(&mut self) -> Result<(), String> {
+    pub fn prepare_new_session_id(
+        &mut self,
+        length: usize,
+        bits_per_character: u8,
+        prefix: &str,
+    ) -> Result<(), String> {
         if self.sessions.session_state.is_none() {
             return Ok(());
         }
         let Some(generator) = self.sessions.session_id_generator else {
             return Ok(());
         };
-        let id = generator.generate()?;
+        let id = generator.generate(length, bits_per_character, prefix)?;
         let state = self
             .sessions
             .session_state
@@ -1283,13 +1415,29 @@ impl<'a> BuiltinContext<'a> {
         Ok(())
     }
 
+    pub fn generate_transport_session_id(
+        &self,
+        length: usize,
+        bits_per_character: u8,
+        prefix: &str,
+    ) -> Result<Option<String>, String> {
+        self.sessions
+            .session_id_generator
+            .map(|generator| generator.generate(length, bits_per_character, prefix))
+            .transpose()
+    }
+
     /// Request-local session state.
     pub fn session_state(&mut self) -> Option<&mut SessionState> {
         self.sessions.session_state.as_deref_mut()
     }
 
     /// Loads pending session data from the transport layer when needed.
-    pub fn load_pending_session_data(&mut self) -> Result<(), String> {
+    pub fn load_pending_session_data(
+        &mut self,
+        strict_mode: bool,
+        serialize_handler: &str,
+    ) -> Result<(), String> {
         let Some(state) = self.sessions.session_state.as_deref_mut() else {
             return Ok(());
         };
@@ -1300,9 +1448,30 @@ impl<'a> BuiltinContext<'a> {
         let Some(loader) = self.sessions.session_loader else {
             return Err("session loader is unavailable".to_string());
         };
-        let data = loader.load(&id)?;
-        state.load_data(data);
+        let loaded = loader.load(&id, strict_mode)?;
+        let data = decode_runtime_session_payload(serialize_handler, &loaded.payload)?;
+        state.load_data_with_existence(data, loaded.existed);
         Ok(())
+    }
+
+    pub fn open_current_session_data(&mut self, serialize_handler: &str) -> Result<(), String> {
+        let Some(state) = self.sessions.session_state.as_deref_mut() else {
+            return Ok(());
+        };
+        let id = state.id().to_owned();
+        let Some(loader) = self.sessions.session_loader else {
+            return Ok(());
+        };
+        let loaded = loader.load(&id, false)?;
+        let data = decode_runtime_session_payload(serialize_handler, &loaded.payload)?;
+        state.load_data_with_existence(data, loaded.existed);
+        Ok(())
+    }
+
+    fn session_serialize_precision(&self) -> i32 {
+        self.ini_get("serialize_precision")
+            .and_then(|value| value.trim().parse::<i32>().ok())
+            .unwrap_or(-1)
     }
 
     /// Sets request-local MySQL/MariaDB extension state.
@@ -1571,6 +1740,7 @@ mod tests {
         let upload = RuntimeUploadedFile {
             field_name: "file".to_owned(),
             client_filename: "test.txt".to_owned(),
+            full_path: "test.txt".to_owned(),
             content_type: "text/plain".to_owned(),
             temp_path: "/tmp/php-upload-test".to_owned(),
             error: 0,

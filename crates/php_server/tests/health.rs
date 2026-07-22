@@ -1253,16 +1253,12 @@ fn server_debug_log_contains_request_failure_diagnostics_without_secrets() {
         forbidden.starts_with("HTTP/1.1 404 Not Found"),
         "{forbidden}"
     );
-    assert!(
-        multipart.starts_with("HTTP/1.1 400 Bad Request"),
-        "{multipart}"
-    );
+    assert!(multipart.starts_with("HTTP/1.1 200 OK"), "{multipart}");
     assert!(
         log.contains("E_PHP_SERVER_SCRIPT_RESOLUTION_FAILED"),
         "{log}"
     );
     assert!(!log.contains("E_PHP_SERVER_OUTSIDE_DOCUMENT_ROOT"), "{log}");
-    assert!(log.contains("E_PHP_REQUEST_BODY_PARSE_FAILED"), "{log}");
     assert!(log.contains("\"method\":\"GET\""), "{log}");
     assert!(
         log.contains("\"uri\":\"/missing.php?token=secret-token\""),
@@ -1825,6 +1821,140 @@ async fn oversized_http3_request_body_returns_413() {
     stop_child(child);
     fs::remove_dir_all(docroot).expect("remove temp docroot");
     assert_eq!(status, hyper::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn php_request_bodies_match_over_http1_http2_and_http3() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("raw.php"),
+        "<?php $first = file_get_contents('php://input'); $second = file_get_contents('php://input'); echo strlen($first), \"\\n\", strlen($second), \"\\n\";",
+    )
+    .expect("write raw body fixture");
+    fs::write(
+        docroot.join("form.php"),
+        "<?php echo strlen($_POST['value']), \"\\n\", ord($_POST['value'][1]), \"\\n\", $_POST['nested']['key'], \"\\n\", implode(',', $_POST['list']), \"\\n\";",
+    )
+    .expect("write form fixture");
+    fs::write(
+        docroot.join("multipart.php"),
+        "<?php echo $_POST['title'], \"\\n\", $_POST['nested']['key'], \"\\n\", $_FILES['avatar']['name'], \"\\n\", $_FILES['avatar']['size'], \"\\n\", $_FILES['avatar']['error'], \"\\n\", file_get_contents($_FILES['avatar']['tmp_name']), \"\\n\";",
+    )
+    .expect("write automatic multipart fixture");
+    fs::write(
+        docroot.join("parse.php"),
+        "<?php [$post, $files] = request_parse_body(); echo $post['title'], \"\\n\", $files['avatar']['name'], \"\\n\", file_get_contents($files['avatar']['tmp_name']), \"\\n\", count($_POST), \"\\n\", count($_FILES), \"\\n\";",
+    )
+    .expect("write explicit multipart fixture");
+    let spool_dir = temp_docroot();
+    let upload_dir = temp_docroot();
+    let spool_arg = spool_dir.to_string_lossy().to_string();
+    let upload_arg = upload_dir.to_string_lossy().to_string();
+    let (cert, key) = tls_fixture_paths();
+    let cert_arg = cert.to_string_lossy().to_string();
+    let key_arg = key.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--tls-cert",
+            &cert_arg,
+            "--tls-key",
+            &key_arg,
+            "--enable-http3",
+            "--max-body-bytes",
+            "350000",
+            "--request-body-memory-bytes",
+            "128",
+            "--request-body-temp-dir",
+            &spool_arg,
+            "--upload-temp-dir",
+            &upload_arg,
+        ],
+    );
+    let address = read_listening_address(&mut child);
+
+    let raw = vec![b'x'; 300 * 1024];
+    let raw_responses = protocol_request_body_set(
+        &address,
+        hyper::Method::POST,
+        "/raw.php",
+        &[("content-type", "application/octet-stream")],
+        &raw,
+    )
+    .await;
+    assert_protocol_bodies(&raw_responses, b"307200\n307200\n");
+
+    let form = b"value=A%00B&nested%5Bkey%5D=inside&list%5B%5D=one&list%5B%5D=two";
+    let form_responses = protocol_request_body_set(
+        &address,
+        hyper::Method::POST,
+        "/form.php",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form,
+    )
+    .await;
+    assert_protocol_bodies(&form_responses, b"3\n0\ninside\none,two\n");
+
+    let multipart = b"--BOUNDARY\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nHello\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"nested[key]\"\r\n\r\ninside\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"../me.txt\"\r\nContent-Type: text/plain\r\n\r\nUPLOAD\0DATA\r\n--BOUNDARY--\r\n";
+    let multipart_responses = protocol_request_body_set(
+        &address,
+        hyper::Method::POST,
+        "/multipart.php",
+        &[("content-type", "multipart/form-data; boundary=BOUNDARY")],
+        multipart,
+    )
+    .await;
+    assert_protocol_bodies(
+        &multipart_responses,
+        b"Hello\ninside\nme.txt\n11\n0\nUPLOAD\0DATA\n",
+    );
+
+    let parse_responses = protocol_request_body_set(
+        &address,
+        hyper::Method::PUT,
+        "/parse.php",
+        &[("content-type", "multipart/form-data; boundary=BOUNDARY")],
+        multipart,
+    )
+    .await;
+    assert_protocol_bodies(&parse_responses, b"Hello\nme.txt\nUPLOAD\0DATA\n0\n0\n");
+
+    let oversized = vec![b'z'; 400_000];
+    let oversized_responses = protocol_request_body_set(
+        &address,
+        hyper::Method::POST,
+        "/raw.php",
+        &[("content-type", "application/octet-stream")],
+        &oversized,
+    )
+    .await;
+    for response in oversized_responses {
+        assert_eq!(response.status, hyper::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    let metrics = http2_request(&address, hyper::Method::GET, "/__phrust/metrics", &[], &[]).await;
+    let metrics = String::from_utf8(metrics.body()).expect("metrics are UTF-8");
+    for expected in [
+        "phrust_server_request_body_tempfiles_active 0\n",
+        "phrust_server_request_body_tempfile_bytes_active 0\n",
+        "phrust_server_upload_tempfiles_active 0\n",
+        "phrust_server_upload_tempfile_bytes_active 0\n",
+    ] {
+        assert!(
+            metrics.contains(expected),
+            "missing {expected:?}: {metrics}"
+        );
+    }
+
+    stop_child(child);
+    assert_eq!(fs::read_dir(&spool_dir).expect("read spool dir").count(), 0);
+    assert_eq!(
+        fs::read_dir(&upload_dir).expect("read upload dir").count(),
+        0
+    );
+    fs::remove_dir_all(docroot).expect("remove protocol body docroot");
+    fs::remove_dir_all(spool_dir).expect("remove protocol body spool dir");
+    fs::remove_dir_all(upload_dir).expect("remove protocol upload dir");
 }
 
 #[test]
@@ -2437,6 +2567,576 @@ fn server_persists_web_sessions_across_requests() {
 }
 
 #[test]
+fn file_sessions_survive_a_server_restart() {
+    let docroot = fixture_docroot("fixtures/server/php");
+    let session_dir = temp_docroot();
+    let session_arg = session_dir.to_string_lossy().to_string();
+    let mut first_server = start_server(&docroot, &["--session-save-path", &session_arg]);
+    let first_address = read_listening_address(&mut first_server);
+    let first = http_request(&first_address, "GET", "/session_counter.php");
+    let cookie = response_header_values(&first, "set-cookie")[0]
+        .split_once(';')
+        .map_or("", |(pair, _)| pair)
+        .to_string();
+    stop_child(first_server);
+
+    let mut second_server = start_server(&docroot, &["--session-save-path", &session_arg]);
+    let second_address = read_listening_address(&mut second_server);
+    let second = http_request_with_headers(
+        &second_address,
+        "GET",
+        "/session_counter.php",
+        &[("Cookie", &cookie)],
+        "",
+    );
+    stop_child(second_server);
+
+    assert!(second.starts_with("HTTP/1.1 200 OK"), "{second}");
+    assert!(response_body(&second).contains("n=2\n"), "{second}");
+    fs::remove_dir_all(session_dir).expect("remove session dir");
+}
+
+#[test]
+fn session_cookie_lifetime_and_attributes_are_published_together() {
+    let docroot = fixture_docroot("fixtures/server/php");
+    let session_dir = temp_docroot();
+    let session_arg = session_dir.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--session-save-path",
+            &session_arg,
+            "--session-cookie-lifetime",
+            "3600",
+            "--session-cookie-domain",
+            "example.test",
+            "--enable-session-cookie-secure",
+            "--session-cookie-samesite",
+            "Strict",
+            "--enable-session-cookie-partitioned",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let response = http_request(&address, "GET", "/session_counter.php");
+    stop_child(child);
+
+    let cookies = response_header_values(&response, "set-cookie");
+    assert_eq!(cookies.len(), 1, "{response}");
+    let cookie = cookies[0];
+    assert!(cookie.contains("; Expires="), "{cookie}");
+    assert!(cookie.contains(" GMT; Max-Age=3600; Path=/"), "{cookie}");
+    assert!(cookie.contains("; Domain=example.test"), "{cookie}");
+    assert!(cookie.contains("; Secure"), "{cookie}");
+    assert!(cookie.contains("; HttpOnly"), "{cookie}");
+    assert!(cookie.contains("; SameSite=Strict"), "{cookie}");
+    assert!(cookie.ends_with("; Partitioned"), "{cookie}");
+    fs::remove_dir_all(session_dir).expect("remove session dir");
+}
+
+#[test]
+fn session_regeneration_moves_the_locked_file_and_updates_the_cookie() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("regenerate.php"),
+        "<?php session_start(); $old = session_id(); $_SESSION[\"n\"] = 7; var_dump(session_regenerate_id(true)); echo $old, \"\\n\", session_id(), \"\\n\";",
+    )
+    .expect("write regeneration fixture");
+    fs::write(
+        docroot.join("read.php"),
+        "<?php session_start([\"read_and_close\" => true]); echo $_SESSION[\"n\"], \"\\n\";",
+    )
+    .expect("write session reader fixture");
+    let session_dir = temp_docroot();
+    let session_arg = session_dir.to_string_lossy().to_string();
+    let mut child = start_server(&docroot, &["--session-save-path", &session_arg]);
+    let address = read_listening_address(&mut child);
+    let response = http_request(&address, "GET", "/regenerate.php");
+    let lines = response_body(&response).lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3, "{response}");
+    assert_eq!(lines[0], "bool(true)", "{response}");
+    let old_id = lines[1];
+    let new_id = lines[2];
+    assert_ne!(old_id, new_id);
+    let cookies = response_header_values(&response, "set-cookie");
+    assert_eq!(cookies.len(), 1, "{response}");
+    assert!(
+        cookies[0].starts_with(&format!("PHPSESSID={new_id};")),
+        "cookie={}, response={response}",
+        cookies[0]
+    );
+    assert!(!session_dir.join(format!("sess_{old_id}")).exists());
+    assert!(session_dir.join(format!("sess_{new_id}")).exists());
+
+    let cookie = format!("PHPSESSID={new_id}");
+    let read = http_request_with_headers(&address, "GET", "/read.php", &[("Cookie", &cookie)], "");
+    stop_child(child);
+    assert_eq!(response_body(&read), "7\n", "{read}");
+    fs::remove_dir_all(docroot).expect("remove regeneration docroot");
+    fs::remove_dir_all(session_dir).expect("remove session dir");
+}
+
+#[test]
+fn deprecated_session_id_ini_settings_warn_and_remain_effective() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("sid.php"),
+        "<?php ob_start(); ini_set(\"session.sid_length\", \"22\"); ini_set(\"session.sid_bits_per_character\", \"6\"); session_start(); echo strlen(session_id()), \"\\n\"; ob_end_flush();",
+    )
+    .expect("write sid fixture");
+    let session_dir = temp_docroot();
+    let session_arg = session_dir.to_string_lossy().to_string();
+    let mut child = start_server(&docroot, &["--session-save-path", &session_arg]);
+    let address = read_listening_address(&mut child);
+    let response = http_request(&address, "GET", "/sid.php");
+    stop_child(child);
+
+    let body = response_body(&response);
+    assert!(
+        body.contains("ini_set(): session.sid_length INI setting is deprecated"),
+        "{response}"
+    );
+    assert!(
+        body.contains("ini_set(): session.sid_bits_per_character INI setting is deprecated"),
+        "{response}"
+    );
+    assert!(body.ends_with("22\n"), "{response}");
+    fs::remove_dir_all(docroot).expect("remove sid docroot");
+    fs::remove_dir_all(session_dir).expect("remove session dir");
+}
+
+#[test]
+fn request_local_session_serializer_controls_the_files_payload() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("binary.php"),
+        "<?php ini_set(\"session.serialize_handler\", \"php_binary\"); session_start(); $_SESSION[\"n\"] = 7; echo session_id(), \"\\n\";",
+    )
+    .expect("write serializer fixture");
+    let session_dir = temp_docroot();
+    let session_arg = session_dir.to_string_lossy().to_string();
+    let mut child = start_server(&docroot, &["--session-save-path", &session_arg]);
+    let address = read_listening_address(&mut child);
+    let response = http_request(&address, "GET", "/binary.php");
+    let id = response_body(&response).trim();
+    let session_file = session_dir.join(format!("sess_{id}"));
+    wait_for_file_contents(&session_file, b"\x01ni:7;", Duration::from_secs(1));
+    stop_child(child);
+
+    assert_eq!(
+        fs::read(session_file).expect("read session payload"),
+        b"\x01ni:7;"
+    );
+    fs::remove_dir_all(docroot).expect("remove serializer docroot");
+    fs::remove_dir_all(session_dir).expect("remove session dir");
+}
+
+#[test]
+fn same_session_requests_serialize_without_lost_updates() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("seed.php"),
+        "<?php session_start(); $_SESSION[\"n\"] = 0; session_write_close(); echo \"seeded\\n\";",
+    )
+    .expect("write seed script");
+    fs::write(
+        docroot.join("increment.php"),
+        "<?php session_start(); $n = $_SESSION[\"n\"]; usleep(150000); $_SESSION[\"n\"] = $n + 1; session_write_close(); echo \"done\\n\";",
+    )
+    .expect("write increment script");
+    fs::write(
+        docroot.join("read.php"),
+        "<?php session_start([\"read_and_close\" => true]); echo $_SESSION[\"n\"], \"\\n\";",
+    )
+    .expect("write read script");
+    let session_dir = temp_docroot();
+    let session_arg = session_dir.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--session-save-path",
+            &session_arg,
+            "--cpu-execution-limit",
+            "2",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let seed = http_request(&address, "GET", "/seed.php");
+    let set_cookie = response_header_values(&seed, "set-cookie");
+    let cookie = set_cookie[0]
+        .split_once(';')
+        .map_or_else(|| set_cookie[0].to_string(), |(pair, _)| pair.to_string());
+    let start = Arc::new(Barrier::new(3));
+    let mut requests = Vec::new();
+    for _ in 0..2 {
+        let address = address.clone();
+        let cookie = cookie.clone();
+        let start = Arc::clone(&start);
+        requests.push(std::thread::spawn(move || {
+            start.wait();
+            http_request_with_headers(
+                &address,
+                "GET",
+                "/increment.php",
+                &[("Cookie", &cookie)],
+                "",
+            )
+        }));
+    }
+    start.wait();
+    for request in requests {
+        let response = request.join().expect("increment request");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    }
+    let read = http_request_with_headers(&address, "GET", "/read.php", &[("Cookie", &cookie)], "");
+    stop_child(child);
+    assert_eq!(response_body(&read), "2\n", "{read}");
+    fs::remove_dir_all(docroot).expect("remove session concurrency docroot");
+    fs::remove_dir_all(session_dir).expect("remove session concurrency store");
+}
+
+#[test]
+fn session_write_close_releases_the_file_lock_before_script_end() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("seed.php"),
+        "<?php session_start(); $_SESSION[\"n\"] = 0; session_write_close();",
+    )
+    .expect("write seed script");
+    fs::write(
+        docroot.join("close_sleep.php"),
+        "<?php session_start(); $_SESSION[\"n\"] = $_SESSION[\"n\"] + 1; session_write_close(); file_put_contents($_SERVER[\"DOCUMENT_ROOT\"] . \"/released.marker\", \"yes\"); usleep(500000); echo \"done\\n\";",
+    )
+    .expect("write close-and-sleep script");
+    fs::write(
+        docroot.join("read.php"),
+        "<?php session_start([\"read_and_close\" => true]); echo $_SESSION[\"n\"], \"\\n\";",
+    )
+    .expect("write read script");
+    let session_dir = temp_docroot();
+    let session_arg = session_dir.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--session-save-path",
+            &session_arg,
+            "--cpu-execution-limit",
+            "2",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let seed = http_request(&address, "GET", "/seed.php");
+    let set_cookie = response_header_values(&seed, "set-cookie");
+    let cookie = set_cookie[0]
+        .split_once(';')
+        .map_or_else(|| set_cookie[0].to_string(), |(pair, _)| pair.to_string());
+    let first_address = address.clone();
+    let first_cookie = cookie.clone();
+    let first = std::thread::spawn(move || {
+        http_request_with_headers(
+            &first_address,
+            "GET",
+            "/close_sleep.php",
+            &[("Cookie", &first_cookie)],
+            "",
+        )
+    });
+    let marker = docroot.join("released.marker");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(marker.exists(), "write_close marker was not published");
+    let started = std::time::Instant::now();
+    let read = http_request_with_headers(&address, "GET", "/read.php", &[("Cookie", &cookie)], "");
+    let elapsed = started.elapsed();
+    let first = first.join().expect("close-and-sleep request");
+    stop_child(child);
+    assert_eq!(response_body(&read), "1\n", "{read}");
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "lock remained held for {elapsed:?}"
+    );
+    assert_eq!(response_body(&first), "done\n", "{first}");
+    fs::remove_dir_all(docroot).expect("remove write-close docroot");
+    fs::remove_dir_all(session_dir).expect("remove write-close session store");
+}
+
+#[test]
+fn session_read_and_close_and_abort_release_without_writing() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("seed.php"),
+        "<?php session_start(); $_SESSION['n'] = 1; session_write_close(); echo \"seeded\\n\";",
+    )
+    .expect("write lifecycle seed fixture");
+    fs::write(
+        docroot.join("read_close.php"),
+        "<?php session_start(['read_and_close' => true]); $_SESSION['n'] = 9; echo \"closed\\n\";",
+    )
+    .expect("write read-and-close fixture");
+    fs::write(
+        docroot.join("abort.php"),
+        "<?php session_start(); $_SESSION['n'] = 8; var_dump(session_abort());",
+    )
+    .expect("write abort fixture");
+    fs::write(
+        docroot.join("read.php"),
+        "<?php session_start(['read_and_close' => true]); echo $_SESSION['n'], \"\\n\";",
+    )
+    .expect("write lifecycle reader fixture");
+    let session_dir = temp_docroot();
+    let session_arg = session_dir.to_string_lossy().to_string();
+    let mut child = start_server(&docroot, &["--session-save-path", &session_arg]);
+    let address = read_listening_address(&mut child);
+    let seed = http_request(&address, "GET", "/seed.php");
+    let cookie = response_header_values(&seed, "set-cookie")[0]
+        .split_once(';')
+        .map_or("", |(pair, _)| pair)
+        .to_string();
+
+    let read_close = http_request_with_headers(
+        &address,
+        "GET",
+        "/read_close.php",
+        &[("Cookie", &cookie)],
+        "",
+    );
+    let after_read_close =
+        http_request_with_headers(&address, "GET", "/read.php", &[("Cookie", &cookie)], "");
+    let abort =
+        http_request_with_headers(&address, "GET", "/abort.php", &[("Cookie", &cookie)], "");
+    let after_abort =
+        http_request_with_headers(&address, "GET", "/read.php", &[("Cookie", &cookie)], "");
+
+    stop_child(child);
+    assert_eq!(response_body(&read_close), "closed\n", "{read_close}");
+    assert_eq!(
+        response_body(&after_read_close),
+        "1\n",
+        "{after_read_close}"
+    );
+    assert_eq!(response_body(&abort), "bool(true)\n", "{abort}");
+    assert_eq!(response_body(&after_abort), "1\n", "{after_abort}");
+    fs::remove_dir_all(docroot).expect("remove lifecycle docroot");
+    fs::remove_dir_all(session_dir).expect("remove lifecycle session store");
+}
+
+#[test]
+fn session_strict_mode_rotates_a_missing_incoming_id() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("id.php"),
+        "<?php session_start(); echo session_id(), \"\\n\";",
+    )
+    .expect("write strict-mode fixture");
+    let session_dir = temp_docroot();
+    let session_arg = session_dir.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--session-save-path",
+            &session_arg,
+            "--enable-session-strict-mode",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let response = http_request_with_headers(
+        &address,
+        "GET",
+        "/id.php",
+        &[("Cookie", "PHPSESSID=missing-but-valid")],
+        "",
+    );
+    stop_child(child);
+
+    let generated = response_body(&response).trim();
+    assert_ne!(generated, "missing-but-valid", "{response}");
+    assert!(!generated.is_empty(), "{response}");
+    assert!(!session_dir.join("sess_missing-but-valid").exists());
+    assert!(session_dir.join(format!("sess_{generated}")).exists());
+    assert!(
+        response_header_values(&response, "set-cookie")[0]
+            .starts_with(&format!("PHPSESSID={generated};"))
+    );
+    fs::remove_dir_all(docroot).expect("remove strict-mode docroot");
+    fs::remove_dir_all(session_dir).expect("remove strict-mode session store");
+}
+
+#[test]
+fn explicit_session_gc_deletes_only_expired_unlocked_session_files() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("gc.php"),
+        "<?php ini_set('session.gc_maxlifetime', '1'); session_start(['gc_probability' => 0]); var_dump(session_gc());",
+    )
+    .expect("write explicit GC fixture");
+    let session_dir = temp_docroot();
+    let expired = session_dir.join("sess_expired");
+    fs::write(&expired, b"n|i:1;").expect("write expired session");
+    let old = SystemTime::now() - Duration::from_secs(60);
+    fs::File::open(&expired)
+        .expect("open expired session")
+        .set_times(fs::FileTimes::new().set_modified(old))
+        .expect("age expired session");
+    let session_arg = session_dir.to_string_lossy().to_string();
+    let mut child = start_server(&docroot, &["--session-save-path", &session_arg]);
+    let address = read_listening_address(&mut child);
+    let response = http_request(&address, "GET", "/gc.php");
+    stop_child(child);
+
+    assert_eq!(response_body(&response), "int(1)\n", "{response}");
+    assert!(!expired.exists());
+    let generated = response_header_values(&response, "set-cookie")[0]
+        .split_once(';')
+        .map_or("", |(pair, _)| pair)
+        .trim_start_matches("PHPSESSID=");
+    assert!(session_dir.join(format!("sess_{generated}")).exists());
+    fs::remove_dir_all(docroot).expect("remove GC docroot");
+    fs::remove_dir_all(session_dir).expect("remove GC session store");
+}
+
+#[test]
+fn fatal_error_and_timeout_release_the_session_lock() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("seed.php"),
+        "<?php session_start(); $_SESSION['n'] = 1; session_write_close();",
+    )
+    .expect("write finalizer seed fixture");
+    fs::write(
+        docroot.join("fatal.php"),
+        "<?php session_start(); $_SESSION['n'] = 2; missing_welle3_function();",
+    )
+    .expect("write fatal fixture");
+    fs::write(
+        docroot.join("timeout.php"),
+        "<?php session_start(); while (true) { usleep(1000); }",
+    )
+    .expect("write timeout fixture");
+    fs::write(
+        docroot.join("read.php"),
+        "<?php session_start(['read_and_close' => true]); echo $_SESSION['n'], \"\\n\";",
+    )
+    .expect("write finalizer reader fixture");
+    let session_dir = temp_docroot();
+    let session_arg = session_dir.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--session-save-path",
+            &session_arg,
+            "--max-execution-ms",
+            "25",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let seed = http_request(&address, "GET", "/seed.php");
+    let cookie = response_header_values(&seed, "set-cookie")[0]
+        .split_once(';')
+        .map_or("", |(pair, _)| pair)
+        .to_string();
+
+    let fatal =
+        http_request_with_headers(&address, "GET", "/fatal.php", &[("Cookie", &cookie)], "");
+    let after_fatal =
+        http_request_with_headers(&address, "GET", "/read.php", &[("Cookie", &cookie)], "");
+    let timeout =
+        http_request_with_headers(&address, "GET", "/timeout.php", &[("Cookie", &cookie)], "");
+    let after_timeout =
+        http_request_with_headers(&address, "GET", "/read.php", &[("Cookie", &cookie)], "");
+
+    stop_child(child);
+    assert!(
+        fatal.starts_with("HTTP/1.1 500 Internal Server Error"),
+        "{fatal}"
+    );
+    assert_eq!(response_body(&after_fatal), "2\n", "{after_fatal}");
+    assert!(
+        timeout.starts_with("HTTP/1.1 504 Gateway Timeout"),
+        "{timeout}"
+    );
+    assert_eq!(response_body(&after_timeout), "2\n", "{after_timeout}");
+    fs::remove_dir_all(docroot).expect("remove finalizer docroot");
+    fs::remove_dir_all(session_dir).expect("remove finalizer session store");
+}
+
+#[test]
+fn client_disconnect_releases_the_session_lock() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("seed.php"),
+        "<?php session_start(); $_SESSION['n'] = 1; session_write_close();",
+    )
+    .expect("write disconnect seed fixture");
+    fs::write(
+        docroot.join("disconnect.php"),
+        "<?php session_start(); $_SESSION['n'] = 2; echo \"first\\n\"; flush(); while (true) { usleep(1000); }",
+    )
+    .expect("write session disconnect fixture");
+    fs::write(
+        docroot.join("read.php"),
+        "<?php session_start(['read_and_close' => true]); echo $_SESSION['n'], \"\\n\";",
+    )
+    .expect("write disconnect reader fixture");
+    let session_dir = temp_docroot();
+    let session_arg = session_dir.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--session-save-path",
+            &session_arg,
+            "--max-execution-ms",
+            "5000",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let seed = http_request(&address, "GET", "/seed.php");
+    let cookie = response_header_values(&seed, "set-cookie")[0]
+        .split_once(';')
+        .map_or("", |(pair, _)| pair)
+        .to_string();
+
+    let mut stream = TcpStream::connect(&address).expect("connect disconnect request");
+    stream
+        .write_all(
+            format!(
+                "GET /disconnect.php HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .expect("write disconnect request");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set disconnect read timeout");
+    let mut received = Vec::new();
+    let mut buffer = [0_u8; 512];
+    while !received
+        .windows(b"first\n".len())
+        .any(|window| window == b"first\n")
+    {
+        let count = stream
+            .read(&mut buffer)
+            .expect("read streamed session response");
+        assert!(count > 0, "session response ended before first chunk");
+        received.extend_from_slice(&buffer[..count]);
+    }
+    drop(stream);
+
+    let started = Instant::now();
+    let read = http_request_with_headers(&address, "GET", "/read.php", &[("Cookie", &cookie)], "");
+    let elapsed = started.elapsed();
+    stop_child(child);
+
+    assert_eq!(response_body(&read), "2\n", "{read}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "session lock survived client disconnect for {elapsed:?}"
+    );
+    fs::remove_dir_all(docroot).expect("remove disconnect docroot");
+    fs::remove_dir_all(session_dir).expect("remove disconnect session store");
+}
+
+#[test]
 fn server_reports_headers_not_sent_during_php_execution() {
     let docroot = fixture_docroot("fixtures/server/php");
     let mut child = start_server(&docroot, &[]);
@@ -2978,6 +3678,7 @@ fn server_exposes_multipart_post_and_files_superglobals() {
         "multipart/form-data; boundary=BOUNDARY",
         body,
     );
+    let metrics = http_request(&address, "GET", "/__phrust/metrics");
 
     stop_child(child);
 
@@ -2989,12 +3690,25 @@ fn server_exposes_multipart_post_and_files_superglobals() {
     let moved_upload = docroot.join("moved-upload.txt");
     assert_eq!(fs::read_to_string(&moved_upload).unwrap(), "PNGDATA");
     fs::remove_file(moved_upload).expect("remove moved upload");
+    let metrics = response_body(&metrics);
+    assert!(
+        metrics.contains("phrust_server_upload_tempfiles_active 0\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phrust_server_upload_tempfile_bytes_active 0\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phrust_server_upload_bytes_written_total 7\n"),
+        "{metrics}"
+    );
     assert_eq!(fs::read_dir(&upload_temp_dir).unwrap().count(), 0);
     fs::remove_dir_all(upload_temp_dir).expect("remove upload temp dir");
 }
 
 #[test]
-fn server_rejects_malformed_multipart() {
+fn server_runs_script_with_empty_inputs_for_malformed_automatic_multipart() {
     let docroot = fixture_docroot("fixtures/server/apps/compat/public");
     let mut child = start_server(&docroot, &[]);
 
@@ -3009,15 +3723,65 @@ fn server_rejects_malformed_multipart() {
 
     stop_child(child);
 
-    assert!(
-        response.starts_with("HTTP/1.1 400 Bad Request"),
-        "{response}"
-    );
-    assert_eq!(response_body(&response), "bad multipart request\n");
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
 }
 
 #[test]
-fn server_rejects_upload_file_over_limit() {
+fn multipart_post_without_boundary_keeps_php_input_replayable() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("input.php"),
+        "<?php echo count($_POST), \" \", count($_FILES), \" \", file_get_contents(\"php://input\"), \"\\n\";",
+    )
+    .expect("write malformed multipart fixture");
+    let mut child = start_server(&docroot, &[]);
+    let address = read_listening_address(&mut child);
+    let response =
+        http_request_with_body(&address, "POST", "/input.php", "multipart/form-data", "abc");
+    stop_child(child);
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let body = response_body(&response);
+    assert!(
+        body.contains("PHP Request Startup: Missing boundary in multipart/form-data POST data"),
+        "{response}"
+    );
+    assert!(body.ends_with("0 0 abc\n"), "{response}");
+    fs::remove_dir_all(docroot).expect("remove malformed multipart docroot");
+}
+
+#[test]
+fn post_max_size_warning_keeps_oversized_post_input_replayable() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("input.php"),
+        "<?php echo count($_POST), \" \", file_get_contents(\"php://input\"), \"\\n\";",
+    )
+    .expect("write post max fixture");
+    let mut child = start_server(&docroot, &["--post-max-bytes", "4"]);
+    let address = read_listening_address(&mut child);
+    let response = http_request_with_body(
+        &address,
+        "POST",
+        "/input.php",
+        "application/x-www-form-urlencoded",
+        "a=1&b=2",
+    );
+    stop_child(child);
+
+    let body = response_body(&response);
+    assert!(
+        body.contains(
+            "PHP Request Startup: POST Content-Length of 7 bytes exceeds the limit of 4 bytes"
+        ),
+        "{response}"
+    );
+    assert!(body.ends_with("0 a=1&b=2\n"), "{response}");
+    fs::remove_dir_all(docroot).expect("remove post max docroot");
+}
+
+#[test]
+fn server_reports_upload_file_over_limit_in_files_array() {
     let docroot = fixture_docroot("fixtures/server/apps/compat/public");
     let mut child = start_server(&docroot, &["--max-upload-file-bytes", "4"]);
 
@@ -3033,11 +3797,259 @@ fn server_rejects_upload_file_over_limit() {
 
     stop_child(child);
 
-    assert!(
-        response.starts_with("HTTP/1.1 413 Payload Too Large"),
-        "{response}"
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response_body(&response).contains("error=1\n"), "{response}");
+}
+
+#[test]
+fn request_parse_body_reparses_put_without_mutating_post() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("parse.php"),
+        "<?php [$post, $files] = request_parse_body(); echo $post[\"name\"], \"\\n\"; echo count($_POST), \"\\n\"; [$again] = request_parse_body(); echo $again[\"name\"], \"\\n\";",
+    )
+    .expect("write request_parse_body fixture");
+    let mut child = start_server(&docroot, &[]);
+    let address = read_listening_address(&mut child);
+    let response = http_request_with_headers(
+        &address,
+        "PUT",
+        "/parse.php",
+        &[
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Content-Length", "10"),
+        ],
+        "name=Alice",
     );
-    assert_eq!(response_body(&response), "upload rejected\n");
+    stop_child(child);
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert_eq!(response_body(&response), "Alice\n0\nAlice\n");
+    fs::remove_dir_all(docroot).expect("remove request_parse_body docroot");
+}
+
+#[test]
+fn invalid_request_parse_body_limits_do_not_consume_the_body() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("parse.php"),
+        "<?php try { request_parse_body([\"post_max_size\" => \"64M\"]); } catch (ValueError $error) { echo \"invalid\\n\"; } [$post] = request_parse_body(); echo $post[\"name\"], \"\\n\";",
+    )
+    .expect("write request parser fixture");
+    let mut child = start_server(&docroot, &[]);
+    let address = read_listening_address(&mut child);
+    let response = http_request_with_body(
+        &address,
+        "PUT",
+        "/parse.php",
+        "application/x-www-form-urlencoded",
+        "name=Johann",
+    );
+    stop_child(child);
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert_eq!(response_body(&response), "invalid\nJohann\n", "{response}");
+    fs::remove_dir_all(docroot).expect("remove parser docroot");
+}
+
+#[test]
+fn php_input_remains_replayable_after_successful_request_parse_body() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("parse.php"),
+        "<?php [$post] = request_parse_body(); echo $post[\"a\"], \"\\n\"; echo file_get_contents(\"php://input\"), \"\\n\";",
+    )
+    .expect("write request parser fixture");
+    let mut child = start_server(&docroot, &[]);
+    let address = read_listening_address(&mut child);
+    let response = http_request_with_body(
+        &address,
+        "PUT",
+        "/parse.php",
+        "application/x-www-form-urlencoded",
+        "a=1&b=2",
+    );
+    stop_child(child);
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert_eq!(response_body(&response), "1\na=1&b=2\n", "{response}");
+    fs::remove_dir_all(docroot).expect("remove parser docroot");
+}
+
+#[test]
+fn php_input_observation_prevents_later_request_parse_body_data() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("observed.php"),
+        "<?php echo file_get_contents(\"php://input\"), \"\\n\"; [$post, $files] = request_parse_body(); echo count($post), \"\\n\";",
+    )
+    .expect("write php input observation fixture");
+    let mut child = start_server(&docroot, &[]);
+    let address = read_listening_address(&mut child);
+    let response = http_request_with_headers(
+        &address,
+        "PUT",
+        "/observed.php",
+        &[
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Content-Length", "3"),
+        ],
+        "a=1",
+    );
+    stop_child(child);
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert_eq!(response_body(&response), "a=1\n0\n");
+    fs::remove_dir_all(docroot).expect("remove php input observation docroot");
+}
+
+#[test]
+fn file_backed_php_input_cleans_spool_and_resets_active_gauges() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("input.php"),
+        "<?php echo strlen(file_get_contents(\"php://input\")), \"\\n\";",
+    )
+    .expect("write php input fixture");
+    let spool_dir = temp_docroot();
+    let spool_arg = spool_dir.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--request-body-memory-bytes",
+            "32",
+            "--request-body-temp-dir",
+            &spool_arg,
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let body = "x".repeat(4096);
+    let response = http_request_with_body(&address, "POST", "/input.php", "text/plain", &body);
+    assert_eq!(response_body(&response), "4096\n", "{response}");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let metrics = loop {
+        let metrics = http_request(&address, "GET", "/__phrust/metrics");
+        if (metrics.contains("phrust_server_request_body_tempfiles_active 0\n")
+            && metrics.contains("phrust_server_request_body_tempfile_bytes_active 0\n"))
+            || Instant::now() >= deadline
+        {
+            break metrics;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    stop_child(child);
+    let metrics = response_body(&metrics);
+    assert!(
+        metrics.contains("phrust_server_request_body_spooled_total 1\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phrust_server_request_body_tempfiles_active 0\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phrust_server_request_body_tempfile_bytes_active 0\n"),
+        "{metrics}"
+    );
+    assert_eq!(fs::read_dir(&spool_dir).expect("read spool dir").count(), 0);
+    fs::remove_dir_all(docroot).expect("remove php input docroot");
+    fs::remove_dir_all(spool_dir).expect("remove body spool dir");
+}
+
+#[test]
+fn request_body_memory_threshold_is_inclusive_and_spills_only_after_crossing() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("input.php"),
+        "<?php echo strlen(file_get_contents('php://input')), \"\\n\";",
+    )
+    .expect("write threshold fixture");
+    let spool_dir = temp_docroot();
+    let spool_arg = spool_dir.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--request-body-memory-bytes",
+            "32",
+            "--request-body-temp-dir",
+            &spool_arg,
+        ],
+    );
+    let address = read_listening_address(&mut child);
+
+    let at_limit = http_request_with_body(
+        &address,
+        "POST",
+        "/input.php",
+        "application/octet-stream",
+        &"m".repeat(32),
+    );
+    let over_limit = http_request_with_body(
+        &address,
+        "POST",
+        "/input.php",
+        "application/octet-stream",
+        &"s".repeat(33),
+    );
+    let metrics = http_request(&address, "GET", "/__phrust/metrics");
+
+    stop_child(child);
+    assert_eq!(response_body(&at_limit), "32\n", "{at_limit}");
+    assert_eq!(response_body(&over_limit), "33\n", "{over_limit}");
+    assert!(
+        metrics.contains("phrust_server_request_body_memory_total 1\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phrust_server_request_body_spooled_total 1\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phrust_server_request_body_spooled_bytes_total 33\n"),
+        "{metrics}"
+    );
+    assert_eq!(fs::read_dir(&spool_dir).expect("read spool dir").count(), 0);
+    fs::remove_dir_all(docroot).expect("remove threshold docroot");
+    fs::remove_dir_all(spool_dir).expect("remove threshold spool dir");
+}
+
+#[test]
+fn request_parse_body_streams_put_multipart_through_the_shared_parser() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("multipart.php"),
+        "<?php [$post, $files] = request_parse_body(); echo $post[\"title\"], \"\\n\"; echo $files[\"avatar\"][\"name\"], \"\\n\"; echo $files[\"avatar\"][\"error\"], \"\\n\"; echo file_get_contents($files[\"avatar\"][\"tmp_name\"]), \"\\n\"; echo count($_FILES), \"\\n\";",
+    )
+    .expect("write multipart request_parse_body fixture");
+    let upload_dir = temp_docroot();
+    let upload_arg = upload_dir.to_string_lossy().to_string();
+    let mut child = start_server(&docroot, &["--upload-temp-dir", &upload_arg]);
+    let address = read_listening_address(&mut child);
+    let body = "--BOUNDARY\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nHello\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"me.txt\"\r\nContent-Type: text/plain\r\n\r\nUPLOAD\r\n--BOUNDARY--\r\n";
+    let response = http_request_with_body(
+        &address,
+        "PUT",
+        "/multipart.php",
+        "multipart/form-data; boundary=BOUNDARY",
+        body,
+    );
+    let metrics = http_request(&address, "GET", "/__phrust/metrics");
+    stop_child(child);
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert_eq!(response_body(&response), "Hello\nme.txt\n0\nUPLOAD\n0\n");
+    let metrics = response_body(&metrics);
+    assert!(
+        metrics.contains("phrust_server_upload_tempfiles_active 0\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phrust_server_upload_tempfile_bytes_active 0\n"),
+        "{metrics}"
+    );
+    assert_eq!(
+        fs::read_dir(&upload_dir).expect("read upload dir").count(),
+        0
+    );
+    fs::remove_dir_all(docroot).expect("remove multipart parse docroot");
+    fs::remove_dir_all(upload_dir).expect("remove multipart upload dir");
 }
 
 #[test]
@@ -3578,15 +4590,32 @@ impl ProtocolResponse {
     }
 }
 
+fn assert_protocol_bodies(responses: &[ProtocolResponse; 3], expected: &[u8]) {
+    for response in responses {
+        assert_eq!(response.status, hyper::StatusCode::OK, "{response:?}");
+        assert_eq!(response.body(), expected, "{response:?}");
+    }
+}
+
 async fn protocol_request_set(
     address: &str,
     method: hyper::Method,
     path: &str,
     headers: &[(&str, &str)],
 ) -> [ProtocolResponse; 3] {
-    let h1 = http1_request(address, method.clone(), path, headers).await;
-    let h2 = http2_request(address, method.clone(), path, headers).await;
-    let h3 = http3_request(address, method, path, headers).await;
+    protocol_request_body_set(address, method, path, headers, &[]).await
+}
+
+async fn protocol_request_body_set(
+    address: &str,
+    method: hyper::Method,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> [ProtocolResponse; 3] {
+    let h1 = http1_request(address, method.clone(), path, headers, body).await;
+    let h2 = http2_request(address, method.clone(), path, headers, body).await;
+    let h3 = http3_request(address, method, path, headers, body).await;
     [h1, h2, h3]
 }
 
@@ -3595,8 +4624,9 @@ async fn http1_request(
     method: hyper::Method,
     path: &str,
     headers: &[(&str, &str)],
+    body: &[u8],
 ) -> ProtocolResponse {
-    use http_body_util::{BodyExt, Empty};
+    use http_body_util::{BodyExt, StreamBody};
     use hyper_util::rt::TokioIo;
 
     let tcp = tokio::net::TcpStream::connect(address)
@@ -3623,10 +4653,14 @@ async fn http1_request(
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
+    let request_body = bytes::Bytes::copy_from_slice(body);
+    let body_stream = futures_util::stream::once(async move {
+        Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(request_body))
+    });
     let response = sender
         .send_request(
             request
-                .body(Empty::<bytes::Bytes>::new())
+                .body(StreamBody::new(body_stream))
                 .expect("build H1 request"),
         )
         .await
@@ -3653,8 +4687,9 @@ async fn http2_request(
     method: hyper::Method,
     path: &str,
     headers: &[(&str, &str)],
+    body: &[u8],
 ) -> ProtocolResponse {
-    use http_body_util::{BodyExt, Empty};
+    use http_body_util::{BodyExt, Full};
     use hyper_util::rt::{TokioExecutor, TokioIo};
 
     let tcp = tokio::net::TcpStream::connect(address)
@@ -3685,7 +4720,7 @@ async fn http2_request(
     let response = sender
         .send_request(
             request
-                .body(Empty::<bytes::Bytes>::new())
+                .body(Full::new(bytes::Bytes::copy_from_slice(body)))
                 .expect("build H2 request"),
         )
         .await
@@ -3859,6 +4894,7 @@ async fn http3_request(
     method: hyper::Method,
     path: &str,
     headers: &[(&str, &str)],
+    body: &[u8],
 ) -> ProtocolResponse {
     use bytes::Buf;
     use quinn::crypto::rustls::QuicClientConfig;
@@ -3890,6 +4926,12 @@ async fn http3_request(
         .send_request(request.body(()).expect("build H3 request"))
         .await
         .expect("send H3 request");
+    if !body.is_empty() {
+        stream
+            .send_data(bytes::Bytes::copy_from_slice(body))
+            .await
+            .expect("send H3 request body");
+    }
     stream.finish().await.expect("finish H3 request");
     let response = stream.recv_response().await.expect("receive H3 response");
     let (parts, ()) = response.into_parts();
@@ -3964,7 +5006,8 @@ async fn abort_http3_response(address: &str, path: &str) {
 async fn wait_for_metric_value(address: &str, metric: &str, expected: u64) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let response = http2_request(address, hyper::Method::GET, "/__phrust/metrics", &[]).await;
+        let response =
+            http2_request(address, hyper::Method::GET, "/__phrust/metrics", &[], &[]).await;
         let body = String::from_utf8(response.body()).expect("metrics response is UTF-8");
         let value = body
             .lines()
@@ -4153,6 +5196,21 @@ fn http_request_with_headers(
 fn stop_child(mut child: Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn wait_for_file_contents(path: &std::path::Path, expected: &[u8], timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if fs::read(path).is_ok_and(|contents| contents == expected) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "file {} did not reach expected contents",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn send_sigint(child: &Child) {

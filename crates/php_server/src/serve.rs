@@ -7,7 +7,7 @@ use super::{
     metrics::metrics_response,
     php_request::{
         BodyReadError, PartsAndBody, execute_builtin_router_if_configured, execute_php_request,
-        read_limited_body,
+        prepare_request_data,
     },
     request_pipeline::PhpTransferCompletion,
     state::AppState,
@@ -18,7 +18,6 @@ use crate::{
     response::{self, RequestBody, ResponseBody},
     routing::{ResolvedRoute, resolve_route},
 };
-use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::{
     Method, Request, Response, StatusCode,
@@ -241,6 +240,37 @@ pub(crate) async fn handle_parts_admitted(
     peer: SocketAddr,
     admission: RequestAdmission,
 ) -> Response<ResponseBody> {
+    match validated_content_length(&parts.headers, state.request.max_body_bytes) {
+        Err(ContentLengthError::TooLarge) => {
+            state
+                .services
+                .metrics
+                .body_too_large
+                .fetch_add(1, Ordering::Relaxed);
+            state
+                .services
+                .metrics
+                .request_body_hard_limit_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            return finish_admitted_response(
+                admission,
+                state,
+                response::text(StatusCode::PAYLOAD_TOO_LARGE, "payload too large\n"),
+                "body-too-large",
+                None,
+            );
+        }
+        Err(ContentLengthError::Invalid) => {
+            return finish_admitted_response(
+                admission,
+                state,
+                response::text(StatusCode::BAD_REQUEST, "bad request\n"),
+                "bad-request",
+                None,
+            );
+        }
+        Ok(_) => {}
+    }
     let method = admission.method.clone();
     let request_id = admission.request_id.clone();
     let request_version = parts.version;
@@ -444,6 +474,40 @@ pub(crate) async fn handle_parts_admitted(
     finish_admitted_response(admission, state, response, route_kind, cache_hit)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContentLengthError {
+    Invalid,
+    TooLarge,
+}
+
+fn validated_content_length(
+    headers: &hyper::HeaderMap,
+    max_body_bytes: usize,
+) -> Result<Option<u64>, ContentLengthError> {
+    let mut parsed = None;
+    for value in headers.get_all(header::CONTENT_LENGTH) {
+        let value = value.to_str().map_err(|_| ContentLengthError::Invalid)?;
+        for item in value.split(',') {
+            let item = item.trim();
+            if item.is_empty() || !item.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(ContentLengthError::Invalid);
+            }
+            let length = item
+                .parse::<u64>()
+                .map_err(|_| ContentLengthError::Invalid)?;
+            if parsed.is_some_and(|previous| previous != length) {
+                return Err(ContentLengthError::Invalid);
+            }
+            parsed = Some(length);
+        }
+    }
+    if parsed.is_some_and(|length| length > max_body_bytes as u64) {
+        Err(ContentLengthError::TooLarge)
+    } else {
+        Ok(parsed)
+    }
+}
+
 pub(crate) fn finish_admitted_response(
     admission: RequestAdmission,
     state: Arc<AppState>,
@@ -502,9 +566,9 @@ async fn execute_builtin_router_before_normal_route(
         },
     );
     let body_started = Instant::now();
-    let body = match timeout(
+    let prepared = match timeout(
         state.request.request_timeout,
-        read_limited_body(body, state.request.max_body_bytes),
+        prepare_request_data(body, parts, &state),
     )
     .await
     {
@@ -531,7 +595,7 @@ async fn execute_builtin_router_before_normal_route(
                 "request timeout\n",
             ));
         }
-        Ok(Ok(body)) => body,
+        Ok(Ok(prepared)) => prepared,
         Ok(Err(BodyReadError::TooLarge)) => {
             state
                 .services
@@ -577,6 +641,17 @@ async fn execute_builtin_router_before_normal_route(
             );
             return Some(response::text(StatusCode::BAD_REQUEST, "bad request\n"));
         }
+        Ok(Err(BodyReadError::Internal)) => {
+            warn!(%peer, "request body temporary storage failed");
+            state.services.metrics.record_phase(
+                super::metrics::RequestPhase::BodyRead,
+                body_started.elapsed().as_nanos(),
+            );
+            return Some(response::text(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "body storage failed\n",
+            ));
+        }
     };
     state.services.metrics.record_phase(
         super::metrics::RequestPhase::BodyRead,
@@ -588,9 +663,18 @@ async fn execute_builtin_router_before_normal_route(
         "D_PHRUST_SERVER_BODY_READ_END",
         "body_read",
         "request body read completed",
-        || BTreeMap::from([("body_bytes".to_string(), body.len().to_string())]),
+        || BTreeMap::from([("body_bytes".to_string(), prepared.body.len().to_string())]),
     );
-    execute_builtin_router_if_configured(parts, state, body, peer, request_id, None).await
+    execute_builtin_router_if_configured(
+        parts,
+        state,
+        prepared.body,
+        prepared.parsed,
+        peer,
+        request_id,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn clear_cache_response(
@@ -617,6 +701,7 @@ pub(crate) async fn clear_cache_response(
     }
     response::text(StatusCode::OK, "cache cleared\n")
 }
+
 pub(crate) fn method_not_allowed(allow: &'static str) -> Response<ResponseBody> {
     let mut response = response::text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n");
     response
@@ -638,6 +723,29 @@ pub(crate) fn incoming_request_body(body: Incoming) -> RequestBody {
         .boxed()
 }
 
-pub(crate) fn bytes_request_body(body: Bytes) -> RequestBody {
-    response::request_body_from_bytes(body)
+#[cfg(test)]
+mod body_limit_tests {
+    use super::{ContentLengthError, validated_content_length};
+    use hyper::{HeaderMap, header};
+
+    #[test]
+    fn content_length_rejects_invalid_conflicting_and_over_limit_values() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::CONTENT_LENGTH, "12".parse().unwrap());
+        headers.append(header::CONTENT_LENGTH, "12".parse().unwrap());
+        assert_eq!(validated_content_length(&headers, 32), Ok(Some(12)));
+
+        headers.append(header::CONTENT_LENGTH, "13".parse().unwrap());
+        assert_eq!(
+            validated_content_length(&headers, 32),
+            Err(ContentLengthError::Invalid)
+        );
+
+        let mut oversized = HeaderMap::new();
+        oversized.insert(header::CONTENT_LENGTH, "33554433".parse().unwrap());
+        assert_eq!(
+            validated_content_length(&oversized, 32 * 1024 * 1024),
+            Err(ContentLengthError::TooLarge)
+        );
+    }
 }

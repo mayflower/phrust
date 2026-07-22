@@ -12,10 +12,10 @@ pub use result::VmResult;
 
 use crate::compiled_unit::CompiledUnit;
 use jit_abi::{
-    NativeExecutionContext, activate_native_context, jit_native_argument_check_abi,
-    jit_native_array_fetch_abi, jit_native_array_insert_abi, jit_native_array_insert_local_abi,
-    jit_native_array_new_abi, jit_native_array_spread_abi, jit_native_array_unset_abi,
-    jit_native_binary_abi, jit_native_builtin_dispatch_abi,
+    NativeExecutionContext, activate_native_context, emit_native_php_startup_warning,
+    jit_native_argument_check_abi, jit_native_array_fetch_abi, jit_native_array_insert_abi,
+    jit_native_array_insert_local_abi, jit_native_array_new_abi, jit_native_array_spread_abi,
+    jit_native_array_unset_abi, jit_native_binary_abi, jit_native_builtin_dispatch_abi,
     jit_native_builtin_dispatch_diagnostic_abi, jit_native_call_dispatch_abi,
     jit_native_call_dispatch_diagnostic_abi, jit_native_cast_abi, jit_native_compare_abi,
     jit_native_constant_fetch_abi, jit_native_dynamic_code_abi, jit_native_echo_abi,
@@ -1051,6 +1051,13 @@ impl Vm {
             output,
             native_entries,
         );
+        let startup_warnings = match &self.options.runtime_context.request_mode {
+            php_runtime::api::RuntimeRequestMode::Http(request) => request.startup_warnings.clone(),
+            php_runtime::api::RuntimeRequestMode::Cli => Vec::new(),
+        };
+        for warning in startup_warnings {
+            emit_native_php_startup_warning(&mut context, &warning);
+        }
         context.attach_root_deployment_image(unit.clone());
         let native_execution_started_at =
             self.options.collect_counters.then(std::time::Instant::now);
@@ -1118,6 +1125,7 @@ impl Vm {
         });
         let mut http_response = std::mem::take(&mut context.http_response);
         let upload_registry = std::mem::take(&mut context.upload_registry);
+        context.sync_session_state_from_global();
         let session = std::mem::take(&mut context.session);
         let process_exit_terminates_process = context.process_exit_terminates_process();
         let mut result = if let Some(throwable) = shutdown_throwable {

@@ -1,13 +1,13 @@
 //! Resource handles and stream metadata for standard-library.
 
-use crate::{ArrayKey, PhpArray, PhpString, Value};
+use crate::{ArrayKey, PhpArray, PhpString, RuntimeRequestBody, Value};
 use flate2::Compression;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use flate2::write::{GzEncoder, ZlibEncoder};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
@@ -347,7 +347,7 @@ impl StreamWrapperRegistry {
         mode: &str,
         cwd: &Path,
         capabilities: &FilesystemCapabilities,
-        php_input: &[u8],
+        php_input: &RuntimeRequestBody,
     ) -> Result<ResourceRef, StreamOpenError> {
         let parsed_mode = StreamOpenMode::parse(mode)?;
         if is_remote_uri(uri) {
@@ -425,6 +425,16 @@ enum StreamData {
         buffer: Vec<u8>,
         cursor: usize,
     },
+    ArcBytes {
+        buffer: std::sync::Arc<[u8]>,
+        body: RuntimeRequestBody,
+        cursor: usize,
+    },
+    ReadOnlyFile {
+        body: RuntimeRequestBody,
+        cursor: usize,
+        length: usize,
+    },
     File {
         path: PathBuf,
         buffer: Vec<u8>,
@@ -459,6 +469,39 @@ enum StreamData {
         mode: StreamFilterMode,
         name: String,
     },
+}
+
+fn stream_seek_target(
+    cursor: usize,
+    length: usize,
+    offset: i64,
+    whence: StreamSeekWhence,
+) -> Result<usize, StreamOpenError> {
+    let base = match whence {
+        StreamSeekWhence::Set => 0_i64,
+        StreamSeekWhence::Current => cursor.try_into().map_err(|_| {
+            StreamOpenError::new(
+                "E_PHP_RUNTIME_STREAM_SEEK",
+                "stream cursor is outside supported range",
+            )
+        })?,
+        StreamSeekWhence::End => length.try_into().map_err(|_| {
+            StreamOpenError::new(
+                "E_PHP_RUNTIME_STREAM_SEEK",
+                "stream length is outside supported range",
+            )
+        })?,
+    };
+    let target = base.checked_add(offset).ok_or_else(|| {
+        StreamOpenError::new("E_PHP_RUNTIME_STREAM_SEEK", "stream seek offset overflowed")
+    })?;
+    if target < 0 {
+        return Err(StreamOpenError::new(
+            "E_PHP_RUNTIME_STREAM_SEEK",
+            "stream seek offset is negative",
+        ));
+    }
+    Ok(target as usize)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -606,6 +649,8 @@ impl ResourceRef {
                 ));
             }
             StreamData::Directory { .. }
+            | StreamData::ArcBytes { .. }
+            | StreamData::ReadOnlyFile { .. }
             | StreamData::Context { .. }
             | StreamData::FileInfo { .. }
             | StreamData::SocketServer { .. }
@@ -637,6 +682,43 @@ impl ResourceRef {
         }
         let filters = state.read_filters.clone();
         let bytes = match &mut state.data {
+            StreamData::ArcBytes {
+                buffer,
+                body,
+                cursor,
+            } => {
+                if *cursor >= buffer.len() {
+                    Ok(Vec::new())
+                } else {
+                    let end = cursor.saturating_add(length).min(buffer.len());
+                    let bytes = buffer[*cursor..end].to_vec();
+                    *cursor = end;
+                    if !bytes.is_empty() {
+                        body.mark_raw_observed();
+                    }
+                    Ok(bytes)
+                }
+            }
+            StreamData::ReadOnlyFile { body, cursor, .. } => {
+                let mut reader = body.independent_reader().map_err(|error| {
+                    StreamOpenError::new("E_PHP_RUNTIME_STREAM_READ", error.to_string())
+                })?;
+                reader
+                    .seek(SeekFrom::Start(*cursor as u64))
+                    .map_err(|error| {
+                        StreamOpenError::new("E_PHP_RUNTIME_STREAM_SEEK", error.to_string())
+                    })?;
+                let mut bytes = vec![0; length];
+                let read = reader.read(&mut bytes).map_err(|error| {
+                    StreamOpenError::new("E_PHP_RUNTIME_STREAM_READ", error.to_string())
+                })?;
+                bytes.truncate(read);
+                *cursor = cursor.saturating_add(read);
+                if read > 0 {
+                    body.mark_raw_observed();
+                }
+                Ok(bytes)
+            }
             StreamData::Memory { buffer, cursor }
             | StreamData::Stdio { buffer, cursor }
             | StreamData::File { buffer, cursor, .. }
@@ -684,6 +766,42 @@ impl ResourceRef {
         }
         let filters = state.read_filters.clone();
         let bytes = match &mut state.data {
+            StreamData::ArcBytes {
+                buffer,
+                body,
+                cursor,
+            } => {
+                let remaining = &buffer[*cursor..];
+                let len = php_source::byte_kernel::find_byte(remaining, b'\n')
+                    .map_or(remaining.len(), |index| index + 1);
+                let end = *cursor + len;
+                let bytes = buffer[*cursor..end].to_vec();
+                *cursor = end;
+                if !bytes.is_empty() {
+                    body.mark_raw_observed();
+                }
+                Ok(bytes)
+            }
+            StreamData::ReadOnlyFile { body, cursor, .. } => {
+                let mut reader = body.independent_reader().map_err(|error| {
+                    StreamOpenError::new("E_PHP_RUNTIME_STREAM_READ", error.to_string())
+                })?;
+                reader
+                    .seek(SeekFrom::Start(*cursor as u64))
+                    .map_err(|error| {
+                        StreamOpenError::new("E_PHP_RUNTIME_STREAM_SEEK", error.to_string())
+                    })?;
+                let mut reader = io::BufReader::new(reader);
+                let mut bytes = Vec::new();
+                reader.read_until(b'\n', &mut bytes).map_err(|error| {
+                    StreamOpenError::new("E_PHP_RUNTIME_STREAM_READ", error.to_string())
+                })?;
+                *cursor = cursor.saturating_add(bytes.len());
+                if !bytes.is_empty() {
+                    body.mark_raw_observed();
+                }
+                Ok(bytes)
+            }
             StreamData::Memory { buffer, cursor }
             | StreamData::Stdio { buffer, cursor }
             | StreamData::File { buffer, cursor, .. }
@@ -732,6 +850,41 @@ impl ResourceRef {
         }
         let filters = state.read_filters.clone();
         let bytes = match &mut state.data {
+            StreamData::ArcBytes {
+                buffer,
+                body,
+                cursor,
+            } => {
+                let bytes = buffer.get(*cursor..).unwrap_or_default().to_vec();
+                *cursor = buffer.len();
+                if !bytes.is_empty() {
+                    body.mark_raw_observed();
+                }
+                Ok(bytes)
+            }
+            StreamData::ReadOnlyFile {
+                body,
+                cursor,
+                length,
+            } => {
+                let mut reader = body.independent_reader().map_err(|error| {
+                    StreamOpenError::new("E_PHP_RUNTIME_STREAM_READ", error.to_string())
+                })?;
+                reader
+                    .seek(SeekFrom::Start(*cursor as u64))
+                    .map_err(|error| {
+                        StreamOpenError::new("E_PHP_RUNTIME_STREAM_SEEK", error.to_string())
+                    })?;
+                let mut bytes = Vec::with_capacity(length.saturating_sub(*cursor));
+                reader.read_to_end(&mut bytes).map_err(|error| {
+                    StreamOpenError::new("E_PHP_RUNTIME_STREAM_READ", error.to_string())
+                })?;
+                *cursor = *length;
+                if !bytes.is_empty() {
+                    body.mark_raw_observed();
+                }
+                Ok(bytes)
+            }
             StreamData::Memory { buffer, cursor }
             | StreamData::Stdio { buffer, cursor }
             | StreamData::File { buffer, cursor, .. }
@@ -785,6 +938,12 @@ impl ResourceRef {
             ));
         }
         match &mut state.data {
+            StreamData::ArcBytes { buffer, cursor, .. } => {
+                *cursor = stream_seek_target(*cursor, buffer.len(), offset, whence)?;
+            }
+            StreamData::ReadOnlyFile { cursor, length, .. } => {
+                *cursor = stream_seek_target(*cursor, *length, offset, whence)?;
+            }
             StreamData::Memory { buffer, cursor }
             | StreamData::Stdio { buffer, cursor }
             | StreamData::File { buffer, cursor, .. }
@@ -867,6 +1026,8 @@ impl ResourceRef {
                 ));
             }
             StreamData::Directory { .. }
+            | StreamData::ArcBytes { .. }
+            | StreamData::ReadOnlyFile { .. }
             | StreamData::Context { .. }
             | StreamData::FileInfo { .. }
             | StreamData::SocketServer { .. }
@@ -890,6 +1051,9 @@ impl ResourceRef {
             ));
         }
         Ok(match &state.data {
+            StreamData::ArcBytes { cursor, .. } | StreamData::ReadOnlyFile { cursor, .. } => {
+                *cursor
+            }
             StreamData::Memory { cursor, .. }
             | StreamData::Stdio { cursor, .. }
             | StreamData::File { cursor, .. }
@@ -913,6 +1077,8 @@ impl ResourceRef {
             ));
         }
         Ok(match &state.data {
+            StreamData::ArcBytes { buffer, cursor, .. } => *cursor >= buffer.len(),
+            StreamData::ReadOnlyFile { cursor, length, .. } => *cursor >= *length,
             StreamData::Memory { buffer, cursor }
             | StreamData::Stdio { buffer, cursor }
             | StreamData::File { buffer, cursor, .. }
@@ -1398,7 +1564,7 @@ fn open_php_stream(
     mode: &str,
     parsed_mode: StreamOpenMode,
     capabilities: &FilesystemCapabilities,
-    php_input: &[u8],
+    php_input: &RuntimeRequestBody,
 ) -> Result<ResourceRef, StreamOpenError> {
     match target {
         "memory" | "temp" => Ok(table.register_stream_data(
@@ -1421,13 +1587,34 @@ fn open_php_stream(
                     "php://input is read-only",
                 ));
             }
+            if !php_input.is_available() {
+                return Err(StreamOpenError::new(
+                    "E_PHP_RUNTIME_STREAM_UNAVAILABLE",
+                    "php://input is unavailable for this request",
+                ));
+            }
+            let data = if let Some(bytes) = php_input.memory_bytes() {
+                StreamData::ArcBytes {
+                    buffer: bytes,
+                    body: php_input.clone(),
+                    cursor: 0,
+                }
+            } else {
+                StreamData::ReadOnlyFile {
+                    body: php_input.clone(),
+                    cursor: 0,
+                    length: usize::try_from(php_input.len()).map_err(|_| {
+                        StreamOpenError::new(
+                            "E_PHP_RUNTIME_STREAM_OPEN",
+                            "request body length exceeds platform limits",
+                        )
+                    })?,
+                }
+            };
             Ok(table.register_stream_data(
                 StreamFlags::new(true, false, true),
                 StreamMetadata::new("PHP", "stream", "r", "php://input"),
-                StreamData::Memory {
-                    buffer: php_input.to_vec(),
-                    cursor: 0,
-                },
+                data,
             ))
         }
         "stdin" => {
@@ -1748,6 +1935,7 @@ mod tests {
         FilesystemCapabilities, ResourceKind, ResourceTable, StreamFlags, StreamMetadata,
         StreamSeekWhence, StreamWrapperRegistry,
     };
+    use crate::context::RuntimeRequestBody;
     use std::path::Path;
 
     #[test]
@@ -1798,7 +1986,14 @@ mod tests {
 
         for uri in ["php://memory", "php://temp"] {
             let resource = registry
-                .open(&mut table, uri, "w+", Path::new("."), &capabilities, &[])
+                .open(
+                    &mut table,
+                    uri,
+                    "w+",
+                    Path::new("."),
+                    &capabilities,
+                    &RuntimeRequestBody::empty(),
+                )
                 .expect("php memory/temp opens");
             assert_eq!(resource.metadata().wrapper_type, "PHP");
             assert_eq!(resource.metadata().mode, "w+b");
@@ -1822,7 +2017,7 @@ mod tests {
                 "rb",
                 Path::new("."),
                 &capabilities,
-                b"name=phrust",
+                &RuntimeRequestBody::from(b"name=phrust".to_vec()),
             )
             .expect("php input opens");
 
@@ -1842,7 +2037,7 @@ mod tests {
                 "w+",
                 Path::new("."),
                 &capabilities,
-                &[],
+                &RuntimeRequestBody::empty(),
             )
             .expect("php memory opens");
 
@@ -1888,7 +2083,7 @@ mod tests {
                 "rb",
                 Path::new("."),
                 &capabilities,
-                &[],
+                &RuntimeRequestBody::empty(),
             )
             .expect("enabled zero device opens");
         zero.seek_from(1024 * 1024, StreamSeekWhence::Set)
@@ -1903,7 +2098,7 @@ mod tests {
             "rb",
             Path::new("."),
             &FilesystemCapabilities::none(),
-            &[],
+            &RuntimeRequestBody::empty(),
         );
         assert_eq!(
             denied
@@ -1926,7 +2121,14 @@ mod tests {
         let mut table = ResourceTable::new();
 
         let implicit = registry
-            .open(&mut table, "fixture.txt", "r", &root, &capabilities, &[])
+            .open(
+                &mut table,
+                "fixture.txt",
+                "r",
+                &root,
+                &capabilities,
+                &RuntimeRequestBody::empty(),
+            )
             .expect("implicit file wrapper opens inside root");
         assert_eq!(implicit.metadata().wrapper_type, "plainfile");
         assert_eq!(implicit.read_to_end().expect("read file"), b"fixture");
@@ -1938,7 +2140,7 @@ mod tests {
                 "r",
                 Path::new("."),
                 &capabilities,
-                &[],
+                &RuntimeRequestBody::empty(),
             )
             .expect("file:// wrapper opens inside root");
         assert_eq!(explicit.read_to_end().expect("read file://"), b"fixture");
@@ -1955,7 +2157,7 @@ mod tests {
                 "r",
                 Path::new("."),
                 &capabilities,
-                &[],
+                &RuntimeRequestBody::empty(),
             )
             .expect_err("outside root is rejected");
         assert_eq!(error.diagnostic_id(), "E_PHP_FILESYSTEM_CAPABILITY_DENIED");
@@ -1978,7 +2180,7 @@ mod tests {
                 "r",
                 Path::new("."),
                 &capabilities,
-                &[],
+                &RuntimeRequestBody::empty(),
             )
             .expect_err("remote streams are disabled");
         assert_eq!(remote.diagnostic_id(), "E_PHP_STREAM_WRAPPER_UNSUPPORTED");
@@ -1990,7 +2192,7 @@ mod tests {
                 "w",
                 Path::new("."),
                 &capabilities,
-                &[],
+                &RuntimeRequestBody::empty(),
             )
             .expect_err("stdio is disabled without capability");
         assert_eq!(stdio.diagnostic_id(), "E_PHP_FILESYSTEM_CAPABILITY_DENIED");
@@ -2002,7 +2204,7 @@ mod tests {
                 "w",
                 Path::new("."),
                 &FilesystemCapabilities::none().with_stdio(true),
-                &[],
+                &RuntimeRequestBody::empty(),
             )
             .expect("stdio opens with explicit capability");
         assert_eq!(stdout.flags(), StreamFlags::new(false, true, false));

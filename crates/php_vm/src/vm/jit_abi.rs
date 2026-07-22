@@ -17,6 +17,7 @@ mod dynamic_units;
 mod frame_arena;
 mod internal_classes;
 mod native_builtins;
+pub(super) use native_builtins::emit_native_php_startup_warning;
 mod object_support;
 mod request_state;
 mod root_index;
@@ -820,6 +821,12 @@ impl<'a> NativeExecutionContext<'a> {
 
     pub(super) const fn process_exit_terminates_process(&self) -> bool {
         self.registered_extensions.is_fork_child()
+    }
+
+    pub(super) fn sync_session_state_from_global(&mut self) {
+        if let Value::Array(data) = self.session_global.get() {
+            self.session.set_data(data);
+        }
     }
 
     pub(super) fn new(

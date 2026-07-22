@@ -26,7 +26,7 @@ use php_executor::{
 use php_vm::api::VmError;
 use std::{
     collections::BTreeMap,
-    fmt,
+    fmt, fs,
     path::Path,
     sync::{
         Arc,
@@ -246,6 +246,8 @@ impl From<std::io::Error> for ServerError {
 
 pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let docroot = config.validated_docroot()?;
+    prepare_private_temp_root(&config.limits.request_body_temp_dir)?;
+    prepare_private_temp_root(&config.sessions_uploads.upload_temp_dir)?;
     let script_cache_preload = config.engine.script_cache_preload.clone();
     let strict_preload = config.engine.strict_preload;
     let startup_front_controller = config.routing.front_controller.clone();
@@ -285,7 +287,10 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         .map(crate::request_profile::RequestProfileWriter::open)
         .transpose()?
         .map(Arc::new);
-    let session_store = Arc::new(SessionStore::new(config.sessions_uploads.session_save_path));
+    let session_store = Arc::new(SessionStore::with_lock_timeout(
+        config.sessions_uploads.session_save_path.clone(),
+        Duration::from_millis(config.sessions_uploads.session_lock_timeout_ms),
+    ));
     if config.sessions_uploads.sessions_enabled {
         session_store
             .ensure_ready()
@@ -371,10 +376,20 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         static_files,
         request: RequestRuntimeConfig {
             max_body_bytes: config.limits.max_body_bytes,
+            post_max_bytes: config.limits.post_max_bytes,
+            request_body_memory_bytes: config.limits.request_body_memory_bytes,
+            request_body_temp_dir: config.limits.request_body_temp_dir,
+            enable_post_data_reading: config.limits.enable_post_data_reading,
             multipart_config: MultipartConfig {
                 upload_temp_dir: config.sessions_uploads.upload_temp_dir,
+                max_body_bytes: config.limits.max_body_bytes,
+                post_max_bytes: config.limits.post_max_bytes,
                 max_upload_files: config.sessions_uploads.max_upload_files,
                 max_upload_file_bytes: config.sessions_uploads.max_upload_file_bytes,
+                max_multipart_parts: config.sessions_uploads.max_multipart_parts,
+                max_input_vars: config.sessions_uploads.max_input_vars,
+                file_uploads: config.sessions_uploads.file_uploads,
+                throw_limit_errors: false,
             },
             request_timeout: Duration::from_millis(config.limits.request_timeout_ms),
             execution_time_limit: config
@@ -411,7 +426,18 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
             config: SessionConfig {
                 enabled: config.sessions_uploads.sessions_enabled,
                 cookie_name: config.sessions_uploads.session_cookie_name,
+                serialize_handler: config.sessions_uploads.session_serialize_handler,
+                use_strict_mode: config.sessions_uploads.session_use_strict_mode,
+                cookie_lifetime: config.sessions_uploads.session_cookie_lifetime,
                 cookie_path: config.sessions_uploads.session_cookie_path,
+                cookie_domain: config.sessions_uploads.session_cookie_domain,
+                cookie_secure: config.sessions_uploads.session_cookie_secure,
+                cookie_httponly: config.sessions_uploads.session_cookie_httponly,
+                cookie_samesite: config.sessions_uploads.session_cookie_samesite,
+                cookie_partitioned: config.sessions_uploads.session_cookie_partitioned,
+                use_cookies: config.sessions_uploads.session_use_cookies,
+                use_only_cookies: config.sessions_uploads.session_use_only_cookies,
+                save_path: config.sessions_uploads.session_save_path,
             },
             session_store,
         },
@@ -424,6 +450,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
             metrics,
             engine,
             request_counter: Arc::new(AtomicU64::new(0)),
+            tokio_handle: tokio::runtime::Handle::current(),
         },
     });
     preload_script_cache(&state, script_cache_preload.as_deref(), strict_preload)?;
@@ -481,6 +508,33 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
             .load(Ordering::Relaxed),
     );
     serve_until_shutdown(listener, state, tls_acceptor, http3_endpoint).await;
+    Ok(())
+}
+
+fn prepare_private_temp_root(path: &Path) -> Result<(), ServerError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(ServerError::Io(std::io::Error::other(format!(
+                    "temporary root `{}` must be a real directory, not a symlink",
+                    path.display()
+                ))));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        Err(error) => return Err(ServerError::Io(error)),
+    }
+    let probe = tempfile::Builder::new()
+        .prefix(".phrust-probe-")
+        .tempfile_in(path)?;
+    drop(probe);
     Ok(())
 }
 

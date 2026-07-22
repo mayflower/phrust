@@ -37,6 +37,7 @@ fi
 ./configure \
   --disable-all \
   --enable-cli \
+  --enable-session \
   --enable-tokenizer \
   --enable-debug \
   2>&1 | tee "../../$LOG_DIR/configure.log"
@@ -48,6 +49,8 @@ sapi/cli/php -v
 sapi/cli/php -m
 sapi/cli/php -r 'echo PHP_VERSION, "\n";'
 sapi/cli/php -r 'var_export(function_exists("token_get_all")); echo "\n";'
+sapi/cli/php -r 'var_export(function_exists("request_parse_body")); echo "\n";'
+sapi/cli/php -r 'var_export(extension_loaded("session")); echo "\n";'
 
 popd >/dev/null
 

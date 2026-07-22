@@ -264,6 +264,16 @@ verify-server:
       cargo test -p php_executor -p php_server
     fi
     just server-smoke
+    just server-request-input-smoke
+    just server-session-files-smoke
+
+server-request-input-smoke:
+    cargo build -p php_server --bin phrust-server
+    REFERENCE_PHP="${REFERENCE_PHP:-$PWD/third_party/php-src/sapi/cli/php}" scripts/server/request_input_smoke.py
+
+server-session-files-smoke:
+    cargo build -p php_server --bin phrust-server
+    REFERENCE_PHP="${REFERENCE_PHP:-$PWD/third_party/php-src/sapi/cli/php}" scripts/server/session_files_smoke.py
 
 server-compat-smoke SECTION="all":
     scripts/server/compat_smoke.sh {{SECTION}}

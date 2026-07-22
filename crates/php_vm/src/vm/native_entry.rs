@@ -101,6 +101,7 @@ impl Vm {
 
         let mut http_response = std::mem::take(&mut context.http_response);
         let upload_registry = std::mem::take(&mut context.upload_registry);
+        context.sync_session_state_from_global();
         let session = std::mem::take(&mut context.session);
         let process_exit_terminates_process = context.process_exit_terminates_process();
         let mut result = if let Some(throwable) = shutdown_throwable {

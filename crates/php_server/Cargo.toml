@@ -13,6 +13,7 @@ path = "src/main.rs"
 base64 = "0.22"
 bytes = "1"
 cap-std = "4.0.2"
+cap-primitives = "4.0.2"
 futures-util = "0.3"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
@@ -21,7 +22,9 @@ httpdate = "1"
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "http2", "server", "tokio"] }
 mimalloc = "0.1.52"
+mime = "0.3"
 mime_guess = "2.0.5"
+multer.workspace = true
 php_executor = { path = "../php_executor", version = "0.0.0", default-features = false }
 php_diagnostics = { path = "../php_diagnostics", version = "0.0.0" }
 php_runtime = { path = "../php_runtime", version = "0.0.0", default-features = false, features = ["full-runtime"] }
@@ -32,6 +35,8 @@ serde_json = "1"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["io"] }
+tempfile.workspace = true
+getrandom.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

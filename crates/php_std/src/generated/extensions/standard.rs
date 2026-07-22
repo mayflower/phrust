@@ -2219,6 +2219,14 @@ const FUNCTIONS: &[FunctionDescriptor] = &[
         false,
     ),
     FunctionDescriptor::generated(
+        "request_parse_body",
+        "standard",
+        SymbolVisibility::PhpVisible,
+        Some("core"),
+        None,
+        false,
+    ),
+    FunctionDescriptor::generated(
         "reset",
         "standard",
         SymbolVisibility::PhpVisible,

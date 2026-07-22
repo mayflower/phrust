@@ -1,10 +1,63 @@
 use crate::{
-    multipart::cleanup_uploaded_files, perf_trace::PerfTraceEvent, response::ResponseBody,
-    sessions::finalize_session_state, state::AppState,
+    perf_trace::PerfTraceEvent, response::ResponseBody, sessions::SessionRequestCallbacks,
 };
 use hyper::Response;
 use php_executor::PhpExecutionOutput;
-use php_runtime::api::RuntimeUploadedFile;
+use std::sync::{Arc, Weak, atomic::Ordering};
+
+#[derive(Debug, Default)]
+pub(crate) struct RequestUploadSet {
+    temp_paths: Vec<tempfile::TempPath>,
+    bytes: u64,
+    metrics: Option<Weak<crate::metrics::ServerMetrics>>,
+}
+
+impl RequestUploadSet {
+    pub(crate) fn with_metrics(metrics: &Arc<crate::metrics::ServerMetrics>) -> Self {
+        Self {
+            temp_paths: Vec::new(),
+            bytes: 0,
+            metrics: Some(Arc::downgrade(metrics)),
+        }
+    }
+
+    pub(crate) fn push(&mut self, path: tempfile::TempPath) {
+        self.temp_paths.push(path);
+        if let Some(metrics) = self.metrics.as_ref().and_then(Weak::upgrade) {
+            metrics
+                .upload_tempfiles_active
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn add_bytes(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+        if let Some(metrics) = self.metrics.as_ref().and_then(Weak::upgrade) {
+            metrics
+                .upload_tempfile_bytes_active
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.temp_paths.len()
+    }
+}
+
+impl Drop for RequestUploadSet {
+    fn drop(&mut self) {
+        if let Some(metrics) = self.metrics.as_ref().and_then(Weak::upgrade) {
+            metrics
+                .upload_tempfiles_active
+                .fetch_sub(self.temp_paths.len() as u64, Ordering::Relaxed);
+            metrics
+                .upload_tempfile_bytes_active
+                .fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestStage {
@@ -32,14 +85,19 @@ impl RequestStage {
 /// Owns request-local cleanup until execution transfers it to the runtime
 /// output or exits through an error path.
 pub(crate) struct RequestCleanup {
-    uploads: Vec<RuntimeUploadedFile>,
+    _uploads: Arc<RequestUploadSet>,
+    sessions: Option<SessionRequestCallbacks>,
     armed: bool,
 }
 
 impl RequestCleanup {
-    pub(crate) fn new(uploads: Vec<RuntimeUploadedFile>) -> Self {
+    pub(crate) fn new(
+        uploads: Arc<RequestUploadSet>,
+        sessions: Option<SessionRequestCallbacks>,
+    ) -> Self {
         Self {
-            uploads,
+            _uploads: uploads,
+            sessions,
             armed: true,
         }
     }
@@ -47,19 +105,19 @@ impl RequestCleanup {
     pub(crate) fn finalize_output(
         mut self,
         output: &mut PhpExecutionOutput,
-        state: &AppState,
+        _state: &crate::state::AppState,
     ) -> Result<(), String> {
         output.upload_registry.cleanup_unmoved();
         self.armed = false;
-        finalize_session_state(output, state)
+        self.sessions
+            .as_ref()
+            .map_or(Ok(()), |sessions| sessions.finalize(output))
     }
 }
 
 impl Drop for RequestCleanup {
     fn drop(&mut self) {
-        if self.armed {
-            cleanup_uploaded_files(&self.uploads);
-        }
+        let _ = self.armed;
     }
 }
 
@@ -115,7 +173,6 @@ impl RequestOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn request_stage_names_are_stable_and_distinct() {
@@ -135,24 +192,16 @@ mod tests {
 
     #[test]
     fn dropped_request_cleanup_removes_uploaded_temp_files() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "phrust-request-cleanup-{}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::write(&path, b"upload").expect("write upload fixture");
+        let named = tempfile::Builder::new()
+            .prefix("phrust-request-cleanup-")
+            .tempfile_in(std::env::temp_dir())
+            .expect("create upload fixture");
+        std::fs::write(named.path(), b"upload").expect("write upload fixture");
+        let path = named.path().to_path_buf();
+        let mut uploads = RequestUploadSet::default();
+        uploads.push(named.into_temp_path());
         {
-            let _cleanup = RequestCleanup::new(vec![RuntimeUploadedFile {
-                field_name: "file".to_string(),
-                client_filename: "fixture.txt".to_string(),
-                content_type: "text/plain".to_string(),
-                temp_path: path.to_string_lossy().into_owned(),
-                error: 0,
-                size: 6,
-            }]);
+            let _cleanup = RequestCleanup::new(Arc::new(uploads), None);
         }
         assert!(!path.exists());
     }
