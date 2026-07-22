@@ -1216,7 +1216,7 @@ fn execute_native_iterator_to_array(
     if native_method_in_hierarchy(context, &class_name, "getIterator").is_some()
         || native_external_method(context, &class_name, "getIterator").is_some()
     {
-        let encoded = invoke_native_bound_method(
+        let encoded = invoke_baseline_native_bound_method(
             context,
             &php_runtime::api::CallableMethodTarget::Object(iterator.clone()),
             "getIterator",
@@ -1253,7 +1253,7 @@ fn execute_native_iterator_to_array(
             return Err("iterator_to_array() requires a supported Traversable object".to_owned());
         }
         let invoke = |context: &mut NativeRequestColdState<'_>, method: &str| {
-            let encoded = invoke_native_bound_method(
+            let encoded = invoke_baseline_native_bound_method(
                 context,
                 &php_runtime::api::CallableMethodTarget::Object(iterator.clone()),
                 method,
@@ -2187,6 +2187,11 @@ pub(super) fn execute_native_call_user_func_encoded(
     {
         return Err(NativeCallControl::BaselineRequired);
     }
+    if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline
+        && !authoritative_native_call_arguments_are_admitted(context, arguments, None)
+    {
+        return Err(NativeCallControl::BaselineRequired);
+    }
     let mut encoded = std::mem::take(&mut context.native_call_encoded_scratch);
     encoded.clear();
     encoded.reserve(arguments.len());
@@ -2212,7 +2217,13 @@ pub(super) fn execute_native_call_user_func_encoded(
                 ),
                 source,
             )?;
-            let payload = context.duplicate_dereferenced_native_value(value)?;
+            let payload = if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
+                context
+                    .duplicate_authoritative_dereferenced_native_value(value)?
+                    .ok_or(NativeCallControl::BaselineRequired)?
+            } else {
+                context.duplicate_dereferenced_native_value(value)?
+            };
             let reference = match context.encode_direct_reference_payload_owned(payload) {
                 Ok(reference) => reference,
                 Err(error) => {
@@ -2261,6 +2272,14 @@ pub(super) fn execute_native_call_user_func_array_direct(
         return Some(Err(NativeCallControl::BaselineRequired));
     }
     let entries = context.direct_array_entries_for(arguments)?.to_vec();
+    if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline
+        && (!authoritative_native_call_value_is_admitted(context, callback)
+            || entries
+                .iter()
+                .any(|entry| !authoritative_native_call_value_is_admitted(context, entry.value)))
+    {
+        return Some(Err(NativeCallControl::BaselineRequired));
+    }
     let mut encoded = std::mem::take(&mut context.native_call_encoded_scratch);
     encoded.clear();
     encoded.reserve(entries.len() + 1);
@@ -2284,7 +2303,13 @@ pub(super) fn execute_native_call_user_func_array_direct(
                     ),
                     source,
                 )?;
-                let payload = context.duplicate_dereferenced_native_value(encoded_value)?;
+                let payload = if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
+                    context
+                        .duplicate_authoritative_dereferenced_native_value(encoded_value)?
+                        .ok_or(NativeCallControl::BaselineRequired)?
+                } else {
+                    context.duplicate_dereferenced_native_value(encoded_value)?
+                };
                 encoded_value = match context.encode_direct_reference_payload_owned(payload) {
                     Ok(reference) => reference,
                     Err(error) => {

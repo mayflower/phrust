@@ -26,6 +26,59 @@ struct NativeSuppliedCallArgument {
     value: i64,
 }
 
+pub(super) fn authoritative_native_call_value_is_admitted(
+    context: &NativeRequestColdState<'_>,
+    mut encoded: i64,
+) -> bool {
+    for _ in 0..16 {
+        let Some(index) = NativeRequestColdState::direct_value_index(encoded) else {
+            // Immediate scalars and unit-local constants are already native
+            // call operands. The binder stabilizes non-immediate constants
+            // directly when it transfers ownership to the callee.
+            return php_jit::jit_decode_runtime_value(encoded).is_none()
+                && context.native_encoded_value_kind(encoded).is_some();
+        };
+        let Some(slot) = context
+            .direct_value_slots
+            .get(index)
+            .filter(|slot| slot.refcount != 0)
+        else {
+            return false;
+        };
+        match slot.kind {
+            php_jit::JIT_NATIVE_VALUE_VIEW_STRING
+            | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY
+            | php_jit::JIT_NATIVE_VALUE_VIEW_FLOAT
+            | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT => return true,
+            php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR
+                if slot.flags == php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION
+                    && slot.reserved != php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_EMPTY =>
+            {
+                encoded = slot.payload as i64;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+pub(super) fn authoritative_native_call_arguments_are_admitted(
+    context: &NativeRequestColdState<'_>,
+    arguments: &[i64],
+    metadata: Option<&[php_ir::instruction::IrCallArg]>,
+) -> bool {
+    arguments.iter().enumerate().all(|(index, value)| {
+        if !authoritative_native_call_value_is_admitted(context, *value) {
+            return false;
+        }
+        metadata
+            .and_then(|metadata| metadata.get(index))
+            .is_none_or(|argument| {
+                !argument.unpack || context.direct_array_entries_for(*value).is_some()
+            })
+    })
+}
+
 /// Expands one PHP call argument vector while preserving the native value
 /// handles stored in direct arrays.  Compatibility arrays are already on a
 /// cold boundary; their temporary encodings are reported to the caller so
@@ -35,7 +88,8 @@ fn expand_native_user_call_arguments(
     arguments: &[i64],
     metadata: Option<&[php_ir::instruction::IrCallArg]>,
     compatibility_owners: &mut Vec<i64>,
-) -> Result<Vec<NativeSuppliedCallArgument>, String> {
+    builtin_policy: NativeCallableBuiltinPolicy,
+) -> Result<Vec<NativeSuppliedCallArgument>, NativeCallControl> {
     let Some(metadata) = metadata else {
         return Ok(arguments
             .iter()
@@ -59,14 +113,16 @@ fn expand_native_user_call_arguments(
                     Some(NativeEncodedValueKind::String) => {
                         let bytes =
                             context.native_string_name_bytes(entry.key).ok_or_else(|| {
-                                "native unpack string key has no byte storage".to_owned()
+                                NativeCallControl::from(
+                                    "native unpack string key has no byte storage",
+                                )
                             })?;
                         Some(String::from_utf8_lossy(&bytes).into_owned())
                     }
                     _ => {
-                        return Err(
-                            "Keys must be of type int|string during argument unpacking".to_owned()
-                        );
+                        return Err(NativeCallControl::from(
+                            "Keys must be of type int|string during argument unpacking",
+                        ));
                     }
                 };
                 supplied.push(NativeSuppliedCallArgument {
@@ -77,10 +133,15 @@ fn expand_native_user_call_arguments(
             continue;
         }
 
-        // This branch is baseline/cold compatibility only. New arrays cross
-        // calls through direct entries and never execute it.
+        if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
+            return Err(NativeCallControl::BaselineRequired);
+        }
+        // Baseline-only compatibility: new arrays cross calls through direct
+        // entries and exact native callbacks cannot enter this conversion.
         let Value::Array(array) = context.decode(*value)? else {
-            return Err("Only arrays and Traversables can be unpacked".to_owned());
+            return Err(NativeCallControl::from(
+                "Only arrays and Traversables can be unpacked",
+            ));
         };
         for (key, value) in array.iter() {
             let name = match key {
@@ -106,8 +167,14 @@ fn bind_native_by_value_parameter(
     target_name: &str,
     parameter_index: usize,
     parameter_name: &str,
+    builtin_policy: NativeCallableBuiltinPolicy,
 ) -> NativeCallResult {
     let Some(type_) = type_ else {
+        if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
+            return context
+                .duplicate_authoritative_dereferenced_native_value(argument)?
+                .ok_or(NativeCallControl::BaselineRequired);
+        }
         return Ok(context.duplicate_dereferenced_native_value(argument)?);
     };
     if let Some(value) = context.coerce_native_call_argument_encoded(argument, type_, strict)? {
@@ -126,9 +193,11 @@ fn bind_native_by_value_parameter(
         ));
     }
 
-    // Compatibility-only value classes have already crossed a cold boundary.
-    // Preserve their complete PHP coercion rules without making this the
-    // ordinary native binder representation.
+    if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
+        return Err(NativeCallControl::BaselineRequired);
+    }
+    // Baseline-only compatibility. Exact native callbacks never decode an
+    // argument or reconstruct it through the Rust value plane.
     let mut value = match context.decode(argument)? {
         Value::Reference(reference) => reference.get(),
         value => value,
@@ -159,6 +228,7 @@ fn bind_native_by_reference_parameter(
     target_name: &str,
     parameter_index: usize,
     parameter_name: &str,
+    builtin_policy: NativeCallableBuiltinPolicy,
 ) -> NativeCallResult {
     if context.php_handle_is_reference(argument) != Some(true) {
         return Err(NativeCallControl::throw(
@@ -188,6 +258,7 @@ fn bind_native_by_reference_parameter(
                     target_name,
                     parameter_index,
                     parameter_name,
+                    builtin_policy,
                 );
             };
             if context.native_encoded_matches_ir_type(replacement, type_) != Some(true) {
@@ -218,6 +289,9 @@ fn bind_native_by_reference_parameter(
         return Ok(argument);
     }
     let Some(type_) = type_ else {
+        if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
+            return Err(NativeCallControl::BaselineRequired);
+        }
         // A materialized/compatibility reference is still one stable arena
         // identity; the callee receives its own native owner.
         if let Value::Reference(reference) = context.decode(argument)?
@@ -235,6 +309,7 @@ fn bind_native_by_reference_parameter(
         target_name,
         parameter_index,
         parameter_name,
+        builtin_policy,
     )
 }
 
@@ -246,7 +321,11 @@ fn bind_materialized_reference_parameter(
     target_name: &str,
     parameter_index: usize,
     parameter_name: &str,
+    builtin_policy: NativeCallableBuiltinPolicy,
 ) -> NativeCallResult {
+    if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
+        return Err(NativeCallControl::BaselineRequired);
+    }
     let Value::Reference(reference) = context.decode(argument)? else {
         return Err(NativeCallControl::throw(
             "Error",
@@ -330,7 +409,13 @@ pub(super) fn invoke_native_function_with_metadata_strict(
     strict: bool,
 ) -> NativeCallResult {
     invoke_native_function_with_metadata_strict_at_tier(
-        context, function, arguments, metadata, strict, false,
+        context,
+        function,
+        arguments,
+        metadata,
+        strict,
+        false,
+        NativeCallableBuiltinPolicy::ExecuteBaseline,
     )
 }
 
@@ -342,17 +427,24 @@ pub(super) fn invoke_native_resolved_function_with_metadata_strict(
     strict: bool,
 ) -> NativeCallResult {
     invoke_native_function_with_metadata_strict_at_tier(
-        context, function, arguments, metadata, strict, true,
+        context,
+        function,
+        arguments,
+        metadata,
+        strict,
+        true,
+        NativeCallableBuiltinPolicy::ExecuteBaseline,
     )
 }
 
-fn invoke_native_function_with_metadata_strict_at_tier(
+pub(super) fn invoke_native_function_with_metadata_strict_at_tier(
     context: &mut NativeRequestColdState<'_>,
     function: php_ir::FunctionId,
     arguments: &[i64],
     metadata: Option<&[php_ir::instruction::IrCallArg]>,
     strict: bool,
     baseline_continuation: bool,
+    builtin_policy: NativeCallableBuiltinPolicy,
 ) -> NativeCallResult {
     let target_metadata = NativeFunctionMetadataPtr::from_compiled(&context.compiled, function)
         .ok_or_else(|| {
@@ -374,6 +466,12 @@ fn invoke_native_function_with_metadata_strict_at_tier(
         .into());
     }
     let raw_supplied = &arguments[leading..];
+    if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline
+        && (!authoritative_native_call_arguments_are_admitted(context, &arguments[..leading], None)
+            || !authoritative_native_call_arguments_are_admitted(context, raw_supplied, metadata))
+    {
+        return Err(NativeCallControl::BaselineRequired);
+    }
     let variadic_index = target_params
         .iter()
         .position(|parameter| parameter.variadic);
@@ -384,11 +482,15 @@ fn invoke_native_function_with_metadata_strict_at_tier(
         // The callee owns every frame slot. Give receiver/captures independent
         // native owners before binding visible parameters.
         for argument in &arguments[..leading] {
-            bound.push(
-                context
-                    .duplicate_authoritative_native_value(*argument)?
-                    .map_or_else(|| context.duplicate_baseline_call_argument(*argument), Ok)?,
-            );
+            let duplicated = context.duplicate_authoritative_native_value(*argument)?;
+            let value = match duplicated {
+                Some(value) => value,
+                None if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline => {
+                    return Err(NativeCallControl::BaselineRequired);
+                }
+                None => context.duplicate_baseline_call_argument(*argument)?,
+            };
+            bound.push(value);
         }
 
         let supplied = expand_native_user_call_arguments(
@@ -396,6 +498,7 @@ fn invoke_native_function_with_metadata_strict_at_tier(
             raw_supplied,
             metadata,
             &mut compatibility_owners,
+            builtin_policy,
         )?;
         let mut assigned = vec![None::<NativeSuppliedCallArgument>; fixed_count];
         let mut variadic = Vec::<NativeSuppliedCallArgument>::new();
@@ -478,6 +581,7 @@ fn invoke_native_function_with_metadata_strict_at_tier(
                             target_name,
                             index,
                             &parameter.name,
+                            builtin_policy,
                         )?
                     } else {
                         bind_native_by_value_parameter(
@@ -488,6 +592,7 @@ fn invoke_native_function_with_metadata_strict_at_tier(
                             target_name,
                             index,
                             &parameter.name,
+                            builtin_policy,
                         )?
                     };
                     let key = if let Some(name) = argument.name.as_ref() {
@@ -521,6 +626,7 @@ fn invoke_native_function_with_metadata_strict_at_tier(
                         target_name,
                         index,
                         &parameter.name,
+                        builtin_policy,
                     )?
                 } else {
                     bind_native_by_value_parameter(
@@ -531,6 +637,7 @@ fn invoke_native_function_with_metadata_strict_at_tier(
                         target_name,
                         index,
                         &parameter.name,
+                        builtin_policy,
                     )?
                 };
                 bound.push(value);
@@ -686,10 +793,57 @@ pub(super) enum NativeCallableBuiltinPolicy {
     RequireBaseline,
 }
 
+fn external_function_is_generator(
+    context: &NativeRequestColdState<'_>,
+    target: NativeDynamicFunction,
+) -> bool {
+    context
+        .dynamic_units
+        .get(target.unit)
+        .and_then(|unit| unit.compiled.unit().functions.get(target.function.index()))
+        .is_some_and(|function| {
+            function.flags.is_generator
+                || function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.instructions)
+                    .any(|instruction| {
+                        matches!(
+                            instruction.kind,
+                            php_ir::InstructionKind::Yield { .. }
+                                | php_ir::InstructionKind::YieldFrom { .. }
+                        )
+                    })
+        })
+}
+
+fn method_callable_requires_baseline(
+    context: &NativeRequestColdState<'_>,
+    class: &str,
+    method: &str,
+) -> bool {
+    if let Some(function) = native_method_in_hierarchy(context, class, method) {
+        return native_function_is_generator(context, function);
+    }
+    if let Some((function, _)) = native_external_method(context, class, method) {
+        return external_function_is_generator(context, function);
+    }
+    true
+}
+
 fn named_callable_requires_baseline(context: &NativeRequestColdState<'_>, name: &str) -> bool {
-    !name.contains("::")
-        && context.function_id(name).is_none()
-        && context.external_function(name).is_none()
+    if let Some((class, method)) = name.split_once("::") {
+        return method_callable_requires_baseline(context, class, method);
+    }
+    if let Some(function) = context.function_id(name) {
+        return native_function_is_generator(context, function);
+    }
+    if let Some(function) = context.external_function(name) {
+        return external_function_is_generator(context, function);
+    }
+    // Fixed builtins execute in the baseline continuation when reached as a
+    // callback. The exact callback ABI never enters the generic dispatcher.
+    true
 }
 
 pub(super) fn exact_native_callable_requires_baseline(
@@ -704,7 +858,47 @@ pub(super) fn exact_native_callable_requires_baseline(
                 named_callable_requires_baseline(context, &String::from_utf8_lossy(&bytes))
             })
             .unwrap_or(true),
-        Some(NativeEncodedValueKind::Object | NativeEncodedValueKind::Array) => false,
+        Some(NativeEncodedValueKind::Object) => context
+            .native_query_object(direct_callee)
+            .is_none_or(|object| {
+                method_callable_requires_baseline(context, &object.class_name(), "__invoke")
+            }),
+        Some(NativeEncodedValueKind::Array) => {
+            let Some(entries) = context.direct_array_entries_for(direct_callee) else {
+                return true;
+            };
+            if entries.len() != 2 {
+                return true;
+            }
+            let mut target = None;
+            let mut method = None;
+            for entry in entries {
+                match context.native_encoded_int(entry.key) {
+                    Some(0) => target = Some(context.dereference_direct_encoding(entry.value)),
+                    Some(1) => method = Some(context.dereference_direct_encoding(entry.value)),
+                    _ => return true,
+                }
+            }
+            let Some(method) = method.and_then(|method| context.native_string_name_bytes(method))
+            else {
+                return true;
+            };
+            let method = String::from_utf8_lossy(&method);
+            let Some(target) = target else {
+                return true;
+            };
+            if let Some(object) = context.native_query_object(target) {
+                method_callable_requires_baseline(context, &object.class_name(), &method)
+            } else if let Some(class) = context.native_string_name_bytes(target) {
+                method_callable_requires_baseline(
+                    context,
+                    &String::from_utf8_lossy(&class),
+                    &method,
+                )
+            } else {
+                true
+            }
+        }
         _ => context.prepared_closure_invocation(callee).is_none(),
     }
 }
@@ -719,6 +913,9 @@ pub(super) fn invoke_native_named_callable(
 ) -> NativeCallResult {
     if let Some(function) = context.function_id(name) {
         if native_function_is_generator(context, function) {
+            if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
+                return Err(NativeCallControl::BaselineRequired);
+            }
             let arguments = arguments
                 .iter()
                 .map(|value| context.decode(*value))
@@ -730,22 +927,25 @@ pub(super) fn invoke_native_named_callable(
                 )))?,
             );
         }
-        return invoke_native_function_with_metadata_strict(
+        return invoke_native_function_with_metadata_strict_at_tier(
             context,
             function,
             arguments,
             metadata,
             context.unit.strict_types_for_span(instruction.span),
+            false,
+            builtin_policy,
         );
     }
     if let Some(function) = context.external_function(name) {
-        return invoke_native_external_function_with_metadata(
+        return invoke_native_external_function_with_metadata_policy(
             context,
             function,
             arguments,
             metadata,
             None,
             context.unit.strict_types_for_span(instruction.span),
+            builtin_policy,
         );
     }
     if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
@@ -979,7 +1179,7 @@ pub(super) fn bind_native_builtin_arguments<'a>(
     Ok(std::borrow::Cow::Owned(bound))
 }
 
-pub(super) fn invoke_native_bound_method(
+pub(super) fn invoke_baseline_native_bound_method(
     context: &mut NativeRequestColdState<'_>,
     target: &php_runtime::api::CallableMethodTarget,
     method: &str,
@@ -987,6 +1187,28 @@ pub(super) fn invoke_native_bound_method(
     metadata: Option<&[php_ir::instruction::IrCallArg]>,
     strict: bool,
     caller_function: Option<u32>,
+) -> NativeCallResult {
+    invoke_native_bound_method(
+        context,
+        target,
+        method,
+        arguments,
+        metadata,
+        strict,
+        caller_function,
+        NativeCallableBuiltinPolicy::ExecuteBaseline,
+    )
+}
+
+fn invoke_native_bound_method(
+    context: &mut NativeRequestColdState<'_>,
+    target: &php_runtime::api::CallableMethodTarget,
+    method: &str,
+    arguments: &[i64],
+    metadata: Option<&[php_ir::instruction::IrCallArg]>,
+    strict: bool,
+    caller_function: Option<u32>,
+    builtin_policy: NativeCallableBuiltinPolicy,
 ) -> NativeCallResult {
     let (class_name, receiver) = match target {
         php_runtime::api::CallableMethodTarget::Object(object) => (
@@ -1032,6 +1254,9 @@ pub(super) fn invoke_native_bound_method(
         }
         let function = entry.function;
         if native_function_is_generator(context, function) {
+            if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
+                return Err(NativeCallControl::BaselineRequired);
+            }
             let arguments = call_arguments
                 .iter()
                 .map(|value| context.decode(*value))
@@ -1047,12 +1272,14 @@ pub(super) fn invoke_native_bound_method(
         if pushed_called_class {
             context.called_classes.push(Arc::from(class_name.as_str()));
         }
-        let result = invoke_native_function_with_metadata_strict(
+        let result = invoke_native_function_with_metadata_strict_at_tier(
             context,
             function,
             &call_arguments,
             metadata,
             strict,
+            false,
+            builtin_policy,
         );
         if pushed_called_class {
             context.called_classes.pop();
@@ -1060,13 +1287,14 @@ pub(super) fn invoke_native_bound_method(
         return result;
     }
     if let Some((function, _)) = native_external_method(context, &class_name, method) {
-        return invoke_native_external_function_with_metadata(
+        return invoke_native_external_function_with_metadata_policy(
             context,
             function,
             &call_arguments,
             metadata,
             Some(class_name),
             strict,
+            builtin_policy,
         );
     }
     Err(NativeCallControl::RuntimeError(format!(
@@ -1250,6 +1478,7 @@ pub(super) fn execute_native_dynamic_callable(
                     metadata,
                     context.unit.strict_types_for_span(instruction.span),
                     caller_function,
+                    builtin_policy,
                 )
             } else {
                 invoke_native_named_callable(
@@ -1275,6 +1504,7 @@ pub(super) fn execute_native_dynamic_callable(
                 metadata,
                 context.unit.strict_types_for_span(instruction.span),
                 caller_function,
+                builtin_policy,
             ));
         }
         Some(NativeEncodedValueKind::Array) => {
@@ -1326,10 +1556,16 @@ pub(super) fn execute_native_dynamic_callable(
                     metadata,
                     context.unit.strict_types_for_span(instruction.span),
                     caller_function,
+                    builtin_policy,
                 ));
             }
         }
         _ => {}
+    }
+    if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
+        // Prepared/boxed closures and compatibility callables are baseline
+        // carriers. Exact native callback handlers never decode them.
+        return Some(Err(NativeCallControl::BaselineRequired));
     }
     if let Some((closure, implicit_this, captures)) = context.prepared_closure_invocation(*callee) {
         return Some(invoke_native_closure_payload(
@@ -1378,6 +1614,7 @@ pub(super) fn execute_native_dynamic_callable(
                         metadata,
                         context.unit.strict_types_for_span(instruction.span),
                         caller_function,
+                        builtin_policy,
                     )
                 }
                 php_runtime::api::CallableValue::MethodPlaceholder { target }
@@ -1396,6 +1633,7 @@ pub(super) fn execute_native_dynamic_callable(
                         metadata,
                         context.unit.strict_types_for_span(instruction.span),
                         caller_function,
+                        builtin_policy,
                     )
                 } else {
                     invoke_native_named_callable(
@@ -1416,6 +1654,7 @@ pub(super) fn execute_native_dynamic_callable(
                 metadata,
                 context.unit.strict_types_for_span(instruction.span),
                 caller_function,
+                builtin_policy,
             ),
             Value::Array(array) => {
                 let target = array
@@ -1452,6 +1691,7 @@ pub(super) fn execute_native_dynamic_callable(
                     metadata,
                     context.unit.strict_types_for_span(instruction.span),
                     caller_function,
+                    builtin_policy,
                 )
             }
             value => Err(format!("{} is not callable", native_value_type_name(&value)).into()),

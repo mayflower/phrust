@@ -4829,7 +4829,7 @@ pub(in crate::vm) extern "C" fn jit_native_foreach_init_abi(
                         });
                     if is_external_iterator {
                         let invoke = |context: &mut NativeRequestColdState<'_>, method: &str| {
-                            let encoded = invoke_native_bound_method(
+                            let encoded = invoke_baseline_native_bound_method(
                                 context,
                                 &php_runtime::api::CallableMethodTarget::Object(iterable.clone()),
                                 method,

@@ -6160,6 +6160,9 @@ impl<'a> NativeRequestColdState<'a> {
     /// direct payload once, so subsequent reads do not repeatedly rebuild an
     /// array/object tree through Rust `Value`.
     fn duplicate_dereferenced_native_value(&mut self, mut encoded: i64) -> Result<i64, String> {
+        if let Some(encoded) = self.duplicate_authoritative_dereferenced_native_value(encoded)? {
+            return Ok(encoded);
+        }
         for _ in 0..16 {
             let Some(index) = Self::direct_value_index(encoded) else {
                 break;
@@ -6215,6 +6218,46 @@ impl<'a> NativeRequestColdState<'a> {
         } else {
             self.duplicate_baseline_call_argument(encoded)
         }
+    }
+
+    /// Gives an exact native call an independently owned dereferenced value
+    /// without entering `ReferenceCell` or the Rust `Value` plane. `None`
+    /// means the caller must take its one baseline continuation before any
+    /// PHP-visible call binding effect.
+    fn duplicate_authoritative_dereferenced_native_value(
+        &mut self,
+        mut encoded: i64,
+    ) -> Result<Option<i64>, String> {
+        for _ in 0..16 {
+            let Some(index) = Self::direct_value_index(encoded) else {
+                break;
+            };
+            let Some(slot) = self
+                .direct_value_slots
+                .get(index)
+                .copied()
+                .filter(|slot| slot.refcount != 0)
+            else {
+                return Ok(None);
+            };
+            match slot.kind {
+                php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR
+                    if slot.flags == php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION
+                        && slot.reserved != php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_EMPTY =>
+                {
+                    encoded = slot.payload as i64;
+                }
+                php_jit::JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR => return Ok(None),
+                _ => return self.duplicate_authoritative_native_value(encoded),
+            }
+        }
+        if self.php_handle_is_reference(encoded) == Some(true) {
+            return Ok(None);
+        }
+        if php_jit::jit_decode_runtime_value(encoded).is_some() {
+            return Ok(None);
+        }
+        self.duplicate_authoritative_native_value(encoded)
     }
 
     /// Materializes a by-value baseline operand without first converting an
@@ -11116,6 +11159,28 @@ fn invoke_native_external_function_with_metadata(
         called_class,
         strict,
         false,
+        NativeCallableBuiltinPolicy::ExecuteBaseline,
+    )
+}
+
+fn invoke_native_external_function_with_metadata_policy(
+    context: &mut NativeRequestColdState<'_>,
+    target: NativeDynamicFunction,
+    arguments: &[i64],
+    metadata: Option<&[php_ir::instruction::IrCallArg]>,
+    called_class: Option<String>,
+    strict: bool,
+    builtin_policy: NativeCallableBuiltinPolicy,
+) -> NativeCallResult {
+    invoke_native_external_function_with_metadata_at_tier(
+        context,
+        target,
+        arguments,
+        metadata,
+        called_class,
+        strict,
+        false,
+        builtin_policy,
     )
 }
 
@@ -11135,6 +11200,7 @@ fn invoke_native_resolved_external_function_with_metadata(
         called_class,
         strict,
         true,
+        NativeCallableBuiltinPolicy::ExecuteBaseline,
     )
 }
 
@@ -11146,8 +11212,14 @@ fn invoke_native_external_function_with_metadata_at_tier(
     called_class: Option<String>,
     strict: bool,
     baseline_continuation: bool,
+    builtin_policy: NativeCallableBuiltinPolicy,
 ) -> NativeCallResult {
     prepare_dynamic_native_entry(context, target.unit, target.function)?;
+    if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline
+        && !authoritative_native_call_arguments_are_admitted(context, arguments, metadata)
+    {
+        return Err(NativeCallControl::BaselineRequired);
+    }
     let transferred_arguments = arguments
         .iter()
         .map(|argument| {
@@ -11179,9 +11251,14 @@ fn invoke_native_external_function_with_metadata_at_tier(
                 context.stabilize_direct_array_for_cross_unit(encoded)?;
                 context.retain(encoded).map(|()| encoded)
             } else {
-                context
-                    .duplicate_authoritative_native_value(encoded)?
-                    .map_or_else(|| context.duplicate_baseline_call_argument(encoded), Ok)
+                let duplicated = context.duplicate_authoritative_native_value(encoded)?;
+                match duplicated {
+                    Some(value) => Ok(value),
+                    None if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline => Err(
+                        "authoritative external call argument unexpectedly disappeared".to_owned(),
+                    ),
+                    None => context.duplicate_baseline_call_argument(encoded),
+                }
             }
         })
         .collect::<Result<smallvec::SmallVec<[i64; 8]>, _>>()?;
@@ -11201,12 +11278,14 @@ fn invoke_native_external_function_with_metadata_at_tier(
                 strict,
             )
         } else {
-            invoke_native_function_with_metadata_strict(
+            invoke_native_function_with_metadata_strict_at_tier(
                 context,
                 target.function,
                 &transferred_arguments,
                 metadata,
                 strict,
+                false,
+                builtin_policy,
             )
         };
         if pushed_called_class {
