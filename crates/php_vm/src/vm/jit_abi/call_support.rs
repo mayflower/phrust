@@ -71,6 +71,31 @@ pub(super) fn invoke_native_function_with_metadata_strict(
     metadata: Option<&[php_ir::instruction::IrCallArg]>,
     strict: bool,
 ) -> Result<i64, String> {
+    invoke_native_function_with_metadata_strict_at_tier(
+        context, function, arguments, metadata, strict, false,
+    )
+}
+
+pub(super) fn invoke_native_resolved_function_with_metadata_strict(
+    context: &mut NativeRequestColdState<'_>,
+    function: php_ir::FunctionId,
+    arguments: &[i64],
+    metadata: Option<&[php_ir::instruction::IrCallArg]>,
+    strict: bool,
+) -> Result<i64, String> {
+    invoke_native_function_with_metadata_strict_at_tier(
+        context, function, arguments, metadata, strict, true,
+    )
+}
+
+fn invoke_native_function_with_metadata_strict_at_tier(
+    context: &mut NativeRequestColdState<'_>,
+    function: php_ir::FunctionId,
+    arguments: &[i64],
+    metadata: Option<&[php_ir::instruction::IrCallArg]>,
+    strict: bool,
+    baseline_continuation: bool,
+) -> Result<i64, String> {
     let target_metadata = NativeFunctionMetadataPtr::from_compiled(&context.compiled, function)
         .ok_or_else(|| {
             format!(
@@ -135,6 +160,7 @@ pub(super) fn invoke_native_function_with_metadata_strict(
             &bound,
             Some(visible_arguments),
             Some(target_metadata),
+            baseline_continuation,
         );
     }
     let mut assigned = vec![None; fixed_count];
@@ -331,6 +357,7 @@ pub(super) fn invoke_native_function_with_metadata_strict(
         &bound,
         Some(visible_arguments),
         Some(target_metadata),
+        baseline_continuation,
     )
 }
 
@@ -340,6 +367,7 @@ fn invoke_native_with_owned_bound_arguments(
     bound: &[i64],
     trace_arguments: Option<request_state::NativeTraceArguments>,
     metadata: Option<NativeFunctionMetadataPtr>,
+    baseline_continuation: bool,
 ) -> Result<i64, String> {
     // Bound handles are transferred into the callee frame. Native epilogues
     // release parameter locals on every return/unwind edge; releasing them a
@@ -350,6 +378,7 @@ fn invoke_native_with_owned_bound_arguments(
         bound,
         trace_arguments,
         metadata,
+        baseline_continuation,
     )
 }
 

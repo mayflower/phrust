@@ -2011,11 +2011,15 @@ pub(super) fn execute_baseline_prepared_runtime_builtin(
         validate_native_builtin_arity_with_metadata(name, arguments.len(), prepared.metadata)?;
     }
     validate_native_builtin_types(context, name, arguments, source, Some(prepared.type_info))?;
+    if name == "array_fill_keys"
+        && let Some(result) = execute_exact_native_array_fill_keys(context, arguments)
+    {
+        return result;
+    }
     let mut values = arguments
         .iter()
         .enumerate()
         .map(|(index, argument)| {
-            let value = context.decode(*argument)?;
             let by_ref = prepared
                 .metadata
                 .and_then(|function| {
@@ -2027,13 +2031,11 @@ pub(super) fn execute_baseline_prepared_runtime_builtin(
                     })
                 })
                 .is_some_and(|parameter| parameter.by_ref);
-            Ok::<Value, String>(if by_ref {
-                value
-            } else if let Value::Reference(reference) = value {
-                reference.get()
+            if by_ref {
+                context.decode(*argument)
             } else {
-                value
-            })
+                context.decode_dereferenced_native_value(*argument)
+            }
         })
         .collect::<Result<Vec<_>, _>>()?;
     if name == "shm_put_var" {
@@ -2163,6 +2165,65 @@ pub(super) fn execute_baseline_prepared_runtime_builtin(
             Err(format!("E_PHP_THROW:{class}:{}", error.message()))
         }
     }
+}
+
+fn execute_exact_native_array_fill_keys(
+    context: &mut NativeRequestColdState<'_>,
+    arguments: &[i64],
+) -> Option<Result<i64, String>> {
+    let [keys, value] = arguments else {
+        return None;
+    };
+    let source = context.direct_array_entries_for(*keys)?.to_vec();
+    let mut normalized = Vec::<php_runtime::api::ArrayKey>::with_capacity(source.len());
+    for entry in source {
+        let mut key = context.decode(entry.value).ok()?;
+        for _ in 0..16 {
+            let Value::Reference(reference) = key else {
+                break;
+            };
+            key = reference.get();
+        }
+        // `array_fill_keys()` stringifies each input value before applying
+        // normal PHP string-key normalization. In particular, `3.7` becomes
+        // the string key `"3.7"`; ordinary array-key coercion would
+        // incorrectly truncate it to the integer key `3`.
+        let key = php_runtime::api::to_string(&key).ok()?;
+        let key = php_runtime::api::ArrayKey::from_php_string(key);
+        if !normalized.contains(&key) {
+            normalized.push(key);
+        }
+    }
+    let mut entries = Vec::<php_jit::JitNativeDirectArrayEntry>::with_capacity(normalized.len());
+    for key in normalized {
+        let key = match key {
+            php_runtime::api::ArrayKey::Int(key) => context.encode(Value::Int(key)),
+            php_runtime::api::ArrayKey::String(key) => context.encode(Value::String(key)),
+        };
+        let key = match key {
+            Ok(key) => key,
+            Err(error) => {
+                for entry in entries {
+                    let _ = context.release(entry.key);
+                    let _ = context.release(entry.value);
+                }
+                return Some(Err(error));
+            }
+        };
+        let value = match context.duplicate_dereferenced_native_value(*value) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = context.release(key);
+                for entry in entries {
+                    let _ = context.release(entry.key);
+                    let _ = context.release(entry.value);
+                }
+                return Some(Err(error));
+            }
+        };
+        entries.push(php_jit::JitNativeDirectArrayEntry { key, value });
+    }
+    Some(context.publish_owned_direct_array_entries(entries))
 }
 
 /// Baseline-native compatibility executor for builtins without an admitted

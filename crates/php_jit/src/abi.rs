@@ -11,13 +11,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use php_ir::{FunctionId, LocalId, RegId};
 
 /// Version for the C-compatible runtime ABI records.
-pub const JIT_RUNTIME_ABI_VERSION: u32 = 73;
+pub const JIT_RUNTIME_ABI_VERSION: u32 = 74;
 
 /// Stable ABI fingerprint for Cranelift ABI.
 ///
 /// This is updated only when a `repr(C)` boundary type changes layout or tag
 /// meaning. It is intentionally independent from Rust type names.
-pub const JIT_RUNTIME_ABI_HASH: u64 = 0x0dc1_a843_0000_0069;
+pub const JIT_RUNTIME_ABI_HASH: u64 = 0x0dc1_a843_0000_006a;
 
 /// No stable length is published for this runtime value slot.
 pub const JIT_NATIVE_VALUE_VIEW_NONE: u32 = 0;
@@ -96,14 +96,18 @@ pub const fn jit_native_direct_array_cursor(flags: u32) -> Option<u32> {
 pub const JIT_NATIVE_DIRECT_VALUE_INDEX_BASE: u32 = 0x4000_0000;
 // The direct plane is the canonical request value store, not a small optimizer
 // cache.  Keep enough stable address space for a complete large application
-// request; released slots are reclaimed in a later allocator tranche without
-// reintroducing a Rust-Value fallback.
-pub const JIT_NATIVE_DIRECT_VALUE_CAPACITY: usize = 262_144;
-pub const JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY: usize = 1_048_576;
+// request. Measured production requests cross the former reservation after
+// the direct plane becomes canonical, before request-end recycling can run.
+// StableNativeArena reserves this address range demand-backed, while ordinary
+// last-owner releases still return slots to the in-request free list.
+pub const JIT_NATIVE_DIRECT_VALUE_CAPACITY: usize = 2_097_152;
+pub const JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY: usize = 4_194_304;
 pub const JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY: u32 = 8;
 pub const JIT_NATIVE_DIRECT_ARRAY_FREE_BUCKETS: usize = 32;
 pub const JIT_NATIVE_DIRECT_ARRAY_FREE_NONE: u32 = u32::MAX;
-pub const JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY: usize = 32 * 1024 * 1024;
+// Large framework requests can transiently cross the former 32 MiB string
+// reservation before their ordinary last-owner releases recycle spans.
+pub const JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 pub const JIT_NATIVE_DIRECT_STRING_FREE_BUCKETS: usize = 32;
 pub const JIT_NATIVE_DIRECT_STRING_MIN_CAPACITY: u32 = 4;
 pub const JIT_NATIVE_DIRECT_STRING_CAPACITY_SHIFT: u32 = 1;
@@ -2014,7 +2018,7 @@ mod tests {
 
     #[test]
     fn c_abi_layout_is_stable() {
-        assert_eq!(JIT_RUNTIME_ABI_VERSION, 73);
+        assert_eq!(JIT_RUNTIME_ABI_VERSION, 74);
         assert_ne!(JIT_RUNTIME_ABI_HASH, 0);
         assert_eq!(size_of::<JitOpaqueHandle>(), 8);
         assert_eq!(size_of::<JitCValueTag>(), 4);

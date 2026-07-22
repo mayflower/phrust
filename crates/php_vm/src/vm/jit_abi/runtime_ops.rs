@@ -1174,6 +1174,49 @@ pub(in crate::vm) extern "C" fn jit_native_local_fetch_abi(
             context.record_local_read_reason("unknown");
             return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
         };
+        if (synthetic_local || ordinary_function_local)
+            && context.php_handle_is_reference(value) == Some(true)
+        {
+            let result = match context.duplicate_dereferenced_native_value(value) {
+                Ok(result) => result,
+                Err(error) => {
+                    record_native_helper_failure(
+                        context,
+                        format!("local reference fetch could not duplicate {value}: {error}"),
+                    );
+                    return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+                }
+            };
+            if context.php_handle_is_uninitialized(result) {
+                let _ = context.release(result);
+                if ordinary_function_local && !quiet_read {
+                    let name = context.unit.functions[function_index].locals[local].clone();
+                    emit_native_undefined_variable_warning(context, &name, file, start);
+                }
+                context.record_local_read_reason(if ordinary_function_local {
+                    "uninitialized_warning"
+                } else {
+                    "synthetic_compiler_local"
+                });
+                let result = php_jit::jit_encode_constant(u32::MAX);
+                return if write_native_value(out, result) {
+                    0
+                } else {
+                    php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
+                };
+            }
+            context.record_local_read_reason(if synthetic_local {
+                "synthetic_compiler_local"
+            } else {
+                "reference_dereference"
+            });
+            return if write_native_value(out, result) {
+                0
+            } else {
+                let _ = context.release(result);
+                php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
+            };
+        }
         if synthetic_local {
             context.record_local_read_reason("synthetic_compiler_local");
             let decoded = match context.decode(value) {
@@ -1188,6 +1231,29 @@ pub(in crate::vm) extern "C" fn jit_native_local_fetch_abi(
             };
         }
         if ordinary_function_local {
+            // A non-reference local read is an ownership copy, not a semantic
+            // conversion. Preserve its encoded native representation and
+            // retain the existing owner; decoding here rebuilt every direct
+            // array reachable through frequently read baseline locals.
+            if !context.php_handle_is_uninitialized(value)
+                && context.php_handle_is_reference(value) == Some(false)
+            {
+                context.record_local_read_reason("plain_initialized_local");
+                return match context.duplicate_native_call_argument(value) {
+                    Ok(value) if write_native_value(out, value) => 0,
+                    Ok(value) => {
+                        let _ = context.release(value);
+                        php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
+                    }
+                    Err(error) => {
+                        record_native_helper_failure(
+                            context,
+                            format!("local fetch could not retain {value}: {error}"),
+                        );
+                        php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
+                    }
+                };
+            }
             let mut decoded = match context.decode(value) {
                 Ok(decoded) => decoded,
                 Err(error) => {
@@ -1269,6 +1335,26 @@ pub(in crate::vm) extern "C" fn jit_native_local_fetch_abi(
                 None,
             ));
             return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+        }
+        if is_top_level && name != "GLOBALS" {
+            match context.duplicate_native_global_value(&name) {
+                Ok(Some(value)) => {
+                    return if write_native_value(out, value) {
+                        0
+                    } else {
+                        let _ = context.release(value);
+                        php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    record_native_helper_failure(
+                        context,
+                        format!("global fetch for ${name} failed: {error}"),
+                    );
+                    return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+                }
+            }
         }
         if is_top_level && let Some(mut inherited) = context.inherited_globals.get(&name).cloned() {
             if matches!(inherited, Value::Uninitialized) {
@@ -1470,7 +1556,11 @@ pub(in crate::vm) extern "C" fn jit_native_local_store_abi(
             .as_ref()
             .filter(|value| matches!(value, Value::Reference(_)))
             .cloned();
-        let current_value = match if context.php_handle_is_reference(current) == Some(true) {
+        let current_value = match if is_top_level && inherited_reference.is_some() {
+            Ok(inherited_reference
+                .clone()
+                .expect("checked inherited global reference"))
+        } else if context.php_handle_is_reference(current) == Some(true) {
             // A direct reference payload is authoritative until this cold
             // store boundary. Materialize it before reading or replacing the
             // ReferenceCell; decoding it after `set()` would replay the stale
@@ -1539,13 +1629,30 @@ pub(in crate::vm) extern "C" fn jit_native_local_store_abi(
                     .inherited_globals
                     .insert(name.clone(), Value::Reference(reference.clone()));
             }
-            let previous = reference.get();
+            let (previous, direct_replaced) = match context
+                .replace_direct_reference_cell_value(&reference, replacement.clone())
+            {
+                Ok(Some(previous)) => (previous, true),
+                Ok(None) => {
+                    let previous = reference.get();
+                    (previous, false)
+                }
+                Err(error) => {
+                    record_native_helper_failure(
+                        context,
+                        format!("global/local reference replacement failed: {error}"),
+                    );
+                    return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+                }
+            };
             let membership_changed = rooted_membership_may_change(&previous, &replacement);
             let synchronize_destructor_roots = membership_changed
                 && (context.value_has_native_destructor(&previous)
                     || context.value_has_native_destructor(&replacement));
             let replacement_scalar = context.native_scalar_encoding(&replacement);
-            reference.set(replacement);
+            if !direct_replaced {
+                reference.set(replacement);
+            }
             if let Some(encoded) = replacement_scalar {
                 reference.publish_native_scalar(encoded);
             }
@@ -1569,11 +1676,10 @@ pub(in crate::vm) extern "C" fn jit_native_local_store_abi(
                 );
                 return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
             }
-            let stored = match context.decode(current) {
-                Ok(Value::Reference(current_reference)) if current_reference.ptr_eq(&reference) => {
+            let stored = if inherited_reference.is_some() {
+                if context.native_reference_identity(current) == Some(reference.gc_debug_id()) {
                     current
-                }
-                _ if inherited_reference.is_some() => {
+                } else {
                     if let Err(error) = context.release_if_live(current) {
                         record_native_helper_failure(
                             context,
@@ -1596,7 +1702,15 @@ pub(in crate::vm) extern "C" fn jit_native_local_store_abi(
                         }
                     }
                 }
-                _ => current,
+            } else {
+                match context.decode(current) {
+                    Ok(Value::Reference(current_reference))
+                        if current_reference.ptr_eq(&reference) =>
+                    {
+                        current
+                    }
+                    _ => current,
+                }
             };
             if write_native_value(out, stored) {
                 0
@@ -3043,6 +3157,123 @@ pub(in crate::vm) extern "C" fn jit_native_property_fetch_abi(
             ));
             return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
         };
+        // Ordinary declared-property reads already have everything needed in
+        // the direct object descriptor: stable owner/class identity, numeric
+        // layout slot, and an encoded native value owner.  Reading that cell
+        // directly prevents the baseline compatibility handler from demoting
+        // and immediately re-promoting every other property in the object.
+        if let Some(native_object) = context.native_query_object(object) {
+            let class_name = normalize_class_name(&native_object.class_name());
+            let local_class = native_active_class_handle(context, &class_name);
+            let (owner_unit, class) = local_class.map_or_else(
+                || {
+                    native_external_class_handle(context, &class_name)
+                        .map_or((None, None), |(unit, class)| (Some(unit), Some(class)))
+                },
+                |class| (None, Some(class)),
+            );
+            let caller_owns_scope = owner_unit.is_none()
+                && class.as_ref().is_some_and(|class| {
+                    class
+                        .methods
+                        .iter()
+                        .any(|method| method.function.raw() == function as u32)
+                });
+            let entry = class
+                .as_ref()
+                .and_then(|class| class.properties.iter().find(|entry| entry.name == property));
+            let accessible = entry.is_some_and(|entry| {
+                (!entry.flags.is_private && !entry.flags.is_protected) || caller_owns_scope
+            });
+            if accessible
+                && entry.is_none_or(|entry| entry.hooks.get.is_none())
+                && let Some(slot) = context.native_declared_property_slot(object, property)
+            {
+                if slot.initialized != 0
+                    && context.php_handle_is_uninitialized(slot.value)
+                    && entry.is_some_and(|entry| entry.type_.is_some())
+                {
+                    let display_class = class.as_ref().map_or_else(
+                        || native_object.display_name(),
+                        |class| class.display_name.clone(),
+                    );
+                    let message = format!(
+                        "Typed property {display_class}::${property} must not be accessed before initialization"
+                    );
+                    let span = native_property_span(context, function, instruction_id)
+                        .unwrap_or_else(|| php_ir::IrSpan::new(php_ir::FileId::new(0), 0, 0));
+                    return match encode_native_throwable_at(context, "Error", &message, span) {
+                        Ok(value) if write_native_value(out, value) => {
+                            php_jit::JitCallStatus::THROW.0 as i32
+                        }
+                        _ => php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
+                    };
+                }
+                let value = if slot.initialized == 0 {
+                    Ok(php_jit::jit_encode_constant(u32::MAX))
+                } else {
+                    context.duplicate_dereferenced_native_value(slot.value)
+                };
+                return match value {
+                    Ok(value) => {
+                        if let Err(error) = context.publish_direct_object_slots(
+                            encoded_object,
+                            property,
+                            value,
+                            function,
+                            instruction_id,
+                            php_jit::JIT_NATIVE_TRUSTED_PROPERTY_SLOT_PUBLISHED,
+                        ) {
+                            let _ = context.release(value);
+                            record_native_helper_failure(context, error);
+                            return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+                        }
+                        if write_native_value(out, value) {
+                            0
+                        } else {
+                            let _ = context.release(value);
+                            php_jit::JitCallStatus::ABI_MISMATCH.0 as i32
+                        }
+                    }
+                    Err(error) => {
+                        record_native_helper_failure(
+                            context,
+                            format!(
+                                "native property ${property} result could not be duplicated: {error}"
+                            ),
+                        );
+                        php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
+                    }
+                };
+            }
+            if entry.is_none()
+                && native_object.has_dynamic_property(property)
+                && let Some(mut value) = native_object.get_property(property)
+            {
+                for _ in 0..16 {
+                    let Value::Reference(reference) = value else {
+                        break;
+                    };
+                    value = reference.get();
+                }
+                return match context.encode_baseline_call_value(value) {
+                    Ok(value) if write_native_value(out, value) => 0,
+                    Ok(value) => {
+                        let _ = context.release(value);
+                        php_jit::JitCallStatus::ABI_MISMATCH.0 as i32
+                    }
+                    Err(error) => {
+                        record_native_helper_failure(
+                            context,
+                            format!(
+                                "native dynamic property ${property} could not be encoded: {error}"
+                            ),
+                        );
+                        php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
+                    }
+                };
+            }
+        }
         let mut object = match context.decode(object) {
             Ok(object) => object,
             Err(error) => {
@@ -3903,11 +4134,13 @@ pub(in crate::vm) extern "C" fn jit_native_array_fetch_abi(
             };
             let exists = if context.is_globals_proxy(array) {
                 context.fetch_native_global_dimension(&key).is_some()
-            } else {
+            } else if let Some(array) = context.direct_array_encoding(array) {
                 let Ok(found) = context.direct_array_find_encoded(array, &key) else {
                     return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
                 };
                 found.is_some()
+            } else {
+                return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
             };
             let encoded = php_jit::jit_encode_constant(if exists {
                 php_jit::JIT_VALUE_TRUE
@@ -3970,7 +4203,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_fetch_abi(
                 out,
             );
         }
-        if context.direct_array_slot(array).is_some() {
+        if let Some(array) = context.direct_array_encoding(array) {
             if emit_native_array_dimension_conversion_diagnostic(
                 context,
                 &key,

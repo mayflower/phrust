@@ -161,6 +161,7 @@ fn helper_index(helper_id: &str) -> usize {
 pub(super) struct NativeRuntimeTelemetry {
     pub(super) counters: crate::counters::VmCounters,
     pub(super) helper_timing_stack: Vec<NativeHelperTimingFrame>,
+    builtin_attribution_stack: Vec<&'static str>,
     helper_calls: [u64; HELPER_NAMES.len()],
     helper_time_nanos: [u64; HELPER_NAMES.len()],
     local_reads: [u64; LOCAL_REASONS.len()],
@@ -181,6 +182,7 @@ impl Default for NativeRuntimeTelemetry {
         Self {
             counters: crate::counters::VmCounters::default(),
             helper_timing_stack: Vec::new(),
+            builtin_attribution_stack: Vec::new(),
             helper_calls: [0; HELPER_NAMES.len()],
             helper_time_nanos: [0; HELPER_NAMES.len()],
             local_reads: [0; LOCAL_REASONS.len()],
@@ -1076,6 +1078,90 @@ impl NativeRequestColdState<'_> {
             .native_value_table_materializations_by_kind_and_origin
             .entry(format!("direct_array_entry_site@{site}"))
             .or_default() += u64::try_from(entries).unwrap_or(u64::MAX);
+        if let Some(name) = telemetry.builtin_attribution_stack.last().copied() {
+            *telemetry
+                .counters
+                .native_value_table_materializations_by_kind_and_origin
+                .entry(format!("direct_array_builtin@{name}"))
+                .or_default() += 1;
+            *telemetry
+                .counters
+                .native_value_table_materializations_by_kind_and_origin
+                .entry(format!("direct_array_entry_builtin@{name}"))
+                .or_default() += u64::try_from(entries).unwrap_or(u64::MAX);
+        }
+    }
+
+    pub(super) fn enter_builtin_attribution(&self, name: &'static str) {
+        if self.options.collect_counters {
+            self.runtime_telemetry
+                .borrow_mut()
+                .builtin_attribution_stack
+                .push(name);
+        }
+    }
+
+    pub(super) fn exit_builtin_attribution(&self, name: &'static str) {
+        if !self.options.collect_counters {
+            return;
+        }
+        let popped = self
+            .runtime_telemetry
+            .borrow_mut()
+            .builtin_attribution_stack
+            .pop();
+        debug_assert_eq!(popped, Some(name));
+    }
+
+    pub(super) fn record_direct_object_promotion(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+    ) {
+        if !self.options.collect_counters {
+            return;
+        }
+        let site = format!("{}:{}", caller.file(), caller.line());
+        *self
+            .runtime_telemetry
+            .borrow_mut()
+            .counters
+            .native_value_table_materializations_by_kind_and_origin
+            .entry(format!("direct_object_promotion_site@{site}"))
+            .or_default() += 1;
+    }
+
+    pub(super) fn record_direct_object_demotion(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+    ) {
+        if !self.options.collect_counters {
+            return;
+        }
+        let site = format!("{}:{}", caller.file(), caller.line());
+        *self
+            .runtime_telemetry
+            .borrow_mut()
+            .counters
+            .native_value_table_materializations_by_kind_and_origin
+            .entry(format!("direct_object_demotion_site@{site}"))
+            .or_default() += 1;
+    }
+
+    pub(super) fn record_direct_reference_demotion(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+    ) {
+        if !self.options.collect_counters {
+            return;
+        }
+        let site = format!("{}:{}", caller.file(), caller.line());
+        *self
+            .runtime_telemetry
+            .borrow_mut()
+            .counters
+            .native_value_table_materializations_by_kind_and_origin
+            .entry(format!("direct_reference_demotion_site@{site}"))
+            .or_default() += 1;
     }
 
     pub(super) fn record_native_transition(

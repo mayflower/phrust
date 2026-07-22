@@ -19691,9 +19691,20 @@ fn lower_optimizing_region_instruction(
                     resumed_status,
                     i64::from(expected_return_status),
                 );
+                let resumed_transition = builder.ins().icmp_imm(
+                    IntCC::Equal,
+                    resumed_status,
+                    i64::from(crate::JitCallStatus::RECOMPILE_REQUESTED.0),
+                );
+                let inspect_resumed = builder.create_block();
+                builder
+                    .ins()
+                    .brif(resumed_return, returned, &[], inspect_resumed, &[]);
+
+                builder.switch_to_block(inspect_resumed);
                 builder.ins().brif(
-                    resumed_return,
-                    returned,
+                    resumed_transition,
+                    resume_callee,
                     &[],
                     propagate,
                     &[resumed_status.into()],
@@ -22855,6 +22866,7 @@ fn lower_baseline_region_instruction(
                         builder,
                         native_operations.semantic_dispatch,
                         native_operations.value_release,
+                        value_flow,
                         locals,
                         register_variables,
                         registers,
@@ -22876,6 +22888,8 @@ fn lower_baseline_region_instruction(
                     module,
                     builder,
                     native_operations.semantic_dispatch,
+                    native_operations.value_release,
+                    value_flow,
                     locals,
                     register_variables,
                     registers,
@@ -25006,7 +25020,8 @@ fn lower_cached_bind_global(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     semantic_helper: Option<NativeHelper>,
-    _lifecycle: Option<NativeHelper>,
+    lifecycle: Option<NativeHelper>,
+    value_flow: &ExecutableValueFlow,
     locals: &NativeLocalMap,
     register_variables: &NativeRegisterMap,
     registers: &mut NativeRegisterMap,
@@ -25032,6 +25047,8 @@ fn lower_cached_bind_global(
         module,
         builder,
         semantic_helper,
+        lifecycle,
+        value_flow,
         locals,
         register_variables,
         registers,
@@ -25211,6 +25228,8 @@ fn lower_direct_semantic_call(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     semantic_helper: Option<NativeHelper>,
+    native_value_release_helper: Option<NativeHelper>,
+    value_flow: &ExecutableValueFlow,
     locals: &NativeLocalMap,
     register_variables: &NativeRegisterMap,
     registers: &mut NativeRegisterMap,
@@ -25234,6 +25253,7 @@ fn lower_direct_semantic_call(
         )
     })?;
     let operand_count = call.operands.len();
+    let mut consumed_operands = BTreeMap::new();
     let operands_ptr = if operand_count == 0 {
         builder.ins().iconst(pointer_type, 0)
     } else {
@@ -25255,6 +25275,17 @@ fn lower_direct_semantic_call(
                 )
             })?;
             let value = lower_region_operand(builder, locals, registers, operand)?;
+            // Semantic operands are synchronous borrows in the runtime ABI,
+            // but Region IR moves every non-borrowed register owner into this
+            // call boundary.  The semantic result owns an independent handle,
+            // so the caller must relinquish the moved operand after success.
+            // Without this, assignment temporaries retain complete native
+            // arrays/objects until request teardown and postpone destructors.
+            if let RegionOperand::Register(register) = operand
+                && value_flow.consumes_semantic_operand(instruction.continuation_id, register)
+            {
+                consumed_operands.entry(register).or_insert(value);
+            }
             builder.ins().store(
                 MemFlagsData::new(),
                 value,
@@ -25339,6 +25370,17 @@ fn lower_direct_semantic_call(
     }
 
     builder.switch_to_block(ok);
+    for operand in consumed_operands.into_values() {
+        let _ = lower_guarded_value_release(
+            module,
+            builder,
+            native_value_release_helper,
+            native_dim_operation(1, function, instruction.continuation_id),
+            operand,
+            result_out,
+            deopt_out,
+        )?;
+    }
     let value = builder.ins().stack_load(types::I64, out_slot, 16);
     match call.result {
         RegionCallResult::Register(register) => {
@@ -25347,7 +25389,21 @@ fn lower_direct_semantic_call(
         RegionCallResult::ReferenceLocal(local) => {
             define_local_variable(builder, locals, local, value)?;
         }
-        RegionCallResult::Discard => {}
+        RegionCallResult::Discard => {
+            // Semantic operations return an independently owned native value.
+            // Ignoring a discarded result kept arrays, objects, references,
+            // and their complete child graphs alive until request teardown;
+            // it also postponed PHP destructors past the following statement.
+            let _ = lower_guarded_value_release(
+                module,
+                builder,
+                native_value_release_helper,
+                native_dim_operation(1, function, instruction.continuation_id),
+                value,
+                result_out,
+                deopt_out,
+            )?;
+        }
     }
     Ok(())
 }

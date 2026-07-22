@@ -1620,6 +1620,9 @@ unsafe fn jit_baseline_native_builtin_dispatch_impl<const DIAGNOSTIC: bool>(
         // Publication prepared the exact builtin record together with the
         // callsite, so the warm path neither rebinds arguments nor validates
         // a redundant helper ID/name pair.
+        if DIAGNOSTIC {
+            context.enter_builtin_attribution(entry.name());
+        }
         let result = if matches!(
             entry.execution_kind(),
             php_runtime::api::BuiltinExecutionKind::Runtime
@@ -1640,6 +1643,9 @@ unsafe fn jit_baseline_native_builtin_dispatch_impl<const DIAGNOSTIC: bool>(
                 Some(prepared),
             )
         };
+        if DIAGNOSTIC {
+            context.exit_builtin_attribution(entry.name());
+        }
         if DIAGNOSTIC {
             let elapsed = started_at
                 .map(|started| started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
@@ -2372,23 +2378,32 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
             if let php_ir::InstructionKind::CallMethod { method, args, .. } = &instruction.kind
                 && let Some(receiver) = encoded.first()
             {
-                let receiver_value = match context.decode(*receiver).map_err(|error| {
-                    format!("{method}() native receiver could not be decoded: {error}")
-                })? {
-                    Value::Reference(reference) => reference.get(),
-                    value => value,
-                };
-                let Value::Object(object) = receiver_value else {
-                    let path = context
-                        .unit
-                        .files
-                        .get(instruction.span.file.index())
-                        .map_or("<unknown>", |file| file.path.as_str());
-                    let line = native_source_line(context, instruction);
-                    return Err(format!(
-                        "Call to a member function {method}() on {} at {path}:{line}",
-                        native_value_type_name(&receiver_value),
-                    ));
+                let object = if let Some(object) = context.native_query_object(*receiver) {
+                    // Method lookup needs only stable object/class identity.
+                    // Keep declared slots authoritative in the native plane;
+                    // decoding here previously rebuilt the receiver's entire
+                    // nested property graph around every method call.
+                    object
+                } else {
+                    let receiver_value = match context.decode(*receiver).map_err(|error| {
+                        format!("{method}() native receiver could not be decoded: {error}")
+                    })? {
+                        Value::Reference(reference) => reference.get(),
+                        value => value,
+                    };
+                    let Value::Object(object) = receiver_value else {
+                        let path = context
+                            .unit
+                            .files
+                            .get(instruction.span.file.index())
+                            .map_or("<unknown>", |file| file.path.as_str());
+                        let line = native_source_line(context, instruction);
+                        return Err(format!(
+                            "Call to a member function {method}() on {} at {path}:{line}",
+                            native_value_type_name(&receiver_value),
+                        ));
+                    };
+                    object
                 };
                 let class_name = object.class_name();
                 if let Some(target) =
