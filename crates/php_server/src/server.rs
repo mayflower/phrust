@@ -7,10 +7,11 @@ use crate::{
     routing::RouteConfig,
     serve::serve_until_shutdown,
     session_store::SessionStore,
+    shutdown::ShutdownCoordinator,
     state::{
-        AppState, CapabilityState, ConcurrencyServices, ObservabilityState, RequestRuntimeConfig,
-        RequestTransport, RuntimeServices, ServerEngineState, SessionConfig, SessionServices,
-        preload_script_cache, server_env_snapshot,
+        AppState, CapabilityState, ConcurrencyServices, ConnectionServices, ObservabilityState,
+        RequestRuntimeConfig, RequestTransport, RuntimeServices, ServerEngineState, SessionConfig,
+        SessionServices, TransportLimits, preload_script_cache, server_env_snapshot,
     },
     static_files::StaticFileService,
     tls::build_tls_acceptor,
@@ -263,6 +264,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let startup_request_profile = config.observability.request_profile.clone();
     let startup_tls_enabled = config.transport.tls_cert.is_some();
     let startup_http3_enabled = config.transport.http3_enabled;
+    let max_connections = config.transport.max_connections;
     let engine_profile = config.engine.engine_preset;
     let tls_acceptor = build_tls_acceptor(
         config.transport.tls_cert.as_deref(),
@@ -330,6 +332,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         config.engine.perf_ablation,
     ));
     let metrics = Arc::new(ServerMetrics::default());
+    metrics.readiness_state.store(1, Ordering::Release);
     let static_files = Arc::new(
         StaticFileService::new(
             docroot.clone(),
@@ -355,7 +358,14 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
                 "HTTP/3 requires TLS; provide --tls-cert <path> and --tls-key <path> with --enable-http3",
             )
         })?;
-        Some(build_http3_endpoint(cert_path, key_path, http3_listen)?)
+        Some(build_http3_endpoint(
+            cert_path,
+            key_path,
+            http3_listen,
+            u32::try_from(config.transport.max_streams_per_connection)
+                .expect("validated max_streams_per_connection fits u32"),
+            Duration::from_millis(config.transport.connection_idle_timeout_ms),
+        )?)
     } else {
         None
     };
@@ -391,7 +401,14 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
                 file_uploads: config.sessions_uploads.file_uploads,
                 throw_limit_errors: false,
             },
-            request_timeout: Duration::from_millis(config.limits.request_timeout_ms),
+            request_admission_timeout: Duration::from_millis(
+                config.limits.request_admission_timeout_ms,
+            ),
+            cpu_queue_timeout: Duration::from_millis(config.limits.cpu_queue_timeout_ms),
+            request_body_timeout: Duration::from_millis(config.limits.request_body_timeout_ms),
+            request_body_idle_timeout: Duration::from_millis(
+                config.limits.request_body_idle_timeout_ms,
+            ),
             execution_time_limit: config
                 .limits
                 .execution_deadline_enabled
@@ -405,6 +422,12 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
             php_workers: Arc::new(crate::worker_pool::PhpWorkerPool::new(
                 config.limits.cpu_execution_limit,
             )),
+        },
+        connections: ConnectionServices {
+            permits: Arc::new(Semaphore::new(max_connections)),
+            handshake_permits: Arc::new(Semaphore::new(max_connections.min(128))),
+            max_connections,
+            shutdown: ShutdownCoordinator::new(),
         },
         observability: ObservabilityState {
             metrics_token: config.observability.metrics_token,
@@ -445,6 +468,29 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
             local_addr,
             request_scheme: if startup_tls_enabled { "https" } else { "http" },
             http3_alt_svc,
+            limits: TransportLimits {
+                request_header_timeout: Duration::from_millis(
+                    config.transport.request_header_timeout_ms,
+                ),
+                response_write_idle_timeout: Duration::from_millis(
+                    config.transport.response_write_idle_timeout_ms,
+                ),
+                connection_idle_timeout: Duration::from_millis(
+                    config.transport.connection_idle_timeout_ms,
+                ),
+                tls_handshake_timeout: Duration::from_millis(
+                    config.transport.tls_handshake_timeout_ms,
+                ),
+                graceful_shutdown_timeout: Duration::from_millis(
+                    config.transport.graceful_shutdown_timeout_ms,
+                ),
+                max_request_header_bytes: config.transport.max_request_header_bytes,
+                max_request_target_bytes: config.transport.max_request_target_bytes,
+                max_streams_per_connection: u32::try_from(
+                    config.transport.max_streams_per_connection,
+                )
+                .expect("validated max_streams_per_connection fits u32"),
+            },
         },
         services: RuntimeServices {
             metrics,
@@ -454,6 +500,10 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         },
     });
     preload_script_cache(&state, script_cache_preload.as_deref(), strict_preload)?;
+    debug!(
+        max_connections = state.connections.max_connections,
+        "transport connection budget initialized"
+    );
     let startup_scheme = if startup_tls_enabled { "https" } else { "http" };
     println!("listening {startup_scheme}://{local_addr}");
     eprintln!(

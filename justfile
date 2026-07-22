@@ -120,6 +120,8 @@ help:
       '  just cli-server-smoke     Run phrust-php -S built-in server smoke checks' \
       '  just server-compat-smoke [SECTION=all] Run Wave 2 server compatibility smoke checks' \
       '  just server-tls-smoke     Run integrated HTTPS server smoke checks' \
+      '  just server-transport-hardening-smoke Run bounded H1/H2/H3 transport checks' \
+      '  just server-graceful-shutdown-smoke Run SIGINT/SIGTERM drain checks' \
       '  just server-benchmark-smoke Run short optional server benchmark smoke' \
       '' \
       'Standard library and compatibility:' \
@@ -266,6 +268,8 @@ verify-server:
     just server-smoke
     just server-request-input-smoke
     just server-session-files-smoke
+    just server-transport-hardening-smoke
+    just server-graceful-shutdown-smoke
 
 server-request-input-smoke:
     cargo build -p php_server --bin phrust-server
@@ -280,6 +284,17 @@ server-compat-smoke SECTION="all":
 
 server-tls-smoke:
     scripts/server/tls_smoke.sh
+
+server-transport-hardening-smoke:
+    cargo test -p php_server --test health connection_admission_rejects_saturation_and_releases_the_permit -- --exact
+    cargo test -p php_server --test health http2_advertised_stream_limit_bounds_admitted_requests -- --exact
+    cargo test -p php_server --test health http3_field_section_and_concurrent_stream_limits_are_enforced -- --exact
+    cargo test -p php_server --test health http3_body_idle_and_quic_connection_idle_are_enforced -- --exact
+
+server-graceful-shutdown-smoke:
+    cargo test -p php_server --test health sigterm_
+    cargo test -p php_server --test health shutdown
+    cargo test -p php_server --test health drain_deadline_forces_incomplete_upload_and_removes_spool_file -- --exact
 
 server-benchmark-smoke:
     scripts/server/benchmark_smoke.sh

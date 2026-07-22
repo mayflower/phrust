@@ -30,6 +30,8 @@ The current server surface includes:
   selection.
 - Production-oriented config, access logs, metrics hardening, Rustls
   HTTP/1.1/HTTP/2 termination, and optional HTTP/3 over QUIC.
+- Shared TCP/TLS/QUIC admission, explicit H1/H2/H3 resource limits, strict
+  authority/framing validation, and graceful SIGINT/SIGTERM drain readiness.
 - A shared bounded response-transfer core for static files and PHP, including
   transport-visible `flush()`, backpressure, and client cancellation.
 
@@ -274,7 +276,19 @@ session_save_path = "/var/tmp/phrust-sessions"
 session_lock_timeout_ms = 5000
 max_in_flight = 200
 cpu_execution_limit = 8
-request_timeout_ms = 30000
+max_connections = 1024
+request_admission_timeout_ms = 500
+cpu_queue_timeout_ms = 30000
+request_header_timeout_ms = 10000
+request_body_timeout_ms = 30000
+request_body_idle_timeout_ms = 15000
+response_write_idle_timeout_ms = 30000
+connection_idle_timeout_ms = 75000
+tls_handshake_timeout_ms = 10000
+graceful_shutdown_timeout_ms = 30000
+max_request_header_bytes = 65536
+max_request_target_bytes = 16384
+max_streams_per_connection = 100
 max_execution_ms = 30000
 metrics_endpoint_enabled = true
 metrics_token = "replace-with-deployment-secret"
@@ -304,6 +318,41 @@ At startup the first stdout line remains the stable machine-readable
 stderr summary reports the resolved docroot, front controller, script-cache
 settings, upload/session temp directories, metrics exposure, access-log target,
 and TLS/ALPN state.
+
+## Transport Limits And Graceful Drain
+
+`max_connections` is one non-waiting budget shared by accepted TCP sockets and
+QUIC connections. TLS and QUIC handshakes consume a derived handshake budget
+and have a hard deadline. Request admission, PHP CPU-queue wait, header read,
+total request-body read, body-frame idle, response-write idle, inactive
+connection idle, and graceful drain are distinct typed policies. The legacy
+`request_timeout_ms` config key is rejected and must be migrated to
+`request_body_timeout_ms` and `cpu_queue_timeout_ms`.
+
+HTTP/1.1 uses strict parsing, a 64 KiB parser buffer, a ten-second default
+header deadline, and the fixed 100-header stack fast path. HTTP/2 advertises at
+most `max_streams_per_connection`, a 64 KiB header-list default, 1 MiB stream
+and 8 MiB connection receive windows, and a 256 KiB per-stream send buffer.
+HTTP/3 uses the same stream/header policies with explicit QUIC 1 MiB stream,
+8 MiB connection receive/send windows, at most 16 unidirectional streams, and
+no datagrams, WebTransport, 0-RTT, or Extended CONNECT.
+
+Request validation is shared before routing: request targets default to a
+16 KiB maximum, decoded headers to 100 values/64 KiB, authority and optional
+Host must agree, and ambiguous Content-Length/Transfer-Encoding or hop-by-hop
+framing is rejected. PHP receives stable HTTP/1.0, HTTP/1.1, HTTP/2.0, or
+HTTP/3.0 transport metadata. A single response finalizer removes application
+transport headers and enforces HEAD/1xx/204/205/304 body rules for all three
+protocols.
+
+`GET` and `HEAD /readyz` report readiness separately from `/healthz`. The first
+SIGINT or SIGTERM switches readiness to 503 before listener accept stops,
+rejects new work, closes HTTP/1 keep-alive gracefully, and sends HTTP/2 and
+HTTP/3 GOAWAY. Admitted transfers may finish until
+`graceful_shutdown_timeout_ms`; a second signal or deadline forces owned tasks
+through the existing cancellation, upload/body-tempfile, transfer, and session
+cleanup paths. With no active traffic the process exits immediately rather
+than waiting for the configured deadline.
 
 ## TLS Transport
 
@@ -336,6 +385,8 @@ nix develop -c cargo test -p php_server
 nix develop -c just server-smoke
 nix develop -c just server-compat-smoke all
 nix develop -c just server-tls-smoke
+nix develop -c just server-transport-hardening-smoke
+nix develop -c just server-graceful-shutdown-smoke
 nix develop -c just server-benchmark-smoke
 nix develop -c rg "FastCGI|php-fpm|mod_php|CGI|std::process::Command|Command::new" crates/php_server crates/php_executor docs README.md
 ```

@@ -26,6 +26,1248 @@ fn server_serves_healthz() {
 }
 
 #[test]
+fn connection_admission_rejects_saturation_and_releases_the_permit() {
+    let docroot = temp_docroot();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--max-connections",
+            "1",
+            "--connection-idle-timeout-ms",
+            "2000",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let held = TcpStream::connect(&address).expect("hold the only connection permit");
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut rejected = TcpStream::connect(&address).expect("connect saturated socket");
+    rejected
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("set saturated read timeout");
+    let _ = rejected
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let mut byte = [0_u8; 1];
+    match rejected.read(&mut byte) {
+        Ok(0) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            ) => {}
+        result => panic!("saturated connection was not dropped immediately: {result:?}"),
+    }
+
+    drop(rejected);
+    drop(held);
+    std::thread::sleep(Duration::from_millis(50));
+    let health = http_request(&address, "GET", "/healthz");
+    let metrics = http_request(&address, "GET", "/__phrust/metrics");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove connection admission docroot");
+    assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+    assert!(
+        metrics.contains("phrust_server_connection_limit_rejections_total 1\n"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn h1_header_deadline_is_observable() {
+    let docroot = temp_docroot();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--request-header-timeout-ms",
+            "100",
+            "--connection-idle-timeout-ms",
+            "1000",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+
+    let mut slow_header = TcpStream::connect(&address).expect("connect slow header");
+    slow_header
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: local")
+        .expect("write partial header");
+    slow_header
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("set slow-header timeout");
+    std::thread::sleep(Duration::from_millis(200));
+    let mut byte = [0_u8; 1];
+    match slow_header.read(&mut byte) {
+        Ok(0) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            ) => {}
+        result => panic!("slow header connection remained open: {result:?}"),
+    }
+
+    let metrics = http_request(&address, "GET", "/__phrust/metrics");
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove header deadline docroot");
+    assert!(
+        metrics.contains("phrust_server_h1_header_timeouts_total 1\n"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn inactive_keep_alive_uses_the_connection_idle_deadline() {
+    let docroot = temp_docroot();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--request-header-timeout-ms",
+            "1000",
+            "--connection-idle-timeout-ms",
+            "100",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let mut idle = TcpStream::connect(&address).expect("connect idle keep-alive");
+    idle.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("write keep-alive request");
+    idle.set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("set idle read timeout");
+    let started = Instant::now();
+    let mut response = String::new();
+    idle.read_to_string(&mut response)
+        .expect("read response through idle close");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(75),
+        "keep-alive closed before its idle budget"
+    );
+
+    let metrics = http_request(&address, "GET", "/__phrust/metrics");
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove connection idle docroot");
+    assert!(
+        metrics.contains("phrust_server_connection_idle_timeouts_total 1\n"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn active_php_request_outlives_the_connection_idle_budget() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("slow.php"),
+        "<?php usleep(250000); echo \"done\\n\";",
+    )
+    .expect("write slow PHP fixture");
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--connection-idle-timeout-ms",
+            "50",
+            "--max-execution-ms",
+            "2000",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let started = Instant::now();
+    let response = http_request(&address, "GET", "/slow.php");
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove active-idle docroot");
+    assert_eq!(response_body(&response), "done\n", "{response}");
+    assert!(started.elapsed() >= Duration::from_millis(200));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_handshake_timeout_and_protocol_failure_release_budgets() {
+    use http_body_util::{BodyExt, Empty};
+    use hyper_util::rt::TokioIo;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let docroot = temp_docroot();
+    let (cert, key) = tls_fixture_paths();
+    let cert_arg = cert.to_string_lossy().to_string();
+    let key_arg = key.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--tls-cert",
+            &cert_arg,
+            "--tls-key",
+            &key_arg,
+            "--max-connections",
+            "1",
+            "--tls-handshake-timeout-ms",
+            "100",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+
+    let mut slow = tokio::net::TcpStream::connect(&address)
+        .await
+        .expect("connect slow TLS handshake");
+    tokio::time::sleep(Duration::from_millis(175)).await;
+    let mut byte = [0_u8; 1];
+    let slow_read = tokio::time::timeout(Duration::from_secs(1), slow.read(&mut byte))
+        .await
+        .expect("slow TLS socket closes");
+    assert_eq!(slow_read.expect("read slow TLS close"), 0);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut invalid = tokio::net::TcpStream::connect(&address)
+        .await
+        .expect("connect invalid TLS handshake");
+    invalid
+        .write_all(b"GET / HTTP/1.1\r\n\r\n")
+        .await
+        .expect("write non-TLS bytes");
+    let mut alert = Vec::new();
+    let invalid_read =
+        tokio::time::timeout(Duration::from_secs(1), invalid.read_to_end(&mut alert))
+            .await
+            .expect("invalid TLS socket closes");
+    invalid_read.expect("read invalid TLS close");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let connector =
+        tokio_rustls::TlsConnector::from(Arc::new(test_client_config(vec![b"http/1.1".to_vec()])));
+    let retry_deadline = Instant::now() + Duration::from_secs(1);
+    let tls = loop {
+        let tcp = tokio::net::TcpStream::connect(&address)
+            .await
+            .expect("connect post-failure TLS client");
+        match connector
+            .connect(
+                rustls_pki_types::ServerName::try_from("localhost").unwrap(),
+                tcp,
+            )
+            .await
+        {
+            Ok(tls) => break tls,
+            Err(_) if Instant::now() < retry_deadline => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!("TLS connection permit was not released: {error}"),
+        }
+    };
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .expect("perform post-failure H1 handshake");
+    let connection_task = tokio::spawn(connection);
+    let health = sender
+        .send_request(
+            hyper::Request::builder()
+                .uri("https://localhost/healthz")
+                .body(Empty::<bytes::Bytes>::new())
+                .expect("build post-failure health request"),
+        )
+        .await
+        .expect("send post-failure health request");
+    let health_status = health.status();
+    health
+        .into_body()
+        .collect()
+        .await
+        .expect("collect post-failure health response");
+    let metrics = sender
+        .send_request(
+            hyper::Request::builder()
+                .uri("https://localhost/__phrust/metrics")
+                .body(Empty::<bytes::Bytes>::new())
+                .expect("build post-failure metrics request"),
+        )
+        .await
+        .expect("send post-failure metrics request")
+        .into_body()
+        .collect()
+        .await
+        .expect("collect post-failure metrics response")
+        .to_bytes();
+    let metrics = String::from_utf8(metrics.to_vec()).expect("TLS metrics are UTF-8");
+    drop(sender);
+    connection_task.abort();
+    let _ = connection_task.await;
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove TLS admission docroot");
+    assert_eq!(health_status, hyper::StatusCode::OK);
+    for expected in [
+        "phrust_server_tls_handshakes_active 0\n",
+        "phrust_server_tls_handshake_timeouts_total 1\n",
+        "phrust_server_tls_handshake_failures_total 1\n",
+        "phrust_server_tls_handshake_protocol_failures_total 1\n",
+    ] {
+        assert!(
+            metrics.contains(expected),
+            "missing {expected:?}: {metrics}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http3_body_idle_and_quic_connection_idle_are_enforced() {
+    use bytes::Buf;
+    use quinn::crypto::rustls::QuicClientConfig;
+
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("body.php"),
+        "<?php echo strlen(file_get_contents('php://input')), \"\\n\";",
+    )
+    .expect("write H3 idle body fixture");
+    let (cert, key) = tls_fixture_paths();
+    let cert_arg = cert.to_string_lossy().to_string();
+    let key_arg = key.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--tls-cert",
+            &cert_arg,
+            "--tls-key",
+            &key_arg,
+            "--enable-http3",
+            "--request-body-idle-timeout-ms",
+            "75",
+            "--request-body-timeout-ms",
+            "1000",
+            "--connection-idle-timeout-ms",
+            "250",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+
+    let mut crypto = test_client_config(vec![b"h3".to_vec()]);
+    crypto.enable_early_data = true;
+    let client_config = quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(crypto).expect("build H3 idle client config"),
+    ));
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())
+        .expect("create H3 idle client endpoint");
+    endpoint.set_default_client_config(client_config.clone());
+    let connection = endpoint
+        .connect(address.parse().unwrap(), "localhost")
+        .expect("start H3 body-idle connection")
+        .await
+        .expect("connect H3 body-idle client");
+    let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .expect("create H3 body-idle client");
+    let driver_task = tokio::spawn(async move { driver.wait_idle().await });
+    let request = hyper::Request::builder()
+        .method(hyper::Method::POST)
+        .uri("https://localhost/body.php")
+        .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
+        .header(hyper::header::CONTENT_LENGTH, "4")
+        .body(())
+        .expect("build H3 idle request");
+    let mut stream = sender
+        .send_request(request)
+        .await
+        .expect("send H3 idle request headers");
+    stream
+        .send_data(bytes::Bytes::from_static(b"a"))
+        .await
+        .expect("send first H3 body frame");
+    let response = match tokio::time::timeout(Duration::from_secs(1), stream.recv_response()).await
+    {
+        Ok(Ok(response)) => response,
+        result => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let mut stderr = String::new();
+            if let Some(mut output) = child.stderr.take() {
+                let _ = output.read_to_string(&mut stderr);
+            }
+            panic!("receive H3 body idle response: {result:?}; server stderr: {stderr}");
+        }
+    };
+    assert_eq!(response.status(), hyper::StatusCode::REQUEST_TIMEOUT);
+    while let Some(mut data) = stream.recv_data().await.expect("receive H3 408 body") {
+        while data.has_remaining() {
+            let _ = data.copy_to_bytes(data.remaining());
+        }
+    }
+    drop(stream);
+    drop(sender);
+    endpoint.close(quinn::VarInt::from_u32(0), b"body idle complete");
+    let _ = driver_task.await;
+
+    let mut idle_endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("create QUIC idle endpoint");
+    idle_endpoint.set_default_client_config(client_config);
+    let idle_connection = idle_endpoint
+        .connect(address.parse().unwrap(), "localhost")
+        .expect("start QUIC idle connection")
+        .await
+        .expect("connect QUIC idle client");
+    let (mut idle_driver, idle_sender) =
+        h3::client::new(h3_quinn::Connection::new(idle_connection))
+            .await
+            .expect("create idle H3 connection");
+    let _ = tokio::time::timeout(Duration::from_secs(2), idle_driver.wait_idle())
+        .await
+        .expect("QUIC idle timeout closes connection");
+    drop(idle_sender);
+    idle_endpoint.close(quinn::VarInt::from_u32(0), b"idle observed");
+
+    let metrics = http3_request(&address, hyper::Method::GET, "/__phrust/metrics", &[], &[]).await;
+    let metrics = String::from_utf8(metrics.body()).expect("H3 idle metrics are UTF-8");
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove H3 idle docroot");
+    for expected in [
+        "phrust_server_request_body_idle_timeouts_total 1\n",
+        "phrust_server_quic_idle_timeouts_total 1\n",
+    ] {
+        assert!(
+            metrics.contains(expected),
+            "missing {expected:?}: {metrics}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_and_http3_share_one_connection_budget() {
+    use quinn::crypto::rustls::QuicClientConfig;
+
+    let docroot = temp_docroot();
+    let (cert, key) = tls_fixture_paths();
+    let cert_arg = cert.to_string_lossy().to_string();
+    let key_arg = key.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--tls-cert",
+            &cert_arg,
+            "--tls-key",
+            &key_arg,
+            "--enable-http3",
+            "--max-connections",
+            "1",
+            "--tls-handshake-timeout-ms",
+            "2000",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let held_tcp = tokio::net::TcpStream::connect(&address)
+        .await
+        .expect("hold shared connection permit with TCP");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let crypto = test_client_config(vec![b"h3".to_vec()]);
+    let client_config = quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(crypto).expect("build shared-limit QUIC client config"),
+    ));
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())
+        .expect("create shared-limit QUIC endpoint");
+    endpoint.set_default_client_config(client_config);
+    let refused = endpoint
+        .connect(address.parse().unwrap(), "localhost")
+        .expect("start saturated QUIC connection");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), refused)
+            .await
+            .expect("saturated QUIC connection resolves")
+            .is_err(),
+        "QUIC connection bypassed the held TCP permit"
+    );
+    endpoint.close(quinn::VarInt::from_u32(0), b"saturation observed");
+
+    drop(held_tcp);
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    let health = http3_request(&address, hyper::Method::GET, "/healthz", &[], &[]).await;
+    let metrics = http3_request(&address, hyper::Method::GET, "/__phrust/metrics", &[], &[]).await;
+    let metrics = String::from_utf8(metrics.body()).expect("shared-limit metrics are UTF-8");
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove shared connection limit docroot");
+    assert_eq!(health.status, hyper::StatusCode::OK);
+    assert!(
+        metrics.contains("phrust_server_h3_connection_limit_rejections_total 1\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phrust_server_connection_limit_rejections_total 1\n"),
+        "{metrics}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http3_field_section_and_concurrent_stream_limits_are_enforced() {
+    use quinn::crypto::rustls::QuicClientConfig;
+
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("body.php"),
+        "<?php echo strlen(file_get_contents('php://input')), \"\\n\";",
+    )
+    .expect("write H3 stream-limit fixture");
+    let (cert, key) = tls_fixture_paths();
+    let cert_arg = cert.to_string_lossy().to_string();
+    let key_arg = key.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--tls-cert",
+            &cert_arg,
+            "--tls-key",
+            &key_arg,
+            "--enable-http3",
+            "--max-streams-per-connection",
+            "2",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let crypto = test_client_config(vec![b"h3".to_vec()]);
+    let client_config = quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(crypto).expect("build H3 limit client config"),
+    ));
+
+    let mut header_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())
+        .expect("create H3 field-limit endpoint");
+    header_endpoint.set_default_client_config(client_config.clone());
+    let header_connection = header_endpoint
+        .connect(address.parse().unwrap(), "localhost")
+        .expect("start H3 field-limit connection")
+        .await
+        .expect("connect H3 field-limit client");
+    let (mut header_driver, mut header_sender) =
+        h3::client::new(h3_quinn::Connection::new(header_connection))
+            .await
+            .expect("create H3 field-limit client");
+    let header_driver_task = tokio::spawn(async move { header_driver.wait_idle().await });
+    let large_value = hyper::header::HeaderValue::from_bytes(&vec![b'x'; 70_000])
+        .expect("construct oversized H3 field value");
+    let large_request = hyper::Request::builder()
+        .uri("https://localhost/healthz")
+        .header("x-large", large_value)
+        .body(())
+        .expect("build oversized H3 request");
+    match header_sender.send_request(large_request).await {
+        Err(_) => {}
+        Ok(mut stream) => {
+            let _ = stream.finish().await;
+            let response = tokio::time::timeout(Duration::from_secs(1), stream.recv_response())
+                .await
+                .expect("oversized H3 field resolves");
+            assert!(
+                response.is_err()
+                    || response.is_ok_and(|response| {
+                        response.status() == hyper::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+                    }),
+                "oversized H3 field section was accepted"
+            );
+        }
+    }
+    drop(header_sender);
+    header_endpoint.close(quinn::VarInt::from_u32(0), b"field limit observed");
+    header_driver_task.abort();
+    let _ = header_driver_task.await;
+
+    let mut stream_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())
+        .expect("create H3 stream-limit endpoint");
+    stream_endpoint.set_default_client_config(client_config);
+    let stream_connection = stream_endpoint
+        .connect(address.parse().unwrap(), "localhost")
+        .expect("start H3 stream-limit connection")
+        .await
+        .expect("connect H3 stream-limit client");
+    let (mut stream_driver, mut stream_sender) =
+        h3::client::new(h3_quinn::Connection::new(stream_connection))
+            .await
+            .expect("create H3 stream-limit client");
+    let stream_driver_task = tokio::spawn(async move { stream_driver.wait_idle().await });
+    let held_request = || {
+        hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri("https://localhost/body.php")
+            .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
+            .header(hyper::header::CONTENT_LENGTH, "1")
+            .body(())
+            .expect("build held H3 request")
+    };
+    let first = stream_sender
+        .send_request(held_request())
+        .await
+        .expect("open first H3 request stream");
+    let second = stream_sender
+        .send_request(held_request())
+        .await
+        .expect("open second H3 request stream");
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(150),
+            stream_sender.send_request(held_request()),
+        )
+        .await
+        .is_err(),
+        "third H3 request stream bypassed max_streams_per_connection=2"
+    );
+    drop(first);
+    drop(second);
+    drop(stream_sender);
+    stream_endpoint.close(quinn::VarInt::from_u32(0), b"stream limit observed");
+    stream_driver_task.abort();
+    let _ = stream_driver_task.await;
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove H3 limits docroot");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http2_advertised_stream_limit_bounds_admitted_requests() {
+    use http_body_util::StreamBody;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("body.php"),
+        "<?php echo strlen(file_get_contents('php://input')), \"\\n\";",
+    )
+    .expect("write H2 stream-limit fixture");
+    let (cert, key) = tls_fixture_paths();
+    let cert_arg = cert.to_string_lossy().to_string();
+    let key_arg = key.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--tls-cert",
+            &cert_arg,
+            "--tls-key",
+            &key_arg,
+            "--max-streams-per-connection",
+            "2",
+            "--request-body-timeout-ms",
+            "5000",
+            "--request-body-idle-timeout-ms",
+            "5000",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let tcp = tokio::net::TcpStream::connect(&address)
+        .await
+        .expect("connect H2 stream-limit client");
+    let connector =
+        tokio_rustls::TlsConnector::from(Arc::new(test_client_config(vec![b"h2".to_vec()])));
+    let tls = connector
+        .connect(
+            rustls_pki_types::ServerName::try_from("localhost").unwrap(),
+            tcp,
+        )
+        .await
+        .expect("connect H2 stream-limit TLS");
+    type PendingBody = StreamBody<
+        futures_util::stream::Pending<
+            Result<hyper::body::Frame<bytes::Bytes>, std::convert::Infallible>,
+        >,
+    >;
+    let (sender, connection) = hyper::client::conn::http2::handshake::<_, _, PendingBody>(
+        TokioExecutor::new(),
+        TokioIo::new(tls),
+    )
+    .await
+    .expect("perform H2 stream-limit handshake");
+    let connection_task = tokio::spawn(connection);
+    let held_request = || {
+        hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri("https://localhost/body.php")
+            .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
+            .header(hyper::header::CONTENT_LENGTH, "1")
+            .body(StreamBody::new(futures_util::stream::pending()))
+            .expect("build held H2 request")
+    };
+    let first_sender = sender.clone();
+    let first = tokio::spawn(async move {
+        let mut sender = first_sender;
+        sender.send_request(held_request()).await
+    });
+    let second_sender = sender.clone();
+    let second = tokio::spawn(async move {
+        let mut sender = second_sender;
+        sender.send_request(held_request()).await
+    });
+    let third_sender = sender.clone();
+    let third = tokio::spawn(async move {
+        let mut sender = third_sender;
+        sender.send_request(held_request()).await
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let metrics = http1_request(&address, hyper::Method::GET, "/__phrust/metrics", &[], &[]).await;
+    let metrics = String::from_utf8(metrics.body()).expect("H2 stream-limit metrics are UTF-8");
+    assert!(
+        metrics.contains("phrust_server_in_flight 3\n"),
+        "only two held H2 streams plus the metrics request may be admitted: {metrics}"
+    );
+
+    first.abort();
+    second.abort();
+    third.abort();
+    let _ = first.await;
+    let _ = second.await;
+    let _ = third.await;
+    drop(sender);
+    connection_task.abort();
+    let _ = connection_task.await;
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove H2 stream-limit docroot");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_drains_h2_requests_and_switches_readiness_before_accept_stop() {
+    use http_body_util::{BodyExt, Empty};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("slow.php"),
+        "<?php usleep(350000); echo \"done\\n\";",
+    )
+    .expect("write drain PHP fixture");
+    let (cert, key) = tls_fixture_paths();
+    let cert_arg = cert.to_string_lossy().to_string();
+    let key_arg = key.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--tls-cert",
+            &cert_arg,
+            "--tls-key",
+            &key_arg,
+            "--max-in-flight",
+            "1",
+            "--request-admission-timeout-ms",
+            "1500",
+            "--graceful-shutdown-timeout-ms",
+            "2000",
+            "--max-execution-ms",
+            "2000",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let tcp = tokio::net::TcpStream::connect(&address)
+        .await
+        .expect("connect drain H2 client");
+    let connector =
+        tokio_rustls::TlsConnector::from(Arc::new(test_client_config(vec![b"h2".to_vec()])));
+    let tls = connector
+        .connect(
+            rustls_pki_types::ServerName::try_from("localhost").unwrap(),
+            tcp,
+        )
+        .await
+        .expect("connect drain H2 TLS");
+    let (sender, connection) = hyper::client::conn::http2::handshake::<_, _, Empty<bytes::Bytes>>(
+        TokioExecutor::new(),
+        TokioIo::new(tls),
+    )
+    .await
+    .expect("perform drain H2 handshake");
+    let connection_task = tokio::spawn(connection);
+    let request_task =
+        |mut sender: hyper::client::conn::http2::SendRequest<Empty<bytes::Bytes>>,
+         path: &'static str| {
+            tokio::spawn(async move {
+                let request = hyper::Request::builder()
+                    .uri(format!("https://localhost{path}"))
+                    .body(Empty::new())
+                    .expect("build drain request");
+                let response = sender
+                    .send_request(request)
+                    .await
+                    .expect("receive drain response head");
+                let (parts, body) = response.into_parts();
+                let body = body
+                    .collect()
+                    .await
+                    .expect("collect drain response")
+                    .to_bytes();
+                (parts.status, parts.headers, body)
+            })
+        };
+
+    let slow = request_task(sender.clone(), "/slow.php");
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    let ready = request_task(sender.clone(), "/readyz");
+    let health = request_task(sender.clone(), "/healthz");
+    let metrics = request_task(sender, "/__phrust/metrics");
+    tokio::time::sleep(Duration::from_millis(75)).await;
+
+    send_sigterm(&child);
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    let new_connection = tokio::time::timeout(
+        Duration::from_millis(250),
+        tokio::net::TcpStream::connect(&address),
+    )
+    .await;
+    assert!(
+        !matches!(new_connection, Ok(Ok(_))),
+        "new TCP connection succeeded after readiness switched to draining"
+    );
+
+    let (slow, ready, health, metrics) = tokio::join!(slow, ready, health, metrics);
+    let (slow_status, _, slow_body) = slow.expect("join slow drain request");
+    let (ready_status, ready_headers, ready_body) = ready.expect("join readiness request");
+    let (health_status, health_headers, health_body) = health.expect("join health request");
+    let (metrics_status, _, metrics_body) = metrics.expect("join metrics request");
+    assert_eq!(slow_status, hyper::StatusCode::OK);
+    assert_eq!(slow_body, b"done\n".as_slice());
+    assert_eq!(ready_status, hyper::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(ready_body, b"draining\n".as_slice());
+    assert_eq!(health_status, hyper::StatusCode::OK);
+    assert_eq!(health_body, b"ok\n".as_slice());
+    assert!(!ready_headers.contains_key(hyper::header::CONNECTION));
+    assert!(!health_headers.contains_key(hyper::header::CONNECTION));
+    assert_eq!(metrics_status, hyper::StatusCode::OK);
+    let metrics_body = String::from_utf8(metrics_body.to_vec()).expect("drain metrics are UTF-8");
+    assert!(
+        metrics_body.contains("phrust_server_graceful_shutdowns_total 1\n"),
+        "{metrics_body}"
+    );
+    assert!(
+        metrics_body.contains("phrust_server_readiness_state 0\n"),
+        "{metrics_body}"
+    );
+
+    let status = wait_for_exit(&mut child, Duration::from_secs(3));
+    let _ = connection_task.await;
+    fs::remove_dir_all(docroot).expect("remove H2 drain docroot");
+    assert!(status.success(), "drained server exited with {status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_sends_http3_goaway_and_finishes_the_existing_stream() {
+    use bytes::Buf;
+    use quinn::crypto::rustls::QuicClientConfig;
+
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("slow.php"),
+        "<?php echo \"first\\n\"; flush(); usleep(350000); echo \"done\\n\";",
+    )
+    .expect("write H3 drain fixture");
+    let (cert, key) = tls_fixture_paths();
+    let cert_arg = cert.to_string_lossy().to_string();
+    let key_arg = key.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--tls-cert",
+            &cert_arg,
+            "--tls-key",
+            &key_arg,
+            "--enable-http3",
+            "--graceful-shutdown-timeout-ms",
+            "2000",
+            "--max-execution-ms",
+            "2000",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+
+    let crypto = test_client_config(vec![b"h3".to_vec()]);
+    let client_config = quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(crypto).expect("build drain QUIC client config"),
+    ));
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("create H3 drain endpoint");
+    endpoint.set_default_client_config(client_config);
+    let connection = endpoint
+        .connect(address.parse().unwrap(), "localhost")
+        .expect("start H3 drain connection")
+        .await
+        .expect("connect H3 drain client");
+    let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .expect("create H3 drain client");
+    let driver_task = tokio::spawn(async move { driver.wait_idle().await });
+    let request = hyper::Request::builder()
+        .uri("https://localhost/slow.php")
+        .body(())
+        .expect("build H3 drain request");
+    let mut stream = sender
+        .send_request(request)
+        .await
+        .expect("send H3 drain request");
+    stream.finish().await.expect("finish H3 drain request");
+    let response = stream
+        .recv_response()
+        .await
+        .expect("receive H3 drain response head");
+    assert_eq!(response.status(), hyper::StatusCode::OK);
+    let mut body = Vec::new();
+    let mut first = stream
+        .recv_data()
+        .await
+        .expect("receive first H3 drain data")
+        .expect("H3 drain response has initial data");
+    while first.has_remaining() {
+        body.extend_from_slice(&first.copy_to_bytes(first.remaining()));
+    }
+    assert_eq!(body, b"first\n");
+
+    send_sigterm(&child);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let rejected = sender
+        .send_request(
+            hyper::Request::builder()
+                .uri("https://localhost/healthz")
+                .body(())
+                .expect("build post-GOAWAY request"),
+        )
+        .await;
+    assert!(rejected.is_err(), "H3 accepted a request after GOAWAY");
+
+    while let Ok(Some(mut data)) = stream.recv_data().await {
+        while data.has_remaining() {
+            body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+        }
+    }
+    assert_eq!(body, b"first\ndone\n");
+    drop(stream);
+    drop(sender);
+    let _driver_result = tokio::time::timeout(Duration::from_secs(2), driver_task)
+        .await
+        .expect("H3 drain driver stopped")
+        .expect("join H3 drain driver");
+    let status = wait_for_exit(&mut child, Duration::from_secs(3));
+    endpoint.close(quinn::VarInt::from_u32(0), b"drain observed");
+    fs::remove_dir_all(docroot).expect("remove H3 drain docroot");
+    assert!(status.success(), "H3 drained server exited with {status}");
+}
+
+#[test]
+fn request_body_idle_timeout_returns_408_and_cleans_spooling() {
+    let docroot = temp_docroot();
+    let spool_dir = temp_docroot();
+    fs::write(
+        docroot.join("body.php"),
+        "<?php echo strlen(file_get_contents('php://input')), \"\\n\";",
+    )
+    .expect("write body fixture");
+    let spool_arg = spool_dir.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--request-body-memory-bytes",
+            "1",
+            "--request-body-temp-dir",
+            &spool_arg,
+            "--request-body-idle-timeout-ms",
+            "100",
+            "--request-body-timeout-ms",
+            "1000",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let mut stream = TcpStream::connect(&address).expect("connect idle request body");
+    stream
+        .write_all(
+            b"POST /body.php HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\nConnection: close\r\n\r\nab",
+        )
+        .expect("write partial request body");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set idle body response timeout");
+    std::thread::sleep(Duration::from_millis(175));
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read idle body response");
+    assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+
+    let metrics = http_request(&address, "GET", "/__phrust/metrics");
+    stop_child(child);
+    assert_eq!(
+        fs::read_dir(&spool_dir)
+            .expect("read idle body spool")
+            .count(),
+        0
+    );
+    fs::remove_dir_all(docroot).expect("remove idle body docroot");
+    fs::remove_dir_all(spool_dir).expect("remove idle body spool");
+    for expected in [
+        "phrust_server_request_body_idle_timeouts_total 1\n",
+        "phrust_server_request_body_total_timeouts_total 0\n",
+        "phrust_server_request_body_tempfiles_active 0\n",
+    ] {
+        assert!(
+            metrics.contains(expected),
+            "missing {expected:?}: {metrics}"
+        );
+    }
+}
+
+#[test]
+fn request_body_total_timeout_is_separate_from_continuous_progress() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("body.php"),
+        "<?php echo strlen(file_get_contents('php://input')), \"\\n\";",
+    )
+    .expect("write total body fixture");
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--request-body-idle-timeout-ms",
+            "120",
+            "--request-body-timeout-ms",
+            "220",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let mut stream = TcpStream::connect(&address).expect("connect total-timeout body");
+    stream
+        .write_all(
+            b"POST /body.php HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: 6\r\nConnection: close\r\n\r\na",
+        )
+        .expect("write total-timeout headers");
+    for byte in [b'b', b'c', b'd'] {
+        std::thread::sleep(Duration::from_millis(60));
+        stream
+            .write_all(&[byte])
+            .expect("write progressing body byte");
+    }
+    std::thread::sleep(Duration::from_millis(60));
+    let _ = stream.write_all(b"e");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set total body response timeout");
+    let mut timed_out = String::new();
+    stream
+        .read_to_string(&mut timed_out)
+        .expect("read total body timeout response");
+    assert!(timed_out.starts_with("HTTP/1.1 408"), "{timed_out}");
+
+    let mut successful = TcpStream::connect(&address).expect("connect progressing body");
+    successful
+        .write_all(
+            b"POST /body.php HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\nConnection: close\r\n\r\na",
+        )
+        .expect("write progressing headers");
+    for byte in [b'b', b'c', b'd'] {
+        std::thread::sleep(Duration::from_millis(35));
+        successful
+            .write_all(&[byte])
+            .expect("write successful body byte");
+    }
+    successful
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set progressing response timeout");
+    let mut completed = String::new();
+    successful
+        .read_to_string(&mut completed)
+        .expect("read progressing body response");
+    assert!(completed.starts_with("HTTP/1.1 200"), "{completed}");
+    assert_eq!(response_body(&completed), "4\n");
+
+    let metrics = http_request(&address, "GET", "/__phrust/metrics");
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove total body docroot");
+    assert!(
+        metrics.contains("phrust_server_request_body_total_timeouts_total 1\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phrust_server_request_body_idle_timeouts_total 0\n"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn slow_response_reader_hits_write_idle_and_aborts_once() {
+    let docroot = temp_docroot();
+    let large = fs::File::create(docroot.join("large.bin")).expect("create slow-reader fixture");
+    large
+        .set_len(64 * 1024 * 1024)
+        .expect("size slow-reader fixture");
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--response-write-idle-timeout-ms",
+            "100",
+            "--connection-idle-timeout-ms",
+            "2000",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let mut slow = TcpStream::connect(&address).expect("connect slow response reader");
+    slow.write_all(b"GET /large.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("request large response");
+    std::thread::sleep(Duration::from_millis(600));
+
+    let metrics = http_request(&address, "GET", "/__phrust/metrics");
+    drop(slow);
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove slow-reader docroot");
+    assert!(
+        metrics.contains("phrust_server_response_write_idle_timeouts_total 1\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phrust_server_transfers_aborted_total 1\n"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn server_validates_authority_framing_and_request_limits_before_routing() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("headers.php"),
+        "<?php echo isset($_SERVER['HTTP_X_REMOVE']) ? \"leaked\\n\" : \"clean\\n\";",
+    )
+    .expect("write header fixture");
+    let mut child = start_server(&docroot, &[]);
+    let address = read_listening_address(&mut child);
+
+    let missing_host = raw_http_request(
+        &address,
+        b"GET /healthz HTTP/1.1\r\nConnection: close\r\n\r\n",
+    );
+    assert!(missing_host.starts_with("HTTP/1.1 400"), "{missing_host}");
+
+    let duplicate_host = raw_http_request(
+        &address,
+        b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        duplicate_host.starts_with("HTTP/1.1 400"),
+        "{duplicate_host}"
+    );
+
+    let absolute = raw_http_request(
+        &address,
+        b"GET http://localhost/healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(absolute.starts_with("HTTP/1.1 200"), "{absolute}");
+
+    let conflict = raw_http_request(
+        &address,
+        b"GET http://example.test/healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(conflict.starts_with("HTTP/1.1 400"), "{conflict}");
+
+    let nominated = raw_http_request(
+        &address,
+        b"GET /headers.php HTTP/1.1\r\nHost: localhost\r\nConnection: close, X-Remove\r\nX-Remove: secret\r\n\r\n",
+    );
+    assert!(nominated.starts_with("HTTP/1.1 200"), "{nominated}");
+    assert_eq!(response_body(&nominated), "clean\n");
+
+    let smuggling = raw_http_request(
+        &address,
+        b"POST /headers.php HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n",
+    );
+    assert!(smuggling.starts_with("HTTP/1.1 400"), "{smuggling}");
+
+    let duplicate_equal_length = raw_http_request(
+        &address,
+        b"POST /headers.php HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        duplicate_equal_length.starts_with("HTTP/1.1 200"),
+        "{duplicate_equal_length}"
+    );
+
+    let duplicate_conflicting_length = raw_http_request(
+        &address,
+        b"POST /headers.php HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        duplicate_conflicting_length.starts_with("HTTP/1.1 400"),
+        "{duplicate_conflicting_length}"
+    );
+
+    let unsupported_transfer_coding = raw_http_request(
+        &address,
+        b"POST /headers.php HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        unsupported_transfer_coding.starts_with("HTTP/1.1 400")
+            || unsupported_transfer_coding.starts_with("HTTP/1.1 501"),
+        "{unsupported_transfer_coding}"
+    );
+
+    let target = format!("/{}", "a".repeat(17_000));
+    let request = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let overlong = raw_http_request(&address, request.as_bytes());
+    assert!(overlong.starts_with("HTTP/1.1 414"), "{overlong}");
+
+    let proxy_connection = raw_http_request(
+        &address,
+        b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nProxy-Connection: keep-alive\r\n\r\n",
+    );
+    assert!(
+        proxy_connection.starts_with("HTTP/1.1 400"),
+        "{proxy_connection}"
+    );
+
+    let mut too_many_headers =
+        b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n".to_vec();
+    for index in 0..101 {
+        too_many_headers.extend_from_slice(format!("X-H-{index}: v\r\n").as_bytes());
+    }
+    too_many_headers.extend_from_slice(b"\r\n");
+    let too_many_headers = raw_http_request(&address, &too_many_headers);
+    assert!(
+        too_many_headers.starts_with("HTTP/1.1 431"),
+        "{too_many_headers}"
+    );
+
+    let oversized_header = format!(
+        "GET /healthz HTTP/1.1\r\nHost: localhost\r\nX-Large: {}\r\nConnection: close\r\n\r\n",
+        "x".repeat(65_536)
+    );
+    let oversized_header = raw_http_request(&address, oversized_header.as_bytes());
+    assert!(
+        oversized_header.starts_with("HTTP/1.1 431"),
+        "{oversized_header}"
+    );
+
+    let invalid_header = raw_http_request(
+        &address,
+        b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nInvalid Header\r\n\r\n",
+    );
+    assert!(
+        invalid_header.starts_with("HTTP/1.1 400"),
+        "{invalid_header}"
+    );
+
+    let obs_fold = raw_http_request(
+        &address,
+        b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nX-Test: one\r\n two\r\n\r\n",
+    );
+    assert!(obs_fold.starts_with("HTTP/1.1 400"), "{obs_fold}");
+
+    let invalid_asterisk = raw_http_request(
+        &address,
+        b"GET * HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        invalid_asterisk.starts_with("HTTP/1.1 400"),
+        "{invalid_asterisk}"
+    );
+
+    let closed_after_smuggling = raw_http_request(
+        &address,
+        b"POST /headers.php HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        closed_after_smuggling.starts_with("HTTP/1.1 400")
+            && closed_after_smuggling.matches("HTTP/1.1").count() == 1,
+        "{closed_after_smuggling}"
+    );
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove request validation docroot");
+}
+
+#[test]
 fn server_serves_static_file_and_head() {
     let docroot = temp_docroot();
     fs::write(docroot.join("static.txt"), "static bytes\n").expect("write static fixture");
@@ -1957,6 +3199,105 @@ async fn php_request_bodies_match_over_http1_http2_and_http3() {
     fs::remove_dir_all(upload_dir).expect("remove protocol upload dir");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn php_transport_metadata_and_response_finalization_match_all_protocols() {
+    let docroot = temp_docroot();
+    fs::write(
+        docroot.join("metadata.php"),
+        "<?php foreach (['HTTP_HOST','SERVER_NAME','SERVER_PORT','REQUEST_SCHEME','HTTPS','REMOTE_ADDR','SERVER_ADDR','SERVER_PROTOCOL'] as $key) echo $key, '=', $_SERVER[$key] ?? '', \"\\n\";",
+    )
+    .expect("write metadata fixture");
+    fs::write(
+        docroot.join("headers.php"),
+        "<?php header('Connection: X-Remove'); header('X-Remove: secret'); header('Keep-Alive: timeout=5'); header('Proxy-Connection: close'); header('Transfer-Encoding: chunked'); header('Upgrade: websocket'); header('Trailer: X-End'); echo \"clean\\n\";",
+    )
+    .expect("write response-header fixture");
+    fs::write(
+        docroot.join("bodyless.php"),
+        "<?php http_response_code((int)($_GET['status'] ?? 204)); echo \"forbidden-body\\n\";",
+    )
+    .expect("write bodyless fixture");
+    let (cert, key) = tls_fixture_paths();
+    let cert_arg = cert.to_string_lossy().to_string();
+    let key_arg = key.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--tls-cert",
+            &cert_arg,
+            "--tls-key",
+            &key_arg,
+            "--enable-http3",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let port = address.rsplit_once(':').unwrap().1;
+
+    let metadata = protocol_request_set(&address, hyper::Method::GET, "/metadata.php", &[]).await;
+    for (index, response) in metadata.iter().enumerate() {
+        assert_eq!(response.status, hyper::StatusCode::OK, "{response:?}");
+        let body = String::from_utf8(response.body()).unwrap();
+        for line in [
+            "HTTP_HOST=localhost",
+            "SERVER_NAME=localhost",
+            &format!("SERVER_PORT={port}"),
+            "REQUEST_SCHEME=https",
+            "HTTPS=on",
+            "REMOTE_ADDR=127.0.0.1",
+            "SERVER_ADDR=127.0.0.1",
+        ] {
+            assert!(body.contains(line), "missing {line:?}: {body}");
+        }
+        let protocol = ["HTTP/1.1", "HTTP/2.0", "HTTP/3.0"][index];
+        assert!(
+            body.contains(&format!("SERVER_PROTOCOL={protocol}")),
+            "{body}"
+        );
+    }
+
+    let headers = protocol_request_set(&address, hyper::Method::GET, "/headers.php", &[]).await;
+    for response in headers {
+        assert_eq!(response.status, hyper::StatusCode::OK, "{response:?}");
+        assert_eq!(response.body(), b"clean\n");
+        for name in [
+            "connection",
+            "x-remove",
+            "keep-alive",
+            "proxy-connection",
+            "transfer-encoding",
+            "upgrade",
+            "trailer",
+        ] {
+            assert!(!response.headers.contains_key(name), "{name}: {response:?}");
+        }
+    }
+
+    for status in [204, 205, 304] {
+        let path = format!("/bodyless.php?status={status}");
+        let responses = protocol_request_set(&address, hyper::Method::GET, &path, &[]).await;
+        for response in responses {
+            assert_eq!(response.status.as_u16(), status, "{response:?}");
+            assert!(response.body().is_empty(), "{response:?}");
+            if status == 205 {
+                assert_eq!(response.header(hyper::header::CONTENT_LENGTH), Some("0"));
+            }
+        }
+    }
+
+    let h2_conflict = http2_request(
+        &address,
+        hyper::Method::GET,
+        "/healthz",
+        &[("host", "example.test")],
+        &[],
+    )
+    .await;
+    assert_eq!(h2_conflict.status, hyper::StatusCode::BAD_REQUEST);
+
+    stop_child(child);
+    fs::remove_dir_all(docroot).expect("remove transport metadata docroot");
+}
+
 #[test]
 fn php_client_disconnect_cancels_execution_and_releases_worker() {
     let docroot = temp_docroot();
@@ -2474,11 +3815,11 @@ fn non_session_request_with_session_cookie_does_not_load_session_store() {
         "{metrics}"
     );
     assert!(
-        metrics.contains("phrust_server_request_headers_materialized_total 2\n"),
+        metrics.contains("phrust_server_request_headers_materialized_total 1\n"),
         "{metrics}"
     );
     assert!(
-        metrics.contains("phrust_server_request_headers_skipped_direct_total 1\n"),
+        metrics.contains("phrust_server_request_headers_skipped_direct_total 2\n"),
         "{metrics}"
     );
 }
@@ -4089,7 +5430,7 @@ fn server_waits_for_in_flight_capacity_before_overload() {
     let docroot = fixture_docroot("fixtures/server/php");
     let mut child = start_server(
         &docroot,
-        &["--max-in-flight", "1", "--request-timeout-ms", "5000"],
+        &["--max-in-flight", "1", "--request-body-timeout-ms", "5000"],
     );
 
     let address = read_listening_address(&mut child);
@@ -4199,7 +5540,7 @@ fn server_cpu_execution_limit_queues_php_without_limiting_http_admission() {
             "4",
             "--cpu-execution-limit",
             "1",
-            "--request-timeout-ms",
+            "--cpu-queue-timeout-ms",
             "5000",
             "--max-execution-ms",
             "5000",
@@ -4266,7 +5607,7 @@ fn server_cpu_execution_queue_timeout_is_observable() {
             "4",
             "--cpu-execution-limit",
             "1",
-            "--request-timeout-ms",
+            "--cpu-queue-timeout-ms",
             "100",
             "--max-execution-ms",
             "5000",
@@ -4326,7 +5667,7 @@ fn server_returns_503_when_max_in_flight_wait_expires() {
     let docroot = fixture_docroot("fixtures/server/php");
     let mut child = start_server(
         &docroot,
-        &["--max-in-flight", "1", "--request-timeout-ms", "5000"],
+        &["--max-in-flight", "1", "--request-body-timeout-ms", "5000"],
     );
 
     let address = read_listening_address(&mut child);
@@ -4400,17 +5741,303 @@ fn static_transfer_holds_in_flight_capacity_until_body_drop() {
 #[test]
 fn server_shutdown_signal_does_not_panic() {
     let docroot = temp_docroot();
-    let mut child = start_server(&docroot, &[]);
+    let mut child = start_server(&docroot, &["--graceful-shutdown-timeout-ms", "30000"]);
 
     let address = read_listening_address(&mut child);
     let response = http_get(&address, "/healthz");
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
 
+    let started = Instant::now();
     send_sigint(&child);
-    let status = wait_for_exit(&mut child, Duration::from_secs(5));
+    let status = wait_for_exit(&mut child, Duration::from_secs(2));
+    let elapsed = started.elapsed();
     fs::remove_dir_all(docroot).expect("remove temp docroot");
 
     assert!(status.success(), "server exited with {status}");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "idle shutdown waited for the configured drain deadline: {elapsed:?}"
+    );
+}
+
+#[test]
+fn drain_deadline_forces_incomplete_upload_and_removes_spool_file() {
+    let docroot = temp_docroot();
+    let spool_dir = temp_docroot();
+    fs::write(
+        docroot.join("upload.php"),
+        "<?php echo strlen(file_get_contents('php://input')), \"\\n\";",
+    )
+    .expect("write forced-drain upload fixture");
+    let spool_arg = spool_dir.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--request-body-memory-bytes",
+            "1",
+            "--request-body-temp-dir",
+            &spool_arg,
+            "--request-body-timeout-ms",
+            "10000",
+            "--request-body-idle-timeout-ms",
+            "10000",
+            "--graceful-shutdown-timeout-ms",
+            "250",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let mut upload = TcpStream::connect(&address).expect("connect forced-drain upload");
+    upload
+        .write_all(
+            b"POST /upload.php HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: 1048576\r\n\r\npartial",
+        )
+        .expect("start forced-drain upload");
+    wait_for_directory_entry(&spool_dir, Duration::from_secs(2));
+
+    let started = Instant::now();
+    send_sigterm(&child);
+    let status = wait_for_exit(&mut child, Duration::from_secs(2));
+    let elapsed = started.elapsed();
+    drop(upload);
+
+    assert!(status.success(), "forced-drain server exited with {status}");
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "incomplete request escaped the configured drain deadline: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "forced drain exceeded its bounded cleanup window: {elapsed:?}"
+    );
+    assert_eq!(
+        fs::read_dir(&spool_dir)
+            .expect("read forced-drain spool dir")
+            .count(),
+        0,
+        "forced shutdown leaked a request-body spool file"
+    );
+    fs::remove_dir_all(docroot).expect("remove forced-drain docroot");
+    fs::remove_dir_all(spool_dir).expect("remove forced-drain spool dir");
+}
+
+#[test]
+fn second_shutdown_signal_forces_immediate_cleanup() {
+    let docroot = temp_docroot();
+    let spool_dir = temp_docroot();
+    fs::write(
+        docroot.join("upload.php"),
+        "<?php echo strlen(file_get_contents('php://input')), \"\\n\";",
+    )
+    .expect("write second-signal upload fixture");
+    let spool_arg = spool_dir.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--request-body-memory-bytes",
+            "1",
+            "--request-body-temp-dir",
+            &spool_arg,
+            "--request-body-timeout-ms",
+            "10000",
+            "--request-body-idle-timeout-ms",
+            "10000",
+            "--graceful-shutdown-timeout-ms",
+            "5000",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let mut upload = TcpStream::connect(&address).expect("connect second-signal upload");
+    upload
+        .write_all(
+            b"POST /upload.php HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: 1048576\r\n\r\npartial",
+        )
+        .expect("start second-signal upload");
+    wait_for_directory_entry(&spool_dir, Duration::from_secs(2));
+
+    send_sigterm(&child);
+    std::thread::sleep(Duration::from_millis(75));
+    assert!(
+        child.try_wait().expect("poll draining child").is_none(),
+        "first shutdown signal did not begin a drain"
+    );
+    let started = Instant::now();
+    send_sigint(&child);
+    let status = wait_for_exit(&mut child, Duration::from_secs(2));
+    let elapsed = started.elapsed();
+    drop(upload);
+
+    assert!(
+        status.success(),
+        "second-signal server exited with {status}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "second signal did not force immediate shutdown: {elapsed:?}"
+    );
+    assert_eq!(
+        fs::read_dir(&spool_dir)
+            .expect("read second-signal spool dir")
+            .count(),
+        0,
+        "second-signal shutdown leaked a request-body spool file"
+    );
+    fs::remove_dir_all(docroot).expect("remove second-signal docroot");
+    fs::remove_dir_all(spool_dir).expect("remove second-signal spool dir");
+}
+
+#[test]
+fn sigterm_finishes_large_h1_static_response() {
+    let docroot = temp_docroot();
+    let static_size = 64 * 1024 * 1024_u64;
+    fs::File::create(docroot.join("large.bin"))
+        .expect("create drain static fixture")
+        .set_len(static_size)
+        .expect("size drain static fixture");
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--graceful-shutdown-timeout-ms",
+            "3000",
+            "--response-write-idle-timeout-ms",
+            "3000",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let mut stream = TcpStream::connect(&address).expect("connect draining static request");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set draining static timeout");
+    stream
+        .write_all(b"GET /large.bin HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("send draining static request");
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = stream
+            .read(&mut buffer)
+            .expect("read draining static response head");
+        assert_ne!(read, 0, "static response ended before its header");
+        response.extend_from_slice(&buffer[..read]);
+    }
+
+    send_sigterm(&child);
+    stream
+        .read_to_end(&mut response)
+        .expect("read complete draining static response");
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("draining static response delimiter")
+        + 4;
+    let headers = String::from_utf8_lossy(&response[..header_end]);
+    assert!(headers.starts_with("HTTP/1.1 200 OK"), "{headers}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains(&format!("content-length: {static_size}\r\n")),
+        "{headers}"
+    );
+    assert_eq!(response.len() - header_end, static_size as usize);
+
+    let status = wait_for_exit(&mut child, Duration::from_secs(4));
+    fs::remove_dir_all(docroot).expect("remove drain static docroot");
+    assert!(status.success(), "static-drain server exited with {status}");
+}
+
+#[test]
+fn sigterm_finishes_h1_php_session_and_stops_keep_alive() {
+    let docroot = temp_docroot();
+    let session_dir = temp_docroot();
+    fs::write(
+        docroot.join("session.php"),
+        "<?php session_start(); echo \"first\\n\"; flush(); usleep(350000); $_SESSION['done'] = true; session_write_close(); echo \"done\\n\";",
+    )
+    .expect("write H1 session drain fixture");
+    let session_arg = session_dir.to_string_lossy().to_string();
+    let mut child = start_server(
+        &docroot,
+        &[
+            "--session-save-path",
+            &session_arg,
+            "--graceful-shutdown-timeout-ms",
+            "2000",
+            "--max-execution-ms",
+            "2000",
+        ],
+    );
+    let address = read_listening_address(&mut child);
+    let mut stream = TcpStream::connect(&address).expect("connect H1 session drain request");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set H1 session drain timeout");
+    stream
+        .write_all(b"GET /session.php HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("send H1 session drain request");
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    while !response
+        .windows(b"first\n".len())
+        .any(|window| window == b"first\n")
+    {
+        let read = stream
+            .read(&mut buffer)
+            .expect("read first H1 session drain chunk");
+        assert_ne!(read, 0, "session response ended before first flush");
+        response.extend_from_slice(&buffer[..read]);
+    }
+
+    send_sigterm(&child);
+    std::thread::sleep(Duration::from_millis(75));
+    let _ = stream.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&buffer[..read]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                break;
+            }
+            Err(error) => panic!("read remaining H1 session drain response: {error}"),
+        }
+    }
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.contains("first\n"), "{response}");
+    assert!(response.contains("done\n"), "{response}");
+    if response.matches("HTTP/1.1 ").count() == 2 {
+        assert!(
+            response.contains("HTTP/1.1 503 Service Unavailable"),
+            "{response}"
+        );
+    } else {
+        assert_eq!(response.matches("HTTP/1.1 ").count(), 1, "{response}");
+    }
+
+    let status = wait_for_exit(&mut child, Duration::from_secs(3));
+    let session_written = fs::read_dir(&session_dir)
+        .expect("read drained session directory")
+        .map(|entry| fs::read(entry.expect("drained session entry").path()).unwrap())
+        .any(|contents| {
+            contents
+                .windows(b"done|b:1;".len())
+                .any(|w| w == b"done|b:1;")
+        });
+    fs::remove_dir_all(docroot).expect("remove H1 session drain docroot");
+    fs::remove_dir_all(session_dir).expect("remove H1 session drain directory");
+    assert!(
+        status.success(),
+        "H1 session-drain server exited with {status}"
+    );
+    assert!(
+        session_written,
+        "drained PHP request did not persist its session"
+    );
 }
 
 fn tls_fixture_paths() -> (std::path::PathBuf, std::path::PathBuf) {
@@ -5193,6 +6820,32 @@ fn http_request_with_headers(
     }
 }
 
+fn raw_http_request(address: &str, request: &[u8]) -> String {
+    let mut stream = TcpStream::connect(address).expect("connect raw HTTP request");
+    stream.write_all(request).expect("write raw HTTP request");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set raw HTTP timeout");
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&buffer[..read]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                break;
+            }
+            Err(error) => panic!("read raw HTTP response: {error}"),
+        }
+    }
+    String::from_utf8_lossy(&response).into_owned()
+}
+
 fn stop_child(mut child: Child) {
     let _ = child.kill();
     let _ = child.wait();
@@ -5213,12 +6866,39 @@ fn wait_for_file_contents(path: &std::path::Path, expected: &[u8], timeout: Dura
     }
 }
 
+fn wait_for_directory_entry(path: &std::path::Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if fs::read_dir(path)
+            .expect("read temporary directory")
+            .next()
+            .is_some()
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "directory {} remained empty",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn send_sigint(child: &Child) {
     let status = Proc::new("kill")
         .args(["-INT", &child.id().to_string()])
         .status()
         .expect("send SIGINT");
     assert!(status.success(), "kill -INT failed with {status}");
+}
+
+fn send_sigterm(child: &Child) {
+    let status = Proc::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(status.success(), "kill -TERM failed with {status}");
 }
 
 fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {

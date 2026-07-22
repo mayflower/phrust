@@ -88,6 +88,7 @@ pub(crate) struct ParsedRequestData {
     pub(crate) stats: MultipartStats,
     pub(crate) post_limit_exceeded: bool,
     pub(crate) startup_warnings: Vec<String>,
+    pub(crate) body_bytes: u64,
 }
 
 impl ParsedRequestData {
@@ -100,6 +101,7 @@ impl ParsedRequestData {
             stats: MultipartStats::default(),
             post_limit_exceeded: false,
             startup_warnings: Vec::new(),
+            body_bytes: 0,
         }
     }
 }
@@ -107,6 +109,7 @@ impl ParsedRequestData {
 #[derive(Debug)]
 pub(crate) enum MultipartError {
     TooLarge,
+    BodyIdleTimeout,
     Malformed(String),
     Limit(String),
 }
@@ -115,10 +118,27 @@ impl std::fmt::Display for MultipartError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TooLarge => formatter.write_str("multipart body exceeded the transport limit"),
+            Self::BodyIdleTimeout => formatter.write_str("multipart body became idle"),
             Self::Malformed(message) => write!(formatter, "malformed multipart body: {message}"),
             Self::Limit(message) => formatter.write_str(message),
         }
     }
+}
+
+fn map_multipart_error(error: multer::Error) -> MultipartError {
+    let mut source: &(dyn std::error::Error + 'static) = &error;
+    loop {
+        if let Some(error) = source.downcast_ref::<std::io::Error>()
+            && error.kind() == std::io::ErrorKind::TimedOut
+        {
+            return MultipartError::BodyIdleTimeout;
+        }
+        let Some(next) = source.source() else {
+            break;
+        };
+        source = next;
+    }
+    MultipartError::Malformed(error.to_string())
 }
 
 impl std::error::Error for MultipartError {}
@@ -137,7 +157,7 @@ pub(crate) fn validated_multipart_boundary(
     }
     multer::parse_boundary(content_type)
         .map(Some)
-        .map_err(|error| MultipartError::Malformed(error.to_string()))
+        .map_err(map_multipart_error)
 }
 
 pub(crate) async fn parse_multipart_stream(
@@ -146,8 +166,7 @@ pub(crate) async fn parse_multipart_stream(
     config: &MultipartConfig,
     metrics: &Arc<ServerMetrics>,
 ) -> Result<ParsedRequestData, MultipartError> {
-    let boundary = multer::parse_boundary(content_type)
-        .map_err(|error| MultipartError::Malformed(error.to_string()))?;
+    let boundary = multer::parse_boundary(content_type).map_err(map_multipart_error)?;
     metrics
         .multipart_requests_total
         .fetch_add(1, Ordering::Relaxed);
@@ -185,8 +204,7 @@ pub(crate) async fn parse_multipart_stream(
         if counted_bytes.load(Ordering::Relaxed) > absolute_limit {
             return Err(MultipartError::TooLarge);
         }
-        let Some(mut field) = next.map_err(|error| MultipartError::Malformed(error.to_string()))?
-        else {
+        let Some(mut field) = next.map_err(map_multipart_error)? else {
             break;
         };
         stats.parts_total = stats.parts_total.saturating_add(1);
@@ -393,11 +411,7 @@ pub(crate) async fn parse_multipart_stream(
             continue;
         }
         let mut value = Vec::new();
-        while let Some(chunk) = field
-            .chunk()
-            .await
-            .map_err(|error| MultipartError::Malformed(error.to_string()))?
-        {
+        while let Some(chunk) = field.chunk().await.map_err(map_multipart_error)? {
             if value.len().saturating_add(chunk.len()) > config.post_max_bytes {
                 drain_field(&mut field).await?;
                 break;
@@ -444,16 +458,12 @@ pub(crate) async fn parse_multipart_stream(
         stats,
         post_limit_exceeded,
         startup_warnings,
+        body_bytes: total_bytes,
     })
 }
 
 async fn drain_field(field: &mut multer::Field<'_>) -> Result<(), MultipartError> {
-    while field
-        .chunk()
-        .await
-        .map_err(|error| MultipartError::Malformed(error.to_string()))?
-        .is_some()
-    {}
+    while field.chunk().await.map_err(map_multipart_error)?.is_some() {}
     Ok(())
 }
 

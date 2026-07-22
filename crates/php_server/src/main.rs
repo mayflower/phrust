@@ -1,12 +1,10 @@
 use php_diagnostics::{DiagnosticOutputFormat, install_panic_diagnostic_hook};
 use php_server::{config::ServerConfig, server};
-use std::{env, str::FromStr};
+use std::str::FromStr;
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-const DEFAULT_TOKIO_WORKER_STACK_BYTES: usize = 128 * 1024 * 1024;
 
 fn main() {
     let error_format = env_error_format();
@@ -18,18 +16,9 @@ fn main() {
         .init();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(tokio_worker_stack_bytes())
         .build()
         .expect("tokio runtime should initialize");
     runtime.block_on(async_main(error_format));
-}
-
-fn tokio_worker_stack_bytes() -> usize {
-    env::var("PHRUST_SERVER_TOKIO_WORKER_STACK_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_TOKIO_WORKER_STACK_BYTES)
 }
 
 async fn async_main(error_format: DiagnosticOutputFormat) {

@@ -1,4 +1,5 @@
 use crate::config::{BUILTIN_SERVER_REWRITE_PREFIX_QUERY_ENV, ServerPerfAblation};
+use crate::shutdown::ShutdownCoordinator;
 use crate::{
     access_log::AccessLogger,
     metrics::ServerMetrics,
@@ -33,6 +34,7 @@ pub(crate) struct AppState {
     pub(crate) static_files: Arc<crate::static_files::StaticFileService>,
     pub(crate) request: RequestRuntimeConfig,
     pub(crate) concurrency: ConcurrencyServices,
+    pub(crate) connections: ConnectionServices,
     pub(crate) observability: ObservabilityState,
     pub(crate) capabilities: CapabilityState,
     pub(crate) sessions: SessionServices,
@@ -48,7 +50,10 @@ pub(crate) struct RequestRuntimeConfig {
     pub(crate) request_body_temp_dir: PathBuf,
     pub(crate) enable_post_data_reading: bool,
     pub(crate) multipart_config: MultipartConfig,
-    pub(crate) request_timeout: Duration,
+    pub(crate) request_admission_timeout: Duration,
+    pub(crate) cpu_queue_timeout: Duration,
+    pub(crate) request_body_timeout: Duration,
+    pub(crate) request_body_idle_timeout: Duration,
     pub(crate) execution_time_limit: Option<Duration>,
 }
 
@@ -61,6 +66,14 @@ pub(crate) struct ConcurrencyServices {
     /// Pinned PHP execution threads; sized to `cpu_execution_limit` so the
     /// pool and the CPU semaphore describe the same concurrency budget.
     pub(crate) php_workers: Arc<crate::worker_pool::PhpWorkerPool>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ConnectionServices {
+    pub(crate) permits: Arc<Semaphore>,
+    pub(crate) handshake_permits: Arc<Semaphore>,
+    pub(crate) max_connections: usize,
+    pub(crate) shutdown: ShutdownCoordinator,
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +107,19 @@ pub(crate) struct RequestTransport {
     pub(crate) local_addr: SocketAddr,
     pub(crate) request_scheme: &'static str,
     pub(crate) http3_alt_svc: Option<String>,
+    pub(crate) limits: TransportLimits,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TransportLimits {
+    pub(crate) request_header_timeout: Duration,
+    pub(crate) response_write_idle_timeout: Duration,
+    pub(crate) connection_idle_timeout: Duration,
+    pub(crate) tls_handshake_timeout: Duration,
+    pub(crate) graceful_shutdown_timeout: Duration,
+    pub(crate) max_request_header_bytes: usize,
+    pub(crate) max_request_target_bytes: usize,
+    pub(crate) max_streams_per_connection: u32,
 }
 
 #[derive(Clone, Debug)]

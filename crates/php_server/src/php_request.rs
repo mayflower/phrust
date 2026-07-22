@@ -10,6 +10,7 @@ use crate::{
     multipart::{
         MultipartError, ParsedRequestData, parse_multipart_stream, validated_multipart_boundary,
     },
+    request_metadata::{DeclaredContentLength, RequestMetadata},
     response::{self, RequestBody, ResponseBody},
     routing::RequestRewriteRule,
     transfer::PhpExecutionCoordinator,
@@ -499,9 +500,6 @@ fn route_target_selection_stage(script_path: PathBuf, path_info: Option<String>)
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RequestLocalAddr(pub(crate) SocketAddr);
-
 pub(crate) async fn execute_php_request(
     request: PartsAndBody,
     state: Arc<AppState>,
@@ -548,6 +546,11 @@ pub(crate) async fn execute_php_request(
     let body_started = Instant::now();
     let prepared = match body_and_multipart_stage(&state, &parts, body).await {
         Err(_) => {
+            state
+                .services
+                .metrics
+                .request_body_total_timeouts_total
+                .fetch_add(1, Ordering::Relaxed);
             emit_server_debug_lazy(
                 &state,
                 Some(&request_id),
@@ -557,7 +560,7 @@ pub(crate) async fn execute_php_request(
                 || {
                     BTreeMap::from([(
                         "timeout_ms".to_string(),
-                        state.request.request_timeout.as_millis().to_string(),
+                        state.request.request_body_timeout.as_millis().to_string(),
                     )])
                 },
             );
@@ -606,6 +609,23 @@ pub(crate) async fn execute_php_request(
                 body_started.elapsed(),
             );
             let response = response::text(StatusCode::PAYLOAD_TOO_LARGE, "payload too large\n");
+            return finish_php_request(
+                &state,
+                trace,
+                response,
+                None,
+                Some(RequestStage::BodyAndMultipart),
+            );
+        }
+        Ok(Err(BodyReadError::IdleTimeout)) => {
+            record_phase(
+                &state,
+                &mut trace,
+                RequestPhase::BodyRead,
+                "body_read",
+                body_started.elapsed(),
+            );
+            let response = response::text(StatusCode::REQUEST_TIMEOUT, "request timeout\n");
             return finish_php_request(
                 &state,
                 trace,
@@ -696,7 +716,6 @@ pub(crate) async fn execute_php_request(
         Arc::clone(&state),
         body.clone(),
         parsed.clone(),
-        peer,
         &request_id,
         Some(&script_path),
     )
@@ -1052,7 +1071,6 @@ fn run_php_request_on_worker(
         &script_name,
         path_info,
         body.clone(),
-        peer,
     );
     request_context
         .startup_warnings
@@ -1466,7 +1484,6 @@ pub(crate) async fn execute_builtin_router_if_configured(
     state: Arc<AppState>,
     body: RuntimeRequestBody,
     parsed: ParsedRequestData,
-    peer: SocketAddr,
     request_id: &str,
     target_script_path: Option<&Path>,
 ) -> Option<Response<ResponseBody>> {
@@ -1501,7 +1518,6 @@ pub(crate) async fn execute_builtin_router_if_configured(
         &script_name,
         None,
         body.clone(),
-        peer,
     );
     request_context
         .startup_warnings
@@ -1663,7 +1679,7 @@ async fn acquire_cpu_execution_permit(state: &AppState) -> Option<OwnedSemaphore
         completed: false,
     };
     let permit = timeout(
-        state.request.request_timeout,
+        state.request.cpu_queue_timeout,
         Arc::clone(&state.concurrency.cpu_execution).acquire_owned(),
     )
     .await;
@@ -2079,6 +2095,7 @@ pub(crate) const PHP_CONTENT_TYPE: &str = "text/html; charset=UTF-8";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BodyReadError {
     TooLarge,
+    IdleTimeout,
     Invalid,
     Internal,
 }
@@ -2089,7 +2106,7 @@ async fn body_and_multipart_stage(
     body: RequestBody,
 ) -> Result<Result<PreparedRequestData, BodyReadError>, tokio::time::error::Elapsed> {
     timeout(
-        state.request.request_timeout,
+        state.request.request_body_timeout,
         prepare_request_data(body, parts, state),
     )
     .await
@@ -2108,12 +2125,16 @@ pub(crate) async fn prepare_request_data(
 ) -> Result<PreparedRequestData, BodyReadError> {
     let content_type = header_value(&parts.headers, header::CONTENT_TYPE);
     let automatic_post = state.request.enable_post_data_reading && parts.method == Method::POST;
-    let declared_length = header_value(&parts.headers, header::CONTENT_LENGTH)
-        .and_then(|value| value.parse::<u64>().ok());
+    let declared_length = parts
+        .extensions
+        .get::<DeclaredContentLength>()
+        .expect("request framing is validated before body ingestion")
+        .0;
     if automatic_post
         && declared_length.is_some_and(|length| length > state.request.post_max_bytes as u64)
     {
         let body = ingest_request_body(body, state).await?;
+        validate_declared_body_length(&body, declared_length)?;
         let mut parsed = ParsedRequestData::empty(&state.services.metrics);
         parsed.startup_warnings.push(format!(
             "PHP Request Startup: POST Content-Length of {} bytes exceeds the limit of {} bytes",
@@ -2133,6 +2154,7 @@ pub(crate) async fn prepare_request_data(
         // PHP does not consume a multipart POST that lacks its boundary. Keep
         // the raw body replayable while exposing empty automatic inputs.
         let body = ingest_request_body(body, state).await?;
+        validate_declared_body_length(&body, declared_length)?;
         let mut parsed = ParsedRequestData::empty(&state.services.metrics);
         parsed.startup_warnings.push(
             "PHP Request Startup: Missing boundary in multipart/form-data POST data".to_string(),
@@ -2150,6 +2172,7 @@ pub(crate) async fn prepare_request_data(
         {
             Ok(parsed) => parsed,
             Err(MultipartError::TooLarge) => return Err(BodyReadError::TooLarge),
+            Err(MultipartError::BodyIdleTimeout) => return Err(BodyReadError::IdleTimeout),
             Err(MultipartError::Malformed(_) | MultipartError::Limit(_)) => {
                 state
                     .services
@@ -2159,16 +2182,36 @@ pub(crate) async fn prepare_request_data(
                 ParsedRequestData::empty(&state.services.metrics)
             }
         };
+        validate_declared_body_bytes(parsed.body_bytes, declared_length)?;
         return Ok(PreparedRequestData {
             body: RuntimeRequestBody::auto_parsed_multipart(),
             parsed,
         });
     }
     let body = ingest_request_body(body, state).await?;
+    validate_declared_body_length(&body, declared_length)?;
     Ok(PreparedRequestData {
         body,
         parsed: ParsedRequestData::empty(&state.services.metrics),
     })
+}
+
+fn validate_declared_body_length(
+    body: &RuntimeRequestBody,
+    declared_length: Option<u64>,
+) -> Result<(), BodyReadError> {
+    validate_declared_body_bytes(body.len(), declared_length)
+}
+
+fn validate_declared_body_bytes(
+    actual_length: u64,
+    declared_length: Option<u64>,
+) -> Result<(), BodyReadError> {
+    if declared_length.is_some_and(|declared| declared != actual_length) {
+        Err(BodyReadError::Invalid)
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) struct RequestBodyIngest<'a> {
@@ -2251,7 +2294,13 @@ impl<'a> RequestBodyIngest<'a> {
         let mut spool: Option<(tokio::fs::File, tempfile::TempPath, RequestBodyTempGauge)> = None;
 
         while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|_| BodyReadError::Invalid)?;
+            let frame = frame.map_err(|error| {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    BodyReadError::IdleTimeout
+                } else {
+                    BodyReadError::Invalid
+                }
+            })?;
             let Ok(data) = frame.into_data() else {
                 continue;
             };
@@ -2347,17 +2396,8 @@ fn request_globals_stage(
     script_name: &str,
     path_info: Option<String>,
     body: RuntimeRequestBody,
-    peer: SocketAddr,
 ) -> RuntimeHttpRequestContext {
-    http_runtime_context(
-        parts,
-        state,
-        script_path,
-        script_name,
-        path_info,
-        body,
-        peer,
-    )
+    http_runtime_context(parts, state, script_path, script_name, path_info, body)
 }
 
 fn session_load_stage(
@@ -2374,39 +2414,42 @@ pub(crate) fn http_runtime_context(
     script_name: &str,
     path_info: Option<String>,
     body: RuntimeRequestBody,
-    peer: SocketAddr,
 ) -> RuntimeHttpRequestContext {
-    let request_uri = parts.uri.path_and_query().map_or_else(
-        || parts.uri.path().to_string(),
-        |value| value.as_str().to_string(),
-    );
+    let metadata = parts
+        .extensions
+        .get::<RequestMetadata>()
+        .expect("validated request metadata is present");
+    debug_assert_eq!(metadata.authority, metadata.host_for_php);
+    let request_uri = if metadata.request_target.starts_with('/') || metadata.request_target == "*"
+    {
+        metadata.request_target.clone()
+    } else {
+        parts.uri.path_and_query().map_or_else(
+            || parts.uri.path().to_string(),
+            |value| value.as_str().to_string(),
+        )
+    };
     let request_uri = rewrite_request_uri(&request_uri, &state.route_config.request_rewrites);
-    let host =
-        header_value(&parts.headers, header::HOST).unwrap_or_else(|| "localhost".to_string());
     let (request_time, request_time_float_micros) = request_time_pair();
     let mut context = RuntimeHttpRequestContext::new(
         parts.method.as_str(),
-        host.clone(),
+        metadata.host_for_php.clone(),
         request_uri,
         script_name.to_string(),
         script_path.to_string_lossy().into_owned(),
         state.route_config.docroot.to_string_lossy().into_owned(),
     );
-    context.scheme = state.transport.request_scheme.to_string();
-    context.host = host;
-    context.server_name = server_name_from_host(&context.host);
-    let local_addr = parts
-        .extensions
-        .get::<RequestLocalAddr>()
-        .map_or(state.transport.local_addr, |addr| addr.0);
-    context.server_addr = local_addr.ip().to_string();
-    context.server_port = local_addr.port();
-    context.server_protocol = format!("{:?}", parts.version);
-    context.https = state.transport.request_scheme == "https";
+    context.scheme = metadata.scheme.to_string();
+    context.host = metadata.host_for_php.clone();
+    context.server_name = metadata.server_name.clone();
+    context.server_addr = metadata.local_addr.ip().to_string();
+    context.server_port = metadata.server_port;
+    context.server_protocol = metadata.protocol.php_name().to_string();
+    context.https = metadata.scheme == "https";
     context.php_self = php_self_for(script_name, path_info.as_deref());
     context.path_info = path_info;
-    context.remote_addr = peer.ip().to_string();
-    context.remote_port = Some(peer.port());
+    context.remote_addr = metadata.remote_addr.ip().to_string();
+    context.remote_port = Some(metadata.remote_addr.port());
     if let Some((user, password)) = basic_authorization(&parts.headers) {
         context.auth_type = Some("Basic".to_string());
         context.remote_user = Some(user.clone());
@@ -2433,8 +2476,11 @@ pub(crate) fn http_runtime_context(
         .fetch_add(header_snapshot.skipped_direct, Ordering::Relaxed);
     context.headers = header_snapshot.entries;
     context.content_type = header_value(&parts.headers, header::CONTENT_TYPE);
-    context.content_length = header_value(&parts.headers, header::CONTENT_LENGTH)
-        .and_then(|value| value.parse::<u64>().ok());
+    context.content_length = parts
+        .extensions
+        .get::<DeclaredContentLength>()
+        .expect("request framing is validated before PHP context construction")
+        .0;
     context.raw_body = body.clone();
     if state.request.enable_post_data_reading
         && parts.method == Method::POST
@@ -2812,7 +2858,18 @@ pub(crate) fn runtime_headers(headers: &HeaderMap) -> RuntimeHeaderSnapshot {
         ..RuntimeHeaderSnapshot::default()
     };
     for (name, value) in headers {
-        if matches!(name.as_str(), "host" | "content-type" | "content-length") {
+        if matches!(
+            name.as_str(),
+            "host"
+                | "content-type"
+                | "content-length"
+                | "connection"
+                | "keep-alive"
+                | "proxy-connection"
+                | "transfer-encoding"
+                | "upgrade"
+                | "te"
+        ) {
             snapshot.skipped_direct = snapshot.skipped_direct.saturating_add(1);
             continue;
         }
@@ -2860,17 +2917,6 @@ pub(crate) fn php_self_for(script_name: &str, path_info: Option<&str>) -> String
         || script_name.to_string(),
         |path_info| format!("{script_name}{path_info}"),
     )
-}
-
-pub(crate) fn server_name_from_host(host: &str) -> String {
-    if let Some(rest) = host.strip_prefix('[')
-        && let Some(end) = rest.find(']')
-    {
-        return rest[..end].to_string();
-    }
-    host.rsplit_once(':')
-        .filter(|(_, port)| port.bytes().all(|byte| byte.is_ascii_digit()))
-        .map_or_else(|| host.to_string(), |(name, _)| name.to_string())
 }
 
 pub(crate) fn request_time_pair() -> (i64, i64) {

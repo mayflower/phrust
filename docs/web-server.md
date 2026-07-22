@@ -34,8 +34,11 @@ HTTP admission and PHP CPU execution are bounded independently.
 `max_in_flight` limits accepted requests, while `cpu_execution_limit` (or
 `--cpu-execution-limit`) defaults to the host's available parallelism and
 limits CPU-bound PHP work. A saturated CPU gate queues for at most
-`request_timeout_ms`; that queue budget is separate from the cooperative
-`max_execution_ms` deadline, which starts when execution begins. Queue and
+`cpu_queue_timeout_ms`; request admission uses its own
+`request_admission_timeout_ms` budget. Both are separate from the total and
+idle request-body limits and from the cooperative `max_execution_ms` deadline,
+which starts when execution begins. The removed `request_timeout_ms` key is
+rejected with a migration error rather than retaining two meanings. Queue and
 execution state is request-local and permits are released on cancellation.
 The metrics endpoint exposes admitted, queued, current, saturated, rejected,
 cancelled, and queue-timeout totals plus the cumulative `cpu_queue` phase.
@@ -62,10 +65,34 @@ out of scope.
 
 Pinned PHP workers reserve a 16 MiB OS-thread stack by default. Set
 `PHRUST_SERVER_PHP_WORKER_STACK_BYTES` to a positive byte count when a measured
-deployment needs a different bound. The older
-`PHRUST_SERVER_TOKIO_WORKER_STACK_BYTES` setting remains a fallback for the PHP
-pool as well as configuring Tokio workers, but the dedicated setting takes
-precedence.
+deployment needs a different bound. Tokio transport workers use Tokio's
+default stack; the former `PHRUST_SERVER_TOKIO_WORKER_STACK_BYTES` override no
+longer exists.
+
+## Transport Limits And Shutdown
+
+TCP, TLS, and QUIC share `max_connections` admission before expensive
+handshake or HTTP work. TLS and QUIC handshakes, HTTP/1 header reads, total and
+idle request-body reads, stalled response writes, and inactive keep-alive
+connections each have separate deadlines. HTTP/1 uses a strict 64 KiB parser
+buffer and keeps Hyper's stack-backed 100-header fast path. HTTP/2 and HTTP/3
+share the configured concurrent-stream and decoded-header limits; their
+flow-control windows and send buffers are bounded internally. Request targets
+default to 16 KiB and decoded header sections to 64 KiB.
+
+`GET /readyz` returns `ready\n` with status 200 while the process accepts work;
+`HEAD /readyz` has the same status without a body. SIGINT or SIGTERM changes
+readiness to 503 `draining\n`, stops new TCP/QUIC admission, sends HTTP/2 and
+HTTP/3 GOAWAY, and lets admitted requests finish until
+`graceful_shutdown_timeout_ms`. A second signal or the drain deadline forces
+the owned connection/request tasks through their normal cancellation and
+tempfile/session cleanup paths. `/healthz` remains the liveness endpoint until
+process exit.
+
+The integrated listener deliberately does not interpret `Forwarded`,
+`X-Forwarded-*`, or PROXY protocol, and it does not add virtual hosts,
+WebSocket/Upgrade, WebTransport, Extended CONNECT, or a separate admin
+listener.
 
 Prefix request rewrites are a webserver-only routing feature. Configure them
 with `--rewrite-prefix-query /api=route` or
@@ -84,6 +111,8 @@ nix develop -c just cli-server-smoke
 nix develop -c just verify-user-interfaces
 nix develop -c just server-compat-smoke all
 nix develop -c just server-tls-smoke
+nix develop -c just server-transport-hardening-smoke
+nix develop -c just server-graceful-shutdown-smoke
 nix develop -c just server-benchmark-smoke
 nix develop -c just verify-server
 ```

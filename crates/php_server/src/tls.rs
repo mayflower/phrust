@@ -1,7 +1,7 @@
 use crate::server::ServerError;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls_pki_types::pem::PemObject;
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 use tokio_rustls::{
     TlsAcceptor,
     rustls::{
@@ -42,6 +42,8 @@ pub(crate) fn http3_alpn_protocols() -> Vec<Vec<u8>> {
 pub(crate) fn build_quic_server_config(
     cert_path: &Path,
     key_path: &Path,
+    max_streams_per_connection: u32,
+    connection_idle_timeout: Duration,
 ) -> Result<quinn::ServerConfig, ServerError> {
     let certs = load_tls_certs(cert_path)?;
     let key = load_tls_private_key(key_path)?;
@@ -58,11 +60,27 @@ pub(crate) fn build_quic_server_config(
         ))
     })?;
     crypto.alpn_protocols = http3_alpn_protocols();
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(
-        QuicServerConfig::try_from(crypto).map_err(|error| {
-            ServerError::Tls(format!("HTTP/3 QUIC TLS configuration is invalid: {error}"))
-        })?,
-    )))
+    let mut server =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto).map_err(
+            |error| ServerError::Tls(format!("HTTP/3 QUIC TLS configuration is invalid: {error}")),
+        )?));
+    let mut transport = quinn::TransportConfig::default();
+    transport
+        .max_concurrent_bidi_streams(quinn::VarInt::from_u32(max_streams_per_connection))
+        .max_concurrent_uni_streams(quinn::VarInt::from_u32(16))
+        .max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(connection_idle_timeout).map_err(|error| {
+                ServerError::Tls(format!("HTTP/3 idle timeout is out of range: {error}"))
+            })?,
+        ))
+        .stream_receive_window(quinn::VarInt::from_u32(1024 * 1024))
+        .receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024))
+        .send_window(8 * 1024 * 1024)
+        .keep_alive_interval(None)
+        .datagram_receive_buffer_size(None)
+        .datagram_send_buffer_size(0);
+    server.transport_config(Arc::new(transport));
+    Ok(server)
 }
 
 pub(crate) fn load_tls_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, ServerError> {

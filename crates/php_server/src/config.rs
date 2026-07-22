@@ -23,7 +23,19 @@ const DEFAULT_REQUEST_BODY_MEMORY_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_UPLOAD_FILES: usize = 20;
 const DEFAULT_MAX_UPLOAD_FILE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_MAX_INPUT_VARS: usize = 1_000;
-const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
+const DEFAULT_REQUEST_ADMISSION_TIMEOUT_MS: u64 = 500;
+const DEFAULT_CPU_QUEUE_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_REQUEST_HEADER_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_REQUEST_BODY_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_REQUEST_BODY_IDLE_TIMEOUT_MS: u64 = 15_000;
+const DEFAULT_RESPONSE_WRITE_IDLE_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_CONNECTION_IDLE_TIMEOUT_MS: u64 = 75_000;
+const DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_MAX_REQUEST_HEADER_BYTES: usize = 65_536;
+const DEFAULT_MAX_REQUEST_TARGET_BYTES: usize = 16_384;
+const DEFAULT_MAX_STREAMS_PER_CONNECTION: usize = 100;
 const DEFAULT_MAX_EXECUTION_MS: u64 = 30_000;
 const DEFAULT_SCRIPT_CACHE_SHARDS: usize = 16;
 const DEFAULT_SCRIPT_CACHE_MAX_ENTRIES: usize = 4096;
@@ -56,6 +68,15 @@ pub struct TransportConfig {
     pub tls_key: Option<PathBuf>,
     pub http3_enabled: bool,
     pub http3_listen: Option<SocketAddr>,
+    pub max_connections: usize,
+    pub request_header_timeout_ms: u64,
+    pub response_write_idle_timeout_ms: u64,
+    pub connection_idle_timeout_ms: u64,
+    pub tls_handshake_timeout_ms: u64,
+    pub graceful_shutdown_timeout_ms: u64,
+    pub max_request_header_bytes: usize,
+    pub max_request_target_bytes: usize,
+    pub max_streams_per_connection: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,7 +100,10 @@ pub struct RequestLimitsConfig {
     pub enable_post_data_reading: bool,
     pub max_in_flight: usize,
     pub cpu_execution_limit: usize,
-    pub request_timeout_ms: u64,
+    pub request_admission_timeout_ms: u64,
+    pub cpu_queue_timeout_ms: u64,
+    pub request_body_timeout_ms: u64,
+    pub request_body_idle_timeout_ms: u64,
     pub max_execution_ms: u64,
     pub execution_deadline_enabled: bool,
 }
@@ -318,15 +342,29 @@ impl ServerConfig {
         let mut session_lock_timeout_ms = file_config
             .positive_u64("session_lock_timeout_ms")?
             .unwrap_or(5_000);
+        if file_config.string("request_timeout_ms").is_some() {
+            return Err(ConfigError::new(
+                "request_timeout_ms was removed; migrate body reads to request_body_timeout_ms and CPU admission to cpu_queue_timeout_ms",
+            ));
+        }
         let mut max_in_flight = file_config
             .positive_usize("max_in_flight")?
             .unwrap_or_else(default_max_in_flight);
         let mut cpu_execution_limit = file_config
             .positive_usize("cpu_execution_limit")?
             .unwrap_or_else(default_cpu_execution_limit);
-        let mut request_timeout_ms = file_config
-            .positive_u64("request_timeout_ms")?
-            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS);
+        let mut request_admission_timeout_ms = file_config
+            .positive_u64("request_admission_timeout_ms")?
+            .unwrap_or(DEFAULT_REQUEST_ADMISSION_TIMEOUT_MS);
+        let mut cpu_queue_timeout_ms = file_config
+            .positive_u64("cpu_queue_timeout_ms")?
+            .unwrap_or(DEFAULT_CPU_QUEUE_TIMEOUT_MS);
+        let mut request_body_timeout_ms = file_config
+            .positive_u64("request_body_timeout_ms")?
+            .unwrap_or(DEFAULT_REQUEST_BODY_TIMEOUT_MS);
+        let mut request_body_idle_timeout_ms = file_config
+            .positive_u64("request_body_idle_timeout_ms")?
+            .unwrap_or(DEFAULT_REQUEST_BODY_IDLE_TIMEOUT_MS);
         let mut max_execution_ms = file_config
             .positive_u64("max_execution_ms")?
             .unwrap_or(DEFAULT_MAX_EXECUTION_MS);
@@ -370,6 +408,33 @@ impl ServerConfig {
         let mut tls_key = file_config.path("tls_key");
         let mut http3_enabled = file_config.bool("http3_enabled")?.unwrap_or(false);
         let mut http3_listen = file_config.parse_listen("http3_listen")?;
+        let mut max_connections = file_config
+            .positive_usize("max_connections")?
+            .unwrap_or(DEFAULT_MAX_CONNECTIONS);
+        let mut request_header_timeout_ms = file_config
+            .positive_u64("request_header_timeout_ms")?
+            .unwrap_or(DEFAULT_REQUEST_HEADER_TIMEOUT_MS);
+        let mut response_write_idle_timeout_ms = file_config
+            .positive_u64("response_write_idle_timeout_ms")?
+            .unwrap_or(DEFAULT_RESPONSE_WRITE_IDLE_TIMEOUT_MS);
+        let mut connection_idle_timeout_ms = file_config
+            .positive_u64("connection_idle_timeout_ms")?
+            .unwrap_or(DEFAULT_CONNECTION_IDLE_TIMEOUT_MS);
+        let mut tls_handshake_timeout_ms = file_config
+            .positive_u64("tls_handshake_timeout_ms")?
+            .unwrap_or(DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS);
+        let mut graceful_shutdown_timeout_ms = file_config
+            .positive_u64("graceful_shutdown_timeout_ms")?
+            .unwrap_or(DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS);
+        let mut max_request_header_bytes = file_config
+            .positive_usize("max_request_header_bytes")?
+            .unwrap_or(DEFAULT_MAX_REQUEST_HEADER_BYTES);
+        let mut max_request_target_bytes = file_config
+            .positive_usize("max_request_target_bytes")?
+            .unwrap_or(DEFAULT_MAX_REQUEST_TARGET_BYTES);
+        let mut max_streams_per_connection = file_config
+            .positive_usize("max_streams_per_connection")?
+            .unwrap_or(DEFAULT_MAX_STREAMS_PER_CONNECTION);
         let mut script_cache_enabled = file_config.bool("script_cache_enabled")?.unwrap_or(true);
         let mut script_cache_shards = file_config
             .positive_usize("script_cache_shards")?
@@ -423,6 +488,10 @@ impl ServerConfig {
                     let _ = required_value(&arg, &mut args)?;
                 }
                 "--listen" => listen = parse_listen(&required_value(&arg, &mut args)?)?,
+                "--max-connections" => {
+                    max_connections =
+                        parse_positive_usize(&arg, &required_value(&arg, &mut args)?)?;
+                }
                 "--docroot" => docroot = Some(PathBuf::from(required_value(&arg, &mut args)?)),
                 "--index" => {
                     indexes = parse_indexes(&arg, &required_value(&arg, &mut args)?)?;
@@ -536,8 +605,57 @@ impl ServerConfig {
                         parse_positive_usize(&arg, &required_value(&arg, &mut args)?)?;
                 }
                 "--request-timeout-ms" => {
-                    request_timeout_ms =
+                    return Err(ConfigError::new(
+                        "--request-timeout-ms was removed; use --request-body-timeout-ms and --cpu-queue-timeout-ms",
+                    ));
+                }
+                "--request-admission-timeout-ms" => {
+                    request_admission_timeout_ms =
                         parse_positive_u64(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--cpu-queue-timeout-ms" => {
+                    cpu_queue_timeout_ms =
+                        parse_positive_u64(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--request-header-timeout-ms" => {
+                    request_header_timeout_ms =
+                        parse_positive_u64(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--request-body-timeout-ms" => {
+                    request_body_timeout_ms =
+                        parse_positive_u64(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--request-body-idle-timeout-ms" => {
+                    request_body_idle_timeout_ms =
+                        parse_positive_u64(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--response-write-idle-timeout-ms" => {
+                    response_write_idle_timeout_ms =
+                        parse_positive_u64(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--connection-idle-timeout-ms" => {
+                    connection_idle_timeout_ms =
+                        parse_positive_u64(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--tls-handshake-timeout-ms" => {
+                    tls_handshake_timeout_ms =
+                        parse_positive_u64(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--graceful-shutdown-timeout-ms" => {
+                    graceful_shutdown_timeout_ms =
+                        parse_positive_u64(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--max-request-header-bytes" => {
+                    max_request_header_bytes =
+                        parse_positive_usize(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--max-request-target-bytes" => {
+                    max_request_target_bytes =
+                        parse_positive_usize(&arg, &required_value(&arg, &mut args)?)?;
+                }
+                "--max-streams-per-connection" => {
+                    max_streams_per_connection =
+                        parse_positive_usize(&arg, &required_value(&arg, &mut args)?)?;
                 }
                 "--max-execution-ms" => {
                     max_execution_ms = parse_positive_u64(&arg, &required_value(&arg, &mut args)?)?;
@@ -645,6 +763,15 @@ impl ServerConfig {
                 tls_key,
                 http3_enabled,
                 http3_listen,
+                max_connections,
+                request_header_timeout_ms,
+                response_write_idle_timeout_ms,
+                connection_idle_timeout_ms,
+                tls_handshake_timeout_ms,
+                graceful_shutdown_timeout_ms,
+                max_request_header_bytes,
+                max_request_target_bytes,
+                max_streams_per_connection,
             },
             routing: ServerRoutingConfig {
                 docroot,
@@ -664,7 +791,10 @@ impl ServerConfig {
                 enable_post_data_reading,
                 max_in_flight,
                 cpu_execution_limit,
-                request_timeout_ms,
+                request_admission_timeout_ms,
+                cpu_queue_timeout_ms,
+                request_body_timeout_ms,
+                request_body_idle_timeout_ms,
                 max_execution_ms,
                 execution_deadline_enabled,
             },
@@ -757,6 +887,15 @@ impl ServerConfig {
                 tls_key: None,
                 http3_enabled: false,
                 http3_listen: None,
+                max_connections: DEFAULT_MAX_CONNECTIONS,
+                request_header_timeout_ms: DEFAULT_REQUEST_HEADER_TIMEOUT_MS,
+                response_write_idle_timeout_ms: DEFAULT_RESPONSE_WRITE_IDLE_TIMEOUT_MS,
+                connection_idle_timeout_ms: DEFAULT_CONNECTION_IDLE_TIMEOUT_MS,
+                tls_handshake_timeout_ms: DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS,
+                graceful_shutdown_timeout_ms: DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+                max_request_header_bytes: DEFAULT_MAX_REQUEST_HEADER_BYTES,
+                max_request_target_bytes: DEFAULT_MAX_REQUEST_TARGET_BYTES,
+                max_streams_per_connection: DEFAULT_MAX_STREAMS_PER_CONNECTION,
             },
             routing: ServerRoutingConfig {
                 docroot,
@@ -777,7 +916,10 @@ impl ServerConfig {
                 enable_post_data_reading: true,
                 max_in_flight: default_max_in_flight(),
                 cpu_execution_limit: default_cpu_execution_limit(),
-                request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
+                request_admission_timeout_ms: DEFAULT_REQUEST_ADMISSION_TIMEOUT_MS,
+                cpu_queue_timeout_ms: DEFAULT_CPU_QUEUE_TIMEOUT_MS,
+                request_body_timeout_ms: DEFAULT_REQUEST_BODY_TIMEOUT_MS,
+                request_body_idle_timeout_ms: DEFAULT_REQUEST_BODY_IDLE_TIMEOUT_MS,
                 max_execution_ms: DEFAULT_MAX_EXECUTION_MS,
                 execution_deadline_enabled: true,
             },
@@ -843,6 +985,7 @@ impl ServerConfig {
 \n\
 Options:\n\
   --listen <addr>              TCP listen address (default: 127.0.0.1:8080)\n\
+  --max-connections <n>        maximum active TCP/TLS/QUIC connections (default: 1024)\n\
   --config <path>              read simple TOML-style server config\n\
   --docroot <path>             document root (required unless --help)\n\
   --front-controller <path>    optional front controller, relative to docroot\n\
@@ -878,10 +1021,21 @@ Options:\n\
   --disable-sessions           disable persistent web sessions\n\
   --max-in-flight <n>          maximum concurrent in-flight requests\n\
   --cpu-execution-limit <n>    maximum concurrent CPU-bound PHP executions (default: available CPUs)\n\
+  --request-admission-timeout-ms <n> request admission wait (default: 500)\n\
+  --cpu-queue-timeout-ms <n>   PHP CPU queue wait (default: 30000)\n\
+  --request-header-timeout-ms <n> header read deadline (default: 10000)\n\
+  --request-body-timeout-ms <n> total body read deadline (default: 30000)\n\
+  --request-body-idle-timeout-ms <n> idle gap between body frames (default: 15000)\n\
+  --response-write-idle-timeout-ms <n> stalled response write deadline (default: 30000)\n\
+  --connection-idle-timeout-ms <n> idle keep-alive deadline (default: 75000)\n\
+  --tls-handshake-timeout-ms <n> TLS/QUIC handshake deadline (default: 10000)\n\
+  --graceful-shutdown-timeout-ms <n> drain deadline (default: 30000)\n\
+  --max-request-header-bytes <n> decoded header-section limit (default: 65536)\n\
+  --max-request-target-bytes <n> request-target limit (default: 16384)\n\
+  --max-streams-per-connection <n> H2/H3 concurrent stream limit (default: 100)\n\
   --index <csv>                ordered directory indexes (default: index.php,index.html)\n\
   --php-extensions <csv>       executable PHP suffixes without dots (default: php)\n\
   --deployment-mode <mode>     dev uses live capability opens; immutable uses a startup asset index\n\
-  --request-timeout-ms <n>     body read timeout in milliseconds (default: 30000)\n\
   --max-execution-ms <n>       PHP execution deadline in milliseconds (default: 30000)\n\
   --disable-execution-deadline disable cooperative PHP execution deadline\n\
   --engine-preset <name>       default optimizing or baseline diagnostic native runtime\n\
@@ -931,6 +1085,22 @@ Options:\n\
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.transport.max_connections > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(ConfigError::new(format!(
+                "max_connections must not exceed {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )));
+        }
+        if self.transport.max_request_header_bytes > DEFAULT_MAX_REQUEST_HEADER_BYTES {
+            return Err(ConfigError::new(format!(
+                "max_request_header_bytes must not exceed the HTTP/1 parser buffer of {DEFAULT_MAX_REQUEST_HEADER_BYTES} bytes"
+            )));
+        }
+        if self.transport.max_streams_per_connection > u32::MAX as usize {
+            return Err(ConfigError::new(
+                "max_streams_per_connection must fit in an HTTP/2 u32 field",
+            ));
+        }
         if self.limits.request_body_memory_bytes > self.limits.max_body_bytes {
             return Err(ConfigError::new(
                 "request_body_memory_bytes must not exceed max_body_bytes",
@@ -1528,5 +1698,47 @@ mod tests {
         assert_eq!(help.matches("--deployment-mode <mode>").count(), 1);
         assert!(help.contains("index.php,index.html"));
         assert!(help.contains("startup asset index"));
+    }
+
+    #[test]
+    fn transport_hardening_defaults_and_timeout_migration_are_explicit() {
+        let config = ServerConfig::parse_from(["--docroot", "."]).expect("default config");
+        assert_eq!(config.transport.max_connections, 1_024);
+        assert_eq!(config.limits.request_admission_timeout_ms, 500);
+        assert_eq!(config.limits.cpu_queue_timeout_ms, 30_000);
+        assert_eq!(config.transport.request_header_timeout_ms, 10_000);
+        assert_eq!(config.limits.request_body_timeout_ms, 30_000);
+        assert_eq!(config.limits.request_body_idle_timeout_ms, 15_000);
+        assert_eq!(config.transport.response_write_idle_timeout_ms, 30_000);
+        assert_eq!(config.transport.connection_idle_timeout_ms, 75_000);
+        assert_eq!(config.transport.tls_handshake_timeout_ms, 10_000);
+        assert_eq!(config.transport.graceful_shutdown_timeout_ms, 30_000);
+        assert_eq!(config.transport.max_request_header_bytes, 65_536);
+        assert_eq!(config.transport.max_request_target_bytes, 16_384);
+        assert_eq!(config.transport.max_streams_per_connection, 100);
+
+        let error = ServerConfig::parse_from(["--docroot", ".", "--request-timeout-ms", "1000"])
+            .expect_err("retired timeout must fail");
+        assert!(error.to_string().contains("--request-body-timeout-ms"));
+        assert!(!ServerConfig::help_text().contains("--request-timeout-ms"));
+    }
+
+    #[test]
+    fn retired_file_timeout_has_a_migration_error() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "phrust-server-retired-timeout-{}-{unique}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "docroot = \".\"\nrequest_timeout_ms = 1\n")
+            .expect("write test config");
+        let path_arg = path.to_string_lossy().into_owned();
+        let error = ServerConfig::parse_from(["--config", path_arg.as_str()])
+            .expect_err("retired file setting must fail");
+        std::fs::remove_file(path).expect("remove test config");
+        assert!(error.to_string().contains("cpu_queue_timeout_ms"));
     }
 }

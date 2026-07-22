@@ -120,6 +120,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[derive(Debug)]
 pub(crate) enum ResolvedRoute {
     Health,
+    Ready,
     Metrics,
     CacheClear,
     StaticFile(OpenedStaticRepresentation),
@@ -151,6 +152,9 @@ pub(crate) async fn resolve_route(
     let path = uri.path();
     if path == "/healthz" {
         return ResolvedRoute::Health;
+    }
+    if path == "/readyz" {
+        return ResolvedRoute::Ready;
     }
     if path == "/__phrust/metrics" {
         if !config.metrics_endpoint_enabled {

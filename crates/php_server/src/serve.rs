@@ -4,15 +4,21 @@ use super::{
         RequestDiagnostic, emit_request_diagnostic, emit_server_debug_lazy, header_debug_value,
         route_debug_name,
     },
+    metrics::ServerMetrics,
     metrics::metrics_response,
     php_request::{
         BodyReadError, PartsAndBody, execute_builtin_router_if_configured, execute_php_request,
         prepare_request_data,
     },
+    request_metadata::{HttpProtocol, RequestLocalAddr, RequestMetadata, validate_request},
     request_pipeline::PhpTransferCompletion,
     state::AppState,
     static_files::{static_file_response, static_not_acceptable_response},
     transfer::{PhpExecutionCoordinator, TransferContext, TransferLifecycle},
+    transport::{
+        ConnectionActivity, ConnectionProtocolTracker, ConnectionRequestGuard, TransportIo,
+        idle_request_body,
+    },
 };
 use crate::{
     response::{self, RequestBody, ResponseBody},
@@ -26,7 +32,10 @@ use hyper::{
     http::request::Parts,
     service::service_fn,
 };
-use hyper_util::{rt::TokioExecutor, rt::TokioIo, server::conn::auto::Builder};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto::Builder,
+};
 use std::{
     collections::BTreeMap,
     convert::Infallible,
@@ -43,8 +52,6 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, warn};
 
-const REQUEST_ADMISSION_TIMEOUT: Duration = Duration::from_millis(500);
-
 pub(crate) async fn serve_until_shutdown(
     listener: TcpListener,
     state: Arc<AppState>,
@@ -52,69 +59,359 @@ pub(crate) async fn serve_until_shutdown(
     http3_endpoint: Option<quinn::Endpoint>,
 ) {
     let mut tasks = JoinSet::new();
-    if let Some(endpoint) = http3_endpoint {
+    if let Some(endpoint) = http3_endpoint.clone() {
         let http3_state = Arc::clone(&state);
         tasks.spawn(async move {
             super::http3::serve_http3_endpoint(endpoint, http3_state).await;
         });
     }
-    let shutdown = tokio::signal::ctrl_c();
-    tokio::pin!(shutdown);
-    loop {
-        tokio::select! {
-            accept = listener.accept() => {
-                let Ok((stream, peer)) = accept else {
-                    continue;
-                };
-                let state = Arc::clone(&state);
-                let tls_acceptor = tls_acceptor.clone();
-                tasks.spawn(async move {
-                    if let Some(tls_acceptor) = tls_acceptor {
-                        match tls_acceptor.accept(stream).await {
-                            Ok(stream) => serve_connection(stream, state, peer).await,
-                            Err(error) => warn!(%peer, %error, "TLS handshake failed"),
-                        }
-                    } else {
-                        serve_connection(stream, state, peer).await;
+    let mut signals = match ShutdownSignals::new() {
+        Ok(signals) => Some(signals),
+        Err(error) => {
+            warn!(%error, "shutdown signal handlers could not be installed");
+            begin_graceful_drain(&state, http3_endpoint.as_ref());
+            None
+        }
+    };
+    if let Some(signals) = signals.as_mut() {
+        loop {
+            tokio::select! {
+                accept = listener.accept() => {
+                    let Ok((stream, peer)) = accept else {
+                        continue;
+                    };
+                    let local_addr = stream.local_addr().unwrap_or(state.transport.local_addr);
+                    state.services.metrics.tcp_connections_accepted_total.fetch_add(1, Ordering::Relaxed);
+                    if let Err(error) = stream.set_nodelay(true) {
+                        debug!(%peer, %error, "failed to set TCP_NODELAY");
                     }
-                });
-            }
-            Some(_) = tasks.join_next() => {}
-            signal = &mut shutdown => {
-                if signal.is_err() {
+                    let Ok(connection_permit) = Arc::clone(&state.connections.permits).try_acquire_owned() else {
+                        state.services.metrics.connection_limit_rejections_total.fetch_add(1, Ordering::Relaxed);
+                        drop(stream);
+                        continue;
+                    };
+                    let state = Arc::clone(&state);
+                    let tls_acceptor = tls_acceptor.clone();
+                    tasks.spawn(async move {
+                        let _connection_permit = connection_permit;
+                        let _active = ActiveTcpConnection::new(Arc::clone(&state.services.metrics));
+                        if let Some(tls_acceptor) = tls_acceptor {
+                            let Ok(handshake_permit) = Arc::clone(&state.connections.handshake_permits).try_acquire_owned() else {
+                                state.services.metrics.connection_limit_rejections_total.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            };
+                            let handshake_guard = ActiveTlsHandshake::new(Arc::clone(&state.services.metrics));
+                            match timeout(
+                                state.transport.limits.tls_handshake_timeout,
+                                tls_acceptor.accept(stream),
+                            ).await {
+                                Ok(Ok(stream)) => {
+                                    drop(handshake_permit);
+                                    drop(handshake_guard);
+                                    serve_connection(stream, state, peer, local_addr).await
+                                }
+                                Ok(Err(error)) => {
+                                    state.services.metrics.tls_handshake_failures_total.fetch_add(1, Ordering::Relaxed);
+                                    if error.kind() == std::io::ErrorKind::InvalidData {
+                                        state.services.metrics.tls_handshake_protocol_failures_total.fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        state.services.metrics.tls_handshake_io_failures_total.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    warn!(%peer, %error, "TLS handshake failed");
+                                }
+                                Err(_) => {
+                                    state.services.metrics.tls_handshake_timeouts_total.fetch_add(1, Ordering::Relaxed);
+                                    debug!(%peer, "TLS handshake timed out");
+                                }
+                            }
+                        } else {
+                            serve_connection(stream, state, peer, local_addr).await;
+                        }
+                    });
+                }
+                Some(_) = tasks.join_next() => {}
+                _ = signals.recv() => {
+                    begin_graceful_drain(&state, http3_endpoint.as_ref());
                     break;
                 }
+            }
+        }
+    }
+    drop(listener);
+
+    let deadline = tokio::time::sleep(state.transport.limits.graceful_shutdown_timeout);
+    tokio::pin!(deadline);
+    let mut forced = false;
+    while !tasks.is_empty() {
+        tokio::select! {
+            result = tasks.join_next() => {
+                if let Some(Err(error)) = result {
+                    warn!(%error, "connection task failed during drain");
+                }
+            }
+            _ = next_shutdown_signal(&mut signals) => {
+                state.services.metrics.shutdown_second_signals_total.fetch_add(1, Ordering::Relaxed);
+                state.services.metrics.forced_shutdowns_total.fetch_add(1, Ordering::Relaxed);
+                state.connections.shutdown.force();
+                forced = true;
+                break;
+            }
+            () = &mut deadline => {
+                state.services.metrics.drain_deadline_exceeded_total.fetch_add(1, Ordering::Relaxed);
+                state.services.metrics.forced_shutdowns_total.fetch_add(1, Ordering::Relaxed);
+                state.connections.shutdown.force();
+                forced = true;
                 break;
             }
         }
     }
-    let _ = timeout(Duration::from_secs(5), async {
+    if forced {
+        tasks.abort_all();
         while tasks.join_next().await.is_some() {}
-    })
-    .await;
-    tasks.abort_all();
+    }
+    if let Some(endpoint) = http3_endpoint {
+        endpoint.close(quinn::VarInt::from_u32(0), b"server shutdown");
+        let _ = timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+    }
 }
 
-pub(crate) async fn serve_connection<S>(stream: S, state: Arc<AppState>, peer: SocketAddr)
-where
+fn begin_graceful_drain(state: &AppState, http3_endpoint: Option<&quinn::Endpoint>) {
+    if state.connections.shutdown.begin_draining() {
+        state
+            .services
+            .metrics
+            .readiness_state
+            .store(0, Ordering::Release);
+        state
+            .services
+            .metrics
+            .graceful_shutdowns_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(endpoint) = http3_endpoint {
+        endpoint.set_server_config(None);
+    }
+}
+
+async fn next_shutdown_signal(signals: &mut Option<ShutdownSignals>) {
+    match signals {
+        Some(signals) => signals.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(unix)]
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ShutdownSignals;
+
+#[cfg(not(unix))]
+impl ShutdownSignals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn recv(&mut self) {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+struct ActiveTcpConnection {
+    metrics: Arc<ServerMetrics>,
+}
+
+impl ActiveTcpConnection {
+    fn new(metrics: Arc<ServerMetrics>) -> Self {
+        metrics
+            .tcp_connections_active
+            .fetch_add(1, Ordering::Relaxed);
+        Self { metrics }
+    }
+}
+
+impl Drop for ActiveTcpConnection {
+    fn drop(&mut self) {
+        self.metrics
+            .tcp_connections_active
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct ActiveTlsHandshake {
+    metrics: Arc<ServerMetrics>,
+}
+
+impl ActiveTlsHandshake {
+    fn new(metrics: Arc<ServerMetrics>) -> Self {
+        metrics
+            .tls_handshakes_active
+            .fetch_add(1, Ordering::Relaxed);
+        Self { metrics }
+    }
+}
+
+impl Drop for ActiveTlsHandshake {
+    fn drop(&mut self) {
+        self.metrics
+            .tls_handshakes_active
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) async fn serve_connection<S>(
+    stream: S,
+    state: Arc<AppState>,
+    peer: SocketAddr,
+    local_addr: SocketAddr,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let activity = Arc::new(ConnectionActivity::default());
+    let protocol = Arc::new(ConnectionProtocolTracker::new(Arc::clone(
+        &state.services.metrics,
+    )));
+    let service_activity = Arc::clone(&activity);
+    let service_protocol = Arc::clone(&protocol);
+    let service_state = Arc::clone(&state);
     let service = service_fn(move |request| {
-        let state = Arc::clone(&state);
-        async move { Ok::<_, Infallible>(handle(request, state, peer).await) }
+        service_protocol.observe(request.version());
+        let state = Arc::clone(&service_state);
+        let connection_request = service_activity.enter();
+        async move {
+            Ok::<_, Infallible>(handle(request, state, peer, local_addr, connection_request).await)
+        }
     });
-    let io = TokioIo::new(stream);
-    let builder = Builder::new(TokioExecutor::new());
-    let _ = builder.serve_connection(io, service).await;
+    let io = TokioIo::new(TransportIo::new(
+        stream,
+        activity,
+        Arc::clone(&state.services.metrics),
+        state.transport.limits.connection_idle_timeout,
+        state.transport.limits.response_write_idle_timeout,
+    ));
+    let mut builder = Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(state.transport.limits.request_header_timeout)
+        .half_close(false)
+        .keep_alive(true)
+        .ignore_invalid_headers(false)
+        .max_buf_size(64 * 1024);
+    // Keep Hyper's stack-backed 100-header HTTP/1 fast path: calling
+    // max_headers(100) would force per-request heap allocation.
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .max_header_list_size(
+            u32::try_from(state.transport.limits.max_request_header_bytes)
+                .expect("validated HTTP/2 header limit"),
+        )
+        .max_concurrent_streams(state.transport.limits.max_streams_per_connection)
+        .initial_stream_window_size(1024 * 1024)
+        .initial_connection_window_size(8 * 1024 * 1024)
+        .adaptive_window(false)
+        .max_send_buf_size(256 * 1024)
+        .max_pending_accept_reset_streams(20)
+        .keep_alive_interval(None);
+    // 100 streams × the fixed 1 MiB stream window bounds peer-controlled
+    // per-connection stream receive credit. Extended CONNECT remains off:
+    // Hyper only enables it through the deliberately unused opt-in method.
+    let connection = builder.serve_connection(io, service);
+    tokio::pin!(connection);
+    let mut shutdown = state.connections.shutdown.subscribe();
+    loop {
+        tokio::select! {
+            result = &mut connection => {
+                if let Err(error) = result {
+                    match protocol.observed_protocol() {
+                        0 | 1 if is_hyper_header_timeout(error.as_ref()) => {
+                            state.services.metrics.h1_header_timeouts_total.fetch_add(1, Ordering::Relaxed);
+                        }
+                        2 if !error_chain_has_io_timeout(error.as_ref()) => {
+                            state.services.metrics.h2_protocol_errors_total.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                    debug!(%peer, %error, "HTTP connection ended with a transport error");
+                }
+                break;
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                match *shutdown.borrow_and_update() {
+                    crate::shutdown::ShutdownPhase::Running => {}
+                    crate::shutdown::ShutdownPhase::Draining => {
+                        connection.as_mut().graceful_shutdown();
+                    }
+                    crate::shutdown::ShutdownPhase::Forced => break,
+                }
+            }
+        }
+    }
+}
+
+fn is_hyper_header_timeout(error: &(dyn std::error::Error + 'static)) -> bool {
+    !error_chain_has_io_timeout(error)
+        && error_chain(error).any(|error| {
+            error
+                .downcast_ref::<hyper::Error>()
+                .is_some_and(hyper::Error::is_timeout)
+        })
+}
+
+fn error_chain_has_io_timeout(error: &(dyn std::error::Error + 'static)) -> bool {
+    error_chain(error).any(|error| {
+        error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+    })
+}
+
+fn error_chain<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(error), |error| error.source())
 }
 
 pub(crate) async fn handle(
     request: Request<Incoming>,
     state: Arc<AppState>,
     peer: SocketAddr,
+    local_addr: SocketAddr,
+    connection_request: ConnectionRequestGuard,
 ) -> Response<ResponseBody> {
-    let (parts, body) = request.into_parts();
-    handle_parts(parts, incoming_request_body(body), state, peer).await
+    let (mut parts, body) = request.into_parts();
+    parts.extensions.insert(RequestLocalAddr(local_addr));
+    let body = idle_request_body(
+        incoming_request_body(body),
+        state.request.request_body_idle_timeout,
+        Arc::clone(&state.services.metrics),
+    );
+    handle_parts(parts, body, state, peer, connection_request).await
 }
 
 pub(crate) async fn handle_parts(
@@ -122,8 +419,9 @@ pub(crate) async fn handle_parts(
     body: RequestBody,
     state: Arc<AppState>,
     peer: SocketAddr,
+    connection_request: ConnectionRequestGuard,
 ) -> Response<ResponseBody> {
-    match admit_request(&parts, &state, peer).await {
+    match admit_request(&parts, &state, peer, connection_request).await {
         Ok(admission) => handle_parts_admitted(parts, body, state, peer, admission).await,
         Err(response) => response,
     }
@@ -135,12 +433,18 @@ pub(crate) struct RequestAdmission {
     method: Method,
     request_target: String,
     permit: tokio::sync::OwnedSemaphorePermit,
+    connection_request: ConnectionRequestGuard,
+    metadata: Option<RequestMetadata>,
+    force_connection_close: bool,
+    protocol: HttpProtocol,
+    admitted_before_drain: bool,
 }
 
 pub(crate) async fn admit_request(
     parts: &Parts,
     state: &Arc<AppState>,
     peer: SocketAddr,
+    connection_request: ConnectionRequestGuard,
 ) -> Result<RequestAdmission, Response<ResponseBody>> {
     let started = Instant::now();
     let request_id = state.next_request_id();
@@ -150,10 +454,50 @@ pub(crate) async fn admit_request(
         .requests_total
         .fetch_add(1, Ordering::Relaxed);
     let method = parts.method.clone();
+    let protocol = HttpProtocol::from_version(parts.version).unwrap_or(HttpProtocol::Http11);
     let request_target = parts
         .uri
         .path_and_query()
         .map_or_else(|| parts.uri.path().to_string(), |value| value.to_string());
+    if !state.connections.shutdown.is_running()
+        && !matches!(parts.uri.path(), "/healthz" | "/readyz")
+    {
+        state
+            .services
+            .metrics
+            .drain_requests_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+        let mut response = response::text(StatusCode::SERVICE_UNAVAILABLE, "draining\n");
+        response::finalize_response(
+            &method,
+            protocol,
+            state.connections.shutdown.phase(),
+            protocol.is_h1(),
+            &mut response,
+            &state.services.metrics,
+        );
+        let status = response.status();
+        response
+            .body_mut()
+            .attach_lifecycle(TransferLifecycle::new(TransferContext {
+                state: Arc::clone(state),
+                request_id,
+                started,
+                method: method.to_string(),
+                request_target,
+                route: "drain-rejected",
+                status,
+                cache_hit: None,
+                permit: None,
+                php: None,
+                execution: None,
+                admitted_before_drain: false,
+            }));
+        response
+            .body_mut()
+            .attach_connection_request(connection_request);
+        return Err(response);
+    }
     emit_server_debug_lazy(
         state,
         Some(&request_id),
@@ -182,7 +526,7 @@ pub(crate) async fn admit_request(
     );
     let admission_started = Instant::now();
     let permit = match timeout(
-        REQUEST_ADMISSION_TIMEOUT,
+        state.request.request_admission_timeout,
         Arc::clone(&state.concurrency.in_flight).acquire_owned(),
     )
     .await
@@ -204,6 +548,14 @@ pub(crate) async fn admit_request(
                 .overload
                 .fetch_add(1, Ordering::Relaxed);
             let mut response = overloaded();
+            response::finalize_response(
+                &method,
+                protocol,
+                state.connections.shutdown.phase(),
+                protocol.is_h1(),
+                &mut response,
+                &state.services.metrics,
+            );
             let status = response.status();
             response
                 .body_mut()
@@ -219,7 +571,11 @@ pub(crate) async fn admit_request(
                     permit: None,
                     php: None,
                     execution: None,
+                    admitted_before_drain: state.connections.shutdown.is_running(),
                 }));
+            response
+                .body_mut()
+                .attach_connection_request(connection_request);
             debug!(%peer, "request rejected because max in-flight admission wait expired");
             return Err(response);
         }
@@ -230,46 +586,41 @@ pub(crate) async fn admit_request(
         method,
         request_target,
         permit,
+        connection_request,
+        metadata: None,
+        force_connection_close: false,
+        protocol,
+        admitted_before_drain: true,
     })
 }
 
 pub(crate) async fn handle_parts_admitted(
-    parts: Parts,
+    mut parts: Parts,
     body: RequestBody,
     state: Arc<AppState>,
     peer: SocketAddr,
-    admission: RequestAdmission,
+    mut admission: RequestAdmission,
 ) -> Response<ResponseBody> {
-    match validated_content_length(&parts.headers, state.request.max_body_bytes) {
-        Err(ContentLengthError::TooLarge) => {
-            state
-                .services
-                .metrics
-                .body_too_large
-                .fetch_add(1, Ordering::Relaxed);
-            state
-                .services
-                .metrics
-                .request_body_hard_limit_rejections_total
-                .fetch_add(1, Ordering::Relaxed);
+    match validate_request(&mut parts, &state, peer) {
+        Ok(metadata) => {
+            admission.metadata = Some(metadata.clone());
+            parts.extensions.insert(metadata);
+        }
+        Err(error) => {
+            admission.force_connection_close = error.force_connection_close;
+            let response = if error.status == StatusCode::PAYLOAD_TOO_LARGE {
+                response::text(error.status, "payload too large\n")
+            } else {
+                response::text(error.status, "bad request\n")
+            };
             return finish_admitted_response(
                 admission,
                 state,
-                response::text(StatusCode::PAYLOAD_TOO_LARGE, "payload too large\n"),
-                "body-too-large",
+                response,
+                "request-validation",
                 None,
             );
         }
-        Err(ContentLengthError::Invalid) => {
-            return finish_admitted_response(
-                admission,
-                state,
-                response::text(StatusCode::BAD_REQUEST, "bad request\n"),
-                "bad-request",
-                None,
-            );
-        }
-        Ok(_) => {}
     }
     let method = admission.method.clone();
     let request_id = admission.request_id.clone();
@@ -309,6 +660,26 @@ pub(crate) async fn handle_parts_admitted(
             Method::HEAD => (response::empty(StatusCode::OK), "health", None),
             _ => (method_not_allowed("GET, HEAD"), "health", None),
         },
+        ResolvedRoute::Ready => {
+            let running = state.connections.shutdown.is_running();
+            match method {
+                Method::GET if running => {
+                    (response::text(StatusCode::OK, "ready\n"), "readiness", None)
+                }
+                Method::HEAD if running => (response::empty(StatusCode::OK), "readiness", None),
+                Method::GET => (
+                    response::text(StatusCode::SERVICE_UNAVAILABLE, "draining\n"),
+                    "readiness",
+                    None,
+                ),
+                Method::HEAD => (
+                    response::empty(StatusCode::SERVICE_UNAVAILABLE),
+                    "readiness",
+                    None,
+                ),
+                _ => (method_not_allowed("GET, HEAD"), "readiness", None),
+            }
+        }
         ResolvedRoute::Metrics => (metrics_response(&state, &parts), "metrics", None),
         ResolvedRoute::CacheClear => (
             clear_cache_response(&state, peer).await,
@@ -474,40 +845,6 @@ pub(crate) async fn handle_parts_admitted(
     finish_admitted_response(admission, state, response, route_kind, cache_hit)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ContentLengthError {
-    Invalid,
-    TooLarge,
-}
-
-fn validated_content_length(
-    headers: &hyper::HeaderMap,
-    max_body_bytes: usize,
-) -> Result<Option<u64>, ContentLengthError> {
-    let mut parsed = None;
-    for value in headers.get_all(header::CONTENT_LENGTH) {
-        let value = value.to_str().map_err(|_| ContentLengthError::Invalid)?;
-        for item in value.split(',') {
-            let item = item.trim();
-            if item.is_empty() || !item.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(ContentLengthError::Invalid);
-            }
-            let length = item
-                .parse::<u64>()
-                .map_err(|_| ContentLengthError::Invalid)?;
-            if parsed.is_some_and(|previous| previous != length) {
-                return Err(ContentLengthError::Invalid);
-            }
-            parsed = Some(length);
-        }
-    }
-    if parsed.is_some_and(|length| length > max_body_bytes as u64) {
-        Err(ContentLengthError::TooLarge)
-    } else {
-        Ok(parsed)
-    }
-}
-
 pub(crate) fn finish_admitted_response(
     admission: RequestAdmission,
     state: Arc<AppState>,
@@ -515,6 +852,21 @@ pub(crate) fn finish_admitted_response(
     route: &'static str,
     cache_hit: Option<bool>,
 ) -> Response<ResponseBody> {
+    response::finalize_response(
+        &admission.method,
+        admission
+            .metadata
+            .as_ref()
+            .map_or(admission.protocol, |metadata| metadata.protocol),
+        state.connections.shutdown.phase(),
+        admission.force_connection_close
+            || admission
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.force_connection_close),
+        &mut response,
+        &state.services.metrics,
+    );
     let status = response.status();
     let php = response.extensions_mut().remove::<PhpTransferCompletion>();
     let execution = response
@@ -534,7 +886,11 @@ pub(crate) fn finish_admitted_response(
             permit: Some(admission.permit),
             php,
             execution,
+            admitted_before_drain: admission.admitted_before_drain,
         }));
+    response
+        .body_mut()
+        .attach_connection_request(admission.connection_request);
     response
 }
 pub(crate) fn write_access_log(state: &AppState, entry: AccessLogEntry<'_>) {
@@ -567,12 +923,17 @@ async fn execute_builtin_router_before_normal_route(
     );
     let body_started = Instant::now();
     let prepared = match timeout(
-        state.request.request_timeout,
+        state.request.request_body_timeout,
         prepare_request_data(body, parts, &state),
     )
     .await
     {
         Err(_) => {
+            state
+                .services
+                .metrics
+                .request_body_total_timeouts_total
+                .fetch_add(1, Ordering::Relaxed);
             emit_server_debug_lazy(
                 &state,
                 Some(request_id),
@@ -582,7 +943,7 @@ async fn execute_builtin_router_before_normal_route(
                 || {
                     BTreeMap::from([(
                         "timeout_ms".to_string(),
-                        state.request.request_timeout.as_millis().to_string(),
+                        state.request.request_body_timeout.as_millis().to_string(),
                     )])
                 },
             );
@@ -623,6 +984,16 @@ async fn execute_builtin_router_before_normal_route(
             return Some(response::text(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "payload too large\n",
+            ));
+        }
+        Ok(Err(BodyReadError::IdleTimeout)) => {
+            state.services.metrics.record_phase(
+                super::metrics::RequestPhase::BodyRead,
+                body_started.elapsed().as_nanos(),
+            );
+            return Some(response::text(
+                StatusCode::REQUEST_TIMEOUT,
+                "request timeout\n",
             ));
         }
         Ok(Err(BodyReadError::Invalid)) => {
@@ -670,7 +1041,6 @@ async fn execute_builtin_router_before_normal_route(
         state,
         prepared.body,
         prepared.parsed,
-        peer,
         request_id,
         None,
     )
@@ -721,31 +1091,4 @@ pub(crate) fn overloaded() -> Response<ResponseBody> {
 pub(crate) fn incoming_request_body(body: Incoming) -> RequestBody {
     body.map_err(|error| std::io::Error::other(error.to_string()))
         .boxed()
-}
-
-#[cfg(test)]
-mod body_limit_tests {
-    use super::{ContentLengthError, validated_content_length};
-    use hyper::{HeaderMap, header};
-
-    #[test]
-    fn content_length_rejects_invalid_conflicting_and_over_limit_values() {
-        let mut headers = HeaderMap::new();
-        headers.append(header::CONTENT_LENGTH, "12".parse().unwrap());
-        headers.append(header::CONTENT_LENGTH, "12".parse().unwrap());
-        assert_eq!(validated_content_length(&headers, 32), Ok(Some(12)));
-
-        headers.append(header::CONTENT_LENGTH, "13".parse().unwrap());
-        assert_eq!(
-            validated_content_length(&headers, 32),
-            Err(ContentLengthError::Invalid)
-        );
-
-        let mut oversized = HeaderMap::new();
-        oversized.insert(header::CONTENT_LENGTH, "33554433".parse().unwrap());
-        assert_eq!(
-            validated_content_length(&oversized, 32 * 1024 * 1024),
-            Err(ContentLengthError::TooLarge)
-        );
-    }
 }

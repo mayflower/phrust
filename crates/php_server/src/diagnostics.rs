@@ -13,6 +13,7 @@ use tracing::warn;
 pub(crate) fn route_debug_name(route: &ResolvedRoute) -> &'static str {
     match route {
         ResolvedRoute::Health => "health",
+        ResolvedRoute::Ready => "readiness",
         ResolvedRoute::Metrics => "metrics",
         ResolvedRoute::CacheClear => "cache-clear",
         ResolvedRoute::StaticFile(_) => "static",

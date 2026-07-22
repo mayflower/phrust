@@ -21,6 +21,51 @@ impl Deref for AtomicU64 {
 
 #[derive(Debug, Default)]
 pub(crate) struct ServerMetrics {
+    pub(crate) tcp_connections_accepted_total: AtomicU64,
+    pub(crate) tcp_connections_active: AtomicU64,
+    pub(crate) h1_connections_active: AtomicU64,
+    pub(crate) h2_connections_active: AtomicU64,
+    pub(crate) connection_limit_rejections_total: AtomicU64,
+    pub(crate) tls_handshakes_active: AtomicU64,
+    pub(crate) tls_handshake_timeouts_total: AtomicU64,
+    pub(crate) tls_handshake_failures_total: AtomicU64,
+    pub(crate) tls_handshake_protocol_failures_total: AtomicU64,
+    pub(crate) tls_handshake_io_failures_total: AtomicU64,
+    pub(crate) connection_idle_timeouts_total: AtomicU64,
+    pub(crate) response_write_idle_timeouts_total: AtomicU64,
+    pub(crate) request_body_idle_timeouts_total: AtomicU64,
+    pub(crate) request_body_total_timeouts_total: AtomicU64,
+    pub(crate) h1_header_timeouts_total: AtomicU64,
+    pub(crate) h2_protocol_errors_total: AtomicU64,
+    pub(crate) h3_connections_accepted_total: AtomicU64,
+    pub(crate) h3_connections_active: AtomicU64,
+    pub(crate) h3_connection_limit_rejections_total: AtomicU64,
+    pub(crate) h3_handshake_timeouts_total: AtomicU64,
+    pub(crate) h3_header_timeouts_total: AtomicU64,
+    pub(crate) h3_request_streams_active: AtomicU64,
+    pub(crate) h3_request_stream_limit_rejections_total: AtomicU64,
+    pub(crate) h3_request_task_failures_total: AtomicU64,
+    pub(crate) h3_write_timeouts_total: AtomicU64,
+    pub(crate) quic_idle_timeouts_total: AtomicU64,
+    pub(crate) request_header_count_rejections_total: AtomicU64,
+    pub(crate) request_header_bytes_rejections_total: AtomicU64,
+    pub(crate) request_target_rejections_total: AtomicU64,
+    pub(crate) malformed_authority_total: AtomicU64,
+    pub(crate) host_authority_conflicts_total: AtomicU64,
+    pub(crate) request_framing_rejections_total: AtomicU64,
+    pub(crate) request_hop_by_hop_rejections_total: AtomicU64,
+    pub(crate) response_hop_by_hop_headers_removed_total: AtomicU64,
+    pub(crate) response_connection_nominated_headers_removed_total: AtomicU64,
+    pub(crate) response_invalid_connection_tokens_total: AtomicU64,
+    pub(crate) response_body_suppressed_total: AtomicU64,
+    pub(crate) response_invalid_upgrade_status_total: AtomicU64,
+    pub(crate) graceful_shutdowns_total: AtomicU64,
+    pub(crate) forced_shutdowns_total: AtomicU64,
+    pub(crate) shutdown_second_signals_total: AtomicU64,
+    pub(crate) drain_requests_completed_total: AtomicU64,
+    pub(crate) drain_requests_rejected_total: AtomicU64,
+    pub(crate) drain_deadline_exceeded_total: AtomicU64,
+    pub(crate) readiness_state: AtomicU64,
     pub(crate) requests_total: AtomicU64,
     pub(crate) static_responses: AtomicU64,
     pub(crate) php_responses: AtomicU64,
@@ -505,6 +550,205 @@ phrust_server_persistent_engine_feedback_template_absorptions_total {}\n",
                 .load(Ordering::Relaxed),
         );
         use std::fmt::Write as _;
+        for (name, value) in [
+            (
+                "phrust_server_tcp_connections_accepted_total",
+                self.tcp_connections_accepted_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_tcp_connections_active",
+                self.tcp_connections_active.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_h1_connections_active",
+                self.h1_connections_active.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_h2_connections_active",
+                self.h2_connections_active.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_connection_limit_rejections_total",
+                self.connection_limit_rejections_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_tls_handshakes_active",
+                self.tls_handshakes_active.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_tls_handshake_timeouts_total",
+                self.tls_handshake_timeouts_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_tls_handshake_failures_total",
+                self.tls_handshake_failures_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_tls_handshake_protocol_failures_total",
+                self.tls_handshake_protocol_failures_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_tls_handshake_io_failures_total",
+                self.tls_handshake_io_failures_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_connection_idle_timeouts_total",
+                self.connection_idle_timeouts_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_response_write_idle_timeouts_total",
+                self.response_write_idle_timeouts_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_request_body_idle_timeouts_total",
+                self.request_body_idle_timeouts_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_request_body_total_timeouts_total",
+                self.request_body_total_timeouts_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_h1_header_timeouts_total",
+                self.h1_header_timeouts_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_h2_protocol_errors_total",
+                self.h2_protocol_errors_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_h3_connections_accepted_total",
+                self.h3_connections_accepted_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_h3_connections_active",
+                self.h3_connections_active.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_h3_connection_limit_rejections_total",
+                self.h3_connection_limit_rejections_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_h3_handshake_timeouts_total",
+                self.h3_handshake_timeouts_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_h3_header_timeouts_total",
+                self.h3_header_timeouts_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_h3_request_streams_active",
+                self.h3_request_streams_active.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_h3_request_stream_limit_rejections_total",
+                self.h3_request_stream_limit_rejections_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_h3_request_task_failures_total",
+                self.h3_request_task_failures_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_h3_write_timeouts_total",
+                self.h3_write_timeouts_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_quic_idle_timeouts_total",
+                self.quic_idle_timeouts_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_request_header_count_rejections_total",
+                self.request_header_count_rejections_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_request_header_bytes_rejections_total",
+                self.request_header_bytes_rejections_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_request_target_rejections_total",
+                self.request_target_rejections_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_malformed_authority_total",
+                self.malformed_authority_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_host_authority_conflicts_total",
+                self.host_authority_conflicts_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_request_framing_rejections_total",
+                self.request_framing_rejections_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_request_hop_by_hop_rejections_total",
+                self.request_hop_by_hop_rejections_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_response_hop_by_hop_headers_removed_total",
+                self.response_hop_by_hop_headers_removed_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_response_connection_nominated_headers_removed_total",
+                self.response_connection_nominated_headers_removed_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_response_invalid_connection_tokens_total",
+                self.response_invalid_connection_tokens_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_response_body_suppressed_total",
+                self.response_body_suppressed_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_response_invalid_upgrade_status_total",
+                self.response_invalid_upgrade_status_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_graceful_shutdowns_total",
+                self.graceful_shutdowns_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_forced_shutdowns_total",
+                self.forced_shutdowns_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_shutdown_second_signals_total",
+                self.shutdown_second_signals_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_drain_requests_completed_total",
+                self.drain_requests_completed_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_drain_requests_rejected_total",
+                self.drain_requests_rejected_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_drain_deadline_exceeded_total",
+                self.drain_deadline_exceeded_total.load(Ordering::Relaxed),
+            ),
+            (
+                "phrust_server_readiness_state",
+                self.readiness_state.load(Ordering::Relaxed),
+            ),
+        ] {
+            let _ = writeln!(output, "{name} {value}");
+        }
         let _ = writeln!(
             output,
             "phrust_server_script_cache_ready {}",

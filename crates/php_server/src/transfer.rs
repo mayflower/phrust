@@ -40,6 +40,7 @@ pub(crate) struct TransferContext {
     pub(crate) permit: Option<OwnedSemaphorePermit>,
     pub(crate) php: Option<PhpTransferCompletion>,
     pub(crate) execution: Option<PhpExecutionCoordinator>,
+    pub(crate) admitted_before_drain: bool,
 }
 
 #[derive(Clone)]
@@ -217,6 +218,14 @@ fn finalize(mut context: TransferContext, outcome: TransferOutcome, emitted_byte
         TransferOutcome::Error => &metrics.transfer_errors,
     }
     .fetch_add(1, Ordering::Relaxed);
+    if context.admitted_before_drain
+        && outcome == TransferOutcome::Completed
+        && !context.state.connections.shutdown.is_running()
+    {
+        metrics
+            .drain_requests_completed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
     if context.route == "static" {
         metrics
             .static_streamed_bytes
