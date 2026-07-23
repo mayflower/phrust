@@ -4206,7 +4206,7 @@ fn published_same_unit_entry_bypasses_the_warm_resolver() {
         crate::JitCallStatus::RETURN.0 as i32
     }
 
-    extern "C" fn forbidden_optimizing_callee(
+    extern "C" fn forbidden_baseline_replacement(
         _runtime: *mut std::ffi::c_void,
         _arguments: *const i64,
         _out: *mut i64,
@@ -4214,13 +4214,13 @@ fn published_same_unit_entry_bypasses_the_warm_resolver() {
         _resume_id: i32,
         _resume_state: *mut std::ffi::c_void,
     ) -> i32 {
-        panic!("baseline continuation re-entered an optimizing callee")
+        panic!("ordinary call reloaded the baseline continuation cell")
     }
 
     let (unit, function, callee) = scalar_direct_call_fixture();
     let mut backend = CraneliftNativeCompiler;
     let outcome = backend.compile_region(&NativeCompileRequest {
-        compile: &JitCompileRequest::new("cl.region.cached-direct-call"),
+        compile: &JitCompileRequest::new("cl.region.cached-direct-call").with_opt_level(2),
         unit: Some(&unit),
         function: Some(function),
         runtime_helpers: crate::JitRuntimeHelperAddresses {
@@ -4232,6 +4232,11 @@ fn published_same_unit_entry_bypasses_the_warm_resolver() {
     });
     assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
     let handle = outcome.handle.expect("cached direct-call region");
+    assert_optimizing_artifact(&handle);
+    let metadata = handle
+        .region_state_metadata()
+        .expect("cached direct-call metadata");
+    assert_eq!(metadata.direct_callees, vec![callee]);
 
     let mut entries = (0..unit.functions.len())
         .map(|_| std::sync::atomic::AtomicUsize::new(0))
@@ -4244,15 +4249,15 @@ fn published_same_unit_entry_bypasses_the_warm_resolver() {
         std::sync::atomic::Ordering::Release,
     );
     optimizing_entries[callee.index()].store(
-        forbidden_optimizing_callee as *const () as usize,
+        published_callee as *const () as usize,
         std::sync::atomic::Ordering::Release,
     );
     let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
         trusted_function_entries: entries.as_mut_ptr() as usize as u64,
         trusted_function_entry_count: entries.len() as u32,
-        trusted_optimizing_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
-        trusted_optimizing_function_entry_count: optimizing_entries.len() as u32,
+        trusted_preferred_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
+        trusted_preferred_function_entry_count: optimizing_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
     });
     assert_eq!(
@@ -4262,11 +4267,11 @@ fn published_same_unit_entry_bypasses_the_warm_resolver() {
         42
     );
     entries[callee.index()].store(
-        replacement_callee as *const () as usize,
+        forbidden_baseline_replacement as *const () as usize,
         std::sync::atomic::Ordering::Release,
     );
     optimizing_entries[callee.index()].store(
-        forbidden_optimizing_callee as *const () as usize,
+        replacement_callee as *const () as usize,
         std::sync::atomic::Ordering::Release,
     );
     assert_eq!(
@@ -4274,7 +4279,7 @@ fn published_same_unit_entry_bypasses_the_warm_resolver() {
             .invoke_i64(&[41], JIT_RUNTIME_ABI_HASH)
             .expect("replacement direct callee execution"),
         84,
-        "compiled caller cached the old baseline address instead of reloading the publication cell"
+        "compiled caller cached the old preferred address instead of reloading the publication cell"
     );
 }
 
@@ -4335,7 +4340,14 @@ fn direct_call_resumes_nested_compile_transitions_before_returning_to_caller() {
     let mut entries = (0..unit.functions.len())
         .map(|_| std::sync::atomic::AtomicUsize::new(0))
         .collect::<Vec<_>>();
+    let mut preferred_entries = (0..unit.functions.len())
+        .map(|_| std::sync::atomic::AtomicUsize::new(0))
+        .collect::<Vec<_>>();
     entries[callee.index()].store(
+        transitioning_callee as *const () as usize,
+        std::sync::atomic::Ordering::Release,
+    );
+    preferred_entries[callee.index()].store(
         transitioning_callee as *const () as usize,
         std::sync::atomic::Ordering::Release,
     );
@@ -4343,6 +4355,8 @@ fn direct_call_resumes_nested_compile_transitions_before_returning_to_caller() {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
         trusted_function_entries: entries.as_mut_ptr() as usize as u64,
         trusted_function_entry_count: entries.len() as u32,
+        trusted_preferred_function_entries: preferred_entries.as_mut_ptr() as usize as u64,
+        trusted_preferred_function_entry_count: preferred_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
     });
     assert_eq!(
@@ -5075,8 +5089,8 @@ fn optimizer_transitions_once_to_dynamic_baseline_without_repeating_effect() {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
         trusted_function_entries: baseline_entries.as_mut_ptr() as usize as u64,
         trusted_function_entry_count: baseline_entries.len() as u32,
-        trusted_optimizing_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
-        trusted_optimizing_function_entry_count: optimizing_entries.len() as u32,
+        trusted_preferred_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
+        trusted_preferred_function_entry_count: optimizing_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
     });
     let outcome = optimized
@@ -10668,6 +10682,10 @@ fn optimizing_runtime_guarded_function_cell_calls_native_callee_without_dispatch
     let caller_handle = caller_outcome.handle.expect("cell caller handle");
     assert_optimizing_artifact(&callee_handle);
     assert_optimizing_artifact(&caller_handle);
+    let caller_metadata = caller_handle
+        .region_state_metadata()
+        .expect("optimizing caller metadata");
+    assert_eq!(caller_metadata.direct_callees, vec![callee]);
     let mut entries = (0..unit.functions.len())
         .map(|_| std::sync::atomic::AtomicUsize::new(0))
         .collect::<Vec<_>>();
@@ -10690,8 +10708,8 @@ fn optimizing_runtime_guarded_function_cell_calls_native_callee_without_dispatch
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
         trusted_function_entries: entries.as_mut_ptr() as usize as u64,
         trusted_function_entry_count: entries.len() as u32,
-        trusted_optimizing_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
-        trusted_optimizing_function_entry_count: optimizing_entries.len() as u32,
+        trusted_preferred_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
+        trusted_preferred_function_entry_count: optimizing_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
     });
     assert_eq!(
@@ -10847,8 +10865,8 @@ fn optimizing_variadic_call_packs_one_authoritative_native_array() {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
         trusted_function_entries: entries.as_mut_ptr() as usize as u64,
         trusted_function_entry_count: entries.len() as u32,
-        trusted_optimizing_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
-        trusted_optimizing_function_entry_count: optimizing_entries.len() as u32,
+        trusted_preferred_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
+        trusted_preferred_function_entry_count: optimizing_entries.len() as u32,
         ..crate::abi::current_native_runtime_view()
     });
     assert_eq!(
@@ -11042,8 +11060,8 @@ fn optimizing_compiled_call_releases_its_borrowed_argument_owner() {
         direct_value_free_head: std::ptr::from_mut(&mut direct_free) as usize as u64,
         trusted_function_entries: entries.as_mut_ptr() as usize as u64,
         trusted_function_entry_count: entries.len() as u32,
-        trusted_optimizing_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
-        trusted_optimizing_function_entry_count: optimizing_entries.len() as u32,
+        trusted_preferred_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
+        trusted_preferred_function_entry_count: optimizing_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
     });
     let encoded = crate::jit_encode_typed_runtime_value(
@@ -11060,6 +11078,218 @@ fn optimizing_compiled_call_releases_its_borrowed_argument_owner() {
         direct_slots[0].refcount, 1,
         "compiled call leaked its argument owner"
     );
+}
+
+#[test]
+fn optimizing_by_ref_dimension_call_clones_cow_root_without_helpers() {
+    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
+    let mut builder = IrBuilder::new(UnitId::new(4_241));
+    let file = builder.add_file("optimizing-by-ref-dimension-call.php");
+    let span = IrSpan::new(file, 0, 1);
+
+    let callee = builder.start_function("increment_dimension", FunctionFlags::default(), span);
+    builder.set_return_type(callee, Some(IrReturnType::Int));
+    let value_local = builder.intern_local(callee, "value");
+    builder.push_param(
+        callee,
+        IrParam {
+            name: "value".to_owned(),
+            local: value_local,
+            required: true,
+            default: None,
+            type_: None,
+            by_ref: true,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let callee_block = builder.append_block(callee);
+    let value = builder.alloc_register(callee);
+    builder.emit(
+        callee,
+        callee_block,
+        InstructionKind::LoadLocal {
+            dst: value,
+            local: value_local,
+        },
+        span,
+    );
+    let one = builder.intern_constant(IrConstant::Int(1));
+    let incremented = builder.alloc_register(callee);
+    builder.emit(
+        callee,
+        callee_block,
+        InstructionKind::Binary {
+            dst: incremented,
+            op: BinaryOp::Add,
+            lhs: Operand::Register(value),
+            rhs: Operand::Constant(one),
+        },
+        span,
+    );
+    builder.emit(
+        callee,
+        callee_block,
+        InstructionKind::StoreLocal {
+            local: value_local,
+            src: Operand::Register(incremented),
+        },
+        span,
+    );
+    builder.terminate_return(
+        callee,
+        callee_block,
+        Some(Operand::Register(incremented)),
+        span,
+    );
+    builder.register_function_name("increment_dimension", callee);
+
+    let caller = builder.start_function("call_increment_dimension", FunctionFlags::default(), span);
+    builder.set_entry(caller);
+    builder.set_return_type(caller, Some(IrReturnType::Int));
+    let array_local = untyped_param(&mut builder, caller, "array");
+    let caller_block = builder.append_block(caller);
+    let zero = builder.intern_constant(IrConstant::Int(0));
+    let argument = builder.alloc_register(caller);
+    builder.emit(
+        caller,
+        caller_block,
+        InstructionKind::FetchDim {
+            dst: argument,
+            array: Operand::Local(array_local),
+            key: Operand::Constant(zero),
+            quiet: false,
+            mode: php_ir::instruction::DimFetchMode::Lvalue,
+        },
+        span,
+    );
+    let result = builder.alloc_register(caller);
+    builder.emit(
+        caller,
+        caller_block,
+        InstructionKind::CallFunction {
+            dst: result,
+            name: "increment_dimension".to_owned(),
+            args: vec![IrCallArg {
+                name: None,
+                value: Operand::Register(argument),
+                unpack: false,
+                value_kind: IrCallArgValueKind::Direct,
+                by_ref_local: None,
+                by_ref_dim: Some(php_ir::instruction::IrCallDimTarget {
+                    local: array_local,
+                    dims: vec![Operand::Constant(zero)],
+                }),
+                by_ref_property: None,
+                by_ref_property_dim: None,
+            }],
+        },
+        span,
+    );
+    builder.terminate_return(caller, caller_block, Some(Operand::Register(result)), span);
+    let unit = builder.finish();
+
+    let mut backend = CraneliftNativeCompiler;
+    let callee_outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.optimizing.by-ref-dimension-callee").with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(callee),
+        runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+    });
+    let caller_outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.optimizing.by-ref-dimension-caller").with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(caller),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_call_dispatch: forbidden_call_dispatch as *const () as usize,
+            native_function_resolve: forbidden_call_dispatch as *const () as usize,
+            native_reference_bind: forbidden_reference_bind as *const () as usize,
+            native_array_fetch: forbidden_cached_array_fetch as *const () as usize,
+            native_array_insert: forbidden_array_insert as *const () as usize,
+            native_local_fetch: forbidden_local_fetch as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(
+        callee_outcome.status,
+        JitCompileStatus::Compiled,
+        "{callee_outcome:?}"
+    );
+    assert_eq!(
+        caller_outcome.status,
+        JitCompileStatus::Compiled,
+        "{caller_outcome:?}"
+    );
+    let callee_handle = callee_outcome.handle.expect("dimension callee handle");
+    let caller_handle = caller_outcome.handle.expect("dimension caller handle");
+    assert_optimizing_artifact(&callee_handle);
+    assert_optimizing_artifact(&caller_handle);
+    let caller_metadata = caller_handle
+        .region_state_metadata()
+        .expect("dimension caller metadata");
+    assert_eq!(caller_metadata.direct_callees, vec![callee]);
+
+    let mut entries = (0..unit.functions.len())
+        .map(|_| std::sync::atomic::AtomicUsize::new(0))
+        .collect::<Vec<_>>();
+    let mut preferred_entries = (0..unit.functions.len())
+        .map(|_| std::sync::atomic::AtomicUsize::new(0))
+        .collect::<Vec<_>>();
+    let callee_address = callee_handle
+        .native_entry_address()
+        .expect("dimension callee executable address");
+    entries[callee.index()].store(callee_address, std::sync::atomic::Ordering::Release);
+    preferred_entries[callee.index()].store(callee_address, std::sync::atomic::Ordering::Release);
+
+    let mut direct_slots =
+        vec![crate::JitNativeValueSlot::default(); crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY];
+    let mut direct_entries = vec![
+        crate::JitNativeDirectArrayEntry::default();
+        crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY
+    ];
+    direct_entries[0] = crate::JitNativeDirectArrayEntry { key: 0, value: 1 };
+    direct_slots[0] = crate::JitNativeValueSlot {
+        refcount: 2,
+        kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY,
+        flags: crate::jit_native_direct_array_flags(Some(0)),
+        reserved: crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY,
+        payload: 1,
+        aux: direct_entries.as_mut_ptr() as usize as u64,
+    };
+    let mut direct_next = 1_u32;
+    let mut entry_next = crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY;
+    let _arena = activate_direct_test_arena(
+        &mut direct_slots,
+        &mut direct_next,
+        &mut direct_entries,
+        &mut entry_next,
+    );
+    let mut roots_dirty = 0_u32;
+    let _entries = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
+        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
+        trusted_function_entries: entries.as_mut_ptr() as usize as u64,
+        trusted_function_entry_count: entries.len() as u32,
+        trusted_preferred_function_entries: preferred_entries.as_mut_ptr() as usize as u64,
+        trusted_preferred_function_entry_count: preferred_entries.len() as u32,
+        root_mutation_pending: std::ptr::from_mut(&mut roots_dirty) as usize as u64,
+        ..crate::abi::current_native_runtime_view()
+    });
+    let array = crate::jit_encode_typed_runtime_value(
+        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
+        crate::JIT_VALUE_RUNTIME_ARRAY_TAG,
+    );
+    assert_eq!(
+        caller_handle
+            .invoke_i64(&[array], JIT_RUNTIME_ABI_HASH)
+            .expect("compiled by-reference dimension call"),
+        2
+    );
+    assert_eq!(
+        direct_entries[0].value, 1,
+        "the shared source array was mutated instead of cloned"
+    );
+    assert_eq!(roots_dirty, 1);
+    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -11217,8 +11447,8 @@ fn optimizing_prepared_default_calls_native_callee_without_dispatch() {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
         trusted_function_entries: entries.as_mut_ptr() as usize as u64,
         trusted_function_entry_count: entries.len() as u32,
-        trusted_optimizing_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
-        trusted_optimizing_function_entry_count: optimizing_entries.len() as u32,
+        trusted_preferred_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
+        trusted_preferred_function_entry_count: optimizing_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
     });
     assert_eq!(
@@ -11459,8 +11689,8 @@ fn optimizing_prepared_method_default_calls_native_callee_without_dispatch() {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
         trusted_function_entries: entries.as_mut_ptr() as usize as u64,
         trusted_function_entry_count: entries.len() as u32,
-        trusted_optimizing_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
-        trusted_optimizing_function_entry_count: optimizing_entries.len() as u32,
+        trusted_preferred_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
+        trusted_preferred_function_entry_count: optimizing_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
     });
     assert_eq!(

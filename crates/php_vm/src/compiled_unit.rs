@@ -193,11 +193,13 @@ pub(crate) struct PreparedDeploymentNativeImage {
     /// Rust `Value` or allocating a request-local string handle.
     pub constant_views: Box<[php_jit::JitNativeConstantView]>,
     /// Dense baseline publication cells indexed by `FunctionId`. Generated
-    /// code loads these cells directly. Optimizing entries are intentionally
-    /// not stored here until the native ABI can preserve an optimized caller
-    /// continuation across a callee side exit.
+    /// code uses these only for an exact continuation after an optimizing
+    /// callee side exit.
     pub native_function_entries: Box<[std::sync::atomic::AtomicUsize]>,
-    pub optimizing_function_entries: Box<[std::sync::atomic::AtomicUsize]>,
+    /// Dense ordinary-call cells indexed by `FunctionId`. Every published
+    /// baseline initializes its cell and an optimizing publication atomically
+    /// replaces that target, so generated calls never select a tier.
+    pub preferred_function_entries: Box<[std::sync::atomic::AtomicUsize]>,
 }
 
 impl PreparedUnit {
@@ -679,7 +681,7 @@ impl CompiledUnit {
                 native_function_entries: (0..unit.functions.len())
                     .map(|_| std::sync::atomic::AtomicUsize::new(0))
                     .collect(),
-                optimizing_function_entries: (0..unit.functions.len())
+                preferred_function_entries: (0..unit.functions.len())
                     .map(|_| std::sync::atomic::AtomicUsize::new(0))
                     .collect(),
             }

@@ -8036,6 +8036,12 @@ fn region_graph_metadata<'a>(
             )
         })
         .unwrap_or_default();
+    let direct_callees = regions
+        .iter()
+        .flat_map(|region| region.direct_callees())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     crate::JitRegionStateMetadata {
         local_count: root_local_count,
         compiler_tier: regions
@@ -8053,6 +8059,7 @@ fn region_graph_metadata<'a>(
         inline_bytes_added: root_inlining.1,
         tail_call_sites: root_inlining.2,
         inline_rejected_by_reason: root_inlining.3,
+        direct_callees,
         continuations,
         native_pc_ranges,
         osr_entries,

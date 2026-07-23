@@ -13692,6 +13692,112 @@ fn lower_optimizing_bind_reference_static_property(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn lower_optimizing_bind_direct_array_dimension_reference(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    array_ensure_unique: FuncId,
+    array_child_entry: FuncId,
+    locals: &NativeLocalMap,
+    array: LocalId,
+    keys: &[(ir::Value, bool)],
+    result_out: ir::Value,
+    deopt_out: ir::Value,
+    transition: NativeOptimizingTransition<'_>,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    let (leaf_key, parents) = keys
+        .split_last()
+        .expect("direct array-dimension reference retains a leaf key");
+    let root = use_local_variable(builder, locals, array)?;
+    let root_additional = builder
+        .ins()
+        .iconst(types::I64, i64::from(parents.is_empty()));
+    let root = lower_direct_array_ensure_unique_capacity(
+        module,
+        builder,
+        array_ensure_unique,
+        root,
+        root_additional,
+        true,
+        result_out,
+        deopt_out,
+        transition,
+    )?;
+    define_local_variable(builder, locals, array, root)?;
+    let leaf = lower_direct_nested_array_path_from_unique_root(
+        module,
+        builder,
+        array_ensure_unique,
+        array_child_entry,
+        root,
+        parents,
+        1,
+        result_out,
+        deopt_out,
+        transition,
+    )?;
+    lower_direct_array_require_supported_key(builder, leaf_key.0, transition)?;
+    let (current, entry) = lower_direct_array_lookup_child_entry(
+        module,
+        builder,
+        array_child_entry,
+        leaf,
+        leaf_key.0,
+        deopt_out,
+    );
+    let existing = builder.create_block();
+    let missing = builder.create_block();
+    let reuse = builder.create_block();
+    let install = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I64);
+    let found = builder.ins().icmp_imm(IntCC::NotEqual, entry, 0);
+    builder.ins().brif(found, existing, &[], missing, &[]);
+
+    builder.switch_to_block(existing);
+    let was_reference =
+        lower_value_has_tag(builder, current, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
+    let reference = lower_optimizing_bind_direct_local_reference(builder, current, transition)?;
+    builder.ins().brif(was_reference, reuse, &[], install, &[]);
+
+    builder.switch_to_block(reuse);
+    builder.ins().jump(done, &[reference.into()]);
+
+    builder.switch_to_block(install);
+    // The element's owner moves into the new reference cell; the entry remains
+    // the authoritative owner passed by borrow to the compiled callee.
+    builder.ins().store(
+        MemFlagsData::new(),
+        reference,
+        entry,
+        std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
+    );
+    builder.ins().jump(done, &[reference.into()]);
+
+    builder.switch_to_block(missing);
+    let null = builder
+        .ins()
+        .iconst(types::I64, crate::jit_encode_constant(u32::MAX));
+    let reference = lower_optimizing_bind_direct_local_reference(builder, null, transition)?;
+    let _ = lower_direct_array_insert(
+        module,
+        builder,
+        leaf,
+        leaf_key.0,
+        leaf_key.1,
+        reference,
+        true,
+        result_out,
+        deopt_out,
+        NativeArrayAppendFallback::Optimizing(transition),
+    )?;
+    builder.ins().jump(done, &[reference.into()]);
+
+    builder.switch_to_block(done);
+    lower_mark_native_roots_dirty(builder, deopt_out);
+    Ok(builder.block_params(done)[0])
+}
+
+#[allow(clippy::too_many_arguments)]
 fn lower_optimizing_bind_reference_from_static_property(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
@@ -18856,15 +18962,19 @@ fn lower_optimizing_region_instruction(
             array,
             key,
             quiet,
-            mode: php_ir::instruction::DimFetchMode::Read,
+            mode,
         } => {
             emitted_class = crate::JitProductionLoweringClass::DirectNativeData;
             let array = lower_region_operand(builder, locals, registers, *array)?;
             let array = lower_optimizing_reference_scalar(builder, array, false, transition)?;
             let constant_string_key = array_key_is_string_constant(constants, *key);
             let key = lower_array_key_operand(builder, locals, registers, constants, *key)?;
+            // Lvalue probes are completed by the following exact reference or
+            // write operation. A missing entry is therefore null here rather
+            // than a read-side undefined-key warning.
+            let quiet = *quiet || *mode == php_ir::instruction::DimFetchMode::Lvalue;
             let operation =
-                native_dim_operation(u32::from(*quiet), function, instruction.continuation_id);
+                native_dim_operation(u32::from(quiet), function, instruction.continuation_id);
             let value = lower_cached_array_fetch(
                 module,
                 builder,
@@ -19207,101 +19317,20 @@ fn lower_optimizing_region_instruction(
                     ))
                 })
                 .collect::<Result<Vec<_>, CraneliftLoweringError>>()?;
-            let (leaf_key, parents) = lowered_keys
-                .split_last()
-                .expect("reference-from-dimension retains a leaf key");
-            let root = use_local_variable(builder, locals, *array)?;
-            let root_additional = builder
-                .ins()
-                .iconst(types::I64, i64::from(parents.is_empty()));
-            let root = lower_direct_array_ensure_unique_capacity(
-                module,
-                builder,
-                optimizing_operations.array_ensure_unique,
-                root,
-                root_additional,
-                true,
-                result_out,
-                deopt_out,
-                transition,
-            )?;
-            define_local_variable(builder, locals, *array, root)?;
-            let leaf = lower_direct_nested_array_path_from_unique_root(
+            let reference = lower_optimizing_bind_direct_array_dimension_reference(
                 module,
                 builder,
                 optimizing_operations.array_ensure_unique,
                 optimizing_operations.array_child_entry,
-                root,
-                parents,
-                1,
+                locals,
+                *array,
+                &lowered_keys,
                 result_out,
                 deopt_out,
                 transition,
             )?;
-            lower_direct_array_require_supported_key(builder, leaf_key.0, transition)?;
-            let (current, entry) = lower_direct_array_lookup_child_entry(
-                module,
-                builder,
-                optimizing_operations.array_child_entry,
-                leaf,
-                leaf_key.0,
-                deopt_out,
-            );
-            let existing = builder.create_block();
-            let missing = builder.create_block();
-            let reuse = builder.create_block();
-            let install = builder.create_block();
-            let retain = builder.create_block();
-            builder.append_block_param(retain, types::I64);
-            let found = builder.ins().icmp_imm(IntCC::NotEqual, entry, 0);
-            builder.ins().brif(found, existing, &[], missing, &[]);
-
-            builder.switch_to_block(existing);
-            let was_reference =
-                lower_value_has_tag(builder, current, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
-            let reference =
-                lower_optimizing_bind_direct_local_reference(builder, current, transition)?;
-            builder.ins().brif(was_reference, reuse, &[], install, &[]);
-
-            builder.switch_to_block(reuse);
-            builder.ins().jump(retain, &[reference.into()]);
-
-            builder.switch_to_block(install);
-            // The element's existing owner moves into the new reference cell;
-            // replacing the entry therefore needs neither retain nor release.
-            builder.ins().store(
-                MemFlagsData::new(),
-                reference,
-                entry,
-                std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
-            );
-            builder.ins().jump(retain, &[reference.into()]);
-
-            builder.switch_to_block(missing);
-            let null = builder
-                .ins()
-                .iconst(types::I64, crate::jit_encode_constant(u32::MAX));
-            let reference =
-                lower_optimizing_bind_direct_local_reference(builder, null, transition)?;
-            let _ = lower_direct_array_insert(
-                module,
-                builder,
-                leaf,
-                leaf_key.0,
-                leaf_key.1,
-                reference,
-                true,
-                result_out,
-                deopt_out,
-                NativeArrayAppendFallback::Optimizing(transition),
-            )?;
-            builder.ins().jump(retain, &[reference.into()]);
-
-            builder.switch_to_block(retain);
-            let reference = builder.block_params(retain)[0];
             lower_optimizing_retain(builder, reference, deopt_out);
             define_local_variable(builder, locals, *target, reference)?;
-            lower_mark_native_roots_dirty(builder, deopt_out);
             builder.ins().jump(done, &[]);
 
             builder.switch_to_block(rejected);
@@ -20019,6 +20048,13 @@ fn lower_optimizing_region_instruction(
                 && fixed_arguments
                 && (call.returns_by_reference
                     == matches!(call.result, RegionCallResult::ReferenceLocal(_)))
+                && match call.result {
+                    RegionCallResult::ReferenceLocal(destination) => {
+                        value_flow.local_storage(destination)
+                            == crate::region_ir::LocalStorageClass::MemoryReference
+                    }
+                    RegionCallResult::Register(_) | RegionCallResult::Discard => true,
+                }
                 && function_params.get(&target).is_some_and(
                     |(_, params, requires_trampoline, arity, reference_only_trampoline)| {
                         let visible_operands = call
@@ -20034,12 +20070,11 @@ fn lower_optimizing_region_instruction(
                                         params.last().filter(|parameter| parameter.variadic)
                                     });
                                     parameter.is_none_or(|parameter| {
-                                        !parameter.by_ref || {
-                                            argument.by_ref_local.is_some()
-                                                && argument.by_ref_dim.is_none()
-                                                && argument.by_ref_property.is_none()
-                                                && argument.by_ref_property_dim.is_none()
-                                        }
+                                        !parameter.by_ref
+                                            || argument.by_ref_local.is_some_and(|local| {
+                                                value_flow.local_storage(local)
+                                                    == crate::region_ir::LocalStorageClass::MemoryReference
+                                            })
                                     })
                                 })))
                             && if call.variadic {
@@ -20082,6 +20117,12 @@ fn lower_optimizing_region_instruction(
                 } else {
                     crate::JitCallStatus::RETURN.0
                 };
+                let replaced_reference_destination =
+                    if let RegionCallResult::ReferenceLocal(destination) = call.result {
+                        Some(use_local_variable(builder, locals, destination)?)
+                    } else {
+                        None
+                    };
                 let completed_call = begin_native_call_or_resume(
                     builder,
                     pending_status,
@@ -20094,23 +20135,6 @@ fn lower_optimizing_region_instruction(
                 let (_, parameters, _, _, _) = function_params
                     .get(&target)
                     .expect("compiled-call target metadata was admitted above");
-                // Replacing a runtime-owned destination could run a PHP
-                // destructor after the callee has already produced effects.
-                // Until optimizing call continuations can carry a post-call
-                // release, reject that uncommon shape before binding any
-                // arguments or invoking the callee. Fresh/uninitialized and
-                // immediate destinations need no lifecycle operation.
-                if let RegionCallResult::ReferenceLocal(destination) = call.result {
-                    let previous = use_local_variable(builder, locals, destination)?;
-                    let admitted = builder.create_block();
-                    let rejected = builder.create_block();
-                    let runtime = lower_is_runtime_handle(builder, previous);
-                    builder.ins().brif(runtime, rejected, &[], admitted, &[]);
-                    builder.switch_to_block(rejected);
-                    let _ = transition.emit_value_with_detail(builder, 0x1203)?;
-                    builder.ins().jump(admitted, &[]);
-                    builder.switch_to_block(admitted);
-                }
                 let mut call_args = Vec::with_capacity(call.operands.len().saturating_add(1));
                 for (index, operand) in call.operands.iter().enumerate() {
                     let operand = operand.expect("fixed optimizing call has every operand");
@@ -20121,10 +20145,12 @@ fn lower_optimizing_region_instruction(
                             .or_else(|| parameters.last().filter(|parameter| parameter.variadic))
                     });
                     if parameter.is_some_and(|parameter| parameter.by_ref) {
-                        let local = visible_index
+                        let argument = visible_index
                             .and_then(|index| call.args.get(index))
-                            .and_then(|argument| argument.by_ref_local)
-                            .expect("admitted reference call has an exact local lvalue");
+                            .expect("admitted reference call has lvalue metadata");
+                        let local = argument
+                            .by_ref_local
+                            .expect("admitted reference call has a prepared local reference");
                         let current = use_local_variable(builder, locals, local)?;
                         let reference = lower_optimizing_bind_direct_local_reference(
                             builder, current, transition,
@@ -20244,65 +20270,24 @@ fn lower_optimizing_region_instruction(
                 let pointer_type = module.target_config().pointer_type();
                 let runtime_view_offset =
                     std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
-                let baseline_entries = builder.ins().load(
+                let preferred_entries = builder.ins().load(
                     pointer_type,
                     MemFlagsData::new(),
                     deopt_out,
                     runtime_view_offset
                         + std::mem::offset_of!(
                             crate::JitNativeRuntimeView,
-                            trusted_function_entries,
-                        ) as i32,
-                );
-                let optimizing_entries = builder.ins().load(
-                    pointer_type,
-                    MemFlagsData::new(),
-                    deopt_out,
-                    runtime_view_offset
-                        + std::mem::offset_of!(
-                            crate::JitNativeRuntimeView,
-                            trusted_optimizing_function_entries,
+                            trusted_preferred_function_entries,
                         ) as i32,
                 );
                 let entry_offset =
                     i64::try_from(target.index().saturating_mul(pointer_type.bytes() as usize))
                         .unwrap_or(i64::MAX);
-                let baseline_entry = builder.ins().iadd_imm(baseline_entries, entry_offset);
-                let optimizing_entry = builder.ins().iadd_imm(optimizing_entries, entry_offset);
-                let baseline_address =
+                let preferred_entry = builder.ins().iadd_imm(preferred_entries, entry_offset);
+                let address =
                     builder
                         .ins()
-                        .atomic_load(pointer_type, MemFlagsData::new(), baseline_entry);
-                let optimizing_address =
-                    builder
-                        .ins()
-                        .atomic_load(pointer_type, MemFlagsData::new(), optimizing_entry);
-                let has_optimizing = builder
-                    .ins()
-                    .icmp_imm(IntCC::NotEqual, optimizing_address, 0);
-                // Direct reference slots are an optimizing ABI. A baseline
-                // callee owns Rust ReferenceCell semantics and must be entered
-                // through the caller's single baseline continuation, where
-                // the direct slot is materialized once.
-                let address = if parameters.iter().any(|parameter| parameter.by_ref)
-                    || call.returns_by_reference
-                {
-                    optimizing_address
-                } else {
-                    builder
-                        .ins()
-                        .select(has_optimizing, optimizing_address, baseline_address)
-                };
-                let invoke = builder.create_block();
-                let unavailable = builder.create_block();
-                let published = builder.ins().icmp_imm(IntCC::NotEqual, address, 0);
-                builder.ins().brif(published, invoke, &[], unavailable, &[]);
-
-                builder.switch_to_block(unavailable);
-                let _ = transition.emit_value_with_detail(builder, 0x1202)?;
-                builder.ins().jump(invoke, &[]);
-
-                builder.switch_to_block(invoke);
+                        .atomic_load(pointer_type, MemFlagsData::new(), preferred_entry);
                 for (index, value) in call_args.iter().copied().enumerate() {
                     if Some(index) != owned_call_argument {
                         lower_optimizing_retain(builder, value, deopt_out);
@@ -20375,6 +20360,20 @@ fn lower_optimizing_region_instruction(
                 );
 
                 builder.switch_to_block(resume_callee);
+                // A callee-local rejection resumes that callee's exact
+                // baseline continuation. This cold load is not tier
+                // selection for the call: the hot invocation above reads only
+                // the one preferred entry cell.
+                let baseline_entries = builder.ins().load(
+                    pointer_type,
+                    MemFlagsData::new(),
+                    deopt_out,
+                    runtime_view_offset
+                        + std::mem::offset_of!(
+                            crate::JitNativeRuntimeView,
+                            trusted_function_entries,
+                        ) as i32,
+                );
                 let rejected_function = builder.ins().load(
                     types::I32,
                     MemFlagsData::new(),
@@ -20509,6 +20508,11 @@ fn lower_optimizing_region_instruction(
                 builder.ins().jump(completed_call, &[result.into()]);
                 builder.switch_to_block(completed_call);
                 let result = builder.block_params(completed_call)[0];
+                if let Some(previous) = replaced_reference_destination {
+                    // The previous owner remains live while the callee runs
+                    // and is released only after a direct or resumed return.
+                    lower_optimizing_release(builder, previous, transition)?;
+                }
                 match call.result {
                     RegionCallResult::Register(destination) => define_region_register(
                         builder,
@@ -22593,22 +22597,49 @@ fn lower_baseline_region_instruction(
                 )?;
                 arrays.push(nested);
             }
+            let leaf_key = *keys
+                .last()
+                .expect("reference-from-dimension retains at least one key");
+            // Establish a unique leaf container before installing the
+            // reference. Binding directly into a shared direct-array handle
+            // mutates every COW peer because the reference helper cannot also
+            // return the replacement root. A quiet fetch followed by an exact
+            // insert clones only when necessary and preserves missing-entry
+            // reference semantics.
+            let leaf = lower_native_value_operation(
+                module,
+                builder,
+                native_operations.array_fetch,
+                native_dim_operation(1, function, instruction.continuation_id),
+                &[nested, leaf_key],
+                result_out,
+            )?;
+            let mut updated = lower_native_value_operation(
+                module,
+                builder,
+                native_operations.array_insert,
+                native_dim_operation(0, function, instruction.continuation_id),
+                &[nested, leaf_key, leaf],
+                result_out,
+            )?;
+            let _ = lower_guarded_value_release(
+                module,
+                builder,
+                native_operations.value_release,
+                native_dim_operation(1, function, instruction.continuation_id),
+                leaf,
+                result_out,
+                deopt_out,
+            )?;
             let zero = builder.ins().iconst(types::I64, 0);
             let reference = lower_native_value_operation(
                 module,
                 builder,
                 native_operations.reference_bind,
                 native_dim_operation(1, function, instruction.continuation_id),
-                &[
-                    nested,
-                    *keys
-                        .last()
-                        .expect("reference-from-dimension retains at least one key"),
-                    zero,
-                ],
+                &[updated, leaf_key, zero],
                 result_out,
             )?;
-            let mut updated = nested;
             for index in (0..keys.len().saturating_sub(1)).rev() {
                 updated = lower_native_value_operation(
                     module,
@@ -24234,6 +24265,15 @@ fn lower_baseline_region_instruction(
                 }
                 RegionCallResult::ReferenceLocal(local) => {
                     define_local_variable(builder, locals, local, value)?;
+                    publish_native_reference_local(
+                        module,
+                        builder,
+                        native_operations.reference_bind,
+                        value,
+                        function,
+                        local,
+                        result_out,
+                    )?;
                 }
                 RegionCallResult::Discard => {}
             }
@@ -27037,6 +27077,15 @@ fn lower_native_call_trampoline(
         }
         RegionCallResult::ReferenceLocal(local) => {
             define_local_variable(builder, locals, local, value)?;
+            publish_native_reference_local(
+                module,
+                builder,
+                native_reference_bind_helper,
+                value,
+                function,
+                local,
+                result_out,
+            )?;
         }
         RegionCallResult::Discard => {}
     }

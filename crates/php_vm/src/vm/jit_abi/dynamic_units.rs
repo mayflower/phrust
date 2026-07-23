@@ -14,13 +14,21 @@ fn publish_dynamic_unit_entry(
         .map(|metadata| metadata.compiler_tier);
     match tier {
         Some(php_jit::region_ir::NativeCompilerTier::Optimizing) => {
-            if let Some(cell) = deployment.optimizing_function_entries.get(function.index()) {
+            if let Some(cell) = deployment.preferred_function_entries.get(function.index()) {
                 cell.store(address, std::sync::atomic::Ordering::Release);
             }
         }
         _ => {
             if let Some(cell) = deployment.native_function_entries.get(function.index()) {
                 cell.store(address, std::sync::atomic::Ordering::Release);
+            }
+            if let Some(cell) = deployment.preferred_function_entries.get(function.index()) {
+                let _ = cell.compare_exchange(
+                    0,
+                    address,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                );
             }
         }
     }

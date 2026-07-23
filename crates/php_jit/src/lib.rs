@@ -878,6 +878,10 @@ pub struct JitRegionStateMetadata {
     pub tail_call_sites: u64,
     #[serde(default)]
     pub inline_rejected_by_reason: std::collections::BTreeMap<String, u64>,
+    /// Stable userland callees whose publication cells must be initialized
+    /// before this optimizing entry becomes callable.
+    #[serde(default)]
+    pub direct_callees: Vec<FunctionId>,
     pub continuations: Vec<JitContinuationMetadata>,
     pub native_pc_ranges: Vec<JitNativePcRange>,
     pub osr_entries: Vec<JitOsrEntryMetadata>,

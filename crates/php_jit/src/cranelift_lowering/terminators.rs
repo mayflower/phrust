@@ -663,18 +663,22 @@ pub(super) fn lower_region_terminator(
             )?;
         }
         RegionTerminator::ReturnReference { local, finally } => {
-            let mut value = use_local_variable(builder, locals, *local)?;
-            if value_flow.local_fact(*local).ownership == SsaOwnership::Borrowed {
-                value = lower_guarded_value_release(
-                    module,
-                    builder,
-                    native_operations.value_release,
-                    native_dim_operation(0, function, 0),
-                    value,
-                    result_out,
-                    deopt_out,
-                )?;
-            }
+            // The returned reference is a new ABI owner independently of the
+            // callee frame. This is required even when value-flow marks the
+            // parameter/local as owned: frame cleanup releases that owner
+            // immediately below. Returning the same handle without retaining
+            // it lets the caller install a recycled direct-reference slot and
+            // breaks aliases such as `$b =& identity_ref($a)`.
+            let local_value = use_local_variable(builder, locals, *local)?;
+            let value = lower_guarded_value_release(
+                module,
+                builder,
+                native_operations.value_release,
+                native_dim_operation(0, function, 0),
+                local_value,
+                result_out,
+                deopt_out,
+            )?;
             let status = builder.ins().iconst(
                 types::I32,
                 i64::from(crate::JitCallStatus::RETURN_REFERENCE.0),

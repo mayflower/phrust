@@ -225,6 +225,9 @@ impl VmWorkerState {
         ),
         String,
     > {
+        if options.native_optimization == NativeOptimizationPolicy::Optimizing {
+            self.prepare_native_baseline_entry(unit, function, options, external_signatures)?;
+        }
         let function_metadata = unit
             .unit()
             .functions
@@ -290,11 +293,40 @@ impl VmWorkerState {
             self.native_compiles.get_or_compile_background(key, compile)
         } else {
             self.native_compiles.get_or_compile(key, compile)
-        };
+        }?;
+        if options.native_optimization == NativeOptimizationPolicy::Optimizing {
+            for handle in compiled
+                .0
+                .iter()
+                .filter_map(|record| record.result.handle.as_ref())
+            {
+                self.prepare_optimizing_direct_callees(unit, handle, options, external_signatures)?;
+            }
+            for record in compiled.0.iter() {
+                let Some(address) = record
+                    .result
+                    .handle
+                    .as_ref()
+                    .and_then(php_jit::JitFunctionHandle::native_entry_address)
+                else {
+                    continue;
+                };
+                let preferred = unit
+                    .prepared_deployment_image()
+                    .preferred_function_entries
+                    .get(record.function.index())
+                    .ok_or_else(|| {
+                        format!(
+                            "optimizing function {} has no preferred publication cell",
+                            record.function.raw()
+                        )
+                    })?;
+                preferred.store(address, std::sync::atomic::Ordering::Release);
+            }
+        }
         if std::env::var_os("PHRUST_NATIVE_COMPILE_FUNCTION_LOG").is_some()
-            && let Ok((records, disposition)) = &compiled
-            && disposition.compiled()
-            && let Some(record) = records.first()
+            && compiled.1.compiled()
+            && let Some(record) = compiled.0.first()
         {
             let source = unit
                 .unit()
@@ -316,7 +348,86 @@ impl VmWorkerState {
                 record.result.stats.native_code_bytes,
             );
         }
-        compiled
+        Ok(compiled)
+    }
+
+    fn prepare_native_baseline_entry(
+        &self,
+        unit: &CompiledUnit,
+        function: php_ir::FunctionId,
+        options: &VmOptions,
+        external_signatures: &[php_jit::JitExternalFunctionSignature],
+    ) -> Result<usize, String> {
+        let deployment = unit.prepared_deployment_image();
+        let baseline_cell = deployment
+            .native_function_entries
+            .get(function.index())
+            .ok_or_else(|| {
+                format!(
+                    "native function {} has no baseline publication cell",
+                    function.raw()
+                )
+            })?;
+        let preferred = deployment
+            .preferred_function_entries
+            .get(function.index())
+            .ok_or_else(|| {
+                format!(
+                    "native function {} has no preferred publication cell",
+                    function.raw()
+                )
+            })?;
+        let mut address = baseline_cell.load(std::sync::atomic::Ordering::Acquire);
+        if address == 0 {
+            let mut baseline_options = options.clone();
+            baseline_options.native_optimization = NativeOptimizationPolicy::Baseline;
+            baseline_options.tiering.enabled = false;
+            let baseline = self.resolve_native_function(
+                unit,
+                function,
+                &baseline_options,
+                external_signatures,
+            )?;
+            address = baseline.native_entry_address().ok_or_else(|| {
+                format!(
+                    "native function {} has no baseline entry address",
+                    function.raw()
+                )
+            })?;
+            baseline_cell.store(address, std::sync::atomic::Ordering::Release);
+        }
+        let _ = preferred.compare_exchange(
+            0,
+            address,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+        Ok(address)
+    }
+
+    fn prepare_optimizing_direct_callees(
+        &self,
+        unit: &CompiledUnit,
+        handle: &php_jit::JitFunctionHandle,
+        options: &VmOptions,
+        external_signatures: &[php_jit::JitExternalFunctionSignature],
+    ) -> Result<(), String> {
+        let Some(metadata) = handle.region_state_metadata() else {
+            return Ok(());
+        };
+        let direct_callees = metadata.direct_callees.clone();
+        if direct_callees.is_empty() {
+            return Ok(());
+        }
+        for callee in direct_callees {
+            self.prepare_native_baseline_entry(unit, callee, options, external_signatures)?;
+            self.schedule_on_demand_optimization(
+                unit.clone(),
+                callee,
+                external_signatures.to_vec(),
+            );
+        }
+        Ok(())
     }
 
     fn background_tiering_decision(
@@ -411,7 +522,7 @@ impl VmWorkerState {
             if let Some(address) = published_optimizing_entry
                 && let Some(cell) = unit
                     .prepared_deployment_image()
-                    .optimizing_function_entries
+                    .preferred_function_entries
                     .get(function.index())
             {
                 cell.store(address, std::sync::atomic::Ordering::Release);
@@ -2040,7 +2151,7 @@ mod tests {
             "nested compiled calls must retain a side-exit-free baseline target"
         );
         assert_eq!(
-            unit.prepared_deployment_image().optimizing_function_entries[function.index()]
+            unit.prepared_deployment_image().preferred_function_entries[function.index()]
                 .load(std::sync::atomic::Ordering::Acquire),
             optimized_address,
             "optimizing callers must observe the independently published optimizing target"
@@ -2131,6 +2242,120 @@ mod tests {
         builder.terminate_return(entry, entry_block, Some(Operand::Register(result)), span);
         builder.set_entry(entry);
         CompiledUnit::new(builder.finish())
+    }
+
+    fn optimizing_reference_call_to_baseline_unit() -> (CompiledUnit, php_ir::FunctionId) {
+        let mut builder = IrBuilder::new(UnitId::new(9_937));
+        let file = builder.add_file("native-reference-call-baseline.php");
+        let span = IrSpan::new(file, 0, 32);
+        let one = builder.intern_constant(IrConstant::Int(1));
+        let four = builder.intern_constant(IrConstant::Int(4));
+
+        let callee = builder.start_function("identity_ref", FunctionFlags::default(), span);
+        builder.set_returns_by_ref(callee, true);
+        let parameter = builder.intern_local(callee, "value");
+        builder.push_param(
+            callee,
+            IrParam {
+                name: "value".to_owned(),
+                local: parameter,
+                required: true,
+                default: None,
+                type_: None,
+                by_ref: true,
+                variadic: false,
+                attributes: Vec::new(),
+            },
+        );
+        let callee_block = builder.append_block(callee);
+        builder.terminate_return_ref(callee, callee_block, parameter, span);
+        builder.register_function_name("identity_ref", callee);
+
+        let entry = builder.start_function("main", FunctionFlags::default(), span);
+        builder.set_return_type(entry, Some(IrReturnType::Int));
+        let source = builder.intern_local(entry, "source");
+        let alias = builder.intern_local(entry, "alias");
+        let entry_block = builder.append_block(entry);
+        let initial = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::LoadConst {
+                dst: initial,
+                constant: one,
+            },
+            span,
+        );
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::StoreLocal {
+                local: source,
+                src: Operand::Register(initial),
+            },
+            span,
+        );
+        let argument = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::LoadLocal {
+                dst: argument,
+                local: source,
+            },
+            span,
+        );
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::BindReferenceFromCall {
+                target: alias,
+                name: "identity_ref".to_owned(),
+                args: vec![php_ir::instruction::IrCallArg {
+                    name: None,
+                    value: Operand::Register(argument),
+                    unpack: false,
+                    value_kind: php_ir::instruction::IrCallArgValueKind::Direct,
+                    by_ref_local: Some(source),
+                    by_ref_dim: None,
+                    by_ref_property: None,
+                    by_ref_property_dim: None,
+                }],
+            },
+            span,
+        );
+        let replacement = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::LoadConst {
+                dst: replacement,
+                constant: four,
+            },
+            span,
+        );
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::StoreLocal {
+                local: alias,
+                src: Operand::Register(replacement),
+            },
+            span,
+        );
+        let result = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::LoadLocal {
+                dst: result,
+                local: source,
+            },
+            span,
+        );
+        builder.terminate_return(entry, entry_block, Some(Operand::Register(result)), span);
+        builder.set_entry(entry);
+        (CompiledUnit::new(builder.finish()), callee)
     }
 
     fn optimizing_array_to_baseline_mutation_unit() -> (CompiledUnit, php_ir::FunctionId) {
@@ -3050,7 +3275,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn optimizing_call_miss_keeps_nested_warm_cell_on_baseline_entry() {
+    fn optimizing_direct_call_keeps_baseline_continuation_and_upgrades_preferred_entry() {
         let unit = direct_call_unit_with_identity(9_936, "native-on-demand-optimizer-cell.php");
         let mut tiering = crate::tiering::TieringOptions::default();
         tiering.collect_stats = true;
@@ -3118,7 +3343,7 @@ mod tests {
         assert_eq!(nested_address, baseline_address);
         assert_ne!(nested_address, optimizing_address);
         assert_eq!(
-            unit.prepared_deployment_image().optimizing_function_entries[callee.index()]
+            unit.prepared_deployment_image().preferred_function_entries[callee.index()]
                 .load(std::sync::atomic::Ordering::Acquire),
             optimizing_address
         );
@@ -3157,6 +3382,49 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
+    fn optimizing_reference_call_preserves_alias_through_baseline_entry() {
+        let (unit, callee) = optimizing_reference_call_to_baseline_unit();
+        let mut tiering = crate::tiering::TieringOptions::default();
+        tiering.enabled = false;
+        let worker = VmWorkerState::new(tiering.clone());
+        let baseline = VmOptions {
+            native_optimization: NativeOptimizationPolicy::Baseline,
+            native_cache: php_jit::NativeCacheMode::Off,
+            collect_counters: true,
+            tiering: tiering.clone(),
+            ..VmOptions::default()
+        };
+        let baseline_address = worker
+            .resolve_native_function(&unit, callee, &baseline, &[])
+            .expect("reference callee baseline")
+            .native_entry_address()
+            .expect("reference callee baseline address");
+
+        let result = Vm::with_options_and_worker_state(
+            VmOptions {
+                native_optimization: NativeOptimizationPolicy::Optimizing,
+                native_cache: php_jit::NativeCacheMode::Off,
+                collect_counters: true,
+                tiering,
+                ..VmOptions::default()
+            },
+            worker,
+        )
+        .execute(unit.clone());
+
+        assert_eq!(result.return_value, Some(Value::Int(4)), "{result:#?}");
+        let counters = result.counters.expect("diagnostic counters");
+        assert_eq!(counters.native_call_dynamic, 0);
+        assert_eq!(
+            unit.prepared_deployment_image().preferred_function_entries[callee.index()]
+                .load(std::sync::atomic::Ordering::Acquire),
+            baseline_address,
+            "the optimizing caller must preserve the reference ABI without a callee optimizer"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
     fn compiled_caller_resumes_rejected_optimizing_callee_and_continues() {
         let (unit, callee) = optimizing_nested_callee_transition_unit();
         let worker = VmWorkerState::new(crate::tiering::TieringOptions::default());
@@ -3184,7 +3452,7 @@ mod tests {
                 .expect("baseline address"),
             std::sync::atomic::Ordering::Release,
         );
-        unit.prepared_deployment_image().optimizing_function_entries[callee.index()].store(
+        unit.prepared_deployment_image().preferred_function_entries[callee.index()].store(
             optimizing_handle
                 .native_entry_address()
                 .expect("optimizing address"),
@@ -3222,7 +3490,7 @@ mod tests {
                 .expect("baseline address"),
             std::sync::atomic::Ordering::Release,
         );
-        unit.prepared_deployment_image().optimizing_function_entries[callee.index()].store(
+        unit.prepared_deployment_image().preferred_function_entries[callee.index()].store(
             optimizing_handle
                 .native_entry_address()
                 .expect("optimizing address"),
@@ -3276,7 +3544,7 @@ mod tests {
                 .expect("baseline address"),
             std::sync::atomic::Ordering::Release,
         );
-        unit.prepared_deployment_image().optimizing_function_entries[callee.index()].store(
+        unit.prepared_deployment_image().preferred_function_entries[callee.index()].store(
             optimizing_handle
                 .native_entry_address()
                 .expect("optimizing address"),
@@ -3466,7 +3734,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn reached_method_is_published_to_the_optimizing_entry_table() {
+    fn reached_method_upgrades_the_preferred_entry_from_baseline() {
         let mut tiering = crate::tiering::TieringOptions::default();
         tiering.collect_stats = true;
         let worker = VmWorkerState::new(tiering.clone());
@@ -3486,19 +3754,23 @@ mod tests {
         assert_eq!(result.return_value, Some(Value::Int(7)), "{result:#?}");
 
         let deadline = Instant::now() + Duration::from_secs(10);
-        while unit.prepared_deployment_image().optimizing_function_entries[method.index()]
-            .load(std::sync::atomic::Ordering::Acquire)
-            == 0
-            && Instant::now() < deadline
-        {
+        let (baseline, preferred) = loop {
+            let baseline = unit.prepared_deployment_image().native_function_entries[method.index()]
+                .load(std::sync::atomic::Ordering::Acquire);
+            let preferred = unit.prepared_deployment_image().preferred_function_entries
+                [method.index()]
+            .load(std::sync::atomic::Ordering::Acquire);
+            if baseline != 0 && preferred != baseline {
+                break (baseline, preferred);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a reached method did not publish baseline and upgraded preferred entries"
+            );
             std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_ne!(
-            unit.prepared_deployment_image().optimizing_function_entries[method.index()]
-                .load(std::sync::atomic::Ordering::Acquire),
-            0,
-            "a reached method must not remain permanently baseline-only"
-        );
+        };
+        assert_ne!(baseline, 0);
+        assert_ne!(preferred, baseline);
     }
 
     #[test]

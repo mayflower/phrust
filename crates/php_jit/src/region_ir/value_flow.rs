@@ -1060,6 +1060,16 @@ fn instruction_mutated_locals(kind: &RegionInstructionKind) -> Vec<LocalId> {
                             .flatten()
                     }),
             );
+            locals.extend(
+                call.args
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, argument)| {
+                        call.argument_requires_reference_binding(index)
+                            .then_some(argument.by_ref_dim.as_ref().map(|target| target.local))
+                            .flatten()
+                    }),
+            );
         }
         RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::MakeClosure {
             captures,

@@ -50,6 +50,8 @@
 {"id":"functions-defaults","path":"fixtures/runtime/valid/functions/defaults.php","tags":["runtime","functions"],"expect":{"exit":0,"stdout":"hi world!|hi php?\n"}}
 {"id":"functions-variadic-sum","path":"fixtures/runtime/valid/functions/variadic-sum.php","tags":["runtime","functions"],"expect":{"exit":0,"stdout":"5\n"}}
 {"id":"functions-return-types","path":"fixtures/runtime/valid/functions/return-types.php","tags":["runtime","functions"],"expect":{"exit":0,"stdout":"ok|4|x\n"}}
+{"id":"functions-return-by-ref-param-binds-caller","path":"fixtures/runtime_semantics/functions/return-by-ref-param-binds-caller.php","tags":["runtime","functions","references","ownership","native"],"expect":{"exit":0,"stdout":"4|4"}}
+{"id":"functions-native-by-ref-array-dimensions-local","path":"fixtures/runtime_semantics/regressions/native-by-ref-array-dimensions-local.php","tags":["runtime","functions","arrays","references","cow","native"],"expect":{"exit":0,"stdout":"2:1:2:2:2:1:2"}}
 {"id":"functions-closure-simple","path":"fixtures/runtime/valid/functions/closure-simple.php","tags":["runtime","functions"],"expect":{"exit":0,"stdout":"3\n"}}
 {"id":"functions-closure-use","path":"fixtures/runtime/valid/functions/closure-use.php","tags":["runtime","functions"],"expect":{"exit":0,"stdout":"5\n"}}
 {"id":"functions-arrow-capture","path":"fixtures/runtime/valid/functions/arrow-capture.php","tags":["runtime","functions"],"expect":{"exit":0,"stdout":"7\n"}}

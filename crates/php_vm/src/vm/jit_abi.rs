@@ -4056,13 +4056,17 @@ impl<'a> NativeRequestColdState<'a> {
     }
 
     fn publish_native_entry_address(&self, function: php_ir::FunctionId, address: usize) {
-        if let Some(cell) = self
-            .compiled
-            .prepared_deployment_image()
-            .native_function_entries
-            .get(function.index())
-        {
+        let deployment = self.compiled.prepared_deployment_image();
+        if let Some(cell) = deployment.native_function_entries.get(function.index()) {
             cell.store(address, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(cell) = deployment.preferred_function_entries.get(function.index()) {
+            let _ = cell.compare_exchange(
+                0,
+                address,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
         }
     }
 
@@ -4081,11 +4085,18 @@ impl<'a> NativeRequestColdState<'a> {
             }) {
                 continue;
             }
-            if let (Some(cell), Some(address)) = (
+            if let (Some(cell), Some(preferred), Some(address)) = (
                 deployment.native_function_entries.get(function.index()),
+                deployment.preferred_function_entries.get(function.index()),
                 handle.native_entry_address(),
             ) {
                 cell.store(address, std::sync::atomic::Ordering::Release);
+                let _ = preferred.compare_exchange(
+                    0,
+                    address,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                );
             }
         }
         // Before the root image is attached there are no runtime declaration
@@ -12159,13 +12170,13 @@ pub(super) fn activate_native_context(
         trusted_function_entry_count: u32::try_from(deployment.native_function_entries.len())
             .unwrap_or(u32::MAX),
         trusted_function_entry_reserved: 0,
-        trusted_optimizing_function_entries: deployment.optimizing_function_entries.as_ptr()
-            as usize as u64,
-        trusted_optimizing_function_entry_count: u32::try_from(
-            deployment.optimizing_function_entries.len(),
+        trusted_preferred_function_entries: deployment.preferred_function_entries.as_ptr() as usize
+            as u64,
+        trusted_preferred_function_entry_count: u32::try_from(
+            deployment.preferred_function_entries.len(),
         )
         .unwrap_or(u32::MAX),
-        trusted_optimizing_function_entry_reserved: 0,
+        trusted_preferred_function_entry_reserved: 0,
         fiber_suspension_states: context.fiber_suspension_states.as_mut_ptr() as usize as u64,
         fiber_suspension_next: std::ptr::from_mut(context.fiber_suspension_next.as_mut()) as usize
             as u64,
