@@ -25976,11 +25976,11 @@ fn lower_optimizing_cached_bind_global(
     );
     let initialize = builder.create_block();
     let initialized = builder.create_block();
-    let is_uninitialized = builder.ins().icmp_imm(
-        IntCC::Equal,
-        payload,
+    let uninitialized = builder.ins().iconst(
+        types::I64,
         crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED),
     );
+    let is_uninitialized = builder.ins().icmp(IntCC::Equal, payload, uninitialized);
     builder
         .ins()
         .brif(is_uninitialized, initialize, &[], initialized, &[]);

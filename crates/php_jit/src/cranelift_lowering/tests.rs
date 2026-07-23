@@ -9721,11 +9721,11 @@ fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch(
     );
 
     let encoded_reference = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
+        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 1,
         crate::JIT_VALUE_RUNTIME_REFERENCE_TAG,
     );
-    let mut direct_slots = vec![crate::JitNativeValueSlot::default(); 1];
-    direct_slots[0] = crate::JitNativeValueSlot {
+    let mut direct_slots = vec![crate::JitNativeValueSlot::default(); 2];
+    direct_slots[1] = crate::JitNativeValueSlot {
         refcount: 1,
         kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR,
         flags: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION,
@@ -9734,7 +9734,7 @@ fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch(
         ..crate::JitNativeValueSlot::default()
     };
     let mut roots_dirty = 0_u32;
-    let mut direct_value_next = 1_u32;
+    let mut direct_value_next = 2_u32;
     let mut function_offsets = vec![0_u32; function.index() + 1];
     let mut trusted_slots = vec![crate::JitNativeTrustedGlobalReferenceSlot {
         encoded: encoded_reference,
@@ -9761,7 +9761,7 @@ fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch(
         crate::jit_encode_constant(u32::MAX)
     );
     assert_eq!(
-        direct_slots[0].payload as i64,
+        direct_slots[1].payload as i64,
         crate::jit_encode_constant(u32::MAX),
         "executing global binding must initialize a missing global to null"
     );

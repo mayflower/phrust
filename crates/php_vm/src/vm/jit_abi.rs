@@ -4183,6 +4183,7 @@ impl<'a> NativeRequestColdState<'a> {
             .copied()
             .filter(|encoded| self.native_reference_identity(*encoded) == Some(reference_identity));
         let encoded = if let Some(encoded) = reusable {
+            self.restore_uninitialized_direct_reference(encoded)?;
             encoded
         } else {
             if let Some(stale) = self.native_global_reference_handles.remove(name) {
@@ -4194,6 +4195,49 @@ impl<'a> NativeRequestColdState<'a> {
             encoded
         };
         Ok(Some(encoded))
+    }
+
+    /// A cold consumer may temporarily materialize a request reference into
+    /// its stable `ReferenceCell` scalar view. Before publishing that same
+    /// identity back to optimizing code, restore an uninitialized payload to
+    /// the authoritative direct slot. Immediate uninitialized carries no
+    /// nested owner, so this is a representation move rather than an
+    /// encode/decode cycle.
+    fn restore_uninitialized_direct_reference(&mut self, encoded: i64) -> Result<(), String> {
+        let Some(index) = Self::direct_value_index(encoded) else {
+            return Err("native request reference is not a direct handle".to_owned());
+        };
+        let slot = self
+            .direct_value_slots
+            .get(index)
+            .copied()
+            .filter(|slot| slot.refcount != 0)
+            .ok_or_else(|| "native request reference points at a dead slot".to_owned())?;
+        if slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR {
+            return Ok(());
+        }
+        if slot.kind != php_jit::JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR
+            || slot.flags != php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION
+        {
+            return Err("native request reference has no stable scalar representation".to_owned());
+        }
+        let reference = self
+            .direct_reference_cells
+            .get(&index)
+            .cloned()
+            .ok_or_else(|| "materialized native request reference has no identity".to_owned())?;
+        if !matches!(reference.get(), Value::Uninitialized) {
+            return Ok(());
+        }
+        self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
+            kind: php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR,
+            flags: php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION,
+            reserved: php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED,
+            payload: php_jit::jit_encode_constant(php_jit::JIT_VALUE_UNINITIALIZED) as u64,
+            aux: 0,
+            ..slot
+        };
+        Ok(())
     }
 
     fn duplicate_native_global_value(&mut self, name: &str) -> Result<Option<i64>, String> {
@@ -4228,6 +4272,7 @@ impl<'a> NativeRequestColdState<'a> {
             .copied()
             .filter(|encoded| self.native_reference_identity(*encoded).is_some())
         {
+            self.restore_uninitialized_direct_reference(encoded)?;
             return Ok(encoded);
         }
         if let Some(encoded) = self.native_global_reference_handle(name)? {
