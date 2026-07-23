@@ -77,11 +77,12 @@ pub(super) use runtime_ops::{
     jit_native_foreach_cleanup_abi, jit_native_foreach_init_abi, jit_native_foreach_next_abi,
     jit_native_local_fetch_abi, jit_native_local_store_abi, jit_native_object_class_name_abi,
     jit_native_object_clone_abi, jit_native_object_clone_with_abi, jit_native_object_new_abi,
-    jit_native_plain_object_clone_abi, jit_native_prepared_object_new_abi,
-    jit_native_property_assign_abi, jit_native_property_fetch_abi, jit_native_reference_bind_abi,
-    jit_native_return_check_abi, jit_native_runtime_fatal_abi, jit_native_stable_length_abi,
-    jit_native_string_predicate_abi, jit_native_truthy_abi, jit_native_type_predicate_abi,
-    jit_native_unary_abi, jit_native_value_release_abi,
+    jit_native_plain_object_clone_abi, jit_native_prepared_closure_new_abi,
+    jit_native_prepared_object_new_abi, jit_native_property_assign_abi,
+    jit_native_property_fetch_abi, jit_native_reference_bind_abi, jit_native_return_check_abi,
+    jit_native_runtime_fatal_abi, jit_native_stable_length_abi, jit_native_string_predicate_abi,
+    jit_native_truthy_abi, jit_native_type_predicate_abi, jit_native_unary_abi,
+    jit_native_value_release_abi,
 };
 use semantic_dispatch::*;
 pub(super) use semantic_dispatch::{
@@ -132,6 +133,8 @@ pub(super) struct NativeRequestFastState {
     stdin: *const std::sync::Arc<[u8]>,
     resources: *mut php_runtime::api::ResourceTable,
     direct_resource_handles: *mut std::collections::HashMap<u64, u32>,
+    direct_closure_handles: *mut std::collections::HashMap<u64, u32>,
+    execution_scope: *const NativeExecutionScope,
 }
 
 impl NativeRequestFastState {
@@ -397,6 +400,64 @@ impl NativeRequestFastState {
             runtime_index,
             php_jit::JIT_VALUE_RUNTIME_RESOURCE_TAG,
         ))
+    }
+
+    /// Publishes one exact closure record whose captures already own native
+    /// encodings. No `Value`, `ReferenceCell`, callsite lookup, or generic
+    /// dynamic-code request participates in this allocation.
+    #[allow(unsafe_code)]
+    fn publish_prepared_closure_owned(
+        &mut self,
+        prepared: NativePreparedClosure,
+    ) -> Result<i64, &'static str> {
+        let rollback = |fast: &mut Self, prepared: &NativePreparedClosure| {
+            if let Some(implicit_this) = prepared.implicit_this {
+                fast.rollback_direct_retain(implicit_this);
+            }
+            for capture in prepared.captures.iter().copied() {
+                fast.rollback_direct_retain(capture);
+            }
+        };
+        if self.direct_closure_handles.is_null() {
+            rollback(self, &prepared);
+            return Err("direct closure identity table is unavailable");
+        }
+        let closure_id = prepared.closure.id;
+        if unsafe { (*self.direct_closure_handles).contains_key(&closure_id) } {
+            rollback(self, &prepared);
+            return Err("new direct closure identity is already published");
+        }
+        let index = match self.reserve_direct_value_index() {
+            Ok(index) => index,
+            Err(error) => {
+                rollback(self, &prepared);
+                return Err(error);
+            }
+        };
+        let runtime_index = index + php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE;
+        let owner = Box::into_raw(Box::new(NativePreparedCallable::Closure(prepared)));
+        let slots = self.header.runtime_view.direct_value_slots as usize
+            as *mut php_jit::JitNativeValueSlot;
+        unsafe {
+            *slots.add(index as usize) = php_jit::JitNativeValueSlot {
+                refcount: 1,
+                kind: php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE,
+                flags: php_jit::JIT_NATIVE_PREPARED_CALLABLE_ABI_VERSION,
+                reserved: 0,
+                payload: closure_id,
+                aux: owner as usize as u64,
+            };
+            (*self.direct_closure_handles).insert(closure_id, index);
+        }
+        Ok(php_jit::jit_encode_typed_runtime_value(
+            runtime_index,
+            php_jit::JIT_VALUE_RUNTIME_CALLABLE_TAG,
+        ))
+    }
+
+    #[allow(unsafe_code)]
+    fn current_execution_scope(&self) -> Option<&NativeExecutionScope> {
+        unsafe { self.execution_scope.as_ref() }
     }
 
     #[allow(unsafe_code)]
@@ -1536,7 +1597,7 @@ pub(super) struct NativeRequestColdState<'a> {
     /// it installs the suspended Fiber execution tree.
     fiber_suspension_states: php_runtime::api::StableNativeArena<php_jit::JitDeoptState>,
     fiber_suspension_next: Box<u32>,
-    native_execution_scopes: Vec<NativeExecutionScope>,
+    native_execution_scopes: Vec<Box<NativeExecutionScope>>,
     current_native_execution_scope: u32,
     native_method_pics: std::collections::BTreeMap<u64, NativeMethodPic>,
     pub(super) output: php_runtime::api::OutputBuffer,
@@ -1686,6 +1747,9 @@ pub(super) struct NativeRequestColdState<'a> {
         std::sync::Arc<Vec<Vec<Option<std::sync::Arc<php_ir::Instruction>>>>>,
     trusted_property_function_offsets: Vec<u32>,
     trusted_property_slots: Vec<php_jit::JitNativeTrustedPropertySlot>,
+    /// Opaque immutable exact closure plans, flattened with the same
+    /// function/continuation offsets as trusted property and lvalue plans.
+    trusted_closure_plans: Vec<u64>,
     /// Exact global constants resolved by their cold continuation once. This
     /// parallel continuation table owns one encoded value per published slot.
     trusted_constant_slots: Vec<php_jit::JitNativeTrustedConstantSlot>,
@@ -1963,7 +2027,7 @@ struct NativePreparedClosure {
     /// PHP closure metadata only. `captures` and `bound_this` are always
     /// empty here; their authoritative owners are the encoded fields below.
     closure: php_runtime::api::ClosurePayload,
-    capture_descriptors: Box<[(String, bool)]>,
+    capture_descriptors: Arc<[(String, bool)]>,
     implicit_this: Option<i64>,
     captures: Box<[i64]>,
 }
@@ -2238,6 +2302,25 @@ fn trusted_property_storage(
         offsets,
         vec![php_jit::JitNativeTrustedPropertySlot::default(); count],
     )
+}
+
+fn trusted_closure_storage(
+    continuations: &[Vec<Option<std::sync::Arc<php_ir::Instruction>>>],
+    sites: &[Vec<Option<Arc<crate::compiled_unit::PreparedNativeClosureSite>>>],
+) -> Vec<u64> {
+    continuations
+        .iter()
+        .enumerate()
+        .flat_map(|(function, continuations)| {
+            (0..continuations.len()).map(move |continuation| {
+                sites
+                    .get(function)
+                    .and_then(|sites| sites.get(continuation))
+                    .and_then(Option::as_ref)
+                    .map_or(0, |site| Arc::as_ptr(site) as usize as u64)
+            })
+        })
+        .collect()
 }
 
 fn trusted_request_local_storage(
@@ -2725,6 +2808,10 @@ impl<'a> NativeRequestColdState<'a> {
         let continuation_instructions = compiled.prepared_continuation_instructions();
         let (trusted_property_function_offsets, trusted_property_slots) =
             trusted_property_storage(&continuation_instructions);
+        let trusted_closure_plans = trusted_closure_storage(
+            &continuation_instructions,
+            &compiled.prepared_native_closure_sites(),
+        );
         let (trusted_request_local_function_offsets, trusted_request_local_slots) =
             trusted_request_local_storage(compiled.unit());
         let trusted_constant_slots =
@@ -2770,11 +2857,11 @@ impl<'a> NativeRequestColdState<'a> {
                 php_jit::JIT_NATIVE_FIBER_SUSPENSION_CAPACITY,
             ),
             fiber_suspension_next: Box::new(0),
-            native_execution_scopes: vec![NativeExecutionScope {
+            native_execution_scopes: vec![Box::new(NativeExecutionScope {
                 unit: None,
                 called_class: None,
                 scope_class: None,
-            }],
+            })],
             current_native_execution_scope: 1,
             native_method_pics: std::collections::BTreeMap::new(),
             output,
@@ -2886,6 +2973,7 @@ impl<'a> NativeRequestColdState<'a> {
             continuation_instructions,
             trusted_property_function_offsets,
             trusted_property_slots,
+            trusted_closure_plans,
             trusted_constant_slots,
             trusted_global_reference_slots,
             trusted_global_reference_names,
@@ -6868,7 +6956,7 @@ impl<'a> NativeRequestColdState<'a> {
         closure.captures.clear();
         self.publish_prepared_closure_owned(NativePreparedClosure {
             closure,
-            capture_descriptors: capture_descriptors.into_boxed_slice(),
+            capture_descriptors: Arc::from(capture_descriptors),
             implicit_this,
             captures: capture_values.into_boxed_slice(),
         })
@@ -9217,6 +9305,10 @@ impl<'a> NativeRequestColdState<'a> {
         let active_continuations = compiled.prepared_continuation_instructions();
         let (active_property_offsets, active_property_slots) =
             trusted_property_storage(&active_continuations);
+        let active_closure_plans = trusted_closure_storage(
+            &active_continuations,
+            &compiled.prepared_native_closure_sites(),
+        );
         let (active_request_local_offsets, active_request_local_slots) =
             trusted_request_local_storage(compiled.unit());
         let active_constant_slots =
@@ -9244,6 +9336,8 @@ impl<'a> NativeRequestColdState<'a> {
         );
         let previous_property_slots =
             std::mem::replace(&mut self.trusted_property_slots, active_property_slots);
+        let previous_closure_plans =
+            std::mem::replace(&mut self.trusted_closure_plans, active_closure_plans);
         let previous_request_local_offsets = std::mem::replace(
             &mut self.trusted_request_local_function_offsets,
             active_request_local_offsets,
@@ -9311,6 +9405,7 @@ impl<'a> NativeRequestColdState<'a> {
         self.continuation_instructions = previous_continuations;
         self.trusted_property_function_offsets = previous_property_offsets;
         self.trusted_property_slots = previous_property_slots;
+        self.trusted_closure_plans = previous_closure_plans;
         self.trusted_request_local_function_offsets = previous_request_local_offsets;
         self.trusted_request_local_slots = previous_request_local_slots;
         self.trusted_constant_slots = previous_constant_slots;
@@ -10045,12 +10140,12 @@ impl<'a> NativeRequestColdState<'a> {
         if let Some(index) = self
             .native_execution_scopes
             .iter()
-            .position(|candidate| candidate == &scope)
+            .position(|candidate| candidate.as_ref() == &scope)
         {
             return u32::try_from(index + 1)
                 .map_err(|_| "native execution scope identity overflow".to_owned());
         }
-        self.native_execution_scopes.push(scope);
+        self.native_execution_scopes.push(Box::new(scope));
         u32::try_from(self.native_execution_scopes.len())
             .map_err(|_| "native execution scope identity overflow".to_owned())
     }
@@ -10098,7 +10193,7 @@ impl<'a> NativeRequestColdState<'a> {
                 same_activation
                     || (recorded.unit != inferred_unit && fallback.unit == inferred_unit)
             })
-            .map_or_else(|| recorded.clone(), NativeExecutionTarget::scope);
+            .map_or_else(|| recorded.as_ref().clone(), NativeExecutionTarget::scope);
         let inferred_unit = if same_activation {
             fallback.and_then(|fallback| fallback.unit)
         } else {
@@ -11729,6 +11824,7 @@ pub(super) struct NativeRequestActivationGuard {
     _runtime_view: php_jit::JitNativeRuntimeViewGuard,
     fast_state: *mut NativeRequestFastState,
     previous_header: php_jit::JitNativeFastStateHeader,
+    previous_execution_scope: *const NativeExecutionScope,
 }
 
 impl Drop for NativeRequestActivationGuard {
@@ -11741,6 +11837,7 @@ impl Drop for NativeRequestActivationGuard {
         #[allow(unsafe_code)]
         unsafe {
             (*self.fast_state).header = self.previous_header;
+            (*self.fast_state).execution_scope = self.previous_execution_scope;
         }
     }
 }
@@ -11842,6 +11939,10 @@ pub(super) fn activate_native_context(
         trusted_property_slot_count: u32::try_from(context.trusted_property_slots.len())
             .unwrap_or(u32::MAX),
         trusted_property_slot_reserved: 0,
+        trusted_closure_plans: context.trusted_closure_plans.as_ptr() as usize as u64,
+        trusted_closure_plan_count: u32::try_from(context.trusted_closure_plans.len())
+            .unwrap_or(u32::MAX),
+        trusted_closure_plan_reserved: 0,
         trusted_global_reference_slots: context.trusted_global_reference_slots.as_ptr() as usize
             as u64,
         trusted_global_reference_slot_count: u32::try_from(
@@ -11874,13 +11975,20 @@ pub(super) fn activate_native_context(
         error_reporting: std::ptr::from_mut(&mut context.error_reporting) as usize as u64,
     };
     let cold_context = std::ptr::from_mut(&mut *context).cast();
+    let execution_scope = usize::try_from(context.current_native_execution_scope)
+        .ok()
+        .and_then(|identity| identity.checked_sub(1))
+        .and_then(|index| context.native_execution_scopes.get(index))
+        .map_or(std::ptr::null(), |scope| std::ptr::from_ref(scope.as_ref()));
     // SAFETY: `NativeRequestOwner` allocates the fast state separately and
     // wires this stable pointer before exposing the cold state.
     let fast_state = context.fast_state;
     let previous_header;
+    let previous_execution_scope;
     #[allow(unsafe_code)]
     unsafe {
         previous_header = (*fast_state).header;
+        previous_execution_scope = (*fast_state).execution_scope;
         (*fast_state).header = php_jit::JitNativeFastStateHeader {
             abi_version: php_jit::JIT_RUNTIME_ABI_VERSION,
             flags: 0,
@@ -11900,12 +12008,16 @@ pub(super) fn activate_native_context(
         (*context.fast_state).resources = std::ptr::from_mut(&mut context.resources);
         (*context.fast_state).direct_resource_handles =
             std::ptr::from_mut(&mut context.direct_resource_handles);
+        (*context.fast_state).direct_closure_handles =
+            std::ptr::from_mut(&mut context.direct_closure_handles);
+        (*context.fast_state).execution_scope = execution_scope;
     }
     let runtime_view = php_jit::activate_native_runtime_view(view);
     NativeRequestActivationGuard {
         _runtime_view: runtime_view,
         fast_state,
         previous_header,
+        previous_execution_scope,
     }
 }
 

@@ -85,14 +85,15 @@ pub(super) fn lower_native_dynamic_code(
         RegionNativeDynamicCode::MakeClosure {
             dst,
             function,
-            capture_count,
+            captures,
+            ..
         } => (
             crate::JitNativeDynamicCodeKind::MAKE_CLOSURE,
             Some(*dst),
             Some(*function),
             None,
             0,
-            *capture_count,
+            u32::try_from(captures.len()).unwrap_or(u32::MAX),
         ),
     };
     let request_size = u32::try_from(std::mem::size_of::<crate::JitNativeDynamicCodeRequest>())

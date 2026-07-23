@@ -1056,6 +1056,17 @@ fn instruction_mutated_locals(kind: &RegionInstructionKind) -> Vec<LocalId> {
                     }),
             );
         }
+        RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::MakeClosure {
+            captures,
+            ..
+        }) => {
+            locals.extend(
+                captures
+                    .iter()
+                    .filter(|capture| capture.by_ref)
+                    .map(|capture| capture.local),
+            );
+        }
         _ => {}
     }
     locals
@@ -1116,6 +1127,16 @@ fn classify_locals(region: &RegionGraph) -> BTreeMap<LocalId, LocalStorageClass>
                         call.args
                             .iter()
                             .filter_map(|argument| argument.by_ref_local),
+                    );
+                }
+                RegionInstructionKind::NativeDynamicCode(
+                    RegionNativeDynamicCode::MakeClosure { captures, .. },
+                ) => {
+                    references.extend(
+                        captures
+                            .iter()
+                            .filter(|capture| capture.by_ref)
+                            .map(|capture| capture.local),
                     );
                 }
                 RegionInstructionKind::NativeSuspend(_) => {

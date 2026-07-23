@@ -238,6 +238,7 @@ struct NativeOptimizingOperations {
     float_to_int: Option<NativeHelper>,
     object_class_name: Option<NativeHelper>,
     prepared_object_new: Option<NativeHelper>,
+    prepared_closure_new: Option<NativeHelper>,
     plain_object_clone: Option<NativeHelper>,
     exact_symbol_query: [Option<NativeHelper>; StableSymbolQueryBuiltin::COUNT],
     exact_pcre: [Option<NativeHelper>; StablePcreBuiltin::COUNT],
@@ -269,6 +270,9 @@ impl NativeOptimizingOperations {
             .map(|helper| helper.with_runtime(runtime));
         self.prepared_object_new = self
             .prepared_object_new
+            .map(|helper| helper.with_runtime(runtime));
+        self.prepared_closure_new = self
+            .prepared_closure_new
             .map(|helper| helper.with_runtime(runtime));
         self.plain_object_clone = self
             .plain_object_clone
@@ -6650,6 +6654,48 @@ fn lower_optimizing_prepared_class_pointer(
         plan,
         std::mem::offset_of!(crate::JitNativePreparedClassPlan, prepared) as i32,
     )
+}
+
+/// Loads the immutable exact closure plan published for this
+/// `(FunctionId, continuation)` pair. Compilation and runtime-view
+/// publication share the same dense continuation layout, so generated code
+/// performs no per-allocation identity or capture-count validation.
+fn lower_optimizing_prepared_closure_pointer(
+    builder: &mut FunctionBuilder<'_>,
+    function: FunctionId,
+    continuation: u32,
+    deopt_out: ir::Value,
+) -> ir::Value {
+    let pointer_type = builder.func.dfg.value_type(deopt_out);
+    let view = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
+    let offsets = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        deopt_out,
+        view + std::mem::offset_of!(
+            crate::JitNativeRuntimeView,
+            trusted_property_function_offsets
+        ) as i32,
+    );
+    let function_offset = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        offsets,
+        i32::try_from(function.index().saturating_mul(4)).unwrap_or(i32::MAX),
+    );
+    let plan_index = builder
+        .ins()
+        .iadd_imm(function_offset, i64::from(continuation));
+    let plan_index = builder.ins().uextend(pointer_type, plan_index);
+    let plans = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        deopt_out,
+        view + std::mem::offset_of!(crate::JitNativeRuntimeView, trusted_closure_plans) as i32,
+    );
+    let plan_offset = builder.ins().ishl_imm(plan_index, 3);
+    let plan = builder.ins().iadd(plans, plan_offset);
+    builder.ins().load(types::I64, MemFlagsData::new(), plan, 0)
 }
 
 fn lower_optimizing_exact_runtime_builtin(
@@ -19508,6 +19554,94 @@ fn lower_optimizing_region_instruction(
                 transition,
             )?;
             define_region_register(builder, register_variables, registers, *dst, value)?;
+        }
+        RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::MakeClosure {
+            dst,
+            captures,
+            binds_this,
+            ..
+        }) => {
+            emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
+            // Admission precedes ownership transfer. A later rejected capture
+            // can therefore enter the one baseline continuation without
+            // leaking owners retained for an earlier capture.
+            let mut capture_values = Vec::with_capacity(captures.len());
+            for capture in captures {
+                let current = use_local_variable(builder, locals, capture.local)?;
+                let value = if capture.by_ref {
+                    let reference =
+                        lower_optimizing_bind_direct_local_reference(builder, current, transition)?;
+                    let reference =
+                        lower_optimizing_require_direct_value(builder, reference, transition)?;
+                    define_local_variable(builder, locals, capture.local, reference)?;
+                    reference
+                } else {
+                    let value =
+                        lower_optimizing_reference_scalar(builder, current, false, transition)?;
+                    lower_optimizing_require_direct_value(builder, value, transition)?
+                };
+                capture_values.push(value);
+            }
+            let implicit_this = if *binds_this {
+                let this = use_local_variable(builder, locals, LocalId::new(0))?;
+                let this = lower_optimizing_reference_scalar(builder, this, false, transition)?;
+                lower_optimizing_require_direct_value(builder, this, transition)?
+            } else {
+                builder
+                    .ins()
+                    .iconst(types::I64, crate::jit_encode_constant(u32::MAX))
+            };
+            for capture in capture_values.iter().copied() {
+                lower_optimizing_retain(builder, capture, deopt_out);
+            }
+            if *binds_this {
+                lower_optimizing_retain(builder, implicit_this, deopt_out);
+            }
+            let pointer_type = builder.func.dfg.value_type(deopt_out);
+            let captures_ptr = if capture_values.is_empty() {
+                builder.ins().iconst(pointer_type, 0)
+            } else {
+                let bytes = u32::try_from(
+                    capture_values
+                        .len()
+                        .saturating_mul(std::mem::size_of::<i64>()),
+                )
+                .map_err(|_| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_CLOSURE_CAPTURES",
+                        "native closure capture storage exceeds stack-slot limits",
+                    )
+                })?;
+                let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    bytes,
+                    3,
+                ));
+                for (index, value) in capture_values.iter().copied().enumerate() {
+                    builder.ins().stack_store(
+                        value,
+                        slot,
+                        i32::try_from(index.saturating_mul(std::mem::size_of::<i64>()))
+                            .unwrap_or(i32::MAX),
+                    );
+                }
+                builder.ins().stack_addr(pointer_type, slot, 0)
+            };
+            let prepared = lower_optimizing_prepared_closure_pointer(
+                builder,
+                function,
+                instruction.continuation_id,
+                deopt_out,
+            );
+            let closure = lower_optimizing_typed_control_value_call(
+                module,
+                builder,
+                optimizing_operations.prepared_closure_new,
+                &[prepared, captures_ptr, implicit_this],
+                transition,
+                "exact prepared closure allocator was not declared",
+            )?;
+            define_region_register(builder, register_variables, registers, *dst, closure)?;
         }
         RegionInstructionKind::NativeSuspend(suspend) => {
             lower_native_suspension(

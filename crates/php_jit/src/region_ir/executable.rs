@@ -283,8 +283,19 @@ pub enum RegionNativeDynamicCode {
     MakeClosure {
         dst: RegId,
         function: FunctionId,
-        capture_count: u32,
+        captures: Vec<RegionNativeClosureCapture>,
+        binds_this: bool,
     },
+}
+
+/// One closure capture whose source location and binding mode are immutable
+/// in Region IR. Optimizing lowering consumes the local directly; the exact
+/// allocator receives only the resulting authoritative native encodings.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegionNativeClosureCapture {
+    pub name: String,
+    pub local: LocalId,
+    pub by_ref: bool,
 }
 
 impl RegionNativeCall {
@@ -2582,7 +2593,26 @@ impl BaselineRegionBuilder {
                             RegionNativeDynamicCode::MakeClosure {
                                 dst: *dst,
                                 function: *function,
-                                capture_count: u32::try_from(captures.len()).unwrap_or(u32::MAX),
+                                captures: captures
+                                    .iter()
+                                    .map(|capture| {
+                                        let Operand::Local(local) = capture.src else {
+                                            unreachable!(
+                                                "verified closure captures always name locals"
+                                            );
+                                        };
+                                        RegionNativeClosureCapture {
+                                            name: capture.name.clone(),
+                                            local,
+                                            by_ref: capture.by_ref,
+                                        }
+                                    })
+                                    .collect(),
+                                binds_this: unit
+                                    .functions
+                                    .get(function.index())
+                                    .is_some_and(|function| !function.flags.is_static)
+                                    && ir_function.flags.is_method,
                             },
                         )
                     }
@@ -2594,7 +2624,26 @@ impl BaselineRegionBuilder {
                         RegionNativeDynamicCode::MakeClosure {
                             dst: *dst,
                             function: *function,
-                            capture_count: u32::try_from(captures.len()).unwrap_or(u32::MAX),
+                            captures: captures
+                                .iter()
+                                .map(|capture| {
+                                    let Operand::Local(local) = capture.src else {
+                                        unreachable!(
+                                            "verified closure captures always name locals"
+                                        );
+                                    };
+                                    RegionNativeClosureCapture {
+                                        name: capture.name.clone(),
+                                        local,
+                                        by_ref: capture.by_ref,
+                                    }
+                                })
+                                .collect(),
+                            binds_this: unit
+                                .functions
+                                .get(function.index())
+                                .is_some_and(|function| !function.flags.is_static)
+                                && ir_function.flags.is_method,
                         },
                     ),
                     InstructionKind::Yield { dst, key, value } => {

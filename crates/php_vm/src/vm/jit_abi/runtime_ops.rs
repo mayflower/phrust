@@ -1026,6 +1026,70 @@ pub(in crate::vm) extern "C" fn jit_native_prepared_object_new_abi(
     }
 }
 
+/// Allocates one closure from immutable callsite metadata and authoritative
+/// native captures. Generated code has already applied by-value/by-reference
+/// binding and transferred one owner per capture; this exact handler never
+/// constructs a Rust `Value` or enters the generic dynamic-code executor.
+#[allow(unsafe_code)]
+pub(in crate::vm) extern "C" fn jit_native_prepared_closure_new_abi(
+    runtime: *mut NativeRequestFastState,
+    prepared: u64,
+    captures: *const i64,
+    implicit_this: i64,
+) -> php_jit::JitNativeControlResult {
+    // SAFETY: generated code loads this opaque pointer from the active
+    // compiled unit's trusted closure-plan table.
+    let prepared =
+        unsafe { &*(prepared as usize as *const crate::compiled_unit::PreparedNativeClosureSite) };
+    let fast = unsafe { &mut *runtime };
+    let capture_values = if prepared.capture_descriptors.is_empty() {
+        &[]
+    } else {
+        // SAFETY: lowering allocates one packed stack word per immutable
+        // descriptor and keeps the stack slot live for this synchronous call.
+        unsafe { std::slice::from_raw_parts(captures, prepared.capture_descriptors.len()) }
+    };
+    let Some(scope) = fast.current_execution_scope().cloned() else {
+        for capture in capture_values.iter().copied() {
+            fast.rollback_direct_retain(capture);
+        }
+        if prepared.binds_this {
+            fast.rollback_direct_retain(implicit_this);
+        }
+        return php_jit::JitNativeControlResult::control(
+            php_jit::JitCallStatus::ABI_MISMATCH,
+            0,
+            0,
+        );
+    };
+    let scope_class = scope.scope_class;
+    let context = php_runtime::api::ClosureContext {
+        owner_unit: scope.unit,
+        called_class: scope.called_class.or_else(|| scope_class.clone()),
+        scope_class: scope_class.clone(),
+        declaring_class: scope_class,
+    };
+    let closure = php_runtime::api::ClosurePayload::new(prepared.function.raw(), Vec::new())
+        .with_debug(prepared.debug.clone())
+        .with_context(context);
+    let prepared_closure = NativePreparedClosure {
+        closure,
+        capture_descriptors: Arc::clone(&prepared.capture_descriptors),
+        implicit_this: prepared.binds_this.then_some(implicit_this),
+        captures: capture_values.to_vec().into_boxed_slice(),
+    };
+    match fast.publish_prepared_closure_owned(prepared_closure) {
+        Ok(value) => php_jit::JitNativeControlResult::returning(value),
+        Err(error) => with_native_context_for(runtime, "prepared_closure_new", |context| {
+            record_native_helper_failure(context, error.to_owned());
+            php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::RUNTIME_ERROR, 0, 0)
+        })
+        .unwrap_or_else(|| {
+            php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::RUNTIME_ERROR, 0, 0)
+        }),
+    }
+}
+
 /// Shallow-clones one direct object whose exact class was proven not to have
 /// `__clone`; no runtime method lookup or `Value` decode occurs here.
 pub(in crate::vm) extern "C" fn jit_native_plain_object_clone_abi(

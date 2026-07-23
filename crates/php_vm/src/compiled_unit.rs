@@ -281,6 +281,7 @@ struct PreparedNativeIndexes {
     continuation_instructions: Arc<Vec<Vec<Option<Arc<php_ir::Instruction>>>>>,
     callsites: Arc<Vec<Vec<Option<Arc<NativeCallSiteDescriptor>>>>>,
     property_sites: Arc<Vec<Vec<Option<PreparedNativePropertySite>>>>,
+    closure_sites: Arc<Vec<Vec<Option<Arc<PreparedNativeClosureSite>>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -288,6 +289,17 @@ pub(crate) struct PreparedNativePropertySite {
     pub class_index: u32,
     pub property: Arc<str>,
     pub required_state: u32,
+}
+
+/// Immutable exact allocation metadata for one `MakeClosure` continuation.
+/// Capture values remain native and are supplied by generated code; this
+/// record owns only source/debug descriptors and the target identity.
+#[derive(Debug)]
+pub(crate) struct PreparedNativeClosureSite {
+    pub function: FunctionId,
+    pub capture_descriptors: Arc<[(String, bool)]>,
+    pub debug: Option<php_runtime::api::ClosureDebugInfo>,
+    pub binds_this: bool,
 }
 
 /// Typed operation selected by one native callsite descriptor.
@@ -893,12 +905,14 @@ impl CompiledUnit {
             let mut instructions = Vec::with_capacity(self.inner.unit.functions.len());
             let mut callsites = Vec::with_capacity(self.inner.unit.functions.len());
             let mut property_sites = Vec::with_capacity(self.inner.unit.functions.len());
+            let mut closure_sites = Vec::with_capacity(self.inner.unit.functions.len());
             let metadata = php_jit::region_ir::CompileMetadata::default();
             for function_index in 0..self.inner.unit.functions.len() {
                 let function = FunctionId::new(function_index as u32);
                 let mut function_instructions = Vec::new();
                 let mut function_callsites = Vec::new();
                 let mut function_property_sites = Vec::new();
+                let mut function_closure_sites = Vec::new();
                 if let Ok(region) = php_jit::region_ir::BaselineRegionBuilder::build(
                     &self.inner.unit,
                     function,
@@ -981,6 +995,61 @@ impl CompiledUnit {
                                 }
                                 function_property_sites[continuation] = Some(property_site);
                             }
+                            if let php_jit::region_ir::RegionInstructionKind::NativeDynamicCode(
+                                php_jit::region_ir::RegionNativeDynamicCode::MakeClosure {
+                                    function: closure_function,
+                                    captures,
+                                    binds_this,
+                                    ..
+                                },
+                            ) = &instruction.kind
+                            {
+                                let debug = self
+                                    .inner
+                                    .unit
+                                    .functions
+                                    .get(closure_function.index())
+                                    .and_then(|function| {
+                                        let file =
+                                            self.inner.unit.files.get(function.span.file.index())?;
+                                        let line = self
+                                            .source_display_line(function.span, false)
+                                            .unwrap_or(1);
+                                        Some(php_runtime::api::ClosureDebugInfo {
+                                            name: format!("{{closure:{}:{line}}}", file.path),
+                                            file: file.path.clone(),
+                                            line,
+                                            parameters: function
+                                                .params
+                                                .iter()
+                                                .map(|parameter| {
+                                                    php_runtime::api::ClosureDebugParameter {
+                                                        name: parameter.name.clone(),
+                                                        required: parameter.required,
+                                                    }
+                                                })
+                                                .collect(),
+                                        })
+                                    });
+                                if function_closure_sites.len() <= continuation {
+                                    function_closure_sites
+                                        .resize_with(continuation + 1, || None);
+                                }
+                                function_closure_sites[continuation] =
+                                    Some(Arc::new(PreparedNativeClosureSite {
+                                        function: *closure_function,
+                                        capture_descriptors: Arc::from(
+                                            captures
+                                                .iter()
+                                                .map(|capture| {
+                                                    (capture.name.clone(), capture.by_ref)
+                                                })
+                                                .collect::<Vec<_>>(),
+                                        ),
+                                        debug,
+                                        binds_this: *binds_this,
+                                    }));
+                            }
                             if let php_jit::region_ir::RegionInstructionKind::NativeCall(call) =
                                 &instruction.kind
                             {
@@ -1037,11 +1106,13 @@ impl CompiledUnit {
                 instructions.push(function_instructions);
                 callsites.push(function_callsites);
                 property_sites.push(function_property_sites);
+                closure_sites.push(function_closure_sites);
             }
             PreparedNativeIndexes {
                 continuation_instructions: Arc::new(instructions),
                 callsites: Arc::new(callsites),
                 property_sites: Arc::new(property_sites),
+                closure_sites: Arc::new(closure_sites),
             }
         })
     }
@@ -1062,6 +1133,12 @@ impl CompiledUnit {
         &self,
     ) -> Arc<Vec<Vec<Option<PreparedNativePropertySite>>>> {
         Arc::clone(&self.prepared_native_indexes().property_sites)
+    }
+
+    pub(crate) fn prepared_native_closure_sites(
+        &self,
+    ) -> Arc<Vec<Vec<Option<Arc<PreparedNativeClosureSite>>>>> {
+        Arc::clone(&self.prepared_native_indexes().closure_sites)
     }
 
     fn prepared_external_function_call_index(&self) -> &PreparedExternalFunctionCalls {

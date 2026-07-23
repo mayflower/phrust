@@ -46,9 +46,9 @@ pub use executable::{
     BaselineRegionBuilder, CompileMetadata, NativeCompileError, NativeCompilerTier, RegionBinaryOp,
     RegionBlock, RegionCallResult, RegionCallTarget, RegionCastOp, RegionCompareOpCode,
     RegionDeclarationMetadata, RegionExceptionRegion, RegionGraph, RegionInstruction,
-    RegionInstructionKind, RegionMethodIdentity, RegionNativeCall, RegionNativeControl,
-    RegionNativeDynamicCode, RegionNativeSuspend, RegionOperand, RegionOsrEntryPoint,
-    RegionTerminator, RegionUnaryOp, build_baseline_region,
+    RegionInstructionKind, RegionMethodIdentity, RegionNativeCall, RegionNativeClosureCapture,
+    RegionNativeControl, RegionNativeDynamicCode, RegionNativeSuspend, RegionOperand,
+    RegionOsrEntryPoint, RegionTerminator, RegionUnaryOp, build_baseline_region,
 };
 pub use ids::{ConstId, EntryId, ExitId, NodeId, RegionId, SnapshotId, VmSlotId};
 pub use node::{

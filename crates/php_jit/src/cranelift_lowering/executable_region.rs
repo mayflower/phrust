@@ -582,6 +582,9 @@ fn optimizing_instruction_family_is_direct(kind: &RegionInstructionKind) -> bool
         | RegionInstructionKind::ForeachNext { .. }
         | RegionInstructionKind::ForeachCleanup { .. }
         | RegionInstructionKind::FetchProperty { .. }
+        | RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::MakeClosure {
+            ..
+        })
         | RegionInstructionKind::NativeCall(_) => true,
         _ => false,
     }
@@ -1535,6 +1538,16 @@ pub(super) fn compile_region_graph_native(
             matches!(kind, RegionInstructionKind::CloneObject { plain: true, .. })
         })
     });
+    let needs_prepared_closure_new = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(
+                kind,
+                RegionInstructionKind::NativeDynamicCode(
+                    RegionNativeDynamicCode::MakeClosure { .. }
+                )
+            )
+        })
+    });
     let needs_object_clone_with = regions.values().any(|region| {
         region_contains(region, |kind| {
             matches!(kind, RegionInstructionKind::CloneWith { .. })
@@ -1698,6 +1711,7 @@ pub(super) fn compile_region_graph_native(
     let needs_exception_new = baseline_helper_imports && needs_exception_new;
     let needs_array_new = baseline_helper_imports && needs_array_new;
     let needs_prepared_object_new = !baseline_helper_imports && needs_object_new;
+    let needs_prepared_closure_new = !baseline_helper_imports && needs_prepared_closure_new;
     let needs_object_new = baseline_helper_imports && needs_object_new;
     let needs_property_fetch = baseline_helper_imports && needs_property_fetch;
     let needs_property_assign = baseline_helper_imports && needs_property_assign;
@@ -2176,6 +2190,16 @@ pub(super) fn compile_region_graph_native(
             },
         ));
     }
+    if needs_prepared_closure_new {
+        imports.push((
+            "phrust_native_prepared_closure_new".to_owned(),
+            if runtime_helpers.native_prepared_closure_new == 0 {
+                test_native_prepared_closure_new_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_prepared_closure_new
+            },
+        ));
+    }
     if needs_plain_object_clone {
         imports.push((
             "phrust_native_plain_object_clone".to_owned(),
@@ -2486,6 +2510,22 @@ pub(super) fn compile_region_graph_native(
                     "phrust_native_prepared_object_new",
                     &signature,
                     helper_address("phrust_native_prepared_object_new"),
+                )?)
+            } else {
+                None
+            };
+            let prepared_closure_new = if needs_prepared_closure_new {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                Some(declare_native_helper(
+                    module,
+                    "phrust_native_prepared_closure_new",
+                    &signature,
+                    helper_address("phrust_native_prepared_closure_new"),
                 )?)
             } else {
                 None
@@ -2980,6 +3020,7 @@ pub(super) fn compile_region_graph_native(
                         float_to_int,
                         object_class_name,
                         prepared_object_new,
+                        prepared_closure_new,
                         plain_object_clone,
                         exact_symbol_query,
                         exact_pcre,
@@ -3655,6 +3696,7 @@ pub(super) fn compile_region_graph_native(
                                     | "phrust_native_float_to_int"
                                     | "phrust_native_object_class_name"
                                     | "phrust_native_prepared_object_new"
+                                    | "phrust_native_prepared_closure_new"
                                     | "phrust_native_plain_object_clone"
                                     | "phrust_native_function_exists"
                                     | "phrust_native_class_exists"

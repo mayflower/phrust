@@ -253,6 +253,9 @@ pub struct JitRuntimeHelperAddresses {
     pub native_object_class_name: usize,
     /// Exact allocation from a request-published immutable class plan.
     pub native_prepared_object_new: usize,
+    /// Exact closure allocation from immutable callsite metadata and native
+    /// capture owners.
+    pub native_prepared_closure_new: usize,
     /// Exact shallow clone for an SSA-exact class without `__clone`.
     pub native_plain_object_clone: usize,
     /// Resolves one local load, including superglobal seeding and warnings.

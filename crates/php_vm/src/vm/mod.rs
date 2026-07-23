@@ -35,14 +35,15 @@ use jit_abi::{
     jit_native_preg_filter_abi, jit_native_preg_grep_abi, jit_native_preg_last_error_abi,
     jit_native_preg_last_error_msg_abi, jit_native_preg_match_abi, jit_native_preg_match_all_abi,
     jit_native_preg_quote_abi, jit_native_preg_replace_abi, jit_native_preg_split_abi,
-    jit_native_prepared_object_new_abi, jit_native_printf_abi, jit_native_property_assign_abi,
-    jit_native_property_exists_abi, jit_native_property_fetch_abi, jit_native_realpath_abi,
-    jit_native_reference_bind_abi, jit_native_return_check_abi, jit_native_runtime_fatal_abi,
-    jit_native_semantic_dispatch_abi, jit_native_semantic_dispatch_diagnostic_abi,
-    jit_native_sprintf_abi, jit_native_stable_length_abi, jit_native_string_predicate_abi,
-    jit_native_trait_exists_abi, jit_native_truthy_abi, jit_native_type_predicate_abi,
-    jit_native_unary_abi, jit_native_value_release_abi, jit_native_vprintf_abi,
-    jit_native_vsprintf_abi, resume_native_optimizing_exit,
+    jit_native_prepared_closure_new_abi, jit_native_prepared_object_new_abi, jit_native_printf_abi,
+    jit_native_property_assign_abi, jit_native_property_exists_abi, jit_native_property_fetch_abi,
+    jit_native_realpath_abi, jit_native_reference_bind_abi, jit_native_return_check_abi,
+    jit_native_runtime_fatal_abi, jit_native_semantic_dispatch_abi,
+    jit_native_semantic_dispatch_diagnostic_abi, jit_native_sprintf_abi,
+    jit_native_stable_length_abi, jit_native_string_predicate_abi, jit_native_trait_exists_abi,
+    jit_native_truthy_abi, jit_native_type_predicate_abi, jit_native_unary_abi,
+    jit_native_value_release_abi, jit_native_vprintf_abi, jit_native_vsprintf_abi,
+    resume_native_optimizing_exit,
 };
 use php_runtime::api::{OutputBuffer, Value};
 use std::collections::{HashMap, HashSet};
@@ -1770,6 +1771,7 @@ fn runtime_helper_addresses(diagnostic: bool) -> php_jit::JitRuntimeHelperAddres
         native_float_to_int: jit_native_float_to_int_abi as *const () as usize,
         native_object_class_name: jit_native_object_class_name_abi as *const () as usize,
         native_prepared_object_new: jit_native_prepared_object_new_abi as *const () as usize,
+        native_prepared_closure_new: jit_native_prepared_closure_new_abi as *const () as usize,
         native_plain_object_clone: jit_native_plain_object_clone_abi as *const () as usize,
         native_local_fetch: helper_address!(
             jit_native_local_fetch_abi,
