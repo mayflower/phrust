@@ -2304,16 +2304,6 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                 } else {
                     visible_arguments
                 };
-                if native_function_is_generator(context, function) {
-                    let arguments = invocation_arguments
-                        .iter()
-                        .map(|value| context.decode(*value))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    return Ok(context.encode(Value::Generator(php_runtime::api::GeneratorRef::new(
-                        function.raw(),
-                        arguments,
-                    )))?);
-                }
                 let metadata = match instruction.kind {
                     php_ir::InstructionKind::CallCallable { .. }
                     | php_ir::InstructionKind::CallClosure { .. } => {
@@ -2322,6 +2312,16 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     php_ir::InstructionKind::Pipe { .. } => None,
                     _ => None,
                 };
+                if native_function_is_generator(context, function) {
+                    return Ok(create_native_generator_with_metadata_strict(
+                        context,
+                        function,
+                        invocation_arguments,
+                        metadata,
+                        context.unit.strict_types_for_span(descriptor.span),
+                        NativeCallableBuiltinPolicy::ExecuteBaseline,
+                    )?);
+                }
                 return Ok(invoke_native_function_with_metadata_strict(
                     context,
                     function,
@@ -2687,13 +2687,14 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                         &encoded
                     };
                     if native_function_is_generator(context, function) {
-                        let arguments = call_arguments
-                            .iter()
-                            .map(|value| context.decode(*value))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        return Ok(context.encode(Value::Generator(
-                            php_runtime::api::GeneratorRef::new(function.raw(), arguments),
-                        ))?);
+                        return Ok(create_native_generator_with_metadata_strict(
+                            context,
+                            function,
+                            call_arguments,
+                            Some(args),
+                            context.unit.strict_types_for_span(instruction.span),
+                            NativeCallableBuiltinPolicy::ExecuteBaseline,
+                        )?);
                     }
                     if context.install_native_method_pic(
                         descriptor,
@@ -3364,14 +3365,29 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                                 })
                     })
                 {
-                    let visible_arguments = encoded
-                        .iter()
-                        .map(|value| context.decode(*value))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    return Ok(context.encode(Value::Generator(php_runtime::api::GeneratorRef::new(
-                        function_id.raw(),
-                        visible_arguments,
-                    )))?);
+                    let metadata = Some(descriptor.arguments.as_ref());
+                    if let Some(parameters) = context
+                        .unit
+                        .functions
+                        .get(function_id.index())
+                        .map(|function| function.params.as_slice())
+                    {
+                        mark_native_function_argument_references(arguments, metadata, parameters);
+                    }
+                    bind_native_property_reference_arguments(
+                        context,
+                        arguments,
+                        encoded.to_mut(),
+                        metadata,
+                    )?;
+                    return Ok(create_native_generator_with_metadata_strict(
+                        context,
+                        function_id,
+                        &encoded,
+                        metadata,
+                        context.unit.strict_types_for_span(descriptor.span),
+                        NativeCallableBuiltinPolicy::ExecuteBaseline,
+                    )?);
                 }
                 let metadata = Some(descriptor.arguments.as_ref());
                 if let Some(parameters) = context

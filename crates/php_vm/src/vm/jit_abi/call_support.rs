@@ -52,6 +52,7 @@ pub(super) fn authoritative_native_call_value_is_admitted(
             | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT
             | php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE
             | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER => return true,
+            php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_GENERATOR => return true,
             php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR
                 if slot.flags == php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION
                     && slot.reserved != php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_EMPTY =>
@@ -448,6 +449,41 @@ pub(super) fn invoke_native_function_with_metadata_strict_at_tier(
     baseline_continuation: bool,
     builtin_policy: NativeCallableBuiltinPolicy,
 ) -> NativeCallResult {
+    bind_native_function_with_metadata_strict_at_tier(
+        context,
+        function,
+        arguments,
+        metadata,
+        strict,
+        builtin_policy,
+        |context, function, bound, visible_arguments, target_metadata| {
+            invoke_native_with_owned_bound_arguments(
+                context,
+                function,
+                &bound,
+                Some(visible_arguments),
+                Some(target_metadata),
+                baseline_continuation,
+            )
+        },
+    )
+}
+
+fn bind_native_function_with_metadata_strict_at_tier<R>(
+    context: &mut NativeRequestColdState<'_>,
+    function: php_ir::FunctionId,
+    arguments: &[i64],
+    metadata: Option<&[php_ir::instruction::IrCallArg]>,
+    strict: bool,
+    builtin_policy: NativeCallableBuiltinPolicy,
+    finish: impl FnOnce(
+        &mut NativeRequestColdState<'_>,
+        php_ir::FunctionId,
+        smallvec::SmallVec<[i64; 8]>,
+        request_state::NativeTraceArguments,
+        NativeFunctionMetadataPtr,
+    ) -> Result<R, NativeCallControl>,
+) -> Result<R, NativeCallControl> {
     let target_metadata = NativeFunctionMetadataPtr::from_compiled(&context.compiled, function)
         .ok_or_else(|| {
             format!(
@@ -675,14 +711,7 @@ pub(super) fn invoke_native_function_with_metadata_strict_at_tier(
             return Err(error.into());
         }
     };
-    let result = invoke_native_with_owned_bound_arguments(
-        context,
-        function,
-        &bound,
-        Some(visible_arguments),
-        Some(target_metadata),
-        baseline_continuation,
-    );
+    let result = finish(context, function, bound, visible_arguments, target_metadata);
     let mut release_error = None;
     for value in compatibility_owners {
         if let Err(error) = context.release(value) {
@@ -696,6 +725,38 @@ pub(super) fn invoke_native_function_with_metadata_strict_at_tier(
     }
 }
 
+pub(super) fn create_native_generator_with_metadata_strict(
+    context: &mut NativeRequestColdState<'_>,
+    function: php_ir::FunctionId,
+    arguments: &[i64],
+    metadata: Option<&[php_ir::instruction::IrCallArg]>,
+    strict: bool,
+    builtin_policy: NativeCallableBuiltinPolicy,
+) -> NativeCallResult {
+    let target = NativeGeneratorTarget {
+        unit: context.current_dynamic_unit,
+        function,
+        called_class: context.called_classes.last().cloned(),
+        scope_class: context
+            .lexical_scope_classes
+            .last()
+            .map(|scope| Arc::from(scope.as_str())),
+    };
+    bind_native_function_with_metadata_strict_at_tier(
+        context,
+        function,
+        arguments,
+        metadata,
+        strict,
+        builtin_policy,
+        move |context, _, bound, _, _| {
+            context
+                .publish_native_generator_owned(target, bound.into_vec())
+                .map_err(NativeCallControl::from)
+        },
+    )
+}
+
 fn invoke_native_with_owned_bound_arguments(
     context: &mut NativeRequestColdState<'_>,
     function: php_ir::FunctionId,
@@ -704,6 +765,22 @@ fn invoke_native_with_owned_bound_arguments(
     metadata: Option<NativeFunctionMetadataPtr>,
     baseline_continuation: bool,
 ) -> NativeCallResult {
+    if native_function_is_generator(context, function) {
+        return context
+            .publish_native_generator_owned(
+                NativeGeneratorTarget {
+                    unit: context.current_dynamic_unit,
+                    function,
+                    called_class: context.called_classes.last().cloned(),
+                    scope_class: context
+                        .lexical_scope_classes
+                        .last()
+                        .map(|scope| Arc::from(scope.as_str())),
+                },
+                bound.to_vec(),
+            )
+            .map_err(NativeCallControl::from);
+    }
     // Bound handles are transferred into the callee frame. Native epilogues
     // release parameter locals on every return/unwind edge; releasing them a
     // second time here recycled live array/object slots during callbacks.
@@ -824,11 +901,11 @@ fn method_callable_requires_baseline(
     class: &str,
     method: &str,
 ) -> bool {
-    if let Some(function) = native_method_in_hierarchy(context, class, method) {
-        return native_function_is_generator(context, function);
+    if native_method_in_hierarchy(context, class, method).is_some() {
+        return false;
     }
-    if let Some((function, _)) = native_external_method(context, class, method) {
-        return external_function_is_generator(context, function);
+    if native_external_method(context, class, method).is_some() {
+        return false;
     }
     true
 }
@@ -837,11 +914,11 @@ fn named_callable_requires_baseline(context: &NativeRequestColdState<'_>, name: 
     if let Some((class, method)) = name.split_once("::") {
         return method_callable_requires_baseline(context, class, method);
     }
-    if let Some(function) = context.function_id(name) {
-        return native_function_is_generator(context, function);
+    if context.function_id(name).is_some() {
+        return false;
     }
-    if let Some(function) = context.external_function(name) {
-        return external_function_is_generator(context, function);
+    if context.external_function(name).is_some() {
+        return false;
     }
     // Fixed builtins execute in the baseline continuation when reached as a
     // callback. The exact callback ABI never enters the generic dispatcher.
@@ -903,20 +980,9 @@ pub(super) fn exact_native_callable_requires_baseline(
         }
         Some(NativeEncodedValueKind::Callable) => {
             match context.prepared_callable_dispatch(direct_callee) {
-                Some(NativePreparedCallableDispatch::Closure) => context
-                    .prepared_closure_payload(direct_callee)
-                    .is_none_or(|closure| {
-                        let function = php_ir::FunctionId::new(closure.function);
-                        closure.context.owner_unit.map_or_else(
-                            || native_function_is_generator(context, function),
-                            |unit| {
-                                external_function_is_generator(
-                                    context,
-                                    NativeDynamicFunction { unit, function },
-                                )
-                            },
-                        )
-                    }),
+                Some(NativePreparedCallableDispatch::Closure) => {
+                    context.prepared_closure_payload(direct_callee).is_none()
+                }
                 Some(NativePreparedCallableDispatch::Named(name)) => {
                     named_callable_requires_baseline(context, &name)
                 }
@@ -946,18 +1012,13 @@ pub(super) fn invoke_native_named_callable(
 ) -> NativeCallResult {
     if let Some(function) = context.function_id(name) {
         if native_function_is_generator(context, function) {
-            if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
-                return Err(NativeCallControl::BaselineRequired);
-            }
-            let arguments = arguments
-                .iter()
-                .map(|value| context.decode(*value))
-                .collect::<Result<Vec<_>, _>>()?;
-            return Ok(
-                context.encode(Value::Generator(php_runtime::api::GeneratorRef::new(
-                    function.raw(),
-                    arguments,
-                )))?,
+            return create_native_generator_with_metadata_strict(
+                context,
+                function,
+                arguments,
+                metadata,
+                context.unit.strict_types_for_span(instruction.span),
+                builtin_policy,
             );
         }
         return invoke_native_function_with_metadata_strict_at_tier(
@@ -971,6 +1032,17 @@ pub(super) fn invoke_native_named_callable(
         );
     }
     if let Some(function) = context.external_function(name) {
+        if external_function_is_generator(context, function) {
+            return create_native_external_generator_with_metadata_policy(
+                context,
+                function,
+                arguments,
+                metadata,
+                None,
+                context.unit.strict_types_for_span(instruction.span),
+                builtin_policy,
+            );
+        }
         return invoke_native_external_function_with_metadata_policy(
             context,
             function,
@@ -1286,24 +1358,23 @@ fn invoke_native_bound_method(
             ));
         }
         let function = entry.function;
-        if native_function_is_generator(context, function) {
-            if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
-                return Err(NativeCallControl::BaselineRequired);
-            }
-            let arguments = call_arguments
-                .iter()
-                .map(|value| context.decode(*value))
-                .collect::<Result<Vec<_>, _>>()?;
-            return Ok(
-                context.encode(Value::Generator(php_runtime::api::GeneratorRef::new(
-                    function.raw(),
-                    arguments,
-                )))?,
-            );
-        }
         let pushed_called_class = entry.flags.is_static;
         if pushed_called_class {
             context.called_classes.push(Arc::from(class_name.as_str()));
+        }
+        if native_function_is_generator(context, function) {
+            let result = create_native_generator_with_metadata_strict(
+                context,
+                function,
+                &call_arguments,
+                metadata,
+                strict,
+                builtin_policy,
+            );
+            if pushed_called_class {
+                context.called_classes.pop();
+            }
+            return result;
         }
         let result = invoke_native_function_with_metadata_strict_at_tier(
             context,
@@ -1320,6 +1391,17 @@ fn invoke_native_bound_method(
         return result;
     }
     if let Some((function, _)) = native_external_method(context, &class_name, method) {
+        if external_function_is_generator(context, function) {
+            return create_native_external_generator_with_metadata_policy(
+                context,
+                function,
+                &call_arguments,
+                metadata,
+                Some(class_name),
+                strict,
+                builtin_policy,
+            );
+        }
         return invoke_native_external_function_with_metadata_policy(
             context,
             function,
@@ -1412,19 +1494,37 @@ fn invoke_native_closure_payload(
             },
         );
         if generator {
-            if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
-                return Err(NativeCallControl::BaselineRequired);
+            if let Some(unit) = closure.context.owner_unit {
+                return create_native_external_generator_with_metadata_policy(
+                    context,
+                    NativeDynamicFunction { unit, function },
+                    &closure_arguments,
+                    metadata,
+                    closure
+                        .context
+                        .called_class
+                        .as_ref()
+                        .map(|class| class.to_string()),
+                    context.unit.strict_types_for_span(instruction.span),
+                    builtin_policy,
+                );
             }
-            let arguments = closure_arguments
-                .iter()
-                .map(|value| context.decode(*value))
-                .collect::<Result<Vec<_>, _>>()?;
-            return Ok(
-                context.encode(Value::Generator(php_runtime::api::GeneratorRef::new(
-                    function.raw(),
-                    arguments,
-                )))?,
+            let pushed_called_class = closure.context.called_class.is_some();
+            if let Some(called_class) = &closure.context.called_class {
+                context.called_classes.push(Arc::clone(called_class));
+            }
+            let result = create_native_generator_with_metadata_strict(
+                context,
+                function,
+                &closure_arguments,
+                metadata,
+                context.unit.strict_types_for_span(instruction.span),
+                builtin_policy,
             );
+            if pushed_called_class {
+                context.called_classes.pop();
+            }
+            return result;
         }
         if let Some(unit) = closure.context.owner_unit {
             return invoke_native_external_function_with_metadata_policy(
@@ -1879,16 +1979,162 @@ pub(super) fn execute_native_generator_method(
         return None;
     };
     let receiver = encoded.first()?;
+    if let Some(index) = context.direct_generator_index(*receiver) {
+        let result = (|| -> Result<i64, String> {
+            let discard_entry = |context: &mut NativeRequestColdState<'_>,
+                                 entry: Option<(i64, i64)>|
+             -> Result<(), String> {
+                if let Some((key, value)) = entry {
+                    context.release(key)?;
+                    context.release(value)?;
+                }
+                Ok(())
+            };
+            let lifecycle = |context: &NativeRequestColdState<'_>| {
+                context
+                    .direct_generator(index)
+                    .map(|generator| generator.lifecycle)
+                    .ok_or_else(|| format!("direct Generator {index} is missing"))
+            };
+            let ensure_started = |context: &mut NativeRequestColdState<'_>| {
+                if lifecycle(context)? == php_runtime::api::GeneratorState::Created {
+                    let entry = context.resume_direct_generator(
+                        *receiver,
+                        php_jit::JitNativeResumeInputKind::START,
+                        php_jit::jit_encode_constant(u32::MAX),
+                    )?;
+                    discard_entry(context, entry)?;
+                }
+                Ok::<(), String>(())
+            };
+            match method.to_ascii_lowercase().as_str() {
+                "rewind" => {
+                    ensure_started(context)?;
+                    if !context.generator_can_rewind(*receiver) {
+                        return Err(
+                            "E_PHP_THROW:Exception:Cannot rewind a generator that was already run"
+                                .to_owned(),
+                        );
+                    }
+                    Ok(php_jit::jit_encode_constant(u32::MAX))
+                }
+                "valid" => {
+                    ensure_started(context)?;
+                    Ok(php_jit::jit_encode_constant(
+                        if lifecycle(context)? == php_runtime::api::GeneratorState::Suspended {
+                            php_jit::JIT_VALUE_TRUE
+                        } else {
+                            php_jit::JIT_VALUE_FALSE
+                        },
+                    ))
+                }
+                "current" | "key" => {
+                    ensure_started(context)?;
+                    let value = context.direct_generator(index).and_then(|generator| {
+                        if method.eq_ignore_ascii_case("current") {
+                            generator.current_value
+                        } else {
+                            generator.current_key
+                        }
+                    });
+                    value.map_or_else(
+                        || Ok(php_jit::jit_encode_constant(u32::MAX)),
+                        |value| context.duplicate_direct_generator_value(value),
+                    )
+                }
+                "next" => {
+                    ensure_started(context)?;
+                    if lifecycle(context)? == php_runtime::api::GeneratorState::Suspended {
+                        let entry = context.resume_direct_generator(
+                            *receiver,
+                            php_jit::JitNativeResumeInputKind::VALUE,
+                            php_jit::jit_encode_constant(u32::MAX),
+                        )?;
+                        discard_entry(context, entry)?;
+                    }
+                    Ok(php_jit::jit_encode_constant(u32::MAX))
+                }
+                "send" => {
+                    ensure_started(context)?;
+                    if lifecycle(context)? != php_runtime::api::GeneratorState::Suspended {
+                        return Ok(php_jit::jit_encode_constant(u32::MAX));
+                    }
+                    let input = encoded
+                        .get(1)
+                        .copied()
+                        .unwrap_or_else(|| php_jit::jit_encode_constant(u32::MAX));
+                    let input = context
+                        .duplicate_authoritative_dereferenced_native_value(input)?
+                        .ok_or_else(|| {
+                            "Generator::send() received a cold compatibility value".to_owned()
+                        })?;
+                    let next = context.resume_direct_generator(
+                        *receiver,
+                        php_jit::JitNativeResumeInputKind::VALUE,
+                        input,
+                    )?;
+                    match next {
+                        Some((key, value)) => {
+                            context.release(key)?;
+                            Ok(value)
+                        }
+                        None => Ok(php_jit::jit_encode_constant(u32::MAX)),
+                    }
+                }
+                "throw" => {
+                    ensure_started(context)?;
+                    let input = encoded
+                        .get(1)
+                        .copied()
+                        .ok_or_else(|| "Generator::throw() expects an exception".to_owned())?;
+                    let input = context
+                        .duplicate_authoritative_native_value(input)?
+                        .ok_or_else(|| {
+                            "Generator::throw() received a cold compatibility value".to_owned()
+                        })?;
+                    let next = context.resume_direct_generator(
+                        *receiver,
+                        php_jit::JitNativeResumeInputKind::THROW,
+                        input,
+                    )?;
+                    match next {
+                        Some((key, value)) => {
+                            context.release(key)?;
+                            Ok(value)
+                        }
+                        None => Ok(php_jit::jit_encode_constant(u32::MAX)),
+                    }
+                }
+                "getreturn" => {
+                    if lifecycle(context)? != php_runtime::api::GeneratorState::Closed {
+                        return Err(
+                            "Cannot get return value of a generator that hasn't returned"
+                                .to_owned(),
+                        );
+                    }
+                    let value = context
+                        .direct_generator(index)
+                        .and_then(|generator| generator.return_value);
+                    value.map_or_else(
+                        || Ok(php_jit::jit_encode_constant(u32::MAX)),
+                        |value| context.duplicate_direct_generator_value(value),
+                    )
+                }
+                _ => Err(format!("Call to undefined method Generator::{method}()")),
+            }
+        })();
+        return Some(result);
+    }
     let generator = match context.decode(*receiver) {
         Ok(Value::Generator(generator)) => generator,
         Ok(_) => return None,
         Err(error) => return Some(Err(error)),
     };
     let result = (|| -> Result<i64, String> {
-        let iterator = context.generator_iterator(generator.clone())?;
+        let iterator = context.baseline_generator_iterator(generator.clone())?;
         let ensure_started = |context: &mut NativeRequestColdState<'_>| {
             if generator.state() == php_runtime::api::GeneratorState::Created {
-                context.iterator_next(iterator).map(|_| ())
+                context.baseline_iterator_next(iterator).map(|_| ())
             } else {
                 Ok(())
             }
@@ -1921,7 +2167,7 @@ pub(super) fn execute_native_generator_method(
             "next" => {
                 ensure_started(context)?;
                 if generator.state() == php_runtime::api::GeneratorState::Suspended {
-                    let _ = context.iterator_next(iterator)?;
+                    let _ = context.baseline_iterator_next(iterator)?;
                 }
                 context.encode(Value::Null)
             }
@@ -1931,7 +2177,7 @@ pub(super) fn execute_native_generator_method(
                     .get(1)
                     .copied()
                     .unwrap_or_else(|| php_jit::jit_encode_constant(u32::MAX));
-                let next = context.generator_resume(
+                let next = context.resume_baseline_iterator(
                     iterator,
                     php_jit::JitNativeResumeInputKind::VALUE,
                     value,
@@ -1944,7 +2190,7 @@ pub(super) fn execute_native_generator_method(
                     .get(1)
                     .copied()
                     .ok_or_else(|| "Generator::throw() expects an exception".to_owned())?;
-                let next = context.generator_resume(
+                let next = context.resume_baseline_iterator(
                     iterator,
                     php_jit::JitNativeResumeInputKind::THROW,
                     value,

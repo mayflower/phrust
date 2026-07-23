@@ -4734,6 +4734,17 @@ pub(in crate::vm) extern "C" fn jit_native_foreach_init_abi(
                 .cloned();
             context.encode_iterator(entries, Some(source), live_global, None, None)
         } else {
+            if context.direct_generator_index(source).is_some() {
+                let iterator = context.retain(source).map(|()| source);
+                return match iterator {
+                    Ok(iterator) if write_native_value(out, iterator) => 0,
+                    Ok(_) => php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
+                    Err(error) => {
+                        record_native_helper_failure(context, error);
+                        php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
+                    }
+                };
+            }
             let mut decoded = match context.decode(source) {
                 Ok(value) => value,
                 Err(error) => {
@@ -4752,7 +4763,9 @@ pub(in crate::vm) extern "C" fn jit_native_foreach_init_abi(
             }
             match decoded {
                 Value::Array(source) => context.encode_array_iterator(source),
-                Value::Generator(generator) => context.encode_generator_iterator(generator),
+                Value::Generator(generator) => {
+                    context.encode_baseline_generator_iterator(generator)
+                }
                 Value::Object(object) if native_spl_iterator_entries(&object).is_some() => {
                     let entries = native_spl_iterator_entries(&object).unwrap_or_default();
                     context.encode_iterator(entries, None, None, None, None)
@@ -4978,8 +4991,12 @@ pub(in crate::vm) extern "C" fn jit_native_foreach_next_abi(
     has_out: *mut i64,
 ) -> i32 {
     with_native_context_for(runtime, "foreach_next", |context| {
-        let Ok(entry) = context.iterator_next_encoded(iterator) else {
-            return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+        let entry = match context.iterator_next_encoded(iterator) {
+            Ok(entry) => entry,
+            Err(error) => {
+                record_native_helper_failure(context, error);
+                return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
+            }
         };
         let (key, value, has_value) = match entry {
             Some((key, value)) => (key, value, 1),

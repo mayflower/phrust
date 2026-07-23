@@ -1461,6 +1461,10 @@ pub(super) struct NativeRequestColdState<'a> {
     /// direct slot and never enter these maps.
     direct_fiber_handles: std::collections::HashMap<u64, u32>,
     direct_fiber_cells: std::collections::HashMap<usize, php_runtime::api::FiberRef>,
+    /// Cold identities for native Generator activations. The sidecar never
+    /// owns execution state; re-encoding it resolves back to the direct slot.
+    direct_generator_handles: std::collections::HashMap<u64, u32>,
+    direct_generator_cells: std::collections::HashMap<usize, php_runtime::api::GeneratorRef>,
     /// Request-wide content identity for immutable direct strings. Array keys
     /// and values reuse one authoritative native slot instead of rebuilding
     /// the same byte value for every materialized array graph.
@@ -1523,7 +1527,7 @@ pub(super) struct NativeRequestColdState<'a> {
         (Option<usize>, u32),
         std::collections::HashMap<String, std::collections::HashMap<String, i64>>,
     >,
-    generator_iterators: std::collections::BTreeMap<u64, i64>,
+    baseline_generator_iterators: std::collections::BTreeMap<u64, i64>,
     fiber_executions: std::collections::BTreeMap<u64, NativeFiberExecution>,
     active_fiber: Option<u64>,
     pending_fiber_suspension_value: Option<i64>,
@@ -1687,7 +1691,7 @@ enum NativeStoredValue {
     GlobalsProxy,
     ArrayIterator(Box<NativeArrayIteratorState>),
     Iterator(Box<NativeIteratorState>),
-    GeneratorIterator(Box<NativeGeneratorIteratorState>),
+    BaselineGeneratorIterator(Box<BaselineGeneratorIteratorState>),
 }
 
 /// Value family observed directly from an encoded native value.  This is a
@@ -1866,6 +1870,30 @@ struct NativeDirectFiber {
     return_value: Option<i64>,
 }
 
+#[derive(Clone)]
+struct NativeGeneratorTarget {
+    unit: Option<usize>,
+    function: php_ir::FunctionId,
+    called_class: Option<Arc<str>>,
+    scope_class: Option<Arc<str>>,
+}
+
+struct NativeDirectGenerator {
+    target: NativeGeneratorTarget,
+    /// These owners transfer into the generated activation on first entry.
+    /// Thereafter the suspension snapshot or generated epilogue owns them.
+    arguments: Vec<i64>,
+    handle: Option<php_jit::JitFunctionHandle>,
+    state: Option<php_jit::JitDeoptState>,
+    lifecycle: php_runtime::api::GeneratorState,
+    current_key: Option<i64>,
+    current_value: Option<i64>,
+    return_value: Option<i64>,
+    next_auto_key: i64,
+    delegation: Option<NativeGeneratorDelegation>,
+    yields_seen: u64,
+}
+
 enum NativeFiberReceiver {
     Direct(i64),
     Materialized(php_runtime::api::FiberRef),
@@ -1892,12 +1920,12 @@ struct NativeIteratorState {
     user_iterator_started: bool,
 }
 
-struct NativeGeneratorIteratorState {
+struct BaselineGeneratorIteratorState {
     generator: php_runtime::api::GeneratorRef,
     handle: Box<php_jit::JitFunctionHandle>,
     arguments: Vec<i64>,
     state: Box<Option<php_jit::JitDeoptState>>,
-    delegation: Option<NativeGeneratorDelegation>,
+    delegation: Option<BaselineGeneratorDelegation>,
     yields_seen: u64,
     finished: bool,
 }
@@ -2109,7 +2137,9 @@ fn stored_value_tag(value: &NativeStoredValue) -> u64 {
         NativeStoredValue::GlobalsProxy => php_jit::JIT_VALUE_RUNTIME_ARRAY_TAG,
         NativeStoredValue::ArrayIterator(_)
         | NativeStoredValue::Iterator(_)
-        | NativeStoredValue::GeneratorIterator(_) => php_jit::JIT_VALUE_RUNTIME_ITERATOR_TAG,
+        | NativeStoredValue::BaselineGeneratorIterator(_) => {
+            php_jit::JIT_VALUE_RUNTIME_ITERATOR_TAG
+        }
         NativeStoredValue::Php(
             Value::Null | Value::Bool(_) | Value::Int(_) | Value::Uninitialized,
         ) => php_jit::JIT_VALUE_RUNTIME_TAG,
@@ -2134,7 +2164,7 @@ fn stored_value_kind(value: &NativeStoredValue) -> &'static str {
         NativeStoredValue::GlobalsProxy => "globals_proxy",
         NativeStoredValue::ArrayIterator(_) => "array_iterator",
         NativeStoredValue::Iterator(_) => "iterator",
-        NativeStoredValue::GeneratorIterator(_) => "generator_iterator",
+        NativeStoredValue::BaselineGeneratorIterator(_) => "baseline_generator_iterator",
     }
 }
 
@@ -2148,7 +2178,7 @@ struct PreparedNativeRuntimeClass {
 }
 
 #[derive(Clone)]
-enum NativeGeneratorDelegation {
+enum BaselineGeneratorDelegation {
     Array {
         entries: Vec<(Value, Value)>,
         index: usize,
@@ -2157,6 +2187,11 @@ enum NativeGeneratorDelegation {
         generator: php_runtime::api::GeneratorRef,
         iterator: i64,
     },
+}
+
+enum NativeGeneratorDelegation {
+    Array { source: i64, cursor: usize },
+    Generator { generator: i64 },
 }
 
 struct NativeFiberExecution {
@@ -2214,9 +2249,17 @@ impl<'a> NativeRequestColdState<'a> {
             self.abandon_native_fiber_execution(*nested)?;
         }
 
+        self.release_native_suspension_owners(&handle, &state)
+    }
+
+    fn release_native_suspension_owners(
+        &mut self,
+        handle: &php_jit::JitFunctionHandle,
+        state: &php_jit::JitDeoptState,
+    ) -> Result<(), String> {
         let metadata = handle
             .region_state_metadata()
-            .ok_or_else(|| "suspended native Fiber has no state metadata".to_owned())?;
+            .ok_or_else(|| "suspended native activation has no state metadata".to_owned())?;
         let (owned_locals, owned_registers) = metadata
             .suspensions
             .iter()
@@ -2237,7 +2280,7 @@ impl<'a> NativeRequestColdState<'a> {
             })
             .ok_or_else(|| {
                 format!(
-                    "suspended native Fiber state {}:{} has no ownership metadata",
+                    "suspended native activation state {}:{} has no ownership metadata",
                     state.function_id, state.continuation_id
                 )
             })?;
@@ -2540,6 +2583,8 @@ impl<'a> NativeRequestColdState<'a> {
             direct_closure_handles: std::collections::HashMap::new(),
             direct_fiber_handles: std::collections::HashMap::new(),
             direct_fiber_cells: std::collections::HashMap::new(),
+            direct_generator_handles: std::collections::HashMap::new(),
+            direct_generator_cells: std::collections::HashMap::new(),
             direct_string_handles: std::collections::HashMap::new(),
             direct_string_keys: std::collections::HashMap::new(),
             direct_array_handles: std::collections::HashMap::new(),
@@ -2584,7 +2629,7 @@ impl<'a> NativeRequestColdState<'a> {
             static_locals: inherited_symbols.static_locals,
             enum_cases: inherited_symbols.enum_cases,
             class_constant_cache: std::collections::HashMap::new(),
-            generator_iterators: std::collections::BTreeMap::new(),
+            baseline_generator_iterators: std::collections::BTreeMap::new(),
             fiber_executions: std::collections::BTreeMap::new(),
             active_fiber: None,
             pending_fiber_suspension_value: None,
@@ -4421,6 +4466,48 @@ impl<'a> NativeRequestColdState<'a> {
         self.direct_fiber(index).map(|_| index)
     }
 
+    #[allow(unsafe_code)]
+    fn direct_generator(&self, index: usize) -> Option<&NativeDirectGenerator> {
+        let slot = self.direct_value_slots.get(index)?;
+        if slot.refcount == 0
+            || !matches!(
+                slot.kind,
+                php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_GENERATOR
+                    | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_GENERATOR
+            )
+            || slot.flags != php_jit::JIT_NATIVE_DIRECT_GENERATOR_ABI_VERSION
+        {
+            return None;
+        }
+        let owner = slot.aux as usize as *const NativeDirectGenerator;
+        // SAFETY: publication installs one boxed activation before exposing
+        // the slot, and final release reclaims both on the request thread.
+        unsafe { owner.as_ref() }
+    }
+
+    #[allow(unsafe_code)]
+    fn direct_generator_mut(&mut self, index: usize) -> Option<&mut NativeDirectGenerator> {
+        let slot = self.direct_value_slots.get(index)?;
+        if slot.refcount == 0
+            || !matches!(
+                slot.kind,
+                php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_GENERATOR
+                    | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_GENERATOR
+            )
+            || slot.flags != php_jit::JIT_NATIVE_DIRECT_GENERATOR_ABI_VERSION
+        {
+            return None;
+        }
+        let owner = slot.aux as usize as *mut NativeDirectGenerator;
+        // SAFETY: `&mut self` excludes a competing activation borrow.
+        unsafe { owner.as_mut() }
+    }
+
+    fn direct_generator_index(&self, encoded: i64) -> Option<usize> {
+        let index = Self::direct_value_index(encoded)?;
+        self.direct_generator(index).map(|_| index)
+    }
+
     fn native_fiber_state(&self, encoded: i64) -> Option<php_runtime::api::FiberState> {
         let index = self.direct_fiber_index(encoded)?;
         self.direct_fiber(index).map(|fiber| fiber.state)
@@ -5802,6 +5889,55 @@ impl<'a> NativeRequestColdState<'a> {
             self.direct_fiber_cells.insert(index, fiber.clone());
             return Ok(Value::Fiber(fiber));
         }
+        if matches!(
+            slot.kind,
+            php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_GENERATOR
+                | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_GENERATOR
+        ) {
+            if let Some(generator) = self.direct_generator_cells.get(&index) {
+                return Ok(Value::Generator(generator.clone()));
+            }
+            let (function, lifecycle, arguments, current_key, current_value, return_value) = {
+                let generator = self.direct_generator(index).ok_or_else(|| {
+                    format!("direct native Generator {index} has no stable activation")
+                })?;
+                (
+                    generator.target.function,
+                    generator.lifecycle,
+                    generator.arguments.clone(),
+                    generator.current_key,
+                    generator.current_value,
+                    generator.return_value,
+                )
+            };
+            let arguments = arguments
+                .into_iter()
+                .map(|argument| self.decode(argument))
+                .collect::<Result<Vec<_>, _>>()?;
+            let generator = php_runtime::api::GeneratorRef::new(function.raw(), arguments);
+            match lifecycle {
+                php_runtime::api::GeneratorState::Created => {}
+                php_runtime::api::GeneratorState::Suspended => {
+                    let key = current_key.map(|key| self.decode(key)).transpose()?;
+                    let value = current_value
+                        .map(|value| self.decode(value))
+                        .transpose()?
+                        .unwrap_or(Value::Null);
+                    generator.suspend_forwarded(key, value);
+                }
+                php_runtime::api::GeneratorState::Closed => {
+                    generator.close(return_value.map(|value| self.decode(value)).transpose()?);
+                }
+                state => generator.set_state(state),
+            }
+            self.direct_value_slots[index].kind =
+                php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_GENERATOR;
+            self.direct_value_slots[index].payload = generator.id();
+            self.direct_generator_handles
+                .insert(generator.id(), index as u32);
+            self.direct_generator_cells.insert(index, generator.clone());
+            return Ok(Value::Generator(generator));
+        }
         if slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE {
             let prepared = self
                 .direct_prepared_callable(index)
@@ -6068,7 +6204,7 @@ impl<'a> NativeRequestColdState<'a> {
                 Some(
                     NativeStoredValue::ArrayIterator(_)
                     | NativeStoredValue::Iterator(_)
-                    | NativeStoredValue::GeneratorIterator(_),
+                    | NativeStoredValue::BaselineGeneratorIterator(_),
                 ) => Err(format!(
                     "native runtime value {index} is a foreach iterator"
                 )),
@@ -6255,6 +6391,86 @@ impl<'a> NativeRequestColdState<'a> {
         self.publish_native_fiber(callable, fiber.state(), return_value, Some(fiber))
     }
 
+    fn publish_native_generator_owned(
+        &mut self,
+        target: NativeGeneratorTarget,
+        arguments: Vec<i64>,
+    ) -> Result<i64, String> {
+        let index = match self.reserve_direct_value_slot() {
+            Ok(index) => index,
+            Err(error) => {
+                for argument in arguments {
+                    let _ = self.release(argument);
+                }
+                return Err(error);
+            }
+        };
+        let runtime_index = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE))
+            .expect("direct Generator index is bounded by the native value arena");
+        let function = target.function;
+        let owner = Box::into_raw(Box::new(NativeDirectGenerator {
+            target,
+            arguments,
+            handle: None,
+            state: None,
+            lifecycle: php_runtime::api::GeneratorState::Created,
+            current_key: None,
+            current_value: None,
+            return_value: None,
+            next_auto_key: 0,
+            delegation: None,
+            yields_seen: 0,
+        }));
+        self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
+            refcount: 1,
+            kind: php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_GENERATOR,
+            flags: php_jit::JIT_NATIVE_DIRECT_GENERATOR_ABI_VERSION,
+            payload: u64::from(function.raw()),
+            aux: owner as usize as u64,
+            ..php_jit::JitNativeValueSlot::default()
+        };
+        Ok(php_jit::jit_encode_typed_runtime_value(
+            runtime_index,
+            php_jit::JIT_VALUE_RUNTIME_GENERATOR_TAG,
+        ))
+    }
+
+    fn encode_native_generator_owner(
+        &mut self,
+        generator: php_runtime::api::GeneratorRef,
+    ) -> Result<i64, String> {
+        if let Some(index) = self.direct_generator_handles.get(&generator.id()).copied() {
+            let slot = self
+                .direct_value_slots
+                .get_mut(index as usize)
+                .filter(|slot| {
+                    slot.refcount != 0
+                        && matches!(
+                            slot.kind,
+                            php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_GENERATOR
+                                | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_GENERATOR
+                        )
+                })
+                .ok_or_else(|| {
+                    "native Generator identity points at a dead activation".to_owned()
+                })?;
+            slot.refcount = slot
+                .refcount
+                .checked_add(1)
+                .ok_or_else(|| "native Generator refcount overflow".to_owned())?;
+            let runtime_index = index
+                .checked_add(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE)
+                .ok_or_else(|| "native Generator handle overflow".to_owned())?;
+            return Ok(php_jit::jit_encode_typed_runtime_value(
+                runtime_index,
+                php_jit::JIT_VALUE_RUNTIME_GENERATOR_TAG,
+            ));
+        }
+        self.encode_stored_value(NativeStoredValue::Php(Value::Generator(generator)))
+    }
+
     fn encode_prepared_closure(
         &mut self,
         callable: Box<php_runtime::api::CallableValue>,
@@ -6381,6 +6597,7 @@ impl<'a> NativeRequestColdState<'a> {
             Value::Reference(reference) => return self.encode_native_reference_owner(reference),
             Value::Callable(callable) => return self.encode_prepared_callable(callable),
             Value::Fiber(fiber) => return self.encode_native_fiber_owner(fiber),
+            Value::Generator(generator) => return self.encode_native_generator_owner(generator),
             value => value,
         };
         match &value {
@@ -6506,7 +6723,7 @@ impl<'a> NativeRequestColdState<'a> {
                 Some(
                     NativeStoredValue::ArrayIterator(_)
                     | NativeStoredValue::Iterator(_)
-                    | NativeStoredValue::GeneratorIterator(_),
+                    | NativeStoredValue::BaselineGeneratorIterator(_),
                 ) => {
                     return Err(format!(
                         "native runtime value {index} is a foreach iterator"
@@ -6558,7 +6775,7 @@ impl<'a> NativeRequestColdState<'a> {
                 Some(
                     NativeStoredValue::ArrayIterator(_)
                     | NativeStoredValue::Iterator(_)
-                    | NativeStoredValue::GeneratorIterator(_),
+                    | NativeStoredValue::BaselineGeneratorIterator(_),
                 ) => Ok(None),
                 None => Err(format!("native runtime value {index} is missing")),
             };
@@ -6744,7 +6961,7 @@ impl<'a> NativeRequestColdState<'a> {
             Some(
                 NativeStoredValue::ArrayIterator(_)
                 | NativeStoredValue::Iterator(_)
-                | NativeStoredValue::GeneratorIterator(_),
+                | NativeStoredValue::BaselineGeneratorIterator(_),
             )
             | None => None,
         }
@@ -6778,7 +6995,7 @@ impl<'a> NativeRequestColdState<'a> {
             | Some(
                 NativeStoredValue::ArrayIterator(_)
                 | NativeStoredValue::Iterator(_)
-                | NativeStoredValue::GeneratorIterator(_),
+                | NativeStoredValue::BaselineGeneratorIterator(_),
             )
             | None => None,
             Some(NativeStoredValue::Php(_)) => Some(Some(index)),
@@ -6793,7 +7010,7 @@ impl<'a> NativeRequestColdState<'a> {
             Some(
                 NativeStoredValue::ArrayIterator(_)
                 | NativeStoredValue::Iterator(_)
-                | NativeStoredValue::GeneratorIterator(_),
+                | NativeStoredValue::BaselineGeneratorIterator(_),
             )
             | None => None,
         }
@@ -7171,6 +7388,10 @@ impl<'a> NativeRequestColdState<'a> {
                 | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_FIBER => {
                     Some(NativeEncodedValueKind::Fiber)
                 }
+                php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_GENERATOR
+                | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_GENERATOR => {
+                    Some(NativeEncodedValueKind::Generator)
+                }
                 php_jit::JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR
                 | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR => {
                     Some(NativeEncodedValueKind::Reference)
@@ -7200,7 +7421,7 @@ impl<'a> NativeRequestColdState<'a> {
             NativeStoredValue::GlobalsProxy
             | NativeStoredValue::ArrayIterator(_)
             | NativeStoredValue::Iterator(_)
-            | NativeStoredValue::GeneratorIterator(_) => None,
+            | NativeStoredValue::BaselineGeneratorIterator(_) => None,
         }
     }
 
@@ -7578,7 +7799,7 @@ impl<'a> NativeRequestColdState<'a> {
             NativeStoredValue::Php(_) | NativeStoredValue::GlobalsProxy => Some(true),
             NativeStoredValue::ArrayIterator(_)
             | NativeStoredValue::Iterator(_)
-            | NativeStoredValue::GeneratorIterator(_) => None,
+            | NativeStoredValue::BaselineGeneratorIterator(_) => None,
         }
     }
 
@@ -7632,7 +7853,7 @@ impl<'a> NativeRequestColdState<'a> {
             NativeStoredValue::GlobalsProxy
             | NativeStoredValue::ArrayIterator(_)
             | NativeStoredValue::Iterator(_)
-            | NativeStoredValue::GeneratorIterator(_) => None,
+            | NativeStoredValue::BaselineGeneratorIterator(_) => None,
         }
     }
 
@@ -7809,6 +8030,28 @@ impl<'a> NativeRequestColdState<'a> {
         let released_fiber_execution = released_fiber
             .as_ref()
             .and_then(|_| self.fiber_executions.remove(&(index as u64)));
+        let released_generator = if matches!(
+            slot.kind,
+            php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_GENERATOR
+                | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_GENERATOR
+        ) {
+            if slot.aux == 0 {
+                return Err(format!(
+                    "direct native Generator {index} lost its stable activation"
+                ));
+            }
+            // SAFETY: Generator publication created exactly one boxed
+            // activation and final direct-slot release reclaims it once.
+            #[allow(unsafe_code)]
+            let generator =
+                unsafe { Box::from_raw(slot.aux as usize as *mut NativeDirectGenerator) };
+            self.direct_generator_handles
+                .retain(|_, mapped| *mapped as usize != index);
+            self.direct_generator_cells.remove(&index);
+            Some(generator)
+        } else {
+            None
+        };
         if slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_SHARED_ARRAY
             && !php_runtime::api::PhpArray::release_native_storage_refcount(slot.payload as usize)
         {
@@ -7878,6 +8121,23 @@ impl<'a> NativeRequestColdState<'a> {
             children.push(fiber.callable);
             children.extend(fiber.return_value);
         }
+        let released_generator_state = released_generator
+            .as_ref()
+            .and_then(|generator| generator.handle.clone().zip(generator.state));
+        if let Some(generator) = released_generator {
+            if generator.lifecycle == php_runtime::api::GeneratorState::Created {
+                children.extend(generator.arguments);
+            }
+            children.extend(generator.current_key);
+            children.extend(generator.current_value);
+            children.extend(generator.return_value);
+            if let Some(delegation) = generator.delegation {
+                children.push(match delegation {
+                    NativeGeneratorDelegation::Array { source, .. } => source,
+                    NativeGeneratorDelegation::Generator { generator } => generator,
+                });
+            }
+        }
         children.extend(direct_object_children);
         self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
             reserved: *self.direct_value_free_head,
@@ -7897,6 +8157,9 @@ impl<'a> NativeRequestColdState<'a> {
         }
         if let Some(execution) = released_fiber_execution {
             self.abandon_native_fiber_execution(execution)?;
+        }
+        if let Some((handle, state)) = released_generator_state {
+            self.release_native_suspension_owners(&handle, &state)?;
         }
         if let Some(object) = released_object {
             let class_name = object.class_name();
@@ -8024,15 +8287,15 @@ impl<'a> NativeRequestColdState<'a> {
                         .as_ref()
                         .is_some_and(|object| object.id() == object_id)
             }
-            NativeStoredValue::GeneratorIterator(iterator) => iterator
+            NativeStoredValue::BaselineGeneratorIterator(iterator) => iterator
                 .delegation
                 .as_ref()
                 .is_some_and(|delegation| match delegation {
-                    NativeGeneratorDelegation::Array { entries, .. } => values_contain_object(
+                    BaselineGeneratorDelegation::Array { entries, .. } => values_contain_object(
                         entries.iter().flat_map(|(key, value)| [key, value]),
                         object_id,
                     ),
-                    NativeGeneratorDelegation::Generator { .. } => false,
+                    BaselineGeneratorDelegation::Generator { .. } => false,
                 }),
         });
         if cold_contains {
@@ -8155,6 +8418,51 @@ impl<'a> NativeRequestColdState<'a> {
                                 .return_value()
                                 .is_some_and(|value| values_contain_object([&value], object_id))
                     })
+            }
+            php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_GENERATOR
+            | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_GENERATOR => {
+                self.direct_generator(index).is_some_and(|generator| {
+                    generator
+                        .arguments
+                        .iter()
+                        .copied()
+                        .any(|value| self.encoded_value_contains_object(value, object_id, visited))
+                        || generator.current_key.is_some_and(|value| {
+                            self.encoded_value_contains_object(value, object_id, visited)
+                        })
+                        || generator.current_value.is_some_and(|value| {
+                            self.encoded_value_contains_object(value, object_id, visited)
+                        })
+                        || generator.return_value.is_some_and(|value| {
+                            self.encoded_value_contains_object(value, object_id, visited)
+                        })
+                        || generator.delegation.as_ref().is_some_and(|delegation| {
+                            let value = match delegation {
+                                NativeGeneratorDelegation::Array { source, .. } => *source,
+                                NativeGeneratorDelegation::Generator { generator } => *generator,
+                            };
+                            self.encoded_value_contains_object(value, object_id, visited)
+                        })
+                        || generator.state.as_ref().is_some_and(|state| {
+                            state
+                                .slots
+                                .iter()
+                                .take(state.slot_count as usize)
+                                .enumerate()
+                                .any(|(index, value)| {
+                                    state.local_initialized(php_ir::LocalId::new(
+                                        u32::try_from(index).unwrap_or(u32::MAX),
+                                    )) && self
+                                        .encoded_value_contains_object(*value, object_id, visited)
+                                })
+                                || state.registers.iter().enumerate().any(|(index, value)| {
+                                    state.initialized_register_mask & (1_u64 << index) != 0
+                                        && self.encoded_value_contains_object(
+                                            *value, object_id, visited,
+                                        )
+                                })
+                        })
+                })
             }
             php_jit::JIT_NATIVE_VALUE_VIEW_SHARED_ARRAY
             | php_jit::JIT_NATIVE_VALUE_VIEW_BORROWED_REFERENCE_ARRAY => {
@@ -9190,7 +9498,391 @@ impl<'a> NativeRequestColdState<'a> {
         }
     }
 
-    fn encode_generator_iterator(
+    fn run_in_native_generator_target<R>(
+        &mut self,
+        target: &NativeGeneratorTarget,
+        operation: impl FnOnce(&mut Self) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let called_class = target.called_class.clone();
+        let scope_class = target.scope_class.clone();
+        let run = move |context: &mut Self| {
+            if let Some(called_class) = called_class {
+                context.called_classes.push(called_class);
+            }
+            if let Some(scope_class) = scope_class {
+                context.lexical_scope_classes.push(scope_class.to_string());
+            }
+            let result = operation(context);
+            if target.scope_class.is_some() {
+                context.lexical_scope_classes.pop();
+            }
+            if target.called_class.is_some() {
+                context.called_classes.pop();
+            }
+            result
+        };
+        match target.unit {
+            Some(unit) => self.with_active_dynamic_unit(unit, run)?,
+            None => run(self),
+        }
+    }
+
+    fn duplicate_direct_generator_value(&mut self, encoded: i64) -> Result<i64, String> {
+        self.duplicate_authoritative_native_value(encoded)?
+            .ok_or_else(|| {
+                format!(
+                    "direct Generator value {} crossed from baseline storage",
+                    self.native_encoded_type_name(encoded)
+                )
+            })
+    }
+
+    fn replace_direct_generator_current_owned(
+        &mut self,
+        index: usize,
+        key: Option<i64>,
+        value: i64,
+        forwarded: bool,
+    ) -> Result<(i64, i64), String> {
+        let (old_key, old_value, key) = {
+            let generator = self
+                .direct_generator_mut(index)
+                .ok_or_else(|| format!("direct Generator {index} is missing"))?;
+            let key = if forwarded {
+                key.unwrap_or_else(|| php_jit::jit_encode_constant(u32::MAX))
+            } else if let Some(key) = key {
+                if let Some(explicit) = (php_jit::jit_decode_runtime_value(key).is_none()
+                    && php_jit::jit_decode_constant(key).is_none())
+                .then_some(key)
+                {
+                    if explicit >= generator.next_auto_key {
+                        generator.next_auto_key = explicit.saturating_add(1);
+                    }
+                }
+                key
+            } else {
+                let key = generator.next_auto_key;
+                generator.next_auto_key = generator.next_auto_key.saturating_add(1);
+                key
+            };
+            let old_key = generator.current_key.replace(key);
+            let old_value = generator.current_value.replace(value);
+            generator.lifecycle = php_runtime::api::GeneratorState::Suspended;
+            generator.yields_seen = generator.yields_seen.saturating_add(1);
+            (old_key, old_value, key)
+        };
+        if let Some(old_key) = old_key {
+            self.release(old_key)?;
+        }
+        if let Some(old_value) = old_value {
+            self.release(old_value)?;
+        }
+        let output_key = self.duplicate_direct_generator_value(key)?;
+        match self.duplicate_direct_generator_value(value) {
+            Ok(output_value) => Ok((output_key, output_value)),
+            Err(error) => {
+                self.release(output_key)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn resume_direct_generator(
+        &mut self,
+        encoded: i64,
+        resume_kind: php_jit::JitNativeResumeInputKind,
+        resume_value: i64,
+    ) -> Result<Option<(i64, i64)>, String> {
+        let index = self
+            .direct_generator_index(encoded)
+            .ok_or_else(|| "native value is not a direct Generator".to_owned())?;
+        let lifecycle = self
+            .direct_generator(index)
+            .map(|generator| generator.lifecycle)
+            .ok_or_else(|| format!("direct Generator {index} is missing"))?;
+        if lifecycle == php_runtime::api::GeneratorState::Closed {
+            return Ok(None);
+        }
+        if lifecycle == php_runtime::api::GeneratorState::Running {
+            return Err(
+                "E_PHP_THROW:Exception:Cannot resume an already running generator".to_owned(),
+            );
+        }
+
+        let mut effective_resume_kind = resume_kind;
+        let mut effective_resume_value = resume_value;
+        let delegation = self
+            .direct_generator(index)
+            .and_then(|generator| generator.delegation.as_ref())
+            .map(|delegation| match delegation {
+                NativeGeneratorDelegation::Array { source, cursor } => (0_u8, *source, *cursor),
+                NativeGeneratorDelegation::Generator { generator } => (1_u8, *generator, 0),
+            });
+        if let Some((kind, delegated, cursor)) = delegation {
+            if kind == 0 {
+                let entry = self
+                    .direct_array_entries_for(delegated)
+                    .and_then(|entries| entries.get(cursor))
+                    .copied();
+                if let Some(entry) = entry {
+                    let key = self.duplicate_direct_generator_value(entry.key)?;
+                    let value = match self
+                        .duplicate_authoritative_dereferenced_native_value(entry.value)?
+                    {
+                        Some(value) => value,
+                        None => {
+                            self.release(key)?;
+                            return Err(
+                                "direct Generator delegation reached a cold array value".to_owned()
+                            );
+                        }
+                    };
+                    if let Some(NativeGeneratorDelegation::Array { cursor, .. }) = self
+                        .direct_generator_mut(index)
+                        .and_then(|generator| generator.delegation.as_mut())
+                    {
+                        *cursor = cursor.saturating_add(1);
+                    }
+                    return self
+                        .replace_direct_generator_current_owned(index, Some(key), value, true)
+                        .map(Some);
+                }
+                let delegation = self
+                    .direct_generator_mut(index)
+                    .and_then(|generator| generator.delegation.take());
+                if let Some(NativeGeneratorDelegation::Array { source, .. }) = delegation {
+                    self.release(source)?;
+                }
+                effective_resume_kind = php_jit::JitNativeResumeInputKind::VALUE;
+                effective_resume_value = php_jit::jit_encode_constant(u32::MAX);
+            } else {
+                if let Some((key, value)) = self.resume_direct_generator(
+                    delegated,
+                    php_jit::JitNativeResumeInputKind::VALUE,
+                    php_jit::jit_encode_constant(u32::MAX),
+                )? {
+                    return self
+                        .replace_direct_generator_current_owned(index, Some(key), value, true)
+                        .map(Some);
+                }
+                effective_resume_kind = php_jit::JitNativeResumeInputKind::VALUE;
+                effective_resume_value = {
+                    let child_index = self
+                        .direct_generator_index(delegated)
+                        .ok_or_else(|| "delegated direct Generator disappeared".to_owned())?;
+                    let return_value = self
+                        .direct_generator(child_index)
+                        .and_then(|generator| generator.return_value)
+                        .unwrap_or_else(|| php_jit::jit_encode_constant(u32::MAX));
+                    self.duplicate_direct_generator_value(return_value)?
+                };
+                let delegation = self
+                    .direct_generator_mut(index)
+                    .and_then(|generator| generator.delegation.take());
+                if let Some(NativeGeneratorDelegation::Generator { generator }) = delegation {
+                    self.release(generator)?;
+                }
+            }
+        }
+
+        let (target, arguments, saved_state, saved_handle, starting) = {
+            let generator = self
+                .direct_generator(index)
+                .ok_or_else(|| format!("direct Generator {index} is missing"))?;
+            (
+                generator.target.clone(),
+                generator.arguments.clone(),
+                generator.state,
+                generator.handle.clone(),
+                generator.lifecycle == php_runtime::api::GeneratorState::Created,
+            )
+        };
+        let handle = match saved_handle {
+            Some(handle) => handle,
+            None => self.run_in_native_generator_target(&target, |context| {
+                ensure_native_entry(context, target.function)
+            })?,
+        };
+        if let Some(generator) = self.direct_generator_mut(index) {
+            generator.lifecycle = php_runtime::api::GeneratorState::Running;
+            generator.handle = Some(handle.clone());
+        }
+        let outcome = self.run_in_native_generator_target(&target, |context| {
+            let runtime = context.native_runtime_ptr();
+            let outcome = if let Some(state) = saved_state.as_ref() {
+                handle.invoke_i64_suspension_resume_with_native_unwind_runtime(
+                    &arguments,
+                    state,
+                    effective_resume_kind,
+                    effective_resume_value,
+                    php_jit::JIT_RUNTIME_ABI_HASH,
+                    runtime,
+                    |types, value| native_catch_matches(context, types, value),
+                )
+            } else {
+                handle.invoke_i64_with_deopt_runtime(
+                    &arguments,
+                    php_jit::JIT_RUNTIME_ABI_HASH,
+                    runtime,
+                )
+            };
+            resume_native_optimizing_exit(context, outcome)
+                .map_err(|error| format!("native Generator invocation failed: {error:?}"))
+        });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(generator) = self.direct_generator_mut(index) {
+                    generator.lifecycle = php_runtime::api::GeneratorState::Errored;
+                }
+                if !starting {
+                    let _ = self.release(effective_resume_value);
+                }
+                return Err(error);
+            }
+        };
+        if starting && let Some(generator) = self.direct_generator_mut(index) {
+            // First entry transferred the bound owners into its native frame.
+            generator.arguments.clear();
+        }
+        match outcome {
+            php_jit::JitI64InvokeOutcome::SideExit {
+                status,
+                value,
+                state,
+            } if status == php_jit::JitCallStatus::SUSPEND_GENERATOR.0 as i32 => {
+                if state.suspend_kind == php_jit::JitNativeSuspendKind::GENERATOR_DELEGATE.0 {
+                    let source = state.delegation_handle as i64;
+                    let source = self.duplicate_direct_generator_value(source)?;
+                    let delegation = match self.native_encoded_value_kind(source) {
+                        Some(NativeEncodedValueKind::Array)
+                            if self.direct_array_entries_for(source).is_some() =>
+                        {
+                            NativeGeneratorDelegation::Array { source, cursor: 0 }
+                        }
+                        Some(NativeEncodedValueKind::Generator)
+                            if self.direct_generator_index(source).is_some() =>
+                        {
+                            NativeGeneratorDelegation::Generator { generator: source }
+                        }
+                        _ => {
+                            let type_name = self.native_encoded_type_name(source);
+                            self.release(source)?;
+                            return Err(format!(
+                                "yield from expects an array or Traversable, got {type_name}"
+                            ));
+                        }
+                    };
+                    if let Some(generator) = self.direct_generator_mut(index) {
+                        generator.state = Some(state);
+                        generator.lifecycle = php_runtime::api::GeneratorState::Suspended;
+                        generator.delegation = Some(delegation);
+                    }
+                    return self.resume_direct_generator(
+                        encoded,
+                        php_jit::JitNativeResumeInputKind::VALUE,
+                        php_jit::jit_encode_constant(u32::MAX),
+                    );
+                }
+                let key = if state.suspend_flags & 1 != 0 {
+                    Some(self.duplicate_direct_generator_value(state.yielded_key)?)
+                } else {
+                    None
+                };
+                let value = self.duplicate_direct_generator_value(value)?;
+                if let Some(generator) = self.direct_generator_mut(index) {
+                    generator.state = Some(state);
+                }
+                self.replace_direct_generator_current_owned(index, key, value, false)
+                    .map(Some)
+            }
+            php_jit::JitI64InvokeOutcome::Returned(value)
+            | php_jit::JitI64InvokeOutcome::SideExit {
+                status: 1 | 2,
+                value,
+                ..
+            } => {
+                let (old_key, old_value, old_return, old_delegation) = {
+                    let generator = self
+                        .direct_generator_mut(index)
+                        .ok_or_else(|| format!("direct Generator {index} is missing"))?;
+                    (
+                        generator.current_key.take(),
+                        generator.current_value.take(),
+                        generator.return_value.replace(value),
+                        generator.delegation.take(),
+                    )
+                };
+                for owner in [old_key, old_value, old_return].into_iter().flatten() {
+                    self.release(owner)?;
+                }
+                if let Some(delegation) = old_delegation {
+                    self.release(match delegation {
+                        NativeGeneratorDelegation::Array { source, .. } => source,
+                        NativeGeneratorDelegation::Generator { generator } => generator,
+                    })?;
+                }
+                if let Some(generator) = self.direct_generator_mut(index) {
+                    generator.state = None;
+                    generator.lifecycle = php_runtime::api::GeneratorState::Closed;
+                }
+                Ok(None)
+            }
+            php_jit::JitI64InvokeOutcome::SideExit { status, value, .. }
+                if status == php_jit::JitCallStatus::THROW.0 as i32 =>
+            {
+                if let Some(generator) = self.direct_generator_mut(index) {
+                    generator.state = None;
+                    generator.lifecycle = php_runtime::api::GeneratorState::Errored;
+                }
+                let (class, message, _) = self
+                    .decode(value)
+                    .ok()
+                    .and_then(super::native_exception_fields)
+                    .unwrap_or_else(|| {
+                        (
+                            "Error".to_owned(),
+                            "unknown native Generator exception".to_owned(),
+                            "<unknown>".to_owned(),
+                        )
+                    });
+                let _ = self.release(value);
+                Err(format!("E_PHP_THROW:{class}:{message}"))
+            }
+            php_jit::JitI64InvokeOutcome::SideExit { status, value, .. }
+                if status == php_jit::JitCallStatus::EXIT.0 as i32 =>
+            {
+                if let Some(generator) = self.direct_generator_mut(index) {
+                    generator.state = None;
+                    generator.lifecycle = php_runtime::api::GeneratorState::Closed;
+                }
+                Err(format!("E_PHP_EXIT:{value}"))
+            }
+            php_jit::JitI64InvokeOutcome::SideExit { status, .. }
+                if status == php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32 =>
+            {
+                if let Some(generator) = self.direct_generator_mut(index) {
+                    generator.lifecycle = php_runtime::api::GeneratorState::Errored;
+                }
+                if self.diagnostic.is_some() {
+                    Err(NATIVE_RUNTIME_ERROR_MARKER.to_owned())
+                } else {
+                    Err("native Generator returned a runtime error".to_owned())
+                }
+            }
+            php_jit::JitI64InvokeOutcome::SideExit { status, value, .. } => {
+                if let Some(generator) = self.direct_generator_mut(index) {
+                    generator.lifecycle = php_runtime::api::GeneratorState::Errored;
+                }
+                Err(format!(
+                    "native Generator returned status {status} with {}",
+                    self.native_encoded_type_name(value)
+                ))
+            }
+        }
+    }
+
+    fn encode_baseline_generator_iterator(
         &mut self,
         generator: php_runtime::api::GeneratorRef,
     ) -> Result<i64, String> {
@@ -9201,8 +9893,8 @@ impl<'a> NativeRequestColdState<'a> {
             .into_iter()
             .map(|value| self.encode(value))
             .collect::<Result<Vec<_>, _>>()?;
-        self.encode_stored_value(NativeStoredValue::GeneratorIterator(Box::new(
-            NativeGeneratorIteratorState {
+        self.encode_stored_value(NativeStoredValue::BaselineGeneratorIterator(Box::new(
+            BaselineGeneratorIteratorState {
                 generator,
                 handle: Box::new(handle),
                 arguments,
@@ -9214,20 +9906,24 @@ impl<'a> NativeRequestColdState<'a> {
         )))
     }
 
-    fn generator_iterator(
+    fn baseline_generator_iterator(
         &mut self,
         generator: php_runtime::api::GeneratorRef,
     ) -> Result<i64, String> {
-        if let Some(encoded) = self.generator_iterators.get(&generator.id()).copied() {
+        if let Some(encoded) = self
+            .baseline_generator_iterators
+            .get(&generator.id())
+            .copied()
+        {
             return Ok(encoded);
         }
         let id = generator.id();
-        let encoded = self.encode_generator_iterator(generator)?;
-        self.generator_iterators.insert(id, encoded);
+        let encoded = self.encode_baseline_generator_iterator(generator)?;
+        self.baseline_generator_iterators.insert(id, encoded);
         Ok(encoded)
     }
 
-    fn generator_resume(
+    fn resume_baseline_iterator(
         &mut self,
         encoded: i64,
         resume_kind: php_jit::JitNativeResumeInputKind,
@@ -9376,7 +10072,7 @@ impl<'a> NativeRequestColdState<'a> {
         }
         let (generator, handle, arguments, state, delegation, finished) =
             match self.values.get(index as usize).and_then(Option::as_ref) {
-                Some(NativeStoredValue::GeneratorIterator(iterator)) => (
+                Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) => (
                     iterator.generator.clone(),
                     iterator.handle.clone(),
                     iterator.arguments.clone(),
@@ -9393,14 +10089,14 @@ impl<'a> NativeRequestColdState<'a> {
         let mut effective_resume_value = resume_value;
         if let Some(delegation) = delegation {
             match delegation {
-                NativeGeneratorDelegation::Array {
+                BaselineGeneratorDelegation::Array {
                     entries,
                     index: cursor,
                 } => {
                     if let Some((key, value)) = entries.get(cursor).cloned() {
-                        if let Some(NativeStoredValue::GeneratorIterator(iterator)) =
+                        if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
                             self.values.get_mut(index as usize).and_then(Option::as_mut)
-                            && let Some(NativeGeneratorDelegation::Array {
+                            && let Some(BaselineGeneratorDelegation::Array {
                                 index: saved_cursor,
                                 ..
                             }) = iterator.delegation.as_mut()
@@ -9408,14 +10104,14 @@ impl<'a> NativeRequestColdState<'a> {
                             *saved_cursor = saved_cursor.saturating_add(1);
                         }
                         generator.suspend_forwarded(Some(key.clone()), value.clone());
-                        if let Some(NativeStoredValue::GeneratorIterator(iterator)) =
+                        if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
                             self.values.get_mut(index as usize).and_then(Option::as_mut)
                         {
                             iterator.yields_seen = iterator.yields_seen.saturating_add(1);
                         }
                         return Ok(Some((key, value)));
                     }
-                    if let Some(NativeStoredValue::GeneratorIterator(iterator)) =
+                    if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
                         self.values.get_mut(index as usize).and_then(Option::as_mut)
                     {
                         iterator.delegation = None;
@@ -9423,13 +10119,13 @@ impl<'a> NativeRequestColdState<'a> {
                     effective_resume_kind = php_jit::JitNativeResumeInputKind::VALUE;
                     effective_resume_value = php_jit::jit_encode_constant(u32::MAX);
                 }
-                NativeGeneratorDelegation::Generator {
+                BaselineGeneratorDelegation::Generator {
                     generator: delegated,
                     iterator,
                 } => {
-                    if let Some((key, value)) = self.iterator_next(iterator)? {
+                    if let Some((key, value)) = self.baseline_iterator_next(iterator)? {
                         generator.suspend_forwarded(Some(key.clone()), value.clone());
-                        if let Some(NativeStoredValue::GeneratorIterator(iterator)) =
+                        if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
                             self.values.get_mut(index as usize).and_then(Option::as_mut)
                         {
                             iterator.yields_seen = iterator.yields_seen.saturating_add(1);
@@ -9439,7 +10135,7 @@ impl<'a> NativeRequestColdState<'a> {
                     effective_resume_kind = php_jit::JitNativeResumeInputKind::VALUE;
                     effective_resume_value =
                         self.encode(delegated.return_value().unwrap_or(Value::Null))?;
-                    if let Some(NativeStoredValue::GeneratorIterator(iterator)) =
+                    if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
                         self.values.get_mut(index as usize).and_then(Option::as_mut)
                     {
                         iterator.delegation = None;
@@ -9472,7 +10168,7 @@ impl<'a> NativeRequestColdState<'a> {
                 if state.suspend_kind == php_jit::JitNativeSuspendKind::GENERATOR_DELEGATE.0 {
                     let delegated = self.decode(state.delegation_handle as i64)?;
                     let delegation = match delegated {
-                        Value::Array(array) => NativeGeneratorDelegation::Array {
+                        Value::Array(array) => BaselineGeneratorDelegation::Array {
                             entries: array
                                 .iter()
                                 .map(|(key, value)| {
@@ -9487,8 +10183,8 @@ impl<'a> NativeRequestColdState<'a> {
                                 .collect(),
                             index: 0,
                         },
-                        Value::Generator(delegated) => NativeGeneratorDelegation::Generator {
-                            iterator: self.generator_iterator(delegated.clone())?,
+                        Value::Generator(delegated) => BaselineGeneratorDelegation::Generator {
+                            iterator: self.baseline_generator_iterator(delegated.clone())?,
                             generator: delegated,
                         },
                         other => {
@@ -9498,13 +10194,13 @@ impl<'a> NativeRequestColdState<'a> {
                             ));
                         }
                     };
-                    if let Some(NativeStoredValue::GeneratorIterator(iterator)) =
+                    if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
                         self.values.get_mut(index as usize).and_then(Option::as_mut)
                     {
                         *iterator.state = Some(state);
                         iterator.delegation = Some(delegation);
                     }
-                    return self.iterator_next(encoded);
+                    return self.baseline_iterator_next(encoded);
                 }
                 let key = if state.suspend_flags & 1 != 0 {
                     Some(self.decode(state.yielded_key)?)
@@ -9513,12 +10209,12 @@ impl<'a> NativeRequestColdState<'a> {
                 };
                 let value = self.decode(value)?;
                 generator.suspend(key, value.clone());
-                if let Some(NativeStoredValue::GeneratorIterator(iterator)) =
+                if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
                     self.values.get_mut(index as usize).and_then(Option::as_mut)
                 {
                     *iterator.state = Some(state);
                 }
-                if let Some(NativeStoredValue::GeneratorIterator(iterator)) =
+                if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
                     self.values.get_mut(index as usize).and_then(Option::as_mut)
                 {
                     iterator.yields_seen = iterator.yields_seen.saturating_add(1);
@@ -9535,7 +10231,7 @@ impl<'a> NativeRequestColdState<'a> {
                 ..
             } => {
                 generator.close(Some(self.decode(value)?));
-                if let Some(NativeStoredValue::GeneratorIterator(iterator)) =
+                if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
                     self.values.get_mut(index as usize).and_then(Option::as_mut)
                 {
                     iterator.finished = true;
@@ -9548,11 +10244,11 @@ impl<'a> NativeRequestColdState<'a> {
         }
     }
 
-    fn iterator_next(&mut self, encoded: i64) -> Result<Option<(Value, Value)>, String> {
-        if let Some(entry) = self.array_iterator_next(encoded) {
+    fn baseline_iterator_next(&mut self, encoded: i64) -> Result<Option<(Value, Value)>, String> {
+        if let Some(entry) = self.baseline_array_iterator_next(encoded) {
             return Ok(entry);
         }
-        self.generator_resume(
+        self.resume_baseline_iterator(
             encoded,
             php_jit::JitNativeResumeInputKind::VALUE,
             php_jit::jit_encode_constant(u32::MAX),
@@ -9560,6 +10256,13 @@ impl<'a> NativeRequestColdState<'a> {
     }
 
     fn iterator_next_encoded(&mut self, encoded: i64) -> Result<Option<(i64, i64)>, String> {
+        if self.direct_generator_index(encoded).is_some() {
+            return self.resume_direct_generator(
+                encoded,
+                php_jit::JitNativeResumeInputKind::VALUE,
+                php_jit::jit_encode_constant(u32::MAX),
+            );
+        }
         if let Some(index) = Self::direct_value_index(encoded) {
             let iterator = *self
                 .direct_value_slots
@@ -9614,7 +10317,7 @@ impl<'a> NativeRequestColdState<'a> {
                 return Ok(Some((key, value)));
             }
         }
-        self.iterator_next(encoded)?
+        self.baseline_iterator_next(encoded)?
             .map(|(key, value)| {
                 let key = self.encode(key)?;
                 match self.encode(value) {
@@ -9628,7 +10331,7 @@ impl<'a> NativeRequestColdState<'a> {
             .transpose()
     }
 
-    fn array_iterator_next(&mut self, encoded: i64) -> Option<Option<(Value, Value)>> {
+    fn baseline_array_iterator_next(&mut self, encoded: i64) -> Option<Option<(Value, Value)>> {
         if let Some(index) = Self::direct_value_index(encoded) {
             let iterator = *self.direct_value_slots.get(index)?;
             if iterator.refcount == 0
@@ -9677,6 +10380,12 @@ impl<'a> NativeRequestColdState<'a> {
     }
 
     fn generator_can_rewind(&self, encoded: i64) -> bool {
+        if let Some(index) = self.direct_generator_index(encoded) {
+            return self.direct_generator(index).is_some_and(|generator| {
+                matches!(generator.yields_seen, 0 | 1)
+                    && generator.lifecycle != php_runtime::api::GeneratorState::Closed
+            });
+        }
         let Some(index) = php_jit::jit_decode_runtime_value(encoded) else {
             return false;
         };
@@ -9684,7 +10393,7 @@ impl<'a> NativeRequestColdState<'a> {
             .get(index as usize)
             .and_then(Option::as_ref)
             .is_some_and(|value| match value {
-                NativeStoredValue::GeneratorIterator(iterator) => {
+                NativeStoredValue::BaselineGeneratorIterator(iterator) => {
                     matches!(iterator.yields_seen, 0 | 1) && !iterator.finished
                 }
                 _ => false,
@@ -9713,7 +10422,9 @@ impl<'a> NativeRequestColdState<'a> {
                 }
                 Ok(())
             }
-            Some(NativeStoredValue::Iterator(_) | NativeStoredValue::GeneratorIterator(_)) => {
+            Some(
+                NativeStoredValue::Iterator(_) | NativeStoredValue::BaselineGeneratorIterator(_),
+            ) => {
                 if let Some(slot) = self.value_slots.get_mut(index as usize) {
                     *slot = php_jit::JitNativeValueSlot::default();
                 }
@@ -12192,7 +12903,66 @@ fn invoke_native_external_function_with_metadata_at_tier(
     {
         return Err(NativeCallControl::BaselineRequired);
     }
-    let transferred_arguments = arguments
+    let transferred_arguments =
+        transfer_native_external_arguments(context, arguments, builtin_policy)?;
+    let result = context.with_active_dynamic_unit(target.unit, |context| {
+        let pushed_called_class = called_class.is_some();
+        if let Some(called_class) = &called_class {
+            context
+                .called_classes
+                .push(Arc::from(called_class.as_str()));
+        }
+        let result = if baseline_continuation {
+            invoke_native_resolved_function_with_metadata_strict(
+                context,
+                target.function,
+                &transferred_arguments,
+                metadata,
+                strict,
+            )
+        } else {
+            invoke_native_function_with_metadata_strict_at_tier(
+                context,
+                target.function,
+                &transferred_arguments,
+                metadata,
+                strict,
+                false,
+                builtin_policy,
+            )
+        };
+        if pushed_called_class {
+            context.called_classes.pop();
+        }
+        match result {
+            Ok(encoded) => Ok(context.transfer_external_return(encoded, target.unit)?),
+            Err(NativeCallControl::Exit(encoded)) => {
+                let encoded = context.transfer_external_return(encoded, target.unit)?;
+                Err(NativeCallControl::Exit(encoded))
+            }
+            Err(control) => Err(control),
+        }
+    });
+    let mut release_error = None;
+    for argument in transferred_arguments {
+        if let Err(error) = context.release(argument) {
+            release_error.get_or_insert(error);
+        }
+    }
+    match (result, release_error) {
+        (Err(error), _) => Err(error.into()),
+        (Ok(Err(control)), _) => Err(control),
+        (Ok(Ok(_)), Some(error)) => Err(error.into()),
+        (Ok(Ok(value)), None) => Ok(value),
+    }
+}
+
+fn transfer_native_external_arguments(
+    context: &mut NativeRequestColdState<'_>,
+    arguments: &[i64],
+    builtin_policy: NativeCallableBuiltinPolicy,
+) -> Result<smallvec::SmallVec<[i64; 8]>, NativeCallControl> {
+    arguments
         .iter()
         .map(|argument| {
             let encoded = *argument;
@@ -12233,45 +13003,58 @@ fn invoke_native_external_function_with_metadata_at_tier(
                 }
             }
         })
-        .collect::<Result<smallvec::SmallVec<[i64; 8]>, _>>()?;
-    context.with_active_dynamic_unit(target.unit, |context| {
+        .collect::<Result<smallvec::SmallVec<[i64; 8]>, _>>()
+        .map_err(NativeCallControl::from)
+}
+
+fn create_native_external_generator_with_metadata_policy(
+    context: &mut NativeRequestColdState<'_>,
+    target: NativeDynamicFunction,
+    arguments: &[i64],
+    metadata: Option<&[php_ir::instruction::IrCallArg]>,
+    called_class: Option<String>,
+    strict: bool,
+    builtin_policy: NativeCallableBuiltinPolicy,
+) -> NativeCallResult {
+    prepare_dynamic_native_entry(context, target.unit, target.function)?;
+    if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline
+        && !authoritative_native_call_arguments_are_admitted(context, arguments, metadata)
+    {
+        return Err(NativeCallControl::BaselineRequired);
+    }
+    let transferred = transfer_native_external_arguments(context, arguments, builtin_policy)?;
+    let result = context.with_active_dynamic_unit(target.unit, |context| {
         let pushed_called_class = called_class.is_some();
         if let Some(called_class) = &called_class {
             context
                 .called_classes
                 .push(Arc::from(called_class.as_str()));
         }
-        let result = if baseline_continuation {
-            invoke_native_resolved_function_with_metadata_strict(
-                context,
-                target.function,
-                &transferred_arguments,
-                metadata,
-                strict,
-            )
-        } else {
-            invoke_native_function_with_metadata_strict_at_tier(
-                context,
-                target.function,
-                &transferred_arguments,
-                metadata,
-                strict,
-                false,
-                builtin_policy,
-            )
-        };
+        let result = create_native_generator_with_metadata_strict(
+            context,
+            target.function,
+            &transferred,
+            metadata,
+            strict,
+            builtin_policy,
+        );
         if pushed_called_class {
             context.called_classes.pop();
         }
-        match result {
-            Ok(encoded) => Ok(context.transfer_external_return(encoded, target.unit)?),
-            Err(NativeCallControl::Exit(encoded)) => {
-                let encoded = context.transfer_external_return(encoded, target.unit)?;
-                Err(NativeCallControl::Exit(encoded))
-            }
-            Err(control) => Err(control),
+        result
+    });
+    let mut release_error = None;
+    for argument in transferred {
+        if let Err(error) = context.release(argument) {
+            release_error.get_or_insert(error);
         }
-    })?
+    }
+    match (result, release_error) {
+        (Err(error), _) => Err(error.into()),
+        (Ok(Err(control)), _) => Err(control),
+        (Ok(Ok(_)), Some(error)) => Err(error.into()),
+        (Ok(Ok(generator)), None) => Ok(generator),
+    }
 }
 
 fn native_value_with_owner_unit(value: Value, owner_unit: Option<usize>) -> Value {
@@ -12304,6 +13087,26 @@ fn invoke_native_method_with_trace_arguments(
     arguments: &[i64],
     trace_arguments: Option<request_state::NativeTraceArguments>,
 ) -> NativeCallResult {
+    if native_function_is_generator(context, function) {
+        // Compiled stable calls have already transferred their argument
+        // owners exactly as they would into an ordinary callee frame. A
+        // Generator call publishes that dormant frame instead of executing
+        // the body synchronously.
+        return context
+            .publish_native_generator_owned(
+                NativeGeneratorTarget {
+                    unit: context.current_dynamic_unit,
+                    function,
+                    called_class: context.called_classes.last().cloned(),
+                    scope_class: context
+                        .lexical_scope_classes
+                        .last()
+                        .map(|scope| Arc::from(scope.as_str())),
+                },
+                arguments.to_vec(),
+            )
+            .map_err(NativeCallControl::from);
+    }
     let metadata = NativeFunctionMetadataPtr::from_compiled(&context.compiled, function);
     invoke_native_method_with_prepared_trace_arguments(
         context,
@@ -12787,7 +13590,7 @@ fn native_transition_stored_value_kind(
         Some(NativeStoredValue::GlobalsProxy) => "globals_proxy",
         Some(NativeStoredValue::ArrayIterator(_)) => "array_iterator",
         Some(NativeStoredValue::Iterator(_)) => "iterator",
-        Some(NativeStoredValue::GeneratorIterator(_)) => "generator_iterator",
+        Some(NativeStoredValue::BaselineGeneratorIterator(_)) => "baseline_generator_iterator",
         None => "missing",
     }
 }
