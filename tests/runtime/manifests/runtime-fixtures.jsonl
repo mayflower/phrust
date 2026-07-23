@@ -10,6 +10,7 @@
 {"id":"variables-isset-uninitialized-global-dimension","path":"fixtures/runtime/valid/variables/isset-uninitialized-global-dimension.php","tags":["runtime","variables","globals","isset"],"expect":{"exit":0,"stdout":"missing\n"}}
 {"id":"variables-globals-proxy","path":"fixtures/runtime/valid/variables/globals-proxy.php","tags":["runtime","variables","globals","references","arrays","native-hotpath"],"expect":{"exit":0,"stdout":"1|2|3|missing|2|present\n"}}
 {"id":"variables-global-binding-cache","path":"fixtures/runtime/valid/variables/global-binding-cache.php","tags":["runtime","variables","globals","references","native-hotpath"],"expect":{"exit":0,"stdout":"1000|2001|missing|11\n"}}
+{"id":"variables-global-binding-missing","path":"fixtures/runtime/valid/variables/global-binding-missing.php","tags":["runtime","variables","globals","references","native-hotpath"],"expect":{"exit":0,"stdout":"bool(false)\nbool(false)\nbool(false)\n"}}
 {"id":"variables-global-binding-cache-include","path":"fixtures/runtime/valid/variables/global-binding-cache-include.php","tags":["runtime","variables","globals","references","include","native-hotpath"],"expect":{"exit":0,"stdout":"1000|501\n"}}
 {"id":"superglobals-argc","path":"fixtures/runtime/valid/superglobals/argc.php","tags":["runtime","superglobals"],"expect":{"exit":0,"stdout":"1\n"}}
 {"id":"superglobals-argv","path":"fixtures/runtime/valid/superglobals/argv.php","args":["--","alpha","beta"],"tags":["runtime","superglobals"],"expect":{"exit":0,"stdout":"3|alpha|beta\n"}}

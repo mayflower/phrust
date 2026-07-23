@@ -25960,6 +25960,45 @@ fn lower_optimizing_cached_bind_global(
         transition,
         false,
     )?;
+    // Request-local slots start with an uninitialized payload so merely
+    // publishing compiled code cannot make a missing global visible. PHP's
+    // `global $name` statement is the point where that symbol becomes a
+    // reference to null. Trusted global plans always carry the canonical
+    // direct reference, so initialize its authoritative payload in place
+    // without materializing a ReferenceCell or entering semantic dispatch.
+    let reference_slot =
+        lower_optimizing_direct_slot_address(builder, encoded, transition.deopt_out);
+    let payload = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        reference_slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+    );
+    let initialize = builder.create_block();
+    let initialized = builder.create_block();
+    let is_uninitialized = builder.ins().icmp_imm(
+        IntCC::Equal,
+        payload,
+        crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED),
+    );
+    builder
+        .ins()
+        .brif(is_uninitialized, initialize, &[], initialized, &[]);
+
+    builder.switch_to_block(initialize);
+    let null = builder
+        .ins()
+        .iconst(types::I64, crate::jit_encode_constant(u32::MAX));
+    builder.ins().store(
+        MemFlagsData::new(),
+        null,
+        reference_slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+    );
+    lower_mark_native_roots_dirty(builder, transition.deopt_out);
+    builder.ins().jump(initialized, &[]);
+
+    builder.switch_to_block(initialized);
     // The dense slot owns one reference. The newly bound local owns a second one.
     // This is a direct slot update, not a lifecycle helper boundary.
     lower_optimizing_retain(builder, encoded, transition.deopt_out);

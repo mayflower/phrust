@@ -4418,9 +4418,10 @@ impl<'a> NativeRequestColdState<'a> {
         }
     }
 
-    /// Publish references for globals that already exist at request entry.
-    /// Missing globals are deliberately left unpublished so preparing native
-    /// code cannot make them visible before PHP executes the `global` binding.
+    /// Publish the canonical request reference for every `global` binding.
+    /// A missing symbol starts with an uninitialized native payload, so
+    /// publication itself does not make it PHP-visible. Executing the binding
+    /// initializes that same payload to null in generated code.
     fn prepare_trusted_global_references(&mut self) {
         self.ensure_native_global_references();
         let continuations = std::sync::Arc::clone(&self.continuation_instructions);
@@ -4442,17 +4443,19 @@ impl<'a> NativeRequestColdState<'a> {
             })
             .collect::<Vec<_>>();
         for (function, continuation, name) in binding_sites {
-            let Ok(Some(encoded)) = self.native_global_reference_handle(&name) else {
-                continue;
+            let encoded = match self.native_request_local_handle(&name) {
+                Ok(encoded) => encoded,
+                Err(_) => continue,
             };
             let (Ok(function), Ok(continuation)) =
                 (u32::try_from(function), u32::try_from(continuation))
             else {
                 continue;
             };
-            let published =
-                self.publish_native_global_reference(function, continuation, &name, encoded);
-            if published.is_err() {
+            if self
+                .publish_native_global_reference(function, continuation, &name, encoded)
+                .is_err()
+            {
                 continue;
             }
         }
@@ -16706,12 +16709,21 @@ fn execute_native_bind_global(
     let current = context
         .inherited_globals
         .get(name)
-        .filter(|value| !matches!(value, Value::Uninitialized))
         .cloned()
         .or_else(|| context.options.runtime_context.global_value(name))
-        .unwrap_or(Value::Null);
+        .unwrap_or(Value::Uninitialized);
     let reference = match current {
-        Value::Reference(reference) => reference,
+        Value::Reference(reference) => {
+            if matches!(reference.get(), Value::Uninitialized) {
+                match context.replace_direct_reference_cell_value(&reference, Value::Null) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => reference.set(Value::Null),
+                    Err(error) => return Some(Err(error)),
+                }
+            }
+            reference
+        }
+        Value::Uninitialized => php_runtime::api::ReferenceCell::new(Value::Null),
         value => php_runtime::api::ReferenceCell::new(value),
     };
     context

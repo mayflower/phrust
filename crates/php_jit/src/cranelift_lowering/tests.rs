@@ -9678,8 +9678,17 @@ fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch(
         },
         span,
     );
-    let null = builder.intern_constant(IrConstant::Null);
-    builder.terminate_return(function, block, Some(Operand::Constant(null)), span);
+    let loaded = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::LoadLocal {
+            dst: loaded,
+            local: global,
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(loaded)), span);
     let unit = builder.finish();
     let mut backend = CraneliftNativeCompiler;
     let outcome = backend.compile_region(&NativeCompileRequest {
@@ -9711,15 +9720,21 @@ fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch(
         metadata.production_lowering
     );
 
-    let encoded_reference =
-        crate::jit_encode_typed_runtime_value(0, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
-    let mut slots = vec![crate::JitNativeValueSlot::default(); 1];
-    slots[0] = crate::JitNativeValueSlot {
+    let encoded_reference = crate::jit_encode_typed_runtime_value(
+        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
+        crate::JIT_VALUE_RUNTIME_REFERENCE_TAG,
+    );
+    let mut direct_slots = vec![crate::JitNativeValueSlot::default(); 1];
+    direct_slots[0] = crate::JitNativeValueSlot {
         refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR,
+        kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR,
         flags: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION,
+        reserved: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED,
+        payload: crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED) as u64,
         ..crate::JitNativeValueSlot::default()
     };
+    let mut roots_dirty = 0_u32;
+    let mut direct_value_next = 1_u32;
     let mut function_offsets = vec![0_u32; function.index() + 1];
     let mut trusted_slots = vec![crate::JitNativeTrustedGlobalReferenceSlot {
         encoded: encoded_reference,
@@ -9730,8 +9745,9 @@ fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch(
     }];
     let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        value_slot_capacity: slots.len() as u32,
-        value_slots: slots.as_mut_ptr() as usize as u64,
+        direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
+        direct_value_next: std::ptr::from_mut(&mut direct_value_next) as usize as u64,
+        root_mutation_pending: std::ptr::from_mut(&mut roots_dirty) as usize as u64,
         trusted_property_function_offsets: function_offsets.as_mut_ptr() as usize as u64,
         trusted_property_function_count: function_offsets.len() as u32,
         trusted_global_reference_slots: trusted_slots.as_mut_ptr() as usize as u64,
@@ -9744,6 +9760,12 @@ fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch(
             .expect("trusted global binding must not side-exit"),
         crate::jit_encode_constant(u32::MAX)
     );
+    assert_eq!(
+        direct_slots[0].payload as i64,
+        crate::jit_encode_constant(u32::MAX),
+        "executing global binding must initialize a missing global to null"
+    );
+    assert_eq!(roots_dirty, 1);
 }
 
 #[test]
