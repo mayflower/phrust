@@ -2915,6 +2915,24 @@ pub(super) fn compile_region_graph_native(
                         )
                     })?;
                 functions.insert(array_child_entry_symbol, array_child_entry);
+                let array_insert_prepared_symbol = FunctionId::new(next_synthetic);
+                next_synthetic = next_synthetic.checked_add(1).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_FRAGMENT_SYMBOL_LIMIT",
+                        "native prepared array-insert symbol id overflowed",
+                    )
+                })?;
+                let symbol = format!("{name}.native.array_insert_prepared");
+                let signature = direct_array_insert_prepared_signature(module);
+                let array_insert_prepared = module
+                    .declare_function(&symbol, Linkage::Local, &signature)
+                    .map_err(|error| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_DECLARE",
+                            format!("failed to declare {symbol}: {error}"),
+                        )
+                    })?;
+                functions.insert(array_insert_prepared_symbol, array_insert_prepared);
                 let value_release_validate_symbol = FunctionId::new(next_synthetic);
                 next_synthetic = next_synthetic.checked_add(1).ok_or_else(|| {
                     CraneliftLoweringError::new(
@@ -2971,6 +2989,8 @@ pub(super) fn compile_region_graph_native(
                         array_ensure_unique_symbol,
                         array_child_entry,
                         array_child_entry_symbol,
+                        array_insert_prepared,
+                        array_insert_prepared_symbol,
                         value_release_validate,
                         value_release_validate_symbol,
                         value_release_commit,
@@ -3289,6 +3309,25 @@ pub(super) fn compile_region_graph_native(
                 )?;
                 let _ = append_defined(
                     operations.value_release_commit_symbol,
+                    0,
+                    0,
+                    defined,
+                )?;
+                let defined = define_direct_array_insert_prepared_function(
+                    module,
+                    codegen_context,
+                    builder_context,
+                    operations.array_insert_prepared,
+                    operations.array_insert_prepared_symbol,
+                    operations.array_child_entry,
+                    operations.array_child_entry_symbol,
+                    operations.value_release_validate,
+                    operations.value_release_validate_symbol,
+                    operations.value_release_commit,
+                    operations.value_release_commit_symbol,
+                )?;
+                let _ = append_defined(
+                    operations.array_insert_prepared_symbol,
                     0,
                     0,
                     defined,
@@ -4176,6 +4215,18 @@ fn direct_array_child_entry_signature(module: &JITModule) -> Signature {
     signature.params.push(AbiParam::new(types::I64));
     signature.returns.push(AbiParam::new(types::I64));
     signature.returns.push(AbiParam::new(pointer_type));
+    signature
+}
+
+fn direct_array_insert_prepared_signature(module: &JITModule) -> Signature {
+    let pointer_type = module.target_config().pointer_type();
+    let mut signature = module.make_signature();
+    signature.params.push(AbiParam::new(pointer_type));
+    signature.params.push(AbiParam::new(types::I64));
+    signature.params.push(AbiParam::new(types::I64));
+    signature.params.push(AbiParam::new(types::I64));
+    signature.returns.push(AbiParam::new(types::I32));
+    signature.returns.push(AbiParam::new(types::I64));
     signature
 }
 
@@ -6658,6 +6709,260 @@ fn lower_direct_array_child_entry_body(builder: &mut FunctionBuilder<'_>) {
     builder.ins().return_(&[zero_value, null_entry]);
 }
 
+fn lower_direct_array_insert_prepared_body(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    child_entry: FuncId,
+    value_release_validate: FuncId,
+    value_release_commit: FuncId,
+) {
+    let entry = builder.create_block();
+    let inspect_result = builder.create_block();
+    let inspect_replace = builder.create_block();
+    let validate_replace = builder.create_block();
+    let replace = builder.create_block();
+    let inspect_missing = builder.create_block();
+    let append = builder.create_block();
+    let succeeded = builder.create_block();
+    let failed = builder.create_block();
+    builder.append_block_params_for_function_params(entry);
+    builder.append_block_param(inspect_replace, types::I64);
+    builder.append_block_param(inspect_replace, module.target_config().pointer_type());
+    builder.append_block_param(validate_replace, types::I64);
+    builder.append_block_param(validate_replace, module.target_config().pointer_type());
+    builder.append_block_param(replace, types::I64);
+    builder.append_block_param(replace, module.target_config().pointer_type());
+
+    builder.switch_to_block(entry);
+    let deopt_out = builder.block_params(entry)[0];
+    let array = builder.block_params(entry)[1];
+    let key = builder.block_params(entry)[2];
+    let value = builder.block_params(entry)[3];
+    let pointer_type = builder.func.dfg.value_type(deopt_out);
+    let child_entry = module.declare_func_in_func(child_entry, builder.func);
+    let lookup = builder.ins().call(child_entry, &[deopt_out, array, key]);
+    let old = builder.inst_results(lookup)[0];
+    let found_entry = builder.inst_results(lookup)[1];
+    builder.ins().jump(inspect_result, &[]);
+
+    builder.switch_to_block(inspect_result);
+    let found = builder.ins().icmp_imm(IntCC::NotEqual, found_entry, 0);
+    builder.ins().brif(
+        found,
+        inspect_replace,
+        &[old.into(), found_entry.into()],
+        inspect_missing,
+        &[],
+    );
+
+    builder.switch_to_block(inspect_replace);
+    let old = builder.block_params(inspect_replace)[0];
+    let found_entry = builder.block_params(inspect_replace)[1];
+    let unchanged = builder.ins().icmp(IntCC::Equal, old, value);
+    builder.ins().brif(
+        unchanged,
+        succeeded,
+        &[],
+        validate_replace,
+        &[old.into(), found_entry.into()],
+    );
+
+    builder.switch_to_block(validate_replace);
+    let old = builder.block_params(validate_replace)[0];
+    let found_entry = builder.block_params(validate_replace)[1];
+    let validate = module.declare_func_in_func(value_release_validate, builder.func);
+    let validation = builder.ins().call(validate, &[deopt_out, old]);
+    let valid = builder.inst_results(validation)[0];
+    builder.ins().brif(
+        valid,
+        replace,
+        &[old.into(), found_entry.into()],
+        failed,
+        &[],
+    );
+
+    builder.switch_to_block(replace);
+    let old = builder.block_params(replace)[0];
+    let found_entry = builder.block_params(replace)[1];
+    lower_optimizing_retain(builder, value, deopt_out);
+    builder.ins().store(
+        MemFlagsData::new(),
+        value,
+        found_entry,
+        std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
+    );
+    let commit = module.declare_func_in_func(value_release_commit, builder.func);
+    let release = builder.ins().call(commit, &[deopt_out, old]);
+    let released = builder.inst_results(release)[0];
+    builder.ins().brif(released, succeeded, &[], failed, &[]);
+
+    builder.switch_to_block(inspect_missing);
+    let array_tag = lower_value_has_tag(builder, array, crate::JIT_VALUE_RUNTIME_ARRAY_TAG);
+    let encoded_index = builder.ins().ireduce(types::I32, array);
+    let direct_index = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        encoded_index,
+        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+    );
+    let direct = builder.ins().band(array_tag, direct_index);
+    let inspect_array = builder.create_block();
+    builder.ins().brif(direct, inspect_array, &[], failed, &[]);
+
+    builder.switch_to_block(inspect_array);
+    let slot = lower_optimizing_slot_address(builder, array, deopt_out);
+    let kind = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+    );
+    let refcount = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, refcount) as i32,
+    );
+    let length = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+    );
+    let capacity = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, reserved) as i32,
+    );
+    let direct_kind = builder.ins().icmp_imm(
+        IntCC::Equal,
+        kind,
+        i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY),
+    );
+    let unique = builder.ins().icmp_imm(IntCC::Equal, refcount, 1);
+    let capacity = builder.ins().uextend(types::I64, capacity);
+    let room = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, length, capacity);
+    let (integer_key, integer_raw) = lower_optimizing_integer_candidate(builder, key, deopt_out);
+    let (string_key, _, _) = lower_native_string_key_descriptor(builder, key, deopt_out);
+    let supported_key = builder.ins().bor(integer_key, string_key);
+    let admitted = builder.ins().band(direct_kind, unique);
+    let admitted = builder.ins().band(admitted, room);
+    let admitted = builder.ins().band(admitted, supported_key);
+    builder.ins().brif(admitted, append, &[], failed, &[]);
+
+    builder.switch_to_block(append);
+    let entries = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, aux) as i32,
+    );
+    let entry_index = if pointer_type == types::I64 {
+        length
+    } else {
+        builder.ins().ireduce(pointer_type, length)
+    };
+    let entry_offset = builder.ins().ishl_imm(entry_index, 4);
+    let destination = builder.ins().iadd(entries, entry_offset);
+    lower_optimizing_retain(builder, key, deopt_out);
+    lower_optimizing_retain(builder, value, deopt_out);
+    builder
+        .ins()
+        .store(MemFlagsData::new(), key, destination, 0);
+    builder.ins().store(
+        MemFlagsData::new(),
+        value,
+        destination,
+        std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
+    );
+    let next_length = builder.ins().iadd_imm(length, 1);
+    builder.ins().store(
+        MemFlagsData::new(),
+        next_length,
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+    );
+
+    let state = lower_direct_array_state_address(builder, array, deopt_out);
+    let current_next = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, next_append_key) as i32,
+    );
+    let has_current_next = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, has_next_append_key) as i32,
+    );
+    let maximum_key = builder.ins().icmp_imm(IntCC::Equal, integer_raw, i64::MAX);
+    let incremented_key = builder.ins().iadd_imm(integer_raw, 1);
+    let candidate_next = builder
+        .ins()
+        .select(maximum_key, integer_raw, incremented_key);
+    let advances = builder
+        .ins()
+        .icmp(IntCC::SignedGreaterThan, candidate_next, current_next);
+    let absent = builder.ins().icmp_imm(IntCC::Equal, has_current_next, 0);
+    let advances = builder.ins().bor(absent, advances);
+    let advances = builder.ins().band(integer_key, advances);
+    let next_append_key = builder.ins().select(advances, candidate_next, current_next);
+    builder.ins().store(
+        MemFlagsData::new(),
+        next_append_key,
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, next_append_key) as i32,
+    );
+    let has_integer_key = builder.ins().icmp_imm(IntCC::NotEqual, integer_key, 0);
+    let had_next = builder.ins().icmp_imm(IntCC::NotEqual, has_current_next, 0);
+    let has_next = builder.ins().bor(has_integer_key, had_next);
+    let has_next = builder.ins().uextend(types::I32, has_next);
+    builder.ins().store(
+        MemFlagsData::new(),
+        has_next,
+        state,
+        std::mem::offset_of!(crate::JitNativeDirectArrayState, has_next_append_key) as i32,
+    );
+
+    let flags = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+    );
+    let cursor = builder
+        .ins()
+        .ushr_imm(flags, crate::JIT_NATIVE_DIRECT_ARRAY_CURSOR_SHIFT as i64);
+    let cursor_absent = builder.ins().icmp_imm(
+        IntCC::Equal,
+        cursor,
+        i64::from(crate::JIT_NATIVE_DIRECT_ARRAY_CURSOR_NONE),
+    );
+    let first = builder.ins().iconst(
+        types::I32,
+        i64::from(crate::JIT_NATIVE_DIRECT_ARRAY_ABI_VERSION),
+    );
+    let flags = builder.ins().select(cursor_absent, first, flags);
+    builder.ins().store(
+        MemFlagsData::new(),
+        flags,
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+    );
+    builder.ins().jump(succeeded, &[]);
+
+    builder.switch_to_block(succeeded);
+    let ok = builder.ins().iconst(types::I32, 0);
+    builder.ins().return_(&[ok, array]);
+
+    builder.switch_to_block(failed);
+    let error = builder.ins().iconst(types::I32, 1);
+    builder.ins().return_(&[error, array]);
+}
+
 fn lower_direct_value_release_validate_body(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
@@ -7773,6 +8078,112 @@ fn define_direct_array_child_entry_function(
         clif_blocks,
         alignment,
         relocations: Vec::new(),
+        native_pc_ranges: Vec::new(),
+        native_stack_bytes,
+        pre_regalloc,
+        maximum_temporary_cache_entries: 0,
+        production_lowering: Vec::new(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn define_direct_array_insert_prepared_function(
+    module: &mut JITModule,
+    ctx: &mut cranelift_codegen::Context,
+    builder_context: &mut FunctionBuilderContext,
+    func_id: FuncId,
+    symbol: FunctionId,
+    child_entry: FuncId,
+    child_entry_symbol: FunctionId,
+    value_release_validate: FuncId,
+    value_release_validate_symbol: FunctionId,
+    value_release_commit: FuncId,
+    value_release_commit_symbol: FunctionId,
+) -> Result<DefinedRegionFunction, CraneliftLoweringError> {
+    ctx.func.signature = direct_array_insert_prepared_signature(module);
+    ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+    {
+        let mut builder = FunctionBuilder::new(&mut ctx.func, builder_context);
+        lower_direct_array_insert_prepared_body(
+            module,
+            &mut builder,
+            child_entry,
+            value_release_validate,
+            value_release_commit,
+        );
+        builder.seal_all_blocks();
+        builder.finalize();
+    }
+    let verifier_flags = settings::Flags::new(settings::builder());
+    verify_function(&ctx.func, &verifier_flags).map_err(|error| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_VERIFIER",
+            format!("prepared direct array insert verifier failure: {error}"),
+        )
+    })?;
+    let clif_blocks = ctx.func.layout.blocks().count();
+    let pre_regalloc = PreRegallocMetrics {
+        blocks: clif_blocks,
+        values: ctx.func.dfg.num_values(),
+        instructions: ctx
+            .func
+            .layout
+            .blocks()
+            .map(|block| ctx.func.layout.block_insts(block).count())
+            .sum(),
+        block_parameters: ctx
+            .func
+            .layout
+            .blocks()
+            .map(|block| ctx.func.dfg.block_params(block).len())
+            .sum(),
+        ..PreRegallocMetrics::default()
+    };
+    module.define_function(func_id, ctx).map_err(|error| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_DEFINE",
+            format!("failed to define prepared direct array insert: {error}"),
+        )
+    })?;
+    let compiled = ctx.compiled_code().ok_or_else(|| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_CACHE_CODE",
+            "Cranelift returned no prepared direct array insert code",
+        )
+    })?;
+    let native_stack_bytes = compiled
+        .buffer
+        .frame_layout()
+        .map_or(0, |layout| layout.frame_to_fp_offset);
+    let code = compiled.code_buffer().to_vec();
+    let alignment = u64::from(compiled.buffer.alignment)
+        .max(module.isa().function_alignment().minimum as u64)
+        .max(module.isa().symbol_alignment());
+    let relocation_functions = BTreeMap::from([
+        (symbol, func_id),
+        (child_entry_symbol, child_entry),
+        (value_release_validate_symbol, value_release_validate),
+        (value_release_commit_symbol, value_release_commit),
+    ]);
+    let relocations = compiled
+        .buffer
+        .relocs()
+        .iter()
+        .map(|relocation| {
+            capture_relocation(
+                module,
+                ModuleReloc::from_mach_reloc(relocation, &ctx.func, func_id),
+                &relocation_functions,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    module.clear_context(ctx);
+    Ok(DefinedRegionFunction {
+        lowered_function: None,
+        code,
+        clif_blocks,
+        alignment,
+        relocations,
         native_pc_ranges: Vec::new(),
         native_stack_bytes,
         pre_regalloc,

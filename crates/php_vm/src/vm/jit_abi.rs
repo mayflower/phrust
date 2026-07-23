@@ -1873,6 +1873,11 @@ pub(super) struct NativeRequestColdState<'a> {
     /// Exact global constants resolved by their cold continuation once. This
     /// parallel continuation table owns one encoded value per published slot.
     trusted_constant_slots: Vec<php_jit::JitNativeTrustedConstantSlot>,
+    /// Request-owned native literal encodings, keyed by immutable compiled
+    /// unit identity. These slots remain in this request arena when include
+    /// symbol metadata moves through a nested VM.
+    trusted_literal_slots:
+        std::collections::BTreeMap<u64, Box<[php_jit::JitNativeTrustedLiteralSlot]>>,
     trusted_global_reference_slots: Vec<php_jit::JitNativeTrustedGlobalReferenceSlot>,
     trusted_global_reference_names: Vec<Option<Box<str>>>,
     trusted_static_local_slots: Vec<php_jit::JitNativeTrustedStaticLocalSlot>,
@@ -2070,6 +2075,10 @@ impl<'a> NativeRequestOwner<'a> {
         cold.trusted_globals_proxy = cold
             .encode_globals_proxy()
             .expect("request globals proxy must fit the native value arena");
+        // Every request owner, including the separately owned context used
+        // while executing an include/eval unit, publishes its active unit's
+        // literal table before any native entry can observe the runtime view.
+        cold.prepare_trusted_literal_slots();
         cold.prepare_trusted_constant_fetches();
         cold.prepare_trusted_request_locals();
         cold.prepare_trusted_global_references();
@@ -3291,6 +3300,7 @@ impl<'a> NativeRequestColdState<'a> {
             trusted_property_slots,
             trusted_closure_plans,
             trusted_constant_slots,
+            trusted_literal_slots: std::collections::BTreeMap::new(),
             trusted_global_reference_slots,
             trusted_global_reference_names,
             trusted_static_local_slots,
@@ -3418,6 +3428,63 @@ impl<'a> NativeRequestColdState<'a> {
             .collect::<std::collections::BTreeSet<_>>();
         for name in names {
             self.publish_trusted_constant_name(&name);
+        }
+    }
+
+    /// Publish every immutable source literal into the request-wide native
+    /// value plane once per compiled unit. Generated storage operations borrow
+    /// these slots and retain only when the value actually acquires an owner.
+    ///
+    /// Named and class constants are deliberately excluded: their PHP-visible
+    /// resolution remains a cold/exact operation and cannot be frozen as a
+    /// source literal.
+    fn prepare_trusted_literal_slots(&mut self) {
+        let identity = self.unit_identity;
+        if self.trusted_literal_slots.contains_key(&identity) {
+            return;
+        }
+        let constants = self.unit.constants.clone();
+        // Slot zero is an unreadable-state sentinel for branchless generated
+        // lookup when a dynamic value is not a unit literal. It must exist
+        // even for a constant-free unit.
+        let mut slots =
+            vec![php_jit::JitNativeTrustedLiteralSlot::default(); constants.len().max(1)];
+        for (index, constant) in constants.iter().enumerate() {
+            if matches!(
+                constant,
+                php_ir::IrConstant::NamedConstant(_) | php_ir::IrConstant::ClassConstant { .. }
+            ) {
+                continue;
+            }
+            let Ok(value) = self.encode_native_ir_constant_owned(constant) else {
+                continue;
+            };
+            slots[index] = php_jit::JitNativeTrustedLiteralSlot {
+                value,
+                state: php_jit::JIT_NATIVE_TRUSTED_LITERAL_PUBLISHED,
+                reserved: 0,
+            };
+        }
+        self.trusted_literal_slots
+            .insert(identity, slots.into_boxed_slice());
+    }
+
+    fn clear_trusted_literal_slots(&mut self) {
+        let values = std::mem::take(&mut self.trusted_literal_slots)
+            .into_values()
+            .flat_map(|slots| {
+                slots
+                    .into_vec()
+                    .into_iter()
+                    .filter_map(|slot| {
+                        (slot.state == php_jit::JIT_NATIVE_TRUSTED_LITERAL_PUBLISHED)
+                            .then_some(slot.value)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for value in values {
+            let _ = self.release_if_live(value);
         }
     }
 
@@ -4061,6 +4128,7 @@ impl<'a> NativeRequestColdState<'a> {
 
     pub(super) fn recycle_native_request_buffers(&mut self) {
         self.clear_trusted_constant_fetches();
+        self.clear_trusted_literal_slots();
         self.clear_trusted_request_locals();
         self.clear_trusted_global_references();
         self.clear_trusted_static_locals();
@@ -4272,6 +4340,7 @@ impl<'a> NativeRequestColdState<'a> {
             native_entry_signature_epochs,
         });
         debug_assert_eq!(unit, 0, "immutable deployment must be the root native unit");
+        self.prepare_trusted_literal_slots();
         self.deployment_functions = std::sync::Arc::clone(&deployment.function_exports);
         self.deployment_classes = std::sync::Arc::clone(&deployment.exported_classes);
         self.current_dynamic_unit = Some(unit);
@@ -10116,13 +10185,6 @@ impl<'a> NativeRequestColdState<'a> {
         unit: usize,
         operation: impl FnOnce(&mut Self) -> R,
     ) -> Result<R, String> {
-        // Request globals outlive every compiled-unit activation. Generated
-        // direct reference stores may leave a literal indexed by the current
-        // unit in their authoritative payload; rehome those roots once while
-        // that unit is still active, before publishing another unit's runtime
-        // view. This is the native ownership boundary, not a per-operation
-        // compatibility decode.
-        self.stabilize_native_global_roots_for_cross_unit()?;
         let compiled = self
             .dynamic_units
             .get(unit)
@@ -10211,6 +10273,7 @@ impl<'a> NativeRequestColdState<'a> {
         );
         let previous_class_plans = std::mem::take(&mut self.trusted_class_plans);
         let previous_dynamic_unit = self.current_dynamic_unit.replace(unit);
+        self.prepare_trusted_literal_slots();
         self.prepare_trusted_static_properties();
         self.prepare_trusted_constant_fetches();
         self.prepare_trusted_request_locals();
@@ -10228,10 +10291,6 @@ impl<'a> NativeRequestColdState<'a> {
         // indirect-call arbitrary data as an address.
         let _runtime_view = activate_native_context(self);
         let result = operation(self);
-        // A callee may publish its own unit-local constants into a request
-        // global. Rehome those direct graph leaves before restoring the
-        // caller's constant table, symmetrically with the entry-side transfer.
-        self.stabilize_native_global_roots_for_cross_unit()?;
 
         let active_entries = std::mem::replace(&mut self.native_entries, previous_entries);
         self.dynamic_units
@@ -10262,19 +10321,6 @@ impl<'a> NativeRequestColdState<'a> {
         self.unit = previous_unit;
         self.compiled = previous_compiled;
         Ok(result)
-    }
-
-    fn stabilize_native_global_roots_for_cross_unit(&mut self) -> Result<(), String> {
-        let global_roots = self
-            .native_global_reference_handles
-            .values()
-            .copied()
-            .collect::<Vec<_>>();
-        let mut visited = std::collections::BTreeSet::new();
-        for root in global_roots {
-            self.stabilize_cross_unit_graph_value(root, &mut visited)?;
-        }
-        Ok(())
     }
 
     fn direct_array_slot(&self, encoded: i64) -> Option<(usize, php_jit::JitNativeValueSlot)> {
@@ -12870,6 +12916,15 @@ pub(super) fn activate_native_context(
     context: &mut NativeRequestColdState<'_>,
 ) -> NativeRequestActivationGuard {
     let deployment = context.compiled.prepared_deployment_image();
+    let (trusted_literal_slots, trusted_literal_slot_count) = context
+        .trusted_literal_slots
+        .get(&context.unit_identity)
+        .map_or((0, 0), |slots| {
+            (
+                slots.as_ptr() as usize as u64,
+                u32::try_from(slots.len()).unwrap_or(u32::MAX),
+            )
+        });
     let view = php_jit::JitNativeRuntimeView {
         abi_version: php_jit::JIT_RUNTIME_ABI_VERSION,
         value_slot_capacity: u32::try_from(context.value_slots.capacity()).unwrap_or(u32::MAX),
@@ -12909,6 +12964,9 @@ pub(super) fn activate_native_context(
         trusted_constant_view_count: u32::try_from(deployment.constant_views.len())
             .unwrap_or(u32::MAX),
         trusted_constant_view_reserved: 0,
+        trusted_literal_slots,
+        trusted_literal_slot_count,
+        trusted_literal_slot_reserved: 0,
         trusted_constant_slots: context.trusted_constant_slots.as_mut_ptr() as usize as u64,
         trusted_constant_slot_count: u32::try_from(context.trusted_constant_slots.len())
             .unwrap_or(u32::MAX),
