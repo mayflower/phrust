@@ -6,7 +6,7 @@ pub use php_runtime::api::JitHelperId;
 
 /// Stable ABI fingerprint for the helper-symbol registry. Bumped whenever the
 /// registry's symbol set or any helper ABI changes.
-pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4820_0000_0023;
+pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4820_0000_0024;
 
 /// Helper argument kind.
 #[repr(u32)]
@@ -813,6 +813,33 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         has_side_effects: true,
         description: "exact native call_user_func_array callback handler",
     },
+    JitHelperSymbol {
+        id: JitHelperId(87),
+        name: "phrust_native_fopen",
+        args: NATIVE_EXACT_BUILTIN_6_ARGS,
+        returns: JitHelperReturnKind::ControlResult,
+        can_throw: true,
+        has_side_effects: true,
+        description: "exact prepared fopen stream-capability handler",
+    },
+    JitHelperSymbol {
+        id: JitHelperId(88),
+        name: "phrust_native_fwrite",
+        args: NATIVE_EXACT_BUILTIN_6_ARGS,
+        returns: JitHelperReturnKind::ControlResult,
+        can_throw: true,
+        has_side_effects: true,
+        description: "exact prepared fwrite stream-capability handler",
+    },
+    JitHelperSymbol {
+        id: JitHelperId(89),
+        name: "phrust_native_fclose",
+        args: NATIVE_EXACT_BUILTIN_6_ARGS,
+        returns: JitHelperReturnKind::ControlResult,
+        can_throw: true,
+        has_side_effects: true,
+        description: "exact prepared fclose stream-capability handler",
+    },
 ];
 
 /// Looks up a helper by stable id.
@@ -871,6 +898,9 @@ pub fn resolve_helper_address(
         "phrust_native_dirname" => Some(runtime.native_dirname),
         "phrust_native_realpath" => Some(runtime.native_realpath),
         "phrust_native_file_exists" => Some(runtime.native_file_exists),
+        "phrust_native_fopen" => Some(runtime.native_fopen),
+        "phrust_native_fwrite" => Some(runtime.native_fwrite),
+        "phrust_native_fclose" => Some(runtime.native_fclose),
         "phrust_native_call_user_func" => Some(runtime.native_call_user_func),
         "phrust_native_call_user_func_array" => Some(runtime.native_call_user_func_array),
         "phrust_jit_native_semantic_dispatch" => Some(runtime.native_semantic_dispatch),
@@ -962,7 +992,7 @@ mod tests {
             JIT_HELPER_SYMBOLS.first().expect("first").id,
             JitHelperId(14)
         );
-        assert_eq!(JIT_HELPER_SYMBOLS.last().expect("last").id, JitHelperId(86));
+        assert_eq!(JIT_HELPER_SYMBOLS.last().expect("last").id, JitHelperId(89));
     }
 
     #[test]

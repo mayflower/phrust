@@ -26,6 +26,33 @@ pub(super) fn native_string(value: Value) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Applies PHP's scalar-to-string parameter coercion directly to an encoded
+/// native operand. Unsupported aggregate/resource shapes stay on their one
+/// baseline continuation; admitted scalars never materialize a Rust `Value`.
+fn native_encoded_string(
+    context: &NativeRequestColdState<'_>,
+    encoded: i64,
+) -> Result<Vec<u8>, String> {
+    let encoded = context.dereference_direct_encoding(encoded);
+    match context.native_encoded_value_kind(encoded) {
+        Some(NativeEncodedValueKind::String) => context
+            .native_string_name_bytes(encoded)
+            .ok_or_else(|| "native string operand has no stable bytes".to_owned()),
+        Some(NativeEncodedValueKind::Int) => context
+            .native_encoded_int(encoded)
+            .map(|value| value.to_string().into_bytes())
+            .ok_or_else(|| "native integer operand has no stable payload".to_owned()),
+        Some(NativeEncodedValueKind::Float) => context
+            .native_encoded_float(encoded)
+            .map(|value| value.to_string().into_bytes())
+            .ok_or_else(|| "native float operand has no stable payload".to_owned()),
+        Some(NativeEncodedValueKind::Bool(true)) => Ok(b"1".to_vec()),
+        Some(NativeEncodedValueKind::Bool(false) | NativeEncodedValueKind::Null) => Ok(Vec::new()),
+        Some(kind) => Err(format!("native builtin expected string, got {kind:?}")),
+        None => Err("native builtin expected a stable string operand".to_owned()),
+    }
+}
+
 fn native_dereference_value(mut value: Value) -> Value {
     // Native call metadata may wrap a value more than once while it crosses
     // foreach, method, and builtin boundaries. PHP references are transparent
@@ -3876,8 +3903,8 @@ pub(super) fn execute_baseline_native_builtin(
             let [path, mode] = arguments else {
                 return Err("fopen() expects exactly 2 arguments".to_owned());
             };
-            let path = native_string(context.decode(*path)?)?;
-            let mode = native_string(context.decode(*mode)?)?;
+            let path = native_encoded_string(context, *path)?;
+            let mode = native_encoded_string(context, *mode)?;
             let path_text = String::from_utf8_lossy(&path).into_owned();
             let mode = String::from_utf8_lossy(&mode);
             let resource = php_runtime::api::StreamWrapperRegistry::new()
@@ -3890,14 +3917,14 @@ pub(super) fn execute_baseline_native_builtin(
                     &context.options.runtime_context.stdin,
                 )
                 .map_err(|error| error.message().to_owned())?;
-            context.encode(Value::Resource(resource))
+            context.encode_native_resource_owner(resource)
         }
         "fwrite" => {
             let [resource, data, ..] = arguments else {
                 return Err("fwrite() expects at least 2 arguments".to_owned());
             };
-            let data = native_string(context.decode(*data)?)?;
-            if let Value::Resource(resource) = context.decode(*resource)? {
+            let data = native_encoded_string(context, *data)?;
+            if let Some(resource) = context.native_resource(*resource) {
                 let written = resource
                     .write_bytes(&data)
                     .map_err(|error| format!("fwrite() failed to write stream resource: {error}"));
@@ -3921,7 +3948,7 @@ pub(super) fn execute_baseline_native_builtin(
             let [resource] = arguments else {
                 return Err("fclose() expects exactly 1 argument".to_owned());
             };
-            if let Value::Resource(resource) = context.decode(*resource)? {
+            if let Some(resource) = context.native_resource(*resource) {
                 return context.encode(Value::Bool(resource.close()));
             }
             Err("fclose() expects a stream resource".to_owned())

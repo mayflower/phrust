@@ -2,10 +2,10 @@ use super::executable_region::{
     instruction_has_native_transition, select_native_region_tier, validate_pre_regalloc_structure,
 };
 use super::{
-    CraneliftNativeCompiler, NativeCompilePlan, StableCallbackBuiltin, StableSymbolQueryBuiltin,
-    build_trivial_add_clif_smoke, native_dim_operation, native_local_store_operation,
-    ordinary_local_fast_path, runtime_helper_abi_hash, stable_builtin_dense_id,
-    stable_builtin_symbol_query, stable_builtin_type_predicate,
+    CraneliftNativeCompiler, NativeCompilePlan, StableCallbackBuiltin, StablePathBuiltin,
+    StableSymbolQueryBuiltin, build_trivial_add_clif_smoke, native_dim_operation,
+    native_local_store_operation, ordinary_local_fast_path, runtime_helper_abi_hash,
+    stable_builtin_dense_id, stable_builtin_symbol_query, stable_builtin_type_predicate,
 };
 use crate::region_ir::{
     BaselineRegionBuilder, CompileMetadata, NativeCompilerTier, RegionCallTarget,
@@ -122,6 +122,9 @@ fn assert_optimizing_artifact(handle: &crate::JitFunctionHandle) {
                         .iter()
                         .any(|builtin| builtin.symbol() == symbol)
                     || StableCallbackBuiltin::all()
+                        .iter()
+                        .any(|builtin| builtin.symbol() == symbol)
+                    || StablePathBuiltin::all()
                         .iter()
                         .any(|builtin| builtin.symbol() == symbol) =>
             {
@@ -260,6 +263,111 @@ fn optimizing_callback_builtin_uses_exact_native_abi() {
         77
     );
     assert_eq!(EXACT_CALLBACK_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn optimizing_stream_family_imports_only_exact_resource_handlers() {
+    let mut builder = IrBuilder::new(UnitId::new(4_243));
+    let file = builder.add_file("optimizing-exact-resource-stream.php");
+    let span = IrSpan::new(file, 0, 1);
+    let function = builder.start_function(
+        "optimizing_exact_resource_stream",
+        FunctionFlags::default(),
+        span,
+    );
+    let block = builder.append_block(function);
+    let path = builder.intern_constant(IrConstant::String("php://memory".to_owned()));
+    let mode = builder.intern_constant(IrConstant::String("w+".to_owned()));
+    let data = builder.intern_constant(IrConstant::String("native".to_owned()));
+    let argument = |value| IrCallArg {
+        name: None,
+        value,
+        unpack: false,
+        value_kind: IrCallArgValueKind::Direct,
+        by_ref_local: None,
+        by_ref_dim: None,
+        by_ref_property: None,
+        by_ref_property_dim: None,
+    };
+
+    let resource = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: resource,
+            name: "fopen".to_owned(),
+            args: vec![
+                argument(Operand::Constant(path)),
+                argument(Operand::Constant(mode)),
+            ],
+        },
+        span,
+    );
+    let written = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: written,
+            name: "fwrite".to_owned(),
+            args: vec![
+                argument(Operand::Register(resource)),
+                argument(Operand::Constant(data)),
+            ],
+        },
+        span,
+    );
+    let closed = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: closed,
+            name: "fclose".to_owned(),
+            args: vec![argument(Operand::Register(resource))],
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(closed)), span);
+    let unit = builder.finish();
+
+    let mut backend = CraneliftNativeCompiler;
+    let exact = return_exact_builtin_first_argument as *const () as usize;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.optimizing.exact-resource-stream").with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_builtin_dispatch: forbidden_call_dispatch as *const () as usize,
+            native_fopen: exact,
+            native_fwrite: exact,
+            native_fclose: exact,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("optimizing exact resource handle");
+    assert_optimizing_artifact(&handle);
+    let helpers = handle
+        .relocatable_code()
+        .expect("optimizer relocatable artifact")
+        .relocations
+        .iter()
+        .filter_map(|relocation| match &relocation.target {
+            crate::JitRelocatableTarget::Helper(symbol) => Some(symbol.as_str()),
+            crate::JitRelocatableTarget::InternalFunction(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        helpers,
+        vec![
+            "phrust_native_fopen",
+            "phrust_native_fwrite",
+            "phrust_native_fclose",
+        ]
+    );
+    assert!(!helpers.contains(&"phrust_baseline_native_builtin_dispatch"));
 }
 
 #[test]
@@ -771,6 +879,22 @@ extern "C" fn return_exact_callback_argument(
     assert_eq!(argument_count, 2);
     assert!(!transition_state.is_null());
     EXACT_CALLBACK_CALLS.fetch_add(1, Ordering::SeqCst);
+    crate::JitNativeControlResult::returning(argument)
+}
+
+extern "C" fn return_exact_builtin_first_argument(
+    _runtime: *mut std::ffi::c_void,
+    _source_file: u32,
+    _source_start: u32,
+    _source_end: u32,
+    _argument_count: u32,
+    argument: i64,
+    _argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> crate::JitNativeControlResult {
     crate::JitNativeControlResult::returning(argument)
 }
 

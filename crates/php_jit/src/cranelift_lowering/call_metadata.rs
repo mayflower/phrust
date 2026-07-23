@@ -415,10 +415,13 @@ pub(super) enum StablePathBuiltin {
     Dirname,
     Realpath,
     FileExists,
+    Fopen,
+    Fwrite,
+    Fclose,
 }
 
 impl StablePathBuiltin {
-    pub(super) const COUNT: usize = 4;
+    pub(super) const COUNT: usize = 7;
 
     pub(super) const fn index(self) -> usize {
         match self {
@@ -426,6 +429,9 @@ impl StablePathBuiltin {
             Self::Dirname => 1,
             Self::Realpath => 2,
             Self::FileExists => 3,
+            Self::Fopen => 4,
+            Self::Fwrite => 5,
+            Self::Fclose => 6,
         }
     }
 
@@ -435,6 +441,9 @@ impl StablePathBuiltin {
             Self::Dirname => "phrust_native_dirname",
             Self::Realpath => "phrust_native_realpath",
             Self::FileExists => "phrust_native_file_exists",
+            Self::Fopen => "phrust_native_fopen",
+            Self::Fwrite => "phrust_native_fwrite",
+            Self::Fclose => "phrust_native_fclose",
         }
     }
 
@@ -442,6 +451,11 @@ impl StablePathBuiltin {
         match self {
             Self::Basename | Self::Dirname => arity == 1 || arity == 2,
             Self::Realpath | Self::FileExists => arity == 1,
+            // Optional fopen include-path/context shapes retain their one
+            // baseline continuation until those capabilities are published.
+            Self::Fopen => arity == 2,
+            Self::Fwrite => arity == 2 || arity == 3,
+            Self::Fclose => arity == 1,
         }
     }
 
@@ -451,6 +465,9 @@ impl StablePathBuiltin {
             Self::Dirname,
             Self::Realpath,
             Self::FileExists,
+            Self::Fopen,
+            Self::Fwrite,
+            Self::Fclose,
         ]
     }
 }
@@ -468,6 +485,9 @@ pub(super) fn stable_builtin_path(target: &RegionCallTarget) -> Option<StablePat
         "dirname" => Some(StablePathBuiltin::Dirname),
         "realpath" => Some(StablePathBuiltin::Realpath),
         "file_exists" => Some(StablePathBuiltin::FileExists),
+        "fopen" => Some(StablePathBuiltin::Fopen),
+        "fwrite" => Some(StablePathBuiltin::Fwrite),
+        "fclose" => Some(StablePathBuiltin::Fclose),
         _ => None,
     }
 }

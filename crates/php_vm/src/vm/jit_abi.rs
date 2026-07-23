@@ -35,7 +35,8 @@ pub(super) use call_dispatch::{
     jit_native_basename_abi, jit_native_call_dispatch_abi, jit_native_call_dispatch_diagnostic_abi,
     jit_native_call_user_func_abi, jit_native_call_user_func_array_abi,
     jit_native_class_exists_abi, jit_native_defined_abi, jit_native_dirname_abi,
-    jit_native_enum_exists_abi, jit_native_file_exists_abi, jit_native_function_exists_abi,
+    jit_native_enum_exists_abi, jit_native_fclose_abi, jit_native_file_exists_abi,
+    jit_native_fopen_abi, jit_native_function_exists_abi, jit_native_fwrite_abi,
     jit_native_interface_exists_abi, jit_native_json_decode_abi, jit_native_json_encode_abi,
     jit_native_json_last_error_abi, jit_native_json_last_error_msg_abi,
     jit_native_json_validate_abi, jit_native_method_exists_abi, jit_native_preg_filter_abi,
@@ -128,6 +129,9 @@ pub(super) struct NativeRequestFastState {
     ini_registry: *const php_runtime::api::IniRegistry,
     cwd: *const std::path::PathBuf,
     filesystem_capabilities: *const php_runtime::api::FilesystemCapabilities,
+    stdin: *const std::sync::Arc<[u8]>,
+    resources: *mut php_runtime::api::ResourceTable,
+    direct_resource_handles: *mut std::collections::HashMap<u64, u32>,
 }
 
 impl NativeRequestFastState {
@@ -141,6 +145,25 @@ impl NativeRequestFastState {
         let cwd = unsafe { self.cwd.as_ref() }?;
         let filesystem = unsafe { self.filesystem_capabilities.as_ref() }?;
         Some((cwd.as_path(), filesystem))
+    }
+
+    /// Borrows only the capabilities needed to open a stream. These pointers
+    /// are published directly from request-owned fields; no cold execution
+    /// coordinator or generic builtin registry is recovered.
+    #[allow(unsafe_code)]
+    fn native_stream_open_capability(
+        &mut self,
+    ) -> Option<(
+        &mut php_runtime::api::ResourceTable,
+        &std::path::Path,
+        &php_runtime::api::FilesystemCapabilities,
+        &[u8],
+    )> {
+        let resources = unsafe { self.resources.as_mut() }?;
+        let cwd = unsafe { self.cwd.as_ref() }?;
+        let filesystem = unsafe { self.filesystem_capabilities.as_ref() }?;
+        let stdin = unsafe { self.stdin.as_ref() }?;
+        Some((resources, cwd.as_path(), filesystem, stdin.as_ref()))
     }
 
     #[allow(unsafe_code)]
@@ -287,6 +310,93 @@ impl NativeRequestFastState {
         // before the direct object descriptor becomes visible.
         let owner = unsafe { *owners.add(index) } as usize as *const php_runtime::api::ObjectRef;
         unsafe { owner.as_ref() }
+    }
+
+    /// Borrows a direct resource capability, transparently following a
+    /// bounded direct-reference chain. The ResourceRef owner is stored in the
+    /// slot itself and remains stable through this synchronous exact call.
+    #[allow(unsafe_code)]
+    fn native_resource_view(&self, mut encoded: i64) -> Option<&php_runtime::api::ResourceRef> {
+        for _ in 0..16 {
+            let (_, slot) = self.direct_slot(encoded)?;
+            match slot.kind {
+                php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE
+                    if slot.flags == php_jit::JIT_NATIVE_DIRECT_RESOURCE_ABI_VERSION
+                        && slot.aux != 0 =>
+                {
+                    let owner = slot.aux as usize as *const php_runtime::api::ResourceRef;
+                    return unsafe { owner.as_ref() };
+                }
+                php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR
+                    if slot.flags == php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION
+                        && slot.reserved != php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_EMPTY =>
+                {
+                    encoded = slot.payload as i64;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Publishes a freshly created resource into the authoritative direct
+    /// plane and records its request identity without constructing `Value`.
+    #[allow(unsafe_code)]
+    fn publish_direct_resource(
+        &mut self,
+        resource: php_runtime::api::ResourceRef,
+    ) -> Result<i64, &'static str> {
+        let resource_id = resource.id().get();
+        let handles = unsafe { self.direct_resource_handles.as_mut() }
+            .ok_or("direct resource identity table is unavailable")?;
+        if let Some(index) = handles.get(&resource_id).copied() {
+            let view = self.header.runtime_view;
+            let slots = view.direct_value_slots as usize as *mut php_jit::JitNativeValueSlot;
+            let slot = unsafe { &mut *slots.add(index as usize) };
+            if slot.refcount == 0
+                || slot.kind != php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE
+                || slot.flags != php_jit::JIT_NATIVE_DIRECT_RESOURCE_ABI_VERSION
+                || slot.payload != resource_id
+            {
+                return Err("direct resource identity points at a dead slot");
+            }
+            slot.refcount = slot
+                .refcount
+                .checked_add(1)
+                .ok_or("direct resource refcount overflow")?;
+            let runtime_index = index
+                .checked_add(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE)
+                .ok_or("direct resource handle overflow")?;
+            return Ok(php_jit::jit_encode_typed_runtime_value(
+                runtime_index,
+                php_jit::JIT_VALUE_RUNTIME_RESOURCE_TAG,
+            ));
+        }
+
+        let index = self.reserve_direct_value_index()?;
+        let runtime_index = index + php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE;
+        let owner = Box::into_raw(Box::new(resource));
+        let slots = self.header.runtime_view.direct_value_slots as usize
+            as *mut php_jit::JitNativeValueSlot;
+        unsafe {
+            *slots.add(index as usize) = php_jit::JitNativeValueSlot {
+                // One owner is returned to generated code; the request-wide
+                // identity table holds the second until arena recycling.
+                // Ordinary SSA release therefore never needs a Rust-drop
+                // continuation for this opaque capability.
+                refcount: 2,
+                kind: php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE,
+                flags: php_jit::JIT_NATIVE_DIRECT_RESOURCE_ABI_VERSION,
+                reserved: 0,
+                payload: resource_id,
+                aux: owner as usize as u64,
+            };
+        }
+        handles.insert(resource_id, index);
+        Ok(php_jit::jit_encode_typed_runtime_value(
+            runtime_index,
+            php_jit::JIT_VALUE_RUNTIME_RESOURCE_TAG,
+        ))
     }
 
     #[allow(unsafe_code)]
@@ -1135,6 +1245,13 @@ impl NativeRequestFastState {
     }
 
     #[allow(unsafe_code)]
+    fn write_output_slice(&self, bytes: &[u8]) -> Result<(), &'static str> {
+        let output = unsafe { self.output.as_mut() }.ok_or("native output is unavailable")?;
+        output.write_bytes(bytes);
+        Ok(())
+    }
+
+    #[allow(unsafe_code)]
     fn retain_direct_encoded(&mut self, encoded: i64) -> Result<(), &'static str> {
         let Some(runtime_index) = php_jit::jit_decode_runtime_value(encoded) else {
             return Ok(());
@@ -1453,6 +1570,9 @@ pub(super) struct NativeRequestColdState<'a> {
     /// writes use the direct reference payload without rebuilding its graph.
     native_global_reference_handles: std::collections::BTreeMap<String, i64>,
     direct_object_handles: std::collections::HashMap<u64, u32>,
+    /// Request-wide identity for direct resource capabilities. The stable
+    /// `ResourceRef` owner lives in the direct value slot's `aux` pointer.
+    direct_resource_handles: std::collections::HashMap<u64, u32>,
     /// Request-wide identity for authoritative direct closure records. The
     /// record itself is owned by the direct value slot's `aux` pointer.
     direct_closure_handles: std::collections::HashMap<u64, u32>,
@@ -1622,6 +1742,11 @@ impl<'a> NativeRequestOwner<'a> {
         fast.json_state = std::ptr::from_mut(cold.builtin_request_state.json_mut());
         fast.pcre_state = std::ptr::from_mut(cold.builtin_request_state.pcre_mut());
         fast.ini_registry = std::ptr::from_ref(&cold.ini_registry);
+        fast.cwd = std::ptr::from_ref(&cold.cwd);
+        fast.filesystem_capabilities = std::ptr::from_ref(&cold.options.runtime_context.filesystem);
+        fast.stdin = std::ptr::from_ref(&cold.options.runtime_context.stdin);
+        fast.resources = std::ptr::from_mut(&mut cold.resources);
+        fast.direct_resource_handles = std::ptr::from_mut(&mut cold.direct_resource_handles);
         cold.trusted_globals_proxy = cold
             .encode_globals_proxy()
             .expect("request globals proxy must fit the native value arena");
@@ -2642,6 +2767,7 @@ impl<'a> NativeRequestColdState<'a> {
             direct_reference_cells: std::collections::HashMap::new(),
             native_global_reference_handles: std::collections::BTreeMap::new(),
             direct_object_handles: std::collections::HashMap::new(),
+            direct_resource_handles: std::collections::HashMap::new(),
             direct_closure_handles: std::collections::HashMap::new(),
             direct_fiber_handles: std::collections::HashMap::new(),
             direct_fiber_cells: std::collections::HashMap::new(),
@@ -3565,6 +3691,8 @@ impl<'a> NativeRequestColdState<'a> {
         self.direct_reference_cells.clear();
         self.native_global_reference_handles.clear();
         self.direct_object_handles.clear();
+        debug_assert!(self.direct_resource_handles.is_empty());
+        self.direct_resource_handles.clear();
         debug_assert!(self.direct_closure_handles.is_empty());
         self.direct_closure_handles.clear();
         self.direct_fiber_handles.clear();
@@ -4447,6 +4575,38 @@ impl<'a> NativeRequestColdState<'a> {
         unsafe { owner.as_ref().cloned() }
     }
 
+    /// Clones the stable resource capability owned directly by one live
+    /// native slot. No `Value` or cold handle lookup participates.
+    #[allow(unsafe_code)]
+    fn direct_resource(&self, index: usize) -> Option<php_runtime::api::ResourceRef> {
+        let slot = *self.direct_value_slots.get(index)?;
+        if slot.refcount == 0
+            || slot.kind != php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE
+            || slot.flags != php_jit::JIT_NATIVE_DIRECT_RESOURCE_ABI_VERSION
+            || slot.aux == 0
+        {
+            return None;
+        }
+        let owner = slot.aux as usize as *const php_runtime::api::ResourceRef;
+        // SAFETY: publication installs exactly one boxed ResourceRef before
+        // exposing the slot, and final release reclaims it exactly once.
+        unsafe { owner.as_ref().cloned() }
+    }
+
+    /// Resolves a resource operand without crossing the Rust `Value` plane.
+    /// Direct references are transparent to by-value builtin parameters.
+    fn native_resource(&self, encoded: i64) -> Option<php_runtime::api::ResourceRef> {
+        let encoded = self.dereference_direct_encoding(encoded);
+        if let Some(index) = Self::direct_value_index(encoded) {
+            return self.direct_resource(index);
+        }
+        let index = php_jit::jit_decode_runtime_value(encoded)? as usize;
+        match self.values.get(index)?.as_ref()? {
+            NativeStoredValue::Php(Value::Resource(resource)) => Some(resource.clone()),
+            _ => None,
+        }
+    }
+
     /// Borrows the authoritative closure record published directly by this
     /// value slot. The pointer is stable until the final encoded owner is
     /// released; no `NativeStoredValue` mirror participates in lookup.
@@ -5180,6 +5340,66 @@ impl<'a> NativeRequestColdState<'a> {
             .and_then(|index| index.checked_add(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE))
             .ok_or_else(|| "direct native value handle overflow".to_owned())?;
         Ok((php_jit::JIT_VALUE_RUNTIME_FLOAT_TAG | u64::from(runtime_index)) as i64)
+    }
+
+    /// Publishes one opaque PHP resource capability directly. The slot owns
+    /// ResourceRef identity and lifetime; ordinary calls never wrap it in a
+    /// Rust `Value` or allocate a compatibility handle.
+    fn encode_native_resource_owner(
+        &mut self,
+        resource: php_runtime::api::ResourceRef,
+    ) -> Result<i64, String> {
+        let resource_id = resource.id().get();
+        if let Some(index) = self.direct_resource_handles.get(&resource_id).copied() {
+            let slot = self
+                .direct_value_slots
+                .get_mut(index as usize)
+                .filter(|slot| {
+                    slot.refcount != 0
+                        && slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE
+                        && slot.flags == php_jit::JIT_NATIVE_DIRECT_RESOURCE_ABI_VERSION
+                        && slot.payload == resource_id
+                })
+                .ok_or_else(|| {
+                    "direct native resource identity points at a dead slot".to_owned()
+                })?;
+            slot.refcount = slot
+                .refcount
+                .checked_add(1)
+                .ok_or_else(|| "direct native resource refcount overflow".to_owned())?;
+            let runtime_index = index
+                .checked_add(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE)
+                .ok_or_else(|| "direct native resource handle overflow".to_owned())?;
+            return Ok(php_jit::jit_encode_typed_runtime_value(
+                runtime_index,
+                php_jit::JIT_VALUE_RUNTIME_RESOURCE_TAG,
+            ));
+        }
+
+        let index = self.reserve_direct_value_slot()?;
+        let runtime_index = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE))
+            .ok_or_else(|| "direct native resource handle overflow".to_owned())?;
+        let owner = Box::into_raw(Box::new(resource));
+        self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
+            // The identity table owns one request-lifetime native reference
+            // in addition to the encoded owner returned to the caller.
+            refcount: 2,
+            kind: php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE,
+            flags: php_jit::JIT_NATIVE_DIRECT_RESOURCE_ABI_VERSION,
+            payload: resource_id,
+            aux: owner as usize as u64,
+            ..php_jit::JitNativeValueSlot::default()
+        };
+        self.direct_resource_handles.insert(
+            resource_id,
+            u32::try_from(index).map_err(|_| "direct native resource index overflow".to_owned())?,
+        );
+        Ok(php_jit::jit_encode_typed_runtime_value(
+            runtime_index,
+            php_jit::JIT_VALUE_RUNTIME_RESOURCE_TAG,
+        ))
     }
 
     /// Publishes one PHP reference identity with its contained value owned by
@@ -6134,6 +6354,12 @@ impl<'a> NativeRequestColdState<'a> {
                 .ok_or_else(|| format!("direct native object {index} has no stable owner"))?;
             return Ok(Value::Object(object));
         }
+        if slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE {
+            let resource = self
+                .direct_resource(index)
+                .ok_or_else(|| format!("direct native resource {index} has no stable owner"))?;
+            return Ok(Value::Resource(resource));
+        }
         if slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR {
             if slot.flags != php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION
                 || slot.reserved == php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_EMPTY
@@ -6665,6 +6891,7 @@ impl<'a> NativeRequestColdState<'a> {
             Value::Callable(callable) => return self.encode_prepared_callable(callable),
             Value::Fiber(fiber) => return self.encode_native_fiber_owner(fiber),
             Value::Generator(generator) => return self.encode_native_generator_owner(generator),
+            Value::Resource(resource) => return self.encode_native_resource_owner(resource),
             value => value,
         };
         match &value {
@@ -7594,6 +7821,9 @@ impl<'a> NativeRequestColdState<'a> {
                 php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT => {
                     Some(NativeEncodedValueKind::Object)
                 }
+                php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE => {
+                    Some(NativeEncodedValueKind::Resource)
+                }
                 php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE => {
                     Some(NativeEncodedValueKind::Callable)
                 }
@@ -8211,6 +8441,24 @@ impl<'a> NativeRequestColdState<'a> {
         } else {
             None
         };
+        let released_resource = if slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE {
+            if slot.aux == 0 {
+                return Err(format!(
+                    "direct native resource {index} lost its stable owner"
+                ));
+            }
+            // SAFETY: resource publication created exactly one boxed
+            // ResourceRef and final direct-slot release reclaims it once.
+            #[allow(unsafe_code)]
+            let resource =
+                unsafe { Box::from_raw(slot.aux as usize as *mut php_runtime::api::ResourceRef) };
+            if self.direct_resource_handles.get(&resource.id().get()) == Some(&(index as u32)) {
+                self.direct_resource_handles.remove(&resource.id().get());
+            }
+            Some(resource)
+        } else {
+            None
+        };
         let released_callable = if slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE {
             if slot.aux == 0 {
                 return Err(format!(
@@ -8398,6 +8646,7 @@ impl<'a> NativeRequestColdState<'a> {
                 }
             }
         }
+        drop(released_resource);
         Ok(())
     }
 
@@ -11462,6 +11711,10 @@ pub(super) fn activate_native_context(
         (*context.fast_state).cwd = std::ptr::from_ref(&context.cwd);
         (*context.fast_state).filesystem_capabilities =
             std::ptr::from_ref(&context.options.runtime_context.filesystem);
+        (*context.fast_state).stdin = std::ptr::from_ref(&context.options.runtime_context.stdin);
+        (*context.fast_state).resources = std::ptr::from_mut(&mut context.resources);
+        (*context.fast_state).direct_resource_handles =
+            std::ptr::from_mut(&mut context.direct_resource_handles);
     }
     let runtime_view = php_jit::activate_native_runtime_view(view);
     NativeRequestActivationGuard {

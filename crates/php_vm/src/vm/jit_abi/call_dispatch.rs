@@ -1376,11 +1376,14 @@ fn exact_native_path(
     runtime: *mut NativeRequestFastState,
     operation: u8,
     argument_count: u32,
-    arguments: [i64; 2],
+    arguments: [i64; 3],
 ) -> php_jit::JitNativeControlResult {
     let accepted_arity = match operation {
         0 | 1 => argument_count == 1 || argument_count == 2,
         2 | 3 => argument_count == 1,
+        4 => argument_count == 2,
+        5 => argument_count == 2 || argument_count == 3,
+        6 => argument_count == 1,
         _ => false,
     };
     if !accepted_arity {
@@ -1391,6 +1394,95 @@ fn exact_native_path(
     // capability are inspected.
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
+    if operation == 4 {
+        let Some(path) = fast.native_string_view(arguments[0]) else {
+            return exact_query_baseline();
+        };
+        let Some(mode) = fast.native_string_view(arguments[1]) else {
+            return exact_query_baseline();
+        };
+        let path = String::from_utf8_lossy(path).into_owned();
+        let mode = String::from_utf8_lossy(mode).into_owned();
+        let Some((resources, cwd, filesystem, stdin)) = fast.native_stream_open_capability() else {
+            return exact_query_baseline();
+        };
+        let resource = php_runtime::api::StreamWrapperRegistry::new()
+            .open(resources, &path, &mode, cwd, filesystem, stdin);
+        return match resource {
+            Ok(resource) => match fast.publish_direct_resource(resource.clone()) {
+                Ok(encoded) => php_jit::JitNativeControlResult::returning(encoded),
+                Err(error) => {
+                    resource.close();
+                    with_native_context_for(runtime, "fopen", |context| {
+                        exact_builtin_runtime_error(context, error.to_owned())
+                    })
+                    .unwrap_or_else(exact_query_baseline)
+                }
+            },
+            Err(error) => with_native_context_for(runtime, "fopen", |context| {
+                exact_builtin_runtime_error(context, error.message().to_owned())
+            })
+            .unwrap_or_else(exact_query_baseline),
+        };
+    }
+    if operation == 5 {
+        let Some(resource) = fast.native_resource_view(arguments[0]).cloned() else {
+            return exact_query_baseline();
+        };
+        let Some(data) = fast.native_string_view(arguments[1]) else {
+            return exact_query_baseline();
+        };
+        let length = if argument_count == 3 {
+            let Some(php_runtime::api::NativePrintfScalar::Int(length)) =
+                fast.native_printf_scalar(arguments[2])
+            else {
+                return exact_query_baseline();
+            };
+            usize::try_from(length.max(0)).unwrap_or(usize::MAX)
+        } else {
+            data.len()
+        };
+        let data = &data[..data.len().min(length)];
+        let uri = resource.metadata().uri;
+        return match resource.write_bytes(data) {
+            Ok(written) => {
+                let output = match uri.as_str() {
+                    "php://stdout" => fast.write_output_slice(&data[..written]),
+                    "php://stderr" => {
+                        use std::io::Write as _;
+                        std::io::stderr()
+                            .lock()
+                            .write_all(&data[..written])
+                            .map_err(|_| "fwrite() failed to write stderr")
+                    }
+                    _ => Ok(()),
+                };
+                match output {
+                    Ok(()) => php_jit::JitNativeControlResult::returning(
+                        i64::try_from(written).unwrap_or(i64::MAX),
+                    ),
+                    Err(error) => with_native_context_for(runtime, "fwrite", |context| {
+                        exact_builtin_runtime_error(context, error.to_owned())
+                    })
+                    .unwrap_or_else(exact_query_baseline),
+                }
+            }
+            Err(error) => with_native_context_for(runtime, "fwrite", |context| {
+                exact_builtin_runtime_error(
+                    context,
+                    format!("fwrite() failed to write stream resource: {error}"),
+                )
+            })
+            .unwrap_or_else(exact_query_baseline),
+        };
+    }
+    if operation == 6 {
+        let Some(resource) = fast.native_resource_view(arguments[0]).cloned() else {
+            return exact_query_baseline();
+        };
+        return exact_query_return_bool(resource.close());
+    }
+
     let Some(path) = fast.native_string_view(arguments[0]) else {
         return exact_query_baseline();
     };
@@ -1432,7 +1524,7 @@ fn exact_native_path(
                 None => exact_query_baseline(),
             };
         }
-        _ => unreachable!("exact path operation was validated above"),
+        _ => unreachable!("exact path/resource operation was validated above"),
     };
     let Some(bytes) = bytes else {
         return exact_query_return_bool(false);
@@ -1465,7 +1557,7 @@ macro_rules! exact_native_path_abi {
                 runtime,
                 $operation,
                 argument_count,
-                [argument_0, argument_1],
+                [argument_0, argument_1, _argument_2],
             )
         }
     };
@@ -1475,6 +1567,9 @@ exact_native_path_abi!(jit_native_basename_abi, 0);
 exact_native_path_abi!(jit_native_dirname_abi, 1);
 exact_native_path_abi!(jit_native_realpath_abi, 2);
 exact_native_path_abi!(jit_native_file_exists_abi, 3);
+exact_native_path_abi!(jit_native_fopen_abi, 4);
+exact_native_path_abi!(jit_native_fwrite_abi, 5);
+exact_native_path_abi!(jit_native_fclose_abi, 6);
 
 #[allow(unsafe_code)]
 fn exact_callback_control_result(

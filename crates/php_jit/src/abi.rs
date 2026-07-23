@@ -11,13 +11,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use php_ir::{FunctionId, LocalId, RegId};
 
 /// Version for the C-compatible runtime ABI records.
-pub const JIT_RUNTIME_ABI_VERSION: u32 = 80;
+pub const JIT_RUNTIME_ABI_VERSION: u32 = 81;
 
 /// Stable ABI fingerprint for Cranelift ABI.
 ///
 /// This is updated only when a `repr(C)` boundary type changes layout or tag
 /// meaning. It is intentionally independent from Rust type names.
-pub const JIT_RUNTIME_ABI_HASH: u64 = 0x0dc1_a843_0000_0070;
+pub const JIT_RUNTIME_ABI_HASH: u64 = 0x0dc1_a843_0000_0071;
 
 /// No stable length is published for this runtime value slot.
 pub const JIT_NATIVE_VALUE_VIEW_NONE: u32 = 0;
@@ -69,6 +69,11 @@ pub const JIT_NATIVE_DIRECT_GENERATOR_ABI_VERSION: u32 = 1;
 /// Generator that crossed an explicit cold boundary. The native activation
 /// remains authoritative; a cached `GeneratorRef` supplies cold identity.
 pub const JIT_NATIVE_VALUE_VIEW_MATERIALIZED_GENERATOR: u32 = 18;
+/// Request-owned opaque resource capability. `payload` is the stable PHP
+/// resource ID and `aux` owns one boxed `ResourceRef` until final release.
+pub const JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE: u32 = 19;
+/// Layout/meaning version for a direct resource value slot.
+pub const JIT_NATIVE_DIRECT_RESOURCE_ABI_VERSION: u32 = 1;
 pub const JIT_NATIVE_SHARED_ARRAY_ABI_VERSION: u32 = 1;
 pub const JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_VERSION: u32 = 1;
 pub const JIT_NATIVE_TRUSTED_PROPERTY_SLOT_EMPTY: u32 = 0;
@@ -2154,7 +2159,7 @@ mod tests {
 
     #[test]
     fn c_abi_layout_is_stable() {
-        assert_eq!(JIT_RUNTIME_ABI_VERSION, 80);
+        assert_eq!(JIT_RUNTIME_ABI_VERSION, 81);
         assert_ne!(JIT_RUNTIME_ABI_HASH, 0);
         assert_eq!(size_of::<JitOpaqueHandle>(), 8);
         assert_eq!(size_of::<JitCValueTag>(), 4);

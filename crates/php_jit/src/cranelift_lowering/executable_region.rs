@@ -1837,6 +1837,9 @@ pub(super) fn compile_region_graph_native(
             StablePathBuiltin::Dirname => runtime_helpers.native_dirname,
             StablePathBuiltin::Realpath => runtime_helpers.native_realpath,
             StablePathBuiltin::FileExists => runtime_helpers.native_file_exists,
+            StablePathBuiltin::Fopen => runtime_helpers.native_fopen,
+            StablePathBuiltin::Fwrite => runtime_helpers.native_fwrite,
+            StablePathBuiltin::Fclose => runtime_helpers.native_fclose,
         };
         if address == 0 {
             return Err(CraneliftLoweringError::new(
@@ -3673,6 +3676,9 @@ pub(super) fn compile_region_graph_native(
                                         | "phrust_native_dirname"
                                         | "phrust_native_realpath"
                                         | "phrust_native_file_exists"
+                                        | "phrust_native_fopen"
+                                        | "phrust_native_fwrite"
+                                        | "phrust_native_fclose"
                                         | "phrust_native_call_user_func"
                                         | "phrust_native_call_user_func_array"
                                 ) =>

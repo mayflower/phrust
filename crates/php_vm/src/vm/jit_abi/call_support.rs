@@ -50,6 +50,7 @@ pub(super) fn authoritative_native_call_value_is_admitted(
             | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY
             | php_jit::JIT_NATIVE_VALUE_VIEW_FLOAT
             | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT
+            | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE
             | php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE
             | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER => return true,
             php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_GENERATOR => return true,
