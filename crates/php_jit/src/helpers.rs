@@ -109,8 +109,9 @@ const NATIVE_OP_5_ARGS: &[JitHelperArgKind] = &[
 ];
 const NATIVE_CONTEXT_VALUE_OUT_ARGS: &[JitHelperArgKind] =
     &[JitHelperArgKind::Value, JitHelperArgKind::U64];
-const NATIVE_CONTEXT_VALUE_OUT_3_ARGS: &[JitHelperArgKind] = &[
+const NATIVE_CONTEXT_VALUE_OUT_4_ARGS: &[JitHelperArgKind] = &[
     JitHelperArgKind::Value,
+    JitHelperArgKind::U64,
     JitHelperArgKind::U64,
     JitHelperArgKind::U64,
     JitHelperArgKind::U64,
@@ -383,7 +384,7 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
     JitHelperSymbol {
         id: JitHelperId(38),
         name: "phrust_native_foreach_next",
-        args: NATIVE_CONTEXT_VALUE_OUT_3_ARGS,
+        args: NATIVE_CONTEXT_VALUE_OUT_4_ARGS,
         returns: JitHelperReturnKind::Status,
         can_throw: true,
         has_side_effects: true,

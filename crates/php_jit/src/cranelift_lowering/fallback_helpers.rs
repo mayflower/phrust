@@ -421,6 +421,7 @@ pub(super) extern "C" fn test_native_foreach_next_fallback(
     _key_out: *mut i64,
     _value_out: *mut i64,
     _has_out: *mut i64,
+    _state_out: *mut crate::JitDeoptState,
 ) -> i32 {
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }

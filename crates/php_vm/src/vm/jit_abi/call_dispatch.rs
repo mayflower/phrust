@@ -2380,6 +2380,18 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
             if let Some(result) = execute_native_fiber_method(context, instruction, &encoded) {
                 return Ok(result?);
             }
+            if let php_ir::InstructionKind::CallMethod { method, .. } = &instruction.kind
+                && method.eq_ignore_ascii_case("bindTo")
+                && let Some(closure) = encoded.first().copied()
+                && let Some(result) = context.rebind_prepared_closure(
+                    closure,
+                    encoded.get(1).copied(),
+                    encoded.get(2).copied(),
+                    "Closure::bindTo",
+                )
+            {
+                return Ok(result?);
+            }
             if let php_ir::InstructionKind::NewObject {
                 display_class_name, ..
             } = &instruction.kind
@@ -2809,6 +2821,14 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                         .first()
                         .copied()
                         .ok_or_else(|| "Closure::bind() expects a closure".to_owned())?;
+                    if let Some(result) = context.rebind_prepared_closure(
+                        closure,
+                        encoded.get(1).copied(),
+                        encoded.get(2).copied(),
+                        "Closure::bind",
+                    ) {
+                        return Ok(result?);
+                    }
                     let closure = context.decode(closure)?;
                     let Value::Callable(callable) = closure else {
                         return Err("Closure::bind() expects a closure".into());
@@ -2817,7 +2837,7 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     else {
                         return Err("Closure::bind() expects a closure".into());
                     };
-                    let rebound = native_rebind_closure(
+                    let rebound = rebind_baseline_materialized_closure(
                         closure,
                         encoded
                             .get(1)

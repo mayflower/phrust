@@ -225,6 +225,20 @@ fn write_native_value(out: *mut i64, value: i64) -> bool {
 
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
+#[inline(always)]
+fn write_native_deopt_state(
+    out: *mut php_jit::JitDeoptState,
+    state: php_jit::JitDeoptState,
+) -> bool {
+    // SAFETY: foreach lowering supplies its live caller-owned state buffer.
+    // The helper writes the complete opaque Generator continuation before it
+    // returns `SUSPEND_FIBER`; no generated code observes a partial record.
+    unsafe { out.write(state) };
+    true
+}
+
+// SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
+#[allow(unsafe_code)]
 pub(in crate::vm) extern "C" fn jit_native_unary_abi(
     runtime: *mut NativeRequestFastState,
     op: u32,
@@ -4989,8 +5003,60 @@ pub(in crate::vm) extern "C" fn jit_native_foreach_next_abi(
     key_out: *mut i64,
     value_out: *mut i64,
     has_out: *mut i64,
+    state_out: *mut php_jit::JitDeoptState,
 ) -> i32 {
     with_native_context_for(runtime, "foreach_next", |context| {
+        if context.direct_generator_index(iterator).is_some() {
+            return match context.advance_direct_generator(
+                iterator,
+                php_jit::JitNativeResumeInputKind::VALUE,
+                php_jit::jit_encode_constant(u32::MAX),
+            ) {
+                Ok(NativeGeneratorAdvance::Yielded { key, value })
+                    if write_native_value(key_out, key)
+                        && write_native_value(value_out, value)
+                        && write_native_value(has_out, 1) =>
+                {
+                    php_jit::JitCallStatus::CONTINUE.0 as i32
+                }
+                Ok(NativeGeneratorAdvance::Complete)
+                    if write_native_value(key_out, php_jit::jit_encode_constant(u32::MAX))
+                        && write_native_value(
+                            value_out,
+                            php_jit::jit_encode_constant(u32::MAX),
+                        )
+                        && write_native_value(has_out, 0) =>
+                {
+                    php_jit::JitCallStatus::CONTINUE.0 as i32
+                }
+                Ok(NativeGeneratorAdvance::FiberSuspended {
+                    value,
+                    active,
+                    parents,
+                }) => {
+                    let root = parents.last().copied().unwrap_or(active);
+                    let mut state = php_jit::JitDeoptState {
+                        control_reserved: NATIVE_FIBER_GENERATOR_FOREACH_CONTINUATION,
+                        control_value: active,
+                        yielded_key: root,
+                        ..php_jit::JitDeoptState::default()
+                    };
+                    state.suspend_flags = u32::try_from(parents.len()).unwrap_or(u32::MAX);
+                    if write_native_value(value_out, value)
+                        && write_native_deopt_state(state_out, state)
+                    {
+                        php_jit::JitCallStatus::SUSPEND_FIBER.0 as i32
+                    } else {
+                        php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
+                    }
+                }
+                Ok(_) => php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
+                Err(error) => {
+                    record_native_helper_failure(context, error);
+                    php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
+                }
+            };
+        }
         let entry = match context.iterator_next_encoded(iterator) {
             Ok(entry) => entry,
             Err(error) => {

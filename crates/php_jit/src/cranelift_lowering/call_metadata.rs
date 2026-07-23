@@ -905,6 +905,54 @@ pub(super) fn known_user_argument_requires_reference(
     caller: FunctionId,
 ) -> Option<bool> {
     let argument = call.args.get(index)?;
+    if let Some(requirement) = call.declared_argument_reference_requirement(index) {
+        return Some(requirement);
+    }
+    if let RegionCallTarget::Method { method, .. } = &call.target {
+        // Region IR records lvalue provenance for ordinary by-value arguments
+        // as well as true by-reference parameters. For internal instance
+        // methods the receiver class is dynamic, but when every published
+        // method with this name agrees on the parameter mode the arginfo is
+        // still authoritative. This prevents speculative ReferenceCell
+        // creation for families such as Closure::bindTo without specializing
+        // the callsite or receiver identity.
+        let mut requirements = php_std::generated::arginfo::GENERATED_METHODS
+            .iter()
+            .filter(|candidate| candidate.name.eq_ignore_ascii_case(method))
+            .map(|candidate| {
+                argument
+                    .name
+                    .as_deref()
+                    .map_or_else(
+                        || {
+                            candidate.params.get(index).or_else(|| {
+                                candidate
+                                    .params
+                                    .last()
+                                    .filter(|parameter| parameter.variadic)
+                            })
+                        },
+                        |name| {
+                            candidate
+                                .params
+                                .iter()
+                                .find(|parameter| parameter.name.eq_ignore_ascii_case(name))
+                                .or_else(|| {
+                                    candidate
+                                        .params
+                                        .last()
+                                        .filter(|parameter| parameter.variadic)
+                                })
+                        },
+                    )
+                    .is_some_and(|parameter| parameter.by_ref)
+            });
+        if let Some(requirement) = requirements.next()
+            && requirements.all(|candidate| candidate == requirement)
+        {
+            return Some(requirement);
+        }
+    }
     if let RegionCallTarget::Function {
         name,
         function: None,

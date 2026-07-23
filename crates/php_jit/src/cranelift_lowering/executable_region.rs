@@ -2778,6 +2778,7 @@ pub(super) fn compile_region_graph_native(
                 signature.params.push(AbiParam::new(pointer_type));
                 signature.params.push(AbiParam::new(pointer_type));
                 signature.params.push(AbiParam::new(pointer_type));
+                signature.params.push(AbiParam::new(pointer_type));
                 signature.returns.push(AbiParam::new(types::I32));
                 native_operations.foreach_next = Some(declare_native_helper(
                     module,

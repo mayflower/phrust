@@ -126,6 +126,20 @@ struct NativeStreamingCallExit {
     block: ir::Block,
 }
 
+#[derive(Clone, Copy)]
+struct NativeForeachSuspension<'a> {
+    pending_status: Variable,
+    pending_value: Variable,
+    resume_state: ir::Value,
+    function: FunctionId,
+    local_count: u32,
+    instruction: &'a RegionInstruction,
+    locals: &'a NativeLocalMap,
+    registers: &'a NativeRegisterMap,
+    live_registers: &'a [RegId],
+    native_version: u32,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct NativeHelper {
     function: FuncId,
@@ -5545,6 +5559,7 @@ fn lower_direct_arena_foreach_next(
     optimizing_transition: Option<NativeOptimizingTransition<'_>>,
     baseline_helper: Option<NativeHelper>,
     baseline_lifecycle: Option<NativeHelper>,
+    baseline_suspension: Option<NativeForeachSuspension<'_>>,
 ) -> Result<(ir::Value, ir::Value, ir::Value), CraneliftLoweringError> {
     let inspect = builder.create_block();
     let advance = builder.create_block();
@@ -5674,6 +5689,7 @@ fn lower_direct_arena_foreach_next(
             iterator,
             result_out,
             deopt_out,
+            baseline_suspension,
         )?;
         builder
             .ins()
@@ -16033,6 +16049,7 @@ fn lower_direct_foreach_next(
     iterator: ir::Value,
     result_out: ir::Value,
     deopt_out: ir::Value,
+    suspension: Option<NativeForeachSuspension<'_>>,
 ) -> Result<(ir::Value, ir::Value, ir::Value), CraneliftLoweringError> {
     let pointer_type = module.target_config().pointer_type();
     let helper = helper.ok_or_else(|| {
@@ -16046,6 +16063,60 @@ fn lower_direct_foreach_next(
     builder.append_block_param(merge, types::I64);
     builder.append_block_param(merge, types::I64);
     builder.append_block_param(merge, types::I64);
+
+    if let Some(suspension) = suspension {
+        let invoke = builder.create_block();
+        let resumed = builder.create_block();
+        let propagate = builder.create_block();
+        let status = builder.use_var(suspension.pending_status);
+        let normal = builder.ins().icmp_imm(
+            IntCC::Equal,
+            status,
+            i64::from(crate::JitCallStatus::CONTINUE.0),
+        );
+        builder.ins().brif(normal, invoke, &[], resumed, &[]);
+
+        builder.switch_to_block(resumed);
+        let value = builder.use_var(suspension.pending_value);
+        let clear = builder
+            .ins()
+            .iconst(types::I32, i64::from(crate::JitCallStatus::CONTINUE.0));
+        builder.def_var(suspension.pending_status, clear);
+        let returned = builder.ins().icmp_imm(
+            IntCC::Equal,
+            status,
+            i64::from(crate::JitCallStatus::RETURN.0),
+        );
+        let completed = builder.create_block();
+        builder.ins().brif(returned, completed, &[], propagate, &[]);
+
+        builder.switch_to_block(completed);
+        let key = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            suspension.resume_state,
+            std::mem::offset_of!(crate::JitDeoptState, yielded_key) as i32,
+        );
+        let has = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            suspension.resume_state,
+            std::mem::offset_of!(crate::JitDeoptState, suspend_flags) as i32,
+        );
+        let has = builder.ins().uextend(types::I64, has);
+        builder
+            .ins()
+            .jump(merge, &[key.into(), value.into(), has.into()]);
+
+        builder.switch_to_block(propagate);
+        copy_native_deopt_state(builder, pointer_type, deopt_out, suspension.resume_state);
+        builder
+            .ins()
+            .store(MemFlagsData::new(), value, result_out, 0);
+        builder.ins().return_(&[status]);
+
+        builder.switch_to_block(invoke);
+    }
 
     if helper.inline_runtime_view {
         let inspect_runtime = builder.create_block();
@@ -16200,13 +16271,58 @@ fn lower_direct_foreach_next(
         module,
         builder,
         helper,
-        &[iterator, key_out, value_out, has_out],
+        &[iterator, key_out, value_out, has_out, deopt_out],
     );
-    require_native_operation_ok(
-        builder,
-        builder.inst_results(call)[0],
-        helper.terminal_exit()?,
-    )?;
+    let status = builder.inst_results(call)[0];
+    if let Some(suspension) = suspension {
+        let ok = builder.create_block();
+        let suspended = builder.create_block();
+        let rejected = builder.create_block();
+        let is_ok = builder.ins().icmp_imm(IntCC::Equal, status, 0);
+        let is_suspended = builder.ins().icmp_imm(
+            IntCC::Equal,
+            status,
+            i64::from(crate::JitCallStatus::SUSPEND_FIBER.0),
+        );
+        builder.ins().brif(is_ok, ok, &[], suspended, &[]);
+        builder.switch_to_block(suspended);
+        let empty = builder.ins().iconst(types::I64, 0);
+        builder.ins().brif(
+            is_suspended,
+            rejected,
+            &[],
+            helper.terminal_exit()?.block,
+            &[status.into(), empty.into()],
+        );
+        builder.switch_to_block(rejected);
+        let link = capture_native_fiber_callee_if_suspended(
+            module, builder, status, deopt_out, result_out,
+        );
+        publish_native_call_state(
+            builder,
+            deopt_out,
+            suspension.function,
+            suspension.local_count,
+            suspension.instruction,
+            suspension.locals,
+            suspension.native_version,
+        )?;
+        publish_native_register_state(
+            builder,
+            deopt_out,
+            suspension.registers,
+            suspension.live_registers,
+        )?;
+        publish_native_fiber_suspension_link(builder, deopt_out, link);
+        let value = builder.ins().stack_load(types::I64, value_slot, 0);
+        builder
+            .ins()
+            .store(MemFlagsData::new(), value, result_out, 0);
+        builder.ins().return_(&[status]);
+        builder.switch_to_block(ok);
+    } else {
+        require_native_operation_ok(builder, status, helper.terminal_exit()?)?;
+    }
     let key = builder.ins().stack_load(types::I64, key_slot, 0);
     let value = builder.ins().stack_load(types::I64, value_slot, 0);
     let has = builder.ins().stack_load(types::I64, has_slot, 0);
@@ -18531,6 +18647,7 @@ fn lower_optimizing_region_instruction(
                 result_out,
                 deopt_out,
                 Some(transition),
+                None,
                 None,
                 None,
             )?;
@@ -24977,6 +25094,18 @@ fn lower_baseline_region_instruction(
                 None,
                 native_operations.foreach_next,
                 native_operations.value_release,
+                Some(NativeForeachSuspension {
+                    pending_status,
+                    pending_value,
+                    resume_state,
+                    function,
+                    local_count,
+                    instruction,
+                    locals,
+                    registers,
+                    live_registers: transition_live_registers,
+                    native_version,
+                }),
             )?;
             define_region_register(builder, register_variables, registers, *has_value, has)?;
             define_region_register(builder, register_variables, registers, *value, next_value)?;
@@ -25042,7 +25171,7 @@ fn lower_baseline_region_instruction(
                 module,
                 builder,
                 helper,
-                &[iterator_value, key_out, value_out, has_out],
+                &[iterator_value, key_out, value_out, has_out, deopt_out],
             );
             require_native_operation_ok(
                 builder,

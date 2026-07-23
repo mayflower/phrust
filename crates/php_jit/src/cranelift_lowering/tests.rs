@@ -892,6 +892,7 @@ extern "C" fn forbidden_foreach_next(
     _key_out: *mut i64,
     _value_out: *mut i64,
     _has_out: *mut i64,
+    _state_out: *mut crate::JitDeoptState,
 ) -> i32 {
     FOREACH_NEXT_FALLBACK_CALLS.fetch_add(1, Ordering::SeqCst);
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32

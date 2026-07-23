@@ -2218,6 +2218,51 @@ fn take_captured_native_fiber_execution(
     let Some(mut state) = context.take_native_fiber_suspension_state(link)? else {
         return Ok(None);
     };
+    if state.control_reserved == NATIVE_FIBER_GENERATOR_FOREACH_CONTINUATION {
+        let root = state.yielded_key;
+        let active = state.control_value;
+        let mut cursor = root;
+        let mut parents = Vec::new();
+        while cursor != active {
+            let index = context.direct_generator_index(cursor).ok_or_else(|| {
+                "native Generator Fiber continuation lost its root activation".to_owned()
+            })?;
+            let child = context
+                .direct_generator(index)
+                .and_then(|generator| generator.delegation.as_ref())
+                .and_then(|delegation| match delegation {
+                    NativeGeneratorDelegation::Generator { generator } => Some(*generator),
+                    NativeGeneratorDelegation::Array { .. } => None,
+                })
+                .ok_or_else(|| {
+                    "native Generator Fiber continuation lost its delegation chain".to_owned()
+                })?;
+            parents.push(cursor);
+            cursor = child;
+        }
+        parents.reverse();
+        let active_index = context.direct_generator_index(active).ok_or_else(|| {
+            "native Generator Fiber continuation lost its active activation".to_owned()
+        })?;
+        let (handle, mut active_state) = context
+            .direct_generator(active_index)
+            .and_then(|generator| generator.handle.clone().zip(generator.state))
+            .ok_or_else(|| {
+                "native Generator Fiber continuation has no compiled activation state".to_owned()
+            })?;
+        let nested_link = std::mem::take(&mut active_state.delegation_handle);
+        if let Some(generator) = context.direct_generator_mut(active_index) {
+            generator.state = Some(active_state);
+        }
+        let nested = take_captured_native_fiber_execution(context, nested_link)?;
+        return Ok(Some(Box::new(NativeFiberExecution {
+            handle,
+            arguments: Vec::new(),
+            state: active_state,
+            nested,
+            generator: Some(NativeGeneratorFiberFrame { active, parents }),
+        })));
+    }
     let nested_link = std::mem::take(&mut state.delegation_handle);
     let function = php_ir::FunctionId::new(state.function_id);
     let handle = ensure_native_baseline_entry(context, function)?;
@@ -2242,6 +2287,7 @@ fn take_captured_native_fiber_execution(
         arguments: vec![0; usize::from(arity)],
         state,
         nested,
+        generator: None,
     })))
 }
 
@@ -2289,6 +2335,7 @@ pub(super) fn finish_native_fiber_outcome(
                     arguments,
                     state,
                     nested,
+                    generator: None,
                 },
             );
             Ok(value)
@@ -2356,6 +2403,7 @@ enum NativeFiberExecutionOutcome {
         handle: php_jit::JitFunctionHandle,
         arguments: Vec<i64>,
         outcome: php_jit::JitI64InvokeOutcome,
+        generator_entry: Option<(i64, i64, i64)>,
     },
 }
 
@@ -2404,7 +2452,134 @@ fn classify_native_fiber_execution_outcome(
             handle: execution.handle,
             arguments: execution.arguments,
             outcome,
+            generator_entry: None,
         }),
+    }
+}
+
+fn resume_native_generator_fiber_execution(
+    context: &mut NativeRequestColdState<'_>,
+    mut execution: NativeFiberExecution,
+    frame: NativeGeneratorFiberFrame,
+    kind: php_jit::JitNativeResumeInputKind,
+    value: i64,
+) -> Result<NativeFiberExecutionOutcome, String> {
+    let advance = if let Some(nested) = execution.nested.take() {
+        match resume_native_fiber_execution(context, *nested, kind, value) {
+            Ok(NativeFiberExecutionOutcome::Suspended {
+                execution: nested,
+                value,
+            }) => {
+                execution.nested = Some(Box::new(nested));
+                return Ok(NativeFiberExecutionOutcome::Suspended { execution, value });
+            }
+            Ok(NativeFiberExecutionOutcome::Completed {
+                outcome,
+                generator_entry,
+                ..
+            }) => {
+                if generator_entry.is_some() {
+                    context.abandon_native_fiber_execution(execution)?;
+                    return Err(
+                        "nested Generator foreach completion escaped its compiled caller"
+                            .to_owned(),
+                    );
+                }
+                let (status, value) = completed_native_fiber_control(&outcome)?;
+                context.completed_nested_fiber_call = Some((
+                    execution.state.function_id,
+                    execution.state.continuation_id,
+                    status,
+                    value,
+                ));
+                execution.state.control_status = status;
+                execution.state.control_value = value;
+                let active_index =
+                    context
+                        .direct_generator_index(frame.active)
+                        .ok_or_else(|| {
+                            "active direct Generator disappeared during Fiber resume".to_owned()
+                        })?;
+                if let Some(generator) = context.direct_generator_mut(active_index) {
+                    generator.state = Some(execution.state);
+                }
+                context.advance_direct_generator(
+                    frame.active,
+                    php_jit::JitNativeResumeInputKind::VALUE,
+                    php_jit::jit_encode_constant(u32::MAX),
+                )?
+            }
+            Err(error) => {
+                context.abandon_native_fiber_execution(execution)?;
+                return Err(error);
+            }
+        }
+    } else {
+        let active_index = context
+            .direct_generator_index(frame.active)
+            .ok_or_else(|| "active direct Generator disappeared during Fiber resume".to_owned())?;
+        if let Some(generator) = context.direct_generator_mut(active_index) {
+            generator.state = Some(execution.state);
+        }
+        context.advance_direct_generator(frame.active, kind, value)?
+    };
+
+    match context.propagate_direct_generator_fiber_advance(frame.active, frame.parents, advance)? {
+        NativeGeneratorAdvance::Yielded { key, value } => {
+            Ok(NativeFiberExecutionOutcome::Completed {
+                handle: execution.handle,
+                arguments: execution.arguments,
+                outcome: php_jit::JitI64InvokeOutcome::SideExit {
+                    status: php_jit::JitCallStatus::RETURN.0 as i32,
+                    value,
+                    state: php_jit::JitDeoptState::default(),
+                },
+                generator_entry: Some((key, value, 1)),
+            })
+        }
+        NativeGeneratorAdvance::Complete => {
+            let missing = php_jit::jit_encode_constant(u32::MAX);
+            Ok(NativeFiberExecutionOutcome::Completed {
+                handle: execution.handle,
+                arguments: execution.arguments,
+                outcome: php_jit::JitI64InvokeOutcome::SideExit {
+                    status: php_jit::JitCallStatus::RETURN.0 as i32,
+                    value: missing,
+                    state: php_jit::JitDeoptState::default(),
+                },
+                generator_entry: Some((missing, missing, 0)),
+            })
+        }
+        NativeGeneratorAdvance::FiberSuspended {
+            value,
+            active,
+            parents,
+        } => {
+            let active_index = context.direct_generator_index(active).ok_or_else(|| {
+                "resuspended direct Generator lost its native activation".to_owned()
+            })?;
+            let (handle, mut state) = context
+                .direct_generator(active_index)
+                .and_then(|generator| generator.handle.clone().zip(generator.state))
+                .ok_or_else(|| {
+                    "resuspended direct Generator has no compiled activation state".to_owned()
+                })?;
+            let nested_link = std::mem::take(&mut state.delegation_handle);
+            if let Some(generator) = context.direct_generator_mut(active_index) {
+                generator.state = Some(state);
+            }
+            let nested = take_captured_native_fiber_execution(context, nested_link)?;
+            Ok(NativeFiberExecutionOutcome::Suspended {
+                execution: NativeFiberExecution {
+                    handle,
+                    arguments: Vec::new(),
+                    state,
+                    nested,
+                    generator: Some(NativeGeneratorFiberFrame { active, parents }),
+                },
+                value,
+            })
+        }
     }
 }
 
@@ -2414,6 +2589,9 @@ fn resume_native_fiber_execution(
     kind: php_jit::JitNativeResumeInputKind,
     value: i64,
 ) -> Result<NativeFiberExecutionOutcome, String> {
+    if let Some(generator) = execution.generator.clone() {
+        return resume_native_generator_fiber_execution(context, execution, generator, kind, value);
+    }
     let outcome = if let Some(nested) = execution.nested.take() {
         match resume_native_fiber_execution(context, *nested, kind, value) {
             Ok(NativeFiberExecutionOutcome::Suspended {
@@ -2423,7 +2601,11 @@ fn resume_native_fiber_execution(
                 execution.nested = Some(Box::new(nested));
                 return Ok(NativeFiberExecutionOutcome::Suspended { execution, value });
             }
-            Ok(NativeFiberExecutionOutcome::Completed { outcome, .. }) => {
+            Ok(NativeFiberExecutionOutcome::Completed {
+                outcome,
+                generator_entry,
+                ..
+            }) => {
                 let (status, value) = match completed_native_fiber_control(&outcome) {
                     Ok(completed) => completed,
                     Err(error) => {
@@ -2439,6 +2621,10 @@ fn resume_native_fiber_execution(
                 ));
                 execution.state.control_status = status;
                 execution.state.control_value = value;
+                if let Some((key, _, has)) = generator_entry {
+                    execution.state.yielded_key = key;
+                    execution.state.suspend_flags = has as u32;
+                }
                 let runtime = context.native_runtime_ptr();
                 let resumed = execution
                     .handle
@@ -2682,7 +2868,16 @@ pub(super) fn execute_native_fiber_method(
                         handle,
                         arguments,
                         outcome,
-                    }) => finish_native_fiber_outcome(context, &fiber, handle, arguments, outcome),
+                        generator_entry,
+                    }) => {
+                        if generator_entry.is_some() {
+                            return Err(
+                                "Generator foreach completion escaped the suspended Fiber caller"
+                                    .to_owned(),
+                            );
+                        }
+                        finish_native_fiber_outcome(context, &fiber, handle, arguments, outcome)
+                    }
                     Err(error) => {
                         context.set_fiber_receiver_state(
                             &fiber,

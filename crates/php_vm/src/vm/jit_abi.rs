@@ -2194,11 +2194,51 @@ enum NativeGeneratorDelegation {
     Generator { generator: i64 },
 }
 
+// `control_reserved` is otherwise zero for generated native call states. The
+// marker lets the Fiber suspension stack distinguish an opaque Generator
+// continuation from an ordinary compiled caller without publishing a second
+// value representation or ABI entry point.
+const NATIVE_FIBER_GENERATOR_FOREACH_CONTINUATION: u32 = 0x4746_4f52;
+
+enum NativeGeneratorAdvance {
+    Yielded {
+        key: i64,
+        value: i64,
+    },
+    Complete,
+    FiberSuspended {
+        value: i64,
+        active: i64,
+        /// Direct Generators waiting for `active`, ordered from the immediate
+        /// delegating parent out to the iterator exposed to foreach.
+        parents: Vec<i64>,
+    },
+}
+
+impl NativeGeneratorAdvance {
+    fn into_entry(self) -> Result<Option<(i64, i64)>, String> {
+        match self {
+            Self::Yielded { key, value } => Ok(Some((key, value))),
+            Self::Complete => Ok(None),
+            Self::FiberSuspended { .. } => {
+                Err("E_PHP_SUSPEND_FIBER:direct Generator suspended its Fiber".to_owned())
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct NativeGeneratorFiberFrame {
+    active: i64,
+    parents: Vec<i64>,
+}
+
 struct NativeFiberExecution {
     handle: php_jit::JitFunctionHandle,
     arguments: Vec<i64>,
     state: php_jit::JitDeoptState,
     nested: Option<Box<NativeFiberExecution>>,
+    generator: Option<NativeGeneratorFiberFrame>,
 }
 
 impl<'a> NativeRequestColdState<'a> {
@@ -2244,12 +2284,21 @@ impl<'a> NativeRequestColdState<'a> {
             arguments: _,
             state,
             nested,
+            generator,
         } = execution;
         if let Some(nested) = nested {
             self.abandon_native_fiber_execution(*nested)?;
         }
-
-        self.release_native_suspension_owners(&handle, &state)
+        self.release_native_suspension_owners(&handle, &state)?;
+        if let Some(generator) = generator {
+            if let Some(index) = self.direct_generator_index(generator.active)
+                && let Some(activation) = self.direct_generator_mut(index)
+            {
+                activation.state = None;
+                activation.lifecycle = php_runtime::api::GeneratorState::Errored;
+            }
+        }
+        Ok(())
     }
 
     fn release_native_suspension_owners(
@@ -6537,13 +6586,28 @@ impl<'a> NativeRequestColdState<'a> {
                 }
             }
         }
+        let mut closure = closure;
+        closure.bound_this = None;
+        closure.captures.clear();
+        self.publish_prepared_closure_owned(NativePreparedClosure {
+            closure,
+            capture_descriptors: capture_descriptors.into_boxed_slice(),
+            implicit_this,
+            captures: capture_values.into_boxed_slice(),
+        })
+    }
+
+    fn publish_prepared_closure_owned(
+        &mut self,
+        prepared: NativePreparedClosure,
+    ) -> Result<i64, String> {
         let index = match self.reserve_direct_value_slot() {
             Ok(index) => index,
             Err(error) => {
-                if let Some(implicit_this) = implicit_this {
+                if let Some(implicit_this) = prepared.implicit_this {
                     let _ = self.release(implicit_this);
                 }
-                for capture in capture_values {
+                for capture in prepared.captures.iter().copied() {
                     let _ = self.release(capture);
                 }
                 return Err(error);
@@ -6553,18 +6617,8 @@ impl<'a> NativeRequestColdState<'a> {
             .ok()
             .and_then(|index| index.checked_add(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE))
             .expect("direct closure index is bounded by the native value arena");
-        let closure_id = closure.id;
-        let mut closure = closure;
-        closure.bound_this = None;
-        closure.captures.clear();
-        let owner = Box::into_raw(Box::new(NativePreparedCallable::Closure(
-            NativePreparedClosure {
-                closure,
-                capture_descriptors: capture_descriptors.into_boxed_slice(),
-                implicit_this,
-                captures: capture_values.into_boxed_slice(),
-            },
-        )));
+        let closure_id = prepared.closure.id;
+        let owner = Box::into_raw(Box::new(NativePreparedCallable::Closure(prepared)));
         self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
             refcount: 1,
             kind: php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE,
@@ -6828,6 +6882,152 @@ impl<'a> NativeRequestColdState<'a> {
         (prepared.closure.id == self.direct_value_slots.get(index)?.payload
             && prepared.capture_descriptors.len() == prepared.captures.len())
         .then_some(&prepared.closure)
+    }
+
+    fn rebind_prepared_closure(
+        &mut self,
+        encoded: i64,
+        new_this: Option<i64>,
+        new_scope: Option<i64>,
+        api: &str,
+    ) -> Option<Result<i64, String>> {
+        let index = Self::direct_value_index(self.dereference_direct_encoding(encoded))?;
+        let (closure, capture_descriptors, captures) = {
+            let NativePreparedCallable::Closure(prepared) = self.direct_prepared_callable(index)?
+            else {
+                return None;
+            };
+            (
+                prepared.closure.clone(),
+                prepared.capture_descriptors.clone(),
+                prepared.captures.clone(),
+            )
+        };
+        let mut retained = Vec::new();
+        let result = (|| {
+            let new_this = match new_this {
+                Some(value) => Some(
+                    self.duplicate_authoritative_dereferenced_native_value(value)?
+                        .ok_or_else(|| {
+                            format!("{api}() new object crossed from baseline storage")
+                        })?,
+                ),
+                None => None,
+            };
+            let bound_this = match new_this {
+                None => None,
+                Some(value)
+                    if self.native_encoded_value_kind(value)
+                        == Some(NativeEncodedValueKind::Null) =>
+                {
+                    self.release(value)?;
+                    None
+                }
+                Some(value)
+                    if self.native_encoded_value_kind(value)
+                        == Some(NativeEncodedValueKind::Object)
+                        && self.native_query_object(value).is_some() =>
+                {
+                    Some(value)
+                }
+                Some(value) => {
+                    let actual = self.native_encoded_type_name(value);
+                    self.release(value)?;
+                    return Err(format!(
+                        "{api}(): Argument #2 ($newThis) must be of type ?object, {} given",
+                        actual
+                    ));
+                }
+            };
+            retained.extend(bound_this);
+
+            let scope_value = match new_scope {
+                Some(value) => Some(
+                    self.duplicate_authoritative_dereferenced_native_value(value)?
+                        .ok_or_else(|| format!("{api}() scope crossed from baseline storage"))?,
+                ),
+                None => None,
+            };
+            let scope_result: Result<Option<Arc<str>>, String> = match scope_value {
+                Some(value)
+                    if self.native_encoded_value_kind(value)
+                        == Some(NativeEncodedValueKind::Null) =>
+                {
+                    Ok(None)
+                }
+                Some(value)
+                    if self.native_encoded_value_kind(value)
+                        == Some(NativeEncodedValueKind::Object) =>
+                {
+                    match self.native_query_object(value) {
+                        Some(object) => Ok(Some(object.display_name().into())),
+                        None => Err(format!(
+                            "{api}() scope object crossed from baseline storage"
+                        )),
+                    }
+                }
+                Some(value)
+                    if self.native_encoded_value_kind(value)
+                        == Some(NativeEncodedValueKind::String) =>
+                {
+                    match self.native_string_name_bytes(value) {
+                        Some(bytes) => {
+                            let scope = String::from_utf8_lossy(&bytes).into_owned();
+                            Ok((scope != "static").then(|| Arc::from(scope.as_str())))
+                        }
+                        None => Err(format!("{api}() scope string has no native bytes")),
+                    }
+                }
+                Some(value) => Err(format!(
+                    "{api}(): Argument #3 ($newScope) must be of type object|string|null, {} given",
+                    self.native_encoded_type_name(value)
+                )),
+                None => Ok(bound_this
+                    .and_then(|value| self.native_query_object(value))
+                    .map(|object| Arc::from(object.display_name()))),
+            };
+            if let Some(scope_value) = scope_value {
+                self.release(scope_value)?;
+            }
+            let scope = scope_result?;
+
+            let mut context = closure.context.clone();
+            if let Some(scope) = scope {
+                context.scope_class = Some(scope.clone());
+                context.called_class = Some(scope.clone());
+                context.declaring_class = Some(scope);
+            }
+            let mut rebound = php_runtime::api::ClosurePayload::new(closure.function, Vec::new());
+            rebound.debug = closure.debug.clone();
+            rebound.context = context;
+
+            let mut rebound_captures = Vec::with_capacity(captures.len());
+            for capture in captures.iter().copied() {
+                match self.duplicate_authoritative_native_value(capture)? {
+                    Some(capture) => {
+                        retained.push(capture);
+                        rebound_captures.push(capture);
+                    }
+                    None => {
+                        return Err(format!("{api}() capture crossed from baseline storage"));
+                    }
+                }
+            }
+            let prepared = NativePreparedClosure {
+                closure: rebound,
+                capture_descriptors,
+                implicit_this: bound_this,
+                captures: rebound_captures.into_boxed_slice(),
+            };
+            retained.clear();
+            self.publish_prepared_closure_owned(prepared)
+        })();
+        if result.is_err() {
+            for value in retained {
+                let _ = self.release(value);
+            }
+        }
+        Some(result)
     }
 
     fn prepared_callable_dispatch(&self, encoded: i64) -> Option<NativePreparedCallableDispatch> {
@@ -9593,6 +9793,16 @@ impl<'a> NativeRequestColdState<'a> {
         resume_kind: php_jit::JitNativeResumeInputKind,
         resume_value: i64,
     ) -> Result<Option<(i64, i64)>, String> {
+        self.advance_direct_generator(encoded, resume_kind, resume_value)?
+            .into_entry()
+    }
+
+    fn advance_direct_generator(
+        &mut self,
+        encoded: i64,
+        resume_kind: php_jit::JitNativeResumeInputKind,
+        resume_value: i64,
+    ) -> Result<NativeGeneratorAdvance, String> {
         let index = self
             .direct_generator_index(encoded)
             .ok_or_else(|| "native value is not a direct Generator".to_owned())?;
@@ -9601,7 +9811,7 @@ impl<'a> NativeRequestColdState<'a> {
             .map(|generator| generator.lifecycle)
             .ok_or_else(|| format!("direct Generator {index} is missing"))?;
         if lifecycle == php_runtime::api::GeneratorState::Closed {
-            return Ok(None);
+            return Ok(NativeGeneratorAdvance::Complete);
         }
         if lifecycle == php_runtime::api::GeneratorState::Running {
             return Err(
@@ -9645,7 +9855,7 @@ impl<'a> NativeRequestColdState<'a> {
                     }
                     return self
                         .replace_direct_generator_current_owned(index, Some(key), value, true)
-                        .map(Some);
+                        .map(|(key, value)| NativeGeneratorAdvance::Yielded { key, value });
                 }
                 let delegation = self
                     .direct_generator_mut(index)
@@ -9656,14 +9866,29 @@ impl<'a> NativeRequestColdState<'a> {
                 effective_resume_kind = php_jit::JitNativeResumeInputKind::VALUE;
                 effective_resume_value = php_jit::jit_encode_constant(u32::MAX);
             } else {
-                if let Some((key, value)) = self.resume_direct_generator(
+                match self.advance_direct_generator(
                     delegated,
                     php_jit::JitNativeResumeInputKind::VALUE,
                     php_jit::jit_encode_constant(u32::MAX),
                 )? {
-                    return self
-                        .replace_direct_generator_current_owned(index, Some(key), value, true)
-                        .map(Some);
+                    NativeGeneratorAdvance::Yielded { key, value } => {
+                        return self
+                            .replace_direct_generator_current_owned(index, Some(key), value, true)
+                            .map(|(key, value)| NativeGeneratorAdvance::Yielded { key, value });
+                    }
+                    NativeGeneratorAdvance::FiberSuspended {
+                        value,
+                        active,
+                        mut parents,
+                    } => {
+                        parents.push(encoded);
+                        return Ok(NativeGeneratorAdvance::FiberSuspended {
+                            value,
+                            active,
+                            parents,
+                        });
+                    }
+                    NativeGeneratorAdvance::Complete => {}
                 }
                 effective_resume_kind = php_jit::JitNativeResumeInputKind::VALUE;
                 effective_resume_value = {
@@ -9710,15 +9935,28 @@ impl<'a> NativeRequestColdState<'a> {
         let outcome = self.run_in_native_generator_target(&target, |context| {
             let runtime = context.native_runtime_ptr();
             let outcome = if let Some(state) = saved_state.as_ref() {
-                handle.invoke_i64_suspension_resume_with_native_unwind_runtime(
-                    &arguments,
-                    state,
-                    effective_resume_kind,
-                    effective_resume_value,
-                    php_jit::JIT_RUNTIME_ABI_HASH,
-                    runtime,
-                    |types, value| native_catch_matches(context, types, value),
-                )
+                if context.completed_nested_fiber_call.as_ref().is_some_and(
+                    |(function, continuation, _, _)| {
+                        *function == state.function_id && *continuation == state.continuation_id
+                    },
+                ) {
+                    handle.invoke_i64_same_artifact_transition_with_unwind_runtime(
+                        state,
+                        php_jit::JIT_RUNTIME_ABI_HASH,
+                        runtime,
+                        |types, value| native_catch_matches(context, types, value),
+                    )
+                } else {
+                    handle.invoke_i64_suspension_resume_with_native_unwind_runtime(
+                        &arguments,
+                        state,
+                        effective_resume_kind,
+                        effective_resume_value,
+                        php_jit::JIT_RUNTIME_ABI_HASH,
+                        runtime,
+                        |types, value| native_catch_matches(context, types, value),
+                    )
+                }
             } else {
                 handle.invoke_i64_with_deopt_runtime(
                     &arguments,
@@ -9729,6 +9967,15 @@ impl<'a> NativeRequestColdState<'a> {
             resume_native_optimizing_exit(context, outcome)
                 .map_err(|error| format!("native Generator invocation failed: {error:?}"))
         });
+        if self.completed_nested_fiber_call.as_ref().is_some_and(
+            |(function, continuation, _, _)| {
+                saved_state.as_ref().is_some_and(|state| {
+                    *function == state.function_id && *continuation == state.continuation_id
+                })
+            },
+        ) {
+            self.completed_nested_fiber_call = None;
+        }
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -9778,7 +10025,7 @@ impl<'a> NativeRequestColdState<'a> {
                         generator.lifecycle = php_runtime::api::GeneratorState::Suspended;
                         generator.delegation = Some(delegation);
                     }
-                    return self.resume_direct_generator(
+                    return self.advance_direct_generator(
                         encoded,
                         php_jit::JitNativeResumeInputKind::VALUE,
                         php_jit::jit_encode_constant(u32::MAX),
@@ -9794,7 +10041,7 @@ impl<'a> NativeRequestColdState<'a> {
                     generator.state = Some(state);
                 }
                 self.replace_direct_generator_current_owned(index, key, value, false)
-                    .map(Some)
+                    .map(|(key, value)| NativeGeneratorAdvance::Yielded { key, value })
             }
             php_jit::JitI64InvokeOutcome::Returned(value)
             | php_jit::JitI64InvokeOutcome::SideExit {
@@ -9826,7 +10073,27 @@ impl<'a> NativeRequestColdState<'a> {
                     generator.state = None;
                     generator.lifecycle = php_runtime::api::GeneratorState::Closed;
                 }
-                Ok(None)
+                Ok(NativeGeneratorAdvance::Complete)
+            }
+            php_jit::JitI64InvokeOutcome::SideExit {
+                status,
+                value,
+                mut state,
+            } if status == php_jit::JitCallStatus::SUSPEND_FIBER.0 as i32 => {
+                // The generated activation remains authoritative. Its nested
+                // compiled-call link is consumed when the Fiber execution is
+                // assembled; keeping the state on the Generator also makes
+                // every live owner visible to normal root traversal.
+                state.control_status = php_jit::JitCallStatus::CONTINUE;
+                if let Some(generator) = self.direct_generator_mut(index) {
+                    generator.state = Some(state);
+                    generator.lifecycle = php_runtime::api::GeneratorState::Suspended;
+                }
+                Ok(NativeGeneratorAdvance::FiberSuspended {
+                    value,
+                    active: encoded,
+                    parents: Vec::new(),
+                })
             }
             php_jit::JitI64InvokeOutcome::SideExit { status, value, .. }
                 if status == php_jit::JitCallStatus::THROW.0 as i32 =>
@@ -9878,6 +10145,101 @@ impl<'a> NativeRequestColdState<'a> {
                     "native Generator returned status {status} with {}",
                     self.native_encoded_type_name(value)
                 ))
+            }
+        }
+    }
+
+    fn propagate_direct_generator_fiber_advance(
+        &mut self,
+        mut active: i64,
+        mut parents: Vec<i64>,
+        mut advance: NativeGeneratorAdvance,
+    ) -> Result<NativeGeneratorAdvance, String> {
+        loop {
+            match advance {
+                NativeGeneratorAdvance::Yielded { mut key, mut value } => {
+                    for parent in parents {
+                        (key, value) = self
+                            .direct_generator_index(parent)
+                            .ok_or_else(|| {
+                                "delegating direct Generator disappeared during Fiber resume"
+                                    .to_owned()
+                            })
+                            .and_then(|index| {
+                                self.replace_direct_generator_current_owned(
+                                    index,
+                                    Some(key),
+                                    value,
+                                    true,
+                                )
+                            })?;
+                    }
+                    return Ok(NativeGeneratorAdvance::Yielded { key, value });
+                }
+                NativeGeneratorAdvance::FiberSuspended {
+                    value,
+                    active,
+                    parents: mut nested_parents,
+                } => {
+                    nested_parents.extend(parents);
+                    return Ok(NativeGeneratorAdvance::FiberSuspended {
+                        value,
+                        active,
+                        parents: nested_parents,
+                    });
+                }
+                NativeGeneratorAdvance::Complete => {
+                    if parents.is_empty() {
+                        return Ok(NativeGeneratorAdvance::Complete);
+                    }
+                    let parent = parents.remove(0);
+                    let return_value = {
+                        let child_index = self.direct_generator_index(active).ok_or_else(|| {
+                            "completed delegated direct Generator disappeared".to_owned()
+                        })?;
+                        let value = self
+                            .direct_generator(child_index)
+                            .and_then(|generator| generator.return_value)
+                            .unwrap_or_else(|| php_jit::jit_encode_constant(u32::MAX));
+                        self.duplicate_direct_generator_value(value)?
+                    };
+                    let parent_index = self.direct_generator_index(parent).ok_or_else(|| {
+                        "delegating direct Generator disappeared during Fiber resume".to_owned()
+                    })?;
+                    let delegation = self
+                        .direct_generator_mut(parent_index)
+                        .and_then(|generator| generator.delegation.take());
+                    match delegation {
+                        Some(NativeGeneratorDelegation::Generator { generator })
+                            if generator == active =>
+                        {
+                            self.release(generator)?;
+                        }
+                        Some(other) => {
+                            if let Some(generator) = self.direct_generator_mut(parent_index) {
+                                generator.delegation = Some(other);
+                            }
+                            self.release(return_value)?;
+                            return Err(
+                                "direct Generator Fiber continuation lost its delegation chain"
+                                    .to_owned(),
+                            );
+                        }
+                        None => {
+                            self.release(return_value)?;
+                            return Err(
+                                "direct Generator Fiber continuation has no delegating parent"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    active = parent;
+                    advance = self.advance_direct_generator(
+                        parent,
+                        php_jit::JitNativeResumeInputKind::VALUE,
+                        return_value,
+                    )?;
+                }
             }
         }
     }
@@ -15384,7 +15746,10 @@ fn execute_native_resolve_callable(
     ))))
 }
 
-fn native_rebind_closure(
+/// Cold compatibility for a Closure value that was already materialized by
+/// an explicit baseline boundary. Prepared native Closures are rebound by
+/// `rebind_prepared_closure` and never enter this Rust `Value` path.
+fn rebind_baseline_materialized_closure(
     closure: &php_runtime::api::ClosurePayload,
     new_this: Option<Value>,
     new_scope: Option<Value>,
@@ -15422,13 +15787,12 @@ fn native_rebind_closure(
         context.called_class = Some(scope.clone());
         context.declaring_class = Some(scope);
     }
+    let rebound = php_runtime::api::ClosurePayload::new(closure.function, closure.captures.clone())
+        .with_bound_this(bound_this)
+        .with_context(context)
+        .with_debug(closure.debug.as_deref().cloned());
     Ok(Value::Callable(Box::new(
-        php_runtime::api::CallableValue::Closure(
-            closure
-                .clone()
-                .with_bound_this(bound_this)
-                .with_context(context),
-        ),
+        php_runtime::api::CallableValue::Closure(rebound),
     )))
 }
 
