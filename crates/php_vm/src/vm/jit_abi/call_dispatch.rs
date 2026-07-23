@@ -1565,9 +1565,6 @@ pub(super) fn finish_native_dispatch_outcome(
             });
             (php_jit::JitCallStatus::RUNTIME_ERROR, None)
         }
-        Some(Err(NativeCallControl::BaselineRequired)) => {
-            (php_jit::JitCallStatus::RECOMPILE_REQUESTED, None)
-        }
         None => (php_jit::JitCallStatus::COMPILE_REQUIRED, None),
     };
     let status_code = status.0 as i32;
@@ -1981,13 +1978,12 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     _ => None,
                 };
                 if native_function_is_generator(context, function) {
-                    return Ok(create_native_generator_with_metadata_strict(
+                    return Ok(create_baseline_bound_generator_with_metadata_strict(
                         context,
                         function,
                         invocation_arguments,
                         metadata,
                         context.unit.strict_types_for_span(descriptor.span),
-                        NativeCallableBuiltinPolicy::ExecuteBaseline,
                     )?);
                 }
                 return Ok(invoke_native_function_with_metadata_strict(
@@ -2013,7 +2009,6 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                         Some(frame.function_id),
                         None,
                         false,
-                        NativeCallableBuiltinPolicy::ExecuteBaseline,
                     )
             {
                 return Ok(result?);
@@ -2367,13 +2362,12 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                         &encoded
                     };
                     if native_function_is_generator(context, function) {
-                        return Ok(create_native_generator_with_metadata_strict(
+                        return Ok(create_baseline_bound_generator_with_metadata_strict(
                             context,
                             function,
                             call_arguments,
                             Some(args),
                             context.unit.strict_types_for_span(instruction.span),
-                            NativeCallableBuiltinPolicy::ExecuteBaseline,
                         )?);
                     }
                     if context.install_native_method_pic(
@@ -3093,13 +3087,12 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                         encoded.to_mut(),
                         metadata,
                     )?;
-                    return Ok(create_native_generator_with_metadata_strict(
+                    return Ok(create_baseline_bound_generator_with_metadata_strict(
                         context,
                         function_id,
                         &encoded,
                         metadata,
                         context.unit.strict_types_for_span(descriptor.span),
-                        NativeCallableBuiltinPolicy::ExecuteBaseline,
                     )?);
                 }
                 let metadata = Some(descriptor.arguments.as_ref());
@@ -3338,11 +3331,6 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     None,
                 )
             }
-            Some(Err(NativeCallControl::BaselineRequired)) => (
-                php_jit::JitCallStatus::RECOMPILE_REQUESTED.0 as i32,
-                php_jit::JitCallStatus::RECOMPILE_REQUESTED,
-                None,
-            ),
             None => (
                 php_jit::JitCallStatus::COMPILE_REQUIRED.0 as i32,
                 php_jit::JitCallStatus::COMPILE_REQUIRED,

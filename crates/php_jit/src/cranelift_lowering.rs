@@ -1069,16 +1069,27 @@ fn lower_region_operand(
     }
 }
 
+fn native_integer_fits_immediate(value: i64) -> bool {
+    crate::jit_decode_runtime_value(value).is_none() && crate::jit_decode_constant(value).is_none()
+}
+
 fn lower_prepared_native_call_operand(
     builder: &mut FunctionBuilder<'_>,
     locals: &NativeLocalMap,
     registers: &NativeRegisterMap,
     constants: &[IrConstant],
     operand: RegionOperand,
+    transition: NativeOptimizingTransition<'_>,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     let RegionOperand::Constant(constant) = operand else {
         return lower_region_operand(builder, locals, registers, operand);
     };
+    if let Some(IrConstant::Int(value)) = constants.get(constant as usize)
+        && !native_integer_fits_immediate(*value)
+    {
+        let value = builder.ins().iconst(types::I64, *value);
+        return lower_optimizing_encode_int(builder, value, transition);
+    }
     let value = match constants.get(constant as usize) {
         Some(IrConstant::Null) => crate::jit_encode_constant(u32::MAX),
         Some(IrConstant::Bool(false)) => crate::jit_encode_constant(crate::JIT_VALUE_FALSE),
@@ -2674,6 +2685,47 @@ fn lower_optimizing_direct_slot_address(
     let direct_index = builder.ins().uextend(pointer_type, direct_index);
     let offset = builder.ins().ishl_imm(direct_index, 5);
     builder.ins().iadd(direct_slots, offset)
+}
+
+/// Loads one packed receiver/capture directly from the immutable prepared
+/// closure record. Region construction proves the exact closure identity and
+/// capture shape; generated code therefore performs no per-call kind, arity,
+/// or descriptor validation.
+fn lower_optimizing_prepared_closure_argument(
+    builder: &mut FunctionBuilder<'_>,
+    closure: ir::Value,
+    bound_object_count: usize,
+    capture_index: Option<usize>,
+    deopt_out: ir::Value,
+) -> ir::Value {
+    let pointer_type = builder.func.dfg.value_type(deopt_out);
+    let slot = lower_optimizing_direct_slot_address(builder, closure, deopt_out);
+    let closure_view = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, aux) as i32,
+    );
+    if bound_object_count != 0 && capture_index.is_none() {
+        return builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            closure_view,
+            std::mem::offset_of!(crate::JitNativePreparedClosureView, implicit_this) as i32,
+        );
+    }
+    let captures = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        closure_view,
+        std::mem::offset_of!(crate::JitNativePreparedClosureView, captures) as i32,
+    );
+    builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        captures,
+        i32::try_from(capture_index.unwrap_or(0).saturating_mul(8)).unwrap_or(i32::MAX),
+    )
 }
 
 fn lower_trusted_request_local_reference(
@@ -12093,6 +12145,7 @@ fn lower_optimizing_unknown_bit_not(
 
     builder.switch_to_block(integer);
     let value = builder.ins().bnot(encoded);
+    let value = lower_optimizing_admit_integer_result(builder, value, transition)?;
     builder.ins().jump(merge, &[value.into()]);
 
     builder.switch_to_block(inspect_runtime);
@@ -12152,6 +12205,7 @@ fn lower_optimizing_unknown_bit_not(
         transition,
     )?;
     let value = builder.ins().bnot(value);
+    let value = lower_optimizing_admit_integer_result(builder, value, transition)?;
     builder.ins().jump(merge, &[value.into()]);
 
     builder.switch_to_block(rejected);
@@ -14793,6 +14847,141 @@ fn lower_shared_array_fetch(
     builder.switch_to_block(merge);
     Ok(builder.block_params(merge)[0])
 }
+fn lower_optimizing_admit_integer_result(
+    builder: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    transition: NativeOptimizingTransition<'_>,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    let admitted = builder.create_block();
+    let rejected = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+    let runtime = lower_is_runtime_handle(builder, value);
+    let constant = lower_value_has_namespace_tag(builder, value, crate::JIT_VALUE_CONSTANT_TAG);
+    let collides = builder.ins().bor(runtime, constant);
+    builder.ins().brif(collides, rejected, &[], admitted, &[]);
+
+    builder.switch_to_block(admitted);
+    builder.ins().jump(merge, &[value.into()]);
+
+    builder.switch_to_block(rejected);
+    let value = lower_optimizing_encode_int(builder, value, transition)?;
+    builder.ins().jump(merge, &[value.into()]);
+
+    builder.switch_to_block(merge);
+    Ok(builder.block_params(merge)[0])
+}
+
+fn lower_optimizing_integer_candidate(
+    builder: &mut FunctionBuilder<'_>,
+    encoded: ir::Value,
+    deopt_out: ir::Value,
+) -> (ir::Value, ir::Value) {
+    let inspect_runtime = builder.create_block();
+    let inspect_slot = builder.create_block();
+    let direct_integer = builder.create_block();
+    let rejected = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I8);
+    builder.append_block_param(merge, types::I64);
+
+    let runtime = lower_is_runtime_handle(builder, encoded);
+    let constant = lower_value_has_namespace_tag(builder, encoded, crate::JIT_VALUE_CONSTANT_TAG);
+    let namespaced = builder.ins().bor(runtime, constant);
+    let immediate = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
+    builder.ins().brif(
+        immediate,
+        merge,
+        &[immediate.into(), encoded.into()],
+        inspect_runtime,
+        &[],
+    );
+
+    builder.switch_to_block(inspect_runtime);
+    let index = builder.ins().ireduce(types::I32, encoded);
+    let direct = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        index,
+        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+    );
+    let direct_runtime = builder.ins().band(runtime, direct);
+    builder
+        .ins()
+        .brif(direct_runtime, inspect_slot, &[], rejected, &[]);
+
+    builder.switch_to_block(inspect_slot);
+    let slot = lower_optimizing_direct_slot_address(builder, encoded, deopt_out);
+    let kind = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+    );
+    let flags = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+    );
+    let kind_matches = builder.ins().icmp_imm(
+        IntCC::Equal,
+        kind,
+        i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_INT),
+    );
+    let version_matches = builder.ins().icmp_imm(
+        IntCC::Equal,
+        flags,
+        i64::from(crate::JIT_NATIVE_DIRECT_INT_ABI_VERSION),
+    );
+    let matches = builder.ins().band(kind_matches, version_matches);
+    builder
+        .ins()
+        .brif(matches, direct_integer, &[], rejected, &[]);
+
+    builder.switch_to_block(direct_integer);
+    let payload = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+    );
+    builder.ins().jump(merge, &[matches.into(), payload.into()]);
+
+    builder.switch_to_block(rejected);
+    let no = builder.ins().iconst(types::I8, 0);
+    builder.ins().jump(merge, &[no.into(), encoded.into()]);
+
+    builder.switch_to_block(merge);
+    (
+        builder.block_params(merge)[0],
+        builder.block_params(merge)[1],
+    )
+}
+
+fn lower_optimizing_unbox_integer(
+    builder: &mut FunctionBuilder<'_>,
+    encoded: ir::Value,
+    transition: NativeOptimizingTransition<'_>,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    let admitted = builder.create_block();
+    let rejected = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+    let (is_integer, value) =
+        lower_optimizing_integer_candidate(builder, encoded, transition.deopt_out);
+    builder.ins().brif(is_integer, admitted, &[], rejected, &[]);
+
+    builder.switch_to_block(admitted);
+    builder.ins().jump(merge, &[value.into()]);
+
+    builder.switch_to_block(rejected);
+    let value = transition.emit_value(builder)?;
+    builder.ins().jump(merge, &[value.into()]);
+
+    builder.switch_to_block(merge);
+    Ok(builder.block_params(merge)[0])
+}
+
 fn lower_guarded_integer_binary(
     builder: &mut FunctionBuilder<'_>,
     operation: RegionBinaryOp,
@@ -14800,23 +14989,11 @@ fn lower_guarded_integer_binary(
     rhs: ir::Value,
     transition: NativeOptimizingTransition<'_>,
 ) -> Result<ir::Value, CraneliftLoweringError> {
-    let calculate = builder.create_block();
+    let lhs = lower_optimizing_unbox_integer(builder, lhs, transition)?;
+    let rhs = lower_optimizing_unbox_integer(builder, rhs, transition)?;
     let rejected = builder.create_block();
     let merge = builder.create_block();
     builder.append_block_param(merge, types::I64);
-    let lhs_runtime = lower_is_runtime_handle(builder, lhs);
-    let lhs_constant = lower_value_has_namespace_tag(builder, lhs, crate::JIT_VALUE_CONSTANT_TAG);
-    let rhs_runtime = lower_is_runtime_handle(builder, rhs);
-    let rhs_constant = lower_value_has_namespace_tag(builder, rhs, crate::JIT_VALUE_CONSTANT_TAG);
-    let lhs_namespaced = builder.ins().bor(lhs_runtime, lhs_constant);
-    let rhs_namespaced = builder.ins().bor(rhs_runtime, rhs_constant);
-    let namespaced = builder.ins().bor(lhs_namespaced, rhs_namespaced);
-    let raw_integers = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
-    builder
-        .ins()
-        .brif(raw_integers, calculate, &[], rejected, &[]);
-
-    builder.switch_to_block(calculate);
     match operation {
         RegionBinaryOp::BitAnd | RegionBinaryOp::BitOr | RegionBinaryOp::BitXor => {
             let value = match operation {
@@ -14882,7 +15059,7 @@ fn lower_guarded_integer_binary(
     let value = transition.emit_value(builder)?;
     builder.ins().jump(merge, &[value.into()]);
     builder.switch_to_block(merge);
-    Ok(builder.block_params(merge)[0])
+    lower_optimizing_admit_integer_result(builder, builder.block_params(merge)[0], transition)
 }
 
 fn lower_optimizing_numeric_f64(
@@ -14907,24 +15084,22 @@ fn lower_optimizing_numeric_f64(
         }
     }
     let encoded = lower_optimizing_reference_scalar(builder, encoded, false, transition)?;
-    let immediate = builder.create_block();
+    let integer = builder.create_block();
     let inspect_runtime = builder.create_block();
     let accepted_float = builder.create_block();
     let rejected = builder.create_block();
     let merge = builder.create_block();
     builder.append_block_param(merge, types::F64);
+    let (is_integer, integer_value) =
+        lower_optimizing_integer_candidate(builder, encoded, transition.deopt_out);
     let runtime = lower_is_runtime_handle(builder, encoded);
-    let constant = lower_value_has_namespace_tag(builder, encoded, crate::JIT_VALUE_CONSTANT_TAG);
     builder
         .ins()
-        .brif(runtime, inspect_runtime, &[], immediate, &[]);
+        .brif(is_integer, integer, &[], inspect_runtime, &[]);
 
-    builder.switch_to_block(immediate);
-    let not_constant = builder.ins().icmp_imm(IntCC::Equal, constant, 0);
-    let integer = builder.ins().fcvt_from_sint(types::F64, encoded);
-    builder
-        .ins()
-        .brif(not_constant, merge, &[integer.into()], rejected, &[]);
+    builder.switch_to_block(integer);
+    let integer = builder.ins().fcvt_from_sint(types::F64, integer_value);
+    builder.ins().jump(merge, &[integer.into()]);
 
     builder.switch_to_block(inspect_runtime);
     let tag = lower_value_has_tag(builder, encoded, crate::JIT_VALUE_RUNTIME_FLOAT_TAG);
@@ -14934,7 +15109,8 @@ fn lower_optimizing_numeric_f64(
         index,
         i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
     );
-    let admitted = builder.ins().band(tag, direct);
+    let admitted = builder.ins().band(runtime, tag);
+    let admitted = builder.ins().band(admitted, direct);
     builder
         .ins()
         .brif(admitted, accepted_float, &[], rejected, &[]);
@@ -15052,6 +15228,89 @@ fn lower_optimizing_encode_float(
     builder.switch_to_block(rejected);
     let placeholder = transition.emit_value(builder)?;
     builder.ins().jump(merge, &[placeholder.into()]);
+
+    builder.switch_to_block(merge);
+    Ok(builder.block_params(merge)[0])
+}
+
+fn lower_optimizing_encode_int(
+    builder: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    transition: NativeOptimizingTransition<'_>,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    let allocate = builder.create_block();
+    let rejected = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+    builder.ins().jump(allocate, &[]);
+
+    builder.switch_to_block(allocate);
+    let slot_index = lower_reserve_direct_value_index(builder, transition.deopt_out, rejected);
+    let pointer_type = builder.func.dfg.value_type(transition.deopt_out);
+    let view = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
+    let slots = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        transition.deopt_out,
+        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_slots) as i32,
+    );
+    let wide_index = builder.ins().uextend(pointer_type, slot_index);
+    let slot_offset = builder.ins().ishl_imm(wide_index, 5);
+    let slot = builder.ins().iadd(slots, slot_offset);
+    for (field, offset) in [
+        (
+            builder.ins().iconst(types::I32, 1),
+            std::mem::offset_of!(crate::JitNativeValueSlot, refcount),
+        ),
+        (
+            builder.ins().iconst(
+                types::I32,
+                i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_INT),
+            ),
+            std::mem::offset_of!(crate::JitNativeValueSlot, kind),
+        ),
+        (
+            builder.ins().iconst(
+                types::I32,
+                i64::from(crate::JIT_NATIVE_DIRECT_INT_ABI_VERSION),
+            ),
+            std::mem::offset_of!(crate::JitNativeValueSlot, flags),
+        ),
+        (
+            builder.ins().iconst(types::I32, 0),
+            std::mem::offset_of!(crate::JitNativeValueSlot, reserved),
+        ),
+    ] {
+        builder
+            .ins()
+            .store(MemFlagsData::new(), field, slot, offset as i32);
+    }
+    builder.ins().store(
+        MemFlagsData::new(),
+        value,
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+    );
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.ins().store(
+        MemFlagsData::new(),
+        zero,
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, aux) as i32,
+    );
+    let encoded_index = builder.ins().iadd_imm(
+        slot_index,
+        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+    );
+    let encoded_index = builder.ins().uextend(types::I64, encoded_index);
+    let encoded = builder
+        .ins()
+        .bor_imm(encoded_index, crate::JIT_VALUE_RUNTIME_TAG as i64);
+    builder.ins().jump(merge, &[encoded.into()]);
+
+    builder.switch_to_block(rejected);
+    let value = transition.emit_value(builder)?;
+    builder.ins().jump(merge, &[value.into()]);
 
     builder.switch_to_block(merge);
     Ok(builder.block_params(merge)[0])
@@ -15366,6 +15625,9 @@ fn lower_optimizing_arithmetic(
     let lhs = if let RegionOperand::Constant(index) = lhs_operand
         && let Some(IrConstant::Int(value)) = constants.get(index as usize)
     {
+        if !native_integer_fits_immediate(*value) {
+            return transition.emit_value(builder);
+        }
         builder.ins().iconst(types::I64, *value)
     } else {
         lhs
@@ -15373,6 +15635,9 @@ fn lower_optimizing_arithmetic(
     let rhs = if let RegionOperand::Constant(index) = rhs_operand
         && let Some(IrConstant::Int(value)) = constants.get(index as usize)
     {
+        if !native_integer_fits_immediate(*value) {
+            return transition.emit_value(builder);
+        }
         builder.ins().iconst(types::I64, *value)
     } else {
         rhs
@@ -15384,21 +15649,18 @@ fn lower_optimizing_arithmetic(
     builder.append_block_param(integer_result, types::I64);
     builder.append_block_param(integer_result, types::I8);
     builder.append_block_param(merge, types::I64);
-    let lhs_runtime = lower_is_runtime_handle(builder, lhs);
-    let lhs_constant = lower_value_has_namespace_tag(builder, lhs, crate::JIT_VALUE_CONSTANT_TAG);
-    let rhs_runtime = lower_is_runtime_handle(builder, rhs);
-    let rhs_constant = lower_value_has_namespace_tag(builder, rhs, crate::JIT_VALUE_CONSTANT_TAG);
-    let namespaced = builder.ins().bor(lhs_runtime, lhs_constant);
-    let namespaced = builder.ins().bor(namespaced, rhs_runtime);
-    let namespaced = builder.ins().bor(namespaced, rhs_constant);
-    let both_integers = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
+    let (lhs_is_integer, lhs_integer) =
+        lower_optimizing_integer_candidate(builder, lhs, transition.deopt_out);
+    let (rhs_is_integer, rhs_integer) =
+        lower_optimizing_integer_candidate(builder, rhs, transition.deopt_out);
+    let both_integers = builder.ins().band(lhs_is_integer, rhs_is_integer);
     builder.ins().brif(both_integers, integer, &[], float, &[]);
 
     builder.switch_to_block(integer);
     let (value, overflow) = match operation {
-        RegionBinaryOp::Add => builder.ins().sadd_overflow(lhs, rhs),
-        RegionBinaryOp::Sub => builder.ins().ssub_overflow(lhs, rhs),
-        RegionBinaryOp::Mul => builder.ins().smul_overflow(lhs, rhs),
+        RegionBinaryOp::Add => builder.ins().sadd_overflow(lhs_integer, rhs_integer),
+        RegionBinaryOp::Sub => builder.ins().ssub_overflow(lhs_integer, rhs_integer),
+        RegionBinaryOp::Mul => builder.ins().smul_overflow(lhs_integer, rhs_integer),
         _ => unreachable!(),
     };
     builder
@@ -15408,9 +15670,14 @@ fn lower_optimizing_arithmetic(
     builder.switch_to_block(integer_result);
     let value = builder.block_params(integer_result)[0];
     let overflow = builder.block_params(integer_result)[1];
+    let integer_admitted = builder.create_block();
     builder
         .ins()
-        .brif(overflow, float, &[], merge, &[value.into()]);
+        .brif(overflow, float, &[], integer_admitted, &[]);
+
+    builder.switch_to_block(integer_admitted);
+    let value = lower_optimizing_admit_integer_result(builder, value, transition)?;
+    builder.ins().jump(merge, &[value.into()]);
 
     builder.switch_to_block(float);
     let lhs_float = lower_optimizing_numeric_f64(builder, lhs, lhs_operand, constants, transition)?;
@@ -15442,6 +15709,9 @@ fn lower_optimizing_integer_exponent_pow(
     let base = if let RegionOperand::Constant(index) = base_operand
         && let Some(IrConstant::Int(value)) = constants.get(index as usize)
     {
+        if !native_integer_fits_immediate(*value) {
+            return transition.emit_value(builder);
+        }
         builder.ins().iconst(types::I64, *value)
     } else {
         base
@@ -15449,6 +15719,9 @@ fn lower_optimizing_integer_exponent_pow(
     let exponent = if let RegionOperand::Constant(index) = exponent_operand
         && let Some(IrConstant::Int(value)) = constants.get(index as usize)
     {
+        if !native_integer_fits_immediate(*value) {
+            return transition.emit_value(builder);
+        }
         builder.ins().iconst(types::I64, *value)
     } else {
         exponent
@@ -15567,6 +15840,7 @@ fn lower_optimizing_integer_exponent_pow(
 
     builder.switch_to_block(integer_done);
     let result = builder.block_params(integer_done)[0];
+    let result = lower_optimizing_admit_integer_result(builder, result, transition)?;
     builder.ins().jump(merge, &[result.into()]);
 
     builder.switch_to_block(float);
@@ -15638,6 +15912,9 @@ fn lower_optimizing_numeric_unary(
     let encoded = if let RegionOperand::Constant(index) = operand
         && let Some(IrConstant::Int(value)) = constants.get(index as usize)
     {
+        if !native_integer_fits_immediate(*value) {
+            return transition.emit_value(builder);
+        }
         builder.ins().iconst(types::I64, *value)
     } else {
         encoded
@@ -15647,22 +15924,24 @@ fn lower_optimizing_numeric_unary(
     let float = builder.create_block();
     let merge = builder.create_block();
     builder.append_block_param(merge, types::I64);
-    let runtime = lower_is_runtime_handle(builder, encoded);
-    let constant = lower_value_has_namespace_tag(builder, encoded, crate::JIT_VALUE_CONSTANT_TAG);
-    let namespaced = builder.ins().bor(runtime, constant);
-    let immediate = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
-    builder.ins().brif(immediate, integer, &[], float, &[]);
+    let (is_integer, integer_value) =
+        lower_optimizing_integer_candidate(builder, encoded, transition.deopt_out);
+    builder.ins().brif(is_integer, integer, &[], float, &[]);
 
     builder.switch_to_block(integer);
     if operation == RegionUnaryOp::Plus {
-        builder.ins().jump(merge, &[encoded.into()]);
+        let value = lower_optimizing_admit_integer_result(builder, integer_value, transition)?;
+        builder.ins().jump(merge, &[value.into()]);
     } else {
-        let minimum = builder.ins().icmp_imm(IntCC::Equal, encoded, i64::MIN);
+        let minimum = builder
+            .ins()
+            .icmp_imm(IntCC::Equal, integer_value, i64::MIN);
         builder.ins().brif(minimum, float, &[], integer_minus, &[]);
     }
 
     builder.switch_to_block(integer_minus);
-    let negated = builder.ins().ineg(encoded);
+    let negated = builder.ins().ineg(integer_value);
+    let negated = lower_optimizing_admit_integer_result(builder, negated, transition)?;
     builder.ins().jump(merge, &[negated.into()]);
 
     builder.switch_to_block(float);
@@ -17425,6 +17704,19 @@ fn optimizing_type_has_direct_guard(type_: &php_ir::IrReturnType) -> bool {
     }
 }
 
+fn optimizing_type_requires_integer_representation_guard(type_: &php_ir::IrReturnType) -> bool {
+    match type_ {
+        php_ir::IrReturnType::Int => true,
+        php_ir::IrReturnType::Nullable { inner } => {
+            optimizing_type_requires_integer_representation_guard(inner)
+        }
+        php_ir::IrReturnType::Union { members } => members
+            .iter()
+            .any(optimizing_type_requires_integer_representation_guard),
+        _ => false,
+    }
+}
+
 /// Emit the exact native-tag test for the subset of `type_` admitted by the
 /// optimizing ABI. This contains no runtime helper, name lookup, operation
 /// ID, or Rust `Value` conversion.
@@ -17432,6 +17724,7 @@ fn lower_optimizing_type_guard(
     builder: &mut FunctionBuilder<'_>,
     value: ir::Value,
     type_: &php_ir::IrReturnType,
+    deopt_out: ir::Value,
 ) -> Option<ir::Value> {
     let equals_constant = |builder: &mut FunctionBuilder<'_>, constant| {
         builder.ins().icmp_imm(IntCC::Equal, value, constant)
@@ -17440,9 +17733,7 @@ fn lower_optimizing_type_guard(
         |builder: &mut FunctionBuilder<'_>, tag| lower_value_has_tag(builder, value, tag);
     match type_ {
         php_ir::IrReturnType::Int => {
-            let constant =
-                lower_value_has_namespace_tag(builder, value, crate::JIT_VALUE_CONSTANT_TAG);
-            Some(lower_is_immediate_int(builder, value, constant))
+            Some(lower_optimizing_integer_candidate(builder, value, deopt_out).0)
         }
         php_ir::IrReturnType::Float => Some(has_kind(builder, crate::JIT_VALUE_RUNTIME_FLOAT_TAG)),
         php_ir::IrReturnType::String => {
@@ -17488,11 +17779,11 @@ fn lower_optimizing_type_guard(
         php_ir::IrReturnType::Mixed => Some(builder.ins().iconst(types::I8, 1)),
         php_ir::IrReturnType::Nullable { inner } => {
             let null = equals_constant(builder, crate::jit_encode_constant(u32::MAX));
-            let inner = lower_optimizing_type_guard(builder, value, inner);
+            let inner = lower_optimizing_type_guard(builder, value, inner, deopt_out);
             Some(inner.map_or(null, |inner| builder.ins().bor(null, inner)))
         }
         php_ir::IrReturnType::Union { members } => members.iter().fold(None, |accepted, member| {
-            let member = lower_optimizing_type_guard(builder, value, member);
+            let member = lower_optimizing_type_guard(builder, value, member, deopt_out);
             match (accepted, member) {
                 (None, member) => member,
                 (accepted, None) => accepted,
@@ -17549,7 +17840,11 @@ fn lower_optimizing_region_instruction(
     // values dominate every direct-data-path block emitted for the operation,
     // so cold exits do not reconstruct them through Cranelift frontend
     // Variable alias chains created by the operation's internal CFG.
-    let transition_live_values = transition_live_registers
+    let mut transition_registers = transition_live_registers.to_vec();
+    transition_registers.extend(instruction.register_uses());
+    transition_registers.sort_unstable();
+    transition_registers.dedup();
+    let transition_live_values = transition_registers
         .iter()
         .copied()
         .map(|register| Ok((register, use_region_register(builder, registers, register)?)))
@@ -17576,7 +17871,15 @@ fn lower_optimizing_region_instruction(
     match &instruction.kind {
         RegionInstructionKind::Nop => {}
         RegionInstructionKind::Move { dst, src } => {
-            let value = lower_region_operand(builder, locals, registers, *src)?;
+            let value = if let RegionOperand::Constant(index) = *src
+                && let Some(IrConstant::Int(value)) = constants.get(index as usize)
+                && !native_integer_fits_immediate(*value)
+            {
+                let value = builder.ins().iconst(types::I64, *value);
+                lower_optimizing_encode_int(builder, value, transition)?
+            } else {
+                lower_region_operand(builder, locals, registers, *src)?
+            };
             if value_copy_requires_retain(lowering_operand_fact(value_flow, constants, *src))
                 && !value_flow.moves_value_into_register(instruction.continuation_id)
             {
@@ -18563,7 +18866,19 @@ fn lower_optimizing_region_instruction(
                     if fact.certainty != crate::region_ir::SsaCertainty::Unknown
                         && fact.class == SsaValueClass::Int =>
                 {
-                    builder.ins().bnot(src)
+                    let src = if let RegionOperand::Constant(index) = src_operand
+                        && let Some(IrConstant::Int(value)) = constants.get(index as usize)
+                    {
+                        if !native_integer_fits_immediate(*value) {
+                            transition.emit_value(builder)?
+                        } else {
+                            builder.ins().iconst(types::I64, *value)
+                        }
+                    } else {
+                        src
+                    };
+                    let value = builder.ins().bnot(src);
+                    lower_optimizing_admit_integer_result(builder, value, transition)?
                 }
                 RegionUnaryOp::BitNot
                     if fact.certainty != crate::region_ir::SsaCertainty::Unknown
@@ -20126,6 +20441,21 @@ fn lower_optimizing_region_instruction(
                 let (_, parameters, _, _, _) = function_params
                     .get(&target)
                     .expect("compiled-call target metadata was admitted above");
+                let prepared_closure = match &call.target {
+                    RegionCallTarget::Closure {
+                        callee,
+                        function: Some(_),
+                        bound_object_count,
+                        capture_count,
+                    } => {
+                        let closure = lower_ir_operand(builder, locals, registers, *callee)?;
+                        let closure = lower_optimizing_reference_scalar(
+                            builder, closure, false, transition,
+                        )?;
+                        Some((closure, *bound_object_count, *capture_count))
+                    }
+                    _ => None,
+                };
                 let mut call_args =
                     Vec::with_capacity(call.argument_operand_offset + parameters.len());
                 let mut owned_call_arguments = std::collections::BTreeSet::new();
@@ -20137,9 +20467,22 @@ fn lower_optimizing_region_instruction(
                         .enumerate()
                     {
                         let operand = operand.expect("admitted unpack prefix has every operand");
-                        let value = lower_prepared_native_call_operand(
-                            builder, locals, registers, constants, operand,
-                        )?;
+                        let value = if let Some((closure, bound_count, capture_count)) =
+                            prepared_closure
+                            && index < bound_count.saturating_add(capture_count)
+                        {
+                            lower_optimizing_prepared_closure_argument(
+                                builder,
+                                closure,
+                                bound_count,
+                                (index >= bound_count).then_some(index - bound_count),
+                                deopt_out,
+                            )
+                        } else {
+                            lower_prepared_native_call_operand(
+                                builder, locals, registers, constants, operand, transition,
+                            )?
+                        };
                         let value = if index >= call.argument_operand_offset {
                             lower_optimizing_reference_scalar(builder, value, false, transition)?
                         } else {
@@ -20159,6 +20502,7 @@ fn lower_optimizing_region_instruction(
                         registers,
                         constants,
                         unpack_operand,
+                        transition,
                     )?;
                     let (_, length, entries) =
                         lower_optimizing_direct_array_descriptor(builder, unpack_array, transition)?;
@@ -20244,7 +20588,7 @@ fn lower_optimizing_region_instruction(
                                 // fresh reference initialized from its
                                 // declared default.
                                 let default = lower_prepared_native_call_operand(
-                                    builder, locals, registers, constants, operand,
+                                    builder, locals, registers, constants, operand, transition,
                                 )?;
                                 let reference = lower_optimizing_bind_direct_local_reference(
                                     builder, default, transition,
@@ -20254,9 +20598,22 @@ fn lower_optimizing_region_instruction(
                             };
                             call_args.push(reference);
                         } else {
-                            let value = lower_prepared_native_call_operand(
-                                builder, locals, registers, constants, operand,
-                            )?;
+                            let value = if let Some((closure, bound_count, capture_count)) =
+                                prepared_closure
+                                && index < bound_count.saturating_add(capture_count)
+                            {
+                                lower_optimizing_prepared_closure_argument(
+                                    builder,
+                                    closure,
+                                    bound_count,
+                                    (index >= bound_count).then_some(index - bound_count),
+                                    deopt_out,
+                                )
+                            } else {
+                                lower_prepared_native_call_operand(
+                                    builder, locals, registers, constants, operand, transition,
+                                )?
+                            };
                             let value = if parameter.is_some() {
                                 // A by-value parameter observes a direct
                                 // reference payload while its caller slot
@@ -20298,12 +20655,19 @@ fn lower_optimizing_region_instruction(
                                     type_,
                                 )
                             });
-                        if static_match {
+                        if static_match
+                            && !optimizing_type_requires_integer_representation_guard(type_)
+                        {
                             continue;
                         }
                         let guarded =
                             call_args[call.argument_operand_offset.saturating_add(index)];
-                        let matched = lower_optimizing_type_guard(builder, guarded, type_)
+                        let matched = lower_optimizing_type_guard(
+                            builder,
+                            guarded,
+                            type_,
+                            transition.deopt_out,
+                        )
                             .expect("compiled unpack parameter type has an admitted native guard");
                         arguments_match = Some(arguments_match.map_or(matched, |accepted| {
                             builder.ins().band(accepted, matched)
@@ -20331,6 +20695,7 @@ fn lower_optimizing_region_instruction(
                                 lowering_operand_fact(value_flow, constants, operand),
                                 type_,
                             )
+                            && !optimizing_type_requires_integer_representation_guard(type_)
                         {
                             continue;
                         }
@@ -20344,7 +20709,12 @@ fn lower_optimizing_region_instruction(
                         } else {
                             call_args[operand_index]
                         };
-                        let matched = lower_optimizing_type_guard(builder, guarded, type_)
+                        let matched = lower_optimizing_type_guard(
+                            builder,
+                            guarded,
+                            type_,
+                            transition.deopt_out,
+                        )
                             .expect("compiled-call parameter type has an admitted native guard");
                         arguments_match = Some(arguments_match.map_or(matched, |accepted| {
                             builder.ins().band(accepted, matched)
@@ -23426,7 +23796,6 @@ fn lower_baseline_region_instruction(
                         })
                     }
                     (RegionUnaryOp::Plus, SsaValueClass::Int) => Some(src),
-                    (RegionUnaryOp::BitNot, SsaValueClass::Int) => Some(builder.ins().bnot(src)),
                     _ => None,
                 }
             } else {
@@ -23978,6 +24347,19 @@ fn lower_baseline_region_instruction(
                         format!("callee {} has no parameter metadata", direct_target.raw()),
                     )
                 })?;
+            let prepared_closure = match &call.target {
+                RegionCallTarget::Closure {
+                    callee,
+                    function: Some(_),
+                    bound_object_count,
+                    capture_count,
+                } => Some((
+                    lower_ir_operand(builder, locals, registers, *callee)?,
+                    *bound_object_count,
+                    *capture_count,
+                )),
+                _ => None,
+            };
             for (index, operand) in call.operands.iter().enumerate() {
                 let operand = operand.ok_or_else(|| {
                     CraneliftLoweringError::new(
@@ -23985,7 +24367,20 @@ fn lower_baseline_region_instruction(
                         "direct call argument requires the typed native binder",
                     )
                 })?;
-                let mut value = lower_region_operand(builder, locals, registers, operand)?;
+                let mut value = if let Some((closure, bound_count, capture_count)) =
+                    prepared_closure
+                    && index < bound_count.saturating_add(capture_count)
+                {
+                    lower_optimizing_prepared_closure_argument(
+                        builder,
+                        closure,
+                        bound_count,
+                        (index >= bound_count).then_some(index - bound_count),
+                        deopt_out,
+                    )
+                } else {
+                    lower_region_operand(builder, locals, registers, operand)?
+                };
                 if let Some((visible_index, argument)) = index
                     .checked_sub(call.argument_operand_offset)
                     .and_then(|index| call.args.get(index).map(|argument| (index, argument)))
@@ -27298,27 +27693,12 @@ fn lower_checked_region_binary(
         RegionBinaryOp::Add => builder.ins().sadd_overflow(lhs, rhs),
         RegionBinaryOp::Sub => builder.ins().ssub_overflow(lhs, rhs),
         RegionBinaryOp::Mul => builder.ins().smul_overflow(lhs, rhs),
-        RegionBinaryOp::BitAnd => {
-            return Ok(builder.ins().band(lhs, rhs));
-        }
-        RegionBinaryOp::BitOr => {
-            return Ok(builder.ins().bor(lhs, rhs));
-        }
-        RegionBinaryOp::BitXor => {
-            return Ok(builder.ins().bxor(lhs, rhs));
-        }
-        RegionBinaryOp::ShiftLeft | RegionBinaryOp::ShiftRight => {
-            let slow_block = builder.create_block();
-            let fast_block = builder.create_block();
-            let merge_block = builder.create_block();
-            builder.append_block_param(merge_block, types::I64);
-            let negative = builder.ins().icmp_imm(IntCC::SignedLessThan, rhs, 0);
-            builder
-                .ins()
-                .brif(negative, slow_block, &[], fast_block, &[]);
-
-            builder.switch_to_block(slow_block);
-            let slow = lower_native_binary_operation(
+        RegionBinaryOp::BitAnd
+        | RegionBinaryOp::BitOr
+        | RegionBinaryOp::BitXor
+        | RegionBinaryOp::ShiftLeft
+        | RegionBinaryOp::ShiftRight => {
+            return lower_native_binary_operation(
                 module,
                 builder,
                 helper,
@@ -27334,27 +27714,7 @@ fn lower_checked_region_binary(
                 registers,
                 live_registers,
                 native_version,
-            )?;
-            builder.ins().jump(merge_block, &[slow.into()]);
-
-            builder.switch_to_block(fast_block);
-            let large = builder
-                .ins()
-                .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, rhs, 64);
-            let shifted = if op == RegionBinaryOp::ShiftLeft {
-                builder.ins().ishl(lhs, rhs)
-            } else {
-                builder.ins().sshr(lhs, rhs)
-            };
-            let out_of_range = if op == RegionBinaryOp::ShiftLeft {
-                builder.ins().iconst(types::I64, 0)
-            } else {
-                builder.ins().sshr_imm(lhs, 63)
-            };
-            let fast = builder.ins().select(large, out_of_range, shifted);
-            builder.ins().jump(merge_block, &[fast.into()]);
-            builder.switch_to_block(merge_block);
-            return Ok(builder.block_params(merge_block)[0]);
+            );
         }
         RegionBinaryOp::Div
         | RegionBinaryOp::Mod
@@ -27370,9 +27730,14 @@ fn lower_checked_region_binary(
     let ok_block = builder.create_block();
     let merge_block = builder.create_block();
     builder.append_block_param(merge_block, types::I64);
+    let runtime_collision = lower_is_runtime_handle(builder, result);
+    let constant_collision =
+        lower_value_has_namespace_tag(builder, result, crate::JIT_VALUE_CONSTANT_TAG);
+    let collision = builder.ins().bor(runtime_collision, constant_collision);
+    let rejected = builder.ins().bor(overflow, collision);
     builder
         .ins()
-        .brif(overflow, overflow_block, &[], ok_block, &[]);
+        .brif(rejected, overflow_block, &[], ok_block, &[]);
     builder.switch_to_block(overflow_block);
     let slow = lower_native_binary_operation(
         module,

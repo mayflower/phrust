@@ -11,13 +11,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use php_ir::{FunctionId, LocalId, RegId};
 
 /// Version for the C-compatible runtime ABI records.
-pub const JIT_RUNTIME_ABI_VERSION: u32 = 87;
+pub const JIT_RUNTIME_ABI_VERSION: u32 = 89;
 
 /// Stable ABI fingerprint for Cranelift ABI.
 ///
 /// This is updated only when a `repr(C)` boundary type changes layout or tag
 /// meaning. It is intentionally independent from Rust type names.
-pub const JIT_RUNTIME_ABI_HASH: u64 = 0x0dc1_a843_0000_0077;
+pub const JIT_RUNTIME_ABI_HASH: u64 = 0x0dc1_a843_0000_0079;
 
 /// No stable length is published for this runtime value slot.
 pub const JIT_NATIVE_VALUE_VIEW_NONE: u32 = 0;
@@ -57,7 +57,7 @@ pub const JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT: u32 = 13;
 /// Request-owned callable record with authoritative encoded object/capture owners.
 pub const JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE: u32 = 14;
 /// Layout/meaning version for a prepared callable direct value slot.
-pub const JIT_NATIVE_PREPARED_CALLABLE_ABI_VERSION: u32 = 1;
+pub const JIT_NATIVE_PREPARED_CALLABLE_ABI_VERSION: u32 = 2;
 /// Request-owned Fiber lifecycle with encoded callable and return owners.
 pub const JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER: u32 = 15;
 /// Layout/meaning version for a direct Fiber value slot.
@@ -82,6 +82,11 @@ pub const JIT_NATIVE_DIRECT_RESOURCE_ABI_VERSION: u32 = 1;
 /// Its contents live in the authoritative global reference slots; the marker
 /// exists only as an exact baseline-continuation operand.
 pub const JIT_NATIVE_VALUE_VIEW_GLOBALS_PROXY: u32 = 20;
+/// Authoritative request-owned integer whose raw bit pattern overlaps a
+/// native handle namespace and therefore cannot travel as an immediate.
+pub const JIT_NATIVE_VALUE_VIEW_DIRECT_INT: u32 = 21;
+/// Layout/meaning version for a direct integer value slot.
+pub const JIT_NATIVE_DIRECT_INT_ABI_VERSION: u32 = 1;
 pub const JIT_NATIVE_SHARED_ARRAY_ABI_VERSION: u32 = 1;
 pub const JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_VERSION: u32 = 1;
 pub const JIT_NATIVE_TRUSTED_PROPERTY_SLOT_EMPTY: u32 = 0;
@@ -199,6 +204,23 @@ pub struct JitNativeValueSlot {
 // SAFETY: this repr(C) record is plain integers and its derived Default is the
 // all-zero representation supplied by the demand-backed native arena.
 unsafe impl php_runtime::api::NativeZeroed for JitNativeValueSlot {}
+
+/// Stable read-only view of one authoritative prepared closure.
+///
+/// A prepared closure slot's `aux` pointer addresses this prefix of its stable
+/// owner record. Generated direct calls load the bound receiver and captures
+/// from here, so the closure object—not a mutable caller-local copy—defines
+/// the packed native frame.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitNativePreparedClosureView {
+    pub captures: u64,
+    pub capture_count: u32,
+    pub flags: u32,
+    pub implicit_this: i64,
+}
+
+pub const JIT_NATIVE_PREPARED_CLOSURE_HAS_IMPLICIT_THIS: u32 = 1;
 
 /// One mutable key/value cell in a direct native array.
 #[repr(C)]
@@ -2173,13 +2195,14 @@ mod tests {
         JitNativeControlRecord, JitNativeDynamicCodeKind, JitNativeDynamicCodeRequest,
         JitNativeExceptionHandler, JitNativeFiberState, JitNativeFrameHeader,
         JitNativeGeneratorState, JitNativeIndirectionEntry, JitNativePcMetadata,
-        JitNativeRootEntry, JitNativeSuspensionGenerationPolicy, JitNativeValueSlot,
-        JitOpaqueHandle, JitOpaqueValueKind, JitSideExit, JitVmContextHandle, SideExitReason,
+        JitNativePreparedClosureView, JitNativeRootEntry, JitNativeSuspensionGenerationPolicy,
+        JitNativeValueSlot, JitOpaqueHandle, JitOpaqueValueKind, JitSideExit, JitVmContextHandle,
+        SideExitReason,
     };
 
     #[test]
     fn c_abi_layout_is_stable() {
-        assert_eq!(JIT_RUNTIME_ABI_VERSION, 87);
+        assert_eq!(JIT_RUNTIME_ABI_VERSION, 89);
         assert_ne!(JIT_RUNTIME_ABI_HASH, 0);
         assert_eq!(size_of::<JitOpaqueHandle>(), 8);
         assert_eq!(size_of::<JitCValueTag>(), 4);
@@ -2202,6 +2225,8 @@ mod tests {
         assert_eq!(align_of::<JitNativeFiberState>(), 8);
         assert_eq!(size_of::<JitNativeValueSlot>(), 32);
         assert_eq!(align_of::<JitNativeValueSlot>(), 8);
+        assert_eq!(size_of::<JitNativePreparedClosureView>(), 24);
+        assert_eq!(align_of::<JitNativePreparedClosureView>(), 8);
         assert_eq!(std::mem::offset_of!(JitNativeValueSlot, refcount), 0);
         assert_eq!(std::mem::offset_of!(JitNativeValueSlot, payload), 16);
         assert_eq!(std::mem::offset_of!(JitNativeValueSlot, aux), 24);

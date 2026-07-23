@@ -947,9 +947,9 @@ pub(super) fn lower_optimizing_region_terminator(
                 value
             };
             if return_check_required {
-                let Some(matches_return_type) = return_type
-                    .and_then(|type_| lower_optimizing_type_guard(builder, value, type_))
-                else {
+                let Some(matches_return_type) = return_type.and_then(|type_| {
+                    lower_optimizing_type_guard(builder, value, type_, deopt_out)
+                }) else {
                     transition.emit(builder)?;
                     return Ok(EmittedOptimizingInstruction {
                         class: crate::JitProductionLoweringClass::BaselineFragmentTransition,

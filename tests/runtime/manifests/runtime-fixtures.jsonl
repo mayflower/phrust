@@ -43,6 +43,7 @@
 {"id":"control-match","path":"fixtures/runtime/valid/control_flow/match-success.php","tags":["runtime","control-flow"],"expect":{"exit":0,"stdout":"one\n"}}
 {"id":"control-return","path":"fixtures/runtime/valid/control_flow/return.php","tags":["runtime","control-flow"],"expect":{"exit":0,"stdout":"before\n"}}
 {"id":"functions-simple","path":"fixtures/runtime/valid/functions/simple.php","tags":["runtime","functions"],"expect":{"exit":0,"stdout":"hi\n"}}
+{"id":"functions-native-tag-collision-int","path":"fixtures/runtime/valid/functions/native-tag-collision-int.php","tags":["runtime","functions","integers","native","ownership"],"expect":{"exit":0,"stdout":"integer\n9219149912204115968\n9219149912204115968\n9219149912204115968\n9219149912204115968\n9219149912204115968\n9219149912204115968\nkept\n"}}
 {"id":"functions-two-args","path":"fixtures/runtime/valid/functions/two-args.php","tags":["runtime","functions"],"expect":{"exit":0,"stdout":"5\n"}}
 {"id":"functions-local-scope","path":"fixtures/runtime/valid/functions/local-scope.php","tags":["runtime","functions"],"expect":{"exit":0,"stdout":"2|10\n"}}
 {"id":"functions-factorial","path":"fixtures/runtime/valid/functions/factorial.php","tags":["runtime","functions"],"expect":{"exit":0,"stdout":"120\n"}}
@@ -57,6 +58,7 @@
 {"id":"functions-native-by-ref-array-dimensions-local","path":"fixtures/runtime_semantics/regressions/native-by-ref-array-dimensions-local.php","tags":["runtime","functions","arrays","references","cow","native"],"expect":{"exit":0,"stdout":"2:1:2:2:2:1:2"}}
 {"id":"functions-closure-simple","path":"fixtures/runtime/valid/functions/closure-simple.php","tags":["runtime","functions"],"expect":{"exit":0,"stdout":"3\n"}}
 {"id":"functions-closure-use","path":"fixtures/runtime/valid/functions/closure-use.php","tags":["runtime","functions"],"expect":{"exit":0,"stdout":"5\n"}}
+{"id":"functions-closure-capture-after-output","path":"fixtures/runtime/valid/functions/closure-capture-after-output.php","tags":["runtime","functions","closures","native"],"expect":{"exit":0,"stdout":"2\n2\n"}}
 {"id":"functions-arrow-capture","path":"fixtures/runtime/valid/functions/arrow-capture.php","tags":["runtime","functions"],"expect":{"exit":0,"stdout":"7\n"}}
 {"id":"functions-closure-return","path":"fixtures/runtime/valid/functions/closure-return.php","tags":["runtime","functions"],"expect":{"exit":0,"stdout":"9\n"}}
 {"id":"php85-pipe-user-function","path":"fixtures/runtime/valid/php85/pipe-user-function.php","tags":["runtime","php85"],"expect":{"exit":0,"stdout":"3\n"}}

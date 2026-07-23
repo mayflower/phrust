@@ -2,11 +2,27 @@ use super::*;
 use crate::region_ir::{
     SsaOwnership, analyze_baseline_value_ownership, analyze_executable_value_flow,
 };
-use php_ir::instruction::{IrCallDimTarget, IrCallPropertyTarget};
+use php_ir::instruction::{ClosureCaptureArg, IrCallDimTarget, IrCallPropertyTarget};
 use php_ir::{
-    ClassEntry, ClassFlags, ClassId, ClassMethodEntry, ClassMethodFlags, FunctionFlags, IrBuilder,
-    IrCapture, IrParam, IrSpan, UnitId,
+    ClassEntry, ClassFlags, ClassId, ClassMethodEntry, ClassMethodFlags, ConstId, FunctionFlags,
+    IrBuilder, IrCapture, IrParam, IrSpan, UnitId,
 };
+
+#[test]
+fn colliding_integer_constant_keeps_its_constant_identity_until_direct_publication() {
+    let mut unit = php_ir::IrUnit::new(UnitId::new(0));
+    unit.constants.push(IrConstant::Int(0x7ff1_0000_0000_0000));
+    unit.constants.push(IrConstant::Int(42));
+
+    assert_eq!(
+        lower_constant(&unit, ConstId::new(0)),
+        RegionOperand::Constant(0)
+    );
+    assert_eq!(
+        lower_constant(&unit, ConstId::new(1)),
+        RegionOperand::I64(42)
+    );
+}
 
 fn builtin_call_with_local_arguments(name: &str, argument_count: usize) -> RegionNativeCall {
     let local = LocalId::new(0);
@@ -1650,6 +1666,170 @@ fn closure_and_constant_fetch_remain_in_the_semantic_graph() {
         InstructionKind::FetchConst { .. }
     ));
     assert_eq!(instruction.span, span);
+}
+
+#[test]
+fn direct_closure_call_reads_the_authoritative_prepared_capture() {
+    let mut builder = IrBuilder::new(UnitId::new(94));
+    let file = builder.add_file("closure-capture-snapshot.php");
+    let span = IrSpan::new(file, 0, 20);
+    let closure = builder.start_function(
+        "{closure}",
+        FunctionFlags {
+            is_closure: true,
+            ..FunctionFlags::default()
+        },
+        span,
+    );
+    let captured = builder.intern_local(closure, "x");
+    builder.push_capture(
+        closure,
+        IrCapture {
+            name: "x".to_owned(),
+            local: captured,
+            by_ref: false,
+        },
+    );
+    let parameter = builder.intern_local(closure, "y");
+    builder.push_param(
+        closure,
+        IrParam {
+            name: "y".to_owned(),
+            local: parameter,
+            required: true,
+            default: None,
+            type_: None,
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let closure_block = builder.append_block(closure);
+    builder.terminate_return(closure, closure_block, Some(Operand::Local(captured)), span);
+
+    let main = builder.start_function(
+        "main",
+        FunctionFlags {
+            is_top_level: true,
+            ..FunctionFlags::default()
+        },
+        span,
+    );
+    let source = builder.intern_local(main, "x");
+    let callable = builder.intern_local(main, "f");
+    let block = builder.append_block(main);
+    let two = builder.intern_constant(IrConstant::Int(2));
+    let hundred = builder.intern_constant(IrConstant::Int(100));
+    let three = builder.intern_constant(IrConstant::Int(3));
+    builder.emit(
+        main,
+        block,
+        InstructionKind::StoreLocal {
+            local: source,
+            src: Operand::Constant(two),
+        },
+        span,
+    );
+    let closure_value = builder.alloc_register(main);
+    builder.emit(
+        main,
+        block,
+        InstructionKind::MakeClosure {
+            dst: closure_value,
+            function: closure,
+            captures: vec![ClosureCaptureArg {
+                name: "x".to_owned(),
+                src: Operand::Local(source),
+                by_ref: false,
+            }],
+        },
+        span,
+    );
+    builder.emit(
+        main,
+        block,
+        InstructionKind::StoreLocal {
+            local: callable,
+            src: Operand::Register(closure_value),
+        },
+        span,
+    );
+    builder.emit(
+        main,
+        block,
+        InstructionKind::StoreLocal {
+            local: source,
+            src: Operand::Constant(hundred),
+        },
+        span,
+    );
+    let loaded_callable = builder.alloc_register(main);
+    builder.emit(
+        main,
+        block,
+        InstructionKind::LoadLocal {
+            dst: loaded_callable,
+            local: callable,
+        },
+        span,
+    );
+    let result = builder.alloc_register(main);
+    builder.emit(
+        main,
+        block,
+        InstructionKind::CallCallable {
+            dst: result,
+            callee: Operand::Register(loaded_callable),
+            args: vec![IrCallArg {
+                name: None,
+                value: Operand::Constant(three),
+                unpack: false,
+                value_kind: IrCallArgValueKind::Direct,
+                by_ref_local: None,
+                by_ref_dim: None,
+                by_ref_property: None,
+                by_ref_property_dim: None,
+            }],
+        },
+        span,
+    );
+    builder.terminate_return(main, block, Some(Operand::Register(result)), span);
+
+    let unit = builder.finish();
+    let region = build_baseline_region(&unit, main).expect("direct closure region");
+    let call_instruction = region.blocks[0]
+        .instructions
+        .iter()
+        .find(|instruction| {
+            matches!(
+                &instruction.kind,
+                RegionInstructionKind::NativeCall(call)
+                    if matches!(
+                        call.target,
+                        RegionCallTarget::Closure {
+                            function: Some(candidate),
+                            capture_count: 1,
+                            ..
+                        } if candidate == closure
+                    )
+            )
+        })
+        .expect("direct closure call");
+    let RegionInstructionKind::NativeCall(call) = &call_instruction.kind else {
+        unreachable!("filtered above");
+    };
+    assert_eq!(
+        region.local_count,
+        unit.functions[main.index()].local_count,
+        "direct closure calls must not retain a second mutable capture plane"
+    );
+    assert_eq!(call.argument_operand_offset, 1);
+    assert_eq!(call.operands[0], Some(RegionOperand::I64(0)));
+    assert_eq!(call.operands[1], Some(RegionOperand::I64(3)));
+    assert!(
+        call_instruction.register_uses().contains(&loaded_callable),
+        "the prepared closure source must remain live even though it is not packed into the callee frame"
+    );
 }
 
 #[test]

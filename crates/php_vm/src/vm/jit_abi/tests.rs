@@ -139,6 +139,8 @@ fn immediate_scalar_fast_paths_preserve_native_slot_encoding() {
     assert_eq!(fast_native_unary(2, false_value), Some(true_value));
     assert_eq!(fast_native_binary(0, 20, 22), Some(42));
     assert_eq!(fast_native_binary(0, i64::MAX, 1), None);
+    assert_eq!(fast_native_binary(0, 0x7ff0_ffff_ffff_ffff, 1), None);
+    assert_eq!(fast_native_unary(3, !0x7ff1_0000_0000_0000), None);
     assert_eq!(fast_native_binary(3, 8, 2), Some(4));
     assert_eq!(fast_native_binary(3, 7, 2), None);
     assert_eq!(fast_native_binary(10, 1, -1), None);

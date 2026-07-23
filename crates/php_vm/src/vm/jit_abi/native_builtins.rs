@@ -1952,95 +1952,6 @@ fn native_method_has_no_by_ref_parameters(
         .map(|method| !method.params.iter().any(|parameter| parameter.by_ref))
 }
 
-fn native_callable_value_by_ref_parameter_at(
-    context: &NativeRequestColdState<'_>,
-    callable: &Value,
-    index: usize,
-) -> Option<(String, String)> {
-    match callable {
-        Value::Reference(reference) => {
-            native_callable_value_by_ref_parameter_at(context, &reference.get(), index)
-        }
-        Value::String(name) => {
-            let name = name.to_string_lossy();
-            native_named_callable_by_ref_parameter_at(context, &name, index).map(|parameter| {
-                (
-                    native_named_callable_display_name(context, &name),
-                    parameter,
-                )
-            })
-        }
-        Value::Callable(callable) => match callable.as_ref() {
-            php_runtime::api::CallableValue::UserFunction { name }
-            | php_runtime::api::CallableValue::InternalBuiltin { name } => {
-                native_named_callable_by_ref_parameter_at(context, name, index)
-                    .map(|parameter| (native_named_callable_display_name(context, name), parameter))
-            }
-            php_runtime::api::CallableValue::Closure(closure) => {
-                let function = php_ir::FunctionId::new(closure.function);
-                let function = closure
-                    .context
-                    .owner_unit
-                    .and_then(|unit| context.dynamic_units.get(unit))
-                    .map(|unit| unit.compiled.unit())
-                    .unwrap_or(&context.unit)
-                    .functions
-                    .get(function.index())?;
-                native_ir_by_ref_parameter_at(function, index)
-                    .map(|parameter| ("{closure}".to_owned(), parameter))
-            }
-            php_runtime::api::CallableValue::BoundMethod { target, method, .. } => {
-                let class = match target {
-                    php_runtime::api::CallableMethodTarget::Object(object) => object.class_name(),
-                    php_runtime::api::CallableMethodTarget::Class(class) => class.clone(),
-                };
-                native_method_by_ref_parameter_at(context, &class, method, index).map(|parameter| {
-                    (
-                        native_method_callable_display_name(context, &class, method),
-                        parameter,
-                    )
-                })
-            }
-            php_runtime::api::CallableValue::MethodPlaceholder { .. }
-            | php_runtime::api::CallableValue::UnresolvedDynamic { .. } => None,
-        },
-        Value::Object(object) => {
-            let class = object.class_name();
-            native_method_by_ref_parameter_at(context, &class, "__invoke", index).map(|parameter| {
-                (
-                    native_method_callable_display_name(context, &class, "__invoke"),
-                    parameter,
-                )
-            })
-        }
-        Value::Array(array) if array.len() == 2 => {
-            let target = array.get(&php_runtime::api::ArrayKey::Int(0))?;
-            let method = array.get(&php_runtime::api::ArrayKey::Int(1))?;
-            let Value::String(method) = method else {
-                return None;
-            };
-            let method = method.to_string_lossy();
-            let class = match target {
-                Value::Reference(reference) => match reference.get() {
-                    Value::Object(object) => object.class_name(),
-                    Value::String(class) => class.to_string_lossy(),
-                    _ => return None,
-                },
-                Value::Object(object) => object.class_name(),
-                Value::String(class) => class.to_string_lossy(),
-                _ => return None,
-            };
-            native_method_by_ref_parameter_at(context, &class, &method, index).map(|parameter| {
-                (
-                    native_method_callable_display_name(context, &class, &method),
-                    parameter,
-                )
-            })
-        }
-        _ => None,
-    }
-}
-
 fn native_encoded_callable_by_ref_parameter_at(
     context: &NativeRequestColdState<'_>,
     encoded: i64,
@@ -2100,13 +2011,7 @@ fn native_encoded_callable_by_ref_parameter_at(
                     },
                 );
             }
-            let runtime = php_jit::jit_decode_runtime_value(encoded)? as usize;
-            match context.values.get(runtime)?.as_ref()? {
-                NativeStoredValue::Php(value) => {
-                    native_callable_value_by_ref_parameter_at(context, value, index)
-                }
-                _ => None,
-            }
+            None
         }
         NativeEncodedValueKind::Callable => {
             if let Some(closure) = context.prepared_closure_payload(encoded) {
@@ -2154,23 +2059,9 @@ fn native_encoded_callable_by_ref_parameter_at(
                     | NativePreparedCallableDispatch::Invalid(_) => None,
                 };
             }
-            let runtime = php_jit::jit_decode_runtime_value(encoded)? as usize;
-            match context.values.get(runtime)?.as_ref()? {
-                NativeStoredValue::Php(value) => {
-                    native_callable_value_by_ref_parameter_at(context, value, index)
-                }
-                _ => None,
-            }
+            None
         }
-        NativeEncodedValueKind::Reference => {
-            let runtime = php_jit::jit_decode_runtime_value(encoded)? as usize;
-            match context.values.get(runtime)?.as_ref()? {
-                NativeStoredValue::Php(Value::Reference(reference)) => {
-                    native_callable_value_by_ref_parameter_at(context, &reference.get(), index)
-                }
-                _ => None,
-            }
-        }
+        NativeEncodedValueKind::Reference => None,
         _ => None,
     }
 }
@@ -2247,22 +2138,11 @@ pub(super) fn execute_native_call_user_func_encoded(
     arguments: &[i64],
     source: &php_ir::Instruction,
     caller_function: Option<u32>,
-    builtin_policy: NativeCallableBuiltinPolicy,
 ) -> NativeCallResult {
     let [callback, call_arguments @ ..] = arguments else {
         return Err("call_user_func() expects a callback".into());
     };
     let callback = *callback;
-    if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline
-        && exact_native_callable_requires_baseline(context, callback)
-    {
-        return Err(NativeCallControl::BaselineRequired);
-    }
-    if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline
-        && !authoritative_native_call_arguments_are_admitted(context, arguments, None)
-    {
-        return Err(NativeCallControl::BaselineRequired);
-    }
     let mut encoded = std::mem::take(&mut context.native_call_encoded_scratch);
     encoded.clear();
     encoded.reserve(arguments.len());
@@ -2288,13 +2168,7 @@ pub(super) fn execute_native_call_user_func_encoded(
                 ),
                 source,
             )?;
-            let payload = if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
-                context
-                    .duplicate_authoritative_dereferenced_native_value(value)?
-                    .ok_or(NativeCallControl::BaselineRequired)?
-            } else {
-                context.duplicate_dereferenced_native_value(value)?
-            };
+            let payload = context.duplicate_dereferenced_native_value(value)?;
             let reference = match context.encode_direct_reference_payload_owned(payload) {
                 Ok(reference) => reference,
                 Err(error) => {
@@ -2305,14 +2179,7 @@ pub(super) fn execute_native_call_user_func_encoded(
             encoded[index + 1] = reference;
             temporary_references.push(reference);
         }
-        invoke_native_encoded_callable_value_from(
-            context,
-            &encoded,
-            source,
-            None,
-            caller_function,
-            builtin_policy,
-        )
+        invoke_native_encoded_callable_value_from(context, &encoded, source, None, caller_function)
     })();
     let mut release_error = None;
     for reference in temporary_references {
@@ -2335,22 +2202,8 @@ pub(super) fn execute_native_call_user_func_array_direct(
     arguments: i64,
     source: &php_ir::Instruction,
     caller_function: Option<u32>,
-    builtin_policy: NativeCallableBuiltinPolicy,
 ) -> Option<NativeCallResult> {
-    if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline
-        && exact_native_callable_requires_baseline(context, callback)
-    {
-        return Some(Err(NativeCallControl::BaselineRequired));
-    }
     let entries = context.direct_array_entries_for(arguments)?.to_vec();
-    if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline
-        && (!authoritative_native_call_value_is_admitted(context, callback)
-            || entries
-                .iter()
-                .any(|entry| !authoritative_native_call_value_is_admitted(context, entry.value)))
-    {
-        return Some(Err(NativeCallControl::BaselineRequired));
-    }
     let mut encoded = std::mem::take(&mut context.native_call_encoded_scratch);
     encoded.clear();
     encoded.reserve(entries.len() + 1);
@@ -2374,13 +2227,7 @@ pub(super) fn execute_native_call_user_func_array_direct(
                     ),
                     source,
                 )?;
-                let payload = if builtin_policy == NativeCallableBuiltinPolicy::RequireBaseline {
-                    context
-                        .duplicate_authoritative_dereferenced_native_value(encoded_value)?
-                        .ok_or(NativeCallControl::BaselineRequired)?
-                } else {
-                    context.duplicate_dereferenced_native_value(encoded_value)?
-                };
+                let payload = context.duplicate_dereferenced_native_value(encoded_value)?;
                 encoded_value = match context.encode_direct_reference_payload_owned(payload) {
                     Ok(reference) => reference,
                     Err(error) => {
@@ -2430,7 +2277,6 @@ pub(super) fn execute_native_call_user_func_array_direct(
             source,
             metadata,
             caller_function,
-            builtin_policy,
         )
     })();
     let mut release_error = None;
@@ -2462,12 +2308,6 @@ fn native_builtin_type_predicate(
     encoded: i64,
     predicate: fn(&Value) -> bool,
 ) -> Result<bool, String> {
-    if let Some(value) = context.borrowed_php_value(encoded) {
-        return Ok(match value {
-            Value::Reference(reference) => predicate(&reference.get()),
-            value => predicate(value),
-        });
-    }
     let value = context.decode(encoded)?;
     Ok(match value {
         Value::Reference(reference) => predicate(&reference.get()),
@@ -2602,7 +2442,7 @@ fn execute_native_read_builtin_fast(
             })))
         }
         ("strlen", [value]) => {
-            let Some(Value::String(value)) = context.borrowed_php_value(*value) else {
+            let Value::String(value) = context.decode(*value)? else {
                 return Ok(None);
             };
             let length =
@@ -2861,7 +2701,6 @@ fn execute_native_call_user_func_array_control(
         *arguments,
         source,
         caller_locals.map(|(function, _)| function),
-        NativeCallableBuiltinPolicy::ExecuteBaseline,
     ) {
         return result;
     }
@@ -2908,7 +2747,6 @@ fn execute_native_call_user_func_array_control(
                 source,
                 metadata,
                 caller_locals.map(|(function, _)| function),
-                NativeCallableBuiltinPolicy::ExecuteBaseline,
             )
         })();
         encoded.clear();
@@ -2994,7 +2832,6 @@ fn execute_native_call_user_func_array_control(
         source,
         Some(metadata),
         caller_locals.map(|(function, _)| function),
-        NativeCallableBuiltinPolicy::ExecuteBaseline,
     )
     .map_err(|control| match control {
         NativeCallControl::RuntimeError(error) if error.starts_with("native runtime value ") => {
@@ -3019,7 +2856,6 @@ pub(super) fn execute_native_callback_builtin_control(
             arguments,
             source,
             caller_locals.map(|(function, _)| function),
-            NativeCallableBuiltinPolicy::ExecuteBaseline,
         )),
         "call_user_func_array" => Some(execute_native_call_user_func_array_control(
             context,
