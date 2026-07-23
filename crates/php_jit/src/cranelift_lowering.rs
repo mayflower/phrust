@@ -3152,10 +3152,7 @@ fn lower_direct_array_require_supported_key(
 ) -> Result<(), CraneliftLoweringError> {
     let accepted = builder.create_block();
     let rejected = builder.create_block();
-    let runtime = lower_is_runtime_handle(builder, key);
-    let constant = lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
-    let namespaced = builder.ins().bor(runtime, constant);
-    let integer = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
+    let integer = lower_optimizing_integer_candidate(builder, key, transition.deopt_out).0;
     let (string, _, _) = lower_native_string_key_descriptor(builder, key, transition.deopt_out);
     let supported = builder.ins().bor(integer, string);
     builder.ins().brif(supported, accepted, &[], rejected, &[]);
@@ -3288,11 +3285,11 @@ fn lower_direct_array_next_integer_key(
     let candidate = builder
         .ins()
         .load(types::I64, MemFlagsData::new(), entry, 0);
-    let runtime = lower_is_runtime_handle(builder, candidate);
-    let constant = lower_value_has_namespace_tag(builder, candidate, crate::JIT_VALUE_CONSTANT_TAG);
-    let namespaced = builder.ins().bor(runtime, constant);
-    let integer = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
-    let maximum = builder.ins().icmp_imm(IntCC::Equal, candidate, i64::MAX);
+    let (integer, candidate_raw) =
+        lower_optimizing_integer_candidate(builder, candidate, transition.deopt_out);
+    let maximum = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, candidate_raw, i64::MAX);
     let occupied = builder.ins().band(integer, maximum);
     let following = builder.ins().iadd_imm(scan_index, 1);
     builder
@@ -3659,14 +3656,11 @@ fn lower_direct_array_append(
         let candidate = builder
             .ins()
             .load(types::I64, MemFlagsData::new(), scan_entry, 0);
-        let candidate_runtime = lower_is_runtime_handle(builder, candidate);
-        let candidate_constant =
-            lower_value_has_namespace_tag(builder, candidate, crate::JIT_VALUE_CONSTANT_TAG);
-        let candidate_namespaced = builder.ins().bor(candidate_runtime, candidate_constant);
-        let candidate_integer = builder
+        let (candidate_integer, candidate_raw) =
+            lower_optimizing_integer_candidate(builder, candidate, deopt_out);
+        let maximum = builder
             .ins()
-            .icmp_imm(IntCC::Equal, candidate_namespaced, 0);
-        let maximum = builder.ins().icmp_imm(IntCC::Equal, candidate, i64::MAX);
+            .icmp_imm(IntCC::Equal, candidate_raw, i64::MAX);
         let found = builder.ins().band(candidate_integer, maximum);
         let found_maximum = builder.ins().bor(found_maximum, found);
         let next_scan = builder.ins().iadd_imm(scan_index, 1);
@@ -3732,16 +3726,13 @@ fn lower_direct_array_append(
         state,
         std::mem::offset_of!(crate::JitNativeDirectArrayState, has_next_append_key) as i32,
     );
-    let runtime_key = lower_is_runtime_handle(builder, entry_key);
-    let constant_key =
-        lower_value_has_namespace_tag(builder, entry_key, crate::JIT_VALUE_CONSTANT_TAG);
-    let namespaced_key = builder.ins().bor(runtime_key, constant_key);
-    let integer_key = builder.ins().icmp_imm(IntCC::Equal, namespaced_key, 0);
-    let maximum_key = builder.ins().icmp_imm(IntCC::Equal, entry_key, i64::MAX);
-    let incremented_key = builder.ins().iadd_imm(entry_key, 1);
+    let (integer_key, integer_raw) =
+        lower_optimizing_integer_candidate(builder, entry_key, deopt_out);
+    let maximum_key = builder.ins().icmp_imm(IntCC::Equal, integer_raw, i64::MAX);
+    let incremented_key = builder.ins().iadd_imm(integer_raw, 1);
     let candidate_next = builder
         .ins()
-        .select(maximum_key, entry_key, incremented_key);
+        .select(maximum_key, integer_raw, incremented_key);
     let advances = builder
         .ins()
         .icmp(IntCC::SignedGreaterThan, candidate_next, current_next);
@@ -3874,26 +3865,25 @@ fn lower_direct_array_insert(
         i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY),
     );
     let unique = builder.ins().icmp_imm(IntCC::Equal, refcount, 1);
-    let key_runtime = lower_is_runtime_handle(builder, key);
-    let key_string = lower_value_has_tag(builder, key, crate::JIT_VALUE_RUNTIME_STRING_TAG);
-    let key_constant = lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
-    let immediate = builder.ins().icmp_imm(IntCC::Equal, key_runtime, 0);
-    let immediate = builder.ins().band_not(immediate, key_constant);
     let supported_key = match fallback {
         NativeArrayAppendFallback::Optimizing(_) => {
-            let supported = builder.ins().bor(immediate, key_string);
-            if constant_string_key {
-                builder.ins().bor(supported, key_constant)
-            } else {
-                supported
-            }
+            let integer = lower_optimizing_integer_candidate(builder, key, deopt_out).0;
+            let (string, _, _) = lower_native_string_key_descriptor(builder, key, deopt_out);
+            builder.ins().bor(integer, string)
         }
         // The baseline compatibility tier deliberately routes string-key
         // semantics through its typed cold operation. Replicating the byte
         // comparison loop at every large literal-table insertion inflated
         // functions such as remove_accents() beyond the fragment ceiling.
-        NativeArrayAppendFallback::Baseline { .. } => immediate,
+        NativeArrayAppendFallback::Baseline { .. } => {
+            let key_runtime = lower_is_runtime_handle(builder, key);
+            let key_constant =
+                lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
+            let immediate = builder.ins().icmp_imm(IntCC::Equal, key_runtime, 0);
+            builder.ins().band_not(immediate, key_constant)
+        }
     };
+    let _ = constant_string_key;
     let admitted = builder.ins().band(direct_kind, unique);
     let admitted = builder.ins().band(admitted, supported_key);
     let zero = builder.ins().iconst(types::I64, 0);
@@ -4411,18 +4401,15 @@ fn lower_direct_array_spread(
     let target_key = builder
         .ins()
         .load(types::I64, MemFlagsData::new(), target_entry, 0);
-    let target_runtime = lower_is_runtime_handle(builder, target_key);
-    let target_constant =
-        lower_value_has_namespace_tag(builder, target_key, crate::JIT_VALUE_CONSTANT_TAG);
-    let target_namespaced = builder.ins().bor(target_runtime, target_constant);
-    let target_integer = builder.ins().icmp_imm(IntCC::Equal, target_namespaced, 0);
+    let (target_integer, target_raw) =
+        lower_optimizing_integer_candidate(builder, target_key, deopt_out);
     let greater = builder
         .ins()
-        .icmp(IntCC::SignedGreaterThan, target_key, greatest);
+        .icmp(IntCC::SignedGreaterThan, target_raw, greatest);
     let first = builder.ins().icmp_imm(IntCC::Equal, found_integer, 0);
     let replace = builder.ins().bor(first, greater);
     let replace = builder.ins().band(target_integer, replace);
-    let greatest = builder.ins().select(replace, target_key, greatest);
+    let greatest = builder.ins().select(replace, target_raw, greatest);
     let found_integer = builder.ins().bor(found_integer, target_integer);
     let next_target = builder.ins().iadd_imm(target_index, 1);
     builder.ins().jump(
@@ -4467,11 +4454,7 @@ fn lower_direct_array_spread(
         source_entry,
         std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
     );
-    let source_runtime = lower_is_runtime_handle(builder, source_key);
-    let source_constant =
-        lower_value_has_namespace_tag(builder, source_key, crate::JIT_VALUE_CONSTANT_TAG);
-    let source_namespaced = builder.ins().bor(source_runtime, source_constant);
-    let source_is_integer = builder.ins().icmp_imm(IntCC::Equal, source_namespaced, 0);
+    let source_is_integer = lower_optimizing_integer_candidate(builder, source_key, deopt_out).0;
     let (source_is_string, _, _) =
         lower_native_string_key_descriptor(builder, source_key, deopt_out);
     builder
@@ -4655,10 +4638,7 @@ fn lower_direct_array_spread(
         source_entry,
         std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
     );
-    let key_runtime = lower_is_runtime_handle(builder, key);
-    let key_constant = lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
-    let key_namespaced = builder.ins().bor(key_runtime, key_constant);
-    let integer = builder.ins().icmp_imm(IntCC::Equal, key_namespaced, 0);
+    let integer = lower_optimizing_integer_candidate(builder, key, transition.deopt_out).0;
     builder
         .ins()
         .brif(integer, mutate_integer, &[], mutate_string, &[]);
@@ -4770,17 +4750,10 @@ fn lower_direct_array_unset(
         i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY),
     );
     let unique = builder.ins().icmp_imm(IntCC::Equal, refcount, 1);
-    let key_runtime = lower_is_runtime_handle(builder, key);
-    let key_constant = lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
-    let immediate = builder.ins().icmp_imm(IntCC::Equal, key_runtime, 0);
-    let immediate = builder.ins().band_not(immediate, key_constant);
-    let runtime_string = lower_value_has_tag(builder, key, crate::JIT_VALUE_RUNTIME_STRING_TAG);
-    let supported_key = builder.ins().bor(immediate, runtime_string);
-    let supported_key = if constant_string_key {
-        builder.ins().bor(supported_key, key_constant)
-    } else {
-        supported_key
-    };
+    let integer = lower_optimizing_integer_candidate(builder, key, transition.deopt_out).0;
+    let (string, _, _) = lower_native_string_key_descriptor(builder, key, transition.deopt_out);
+    let supported_key = builder.ins().bor(integer, string);
+    let _ = constant_string_key;
     let admitted = builder.ins().band(direct_kind, unique);
     let admitted = builder.ins().band(admitted, supported_key);
     let zero = builder.ins().iconst(types::I64, 0);
@@ -5038,7 +5011,8 @@ fn lower_direct_array_unset(
 }
 
 /// Compare PHP array keys without reconstructing a Rust `Value` or crossing a
-/// runtime-helper boundary. Integer keys compare as encoded immediates. String
+/// runtime-helper boundary. Integer keys compare their native payloads,
+/// including namespace-colliding integers published as direct records. String
 /// keys compare their publication-owned byte views, so independently encoded
 /// handles with equal contents name the same PHP array element.
 fn lower_native_string_key_descriptor(
@@ -5196,6 +5170,8 @@ fn lower_native_array_key_equal(
     rhs: ir::Value,
     deopt_out: ir::Value,
 ) -> ir::Value {
+    let inspect_integer = builder.create_block();
+    let inspect_encoded = builder.create_block();
     let inspect_strings = builder.create_block();
     let compare_length = builder.create_block();
     let compare_loop = builder.create_block();
@@ -5208,6 +5184,22 @@ fn lower_native_array_key_equal(
     builder.append_block_param(next_byte, types::I64);
     builder.append_block_param(merge, types::I8);
 
+    let (lhs_integer, lhs_raw) = lower_optimizing_integer_candidate(builder, lhs, deopt_out);
+    let (rhs_integer, rhs_raw) = lower_optimizing_integer_candidate(builder, rhs, deopt_out);
+    let either_integer = builder.ins().bor(lhs_integer, rhs_integer);
+    builder
+        .ins()
+        .brif(either_integer, inspect_integer, &[], inspect_encoded, &[]);
+
+    builder.switch_to_block(inspect_integer);
+    let both_integer = builder.ins().band(lhs_integer, rhs_integer);
+    let same_integer = builder.ins().icmp(IntCC::Equal, lhs_raw, rhs_raw);
+    let same_integer = builder.ins().band(both_integer, same_integer);
+    builder
+        .ins()
+        .brif(same_integer, matched, &[], different, &[]);
+
+    builder.switch_to_block(inspect_encoded);
     let identical = builder.ins().icmp(IntCC::Equal, lhs, rhs);
     builder
         .ins()
@@ -6286,11 +6278,7 @@ fn lower_optimizing_type_predicate(
         crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
     );
     let is_bool = builder.ins().bor(is_false, is_true);
-    let is_constant = lower_value_has_namespace_tag(builder, value, crate::JIT_VALUE_CONSTANT_TAG);
-    let is_runtime = lower_is_runtime_handle(builder, value);
-    let not_constant = builder.ins().icmp_imm(IntCC::Equal, is_constant, 0);
-    let not_runtime = builder.ins().icmp_imm(IntCC::Equal, is_runtime, 0);
-    let is_int = builder.ins().band(not_constant, not_runtime);
+    let is_int = lower_optimizing_integer_candidate(builder, value, transition.deopt_out).0;
     let has_kind =
         |builder: &mut FunctionBuilder<'_>, tag| lower_value_has_tag(builder, value, tag);
     let matched = match operation {
@@ -6387,11 +6375,7 @@ fn lower_optimizing_is_numeric(
     builder.append_block_param(trailing, types::I64);
     builder.append_block_param(merge, types::I8);
 
-    let constant = lower_value_has_namespace_tag(builder, value, crate::JIT_VALUE_CONSTANT_TAG);
-    let runtime = lower_is_runtime_handle(builder, value);
-    let not_constant = builder.ins().icmp_imm(IntCC::Equal, constant, 0);
-    let not_runtime = builder.ins().icmp_imm(IntCC::Equal, runtime, 0);
-    let integer = builder.ins().band(not_constant, not_runtime);
+    let integer = lower_optimizing_integer_candidate(builder, value, transition.deopt_out).0;
     let float = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_FLOAT_TAG);
     let scalar_numeric = builder.ins().bor(integer, float);
     builder
@@ -7505,6 +7489,8 @@ fn lower_optimizing_truthy(
     transition: NativeOptimizingTransition<'_>,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     let value = lower_optimizing_reference_scalar(builder, value, false, transition)?;
+    let integer = builder.create_block();
+    let inspect_value = builder.create_block();
     let inspect_runtime = builder.create_block();
     let inspect_non_runtime = builder.create_block();
     let inspect_descriptor = builder.create_block();
@@ -7513,6 +7499,17 @@ fn lower_optimizing_truthy(
     let merge = builder.create_block();
     builder.append_block_param(merge, types::I8);
 
+    let (is_integer, integer_value) =
+        lower_optimizing_integer_candidate(builder, value, transition.deopt_out);
+    builder
+        .ins()
+        .brif(is_integer, integer, &[], inspect_value, &[]);
+
+    builder.switch_to_block(integer);
+    let integer_truthy = builder.ins().icmp_imm(IntCC::NotEqual, integer_value, 0);
+    builder.ins().jump(merge, &[integer_truthy.into()]);
+
+    builder.switch_to_block(inspect_value);
     let is_true = builder.ins().icmp_imm(
         IntCC::Equal,
         value,
@@ -7682,6 +7679,8 @@ fn lower_optimizing_strict_identity(
 ) -> Result<ir::Value, CraneliftLoweringError> {
     let lhs = lower_optimizing_reference_scalar(builder, lhs, false, transition)?;
     let rhs = lower_optimizing_reference_scalar(builder, rhs, false, transition)?;
+    let integer_lane = builder.create_block();
+    let classify_non_integer = builder.create_block();
     let string_lane = builder.create_block();
     let compare_strings = builder.create_block();
     let non_string = builder.create_block();
@@ -7697,6 +7696,22 @@ fn lower_optimizing_strict_identity(
     builder.append_block_param(compare_immediate, types::I8);
     builder.append_block_param(merge, types::I8);
 
+    let (lhs_integer, lhs_raw) =
+        lower_optimizing_integer_candidate(builder, lhs, transition.deopt_out);
+    let (rhs_integer, rhs_raw) =
+        lower_optimizing_integer_candidate(builder, rhs, transition.deopt_out);
+    let either_integer = builder.ins().bor(lhs_integer, rhs_integer);
+    builder
+        .ins()
+        .brif(either_integer, integer_lane, &[], classify_non_integer, &[]);
+
+    builder.switch_to_block(integer_lane);
+    let both_integer = builder.ins().band(lhs_integer, rhs_integer);
+    let same = builder.ins().icmp(IntCC::Equal, lhs_raw, rhs_raw);
+    let same = builder.ins().band(both_integer, same);
+    builder.ins().brif(same, equal, &[], different, &[]);
+
+    builder.switch_to_block(classify_non_integer);
     let (lhs_string, _, _) = lower_native_string_key_descriptor(builder, lhs, transition.deopt_out);
     let (rhs_string, _, _) = lower_native_string_key_descriptor(builder, rhs, transition.deopt_out);
     let any_string = builder.ins().bor(lhs_string, rhs_string);
@@ -8240,18 +8255,7 @@ fn lower_optimizing_require_immediate_integer(
     value: ir::Value,
     transition: NativeOptimizingTransition<'_>,
 ) -> Result<ir::Value, CraneliftLoweringError> {
-    let accepted = builder.create_block();
-    let rejected = builder.create_block();
-    let runtime = lower_is_runtime_handle(builder, value);
-    let constant = lower_value_has_namespace_tag(builder, value, crate::JIT_VALUE_CONSTANT_TAG);
-    let namespaced = builder.ins().bor(runtime, constant);
-    let integer = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
-    builder.ins().brif(integer, accepted, &[], rejected, &[]);
-    builder.switch_to_block(rejected);
-    let _ = transition.emit_value(builder)?;
-    builder.ins().jump(accepted, &[]);
-    builder.switch_to_block(accepted);
-    Ok(value)
+    lower_optimizing_unbox_integer(builder, value, transition)
 }
 
 fn lower_ascii_fold_byte(builder: &mut FunctionBuilder<'_>, byte: ir::Value) -> ir::Value {
@@ -9162,20 +9166,20 @@ fn lower_optimizing_array_pop(
         state,
         std::mem::offset_of!(crate::JitNativeDirectArrayState, has_next_append_key) as i32,
     );
-    let runtime_key = lower_is_runtime_handle(builder, key);
-    let constant_key = lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
-    let namespaced_key = builder.ins().bor(runtime_key, constant_key);
-    let integer_key = builder.ins().icmp_imm(IntCC::Equal, namespaced_key, 0);
-    let maximum_key = builder.ins().icmp_imm(IntCC::Equal, key, i64::MAX);
-    let incremented_key = builder.ins().iadd_imm(key, 1);
-    let key_next = builder.ins().select(maximum_key, key, incremented_key);
+    let (integer_key, integer_raw) =
+        lower_optimizing_integer_candidate(builder, key, transition.deopt_out);
+    let maximum_key = builder.ins().icmp_imm(IntCC::Equal, integer_raw, i64::MAX);
+    let incremented_key = builder.ins().iadd_imm(integer_raw, 1);
+    let key_next = builder
+        .ins()
+        .select(maximum_key, integer_raw, incremented_key);
     let latest = builder.ins().icmp(IntCC::Equal, previous_next, key_next);
     let rewind = builder.ins().band(integer_key, latest);
     let has_previous_next = builder
         .ins()
         .icmp_imm(IntCC::NotEqual, has_previous_next, 0);
     let rewind = builder.ins().band(rewind, has_previous_next);
-    let next_append_key = builder.ins().select(rewind, key, previous_next);
+    let next_append_key = builder.ins().select(rewind, integer_raw, previous_next);
     builder.ins().store(
         MemFlagsData::new(),
         next_append_key,
@@ -9782,10 +9786,7 @@ fn lower_optimizing_copy_direct_array_range(
     let key = builder
         .ins()
         .load(types::I64, MemFlagsData::new(), source_entry, 0);
-    let runtime = lower_is_runtime_handle(builder, key);
-    let constant = lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
-    let namespaced = builder.ins().bor(runtime, constant);
-    let integer = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
+    let integer = lower_optimizing_integer_candidate(builder, key, transition.deopt_out).0;
     let (string, _, _) = lower_native_string_key_descriptor(builder, key, transition.deopt_out);
     let supported = builder.ins().bor(integer, string);
     builder.ins().brif(
@@ -9861,10 +9862,7 @@ fn lower_optimizing_copy_direct_array_range(
         source_entry,
         std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
     );
-    let runtime = lower_is_runtime_handle(builder, key);
-    let constant = lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
-    let namespaced = builder.ins().bor(runtime, constant);
-    let integer = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
+    let integer = lower_optimizing_integer_candidate(builder, key, transition.deopt_out).0;
     let string = builder.ins().icmp_imm(IntCC::Equal, integer, 0);
     let preserve_original = builder.ins().bor(preserve_keys, string);
     let output_key = builder.ins().select(preserve_original, key, next_integer);
@@ -9933,11 +9931,8 @@ fn lower_optimizing_array_slice(
             requested,
             crate::jit_encode_constant(u32::MAX),
         );
-        let runtime = lower_is_runtime_handle(builder, requested);
-        let constant =
-            lower_value_has_namespace_tag(builder, requested, crate::JIT_VALUE_CONSTANT_TAG);
-        let namespaced = builder.ins().bor(runtime, constant);
-        let integer = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
+        let (integer, requested_raw) =
+            lower_optimizing_integer_candidate(builder, requested, transition.deopt_out);
         let supported = builder.ins().bor(integer, is_null);
         let accepted = builder.create_block();
         let rejected = builder.create_block();
@@ -9946,13 +9941,17 @@ fn lower_optimizing_array_slice(
         let _ = transition.emit_value(builder)?;
         builder.ins().jump(accepted, &[]);
         builder.switch_to_block(accepted);
-        let requested_negative = builder.ins().icmp_imm(IntCC::SignedLessThan, requested, 0);
+        let requested_negative = builder
+            .ins()
+            .icmp_imm(IntCC::SignedLessThan, requested_raw, 0);
         let positive_fits =
             builder
                 .ins()
-                .icmp(IntCC::UnsignedLessThanOrEqual, requested, remaining);
-        let positive = builder.ins().select(positive_fits, requested, remaining);
-        let requested_magnitude = builder.ins().ineg(requested);
+                .icmp(IntCC::UnsignedLessThanOrEqual, requested_raw, remaining);
+        let positive = builder
+            .ins()
+            .select(positive_fits, requested_raw, remaining);
+        let requested_magnitude = builder.ins().ineg(requested_raw);
         let magnitude_fits =
             builder
                 .ins()
@@ -10063,10 +10062,7 @@ fn lower_optimizing_array_merge(
         let key = builder
             .ins()
             .load(types::I64, MemFlagsData::new(), entry, 0);
-        let runtime = lower_is_runtime_handle(builder, key);
-        let constant = lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
-        let namespaced = builder.ins().bor(runtime, constant);
-        let integer = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
+        let integer = lower_optimizing_integer_candidate(builder, key, transition.deopt_out).0;
         let (string, _, _) = lower_native_string_key_descriptor(builder, key, transition.deopt_out);
         let supported = builder.ins().bor(integer, string);
         builder
@@ -10127,10 +10123,7 @@ fn lower_optimizing_array_merge(
         let key = builder
             .ins()
             .load(types::I64, MemFlagsData::new(), entry, 0);
-        let runtime = lower_is_runtime_handle(builder, key);
-        let constant = lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
-        let namespaced = builder.ins().bor(runtime, constant);
-        let integer = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
+        let integer = lower_optimizing_integer_candidate(builder, key, transition.deopt_out).0;
         builder.ins().brif(
             integer,
             append_integer,
@@ -10226,6 +10219,8 @@ fn lower_optimizing_strict_scalar_equal(
     rhs: ir::Value,
     deopt_out: ir::Value,
 ) -> (ir::Value, ir::Value) {
+    let compare_integer = builder.create_block();
+    let inspect_encoded = builder.create_block();
     let inspect = builder.create_block();
     let inspect_same_kind = builder.create_block();
     let compare_string = builder.create_block();
@@ -10236,6 +10231,23 @@ fn lower_optimizing_strict_scalar_equal(
     builder.append_block_param(merge, types::I8);
     builder.append_block_param(merge, types::I8);
 
+    let (lhs_integer, lhs_raw) = lower_optimizing_integer_candidate(builder, lhs, deopt_out);
+    let (rhs_integer, rhs_raw) = lower_optimizing_integer_candidate(builder, rhs, deopt_out);
+    let either_integer = builder.ins().bor(lhs_integer, rhs_integer);
+    builder
+        .ins()
+        .brif(either_integer, compare_integer, &[], inspect_encoded, &[]);
+
+    builder.switch_to_block(compare_integer);
+    let both_integer = builder.ins().band(lhs_integer, rhs_integer);
+    let same_integer = builder.ins().icmp(IntCC::Equal, lhs_raw, rhs_raw);
+    let same_integer = builder.ins().band(both_integer, same_integer);
+    let yes = builder.ins().iconst(types::I8, 1);
+    builder
+        .ins()
+        .jump(merge, &[yes.into(), same_integer.into()]);
+
+    builder.switch_to_block(inspect_encoded);
     let identical = builder.ins().icmp(IntCC::Equal, lhs, rhs);
     builder.ins().brif(identical, matched, &[], inspect, &[]);
 
@@ -10455,11 +10467,7 @@ fn lower_optimizing_loose_scalar_equal(
     let lhs_is_string = lower_value_has_tag(builder, lhs, crate::JIT_VALUE_RUNTIME_STRING_TAG);
     let string = builder.ins().select(lhs_is_string, lhs, rhs);
     let other = builder.ins().select(lhs_is_string, rhs, lhs);
-    let other_runtime = lower_is_runtime_handle(builder, other);
-    let other_constant =
-        lower_value_has_namespace_tag(builder, other, crate::JIT_VALUE_CONSTANT_TAG);
-    let namespaced = builder.ins().bor(other_runtime, other_constant);
-    let other_integer = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
+    let other_integer = lower_optimizing_integer_candidate(builder, other, transition.deopt_out).0;
     let inspect_numeric_string = builder.create_block();
     builder
         .ins()
@@ -10473,15 +10481,18 @@ fn lower_optimizing_loose_scalar_equal(
     builder.switch_to_block(inspect_plain);
     let lhs = builder.block_params(inspect_plain)[0];
     let rhs = builder.block_params(inspect_plain)[1];
-    let lhs_runtime = lower_is_runtime_handle(builder, lhs);
-    let rhs_runtime = lower_is_runtime_handle(builder, rhs);
-    let lhs_constant = lower_value_has_namespace_tag(builder, lhs, crate::JIT_VALUE_CONSTANT_TAG);
-    let rhs_constant = lower_value_has_namespace_tag(builder, rhs, crate::JIT_VALUE_CONSTANT_TAG);
-    let lhs_namespaced = builder.ins().bor(lhs_runtime, lhs_constant);
-    let rhs_namespaced = builder.ins().bor(rhs_runtime, rhs_constant);
-    let lhs_integer = builder.ins().icmp_imm(IntCC::Equal, lhs_namespaced, 0);
-    let rhs_integer = builder.ins().icmp_imm(IntCC::Equal, rhs_namespaced, 0);
+    let (lhs_integer, lhs_raw) =
+        lower_optimizing_integer_candidate(builder, lhs, transition.deopt_out);
+    let (rhs_integer, rhs_raw) =
+        lower_optimizing_integer_candidate(builder, rhs, transition.deopt_out);
     let both_integer = builder.ins().band(lhs_integer, rhs_integer);
+    let integer_equal = builder.ins().icmp(IntCC::Equal, lhs_raw, rhs_raw);
+    let integer_equal = builder.ins().band(both_integer, integer_equal);
+    let classify_integer = builder.create_block();
+    builder
+        .ins()
+        .brif(integer_equal, matched, &[], classify_integer, &[]);
+    builder.switch_to_block(classify_integer);
     builder
         .ins()
         .brif(both_integer, different, &[], unsupported, &[]);
@@ -11238,6 +11249,7 @@ fn lower_optimizing_string_cast(
         }
         SsaValueClass::Int => {
             let value = lower_optimizing_reference_scalar(builder, value, false, transition)?;
+            let value = lower_optimizing_unbox_integer(builder, value, transition)?;
             lower_optimizing_integer_to_string(builder, value, transition)
         }
         SsaValueClass::StringHandle => {
@@ -12135,20 +12147,26 @@ fn lower_optimizing_unknown_bit_not(
     let merge = builder.create_block();
     builder.append_block_param(merge, types::I64);
 
-    let runtime = lower_is_runtime_handle(builder, encoded);
-    let constant = lower_value_has_namespace_tag(builder, encoded, crate::JIT_VALUE_CONSTANT_TAG);
-    let namespaced = builder.ins().bor(runtime, constant);
-    let immediate = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
+    let (is_integer, integer_value) = if matches!(
+        operand,
+        RegionOperand::Constant(index)
+            if matches!(constants.get(index as usize), Some(IrConstant::Int(_)))
+    ) {
+        (builder.ins().iconst(types::I8, 1), encoded)
+    } else {
+        lower_optimizing_integer_candidate(builder, encoded, transition.deopt_out)
+    };
     builder
         .ins()
-        .brif(immediate, integer, &[], inspect_runtime, &[]);
+        .brif(is_integer, integer, &[], inspect_runtime, &[]);
 
     builder.switch_to_block(integer);
-    let value = builder.ins().bnot(encoded);
+    let value = builder.ins().bnot(integer_value);
     let value = lower_optimizing_admit_integer_result(builder, value, transition)?;
     builder.ins().jump(merge, &[value.into()]);
 
     builder.switch_to_block(inspect_runtime);
+    let runtime = lower_is_runtime_handle(builder, encoded);
     let index = builder.ins().ireduce(types::I32, encoded);
     let direct = builder.ins().icmp_imm(
         IntCC::UnsignedGreaterThanOrEqual,
@@ -12366,11 +12384,8 @@ fn lower_optimizing_substr(
             requested,
             crate::jit_encode_constant(u32::MAX),
         );
-        let runtime = lower_is_runtime_handle(builder, requested);
-        let constant =
-            lower_value_has_namespace_tag(builder, requested, crate::JIT_VALUE_CONSTANT_TAG);
-        let namespaced = builder.ins().bor(runtime, constant);
-        let integer = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
+        let (integer, requested_raw) =
+            lower_optimizing_integer_candidate(builder, requested, transition.deopt_out);
         let supported = builder.ins().bor(integer, is_null);
         let accepted = builder.create_block();
         let rejected = builder.create_block();
@@ -12379,13 +12394,17 @@ fn lower_optimizing_substr(
         let _ = transition.emit_value(builder)?;
         builder.ins().jump(accepted, &[]);
         builder.switch_to_block(accepted);
-        let requested_negative = builder.ins().icmp_imm(IntCC::SignedLessThan, requested, 0);
+        let requested_negative = builder
+            .ins()
+            .icmp_imm(IntCC::SignedLessThan, requested_raw, 0);
         let requested_fits =
             builder
                 .ins()
-                .icmp(IntCC::UnsignedLessThanOrEqual, requested, remaining);
-        let positive = builder.ins().select(requested_fits, requested, remaining);
-        let requested_magnitude = builder.ins().ineg(requested);
+                .icmp(IntCC::UnsignedLessThanOrEqual, requested_raw, remaining);
+        let positive = builder
+            .ins()
+            .select(requested_fits, requested_raw, remaining);
+        let requested_magnitude = builder.ins().ineg(requested_raw);
         let magnitude_fits =
             builder
                 .ins()
@@ -13894,7 +13913,9 @@ fn lower_optimizing_bind_reference_from_static_property(
             .copied()
             .map(|key| {
                 Ok((
-                    lower_array_key_operand(builder, locals, registers, constants, key)?,
+                    lower_optimizing_array_key_operand(
+                        builder, locals, registers, constants, key, transition,
+                    )?,
                     array_key_is_string_constant(constants, key),
                 ))
             })
@@ -14486,18 +14507,15 @@ fn lower_reference_array_entry_key_equal(
         entry,
         std::mem::offset_of!(crate::JitNativeReferenceArrayEntry, integer) as i32,
     );
-    let key_runtime = lower_is_runtime_handle(builder, key);
-    let key_constant = lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
-    let namespaced = builder.ins().bor(key_runtime, key_constant);
-    let immediate = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
+    let (integer_key, integer_raw) = lower_optimizing_integer_candidate(builder, key, deopt_out);
     let int_kind = builder.ins().icmp_imm(
         IntCC::Equal,
         entry_kind,
         i64::from(crate::JIT_NATIVE_REFERENCE_ARRAY_KEY_INT),
     );
-    let integer_equal = builder.ins().icmp(IntCC::Equal, integer, key);
+    let integer_equal = builder.ins().icmp(IntCC::Equal, integer, integer_raw);
     let integer_equal = builder.ins().band(int_kind, integer_equal);
-    let integer_equal = builder.ins().band(immediate, integer_equal);
+    let integer_equal = builder.ins().band(integer_key, integer_equal);
     let (string_valid, key_length, key_bytes) =
         lower_native_string_key_descriptor(builder, key, deopt_out);
     let string_kind = builder.ins().icmp_imm(
@@ -15625,9 +15643,6 @@ fn lower_optimizing_arithmetic(
     let lhs = if let RegionOperand::Constant(index) = lhs_operand
         && let Some(IrConstant::Int(value)) = constants.get(index as usize)
     {
-        if !native_integer_fits_immediate(*value) {
-            return transition.emit_value(builder);
-        }
         builder.ins().iconst(types::I64, *value)
     } else {
         lhs
@@ -15635,9 +15650,6 @@ fn lower_optimizing_arithmetic(
     let rhs = if let RegionOperand::Constant(index) = rhs_operand
         && let Some(IrConstant::Int(value)) = constants.get(index as usize)
     {
-        if !native_integer_fits_immediate(*value) {
-            return transition.emit_value(builder);
-        }
         builder.ins().iconst(types::I64, *value)
     } else {
         rhs
@@ -15649,10 +15661,24 @@ fn lower_optimizing_arithmetic(
     builder.append_block_param(integer_result, types::I64);
     builder.append_block_param(integer_result, types::I8);
     builder.append_block_param(merge, types::I64);
-    let (lhs_is_integer, lhs_integer) =
-        lower_optimizing_integer_candidate(builder, lhs, transition.deopt_out);
-    let (rhs_is_integer, rhs_integer) =
-        lower_optimizing_integer_candidate(builder, rhs, transition.deopt_out);
+    let (lhs_is_integer, lhs_integer) = if matches!(
+        lhs_operand,
+        RegionOperand::Constant(index)
+            if matches!(constants.get(index as usize), Some(IrConstant::Int(_)))
+    ) {
+        (builder.ins().iconst(types::I8, 1), lhs)
+    } else {
+        lower_optimizing_integer_candidate(builder, lhs, transition.deopt_out)
+    };
+    let (rhs_is_integer, rhs_integer) = if matches!(
+        rhs_operand,
+        RegionOperand::Constant(index)
+            if matches!(constants.get(index as usize), Some(IrConstant::Int(_)))
+    ) {
+        (builder.ins().iconst(types::I8, 1), rhs)
+    } else {
+        lower_optimizing_integer_candidate(builder, rhs, transition.deopt_out)
+    };
     let both_integers = builder.ins().band(lhs_is_integer, rhs_is_integer);
     builder.ins().brif(both_integers, integer, &[], float, &[]);
 
@@ -15709,9 +15735,6 @@ fn lower_optimizing_integer_exponent_pow(
     let base = if let RegionOperand::Constant(index) = base_operand
         && let Some(IrConstant::Int(value)) = constants.get(index as usize)
     {
-        if !native_integer_fits_immediate(*value) {
-            return transition.emit_value(builder);
-        }
         builder.ins().iconst(types::I64, *value)
     } else {
         base
@@ -15719,9 +15742,6 @@ fn lower_optimizing_integer_exponent_pow(
     let exponent = if let RegionOperand::Constant(index) = exponent_operand
         && let Some(IrConstant::Int(value)) = constants.get(index as usize)
     {
-        if !native_integer_fits_immediate(*value) {
-            return transition.emit_value(builder);
-        }
         builder.ins().iconst(types::I64, *value)
     } else {
         exponent
@@ -15752,30 +15772,42 @@ fn lower_optimizing_integer_exponent_pow(
     builder.append_block_param(float_done, types::F64);
     builder.append_block_param(merge, types::I64);
 
-    let exponent_runtime = lower_is_runtime_handle(builder, exponent);
-    let exponent_constant =
-        lower_value_has_namespace_tag(builder, exponent, crate::JIT_VALUE_CONSTANT_TAG);
-    let exponent_namespaced = builder.ins().bor(exponent_runtime, exponent_constant);
-    let exponent_is_int = builder.ins().icmp_imm(IntCC::Equal, exponent_namespaced, 0);
+    let (exponent_is_int, exponent_integer) = if matches!(
+        exponent_operand,
+        RegionOperand::Constant(index)
+            if matches!(constants.get(index as usize), Some(IrConstant::Int(_)))
+    ) {
+        (builder.ins().iconst(types::I8, 1), exponent)
+    } else {
+        lower_optimizing_integer_candidate(builder, exponent, transition.deopt_out)
+    };
     builder
         .ins()
         .brif(exponent_is_int, admitted_exponent, &[], rejected, &[]);
 
     builder.switch_to_block(admitted_exponent);
-    let negative = builder.ins().icmp_imm(IntCC::SignedLessThan, exponent, 0);
-    let base_runtime = lower_is_runtime_handle(builder, base);
-    let base_constant = lower_value_has_namespace_tag(builder, base, crate::JIT_VALUE_CONSTANT_TAG);
-    let base_namespaced = builder.ins().bor(base_runtime, base_constant);
-    let base_is_int = builder.ins().icmp_imm(IntCC::Equal, base_namespaced, 0);
+    let negative = builder
+        .ins()
+        .icmp_imm(IntCC::SignedLessThan, exponent_integer, 0);
+    let (base_is_int, base_integer) = if matches!(
+        base_operand,
+        RegionOperand::Constant(index)
+            if matches!(constants.get(index as usize), Some(IrConstant::Int(_)))
+    ) {
+        (builder.ins().iconst(types::I8, 1), base)
+    } else {
+        lower_optimizing_integer_candidate(builder, base, transition.deopt_out)
+    };
     let non_negative = builder.ins().bxor_imm(negative, 1);
     let exact_integer = builder.ins().band(base_is_int, non_negative);
     builder.ins().brif(exact_integer, integer, &[], float, &[]);
 
     builder.switch_to_block(integer);
     let one = builder.ins().iconst(types::I64, 1);
-    builder
-        .ins()
-        .jump(integer_loop, &[one.into(), base.into(), exponent.into()]);
+    builder.ins().jump(
+        integer_loop,
+        &[one.into(), base_integer.into(), exponent_integer.into()],
+    );
 
     builder.switch_to_block(integer_loop);
     let accumulator = builder.block_params(integer_loop)[0];
@@ -15846,8 +15878,10 @@ fn lower_optimizing_integer_exponent_pow(
     builder.switch_to_block(float);
     let base_float =
         lower_optimizing_numeric_f64(builder, base, base_operand, constants, transition)?;
-    let negative_exponent = builder.ins().ineg(exponent);
-    let magnitude = builder.ins().select(negative, negative_exponent, exponent);
+    let negative_exponent = builder.ins().ineg(exponent_integer);
+    let magnitude = builder
+        .ins()
+        .select(negative, negative_exponent, exponent_integer);
     let one_float = builder
         .ins()
         .f64const(cranelift_codegen::ir::immediates::Ieee64::with_float(1.0));
@@ -15912,9 +15946,6 @@ fn lower_optimizing_numeric_unary(
     let encoded = if let RegionOperand::Constant(index) = operand
         && let Some(IrConstant::Int(value)) = constants.get(index as usize)
     {
-        if !native_integer_fits_immediate(*value) {
-            return transition.emit_value(builder);
-        }
         builder.ins().iconst(types::I64, *value)
     } else {
         encoded
@@ -15924,8 +15955,15 @@ fn lower_optimizing_numeric_unary(
     let float = builder.create_block();
     let merge = builder.create_block();
     builder.append_block_param(merge, types::I64);
-    let (is_integer, integer_value) =
-        lower_optimizing_integer_candidate(builder, encoded, transition.deopt_out);
+    let (is_integer, integer_value) = if matches!(
+        operand,
+        RegionOperand::Constant(index)
+            if matches!(constants.get(index as usize), Some(IrConstant::Int(_)))
+    ) {
+        (builder.ins().iconst(types::I8, 1), encoded)
+    } else {
+        lower_optimizing_integer_candidate(builder, encoded, transition.deopt_out)
+    };
     builder.ins().brif(is_integer, integer, &[], float, &[]);
 
     builder.switch_to_block(integer);
@@ -16166,20 +16204,22 @@ fn lower_cached_array_fetch_inner(
         i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY),
     );
     let array_kind = builder.ins().bor(runtime_kind, arena_kind);
-    let key_runtime = lower_is_runtime_handle(builder, key);
-    let key_constant = lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
-    let namespaced = builder.ins().bor(key_runtime, key_constant);
-    let key_is_immediate = builder.ins().icmp_imm(IntCC::Equal, namespaced, 0);
-    let supported_key = if optimizing_transition.is_some() {
+    let supported_key = if let Some(transition) = optimizing_transition {
         // A literal string frequently reaches this operation through a
         // LoadConst register rather than as a RegionOperand::Constant. Admit
         // the runtime value by its stable descriptor, not by that syntactic
         // provenance. This also rejects cold compatibility string handles
         // before the direct lookup can misreport a miss.
+        let integer = lower_optimizing_integer_candidate(builder, key, deopt_out).0;
         let (string_valid, _, _) = lower_native_string_key_descriptor(builder, key, deopt_out);
-        builder.ins().bor(key_is_immediate, string_valid)
+        let _ = transition;
+        builder.ins().bor(integer, string_valid)
     } else {
-        key_is_immediate
+        let key_runtime = lower_is_runtime_handle(builder, key);
+        let key_constant =
+            lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
+        let namespaced = builder.ins().bor(key_runtime, key_constant);
+        builder.ins().icmp_imm(IntCC::Equal, namespaced, 0)
     };
     let length = builder.ins().load(
         types::I64,
@@ -17544,6 +17584,24 @@ fn lower_array_key_operand(
     }
 }
 
+fn lower_optimizing_array_key_operand(
+    builder: &mut FunctionBuilder<'_>,
+    locals: &NativeLocalMap,
+    registers: &NativeRegisterMap,
+    constants: &[IrConstant],
+    operand: RegionOperand,
+    transition: NativeOptimizingTransition<'_>,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    if let RegionOperand::Constant(index) = operand
+        && let Some(IrConstant::Int(value)) = constants.get(index as usize)
+        && !native_integer_fits_immediate(*value)
+    {
+        let value = builder.ins().iconst(types::I64, *value);
+        return lower_optimizing_encode_int(builder, value, transition);
+    }
+    lower_array_key_operand(builder, locals, registers, constants, operand)
+}
+
 fn array_key_is_string_constant(constants: &[IrConstant], operand: RegionOperand) -> bool {
     matches!(
         operand,
@@ -17866,6 +17924,18 @@ fn lower_optimizing_region_instruction(
         value_release_validate,
         value_release_commit,
         emitted_transition: &emitted_transition,
+    };
+    // Integer array keys use the encoded native value domain just like array
+    // values. Keep every optimizing key producer on the same publication
+    // boundary so namespace-colliding integers never masquerade as handles.
+    let lower_array_key_operand = |builder: &mut FunctionBuilder<'_>,
+                                   locals: &NativeLocalMap,
+                                   registers: &NativeRegisterMap,
+                                   constants: &[IrConstant],
+                                   operand: RegionOperand| {
+        lower_optimizing_array_key_operand(
+            builder, locals, registers, constants, operand, transition,
+        )
     };
     let mut emitted_class = crate::JitProductionLoweringClass::DirectClif;
     match &instruction.kind {
@@ -18869,13 +18939,11 @@ fn lower_optimizing_region_instruction(
                     let src = if let RegionOperand::Constant(index) = src_operand
                         && let Some(IrConstant::Int(value)) = constants.get(index as usize)
                     {
-                        if !native_integer_fits_immediate(*value) {
-                            transition.emit_value(builder)?
-                        } else {
-                            builder.ins().iconst(types::I64, *value)
-                        }
+                        builder.ins().iconst(types::I64, *value)
                     } else {
-                        src
+                        let src =
+                            lower_optimizing_reference_scalar(builder, src, false, transition)?;
+                        lower_optimizing_unbox_integer(builder, src, transition)?
                     };
                     let value = builder.ins().bnot(src);
                     lower_optimizing_admit_integer_result(builder, value, transition)?
@@ -18902,7 +18970,8 @@ fn lower_optimizing_region_instruction(
                         instruction.continuation_id,
                         transition,
                     )?;
-                    builder.ins().bnot(integer)
+                    let value = builder.ins().bnot(integer);
+                    lower_optimizing_admit_integer_result(builder, value, transition)?
                 }
                 RegionUnaryOp::BitNot => lower_optimizing_unknown_bit_not(
                     module,
@@ -18919,8 +18988,12 @@ fn lower_optimizing_region_instruction(
             define_region_register(builder, register_variables, registers, *dst, value)?;
         }
         RegionInstructionKind::Compare { dst, op, lhs, rhs } => {
-            let lhs_value = lower_region_operand(builder, locals, registers, *lhs)?;
-            let rhs_value = lower_region_operand(builder, locals, registers, *rhs)?;
+            let lhs_value = lower_prepared_native_call_operand(
+                builder, locals, registers, constants, *lhs, transition,
+            )?;
+            let rhs_value = lower_prepared_native_call_operand(
+                builder, locals, registers, constants, *rhs, transition,
+            )?;
             let lhs_fact = lowering_operand_fact(value_flow, constants, *lhs);
             let rhs_fact = lowering_operand_fact(value_flow, constants, *rhs);
             let value = if !matches!(
@@ -18986,6 +19059,28 @@ fn lower_optimizing_region_instruction(
                     transition,
                 )?
             } else if optimizing_compare_is_direct(*op, lhs_fact, rhs_fact) {
+                let lhs_value = if lhs_fact.class == SsaValueClass::Int {
+                    if let RegionOperand::Constant(index) = *lhs
+                        && let Some(IrConstant::Int(value)) = constants.get(index as usize)
+                    {
+                        builder.ins().iconst(types::I64, *value)
+                    } else {
+                        lower_optimizing_unbox_integer(builder, lhs_value, transition)?
+                    }
+                } else {
+                    lhs_value
+                };
+                let rhs_value = if rhs_fact.class == SsaValueClass::Int {
+                    if let RegionOperand::Constant(index) = *rhs
+                        && let Some(IrConstant::Int(value)) = constants.get(index as usize)
+                    {
+                        builder.ins().iconst(types::I64, *value)
+                    } else {
+                        lower_optimizing_unbox_integer(builder, rhs_value, transition)?
+                    }
+                } else {
+                    rhs_value
+                };
                 lower_direct_compare(
                     builder,
                     *op,
@@ -19001,7 +19096,9 @@ fn lower_optimizing_region_instruction(
             define_region_register(builder, register_variables, registers, *dst, value)?;
         }
         RegionInstructionKind::Cast { dst, op, src } => {
-            let value = lower_region_operand(builder, locals, registers, *src)?;
+            let value = lower_prepared_native_call_operand(
+                builder, locals, registers, constants, *src, transition,
+            )?;
             let fact = lowering_operand_fact(value_flow, constants, *src);
             let value = if *op == RegionCastOp::Bool {
                 let truthy = lower_optimizing_truthy(builder, value, transition)?;
@@ -19073,7 +19170,12 @@ fn lower_optimizing_region_instruction(
                 }
                 SsaValueClass::Int if fact.certainty != crate::region_ir::SsaCertainty::Unknown => {
                     emitted_class = crate::JitProductionLoweringClass::DirectNativeData;
-                    let value = lower_region_operand(builder, locals, registers, *src)?;
+                    let value = lower_prepared_native_call_operand(
+                        builder, locals, registers, constants, *src, transition,
+                    )?;
+                    let value =
+                        lower_optimizing_reference_scalar(builder, value, false, transition)?;
+                    let value = lower_optimizing_unbox_integer(builder, value, transition)?;
                     let helper = optimizing_operations.echo_int.ok_or_else(|| {
                         CraneliftLoweringError::new(
                             "JIT_CRANELIFT_REJECT_NATIVE_OPERATION",
@@ -20528,11 +20630,8 @@ fn lower_optimizing_region_instruction(
                             entry,
                             std::mem::offset_of!(crate::JitNativeDirectArrayEntry, key) as i32,
                         );
-                        let runtime_key = lower_is_runtime_handle(builder, key);
-                        let constant_key =
-                            lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
-                        let tagged_key = builder.ins().bor(runtime_key, constant_key);
-                        let integer_key = builder.ins().icmp_imm(IntCC::Equal, tagged_key, 0);
+                        let integer_key =
+                            lower_optimizing_integer_candidate(builder, key, deopt_out).0;
                         admitted = builder.ins().band(admitted, integer_key);
                         let value = builder.ins().load(
                             types::I64,

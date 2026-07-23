@@ -256,12 +256,38 @@ fn lower_optimizing_condition(
         value
     };
     let fact = value_flow.operand_fact(constants, condition);
+    if fact.certainty != crate::region_ir::SsaCertainty::Unknown && fact.class == SsaValueClass::Int
+    {
+        if let RegionOperand::Constant(index) = condition
+            && let Some(IrConstant::Int(value)) = constants.get(index as usize)
+        {
+            return Ok(builder.ins().iconst(types::I8, i64::from(*value != 0)));
+        }
+        let accepted = builder.create_block();
+        let rejected = builder.create_block();
+        let merge = builder.create_block();
+        builder.append_block_param(merge, types::I8);
+        let (is_integer, integer) =
+            lower_optimizing_integer_candidate(builder, value, transition.deopt_out);
+        builder.ins().brif(is_integer, accepted, &[], rejected, &[]);
+        builder.switch_to_block(accepted);
+        let truthy = builder.ins().icmp_imm(IntCC::NotEqual, integer, 0);
+        builder.ins().jump(merge, &[truthy.into()]);
+        builder.switch_to_block(rejected);
+        transition.emit(builder)?;
+        let unreachable = builder.ins().iconst(types::I8, 0);
+        builder.ins().jump(merge, &[unreachable.into()]);
+        builder.switch_to_block(merge);
+        return Ok(builder.block_params(merge)[0]);
+    }
     if let Some(truthy) = scalar_truthy(builder, value, fact.class)
         && fact.certainty != crate::region_ir::SsaCertainty::Unknown
     {
         return Ok(truthy);
     }
 
+    let integer = builder.create_block();
+    let inspect_value = builder.create_block();
     let inspect_runtime = builder.create_block();
     let inspect_non_runtime = builder.create_block();
     let inspect_descriptor = builder.create_block();
@@ -269,6 +295,16 @@ fn lower_optimizing_condition(
     let merge = builder.create_block();
     builder.append_block_param(merge, types::I8);
 
+    let (is_integer, integer_value) =
+        lower_optimizing_integer_candidate(builder, value, transition.deopt_out);
+    builder
+        .ins()
+        .brif(is_integer, integer, &[], inspect_value, &[]);
+    builder.switch_to_block(integer);
+    let truthy = builder.ins().icmp_imm(IntCC::NotEqual, integer_value, 0);
+    builder.ins().jump(merge, &[truthy.into()]);
+
+    builder.switch_to_block(inspect_value);
     let is_true = builder.ins().icmp_imm(
         IntCC::Equal,
         value,
