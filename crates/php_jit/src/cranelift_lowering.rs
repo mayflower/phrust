@@ -5996,6 +5996,25 @@ fn lower_optimizing_retain(
     builder.switch_to_block(done);
 }
 
+/// Tests the one representation invariant required by compiled-to-compiled
+/// calls: an operand is immediate/unit-local or indexes the authoritative
+/// direct arena. Old request-value handles are rejected before the callee
+/// observes any binding effect.
+fn lower_optimizing_call_value_is_authoritative(
+    builder: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+) -> ir::Value {
+    let runtime = lower_is_runtime_handle(builder, value);
+    let immediate = builder.ins().icmp_imm(IntCC::Equal, runtime, 0);
+    let index = builder.ins().ireduce(types::I32, value);
+    let direct = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        index,
+        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+    );
+    builder.ins().bor(immediate, direct)
+}
+
 /// Release an owner that was retained immediately before a compiled call.
 /// The source SSA/local owner remains live, so every runtime handle is known
 /// to be shared and this post-call cleanup cannot require a cold last-owner
@@ -19887,10 +19906,11 @@ fn lower_optimizing_region_instruction(
             let fixed_arguments = call.operands.len()
                 >= call.argument_operand_offset.saturating_add(call.args.len())
                 && call.operands.iter().all(Option::is_some)
-                && call
-                    .args
-                    .iter()
-                    .all(|argument| argument.name.is_none() && !argument.unpack);
+                && call.args.iter().all(|argument| !argument.unpack);
+            let trailing_unpack = call.trailing_unpack_argument();
+            let compiled_target = call
+                .direct_compiled_target()
+                .or_else(|| call.direct_compiled_unpack_target());
             // Fixed builtin signatures consume values, not caller lvalue
             // descriptors.  The IR deliberately preserves local/property
             // location metadata for the generic binder, but that metadata
@@ -19964,9 +19984,9 @@ fn lower_optimizing_region_instruction(
                     call.result,
                     value,
                 )?;
-            } else if let Some(target) = call.direct_compiled_target()
+            } else if let Some(target) = compiled_target
                 && !direct_builtin
-                && fixed_arguments
+                && (fixed_arguments || trailing_unpack.is_some())
                 && (call.returns_by_reference
                     == matches!(call.result, RegionCallResult::ReferenceLocal(_)))
                 && match call.result {
@@ -19978,25 +19998,75 @@ fn lower_optimizing_region_instruction(
                 }
                 && function_params.get(&target).is_some_and(
                     |(_, params, requires_trampoline, arity, reference_only_trampoline)| {
+                        if let Some(unpack) = trailing_unpack {
+                            let prefix_fits = unpack <= params.len();
+                            let prefix_types = call
+                                .operands
+                                .iter()
+                                .skip(call.argument_operand_offset)
+                                .take(unpack)
+                                .zip(params)
+                                .all(|(operand, parameter)| {
+                                    parameter.type_.as_ref().is_none_or(|type_| {
+                                        operand.is_some_and(|operand| {
+                                            optimizing_fact_satisfies_type(
+                                                lowering_operand_fact(
+                                                    value_flow, constants, operand,
+                                                ),
+                                                type_,
+                                            ) || optimizing_type_has_direct_guard(type_)
+                                        })
+                                    })
+                                });
+                            let unpack_types = params.iter().skip(unpack).all(|parameter| {
+                                parameter
+                                    .type_
+                                    .as_ref()
+                                    .is_none_or(optimizing_type_has_direct_guard)
+                            });
+                            return !*requires_trampoline
+                                && !call.variadic
+                                && prefix_fits
+                                && *arity
+                                    == call
+                                        .argument_operand_offset
+                                        .saturating_add(params.len())
+                                && params.iter().all(|parameter| !parameter.by_ref)
+                                && prefix_types
+                                && unpack_types;
+                        }
                         let visible_operands = call
                             .operands
                             .len()
                             .saturating_sub(call.argument_operand_offset);
                         let fixed_parameters =
                             params.len().saturating_sub(usize::from(call.variadic));
+                        let argument_sources = call.prepared_argument_sources(params);
                         (!*requires_trampoline
                             || (*reference_only_trampoline
-                                && call.args.iter().enumerate().all(|(index, argument)| {
-                                    let parameter = params.get(index).or_else(|| {
-                                        params.last().filter(|parameter| parameter.variadic)
-                                    });
-                                    parameter.is_none_or(|parameter| {
-                                        !parameter.by_ref
-                                            || argument.by_ref_local.is_some_and(|local| {
-                                                value_flow.local_storage(local)
-                                                    == crate::region_ir::LocalStorageClass::MemoryReference
+                                && argument_sources.as_ref().is_some_and(|sources| {
+                                    sources.iter().enumerate().all(
+                                        |(parameter_index, source)| {
+                                            let parameter =
+                                                params.get(parameter_index).or_else(|| {
+                                                    params
+                                                        .last()
+                                                        .filter(|parameter| parameter.variadic)
+                                                });
+                                            parameter.is_none_or(|parameter| {
+                                                !parameter.by_ref
+                                                    || source
+                                                        .and_then(|source| call.args.get(source))
+                                                        .and_then(|argument| {
+                                                            argument.by_ref_local
+                                                        })
+                                                        .is_some_and(|local| {
+                                                            value_flow.local_storage(local)
+                                                                == crate::region_ir::LocalStorageClass::MemoryReference
+                                                        })
                                             })
-                                    })
+                                        },
+                                    )
                                 })))
                             && if call.variadic {
                                 *arity == call.argument_operand_offset.saturating_add(params.len())
@@ -20056,58 +20126,149 @@ fn lower_optimizing_region_instruction(
                 let (_, parameters, _, _, _) = function_params
                     .get(&target)
                     .expect("compiled-call target metadata was admitted above");
-                let mut call_args = Vec::with_capacity(call.operands.len().saturating_add(1));
-                for (index, operand) in call.operands.iter().enumerate() {
-                    let operand = operand.expect("fixed optimizing call has every operand");
-                    let visible_index = index.checked_sub(call.argument_operand_offset);
-                    let parameter = visible_index.and_then(|index| {
-                        parameters
-                            .get(index)
-                            .or_else(|| parameters.last().filter(|parameter| parameter.variadic))
-                    });
-                    if parameter.is_some_and(|parameter| parameter.by_ref) {
-                        let reference = if let Some(argument) =
-                            visible_index.and_then(|index| call.args.get(index))
-                        {
-                            let local = argument
-                                .by_ref_local
-                                .expect("admitted reference call has a prepared local reference");
-                            let current = use_local_variable(builder, locals, local)?;
-                            let reference = lower_optimizing_bind_direct_local_reference(
-                                builder, current, transition,
-                            )?;
-                            define_local_variable(builder, locals, local, reference)?;
-                            reference
-                        } else {
-                            // An omitted by-reference parameter owns a fresh
-                            // reference initialized from its declared default.
-                            // It has no caller lvalue metadata by definition,
-                            // but still enters the callee as the same native
-                            // numeric reference representation as a supplied
-                            // lvalue.
-                            let default = lower_prepared_native_call_operand(
-                                builder, locals, registers, constants, operand,
-                            )?;
-                            lower_optimizing_bind_direct_local_reference(
-                                builder, default, transition,
-                            )?
-                        };
-                        call_args.push(reference);
-                    } else {
+                let mut call_args =
+                    Vec::with_capacity(call.argument_operand_offset + parameters.len());
+                let mut owned_call_arguments = std::collections::BTreeSet::new();
+                if let Some(unpack) = trailing_unpack {
+                    for (index, operand) in call
+                        .operands
+                        .iter()
+                        .take(call.argument_operand_offset.saturating_add(unpack))
+                        .enumerate()
+                    {
+                        let operand = operand.expect("admitted unpack prefix has every operand");
                         let value = lower_prepared_native_call_operand(
                             builder, locals, registers, constants, operand,
                         )?;
-                        let value = if parameter.is_some() {
-                            // A caller lvalue may already hold a direct native
-                            // reference. By-value binding observes its payload,
-                            // while the reference slot remains authoritative in
-                            // the caller. The retained call owner below keeps
-                            // that payload alive across the compiled call.
+                        let value = if index >= call.argument_operand_offset {
                             lower_optimizing_reference_scalar(builder, value, false, transition)?
                         } else {
                             value
                         };
                         call_args.push(value);
+                    }
+                    let unpack_operand = call
+                        .operands
+                        .get(call.argument_operand_offset.saturating_add(unpack))
+                        .copied()
+                        .flatten()
+                        .expect("admitted trailing unpack has an array operand");
+                    let unpack_array = lower_prepared_native_call_operand(
+                        builder,
+                        locals,
+                        registers,
+                        constants,
+                        unpack_operand,
+                    )?;
+                    let (_, length, entries) =
+                        lower_optimizing_direct_array_descriptor(builder, unpack_array, transition)?;
+                    let expected = parameters.len().saturating_sub(unpack);
+                    let expected_length = builder
+                        .ins()
+                        .icmp_imm(IntCC::Equal, length, i64::try_from(expected).unwrap_or(i64::MAX));
+                    let mut admitted = expected_length;
+                    let mut unpacked = Vec::with_capacity(expected);
+                    for index in 0..expected {
+                        let entry = builder.ins().iadd_imm(
+                            entries,
+                            i64::try_from(
+                                index.saturating_mul(std::mem::size_of::<
+                                    crate::JitNativeDirectArrayEntry,
+                                >()),
+                            )
+                            .unwrap_or(i64::MAX),
+                        );
+                        let key = builder.ins().load(
+                            types::I64,
+                            MemFlagsData::new(),
+                            entry,
+                            std::mem::offset_of!(crate::JitNativeDirectArrayEntry, key) as i32,
+                        );
+                        let runtime_key = lower_is_runtime_handle(builder, key);
+                        let constant_key =
+                            lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
+                        let tagged_key = builder.ins().bor(runtime_key, constant_key);
+                        let integer_key = builder.ins().icmp_imm(IntCC::Equal, tagged_key, 0);
+                        admitted = builder.ins().band(admitted, integer_key);
+                        let value = builder.ins().load(
+                            types::I64,
+                            MemFlagsData::new(),
+                            entry,
+                            std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
+                        );
+                        unpacked.push(lower_optimizing_reference_scalar(
+                            builder, value, false, transition,
+                        )?);
+                    }
+                    let unpack_admitted = builder.create_block();
+                    let unpack_rejected = builder.create_block();
+                    builder
+                        .ins()
+                        .brif(admitted, unpack_admitted, &[], unpack_rejected, &[]);
+                    builder.switch_to_block(unpack_rejected);
+                    let _ = transition.emit_value_with_detail(builder, 0x1204)?;
+                    builder.ins().jump(unpack_admitted, &[]);
+                    builder.switch_to_block(unpack_admitted);
+                    call_args.extend(unpacked);
+                } else {
+                    let argument_sources = call
+                        .prepared_argument_sources(parameters)
+                        .expect("compiled-call target retains a prepared argument plan");
+                    call_args.reserve(call.operands.len().saturating_add(1));
+                    for (index, operand) in call.operands.iter().enumerate() {
+                        let operand = operand.expect("fixed optimizing call has every operand");
+                        let visible_index = index.checked_sub(call.argument_operand_offset);
+                        let parameter = visible_index.and_then(|index| {
+                            parameters.get(index).or_else(|| {
+                                parameters.last().filter(|parameter| parameter.variadic)
+                            })
+                        });
+                        if parameter.is_some_and(|parameter| parameter.by_ref) {
+                            let source_argument = visible_index
+                                .and_then(|index| argument_sources.get(index))
+                                .copied()
+                                .flatten()
+                                .and_then(|source| call.args.get(source));
+                            let reference = if let Some(argument) = source_argument {
+                                let local = argument.by_ref_local.expect(
+                                    "admitted reference call has a prepared local reference",
+                                );
+                                let current = use_local_variable(builder, locals, local)?;
+                                let reference = lower_optimizing_bind_direct_local_reference(
+                                    builder, current, transition,
+                                )?;
+                                define_local_variable(builder, locals, local, reference)?;
+                                reference
+                            } else {
+                                // An omitted by-reference parameter owns a
+                                // fresh reference initialized from its
+                                // declared default.
+                                let default = lower_prepared_native_call_operand(
+                                    builder, locals, registers, constants, operand,
+                                )?;
+                                let reference = lower_optimizing_bind_direct_local_reference(
+                                    builder, default, transition,
+                                )?;
+                                owned_call_arguments.insert(call_args.len());
+                                reference
+                            };
+                            call_args.push(reference);
+                        } else {
+                            let value = lower_prepared_native_call_operand(
+                                builder, locals, registers, constants, operand,
+                            )?;
+                            let value = if parameter.is_some() {
+                                // A by-value parameter observes a direct
+                                // reference payload while its caller slot
+                                // remains authoritative.
+                                lower_optimizing_reference_scalar(
+                                    builder, value, false, transition,
+                                )?
+                            } else {
+                                value
+                            };
+                            call_args.push(value);
+                        }
                     }
                 }
 
@@ -20118,45 +20279,84 @@ fn lower_optimizing_region_instruction(
                 // permitted transition to the exact baseline continuation;
                 // it never calls the Rust dispatcher from optimized code.
                 let mut arguments_match = None;
-                for (index, operand) in call
-                    .operands
-                    .iter()
-                    .skip(call.argument_operand_offset)
-                    .enumerate()
-                {
-                    let parameter = parameters
-                        .get(index)
-                        .or_else(|| parameters.last().filter(|parameter| parameter.variadic))
-                        .expect("admitted call operand has a parameter");
-                    let Some(type_) = parameter.type_.as_ref() else {
-                        continue;
-                    };
-                    let operand_index = call.argument_operand_offset.saturating_add(index);
-                    let operand = operand.expect("fixed optimizing call has every visible operand");
-                    if !parameter.by_ref
-                        && optimizing_fact_satisfies_type(
-                            lowering_operand_fact(value_flow, constants, operand),
-                            type_,
-                        )
-                    {
-                        continue;
+                if let Some(unpack) = trailing_unpack {
+                    for (index, parameter) in parameters.iter().enumerate() {
+                        let Some(type_) = parameter.type_.as_ref() else {
+                            continue;
+                        };
+                        let static_match = (index < unpack)
+                            .then(|| {
+                                call.operands
+                                    .get(call.argument_operand_offset.saturating_add(index))
+                                    .copied()
+                                    .flatten()
+                            })
+                            .flatten()
+                            .is_some_and(|operand| {
+                                optimizing_fact_satisfies_type(
+                                    lowering_operand_fact(value_flow, constants, operand),
+                                    type_,
+                                )
+                            });
+                        if static_match {
+                            continue;
+                        }
+                        let guarded =
+                            call_args[call.argument_operand_offset.saturating_add(index)];
+                        let matched = lower_optimizing_type_guard(builder, guarded, type_)
+                            .expect("compiled unpack parameter type has an admitted native guard");
+                        arguments_match = Some(arguments_match.map_or(matched, |accepted| {
+                            builder.ins().band(accepted, matched)
+                        }));
                     }
-                    let guarded = if parameter.by_ref {
-                        lower_optimizing_reference_scalar(
-                            builder,
-                            call_args[operand_index],
-                            false,
-                            transition,
-                        )?
-                    } else {
-                        call_args[operand_index]
-                    };
-                    let matched = lower_optimizing_type_guard(builder, guarded, type_)
-                        .expect("compiled-call parameter type has an admitted native guard");
-                    arguments_match = Some(
-                        arguments_match
-                            .map_or(matched, |accepted| builder.ins().band(accepted, matched)),
-                    );
+                } else {
+                    for (index, operand) in call
+                        .operands
+                        .iter()
+                        .skip(call.argument_operand_offset)
+                        .enumerate()
+                    {
+                        let parameter = parameters
+                            .get(index)
+                            .or_else(|| parameters.last().filter(|parameter| parameter.variadic))
+                            .expect("admitted call operand has a parameter");
+                        let Some(type_) = parameter.type_.as_ref() else {
+                            continue;
+                        };
+                        let operand_index = call.argument_operand_offset.saturating_add(index);
+                        let operand =
+                            operand.expect("fixed optimizing call has every visible operand");
+                        if !parameter.by_ref
+                            && optimizing_fact_satisfies_type(
+                                lowering_operand_fact(value_flow, constants, operand),
+                                type_,
+                            )
+                        {
+                            continue;
+                        }
+                        let guarded = if parameter.by_ref {
+                            lower_optimizing_reference_scalar(
+                                builder,
+                                call_args[operand_index],
+                                false,
+                                transition,
+                            )?
+                        } else {
+                            call_args[operand_index]
+                        };
+                        let matched = lower_optimizing_type_guard(builder, guarded, type_)
+                            .expect("compiled-call parameter type has an admitted native guard");
+                        arguments_match = Some(arguments_match.map_or(matched, |accepted| {
+                            builder.ins().band(accepted, matched)
+                        }));
+                    }
+                }
+                for value in call_args.iter().copied() {
+                    let authoritative =
+                        lower_optimizing_call_value_is_authoritative(builder, value);
+                    arguments_match = Some(arguments_match.map_or(authoritative, |accepted| {
+                        builder.ins().band(accepted, authoritative)
+                    }));
                 }
                 if let Some(arguments_match) = arguments_match {
                     let admitted = builder.create_block();
@@ -20170,7 +20370,7 @@ fn lower_optimizing_region_instruction(
                     builder.switch_to_block(admitted);
                 }
 
-                let owned_call_argument = if call.variadic {
+                if call.variadic {
                     let fixed_parameters = parameters.len().saturating_sub(1);
                     let variadic_start = call
                         .argument_operand_offset
@@ -20183,10 +20383,8 @@ fn lower_optimizing_region_instruction(
                     )?;
                     let index = call_args.len();
                     call_args.push(variadic_array);
-                    Some(index)
-                } else {
-                    None
-                };
+                    owned_call_arguments.insert(index);
+                }
                 let expected_arity = function_params
                     .get(&target)
                     .map(|(_, _, _, arity, _)| *arity)
@@ -20225,7 +20423,7 @@ fn lower_optimizing_region_instruction(
                         .ins()
                         .atomic_load(pointer_type, MemFlagsData::new(), preferred_entry);
                 for (index, value) in call_args.iter().copied().enumerate() {
-                    if Some(index) != owned_call_argument {
+                    if !owned_call_arguments.contains(&index) {
                         lower_optimizing_retain(builder, value, deopt_out);
                     }
                 }
@@ -20376,7 +20574,7 @@ fn lower_optimizing_region_instruction(
                 let propagated_status = builder.block_params(propagate)[0];
                 let control = builder.ins().stack_load(types::I64, result_slot, 0);
                 for (index, argument) in call_args.iter().copied().enumerate() {
-                    if Some(index) == owned_call_argument {
+                    if owned_call_arguments.contains(&index) {
                         lower_optimizing_commit_owned_call_argument(builder, argument, transition);
                     } else {
                         lower_optimizing_release_call_owner(builder, argument, deopt_out);
@@ -20435,7 +20633,7 @@ fn lower_optimizing_region_instruction(
                 builder.switch_to_block(returned);
                 let result = builder.ins().stack_load(types::I64, result_slot, 0);
                 for (index, argument) in call_args.iter().copied().enumerate() {
-                    if Some(index) == owned_call_argument {
+                    if owned_call_arguments.contains(&index) {
                         lower_optimizing_commit_owned_call_argument(builder, argument, transition);
                     } else {
                         lower_optimizing_release_call_owner(builder, argument, deopt_out);
@@ -26567,6 +26765,10 @@ fn lower_native_call_trampoline(
     };
     let mut consumed_arguments = Vec::new();
     let mut speculative_local_bindings = BTreeMap::<LocalId, (ir::Value, Vec<i32>)>::new();
+    let prepared_argument_sources = call
+        .direct_compiled_target()
+        .and_then(|target| function_params.get(&target))
+        .and_then(|(_, parameters, _, _, _)| call.prepared_argument_sources(parameters));
     let arguments_ptr = if argument_count == 0 {
         builder.ins().iconst(pointer_type, 0)
     } else {
@@ -26584,13 +26786,23 @@ fn lower_native_call_trampoline(
         })?;
         let pointer = allocate_native_stack_storage(builder, pointer_type, bytes, 3);
         for index in 0..argument_count {
-            let argument = index
-                .checked_sub(call.argument_operand_offset)
-                .and_then(|index| call.args.get(index));
+            let source_index = index.checked_sub(call.argument_operand_offset);
+            let argument = source_index.and_then(|index| call.args.get(index));
+            let operand_index = source_index
+                .and_then(|source| {
+                    prepared_argument_sources.as_ref().and_then(|sources| {
+                        sources
+                            .iter()
+                            .position(|candidate| *candidate == Some(source))
+                    })
+                })
+                .map_or(index, |parameter| {
+                    call.argument_operand_offset.saturating_add(parameter)
+                });
             let base = i32::try_from(index.saturating_mul(argument_size)).unwrap_or(i32::MAX);
             let mut lowered = call
                 .operands
-                .get(index)
+                .get(operand_index)
                 .copied()
                 .flatten()
                 .map(|operand| lower_region_operand(builder, locals, registers, operand))
@@ -26635,13 +26847,13 @@ fn lower_native_call_trampoline(
             };
             if call
                 .operands
-                .get(index)
+                .get(operand_index)
                 .copied()
                 .flatten()
                 .is_some_and(|operand| matches!(operand, RegionOperand::Register(_)))
                 && !call
                     .operands
-                    .get(index)
+                    .get(operand_index)
                     .copied()
                     .flatten()
                     .is_some_and(|operand| {

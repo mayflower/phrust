@@ -296,6 +296,47 @@ pub struct RegionNativeClosureCapture {
 }
 
 impl RegionNativeCall {
+    /// Resolves PHP-visible source arguments to the callee's packed native
+    /// parameter order. Fixed parameters occupy one entry each; omitted
+    /// defaults are `None`, while a variadic parameter contributes one entry
+    /// per supplied positional tail value. Named variadic entries remain on
+    /// the exact baseline binder because their string keys are PHP-visible.
+    pub(crate) fn prepared_argument_sources(
+        &self,
+        parameters: &[php_ir::IrParam],
+    ) -> Option<Vec<Option<usize>>> {
+        prepared_call_argument_sources(&self.args, parameters)
+    }
+
+    /// Returns the source index of the one direct-array segment that can be
+    /// expanded entirely in generated code. Multiple/interleaved unpack
+    /// segments and named unpack keys retain their exact baseline binder.
+    pub(crate) fn trailing_unpack_argument(&self) -> Option<usize> {
+        let (last, prefix) = self.args.split_last()?;
+        (last.unpack
+            && last.name.is_none()
+            && prefix
+                .iter()
+                .all(|argument| argument.name.is_none() && !argument.unpack)
+            && self.operands.len() == self.argument_operand_offset.saturating_add(self.args.len())
+            && self.operands.iter().all(Option::is_some))
+        .then_some(prefix.len())
+    }
+
+    /// Statically bound callee for a trailing direct-array argument segment.
+    /// Parameter-count, type and by-reference admission is performed by the
+    /// optimizing compiler with the published signature.
+    pub(crate) fn direct_compiled_unpack_target(&self) -> Option<FunctionId> {
+        let RegionCallTarget::Function {
+            function: Some(function),
+            ..
+        } = self.target
+        else {
+            return None;
+        };
+        self.trailing_unpack_argument().map(|_| function)
+    }
+
     pub(crate) fn declared_argument_reference_requirement(&self, index: usize) -> Option<bool> {
         let argument = self.args.get(index)?;
         let parameters = match &self.target {
@@ -414,8 +455,7 @@ impl RegionNativeCall {
         (arity_matches
             && self.operands.iter().all(Option::is_some)
             && self.args.iter().all(|arg| {
-                arg.name.is_none()
-                    && !arg.unpack
+                !arg.unpack
                     && (arg.value_kind == IrCallArgValueKind::Direct
                         || (arg.value_kind == IrCallArgValueKind::ByRefLocationPlaceholder
                             && arg.by_ref_local.is_some()))
@@ -1098,18 +1138,6 @@ pub(crate) fn native_function_parameter_locals(
     )
 }
 
-fn omitted_defaults_require_runtime_binding(
-    target: &php_ir::IrFunction,
-    supplied_arguments: usize,
-) -> bool {
-    target
-        .params
-        .iter()
-        .skip(supplied_arguments)
-        .filter_map(|parameter| parameter.default.as_ref())
-        .any(|default| matches!(default, IrConstant::Array(_)))
-}
-
 fn implicit_closure_bound_object(
     unit: &IrUnit,
     caller: &php_ir::IrFunction,
@@ -1335,15 +1363,7 @@ impl BaselineRegionBuilder {
                         for (index, argument) in prepared.iter_mut().enumerate() {
                             if !target
                                 .and_then(|target| {
-                                    argument
-                                        .name
-                                        .as_deref()
-                                        .and_then(|name| {
-                                            target.params.iter().find(|parameter| {
-                                                parameter.name.eq_ignore_ascii_case(name)
-                                            })
-                                        })
-                                        .or_else(|| target.params.get(index))
+                                    prepared_parameter_for_source(target, args, index)
                                 })
                                 .is_some_and(|parameter| parameter.by_ref)
                             {
@@ -1472,7 +1492,9 @@ impl BaselineRegionBuilder {
                         let mut prepared = args.clone();
                         for (index, argument) in prepared.iter_mut().enumerate() {
                             if !target
-                                .and_then(|target| target.params.get(index))
+                                .and_then(|target| {
+                                    prepared_parameter_for_source(target, args, index)
+                                })
                                 .is_some_and(|parameter| parameter.by_ref)
                             {
                                 continue;
@@ -1972,33 +1994,16 @@ impl BaselineRegionBuilder {
                                 .and_then(|target| target.params.last())
                                 .is_some_and(|parameter| parameter.variadic)
                         });
-                        let mut operands = lower_call_operands(unit, args);
-                        if let Some(function) = function
-                            && let Some(target) = unit.functions.get(function.index())
-                        {
-                            for parameter in target
-                                .params
-                                .iter()
-                                .skip(args.len())
-                                .filter(|parameter| !parameter.variadic)
-                            {
-                                let operand = parameter.default.as_ref().and_then(|default| {
-                                    unit.constants
-                                        .iter()
-                                        .position(|constant| constant == default)
-                                        .and_then(|index| u32::try_from(index).ok())
-                                        .map(RegionOperand::Constant)
-                                });
-                                operands.push(operand);
-                            }
-                        }
+                        let prepared_operands = function
+                            .and_then(|function| unit.functions.get(function.index()))
+                            .and_then(|target| prepare_direct_call_operands(unit, target, args));
+                        let operands = prepared_operands
+                            .clone()
+                            .unwrap_or_else(|| lower_call_operands(unit, args));
                         let direct_function = function.filter(|function| {
                                 unit.functions.get(function.index()).is_some_and(|target| {
                                     !target.flags.is_generator
-                                        && !omitted_defaults_require_runtime_binding(
-                                            target,
-                                            args.len(),
-                                        )
+                                        && prepared_operands.is_some()
                                         && !target.blocks.iter().flat_map(|block| &block.instructions).any(
                                             |instruction| matches!(
                                                 &instruction.kind,
@@ -2042,13 +2047,7 @@ impl BaselineRegionBuilder {
                         if let Some(target) =
                             function.and_then(|function| unit.functions.get(function.index()))
                         {
-                            for (argument, parameter) in native_args.iter_mut().zip(&target.params)
-                            {
-                                if parameter.by_ref {
-                                    argument.value_kind =
-                                        IrCallArgValueKind::ByRefLocationPlaceholder;
-                                }
-                            }
+                            mark_prepared_reference_arguments(&mut native_args, target);
                         }
                         RegionInstructionKind::NativeCall(RegionNativeCall {
                             result: RegionCallResult::Register(*dst),
@@ -4489,6 +4488,137 @@ fn lower_call_operands(unit: &IrUnit, args: &[IrCallArg]) -> Vec<Option<RegionOp
         .collect()
 }
 
+/// Builds the immutable source-to-parameter plan for a statically published
+/// userland signature. This is compile-time PHP argument binding: generated
+/// optimizing code receives only the resulting numeric operand order.
+fn prepared_call_argument_sources(
+    args: &[IrCallArg],
+    parameters: &[php_ir::IrParam],
+) -> Option<Vec<Option<usize>>> {
+    let variadic_index = parameters.iter().position(|parameter| parameter.variadic);
+    let fixed_count = variadic_index.unwrap_or(parameters.len());
+    let mut assigned = vec![None; fixed_count];
+    let mut variadic = Vec::new();
+    let mut positional = 0usize;
+    let mut saw_named = false;
+
+    for (source, argument) in args.iter().enumerate() {
+        if argument.unpack {
+            return None;
+        }
+        if let Some(name) = argument.name.as_deref() {
+            saw_named = true;
+            let parameter = parameters[..fixed_count]
+                .iter()
+                .position(|parameter| parameter.name.eq_ignore_ascii_case(name));
+            let Some(parameter) = parameter else {
+                // PHP preserves unknown named arguments as string-keyed
+                // variadics. The direct call ABI currently packs only the
+                // positional variadic tail, so keep that semantic shape at
+                // the one baseline continuation.
+                return None;
+            };
+            if assigned[parameter].replace(source).is_some() {
+                return None;
+            }
+            continue;
+        }
+        if saw_named {
+            return None;
+        }
+        while positional < fixed_count && assigned[positional].is_some() {
+            positional += 1;
+        }
+        if positional < fixed_count {
+            assigned[positional] = Some(source);
+            positional += 1;
+        } else if variadic_index.is_some() {
+            variadic.push(Some(source));
+        } else {
+            // Surplus arguments remain observable through func_get_args()
+            // and therefore require the baseline binder unless the complete
+            // target ABI explicitly carries them.
+            return None;
+        }
+    }
+    assigned.extend(variadic);
+    Some(assigned)
+}
+
+fn prepare_direct_call_operands(
+    unit: &IrUnit,
+    target: &php_ir::IrFunction,
+    args: &[IrCallArg],
+) -> Option<Vec<Option<RegionOperand>>> {
+    let sources = prepared_call_argument_sources(args, &target.params)?;
+    let fixed_count = target
+        .params
+        .iter()
+        .position(|parameter| parameter.variadic)
+        .unwrap_or(target.params.len());
+    let mut operands = Vec::with_capacity(sources.len());
+    for (parameter_index, source) in sources.iter().take(fixed_count).copied().enumerate() {
+        if let Some(source) = source {
+            operands.push(Some(lower_operand(unit, args.get(source)?.value)));
+            continue;
+        }
+        let default = target.params.get(parameter_index)?.default.as_ref()?;
+        if matches!(default, IrConstant::Array(_)) {
+            return None;
+        }
+        let operand = unit
+            .constants
+            .iter()
+            .position(|constant| constant == default)
+            .and_then(|index| u32::try_from(index).ok())
+            .map(RegionOperand::Constant)?;
+        operands.push(Some(operand));
+    }
+    for source in sources.into_iter().skip(fixed_count) {
+        operands.push(Some(lower_operand(unit, args.get(source?)?.value)));
+    }
+    Some(operands)
+}
+
+fn mark_prepared_reference_arguments(args: &mut [IrCallArg], target: &php_ir::IrFunction) {
+    let Some(sources) = prepared_call_argument_sources(args, &target.params) else {
+        return;
+    };
+    let variadic_index = target
+        .params
+        .iter()
+        .position(|parameter| parameter.variadic);
+    for (parameter_index, source) in sources.into_iter().enumerate() {
+        let Some(source) = source else {
+            continue;
+        };
+        let parameter = target
+            .params
+            .get(parameter_index)
+            .or_else(|| variadic_index.and_then(|index| target.params.get(index)));
+        if parameter.is_some_and(|parameter| parameter.by_ref)
+            && let Some(argument) = args.get_mut(source)
+        {
+            argument.value_kind = IrCallArgValueKind::ByRefLocationPlaceholder;
+        }
+    }
+}
+
+fn prepared_parameter_for_source<'a>(
+    target: &'a php_ir::IrFunction,
+    args: &[IrCallArg],
+    source: usize,
+) -> Option<&'a php_ir::IrParam> {
+    let sources = prepared_call_argument_sources(args, &target.params)?;
+    let parameter_index = sources
+        .iter()
+        .position(|candidate| *candidate == Some(source))?;
+    target
+        .params
+        .get(parameter_index)
+        .or_else(|| target.params.last().filter(|parameter| parameter.variadic))
+}
+
 fn known_string_operand(
     unit: &IrUnit,
     operand: Operand,
@@ -4784,9 +4914,10 @@ fn lower_direct_function_call(
     args: &[IrCallArg],
 ) -> RegionInstructionKind {
     let target = &unit.functions[function.index()];
-    let direct_arity = (!omitted_defaults_require_runtime_binding(target, args.len()))
-        .then(|| u32::try_from(target.params.len()).ok())
-        .flatten();
+    let prepared_operands = prepare_direct_call_operands(unit, target, args);
+    let direct_arity = prepared_operands
+        .as_ref()
+        .and_then(|_| u32::try_from(target.params.len()).ok());
     let is_generator = target.flags.is_generator
         || target
             .blocks
@@ -4802,29 +4933,16 @@ fn lower_direct_function_call(
         .params
         .last()
         .is_some_and(|parameter| parameter.variadic);
-    let mut operands = lower_call_operands(unit, args);
-    for parameter in target
-        .params
-        .iter()
-        .skip(args.len())
-        .filter(|parameter| !parameter.variadic)
-    {
-        let operand = parameter.default.as_ref().and_then(|default| {
-            unit.constants
-                .iter()
-                .position(|constant| constant == default)
-                .and_then(|index| u32::try_from(index).ok())
-                .map(RegionOperand::Constant)
-        });
-        operands.push(operand);
-    }
+    let operands = prepared_operands.unwrap_or_else(|| lower_call_operands(unit, args));
+    let mut native_args = args.to_vec();
+    mark_prepared_reference_arguments(&mut native_args, target);
     RegionInstructionKind::NativeCall(RegionNativeCall {
         result: RegionCallResult::Register(dst),
         target: RegionCallTarget::Function {
             name,
             function: (!is_generator).then_some(function),
         },
-        args: args.to_vec(),
+        args: native_args,
         argument_operand_offset: 0,
         operands,
         direct_arity,
@@ -4840,16 +4958,15 @@ fn lower_stable_named_callable(
     name: String,
     args: &[IrCallArg],
 ) -> (RegionInstructionKind, bool) {
-    let direct_shape = args
-        .iter()
-        .all(|argument| argument.name.is_none() && !argument.unpack);
     if let Some((class_name, method)) = name.split_once("::") {
-        if direct_shape && let Some(function) = find_direct_static_method(unit, class_name, method)
-        {
-            return (
-                lower_direct_function_call(unit, dst, name, function, args),
-                true,
+        if let Some(function) = find_direct_static_method(unit, class_name, method) {
+            let call = lower_direct_function_call(unit, dst, name, function, args);
+            let direct = matches!(
+                &call,
+                RegionInstructionKind::NativeCall(call)
+                    if call.direct_compiled_target().is_some()
             );
+            return (call, direct);
         }
         return (
             RegionInstructionKind::NativeCall(RegionNativeCall {
@@ -4870,10 +4987,13 @@ fn lower_stable_named_callable(
         );
     }
     if let Some(function) = find_function(unit, &name) {
-        return (
-            lower_direct_function_call(unit, dst, name, function, args),
-            direct_shape,
+        let call = lower_direct_function_call(unit, dst, name, function, args);
+        let direct = matches!(
+            &call,
+            RegionInstructionKind::NativeCall(call)
+                if call.direct_compiled_target().is_some()
         );
+        return (call, direct);
     }
     (
         RegionInstructionKind::NativeCall(RegionNativeCall {
@@ -4930,37 +5050,25 @@ fn lower_direct_method_call(
         .last()
         .is_some_and(|parameter| parameter.variadic);
     let receiver_count = usize::from(!is_static);
-    let direct_arity = (!omitted_defaults_require_runtime_binding(target, args.len()))
-        .then(|| u32::try_from(receiver_count + target.params.len()).ok())
-        .flatten();
+    let prepared_operands = prepare_direct_call_operands(unit, target, args);
+    let direct_arity = prepared_operands
+        .as_ref()
+        .and_then(|_| u32::try_from(receiver_count + target.params.len()).ok());
     let mut operands = if is_static {
         Vec::new()
     } else {
         vec![Some(lower_operand(unit, receiver))]
     };
-    operands.extend(lower_call_operands(unit, args));
-    for parameter in target
-        .params
-        .iter()
-        .skip(args.len())
-        .filter(|parameter| !parameter.variadic)
-    {
-        let operand = parameter.default.as_ref().and_then(|default| {
-            unit.constants
-                .iter()
-                .position(|constant| constant == default)
-                .and_then(|index| u32::try_from(index).ok())
-                .map(RegionOperand::Constant)
-        });
-        operands.push(operand);
-    }
+    operands.extend(prepared_operands.unwrap_or_else(|| lower_call_operands(unit, args)));
+    let mut native_args = args.to_vec();
+    mark_prepared_reference_arguments(&mut native_args, target);
     RegionInstructionKind::NativeCall(RegionNativeCall {
         result: RegionCallResult::Register(dst),
         target: RegionCallTarget::Function {
             name: target.name.clone(),
             function: Some(function),
         },
-        args: args.to_vec(),
+        args: native_args,
         argument_operand_offset: receiver_count,
         operands,
         direct_arity,
@@ -5015,11 +5123,10 @@ fn lower_direct_closure_call(
         });
     }
     let bound_object_count = usize::from(closure.bound_object.is_some());
-    let direct_arity = (!omitted_defaults_require_runtime_binding(target, args.len()))
-        .then(|| {
-            u32::try_from(bound_object_count + target.captures.len() + target.params.len()).ok()
-        })
-        .flatten();
+    let prepared_operands = prepare_direct_call_operands(unit, target, args);
+    let direct_arity = prepared_operands.as_ref().and_then(|_| {
+        u32::try_from(bound_object_count + target.captures.len() + target.params.len()).ok()
+    });
     let argument_operand_offset = bound_object_count + closure.captures.len();
     let mut operands = closure
         .bound_object
@@ -5027,29 +5134,16 @@ fn lower_direct_closure_call(
         .map(Some)
         .collect::<Vec<_>>();
     operands.extend(closure.captures.into_iter().map(Some));
-    operands.extend(lower_call_operands(unit, args));
-    for parameter in target
-        .params
-        .iter()
-        .skip(args.len())
-        .filter(|parameter| !parameter.variadic)
-    {
-        let operand = parameter.default.as_ref().and_then(|default| {
-            unit.constants
-                .iter()
-                .position(|constant| constant == default)
-                .and_then(|index| u32::try_from(index).ok())
-                .map(RegionOperand::Constant)
-        });
-        operands.push(operand);
-    }
+    operands.extend(prepared_operands.unwrap_or_else(|| lower_call_operands(unit, args)));
+    let mut native_args = args.to_vec();
+    mark_prepared_reference_arguments(&mut native_args, target);
     RegionInstructionKind::NativeCall(RegionNativeCall {
         result: RegionCallResult::Register(dst),
         target: RegionCallTarget::Function {
             name: target.name.clone(),
             function: Some(closure.function),
         },
-        args: args.to_vec(),
+        args: native_args,
         argument_operand_offset,
         operands,
         direct_arity,

@@ -131,6 +131,78 @@ fn lower_optimizing_terminator_reference_local(
     Ok(builder.block_params(merge)[0])
 }
 
+fn lower_optimizing_require_authoritative_return(
+    builder: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    by_reference: bool,
+    transition: NativeOptimizingTerminatorTransition<'_>,
+) -> Result<(), CraneliftLoweringError> {
+    let authoritative = lower_optimizing_call_value_is_authoritative(builder, value);
+    let direct = builder.create_block();
+    let rejected = builder.create_block();
+    if !by_reference {
+        builder
+            .ins()
+            .brif(authoritative, direct, &[], rejected, &[]);
+    } else {
+        let inspect = builder.create_block();
+        let reference = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
+        let index = builder.ins().ireduce(types::I32, value);
+        let direct_index = builder.ins().icmp_imm(
+            IntCC::UnsignedGreaterThanOrEqual,
+            index,
+            i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+        );
+        let candidate = builder.ins().band(reference, direct_index);
+        builder.ins().brif(candidate, inspect, &[], rejected, &[]);
+
+        builder.switch_to_block(inspect);
+        let slot = lower_optimizing_slot_address(builder, value, transition.deopt_out);
+        let kind = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+        );
+        let flags = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+        );
+        let state = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, reserved) as i32,
+        );
+        let direct_kind = builder.ins().icmp_imm(
+            IntCC::Equal,
+            kind,
+            i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR),
+        );
+        let version = builder.ins().icmp_imm(
+            IntCC::Equal,
+            flags,
+            i64::from(crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION),
+        );
+        let published = builder.ins().icmp_imm(
+            IntCC::NotEqual,
+            state,
+            i64::from(crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_EMPTY),
+        );
+        let mut admitted = builder.ins().band(authoritative, direct_kind);
+        admitted = builder.ins().band(admitted, version);
+        admitted = builder.ins().band(admitted, published);
+        builder.ins().brif(admitted, direct, &[], rejected, &[]);
+    }
+    builder.switch_to_block(rejected);
+    transition.emit(builder)?;
+    builder.ins().jump(direct, &[]);
+    builder.switch_to_block(direct);
+    Ok(())
+}
+
 fn lower_optimizing_frame_cleanup(
     builder: &mut FunctionBuilder<'_>,
     cleanup: &[(LocalId, ir::Value)],
@@ -894,6 +966,7 @@ pub(super) fn lower_optimizing_region_terminator(
                 builder.ins().jump(admitted, &[]);
                 builder.switch_to_block(admitted);
             }
+            lower_optimizing_require_authoritative_return(builder, value, false, transition)?;
             if reference_local || fact.ownership == SsaOwnership::Borrowed {
                 lower_optimizing_retain(builder, value, deopt_out);
             }
@@ -921,6 +994,7 @@ pub(super) fn lower_optimizing_region_terminator(
             // both cases. Direct compiled callers consume this owner when
             // they install the returned alias.
             let value = use_local_variable(builder, locals, *local)?;
+            lower_optimizing_require_authoritative_return(builder, value, true, transition)?;
             lower_optimizing_retain(builder, value, deopt_out);
             let cleanup = frame_cleanup_locals
                 .iter()

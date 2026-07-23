@@ -703,10 +703,15 @@ fn bind_native_function_with_metadata_strict_at_tier<R>(
                 bound.push(value);
             } else if let Some(default) = &parameter.default {
                 if parameter.by_ref {
-                    let value = native_runtime_constant_value(context, default)?;
-                    bound.push(context.encode_native_reference_owner(
-                        php_runtime::api::ReferenceCell::new(value),
-                    )?);
+                    let payload = context.encode_native_ir_constant_owned(default)?;
+                    let reference = match context.encode_direct_reference_payload_owned(payload) {
+                        Ok(reference) => reference,
+                        Err(error) => {
+                            context.release(payload)?;
+                            return Err(error.into());
+                        }
+                    };
+                    bound.push(reference);
                 } else {
                     bound.push(context.encode_native_ir_constant_owned(default)?);
                 }

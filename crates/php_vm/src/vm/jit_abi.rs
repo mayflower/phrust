@@ -8096,8 +8096,8 @@ impl<'a> NativeRequestColdState<'a> {
     }
 
     /// Creates a direct reference whose payload ownership is supplied by the
-    /// caller. The cold ReferenceCell is identity-only until an explicit cold
-    /// boundary materializes the authoritative payload.
+    /// caller. No `ReferenceCell` exists on this path; an explicit cold decode
+    /// creates and publishes that compatibility identity only when required.
     fn encode_direct_reference_payload_owned(&mut self, payload: i64) -> Result<i64, String> {
         let index = self.reserve_direct_value_slot()?;
         self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
@@ -8108,13 +8108,10 @@ impl<'a> NativeRequestColdState<'a> {
             payload: payload as u64,
             ..php_jit::JitNativeValueSlot::default()
         };
-        self.direct_reference_cells
-            .insert(index, php_runtime::api::ReferenceCell::new(Value::Null));
         let Some(runtime_index) = u32::try_from(index)
             .ok()
             .and_then(|index| index.checked_add(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE))
         else {
-            self.direct_reference_cells.remove(&index);
             self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
                 reserved: *self.direct_value_free_head,
                 ..php_jit::JitNativeValueSlot::default()

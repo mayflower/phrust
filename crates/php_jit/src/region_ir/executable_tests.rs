@@ -1056,6 +1056,110 @@ fn object_syntax_static_method_call_omits_receiver_from_native_abi() {
 }
 
 #[test]
+fn named_user_call_prepares_native_parameter_order() {
+    let mut builder = IrBuilder::new(UnitId::new(9_801));
+    let file = builder.add_file("named-direct-call.php");
+    let span = IrSpan::new(file, 0, 40);
+    let function = builder.start_function("named_target", FunctionFlags::default(), span);
+    let first = builder.intern_local(function, "first");
+    let second = builder.intern_local(function, "second");
+    let third = builder.intern_local(function, "third");
+    let second_default = IrConstant::Int(20);
+    builder.intern_constant(second_default.clone());
+    for parameter in [
+        IrParam {
+            name: "first".to_owned(),
+            local: first,
+            required: true,
+            default: None,
+            type_: None,
+            by_ref: true,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+        IrParam {
+            name: "second".to_owned(),
+            local: second,
+            required: false,
+            default: Some(second_default),
+            type_: None,
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+        IrParam {
+            name: "third".to_owned(),
+            local: third,
+            required: true,
+            default: None,
+            type_: None,
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    ] {
+        builder.push_param(function, parameter);
+    }
+    let block = builder.append_block(function);
+    builder.terminate_return(function, block, None, span);
+
+    let caller = builder.start_function("named_caller", FunctionFlags::default(), span);
+    let first_source = builder.intern_local(caller, "first_source");
+    let third_value = builder.intern_constant(IrConstant::Int(30));
+    let unit = builder.finish();
+    let args = vec![
+        IrCallArg {
+            name: Some("third".to_owned()),
+            value: Operand::Constant(third_value),
+            unpack: false,
+            value_kind: IrCallArgValueKind::Direct,
+            by_ref_local: None,
+            by_ref_dim: None,
+            by_ref_property: None,
+            by_ref_property_dim: None,
+        },
+        IrCallArg {
+            name: Some("first".to_owned()),
+            value: Operand::Local(first_source),
+            unpack: false,
+            value_kind: IrCallArgValueKind::Direct,
+            by_ref_local: Some(first_source),
+            by_ref_dim: None,
+            by_ref_property: None,
+            by_ref_property_dim: None,
+        },
+    ];
+    let RegionInstructionKind::NativeCall(call) = lower_direct_function_call(
+        &unit,
+        RegId::new(0),
+        "named_target".to_owned(),
+        function,
+        &args,
+    ) else {
+        panic!("named target should use the unified native call model");
+    };
+
+    assert_eq!(call.direct_arity, Some(3));
+    assert_eq!(call.direct_compiled_target(), Some(function));
+    assert_eq!(
+        call.prepared_argument_sources(&unit.functions[function.index()].params),
+        Some(vec![Some(1), None, Some(0)])
+    );
+    assert_eq!(
+        call.operands,
+        vec![
+            Some(RegionOperand::Local(first_source)),
+            Some(RegionOperand::Constant(0)),
+            Some(RegionOperand::I64(30)),
+        ]
+    );
+    assert_eq!(
+        call.args[1].value_kind,
+        IrCallArgValueKind::ByRefLocationPlaceholder
+    );
+}
+
+#[test]
 fn static_syntax_non_static_method_uses_runtime_receiver_binding() {
     let mut builder = IrBuilder::new(UnitId::new(98));
     let file = builder.add_file("non-static-method.php");
