@@ -7287,6 +7287,11 @@ impl<'a> NativeRequestColdState<'a> {
         };
         match &value {
             Value::Null => return Ok(php_jit::jit_encode_constant(u32::MAX)),
+            Value::Uninitialized => {
+                return Ok(php_jit::jit_encode_constant(
+                    php_jit::JIT_VALUE_UNINITIALIZED,
+                ));
+            }
             Value::Bool(false) => {
                 return Ok(php_jit::jit_encode_constant(php_jit::JIT_VALUE_FALSE));
             }

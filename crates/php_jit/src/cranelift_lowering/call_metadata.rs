@@ -899,50 +899,14 @@ pub(super) fn known_user_argument_requires_reference(
     if let Some(requirement) = call.declared_argument_reference_requirement(index) {
         return Some(requirement);
     }
-    if let RegionCallTarget::Method { method, .. } = &call.target {
-        // Region IR records lvalue provenance for ordinary by-value arguments
-        // as well as true by-reference parameters. For internal instance
-        // methods the receiver class is dynamic, but when every published
-        // method with this name agrees on the parameter mode the arginfo is
-        // still authoritative. This prevents speculative ReferenceCell
-        // creation for families such as Closure::bindTo without specializing
-        // the callsite or receiver identity.
-        let mut requirements = php_std::generated::arginfo::GENERATED_METHODS
-            .iter()
-            .filter(|candidate| candidate.name.eq_ignore_ascii_case(method))
-            .map(|candidate| {
-                argument
-                    .name
-                    .as_deref()
-                    .map_or_else(
-                        || {
-                            candidate.params.get(index).or_else(|| {
-                                candidate
-                                    .params
-                                    .last()
-                                    .filter(|parameter| parameter.variadic)
-                            })
-                        },
-                        |name| {
-                            candidate
-                                .params
-                                .iter()
-                                .find(|parameter| parameter.name.eq_ignore_ascii_case(name))
-                                .or_else(|| {
-                                    candidate
-                                        .params
-                                        .last()
-                                        .filter(|parameter| parameter.variadic)
-                                })
-                        },
-                    )
-                    .is_some_and(|parameter| parameter.by_ref)
-            });
-        if let Some(requirement) = requirements.next()
-            && requirements.all(|candidate| candidate == requirement)
-        {
-            return Some(requirement);
-        }
+    if matches!(call.target, RegionCallTarget::Method { .. }) {
+        // A dynamic receiver may resolve to any visible userland or internal
+        // class. Method-name-only arginfo is therefore not authoritative:
+        // an unrelated internal `get()` must not classify a userland
+        // `get(&$value)` as by-value. The resolved dispatcher publishes the
+        // exact parameter flags and the caller restores speculative local
+        // bindings after the call.
+        return None;
     }
     if let RegionCallTarget::Function {
         name,
@@ -1038,10 +1002,7 @@ pub(super) fn known_user_argument_requires_reference(
                 |metadata| vec![metadata],
             )
         }
-        RegionCallTarget::Method { method, .. } => function_params
-            .values()
-            .filter(|(candidate, ..)| method_matches(candidate, method))
-            .collect(),
+        RegionCallTarget::Method { .. } => unreachable!("handled before metadata lookup"),
         RegionCallTarget::Constructor { class_name, .. } => function_params
             .values()
             .filter(|(candidate, ..)| {

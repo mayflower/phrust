@@ -20145,17 +20145,32 @@ fn lower_optimizing_region_instruction(
                             .or_else(|| parameters.last().filter(|parameter| parameter.variadic))
                     });
                     if parameter.is_some_and(|parameter| parameter.by_ref) {
-                        let argument = visible_index
-                            .and_then(|index| call.args.get(index))
-                            .expect("admitted reference call has lvalue metadata");
-                        let local = argument
-                            .by_ref_local
-                            .expect("admitted reference call has a prepared local reference");
-                        let current = use_local_variable(builder, locals, local)?;
-                        let reference = lower_optimizing_bind_direct_local_reference(
-                            builder, current, transition,
-                        )?;
-                        define_local_variable(builder, locals, local, reference)?;
+                        let reference = if let Some(argument) =
+                            visible_index.and_then(|index| call.args.get(index))
+                        {
+                            let local = argument
+                                .by_ref_local
+                                .expect("admitted reference call has a prepared local reference");
+                            let current = use_local_variable(builder, locals, local)?;
+                            let reference = lower_optimizing_bind_direct_local_reference(
+                                builder, current, transition,
+                            )?;
+                            define_local_variable(builder, locals, local, reference)?;
+                            reference
+                        } else {
+                            // An omitted by-reference parameter owns a fresh
+                            // reference initialized from its declared default.
+                            // It has no caller lvalue metadata by definition,
+                            // but still enters the callee as the same native
+                            // numeric reference representation as a supplied
+                            // lvalue.
+                            let default = lower_prepared_native_call_operand(
+                                builder, locals, registers, constants, operand,
+                            )?;
+                            lower_optimizing_bind_direct_local_reference(
+                                builder, default, transition,
+                            )?
+                        };
                         call_args.push(reference);
                     } else {
                         let value = lower_prepared_native_call_operand(
@@ -26654,6 +26669,7 @@ fn lower_native_call_trampoline(
                 && matches!(
                     call.target,
                     RegionCallTarget::Function { function: None, .. }
+                        | RegionCallTarget::Method { .. }
                 )
                 && let Some(local) = argument.and_then(|argument| argument.by_ref_local)
             {
