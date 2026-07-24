@@ -579,6 +579,7 @@ fn optimizing_instruction_family_is_direct(kind: &RegionInstructionKind) -> bool
         | RegionInstructionKind::ForeachNext { .. }
         | RegionInstructionKind::ForeachCleanup { .. }
         | RegionInstructionKind::FetchProperty { .. }
+        | RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::Include { .. })
         | RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::MakeClosure {
             ..
         })
@@ -1315,11 +1316,29 @@ pub(super) fn compile_region_graph_native(
             "include, eval, or runtime declaration requires the native dynamic-code compiler",
         ));
     }
+    let needs_exact_include = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(
+                    kind,
+                    RegionInstructionKind::NativeDynamicCode(
+                        RegionNativeDynamicCode::Include { .. }
+                    )
+                )
+            })
+        });
+    if needs_exact_include && runtime_helpers.native_include == 0 {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_NATIVE_INCLUDE",
+            "optimizing include requires its exact native compiler/invoker",
+        ));
+    }
     let native_call_symbol = NATIVE_CALL_DISPATCH_SYMBOL.to_owned();
     let native_builtin_dispatch_symbol = BASELINE_NATIVE_BUILTIN_DISPATCH_SYMBOL.to_owned();
     let native_semantic_dispatch_symbol = NATIVE_SEMANTIC_DISPATCH_SYMBOL.to_owned();
     let native_function_resolve_symbol = NATIVE_FUNCTION_RESOLVE_SYMBOL.to_owned();
     let native_dynamic_code_symbol = NATIVE_DYNAMIC_CODE_SYMBOL.to_owned();
+    let native_include_symbol = NATIVE_INCLUDE_SYMBOL.to_owned();
     let needs_unary = regions.values().any(|region| {
         region_contains(region, |kind| {
             matches!(
@@ -1886,6 +1905,12 @@ pub(super) fn compile_region_graph_native(
             runtime_helpers.native_dynamic_code,
         ));
     }
+    if needs_exact_include {
+        imports.push((
+            native_include_symbol.clone(),
+            runtime_helpers.native_include,
+        ));
+    }
     for (needed, configured, fallback, symbol) in [
         (
             needs_unary,
@@ -2265,6 +2290,25 @@ pub(super) fn compile_region_graph_native(
                     &native_dynamic_code_symbol,
                     &signature,
                     helper_address(&native_dynamic_code_symbol),
+                )?)
+            } else {
+                None
+            };
+            let native_include = if needs_exact_include {
+                let pointer_type = module.target_config().pointer_type();
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                Some(declare_native_helper(
+                    module,
+                    &native_include_symbol,
+                    &signature,
+                    helper_address(&native_include_symbol),
                 )?)
             } else {
                 None
@@ -2972,6 +3016,7 @@ pub(super) fn compile_region_graph_native(
                 functions.insert(value_release_commit_symbol, value_release_commit);
                 NativeTierOperations::Optimizing {
                     operations: NativeOptimizingOperations {
+                        include: native_include,
                         echo_bytes,
                         echo_int,
                         echo_float,
@@ -3810,6 +3855,7 @@ pub(super) fn compile_region_graph_native(
                             if matches!(
                                 symbol.as_str(),
                                 "phrust_native_define"
+                                    | "phrust_native_include"
                                     | "phrust_native_defined"
                                     | "phrust_native_echo_bytes"
                                     | "phrust_native_echo_int"

@@ -48,7 +48,7 @@ pub(super) use call_dispatch::{
 use call_support::*;
 pub(in crate::vm) use diagnostic_helpers::*;
 use diagnostics::*;
-pub(super) use dynamic_code::jit_native_dynamic_code_abi;
+pub(super) use dynamic_code::{jit_native_dynamic_code_abi, jit_native_include_abi};
 use internal_classes::*;
 use native_builtins::{
     NativeDimensionOperation, emit_native_array_dimension_conversion_diagnostic,

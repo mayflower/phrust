@@ -231,6 +231,7 @@ struct NativeOperationFunctions {
 
 #[derive(Clone, Copy, Debug)]
 struct NativeOptimizingOperations {
+    include: Option<NativeHelper>,
     echo_bytes: Option<NativeHelper>,
     echo_int: Option<NativeHelper>,
     echo_float: Option<NativeHelper>,
@@ -259,6 +260,7 @@ struct NativeOptimizingOperations {
 
 impl NativeOptimizingOperations {
     fn with_runtime(mut self, runtime: ir::Value) -> Self {
+        self.include = self.include.map(|helper| helper.with_runtime(runtime));
         self.echo_bytes = self.echo_bytes.map(|helper| helper.with_runtime(runtime));
         self.echo_int = self.echo_int.map(|helper| helper.with_runtime(runtime));
         self.echo_float = self.echo_float.map(|helper| helper.with_runtime(runtime));
@@ -541,6 +543,7 @@ const BASELINE_NATIVE_BUILTIN_DISPATCH_SYMBOL: &str = "phrust_baseline_native_bu
 const NATIVE_SEMANTIC_DISPATCH_SYMBOL: &str = "phrust_jit_native_semantic_dispatch";
 const NATIVE_FUNCTION_RESOLVE_SYMBOL: &str = "phrust_jit_native_function_resolve";
 const NATIVE_DYNAMIC_CODE_SYMBOL: &str = "phrust_jit_native_dynamic_code";
+const NATIVE_INCLUDE_SYMBOL: &str = "phrust_native_include";
 
 /// Mandatory Cranelift native compiler.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -19883,6 +19886,26 @@ fn lower_optimizing_region_instruction(
                 builder,
                 function,
                 instruction.continuation_id,
+                transition,
+            )?;
+            define_region_register(builder, register_variables, registers, *dst, value)?;
+        }
+        RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::Include {
+            dst,
+            kind,
+            path,
+        }) => {
+            emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
+            let value = lower_optimizing_native_include(
+                module,
+                builder,
+                optimizing_operations.include,
+                locals,
+                registers,
+                *kind,
+                *path,
+                instruction,
+                function,
                 transition,
             )?;
             define_region_register(builder, register_variables, registers, *dst, value)?;

@@ -193,6 +193,9 @@ pub struct JitRuntimeHelperAddresses {
     pub native_enum_exists: usize,
     pub native_method_exists: usize,
     pub native_property_exists: usize,
+    /// Exact cold include compiler/invoker. Optimizing code calls this
+    /// operation directly and resumes in the same optimizing frame.
+    pub native_include: usize,
     /// Exact prepared PCRE handlers. Each address names one fixed builtin;
     /// optimizing code never supplies an operation or registry ID.
     pub native_preg_match: usize,

@@ -648,6 +648,66 @@ fn render_native_include_failure(
     Err(fatal)
 }
 
+fn invoke_native_include(
+    runtime: *mut NativeRequestFastState,
+    request: &php_jit::JitNativeDynamicCodeRequest,
+) -> (php_jit::JitCallStatus, Option<i64>) {
+    with_native_context_for(runtime, "include", |context| {
+        match execute_native_include(context, request) {
+            Ok(NativeDynamicCodeOutcome::Returned(value)) => {
+                (php_jit::JitCallStatus::RETURN, Some(value))
+            }
+            Ok(NativeDynamicCodeOutcome::Exit(value)) => {
+                (php_jit::JitCallStatus::EXIT, Some(value))
+            }
+            Err(NativeIncludeFailure::Execution(control)) => {
+                finish_native_dynamic_call_control(context, control)
+            }
+            Err(NativeIncludeFailure::Resolution(message)) => {
+                match render_native_include_failure(context, request, &message) {
+                    Ok(value) => (php_jit::JitCallStatus::RETURN, Some(value)),
+                    Err(_) => (php_jit::JitCallStatus::RUNTIME_ERROR, None),
+                }
+            }
+        }
+    })
+    .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
+}
+
+/// Exact cold include boundary for optimizing code. The include unit is
+/// compiled, published, and invoked through its native entry, then control
+/// returns to the same optimizing caller frame.
+pub(in crate::vm) extern "C" fn jit_native_include_abi(
+    runtime: *mut NativeRequestFastState,
+    kind: u32,
+    caller_function_id: u32,
+    continuation_id: u32,
+    source: i64,
+    caller_frame: u64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!(!runtime.is_null());
+    let _ = with_native_context_for(runtime, "include", |context| {
+        context.mark_roots_dirty(RootMutationReason::GlobalOrStatic);
+    });
+    let request = php_jit::JitNativeDynamicCodeRequest {
+        kind: php_jit::JitNativeDynamicCodeKind(kind),
+        caller_function_id,
+        continuation_id,
+        source: php_jit::JitAbiSlot {
+            tag: 3,
+            flags: 0,
+            payload: source as u64,
+        },
+        caller_frame,
+        ..php_jit::JitNativeDynamicCodeRequest::default()
+    };
+    let (status, value) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        invoke_native_include(runtime, &request)
+    }))
+    .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None));
+    php_jit::JitNativeControlResult::control(status, status.0, value.unwrap_or(0))
+}
+
 /// Native dynamic-code compiler boundary. Includes are resolved, compiled to
 /// Cranelift entries, published, and invoked without entering an interpreter.
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
@@ -679,22 +739,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
                 | php_jit::JitNativeDynamicCodeKind::REQUIRE
                 | php_jit::JitNativeDynamicCodeKind::REQUIRE_ONCE
         ) {
-            with_native_context_for(runtime, "dynamic_code", |context| match execute_native_include(context, request) {
-                Ok(NativeDynamicCodeOutcome::Returned(value)) => {
-                    (php_jit::JitCallStatus::RETURN, Some(value))
-                }
-                Ok(NativeDynamicCodeOutcome::Exit(value)) => {
-                    (php_jit::JitCallStatus::EXIT, Some(value))
-                }
-                Err(NativeIncludeFailure::Execution(control)) => {
-                    finish_native_dynamic_call_control(context, control)
-                }
-                Err(NativeIncludeFailure::Resolution(message)) => match render_native_include_failure(context, request, &message) {
-                    Ok(value) => (php_jit::JitCallStatus::RETURN, Some(value)),
-                    Err(_) => (php_jit::JitCallStatus::RUNTIME_ERROR, None),
-                },
-            })
-            .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
+            invoke_native_include(runtime, request)
         } else if request.kind == php_jit::JitNativeDynamicCodeKind::EVAL {
             with_native_context_for(runtime, "dynamic_code", |context| match execute_native_eval(context, request) {
                 Ok(NativeDynamicCodeOutcome::Returned(value)) => {

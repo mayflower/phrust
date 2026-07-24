@@ -116,7 +116,8 @@ fn assert_optimizing_artifact(handle: &crate::JitFunctionHandle) {
         .iter()
         .filter_map(|relocation| match &relocation.target {
             crate::JitRelocatableTarget::Helper(symbol)
-                if symbol.starts_with("phrust_native_preg_")
+                if symbol == "phrust_native_include"
+                    || symbol.starts_with("phrust_native_preg_")
                     || symbol.starts_with("phrust_native_json_")
                     || StableSymbolQueryBuiltin::all()
                         .iter()
@@ -994,6 +995,20 @@ extern "C" fn test_nested_native_dynamic_code(
     test_native_dynamic_code_with_counter(request, out, &NESTED_NATIVE_DYNAMIC_EFFECTS)
 }
 
+extern "C" fn test_native_include_exact(
+    _runtime: *mut std::ffi::c_void,
+    kind: u32,
+    _caller_function_id: u32,
+    _continuation_id: u32,
+    source: i64,
+    caller_frame: u64,
+) -> crate::JitNativeControlResult {
+    assert_eq!(kind, crate::JitNativeDynamicCodeKind::REQUIRE_ONCE.0);
+    assert_eq!(source, 91);
+    assert_eq!(caller_frame, 0);
+    crate::JitNativeControlResult::returning(123)
+}
+
 fn test_native_dynamic_code_with_counter(
     request: *mut crate::JitNativeDynamicCodeRequest,
     out: *mut crate::JitCallResult,
@@ -1013,6 +1028,7 @@ fn test_native_dynamic_code_with_counter(
         if request.source.payload != 92 {
             return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
         }
+        effects.fetch_add(1, Ordering::SeqCst);
         321
     } else if request.kind == crate::JitNativeDynamicCodeKind::REQUIRE {
         effects.fetch_add(1, Ordering::SeqCst);
@@ -4515,6 +4531,51 @@ fn include_executes_only_after_native_dynamic_compiler_returns_entry_result() {
 }
 
 #[test]
+fn optimizing_include_calls_exact_native_entry_and_resumes_same_frame() {
+    let (unit, function) = scalar_native_include_fixture();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.region.optimizing-native-include").with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_include: test_native_include_exact as *const () as usize,
+            native_dynamic_code: forbidden_call_dispatch as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("optimizing native include");
+    assert_optimizing_artifact(&handle);
+    let helper_imports = handle
+        .relocatable_code()
+        .expect("optimizing include relocations")
+        .relocations
+        .iter()
+        .filter_map(|relocation| match &relocation.target {
+            crate::JitRelocatableTarget::Helper(symbol) => Some(symbol.as_str()),
+            crate::JitRelocatableTarget::InternalFunction(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(helper_imports.contains(&"phrust_native_include"));
+    assert!(!helper_imports.contains(&"phrust_jit_native_dynamic_code"));
+    let metadata = handle
+        .region_state_metadata()
+        .expect("optimizing include metadata");
+    assert!(metadata.production_lowering.iter().any(|entry| {
+        entry.operation.contains("Include")
+            && entry.class == crate::JitProductionLoweringClass::CompiledNativeCall
+            && !entry.operation_local_transition
+    }));
+    assert_eq!(
+        handle
+            .invoke_i64(&[], JIT_RUNTIME_ABI_HASH)
+            .expect("optimizing include executes"),
+        123
+    );
+}
+
+#[test]
 fn eval_executes_only_after_native_dynamic_compiler_returns_entry_result() {
     let (unit, function) = scalar_native_eval_fixture();
     let mut compiler = CraneliftNativeCompiler;
@@ -5694,7 +5755,7 @@ fn effect_then_direct_fixture() -> (php_ir::IrUnit, FunctionId) {
     builder.set_entry(function);
     builder.set_return_type(function, Some(IrReturnType::Int));
     let block = builder.append_block(function);
-    let path = builder.add_constant(IrConstant::Int(5));
+    let source = builder.add_constant(IrConstant::Int(92));
     let forty_one = builder.add_constant(IrConstant::Int(41));
     let one = builder.add_constant(IrConstant::Int(1));
     let effect = builder.alloc_register(function);
@@ -5704,10 +5765,9 @@ fn effect_then_direct_fixture() -> (php_ir::IrUnit, FunctionId) {
     builder.emit(
         function,
         block,
-        InstructionKind::Include {
+        InstructionKind::Eval {
             dst: effect,
-            kind: php_ir::instruction::IncludeKind::Require,
-            path: Operand::Constant(path),
+            code: Operand::Constant(source),
         },
         span,
     );
@@ -11024,15 +11084,14 @@ fn optimizing_direct_call_resumes_callee_guard_exit_before_continuing_caller() {
     let callee = builder.start_function("transitioning_callee", FunctionFlags::default(), span);
     builder.set_return_type(callee, Some(IrReturnType::Int));
     let callee_block = builder.append_block(callee);
-    let path = builder.add_constant(IrConstant::Int(5));
+    let source = builder.add_constant(IrConstant::Int(92));
     let effect = builder.alloc_register(callee);
     builder.emit(
         callee,
         callee_block,
-        InstructionKind::Include {
+        InstructionKind::Eval {
             dst: effect,
-            kind: php_ir::instruction::IncludeKind::Require,
-            path: Operand::Constant(path),
+            code: Operand::Constant(source),
         },
         span,
     );

@@ -89,6 +89,7 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         {
             Some(owned(BORROW_6, false))
         }
+        "phrust_native_include" => Some(owned(BORROW_1, false)),
         "phrust_jit_native_call_dispatch"
         | "phrust_baseline_native_builtin_dispatch"
         | "phrust_jit_native_semantic_dispatch"
