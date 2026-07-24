@@ -33,11 +33,11 @@ pub(super) use frame_arena::{jit_native_frame_alloc_abi, jit_native_frame_releas
 pub(super) use call_dispatch::{
     jit_baseline_native_builtin_dispatch_abi, jit_baseline_native_builtin_dispatch_diagnostic_abi,
     jit_native_basename_abi, jit_native_call_dispatch_abi, jit_native_call_dispatch_diagnostic_abi,
-    jit_native_class_exists_abi, jit_native_defined_abi, jit_native_dirname_abi,
-    jit_native_enum_exists_abi, jit_native_fclose_abi, jit_native_file_exists_abi,
-    jit_native_fopen_abi, jit_native_function_exists_abi, jit_native_fwrite_abi,
-    jit_native_interface_exists_abi, jit_native_json_decode_abi, jit_native_json_encode_abi,
-    jit_native_json_last_error_abi, jit_native_json_last_error_msg_abi,
+    jit_native_class_exists_abi, jit_native_define_abi, jit_native_defined_abi,
+    jit_native_dirname_abi, jit_native_enum_exists_abi, jit_native_fclose_abi,
+    jit_native_file_exists_abi, jit_native_fopen_abi, jit_native_function_exists_abi,
+    jit_native_fwrite_abi, jit_native_interface_exists_abi, jit_native_json_decode_abi,
+    jit_native_json_encode_abi, jit_native_json_last_error_abi, jit_native_json_last_error_msg_abi,
     jit_native_json_validate_abi, jit_native_method_exists_abi, jit_native_preg_filter_abi,
     jit_native_preg_grep_abi, jit_native_preg_last_error_abi, jit_native_preg_last_error_msg_abi,
     jit_native_preg_match_abi, jit_native_preg_match_all_abi, jit_native_preg_quote_abi,
@@ -133,6 +133,7 @@ struct NativeSymbolQueryCapability {
     deployment_classes: *const std::sync::Arc<std::collections::HashSet<std::sync::Arc<str>>>,
     visible_function_names: *const Rc<NativeFunctionNameScope>,
     dynamic_constants: *const std::collections::BTreeMap<String, Value>,
+    native_dynamic_constants: *mut std::collections::BTreeMap<String, i64>,
     dynamic_classes: *const std::collections::BTreeSet<String>,
     class_aliases: *const std::collections::BTreeMap<String, String>,
 }
@@ -195,9 +196,19 @@ impl NativeRequestFastState {
     fn reserve_direct_value_index(&mut self) -> Result<u32, &'static str> {
         let view = self.header.runtime_view;
         let value_next = view.direct_value_next as usize as *mut u32;
+        let free_head = view.direct_value_free_head as usize as *mut u32;
+        let reused_bytes = view.direct_value_reused_bytes as usize as *mut u64;
+        let slots = view.direct_value_slots as usize as *mut php_jit::JitNativeValueSlot;
         // SAFETY: runtime publication owns these stable counters and the
         // request executes synchronously on one thread.
         unsafe {
+            let index = *free_head;
+            if index != php_jit::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE {
+                *free_head = (*slots.add(index as usize)).payload as u32;
+                *reused_bytes = (*reused_bytes)
+                    .saturating_add(std::mem::size_of::<php_jit::JitNativeValueSlot>() as u64);
+                return Ok(index);
+            }
             let index = *value_next;
             if index as usize >= php_jit::JIT_NATIVE_DIRECT_VALUE_CAPACITY {
                 return Err("direct native value arena exhausted");
@@ -1425,6 +1436,102 @@ impl NativeRequestFastState {
         Ok(())
     }
 
+    /// Publishes a new scalar/string constant without recovering the cold
+    /// coordinator or constructing a Rust `Value`. The native map owns one
+    /// handle and every prepared FetchConst slot owns one additional handle.
+    #[allow(unsafe_code)]
+    fn publish_native_dynamic_constant(&mut self, name: String, encoded: i64) -> bool {
+        if php_jit::jit_decode_runtime_value(encoded).is_some() {
+            let Some((_, slot)) = self.direct_slot(encoded) else {
+                return false;
+            };
+            if slot.kind != php_jit::JIT_NATIVE_VALUE_VIEW_STRING {
+                return false;
+            }
+        } else if php_jit::jit_decode_constant(encoded)
+            .is_some_and(|constant| constant < php_jit::JIT_VALUE_TRUE)
+        {
+            // Active-unit literal handles are not stable storage. Lowering
+            // must replace them with their trusted direct literal owner.
+            return false;
+        }
+
+        let Some(compiled) = self.symbol_query.active_compiled() else {
+            return false;
+        };
+        let continuations = compiled.prepared_continuation_instructions();
+        let mut plan_indices = Vec::new();
+        let view = self.header.runtime_view;
+        let offsets = view.trusted_property_function_offsets as usize as *const u32;
+        for (function, instructions) in continuations.iter().enumerate() {
+            let Some(base) = (function < view.trusted_property_function_count as usize)
+                .then(|| unsafe { *offsets.add(function) as usize })
+            else {
+                return false;
+            };
+            for (continuation, instruction) in instructions.iter().enumerate() {
+                let Some(instruction) = instruction.as_ref() else {
+                    continue;
+                };
+                if matches!(
+                    &instruction.kind,
+                    php_ir::InstructionKind::FetchConst { name: candidate, .. }
+                        if candidate == &name
+                ) {
+                    let Some(index) = base.checked_add(continuation) else {
+                        return false;
+                    };
+                    if index >= view.trusted_constant_slot_count as usize {
+                        return false;
+                    }
+                    plan_indices.push(index);
+                }
+            }
+        }
+
+        let owner_count = 1_usize.saturating_add(plan_indices.len());
+        let mut retained = 0_usize;
+        for _ in 0..owner_count {
+            if self.retain_direct_encoded(encoded).is_err() {
+                for _ in 0..retained {
+                    self.rollback_direct_retain(encoded);
+                }
+                return false;
+            }
+            retained += 1;
+        }
+
+        let Some(constants) = (unsafe { self.symbol_query.native_dynamic_constants.as_mut() })
+        else {
+            for _ in 0..retained {
+                self.rollback_direct_retain(encoded);
+            }
+            return false;
+        };
+        if constants.insert(name, encoded).is_some() {
+            for _ in 0..retained {
+                self.rollback_direct_retain(encoded);
+            }
+            return false;
+        }
+        let plans =
+            view.trusted_constant_slots as usize as *mut php_jit::JitNativeTrustedConstantSlot;
+        for index in plan_indices {
+            unsafe {
+                *plans.add(index) = php_jit::JitNativeTrustedConstantSlot {
+                    value: encoded,
+                    state: php_jit::JIT_NATIVE_TRUSTED_CONSTANT_PUBLISHED,
+                    reserved: 0,
+                };
+            }
+        }
+        let pending = view.root_mutation_pending as usize as *mut u32;
+        if !pending.is_null() {
+            unsafe { *pending = 1 };
+        }
+        true
+    }
+
     #[allow(unsafe_code)]
     fn rollback_direct_retain(&mut self, encoded: i64) {
         let Some(runtime_index) = php_jit::jit_decode_runtime_value(encoded) else {
@@ -1787,6 +1894,9 @@ pub(super) struct NativeRequestColdState<'a> {
     default_timezone: String,
     mysql_state: std::rc::Rc<RefCell<php_runtime::api::MysqlState>>,
     dynamic_constants: std::collections::BTreeMap<String, Value>,
+    /// Constants created by admitted exact `define()` calls. Values remain
+    /// authoritative native encodings until a cold include/final boundary.
+    native_dynamic_constants: std::collections::BTreeMap<String, i64>,
     visible_function_names: Rc<NativeFunctionNameScope>,
     inherited_autoload_callback_count: usize,
     inherited_shutdown_callback_count: usize,
@@ -1906,6 +2016,8 @@ impl NativeSymbolQueryCapability {
             deployment_classes: std::ptr::from_ref(&context.deployment_classes),
             visible_function_names: std::ptr::from_ref(&context.visible_function_names),
             dynamic_constants: std::ptr::from_ref(&context.dynamic_constants),
+            native_dynamic_constants: std::ptr::from_ref(&context.native_dynamic_constants)
+                as *mut std::collections::BTreeMap<String, i64>,
             dynamic_classes: std::ptr::from_ref(&context.dynamic_classes),
             class_aliases: std::ptr::from_ref(&context.class_aliases),
         }
@@ -1983,6 +2095,8 @@ impl NativeSymbolQueryCapability {
     #[allow(unsafe_code)]
     fn constant_exists(&self, name: &str) -> bool {
         unsafe { self.dynamic_constants.as_ref() }.is_some_and(|values| values.contains_key(name))
+            || unsafe { self.native_dynamic_constants.as_ref() }
+                .is_some_and(|values| values.contains_key(name))
             || self.active_compiled().is_some_and(|compiled| {
                 compiled
                     .unit()
@@ -3183,6 +3297,7 @@ impl<'a> NativeRequestColdState<'a> {
             mysql_state: inherited_mysql
                 .unwrap_or_else(|| std::rc::Rc::new(RefCell::new(Default::default()))),
             dynamic_constants,
+            native_dynamic_constants: std::collections::BTreeMap::new(),
             visible_function_names,
             inherited_autoload_callback_count,
             inherited_shutdown_callback_count,
@@ -3483,6 +3598,18 @@ impl<'a> NativeRequestColdState<'a> {
     fn insert_dynamic_constant(&mut self, name: String, value: Value) {
         self.dynamic_constants.insert(name.clone(), value);
         self.publish_trusted_constant_name(&name);
+    }
+
+    /// Crosses native constants into the cold PHP-value registry only at an
+    /// explicit include/final/introspection boundary.
+    fn materialize_native_dynamic_constants(&mut self) -> Result<(), String> {
+        let native = std::mem::take(&mut self.native_dynamic_constants);
+        for (name, encoded) in native {
+            let value = self.decode(encoded)?;
+            self.dynamic_constants.insert(name, value);
+            self.release(encoded)?;
+        }
+        Ok(())
     }
 
     /// Publish exact declared-property slots for statically proven object
@@ -5600,6 +5727,20 @@ impl<'a> NativeRequestColdState<'a> {
     }
 
     fn reserve_direct_value_slot(&mut self) -> Result<usize, String> {
+        if *self.direct_value_free_head != php_jit::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE {
+            let index = usize::try_from(*self.direct_value_free_head)
+                .map_err(|_| "direct native free-list index overflow".to_owned())?;
+            let slot = self
+                .direct_value_slots
+                .get(index)
+                .ok_or_else(|| format!("direct native free-list slot {index} is missing"))?;
+            *self.direct_value_free_head = u32::try_from(slot.payload)
+                .map_err(|_| format!("direct native free-list link {} is invalid", slot.payload))?;
+            *self.direct_value_reused_bytes = self
+                .direct_value_reused_bytes
+                .saturating_add(std::mem::size_of::<php_jit::JitNativeValueSlot>() as u64);
+            return Ok(index);
+        }
         let index = usize::try_from(*self.direct_value_next)
             .map_err(|_| "direct native value index overflow".to_owned())?;
         if index >= self.direct_value_slots.len() {
@@ -9739,6 +9880,10 @@ impl<'a> NativeRequestColdState<'a> {
         }
         drop(released_resource);
         drop(released_cold_generator);
+        let index = u32::try_from(index)
+            .map_err(|_| "direct native free-list index overflow".to_owned())?;
+        self.direct_value_slots[index as usize].payload = u64::from(*self.direct_value_free_head);
+        *self.direct_value_free_head = index;
         Ok(())
     }
 
@@ -12661,6 +12806,9 @@ impl<'a> NativeRequestColdState<'a> {
     }
 
     fn lookup_constant(&self, name: &str) -> Result<Value, String> {
+        if let Some(encoded) = self.native_dynamic_constants.get(name).copied() {
+            return self.native_dynamic_constant_value(encoded);
+        }
         if let Some(value) = self.dynamic_constants.get(name) {
             return Ok(value.clone());
         }
@@ -12680,7 +12828,26 @@ impl<'a> NativeRequestColdState<'a> {
             .ok_or_else(|| format!("Undefined constant \"{name}\""))
     }
 
-    fn visible_include_constants(&self) -> std::collections::BTreeMap<String, Value> {
+    fn native_dynamic_constant_value(&self, encoded: i64) -> Result<Value, String> {
+        match self.native_encoded_value_kind(encoded) {
+            Some(NativeEncodedValueKind::Null) => Ok(Value::Null),
+            Some(NativeEncodedValueKind::Bool(value)) => Ok(Value::Bool(value)),
+            Some(NativeEncodedValueKind::Int) => self
+                .native_encoded_int(encoded)
+                .map(Value::Int)
+                .ok_or_else(|| "native dynamic integer constant lost its payload".to_owned()),
+            Some(NativeEncodedValueKind::String) => self
+                .native_string_name_bytes(encoded)
+                .map(|bytes| Value::String(PhpString::from_bytes(bytes)))
+                .ok_or_else(|| "native dynamic string constant lost its bytes".to_owned()),
+            _ => Err("native dynamic constant left the admitted scalar/string plane".to_owned()),
+        }
+    }
+
+    fn visible_include_constants(
+        &mut self,
+    ) -> Result<std::collections::BTreeMap<String, Value>, String> {
+        self.materialize_native_dynamic_constants()?;
         let mut constants = self.dynamic_constants.clone();
         for entry in &self.unit.constant_table {
             if let Some(value) = self.unit.constants.get(entry.value.index())
@@ -12689,7 +12856,7 @@ impl<'a> NativeRequestColdState<'a> {
                 constants.entry(entry.name.clone()).or_insert(value);
             }
         }
-        constants
+        Ok(constants)
     }
 
     pub(super) fn decode_result(&mut self, encoded: i64) -> Result<Value, String> {
@@ -12841,6 +13008,7 @@ impl<'a> NativeRequestColdState<'a> {
     pub(super) fn publish_include_globals(&mut self) -> Result<(), String> {
         if self.include_child {
             self.materialize_native_request_globals()?;
+            self.materialize_native_dynamic_constants()?;
             let entry_file = self
                 .unit
                 .functions
@@ -17623,43 +17791,6 @@ fn rebind_baseline_materialized_closure(
     Ok(Value::Callable(Box::new(
         php_runtime::api::CallableValue::Closure(rebound),
     )))
-}
-
-fn execute_native_bind_global(
-    context: &mut NativeRequestColdState<'_>,
-    instruction: &php_ir::Instruction,
-) -> Option<Result<i64, String>> {
-    let php_ir::InstructionKind::BindGlobal { name, .. } = &instruction.kind else {
-        return None;
-    };
-    if let Err(error) = context.materialize_native_request_global(name) {
-        return Some(Err(error));
-    }
-    let current = context
-        .inherited_globals
-        .get(name)
-        .cloned()
-        .or_else(|| context.options.runtime_context.global_value(name))
-        .unwrap_or(Value::Uninitialized);
-    let reference = match current {
-        Value::Reference(reference) => {
-            if matches!(reference.get(), Value::Uninitialized) {
-                match context.replace_direct_reference_cell_value(&reference, Value::Null) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => reference.set(Value::Null),
-                    Err(error) => return Some(Err(error)),
-                }
-            }
-            reference
-        }
-        Value::Uninitialized => php_runtime::api::ReferenceCell::new(Value::Null),
-        value => php_runtime::api::ReferenceCell::new(value),
-    };
-    context
-        .inherited_globals
-        .insert(name.clone(), Value::Reference(reference.clone()));
-    context.mark_roots_dirty(RootMutationReason::GlobalOrStatic);
-    Some(context.encode_native_reference_owner(reference))
 }
 
 #[cfg(test)]

@@ -65,7 +65,8 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
             || name.starts_with("phrust_native_json_")
             || matches!(
                 name,
-                "phrust_native_defined"
+                "phrust_native_define"
+                    | "phrust_native_defined"
                     | "phrust_native_function_exists"
                     | "phrust_native_class_exists"
                     | "phrust_native_interface_exists"

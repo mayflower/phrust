@@ -447,6 +447,36 @@ macro_rules! exact_symbol_query_abi {
     };
 }
 
+pub(in crate::vm) extern "C" fn jit_native_define_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!(!runtime.is_null());
+    debug_assert_eq!(argument_count, 2);
+    // SAFETY: exact-handler publication passes the request-owned FastState
+    // and the call remains synchronous.
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let Some(name) = exact_query_class_name(fast, argument_0) else {
+        return exact_query_baseline();
+    };
+    if fast.symbol_query.constant_exists(&name) {
+        // Duplicate-definition diagnostics require the exact source span and
+        // therefore execute once in the operation's baseline continuation.
+        return exact_query_baseline();
+    }
+    if !fast.publish_native_dynamic_constant(name, argument_1) {
+        return exact_query_baseline();
+    }
+    exact_query_return_bool(true)
+}
+
 exact_symbol_query_abi!(
     jit_native_defined_abi,
     fast,
@@ -1944,9 +1974,6 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                 return Ok(result?);
             }
             if let Some(result) = execute_native_acquire_callable(context, instruction, &encoded) {
-                return Ok(result?);
-            }
-            if let Some(result) = execute_native_bind_global(context, instruction) {
                 return Ok(result?);
             }
             if matches!(

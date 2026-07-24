@@ -123,17 +123,6 @@ unsafe fn jit_native_semantic_dispatch_impl<const DIAGNOSTIC: bool>(
         function,
         continuation,
     );
-    let outcome = match outcome {
-        Ok(encoded) if operation == php_jit::region_ir::RegionSemanticOperationId::BindGlobal => {
-            let php_ir::InstructionKind::BindGlobal { name, .. } = &instruction.kind else {
-                unreachable!("validated BindGlobal callsite must retain its source name")
-            };
-            context
-                .publish_native_global_reference(function, continuation, name, encoded)
-                .map(|()| encoded)
-        }
-        outcome => outcome,
-    };
     if DIAGNOSTIC {
         context.exit_runtime_helper(helper_id);
     }
@@ -238,7 +227,12 @@ pub(super) fn execute_native_semantic_operation(
             caller_function,
             Some(continuation),
         ),
-        Id::BindGlobal => execute_native_bind_global(context, instruction),
+        Id::BindGlobal => {
+            return Err(
+                "JIT_NATIVE_BIND_GLOBAL_PLAN_MISSING: global binding must use its prepared direct reference plan"
+                    .to_owned(),
+            );
+        }
         Id::BoundClosureClass => return execute_bound_closure_class(context, arguments),
         Id::ObjectClassName => None,
     };

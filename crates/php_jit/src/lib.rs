@@ -184,6 +184,7 @@ pub struct JitRuntimeHelperAddresses {
     pub native_builtin_dispatch: usize,
     /// Exact prepared symbol/reflection query handlers. Each address names one
     /// fixed builtin; optimizing code never supplies an operation or registry ID.
+    pub native_define: usize,
     pub native_defined: usize,
     pub native_function_exists: usize,
     pub native_class_exists: usize,

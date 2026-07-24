@@ -4371,7 +4371,7 @@ pub(super) fn execute_baseline_native_builtin(
                 }
             }
             let mut user = php_runtime::api::PhpArray::new();
-            for (name, value) in context.visible_include_constants() {
+            for (name, value) in context.visible_include_constants()? {
                 user.insert(
                     php_runtime::api::ArrayKey::String(PhpString::from_bytes(name.into_bytes())),
                     value,

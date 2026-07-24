@@ -6,7 +6,7 @@ pub use php_runtime::api::JitHelperId;
 
 /// Stable ABI fingerprint for the helper-symbol registry. Bumped whenever the
 /// registry's symbol set or any helper ABI changes.
-pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4820_0000_0024;
+pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4820_0000_0025;
 
 /// Helper argument kind.
 #[repr(u32)]
@@ -808,6 +808,15 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         has_side_effects: true,
         description: "exact prepared fclose stream-capability handler",
     },
+    JitHelperSymbol {
+        id: JitHelperId(90),
+        name: "phrust_native_define",
+        args: NATIVE_EXACT_BUILTIN_6_ARGS,
+        returns: JitHelperReturnKind::ControlResult,
+        can_throw: true,
+        has_side_effects: true,
+        description: "exact prepared native constant-definition handler",
+    },
 ];
 
 /// Looks up a helper by stable id.
@@ -836,6 +845,7 @@ pub fn resolve_helper_address(
     match helper.name {
         "phrust_jit_native_call_dispatch" => Some(runtime.native_call_dispatch),
         "phrust_baseline_native_builtin_dispatch" => Some(runtime.native_builtin_dispatch),
+        "phrust_native_define" => Some(runtime.native_define),
         "phrust_native_defined" => Some(runtime.native_defined),
         "phrust_native_function_exists" => Some(runtime.native_function_exists),
         "phrust_native_class_exists" => Some(runtime.native_class_exists),
@@ -958,7 +968,7 @@ mod tests {
             JIT_HELPER_SYMBOLS.first().expect("first").id,
             JitHelperId(14)
         );
-        assert_eq!(JIT_HELPER_SYMBOLS.last().expect("last").id, JitHelperId(89));
+        assert_eq!(JIT_HELPER_SYMBOLS.last().expect("last").id, JitHelperId(90));
     }
 
     #[test]

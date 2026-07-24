@@ -115,10 +115,11 @@ pub(super) fn stable_builtin_error_reporting(target: &RegionCallTarget) -> bool 
     !normalized.contains('\\') && normalized.eq_ignore_ascii_case("error_reporting")
 }
 
-/// Exact read-only symbol queries. The selector is part of the dedicated
-/// native ABI and never enters the prepared builtin dispatcher.
+/// Exact symbol operations. The selector is part of the dedicated native ABI
+/// and never enters the prepared builtin dispatcher.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StableSymbolQueryBuiltin {
+    Define,
     Defined,
     FunctionExists,
     ClassExists,
@@ -130,23 +131,25 @@ pub(super) enum StableSymbolQueryBuiltin {
 }
 
 impl StableSymbolQueryBuiltin {
-    pub(super) const COUNT: usize = 8;
+    pub(super) const COUNT: usize = 9;
 
     pub(super) const fn index(self) -> usize {
         match self {
-            Self::Defined => 0,
-            Self::FunctionExists => 1,
-            Self::ClassExists => 2,
-            Self::InterfaceExists => 3,
-            Self::TraitExists => 4,
-            Self::EnumExists => 5,
-            Self::MethodExists => 6,
-            Self::PropertyExists => 7,
+            Self::Define => 0,
+            Self::Defined => 1,
+            Self::FunctionExists => 2,
+            Self::ClassExists => 3,
+            Self::InterfaceExists => 4,
+            Self::TraitExists => 5,
+            Self::EnumExists => 6,
+            Self::MethodExists => 7,
+            Self::PropertyExists => 8,
         }
     }
 
     pub(super) const fn symbol(self) -> &'static str {
         match self {
+            Self::Define => "phrust_native_define",
             Self::Defined => "phrust_native_defined",
             Self::FunctionExists => "phrust_native_function_exists",
             Self::ClassExists => "phrust_native_class_exists",
@@ -160,6 +163,7 @@ impl StableSymbolQueryBuiltin {
 
     pub(super) const fn all() -> [Self; Self::COUNT] {
         [
+            Self::Define,
             Self::Defined,
             Self::FunctionExists,
             Self::ClassExists,
@@ -173,6 +177,7 @@ impl StableSymbolQueryBuiltin {
 
     pub(super) const fn accepts_arity(self, arity: usize) -> bool {
         match self {
+            Self::Define => arity == 2,
             Self::Defined | Self::FunctionExists => arity == 1,
             Self::ClassExists | Self::InterfaceExists | Self::TraitExists | Self::EnumExists => {
                 arity == 1 || arity == 2
@@ -193,6 +198,7 @@ pub(super) fn stable_builtin_symbol_query(
         return None;
     }
     match normalized.to_ascii_lowercase().as_str() {
+        "define" => Some(StableSymbolQueryBuiltin::Define),
         "defined" => Some(StableSymbolQueryBuiltin::Defined),
         "function_exists" => Some(StableSymbolQueryBuiltin::FunctionExists),
         "class_exists" => Some(StableSymbolQueryBuiltin::ClassExists),

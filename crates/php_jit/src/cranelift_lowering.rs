@@ -2854,17 +2854,76 @@ fn lower_trusted_request_local_reference(
     )
 }
 
-/// Reserve one request-owned direct value slot without entering Rust. Slot
-/// identities remain stable for the complete request and the arena is reset
-/// wholesale when the request ends, so allocation only advances its high-water.
+/// Reserve one request-owned direct value slot without entering Rust.
+///
+/// Final-owner release links retired slots through `payload`; allocation
+/// consumes that request-owned free list before advancing the high-water.
 fn lower_reserve_direct_value_index(
     builder: &mut FunctionBuilder<'_>,
     deopt_out: ir::Value,
     rejected: ir::Block,
 ) -> ir::Value {
+    let reuse = builder.create_block();
+    let bump = builder.create_block();
     let bump_accepted = builder.create_block();
+    let ready = builder.create_block();
+    builder.append_block_param(ready, types::I32);
     let pointer_type = builder.func.dfg.value_type(deopt_out);
     let view = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
+    let free_head_ptr = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        deopt_out,
+        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_free_head) as i32,
+    );
+    let free_head = builder
+        .ins()
+        .load(types::I32, MemFlagsData::new(), free_head_ptr, 0);
+    let has_free = builder.ins().icmp_imm(
+        IntCC::NotEqual,
+        free_head,
+        i64::from(crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE),
+    );
+    builder.ins().brif(has_free, reuse, &[], bump, &[]);
+
+    builder.switch_to_block(reuse);
+    let slots = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        deopt_out,
+        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_slots) as i32,
+    );
+    let wide_index = builder.ins().uextend(pointer_type, free_head);
+    let slot_offset = builder.ins().ishl_imm(wide_index, 5);
+    let slot = builder.ins().iadd(slots, slot_offset);
+    let previous = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+    );
+    builder
+        .ins()
+        .store(MemFlagsData::new(), previous, free_head_ptr, 0);
+    let reused_bytes_ptr = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        deopt_out,
+        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_reused_bytes) as i32,
+    );
+    let reused_bytes = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), reused_bytes_ptr, 0);
+    let reused_bytes = builder.ins().iadd_imm(
+        reused_bytes,
+        i64::try_from(std::mem::size_of::<crate::JitNativeValueSlot>()).unwrap_or(i64::MAX),
+    );
+    builder
+        .ins()
+        .store(MemFlagsData::new(), reused_bytes, reused_bytes_ptr, 0);
+    builder.ins().jump(ready, &[free_head.into()]);
+
+    builder.switch_to_block(bump);
     let next_ptr = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
@@ -2888,7 +2947,10 @@ fn lower_reserve_direct_value_index(
     builder
         .ins()
         .store(MemFlagsData::new(), next_value, next_ptr, 0);
-    next
+    builder.ins().jump(ready, &[next.into()]);
+
+    builder.switch_to_block(ready);
+    builder.block_params(ready)[0]
 }
 
 /// Binds one SSA local to an authoritative direct reference slot. Existing
@@ -13814,9 +13876,9 @@ fn lower_optimizing_property_fetch(
 
 fn lower_free_direct_scalar_slot(
     builder: &mut FunctionBuilder<'_>,
-    _value: ir::Value,
+    value: ir::Value,
     slot: ir::Value,
-    _deopt_out: ir::Value,
+    deopt_out: ir::Value,
 ) {
     let zero32 = builder.ins().iconst(types::I32, 0);
     let zero64 = builder.ins().iconst(types::I64, 0);
@@ -13849,14 +13911,39 @@ fn lower_free_direct_scalar_slot(
         slot,
         std::mem::offset_of!(crate::JitNativeValueSlot, reserved) as i32,
     );
-    for offset in [
-        std::mem::offset_of!(crate::JitNativeValueSlot, payload),
-        std::mem::offset_of!(crate::JitNativeValueSlot, aux),
-    ] {
-        builder
-            .ins()
-            .store(MemFlagsData::new(), zero64, slot, offset as i32);
-    }
+    let pointer_type = builder.func.dfg.value_type(deopt_out);
+    let view = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
+    let free_head_ptr = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        deopt_out,
+        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_free_head) as i32,
+    );
+    let previous = builder
+        .ins()
+        .load(types::I32, MemFlagsData::new(), free_head_ptr, 0);
+    let previous = builder.ins().uextend(types::I64, previous);
+    builder.ins().store(
+        MemFlagsData::new(),
+        previous,
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+    );
+    builder.ins().store(
+        MemFlagsData::new(),
+        zero64,
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, aux) as i32,
+    );
+    let index = builder.ins().ireduce(types::I32, value);
+    let index = builder
+        .ins()
+        .iadd_imm(index, -i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE));
+    // Publish the retired slot only after its complete descriptor has become
+    // the new free-list node.
+    builder
+        .ins()
+        .store(MemFlagsData::new(), index, free_head_ptr, 0);
 }
 
 fn lower_optimizing_property_assign(
@@ -17882,12 +17969,11 @@ fn lower_optimizing_region_instruction(
         } if instruction.native_global_name.is_some() => {
             emitted_class = crate::JitProductionLoweringClass::DirectNativeData;
             debug_assert!(!keys.is_empty());
-            let reference = lower_optimizing_trusted_global_reference(
+            let reference = lower_trusted_global_reference(
                 builder,
                 function,
                 instruction,
-                transition,
-                true,
+                transition.deopt_out,
             )?;
             let (current, reference_slot) =
                 lower_optimizing_mutable_array_reference(builder, reference, transition)?;
@@ -18035,12 +18121,11 @@ fn lower_optimizing_region_instruction(
         } if instruction.native_global_name.is_some() => {
             emitted_class = crate::JitProductionLoweringClass::DirectNativeData;
             debug_assert!(!keys.is_empty());
-            let reference = lower_optimizing_trusted_global_reference(
+            let reference = lower_trusted_global_reference(
                 builder,
                 function,
                 instruction,
-                transition,
-                true,
+                transition.deopt_out,
             )?;
             let value = lower_region_operand(builder, locals, registers, *value)?;
             if keys.len() == 1 {
@@ -18207,12 +18292,11 @@ fn lower_optimizing_region_instruction(
         {
             emitted_class = crate::JitProductionLoweringClass::DirectNativeData;
             debug_assert!(!keys.is_empty());
-            let reference = lower_optimizing_trusted_global_reference(
+            let reference = lower_trusted_global_reference(
                 builder,
                 function,
                 instruction,
-                transition,
-                true,
+                transition.deopt_out,
             )?;
             let mut value =
                 lower_optimizing_reference_scalar(builder, reference, false, transition)?;
@@ -18285,12 +18369,11 @@ fn lower_optimizing_region_instruction(
         {
             emitted_class = crate::JitProductionLoweringClass::DirectNativeData;
             debug_assert!(!keys.is_empty());
-            let reference = lower_optimizing_trusted_global_reference(
+            let reference = lower_trusted_global_reference(
                 builder,
                 function,
                 instruction,
-                transition,
-                true,
+                transition.deopt_out,
             )?;
             let mut value =
                 lower_optimizing_reference_scalar(builder, reference, false, transition)?;
@@ -18360,12 +18443,11 @@ fn lower_optimizing_region_instruction(
             if instruction.native_global_name.is_some() && keys.len() > 1 =>
         {
             emitted_class = crate::JitProductionLoweringClass::DirectNativeData;
-            let reference = lower_optimizing_trusted_global_reference(
+            let reference = lower_trusted_global_reference(
                 builder,
                 function,
                 instruction,
-                transition,
-                true,
+                transition.deopt_out,
             )?;
             let lowered_keys = keys[1..]
                 .iter()
@@ -18889,12 +18971,11 @@ fn lower_optimizing_region_instruction(
             ..
         } if instruction.native_global_name.is_some() => {
             emitted_class = crate::JitProductionLoweringClass::DirectNativeData;
-            let reference = lower_optimizing_trusted_global_reference(
+            let reference = lower_trusted_global_reference(
                 builder,
                 function,
                 instruction,
-                transition,
-                true,
+                transition.deopt_out,
             )?;
             let value = lower_optimizing_reference_scalar(builder, reference, true, transition)?;
             let uninitialized = builder.ins().icmp_imm(
@@ -19234,12 +19315,11 @@ fn lower_optimizing_region_instruction(
                 builder.ins().jump(admitted, &[]);
             }
             builder.switch_to_block(admitted);
-            let reference = lower_optimizing_trusted_global_reference(
+            let reference = lower_trusted_global_reference(
                 builder,
                 function,
                 instruction,
-                transition,
-                true,
+                transition.deopt_out,
             )?;
             lower_optimizing_retain(builder, reference, deopt_out);
             define_local_variable(builder, locals, *target, reference)?;
@@ -20815,6 +20895,7 @@ fn lower_optimizing_region_instruction(
                 emitted_class = crate::JitProductionLoweringClass::DirectNativeData;
                 lower_optimizing_cached_bind_global(
                     builder,
+                    value_flow,
                     locals,
                     call,
                     instruction,
@@ -21649,7 +21730,16 @@ fn lower_optimizing_region_instruction(
                     .map(|index| {
                         let operand = direct_builtin_argument(index)
                             .expect("fixed exact symbol-query argument has an operand");
-                        lower_region_operand(builder, locals, registers, operand)
+                        let value = lower_region_operand(builder, locals, registers, operand)?;
+                        if builtin == StableSymbolQueryBuiltin::Define && index == 1 {
+                            let value = lower_optimizing_reference_scalar(
+                                builder, value, false, transition,
+                            )?;
+                            return Ok(
+                                lower_native_storage_value(builder, value, transition.deopt_out).0,
+                            );
+                        }
+                        Ok(value)
                     })
                     .collect::<Result<Vec<_>, CraneliftLoweringError>>()?;
                 let result = lower_optimizing_exact_runtime_builtin(
@@ -22653,6 +22743,8 @@ fn lower_baseline_region_instruction(
             let src_operand = *src;
             let src = lower_region_operand(builder, locals, registers, src_operand)?;
             let fact = lowering_operand_fact(value_flow, constants, src_operand);
+            let release_current = instruction.live_locals.contains(local)
+                && value_release_required(value_flow.local_fact(*local));
             let direct = !function_is_top_level
                 && value_flow.local_storage(*local).is_promoted()
                 && fact.certainty != crate::region_ir::SsaCertainty::Unknown
@@ -22676,11 +22768,7 @@ fn lower_baseline_region_instruction(
                 } else {
                     src
                 };
-                let current_fact = value_flow.local_fact(*local);
-                if instruction.live_locals.contains(local)
-                    && (current_fact.certainty == crate::region_ir::SsaCertainty::Unknown
-                        || value_release_required(current_fact))
-                {
+                if release_current {
                     let _ = lower_guarded_value_release(
                         module,
                         builder,
@@ -22706,7 +22794,7 @@ fn lower_baseline_region_instruction(
                         *local,
                     ),
                     value_flow.moves_value_into_local(instruction.continuation_id),
-                    instruction.live_locals.contains(local),
+                    release_current,
                     function,
                     *local,
                     instruction.continuation_id,
@@ -22740,10 +22828,23 @@ fn lower_baseline_region_instruction(
             let value_operand = *value;
             let value = lower_region_operand(builder, locals, registers, value_operand)?;
             let fact = lowering_operand_fact(value_flow, constants, value_operand);
+            let release_current = instruction.live_locals.contains(local)
+                && value_release_required(value_flow.local_fact(*local));
             let direct = !function_is_top_level
                 && value_flow.local_storage(*local).is_promoted()
                 && !value_copy_requires_retain(fact);
             let stored = if direct {
+                if release_current {
+                    let _ = lower_guarded_value_release(
+                        module,
+                        builder,
+                        native_operations.value_release,
+                        native_dim_operation(1, function, instruction.continuation_id),
+                        current,
+                        result_out,
+                        deopt_out,
+                    )?;
+                }
                 value
             } else if value_flow.local_storage(*local).is_native_frame_local() {
                 lower_guarded_native_local_store(
@@ -22759,7 +22860,7 @@ fn lower_baseline_region_instruction(
                         *local,
                     ),
                     false,
-                    instruction.live_locals.contains(local),
+                    release_current,
                     function,
                     *local,
                     instruction.continuation_id,
@@ -23933,23 +24034,14 @@ fn lower_baseline_region_instruction(
                     lower_cached_bind_global(
                         module,
                         builder,
-                        native_operations.semantic_dispatch,
                         native_operations.value_release,
                         value_flow,
                         locals,
-                        register_variables,
-                        registers,
                         call,
                         instruction,
-                        transition_live_registers,
-                        streaming_call_exit,
                         result_out,
                         deopt_out,
                         function,
-                        local_count,
-                        native_version,
-                        unit_identity,
-                        pointer_type,
                     )?;
                     return Ok(());
                 }
@@ -26159,56 +26251,43 @@ fn lower_native_suspension(
 fn lower_cached_bind_global(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    semantic_helper: Option<NativeHelper>,
     lifecycle: Option<NativeHelper>,
     value_flow: &ExecutableValueFlow,
     locals: &NativeLocalMap,
-    register_variables: &NativeRegisterMap,
-    registers: &mut NativeRegisterMap,
     call: &RegionNativeCall,
     instruction: &RegionInstruction,
-    transition_live_registers: &[RegId],
-    streaming_call_exit: Option<NativeStreamingCallExit>,
     result_out: ir::Value,
     deopt_out: ir::Value,
     function: FunctionId,
-    local_count: u32,
-    native_version: u32,
-    unit_identity: u64,
-    pointer_type: ir::Type,
 ) -> Result<(), CraneliftLoweringError> {
-    let RegionCallResult::ReferenceLocal(_) = call.result else {
+    let RegionCallResult::ReferenceLocal(destination) = call.result else {
         return Err(CraneliftLoweringError::new(
             "JIT_CRANELIFT_BIND_GLOBAL_RESULT",
             "BindGlobal must publish a reference local",
         ));
     };
-    lower_direct_semantic_call(
-        module,
-        builder,
-        semantic_helper,
-        lifecycle,
-        value_flow,
-        locals,
-        register_variables,
-        registers,
-        call,
-        crate::region_ir::RegionSemanticOperationId::BindGlobal,
-        instruction,
-        transition_live_registers,
-        streaming_call_exit,
-        result_out,
-        deopt_out,
-        function,
-        local_count,
-        native_version,
-        unit_identity,
-        pointer_type,
-    )
+    let previous = use_local_variable(builder, locals, destination)?;
+    let release_previous = instruction.live_locals.contains(&destination)
+        && value_release_required(value_flow.local_fact(destination));
+    let encoded = lower_direct_global_binding_value(builder, function, instruction, deopt_out)?;
+    if release_previous {
+        let _ = lower_guarded_value_release(
+            module,
+            builder,
+            lifecycle,
+            native_dim_operation(1, function, instruction.continuation_id),
+            previous,
+            result_out,
+            deopt_out,
+        )?;
+    }
+    define_local_variable(builder, locals, destination, encoded)?;
+    Ok(())
 }
 
 fn lower_optimizing_cached_bind_global(
     builder: &mut FunctionBuilder<'_>,
+    value_flow: &ExecutableValueFlow,
     locals: &NativeLocalMap,
     call: &RegionNativeCall,
     instruction: &RegionInstruction,
@@ -26221,20 +26300,38 @@ fn lower_optimizing_cached_bind_global(
             "BindGlobal must publish a reference local",
         ));
     };
-    let encoded = lower_optimizing_trusted_global_reference(
-        builder,
-        function,
-        instruction,
-        transition,
-        false,
-    )?;
+    let previous = use_local_variable(builder, locals, destination)?;
+    let release_previous = instruction.live_locals.contains(&destination)
+        && value_release_required(value_flow.local_fact(destination));
+    let encoded =
+        lower_direct_global_binding_value(builder, function, instruction, transition.deopt_out)?;
+    if release_previous {
+        lower_optimizing_release(builder, previous, transition)?;
+    }
+    define_local_variable(builder, locals, destination, encoded)?;
+    Ok(())
+}
+
+/// Binds a prepared `global $name` site to its canonical request reference.
+///
+/// Request publication resolves the name and reference identity once. Both
+/// compiler tiers consume only the numeric slot plan and update the
+/// authoritative native reference payload here; no semantic dispatcher,
+/// `ReferenceCell` materialization, or name lookup remains in execution.
+fn lower_direct_global_binding_value(
+    builder: &mut FunctionBuilder<'_>,
+    function: FunctionId,
+    instruction: &RegionInstruction,
+    deopt_out: ir::Value,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    let encoded = lower_trusted_global_reference(builder, function, instruction, deopt_out)?;
     // Request-local slots start with an uninitialized payload so merely
     // publishing compiled code cannot make a missing global visible. PHP's
     // `global $name` statement is the point where that symbol becomes a
     // reference to null. Trusted global plans always carry the canonical
     // direct reference, so initialize its authoritative payload in place
     // without materializing a ReferenceCell or entering semantic dispatch.
-    let reference_slot = lower_optimizing_slot_address(builder, encoded, transition.deopt_out);
+    let reference_slot = lower_optimizing_slot_address(builder, encoded, deopt_out);
     let payload = builder.ins().load(
         types::I64,
         MemFlagsData::new(),
@@ -26262,30 +26359,28 @@ fn lower_optimizing_cached_bind_global(
         reference_slot,
         std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
     );
-    lower_mark_native_roots_dirty(builder, transition.deopt_out);
+    lower_mark_native_roots_dirty(builder, deopt_out);
     builder.ins().jump(initialized, &[]);
 
     builder.switch_to_block(initialized);
     // The dense slot owns one reference. The newly bound local owns a second one.
     // This is a direct slot update, not a lifecycle helper boundary.
-    lower_optimizing_retain(builder, encoded, transition.deopt_out);
-    define_local_variable(builder, locals, destination, encoded)?;
-    Ok(())
+    lower_optimizing_retain(builder, encoded, deopt_out);
+    Ok(encoded)
 }
 
-fn lower_optimizing_trusted_global_reference(
+fn lower_trusted_global_reference(
     builder: &mut FunctionBuilder<'_>,
     function: FunctionId,
     instruction: &RegionInstruction,
-    transition: NativeOptimizingTransition<'_>,
-    publication_is_mandatory: bool,
+    deopt_out: ir::Value,
 ) -> Result<ir::Value, CraneliftLoweringError> {
-    let pointer_type = builder.func.dfg.value_type(transition.deopt_out);
+    let pointer_type = builder.func.dfg.value_type(deopt_out);
     let view = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
     let offsets = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
-        transition.deopt_out,
+        deopt_out,
         view + std::mem::offset_of!(
             crate::JitNativeRuntimeView,
             trusted_property_function_offsets,
@@ -26294,7 +26389,7 @@ fn lower_optimizing_trusted_global_reference(
     let slots = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
-        transition.deopt_out,
+        deopt_out,
         view + std::mem::offset_of!(crate::JitNativeRuntimeView, trusted_global_reference_slots,)
             as i32,
     );
@@ -26315,38 +26410,10 @@ fn lower_optimizing_trusted_global_reference(
         slot,
         std::mem::offset_of!(crate::JitNativeTrustedGlobalReferenceSlot, encoded) as i32,
     );
-    if publication_is_mandatory {
-        // Constant `$GLOBALS["name"]` plans are request-publication
-        // invariants. Generated code consumes the numeric slot directly;
-        // validation does not repeat per invocation.
-        return Ok(encoded);
-    }
-    let hit = builder.create_block();
-    let miss = builder.create_block();
-    let merge = builder.create_block();
-    builder.append_block_param(merge, types::I64);
-    let state = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        slot,
-        std::mem::offset_of!(crate::JitNativeTrustedGlobalReferenceSlot, state) as i32,
-    );
-    let published = builder.ins().icmp_imm(
-        IntCC::Equal,
-        state,
-        i64::from(crate::JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_PUBLISHED),
-    );
-    builder.ins().brif(published, hit, &[], miss, &[]);
-
-    builder.switch_to_block(hit);
-    builder.ins().jump(merge, &[encoded.into()]);
-
-    builder.switch_to_block(miss);
-    let resumed = transition.emit_value_with_detail(builder, 0x1601)?;
-    builder.ins().jump(merge, &[resumed.into()]);
-
-    builder.switch_to_block(merge);
-    Ok(builder.block_params(merge)[0])
+    // Publication is an engine-integrity invariant established before native
+    // entry. Generated code consumes the numeric plan directly and does not
+    // repeat slot-state or name validation per invocation.
+    Ok(encoded)
 }
 
 fn lower_optimizing_trusted_static_local(

@@ -153,9 +153,17 @@ fn stable_builtin_identity_survives_symbolic_function_metadata() {
     assert_eq!(stable_builtin_type_predicate(&namespaced), None);
     assert_eq!(stable_builtin_dense_id(&namespaced), None);
 
+    let define = RegionCallTarget::Function {
+        name: "define".to_owned(),
+        function: Some(FunctionId::new(19)),
+    };
+    assert_eq!(
+        stable_builtin_symbol_query(&define),
+        Some(StableSymbolQueryBuiltin::Define)
+    );
     let defined = RegionCallTarget::Function {
         name: "defined".to_owned(),
-        function: Some(FunctionId::new(19)),
+        function: Some(FunctionId::new(20)),
     };
     assert_eq!(
         stable_builtin_symbol_query(&defined),
@@ -7274,6 +7282,25 @@ fn optimizing_declared_property_store_bypasses_property_helper() {
         },
         span,
     );
+    // The property replacement retires its former array owner. Allocate and
+    // discard one more array in the same native entry to prove that generated
+    // allocation consumes that retired value slot instead of advancing the
+    // request high-water.
+    let recycled = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::NewArray { dst: recycled },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::Discard {
+            src: Operand::Register(recycled),
+        },
+        span,
+    );
     builder.terminate_return(function, block, Some(Operand::Register(assigned)), span);
     let unit = builder.finish();
     let mut backend = CraneliftNativeCompiler;
@@ -7325,6 +7352,7 @@ fn optimizing_declared_property_store_bypasses_property_helper() {
     };
     let mut direct_next = 5_u32;
     let mut direct_free = crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE;
+    let mut direct_reused_bytes = 0_u64;
     let mut array_next = crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY;
     let mut array_free_heads =
         [crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE; crate::JIT_NATIVE_DIRECT_ARRAY_FREE_BUCKETS];
@@ -7343,6 +7371,7 @@ fn optimizing_declared_property_store_bypasses_property_helper() {
         direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
         direct_value_next: std::ptr::from_mut(&mut direct_next) as usize as u64,
         direct_value_free_head: std::ptr::from_mut(&mut direct_free) as usize as u64,
+        direct_value_reused_bytes: std::ptr::from_mut(&mut direct_reused_bytes) as usize as u64,
         direct_array_entries: array_entries.as_mut_ptr() as usize as u64,
         direct_array_next: std::ptr::from_mut(&mut array_next) as usize as u64,
         direct_array_free_heads: array_free_heads.as_mut_ptr() as usize as u64,
@@ -7371,8 +7400,12 @@ fn optimizing_declared_property_store_bypasses_property_helper() {
         direct_slots[4].flags,
         crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY
     );
-    assert_eq!(direct_free, crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE);
+    assert_eq!(direct_free, 4);
     assert_eq!(direct_next, 5);
+    assert_eq!(
+        direct_reused_bytes,
+        std::mem::size_of::<crate::JitNativeValueSlot>() as u64
+    );
     assert_eq!(root_mutation_pending, 1);
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
@@ -9823,6 +9856,7 @@ fn optimizing_array_pointer_builtins_mutate_authoritative_native_cursor() {
 
 #[test]
 fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch() {
+    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
     let mut builder = IrBuilder::new(UnitId::new(4_235));
     let file = builder.add_file("optimizing-bind-global.php");
     let span = IrSpan::new(file, 0, 1);
@@ -9838,17 +9872,7 @@ fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch(
         },
         span,
     );
-    let loaded = builder.alloc_register(function);
-    builder.emit(
-        function,
-        block,
-        InstructionKind::LoadLocal {
-            dst: loaded,
-            local: global,
-        },
-        span,
-    );
-    builder.terminate_return(function, block, Some(Operand::Register(loaded)), span);
+    builder.terminate_return(function, block, None, span);
     let unit = builder.finish();
     let mut backend = CraneliftNativeCompiler;
     let outcome = backend.compile_region(&NativeCompileRequest {
@@ -9867,14 +9891,52 @@ fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch(
     assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
     let handle = outcome.handle.expect("optimizing global-binding handle");
     assert_optimizing_artifact(&handle);
+    let baseline = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.baseline.bind-global")
+            .with_opt_level(0)
+            .with_deployment_runtime_identity(42),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_semantic_dispatch: forbidden_call_dispatch as *const () as usize,
+            native_reference_bind: forbidden_reference_bind as *const () as usize,
+            native_value_release: forbidden_release as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(baseline.status, JitCompileStatus::Compiled, "{baseline:?}");
+    let baseline = baseline.handle.expect("baseline global-binding handle");
+    assert_eq!(
+        baseline
+            .region_state_metadata()
+            .expect("baseline global-binding metadata")
+            .compiler_tier,
+        NativeCompilerTier::Baseline
+    );
+    for artifact in [&handle, &baseline] {
+        let helper_imports = artifact
+            .relocatable_code()
+            .expect("global-binding relocatable artifact")
+            .relocations
+            .iter()
+            .filter_map(|relocation| match &relocation.target {
+                crate::JitRelocatableTarget::Helper(symbol) => Some(symbol.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !helper_imports.contains(&"phrust_native_semantic_dispatch"),
+            "global binding imported the old semantic dispatcher: {helper_imports:?}"
+        );
+    }
     let metadata = handle
         .region_state_metadata()
         .expect("global-binding lowering metadata");
     assert!(
         metadata.production_lowering.iter().any(|entry| {
             entry.operation.contains("BindGlobal")
-                && entry.class == crate::JitProductionLoweringClass::BaselineFragmentTransition
-                && entry.operation_local_transition
+                && entry.class == crate::JitProductionLoweringClass::DirectNativeData
+                && !entry.operation_local_transition
         }),
         "unexpected lowering manifest: {:?}",
         metadata.production_lowering
@@ -9926,6 +9988,20 @@ fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch(
         "executing global binding must initialize a missing global to null"
     );
     assert_eq!(roots_dirty, 1);
+    direct_slots[1].payload = crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED) as u64;
+    roots_dirty = 0;
+    assert_eq!(
+        baseline
+            .invoke_i64(&[], JIT_RUNTIME_ABI_HASH)
+            .expect("baseline trusted global binding must stay direct"),
+        crate::jit_encode_constant(u32::MAX)
+    );
+    assert_eq!(
+        direct_slots[1].payload as i64,
+        crate::jit_encode_constant(u32::MAX)
+    );
+    assert_eq!(roots_dirty, 1);
+    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 
 #[test]

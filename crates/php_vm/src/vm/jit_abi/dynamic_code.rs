@@ -82,7 +82,7 @@ fn prepare_native_include_local_bindings(
     if caller.flags.is_top_level {
         return Ok(Vec::new());
     }
-    if request.caller_frame == 0 {
+    if request.caller_frame == 0 && !caller.locals.is_empty() {
         return Err("function-scoped native include has no caller-local frame".to_owned());
     }
     let caller_locals = caller.locals.clone();
@@ -428,6 +428,7 @@ fn execute_native_eval(
         .compile_eval(&source_path, &source)
         .map_err(|error| error.to_string())?;
     context.materialize_native_request_globals()?;
+    context.materialize_native_dynamic_constants()?;
     let mut inherited_globals = std::mem::take(&mut context.inherited_globals);
     if request.caller_frame != 0 {
         let caller_frame = request.caller_frame as *const i64;

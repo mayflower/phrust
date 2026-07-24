@@ -1744,6 +1744,7 @@ pub(super) fn compile_region_graph_native(
             continue;
         }
         let address = match builtin {
+            StableSymbolQueryBuiltin::Define => runtime_helpers.native_define,
             StableSymbolQueryBuiltin::Defined => runtime_helpers.native_defined,
             StableSymbolQueryBuiltin::FunctionExists => runtime_helpers.native_function_exists,
             StableSymbolQueryBuiltin::ClassExists => runtime_helpers.native_class_exists,
@@ -3808,7 +3809,8 @@ pub(super) fn compile_region_graph_native(
                         crate::JitRelocatableTarget::Helper(symbol)
                             if matches!(
                                 symbol.as_str(),
-                                "phrust_native_defined"
+                                "phrust_native_define"
+                                    | "phrust_native_defined"
                                     | "phrust_native_echo_bytes"
                                     | "phrust_native_echo_int"
                                     | "phrust_native_echo_float"
