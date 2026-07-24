@@ -2752,18 +2752,8 @@ fn lower_optimizing_slot_address(
     value: ir::Value,
     deopt_out: ir::Value,
 ) -> ir::Value {
-    let direct_path = builder.create_block();
-    let normal_path = builder.create_block();
-    let merge = builder.create_block();
     let pointer_type = builder.func.dfg.value_type(deopt_out);
-    builder.append_block_param(merge, pointer_type);
     let view = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
-    let normal_slots = builder.ins().load(
-        pointer_type,
-        MemFlagsData::new(),
-        deopt_out,
-        view + std::mem::offset_of!(crate::JitNativeRuntimeView, value_slots) as i32,
-    );
     let direct_slots = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
@@ -2771,57 +2761,12 @@ fn lower_optimizing_slot_address(
         view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_slots) as i32,
     );
     let index = builder.ins().ireduce(types::I32, value);
-    let direct = builder.ins().icmp_imm(
-        IntCC::UnsignedGreaterThanOrEqual,
-        index,
-        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
-    );
-    builder
-        .ins()
-        .brif(direct, direct_path, &[], normal_path, &[]);
-
-    builder.switch_to_block(direct_path);
     let direct_index = builder
         .ins()
         .iadd_imm(index, -i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE));
     let direct_index = builder.ins().uextend(pointer_type, direct_index);
     let direct_offset = builder.ins().ishl_imm(direct_index, 5);
-    let direct_slot = builder.ins().iadd(direct_slots, direct_offset);
-    builder.ins().jump(merge, &[direct_slot.into()]);
-
-    builder.switch_to_block(normal_path);
-    let normal_index = builder.ins().uextend(pointer_type, index);
-    let normal_offset = builder.ins().ishl_imm(normal_index, 5);
-    let normal_slot = builder.ins().iadd(normal_slots, normal_offset);
-    builder.ins().jump(merge, &[normal_slot.into()]);
-
-    builder.switch_to_block(merge);
-    builder.block_params(merge)[0]
-}
-
-/// Resolves a value slot after the caller has admitted the handle as part of
-/// the authoritative direct-value index range. Unlike the compatibility slot
-/// resolver above, this emits no branch or address into the cold value store.
-fn lower_optimizing_direct_slot_address(
-    builder: &mut FunctionBuilder<'_>,
-    value: ir::Value,
-    deopt_out: ir::Value,
-) -> ir::Value {
-    let pointer_type = builder.func.dfg.value_type(deopt_out);
-    let view = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
-    let direct_slots = builder.ins().load(
-        pointer_type,
-        MemFlagsData::new(),
-        deopt_out,
-        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_slots) as i32,
-    );
-    let index = builder.ins().ireduce(types::I32, value);
-    let direct_index = builder
-        .ins()
-        .iadd_imm(index, -i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE));
-    let direct_index = builder.ins().uextend(pointer_type, direct_index);
-    let offset = builder.ins().ishl_imm(direct_index, 5);
-    builder.ins().iadd(direct_slots, offset)
+    builder.ins().iadd(direct_slots, direct_offset)
 }
 
 /// Loads one packed receiver/capture directly from the immutable prepared
@@ -2836,7 +2781,7 @@ fn lower_optimizing_prepared_closure_argument(
     deopt_out: ir::Value,
 ) -> ir::Value {
     let pointer_type = builder.func.dfg.value_type(deopt_out);
-    let slot = lower_optimizing_direct_slot_address(builder, closure, deopt_out);
+    let slot = lower_optimizing_slot_address(builder, closure, deopt_out);
     let closure_view = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
@@ -2909,19 +2854,15 @@ fn lower_trusted_request_local_reference(
     )
 }
 
-/// Reserve one request-owned direct value slot without entering Rust. Released
-/// slots form an intrusive single-linked list through `reserved`; only when
-/// that list is empty does allocation advance the stable arena high-water.
+/// Reserve one request-owned direct value slot without entering Rust. Slot
+/// identities remain stable for the complete request and the arena is reset
+/// wholesale when the request ends, so allocation only advances its high-water.
 fn lower_reserve_direct_value_index(
     builder: &mut FunctionBuilder<'_>,
     deopt_out: ir::Value,
     rejected: ir::Block,
 ) -> ir::Value {
-    let reuse = builder.create_block();
-    let bump = builder.create_block();
     let bump_accepted = builder.create_block();
-    let allocated = builder.create_block();
-    builder.append_block_param(allocated, types::I32);
     let pointer_type = builder.func.dfg.value_type(deopt_out);
     let view = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
     let next_ptr = builder.ins().load(
@@ -2930,60 +2871,6 @@ fn lower_reserve_direct_value_index(
         deopt_out,
         view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_next) as i32,
     );
-    let free_head_ptr = builder.ins().load(
-        pointer_type,
-        MemFlagsData::new(),
-        deopt_out,
-        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_free_head) as i32,
-    );
-    let free_head = builder
-        .ins()
-        .load(types::I32, MemFlagsData::new(), free_head_ptr, 0);
-    let has_free = builder.ins().icmp_imm(
-        IntCC::NotEqual,
-        free_head,
-        i64::from(crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE),
-    );
-    builder.ins().brif(has_free, reuse, &[], bump, &[]);
-
-    builder.switch_to_block(reuse);
-    let slots = builder.ins().load(
-        pointer_type,
-        MemFlagsData::new(),
-        deopt_out,
-        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_slots) as i32,
-    );
-    let free_index = builder.ins().uextend(pointer_type, free_head);
-    let free_offset = builder.ins().ishl_imm(free_index, 5);
-    let free_slot = builder.ins().iadd(slots, free_offset);
-    let preceding = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        free_slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, reserved) as i32,
-    );
-    builder
-        .ins()
-        .store(MemFlagsData::new(), preceding, free_head_ptr, 0);
-    let reused_bytes_ptr = builder.ins().load(
-        pointer_type,
-        MemFlagsData::new(),
-        deopt_out,
-        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_reused_bytes) as i32,
-    );
-    let reused_bytes = builder
-        .ins()
-        .load(types::I64, MemFlagsData::new(), reused_bytes_ptr, 0);
-    let reused_bytes = builder.ins().iadd_imm(
-        reused_bytes,
-        std::mem::size_of::<crate::JitNativeValueSlot>() as i64,
-    );
-    builder
-        .ins()
-        .store(MemFlagsData::new(), reused_bytes, reused_bytes_ptr, 0);
-    builder.ins().jump(allocated, &[free_head.into()]);
-
-    builder.switch_to_block(bump);
     let next = builder
         .ins()
         .load(types::I32, MemFlagsData::new(), next_ptr, 0);
@@ -3001,10 +2888,7 @@ fn lower_reserve_direct_value_index(
     builder
         .ins()
         .store(MemFlagsData::new(), next_value, next_ptr, 0);
-    builder.ins().jump(allocated, &[next.into()]);
-
-    builder.switch_to_block(allocated);
-    builder.block_params(allocated)[0]
+    next
 }
 
 /// Binds one SSA local to an authoritative direct reference slot. Existing
@@ -5227,7 +5111,7 @@ fn lower_native_string_key_descriptor(
     // slot before loading. The `direct` bit remains part of admission below,
     // so the cold handle can never be mistaken for an authoritative string.
     let safe_value = builder.ins().select(direct, value, first_direct);
-    let slot = lower_optimizing_direct_slot_address(builder, safe_value, deopt_out);
+    let slot = lower_optimizing_slot_address(builder, safe_value, deopt_out);
     let kind = builder.ins().load(
         types::I32,
         MemFlagsData::new(),
@@ -6282,7 +6166,7 @@ fn lower_optimizing_pack_variadic_arguments(
         .ins()
         .iconst(types::I64, i64::try_from(values.len()).unwrap_or(i64::MAX));
     let array = lower_optimizing_allocate_direct_array(builder, count, transition)?;
-    let slot = lower_optimizing_direct_slot_address(builder, array, transition.deopt_out);
+    let slot = lower_optimizing_slot_address(builder, array, transition.deopt_out);
     let pointer_type = builder.func.dfg.value_type(transition.deopt_out);
     let entries = builder.ins().load(
         pointer_type,
@@ -9398,84 +9282,26 @@ fn lower_optimizing_require_direct_value_capacity(
 ) -> Result<(), CraneliftLoweringError> {
     let pointer_type = builder.func.dfg.value_type(transition.deopt_out);
     let view = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
-    let slots = builder.ins().load(
-        pointer_type,
-        MemFlagsData::new(),
-        transition.deopt_out,
-        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_slots) as i32,
-    );
     let next_ptr = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
         transition.deopt_out,
         view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_next) as i32,
     );
-    let free_head_ptr = builder.ins().load(
-        pointer_type,
-        MemFlagsData::new(),
-        transition.deopt_out,
-        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_free_head) as i32,
-    );
     let next = builder
         .ins()
         .load(types::I32, MemFlagsData::new(), next_ptr, 0);
-    let free_head = builder
-        .ins()
-        .load(types::I32, MemFlagsData::new(), free_head_ptr, 0);
-    let scan = builder.create_block();
-    let inspect = builder.create_block();
-    let finish = builder.create_block();
     let accepted = builder.create_block();
     let rejected = builder.create_block();
-    builder.append_block_param(scan, types::I32);
-    builder.append_block_param(scan, types::I64);
-    builder.append_block_param(finish, types::I64);
-    let zero = builder.ins().iconst(types::I64, 0);
-    builder.ins().jump(scan, &[free_head.into(), zero.into()]);
-
-    builder.switch_to_block(scan);
-    let head = builder.block_params(scan)[0];
-    let free_count = builder.block_params(scan)[1];
-    let exhausted = builder.ins().icmp_imm(
-        IntCC::Equal,
-        head,
-        i64::from(crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE),
-    );
-    let enough = builder
-        .ins()
-        .icmp(IntCC::UnsignedGreaterThanOrEqual, free_count, required);
-    let done = builder.ins().bor(exhausted, enough);
-    builder
-        .ins()
-        .brif(done, finish, &[free_count.into()], inspect, &[]);
-
-    builder.switch_to_block(inspect);
-    let wide_head = builder.ins().uextend(pointer_type, head);
-    let offset = builder.ins().ishl_imm(wide_head, 5);
-    let slot = builder.ins().iadd(slots, offset);
-    let preceding = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, reserved) as i32,
-    );
-    let next_count = builder.ins().iadd_imm(free_count, 1);
-    builder
-        .ins()
-        .jump(scan, &[preceding.into(), next_count.into()]);
-
-    builder.switch_to_block(finish);
-    let free_count = builder.block_params(finish)[0];
     let capacity = builder.ins().iconst(
         types::I32,
         i64::try_from(crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY).unwrap_or(i64::MAX),
     );
     let remaining = builder.ins().isub(capacity, next);
     let remaining = builder.ins().uextend(types::I64, remaining);
-    let available = builder.ins().iadd(free_count, remaining);
     let enough = builder
         .ins()
-        .icmp(IntCC::UnsignedGreaterThanOrEqual, available, required);
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, remaining, required);
     builder.ins().brif(enough, accepted, &[], rejected, &[]);
 
     builder.switch_to_block(rejected);
@@ -12040,7 +11866,7 @@ fn lower_optimizing_unknown_bit_not(
         .brif(direct_runtime, inspect_slot, &[], rejected, &[]);
 
     builder.switch_to_block(inspect_slot);
-    let slot = lower_optimizing_direct_slot_address(builder, encoded, transition.deopt_out);
+    let slot = lower_optimizing_slot_address(builder, encoded, transition.deopt_out);
     let kind = builder.ins().load(
         types::I32,
         MemFlagsData::new(),
@@ -13988,36 +13814,38 @@ fn lower_optimizing_property_fetch(
 
 fn lower_free_direct_scalar_slot(
     builder: &mut FunctionBuilder<'_>,
-    value: ir::Value,
+    _value: ir::Value,
     slot: ir::Value,
-    deopt_out: ir::Value,
+    _deopt_out: ir::Value,
 ) {
-    let pointer_type = builder.func.dfg.value_type(deopt_out);
-    let runtime_view = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
-    let free_head_ptr = builder.ins().load(
-        pointer_type,
-        MemFlagsData::new(),
-        deopt_out,
-        runtime_view
-            + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_free_head) as i32,
-    );
-    let preceding = builder
-        .ins()
-        .load(types::I32, MemFlagsData::new(), free_head_ptr, 0);
     let zero32 = builder.ins().iconst(types::I32, 0);
     let zero64 = builder.ins().iconst(types::I64, 0);
+    let retired_kind = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+    );
     for offset in [
         std::mem::offset_of!(crate::JitNativeValueSlot, refcount),
         std::mem::offset_of!(crate::JitNativeValueSlot, kind),
-        std::mem::offset_of!(crate::JitNativeValueSlot, flags),
     ] {
         builder
             .ins()
             .store(MemFlagsData::new(), zero32, slot, offset as i32);
     }
+    // A free descriptor keeps its retired kind in the otherwise-unused flags
+    // word. This does not participate in allocation or dispatch, but makes a
+    // stale-owner diagnostic identify the value family that was retired.
     builder.ins().store(
         MemFlagsData::new(),
-        preceding,
+        retired_kind,
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+    );
+    builder.ins().store(
+        MemFlagsData::new(),
+        zero32,
         slot,
         std::mem::offset_of!(crate::JitNativeValueSlot, reserved) as i32,
     );
@@ -14029,13 +13857,6 @@ fn lower_free_direct_scalar_slot(
             .ins()
             .store(MemFlagsData::new(), zero64, slot, offset as i32);
     }
-    let index = builder.ins().ireduce(types::I32, value);
-    let direct_index = builder
-        .ins()
-        .iadd_imm(index, -i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE));
-    builder
-        .ins()
-        .store(MemFlagsData::new(), direct_index, free_head_ptr, 0);
 }
 
 fn lower_optimizing_property_assign(
@@ -14790,7 +14611,7 @@ fn lower_optimizing_integer_candidate(
         .brif(direct_runtime, inspect_slot, &[], rejected, &[]);
 
     builder.switch_to_block(inspect_slot);
-    let slot = lower_optimizing_direct_slot_address(builder, encoded, deopt_out);
+    let slot = lower_optimizing_slot_address(builder, encoded, deopt_out);
     let kind = builder.ins().load(
         types::I32,
         MemFlagsData::new(),
@@ -14996,7 +14817,7 @@ fn lower_optimizing_numeric_f64(
         .brif(admitted, accepted_float, &[], rejected, &[]);
 
     builder.switch_to_block(accepted_float);
-    let slot = lower_optimizing_direct_slot_address(builder, encoded, transition.deopt_out);
+    let slot = lower_optimizing_slot_address(builder, encoded, transition.deopt_out);
     let kind = builder.ins().load(
         types::I32,
         MemFlagsData::new(),
@@ -15993,8 +15814,6 @@ fn lower_cached_array_fetch_inner(
         );
     }
     let inspect_runtime = builder.create_block();
-    let inspect_normal = builder.create_block();
-    let inspect_direct = builder.create_block();
     let inspect_descriptor = builder.create_block();
     let entry_loop = builder.create_block();
     let entry_compare = builder.create_block();
@@ -16018,32 +15837,7 @@ fn lower_cached_array_fetch_inner(
         .brif(is_array, inspect_runtime, &[], slow_not_tagged, &[]);
 
     let pointer_type = module.target_config().pointer_type();
-    let view_offset = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
     builder.switch_to_block(inspect_runtime);
-    let raw_index = builder.ins().ireduce(types::I32, array);
-    let is_direct = builder.ins().icmp_imm(
-        IntCC::UnsignedGreaterThanOrEqual,
-        raw_index,
-        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
-    );
-    builder
-        .ins()
-        .brif(is_direct, inspect_direct, &[], inspect_normal, &[]);
-
-    builder.switch_to_block(inspect_normal);
-    let views = builder.ins().load(
-        pointer_type,
-        MemFlagsData::new(),
-        deopt_out,
-        view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, value_slots) as i32,
-    );
-    let array_index = builder.ins().ireduce(types::I32, array);
-    let array_index = builder.ins().uextend(pointer_type, array_index);
-    let descriptor_offset = builder.ins().ishl_imm(array_index, 5);
-    let descriptor = builder.ins().iadd(views, descriptor_offset);
-    builder.ins().jump(inspect_descriptor, &[descriptor.into()]);
-
-    builder.switch_to_block(inspect_direct);
     let descriptor = lower_optimizing_slot_address(builder, array, deopt_out);
     builder.ins().jump(inspect_descriptor, &[descriptor.into()]);
 
@@ -16329,21 +16123,11 @@ fn lower_direct_foreach_next(
             .ins()
             .brif(is_iterator, inspect_runtime, &[], slow, &[]);
 
-        let view_offset = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
         builder.switch_to_block(inspect_runtime);
-        let views = builder.ins().load(
-            pointer_type,
-            MemFlagsData::new(),
-            deopt_out,
-            view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, value_slots) as i32,
-        );
-        let index = builder.ins().ireduce(types::I32, iterator);
+        let descriptor = lower_optimizing_slot_address(builder, iterator, deopt_out);
         builder.ins().jump(inspect_descriptor, &[]);
 
         builder.switch_to_block(inspect_descriptor);
-        let index = builder.ins().uextend(pointer_type, index);
-        let descriptor_offset = builder.ins().ishl_imm(index, 5);
-        let descriptor = builder.ins().iadd(views, descriptor_offset);
         let kind = builder.ins().load(
             types::I32,
             MemFlagsData::new(),
@@ -16789,57 +16573,12 @@ fn lower_guarded_value_release(
 ) -> Result<ir::Value, CraneliftLoweringError> {
     if operation & 1 == 0 {
         let retain = builder.create_block();
-        let direct_slot = builder.create_block();
-        let normal_slot = builder.create_block();
-        let update = builder.create_block();
         let done = builder.create_block();
-        let pointer_type = module.target_config().pointer_type();
-        builder.append_block_param(update, pointer_type);
         let is_runtime = lower_is_runtime_handle(builder, value);
         builder.ins().brif(is_runtime, retain, &[], done, &[]);
 
         builder.switch_to_block(retain);
-        let view_offset = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
-        let index = builder.ins().ireduce(types::I32, value);
-        let is_direct = builder.ins().icmp_imm(
-            IntCC::UnsignedGreaterThanOrEqual,
-            index,
-            i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
-        );
-        builder
-            .ins()
-            .brif(is_direct, direct_slot, &[], normal_slot, &[]);
-
-        builder.switch_to_block(direct_slot);
-        let direct_slots = builder.ins().load(
-            pointer_type,
-            MemFlagsData::new(),
-            deopt_out,
-            view_offset
-                + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_slots) as i32,
-        );
-        let direct_index = builder
-            .ins()
-            .iadd_imm(index, -i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE));
-        let direct_index = builder.ins().uextend(pointer_type, direct_index);
-        let direct_offset = builder.ins().ishl_imm(direct_index, 5);
-        let direct_cell = builder.ins().iadd(direct_slots, direct_offset);
-        builder.ins().jump(update, &[direct_cell.into()]);
-
-        builder.switch_to_block(normal_slot);
-        let value_slots = builder.ins().load(
-            pointer_type,
-            MemFlagsData::new(),
-            deopt_out,
-            view_offset + std::mem::offset_of!(crate::JitNativeRuntimeView, value_slots) as i32,
-        );
-        let normal_index = builder.ins().uextend(pointer_type, index);
-        let normal_offset = builder.ins().ishl_imm(normal_index, 5);
-        let normal_cell = builder.ins().iadd(value_slots, normal_offset);
-        builder.ins().jump(update, &[normal_cell.into()]);
-
-        builder.switch_to_block(update);
-        let cell = builder.block_params(update)[0];
+        let cell = lower_optimizing_slot_address(builder, value, deopt_out);
         let count = builder.ins().load(types::I32, MemFlagsData::new(), cell, 0);
         let incremented = builder.ins().iadd_imm(count, 1);
         builder
@@ -20805,6 +20544,16 @@ fn lower_optimizing_region_instruction(
                             trusted_preferred_function_entries,
                         ) as i32,
                 );
+                let baseline_entries = builder.ins().load(
+                    pointer_type,
+                    MemFlagsData::new(),
+                    deopt_out,
+                    runtime_view_offset
+                        + std::mem::offset_of!(
+                            crate::JitNativeRuntimeView,
+                            trusted_function_entries,
+                        ) as i32,
+                );
                 let entry_offset =
                     i64::try_from(target.index().saturating_mul(pointer_type.bytes() as usize))
                         .unwrap_or(i64::MAX);
@@ -20858,7 +20607,77 @@ fn lower_optimizing_region_instruction(
                         resume_state,
                     ],
                 );
-                let status = builder.inst_results(native_call)[0];
+                let mut status = builder.inst_results(native_call)[0];
+                let resume_callee = builder.create_block();
+                let status_ready = builder.create_block();
+                builder.append_block_param(status_ready, types::I32);
+                let is_transition = builder.ins().icmp_imm(
+                    IntCC::Equal,
+                    status,
+                    i64::from(crate::JitCallStatus::RECOMPILE_REQUESTED.0),
+                );
+                builder.ins().brif(
+                    is_transition,
+                    resume_callee,
+                    &[],
+                    status_ready,
+                    &[status.into()],
+                );
+
+                builder.switch_to_block(resume_callee);
+                let rejected_function = builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    deopt_out,
+                    std::mem::offset_of!(crate::JitDeoptState, function_id) as i32,
+                );
+                let rejected_function = builder.ins().uextend(pointer_type, rejected_function);
+                let rejected_offset = builder
+                    .ins()
+                    .imul_imm(rejected_function, i64::from(pointer_type.bytes()));
+                let rejected_entry = builder.ins().iadd(baseline_entries, rejected_offset);
+                let rejected_address =
+                    builder
+                        .ins()
+                        .atomic_load(pointer_type, MemFlagsData::new(), rejected_entry);
+                let rejected_continuation = builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    deopt_out,
+                    std::mem::offset_of!(crate::JitDeoptState, continuation_id) as i32,
+                );
+                let rejected_resume_id = builder.ins().bor_imm(
+                    rejected_continuation,
+                    i64::from(crate::JIT_NATIVE_TRANSITION_RESUME_TAG),
+                );
+                let resumed = builder.ins().call_indirect(
+                    signature,
+                    rejected_address,
+                    &[
+                        runtime,
+                        arguments,
+                        callee_result_out,
+                        deopt_out,
+                        rejected_resume_id,
+                        deopt_out,
+                    ],
+                );
+                let resumed_status = builder.inst_results(resumed)[0];
+                let nested_transition = builder.ins().icmp_imm(
+                    IntCC::Equal,
+                    resumed_status,
+                    i64::from(crate::JitCallStatus::RECOMPILE_REQUESTED.0),
+                );
+                builder.ins().brif(
+                    nested_transition,
+                    resume_callee,
+                    &[],
+                    status_ready,
+                    &[resumed_status.into()],
+                );
+
+                builder.switch_to_block(status_ready);
+                status = builder.block_params(status_ready)[0];
                 let returned = builder.create_block();
                 let propagate = builder.create_block();
                 builder.append_block_param(propagate, types::I32);
@@ -26409,8 +26228,7 @@ fn lower_optimizing_cached_bind_global(
     // reference to null. Trusted global plans always carry the canonical
     // direct reference, so initialize its authoritative payload in place
     // without materializing a ReferenceCell or entering semantic dispatch.
-    let reference_slot =
-        lower_optimizing_direct_slot_address(builder, encoded, transition.deopt_out);
+    let reference_slot = lower_optimizing_slot_address(builder, encoded, transition.deopt_out);
     let payload = builder.ins().load(
         types::I64,
         MemFlagsData::new(),

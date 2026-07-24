@@ -3078,13 +3078,91 @@ pub(super) fn compile_region_graph_native(
                     ),
                 )
             }));
+            let mut preflighted_whole = None;
             let mut preflighted_fragments = BTreeMap::<u32, DefinedRegionFunction>::new();
-            // Fragmented optimizing functions need the same exact CLIF
-            // preflight as streaming baseline functions. The cheap planner
-            // estimate intentionally cannot account for the full live-state
-            // fanout of direct guards; without this pass, one underestimated
-            // fragment rejects the complete optimizing artifact only after
-            // all preceding fragments have already been compiled.
+            // A planner-admitted whole optimizing function still needs exact
+            // CLIF preflight. Direct calls, ownership, and guards can expand
+            // one Region instruction into enough backend state to exceed the
+            // whole-function ceiling even when the source estimate is
+            // bounded. Keep the ordinary whole-function representation when
+            // its exact form fits; otherwise enter the same deterministic
+            // fragment refinement used below.
+            if active_fragment_layout.is_none() {
+                let register_liveness = NativeRegisterLiveness::analyze(region);
+                let compiler =
+                    crate::cranelift_lowering::baseline_streaming::compiler_for_tier(
+                        region.compile_metadata.tier,
+                    );
+                let preflight = compiler.compile_fragment(&mut |mode| {
+                    define_region_graph_function(
+                        module,
+                        codegen_context,
+                        builder_context,
+                        region,
+                        &unit.constants,
+                        &value_flows[&region.function],
+                        functions[&region.function],
+                        &functions,
+                        &inline_constants,
+                        &tail_forwards,
+                        &function_params,
+                        &request.external_function_signatures,
+                        tier_operations,
+                        &register_liveness,
+                        None,
+                        runtime_unit_identity,
+                        mode,
+                        false,
+                        true,
+                    )
+                });
+                match preflight {
+                    Ok(defined)
+                        if defined
+                            .pre_regalloc
+                            .exceeds_replan_margin(region.compile_metadata.tier) =>
+                    {
+                        active_plan = NativeCompilePlan::for_bounded_fragments(region);
+                        active_fragment_layout =
+                            Some(NativeFunctionFragmentLayout::for_plan(region, &active_plan)?);
+                        compiled_pre_regalloc_replans
+                            .set(compiled_pre_regalloc_replans.get().saturating_add(1));
+                        (fragment_functions, fragment_symbols) = declare_fragment_functions(
+                            module,
+                            name,
+                            region,
+                            active_fragment_layout.as_ref(),
+                            0,
+                            &mut next_synthetic,
+                            &mut functions,
+                        )?;
+                    }
+                    Ok(defined) => preflighted_whole = Some(defined),
+                    Err(error) if error.code == "JIT_CRANELIFT_PRE_REGALLOC_BUDGET" => {
+                        active_plan = NativeCompilePlan::for_bounded_fragments(region);
+                        active_fragment_layout =
+                            Some(NativeFunctionFragmentLayout::for_plan(region, &active_plan)?);
+                        compiled_pre_regalloc_replans
+                            .set(compiled_pre_regalloc_replans.get().saturating_add(1));
+                        (fragment_functions, fragment_symbols) = declare_fragment_functions(
+                            module,
+                            name,
+                            region,
+                            active_fragment_layout.as_ref(),
+                            0,
+                            &mut next_synthetic,
+                            &mut functions,
+                        )?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            // Fragmented optimizing functions and streaming baseline
+            // functions use exact preflight for every fragment. The cheap
+            // planner estimate intentionally cannot account for the full
+            // live-state fanout of direct guards; without this pass, one
+            // underestimated fragment rejects the complete artifact only
+            // after all preceding fragments have already been compiled.
             if active_fragment_layout.is_some() {
                 for replan_attempt in 0..=MAX_PRE_REGALLOC_REPLAN_ATTEMPTS {
                     let mut offending_fragments = Vec::new();
@@ -3405,33 +3483,44 @@ pub(super) fn compile_region_graph_native(
                         .insert(candidate.function, (function_bytes, maximum_stack));
                 } else {
                     let register_liveness = NativeRegisterLiveness::analyze(candidate);
-                    let compiler =
-                        crate::cranelift_lowering::baseline_streaming::compiler_for_tier(
-                            candidate.compile_metadata.tier,
-                        );
-                    let defined = compiler.compile_fragment(&mut |compilation_mode| {
-                        define_region_graph_function(
+                    let defined = if let Some(preflighted) = preflighted_whole.take() {
+                        compile_preflighted_region_function(
                             module,
                             codegen_context,
-                            builder_context,
-                            candidate,
-                            &unit.constants,
-                            &value_flows[&candidate.function],
                             functions[&candidate.function],
+                            candidate,
                             &functions,
-                            &inline_constants,
-                            &tail_forwards,
-                            &function_params,
-                            &request.external_function_signatures,
-                            tier_operations,
-                            &register_liveness,
-                            None,
-                            runtime_unit_identity,
-                            compilation_mode,
-                            false,
-                            false,
+                            preflighted,
                         )
-                    })?;
+                    } else {
+                        let compiler =
+                            crate::cranelift_lowering::baseline_streaming::compiler_for_tier(
+                                candidate.compile_metadata.tier,
+                            );
+                        compiler.compile_fragment(&mut |compilation_mode| {
+                            define_region_graph_function(
+                                module,
+                                codegen_context,
+                                builder_context,
+                                candidate,
+                                &unit.constants,
+                                &value_flows[&candidate.function],
+                                functions[&candidate.function],
+                                &functions,
+                                &inline_constants,
+                                &tail_forwards,
+                                &function_params,
+                                &request.external_function_signatures,
+                                tier_operations,
+                                &register_liveness,
+                                None,
+                                runtime_unit_identity,
+                                compilation_mode,
+                                false,
+                                false,
+                            )
+                        })
+                    }?;
                     let metrics = append_defined(
                         candidate.function,
                         region_arity(candidate)?,
@@ -5987,6 +6076,30 @@ fn define_region_graph_function(
                                 .local_offset(local)?,
                         );
                         define_local_variable(&mut builder, &locals, local, value)?;
+                    }
+                    let mut restored_registers = register_variables.clone();
+                    for register in register_live_in.get(entry).into_iter().flatten() {
+                        let type_ = register_types.get(register).copied().unwrap_or(types::I64);
+                        let value = builder.ins().load(
+                            types::I64,
+                            MemFlagsData::new(),
+                            frame,
+                            frame_layout
+                                .expect("optimizing fragment frame layout")
+                                .register_offset(fragment.fragment.id, *register)?,
+                        );
+                        let value = if type_ == types::I64 {
+                            value
+                        } else {
+                            builder.ins().ireduce(type_, value)
+                        };
+                        define_region_register(
+                            &mut builder,
+                            &register_variables,
+                            &mut restored_registers,
+                            *register,
+                            value,
+                        )?;
                     }
                 }
                 builder.ins().jump(cranelift_block(&blocks, *entry)?, &[]);

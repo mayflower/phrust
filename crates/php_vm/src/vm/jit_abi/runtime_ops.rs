@@ -1944,9 +1944,16 @@ pub(in crate::vm) extern "C" fn jit_native_value_release_abi(
         match context.release(encoded) {
             Ok(()) => 0,
             Err(error) => {
+                let active_function = context
+                    .call_frames
+                    .last()
+                    .and_then(|frame| frame.metadata.as_ref())
+                    .map_or("<unknown>", |metadata| metadata.name.as_ref());
                 record_native_helper_failure(
                     context,
-                    format!("native final release of {encoded} failed: {error}"),
+                    format!(
+                        "native final release of {encoded} in {active_function}() failed: {error}"
+                    ),
                 );
                 php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
             }

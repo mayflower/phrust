@@ -372,7 +372,6 @@ impl NativeRequestColdState<'_> {
             self.native_frame_arena.capacity_bytes() as u64;
         counters.native_frame_arena_high_water_bytes =
             self.native_frame_arena.high_water_bytes() as u64;
-        let cold_values = self.value_slots.usage(self.values.len());
         let direct_values = self
             .direct_value_slots
             .usage(*self.direct_value_next as usize);
@@ -389,7 +388,6 @@ impl NativeRequestColdState<'_> {
             .static_property_slots
             .usage(*self.static_property_next as usize);
         for (name, usage) in [
-            ("cold_value_slots", cold_values),
             ("direct_value_slots", direct_values),
             ("direct_object_owners", direct_object_owners),
             ("direct_array_entries", direct_arrays),
@@ -1000,16 +998,6 @@ impl NativeRequestColdState<'_> {
         record_scratch(target, &LIFECYCLE_REASONS, reason);
     }
 
-    pub(super) fn record_release_to_zero(&self) {
-        if self.options.collect_counters {
-            let mut telemetry = self.runtime_telemetry.borrow_mut();
-            telemetry.counters.runtime_helper_release_to_zero = telemetry
-                .counters
-                .runtime_helper_release_to_zero
-                .saturating_add(1);
-        }
-    }
-
     pub(super) fn record_root_rebuild_reason(&self, reason: &'static str) {
         if !self.options.collect_counters {
             return;
@@ -1019,48 +1007,6 @@ impl NativeRequestColdState<'_> {
             &ROOT_REASONS,
             reason,
         );
-    }
-
-    pub(super) fn record_value_table_allocation(&self, high_water: usize, kind: &'static str) {
-        if self.options.collect_counters {
-            let mut telemetry = self.runtime_telemetry.borrow_mut();
-            let helper = telemetry
-                .helper_timing_stack
-                .last()
-                .map_or("outside_helper", |frame| HELPER_NAMES[frame.helper_index]);
-            telemetry.counters.native_value_table_allocations = telemetry
-                .counters
-                .native_value_table_allocations
-                .saturating_add(1);
-            telemetry.counters.native_value_table_high_water = telemetry
-                .counters
-                .native_value_table_high_water
-                .max(high_water as u64);
-            *telemetry
-                .counters
-                .native_value_table_materializations_by_kind_and_origin
-                .entry(format!("{kind}@{helper}"))
-                .or_default() += 1;
-        }
-    }
-
-    pub(super) fn record_value_table_reuse(&self, kind: &'static str) {
-        if self.options.collect_counters {
-            let mut telemetry = self.runtime_telemetry.borrow_mut();
-            let helper = telemetry
-                .helper_timing_stack
-                .last()
-                .map_or("outside_helper", |frame| HELPER_NAMES[frame.helper_index]);
-            telemetry.counters.native_value_table_reuses = telemetry
-                .counters
-                .native_value_table_reuses
-                .saturating_add(1);
-            *telemetry
-                .counters
-                .native_value_table_materializations_by_kind_and_origin
-                .entry(format!("{kind}@{helper}"))
-                .or_default() += 1;
-        }
     }
 
     pub(super) fn record_direct_array_materialization(

@@ -195,19 +195,9 @@ impl NativeRequestFastState {
     fn reserve_direct_value_index(&mut self) -> Result<u32, &'static str> {
         let view = self.header.runtime_view;
         let value_next = view.direct_value_next as usize as *mut u32;
-        let free_head = view.direct_value_free_head as usize as *mut u32;
-        let reused_bytes = view.direct_value_reused_bytes as usize as *mut u64;
-        let slots = view.direct_value_slots as usize as *mut php_jit::JitNativeValueSlot;
         // SAFETY: runtime publication owns these stable counters and the
         // request executes synchronously on one thread.
         unsafe {
-            if *free_head != php_jit::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE {
-                let index = *free_head;
-                *free_head = (*slots.add(index as usize)).reserved;
-                *reused_bytes = (*reused_bytes)
-                    .saturating_add(std::mem::size_of::<php_jit::JitNativeValueSlot>() as u64);
-                return Ok(index);
-            }
             let index = *value_next;
             if index as usize >= php_jit::JIT_NATIVE_DIRECT_VALUE_CAPACITY {
                 return Err("direct native value arena exhausted");
@@ -1713,8 +1703,6 @@ pub(super) struct NativeRequestColdState<'a> {
     current_native_execution_scope: u32,
     native_method_pics: std::collections::BTreeMap<u64, NativeMethodPic>,
     pub(super) output: php_runtime::api::OutputBuffer,
-    values: Vec<Option<NativeStoredValue>>,
-    value_slots: php_runtime::api::StableNativeArena<php_jit::JitNativeValueSlot>,
     direct_value_slots: php_runtime::api::StableNativeArena<php_jit::JitNativeValueSlot>,
     direct_value_next: Box<u32>,
     direct_object_owners: php_runtime::api::StableNativeArena<u64>,
@@ -1773,7 +1761,6 @@ pub(super) struct NativeRequestColdState<'a> {
     direct_array_encode_depth: usize,
     native_poll_counter: Box<u32>,
     native_root_mutation_pending: Box<u32>,
-    free_value_slots: Vec<u32>,
     /// Successfully resolved IR constants are immutable for the lifetime of
     /// their owning unit. Keep one request-local value per unit/index so hot
     /// native operands do not repeatedly search runtime constant registries.
@@ -2105,34 +2092,12 @@ impl<'a> std::ops::DerefMut for NativeRequestOwner<'a> {
     }
 }
 
-// Generated code holds raw pointers into these parallel vectors while a
-// request is active, so their allocations must not move.
-const NATIVE_COLD_VALUE_SLOT_LIMIT: usize = 1 << 20;
-fn stored_value_slot(value: &NativeStoredValue) -> php_jit::JitNativeValueSlot {
-    let mut slot = php_jit::JitNativeValueSlot {
-        refcount: 1,
-        ..php_jit::JitNativeValueSlot::default()
-    };
-    match value {
-        NativeStoredValue::ArrayIterator(iterator) => {
-            if let Some(direct) = iterator.direct.as_ref() {
-                slot.kind = php_jit::JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT;
-                slot.flags = php_jit::JIT_NATIVE_FOREACH_VIEW_ABI_VERSION;
-                slot.payload = std::ptr::from_ref(direct.view.as_ref()) as usize as u64;
-            }
-        }
-        _ => {}
-    }
-    slot
-}
-
-enum NativeStoredValue {
-    /// Generator identity imported through an explicit cold/runtime boundary.
-    /// It is never exposed as a generic `Value` slot to generated code.
-    MaterializedGenerator(php_runtime::api::GeneratorRef),
-    ArrayIterator(Box<NativeArrayIteratorState>),
-    Iterator(Box<NativeIteratorState>),
-    BaselineGeneratorIterator(Box<BaselineGeneratorIteratorState>),
+/// Baseline-only iterator state. The allocation is owned by one authoritative
+/// direct value slot; there is no parallel request value table or mirror slot.
+enum NativeColdIterator {
+    Array(Box<NativeArrayIteratorState>),
+    User(Box<NativeIteratorState>),
+    Generator(Box<BaselineGeneratorIteratorState>),
 }
 
 /// Value family observed directly from an encoded native value.  This is a
@@ -2458,7 +2423,6 @@ struct BaselineGeneratorIteratorState {
 /// numeric scratch capacity; it never retains values, globals, callbacks,
 /// exceptions, extension state, or other request semantics.
 pub(super) struct NativeRequestBuffers {
-    value_slots: php_runtime::api::StableNativeArena<php_jit::JitNativeValueSlot>,
     direct_value_slots: php_runtime::api::StableNativeArena<php_jit::JitNativeValueSlot>,
     direct_value_next: Box<u32>,
     direct_object_owners: php_runtime::api::StableNativeArena<u64>,
@@ -2473,7 +2437,6 @@ pub(super) struct NativeRequestBuffers {
     direct_string_next: Box<u32>,
     direct_string_free_heads: Box<[u32; php_jit::JIT_NATIVE_DIRECT_STRING_FREE_BUCKETS]>,
     direct_string_reused_bytes: Box<u64>,
-    free_value_slots: Vec<u32>,
     fiber_suspension_states: php_runtime::api::StableNativeArena<php_jit::JitDeoptState>,
     fiber_suspension_next: Box<u32>,
     static_property_slots:
@@ -2498,7 +2461,6 @@ pub(super) struct NativeRequestBuffers {
 impl Default for NativeRequestBuffers {
     fn default() -> Self {
         Self {
-            value_slots: php_runtime::api::StableNativeArena::new(NATIVE_COLD_VALUE_SLOT_LIMIT),
             direct_value_slots: php_runtime::api::StableNativeArena::new(
                 php_jit::JIT_NATIVE_DIRECT_VALUE_CAPACITY,
             ),
@@ -2529,7 +2491,6 @@ impl Default for NativeRequestBuffers {
                     php_jit::JIT_NATIVE_DIRECT_STRING_FREE_BUCKETS],
             ),
             direct_string_reused_bytes: Box::new(0),
-            free_value_slots: Vec::new(),
             fiber_suspension_states: php_runtime::api::StableNativeArena::new(
                 php_jit::JIT_NATIVE_FIBER_SUSPENSION_CAPACITY,
             ),
@@ -2557,7 +2518,7 @@ impl std::fmt::Debug for NativeRequestBuffers {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("NativeRequestBuffers")
-            .field("slot_capacity", &self.value_slots.capacity())
+            .field("slot_capacity", &self.direct_value_slots.capacity())
             .field(
                 "argument_scratch_capacity",
                 &self.native_call_encoded_scratch.capacity(),
@@ -2592,7 +2553,6 @@ impl NativeRequestPool {
     }
 
     pub(super) fn recycle(&mut self, mut buffers: NativeRequestBuffers) {
-        debug_assert!(buffers.free_value_slots.is_empty());
         debug_assert_eq!(*buffers.direct_value_next, 0);
         debug_assert_eq!(*buffers.direct_array_next, 0);
         debug_assert_eq!(*buffers.direct_string_next, 0);
@@ -2675,26 +2635,6 @@ fn native_request_local_name(function: &php_ir::IrFunction, local: usize) -> Opt
         && !php_ir::is_compiler_generated_local_name(name))
         || SUPERGLOBALS.contains(&name))
     .then_some(name)
-}
-
-fn stored_value_tag(value: &NativeStoredValue) -> u64 {
-    match value {
-        NativeStoredValue::MaterializedGenerator(_) => php_jit::JIT_VALUE_RUNTIME_GENERATOR_TAG,
-        NativeStoredValue::ArrayIterator(_)
-        | NativeStoredValue::Iterator(_)
-        | NativeStoredValue::BaselineGeneratorIterator(_) => {
-            php_jit::JIT_VALUE_RUNTIME_ITERATOR_TAG
-        }
-    }
-}
-
-fn stored_value_kind(value: &NativeStoredValue) -> &'static str {
-    match value {
-        NativeStoredValue::MaterializedGenerator(_) => "materialized_generator",
-        NativeStoredValue::ArrayIterator(_) => "array_iterator",
-        NativeStoredValue::Iterator(_) => "iterator",
-        NativeStoredValue::BaselineGeneratorIterator(_) => "baseline_generator_iterator",
-    }
 }
 
 struct PreparedNativeRuntimeClass {
@@ -3138,7 +3078,6 @@ impl<'a> NativeRequestColdState<'a> {
             environment = std::sync::Arc::new(sorted);
         }
         let NativeRequestBuffers {
-            value_slots,
             direct_value_slots,
             direct_value_next,
             direct_object_owners,
@@ -3153,7 +3092,6 @@ impl<'a> NativeRequestColdState<'a> {
             direct_string_next,
             direct_string_free_heads,
             direct_string_reused_bytes,
-            free_value_slots,
             fiber_suspension_states,
             fiber_suspension_next,
             static_property_slots,
@@ -3191,8 +3129,6 @@ impl<'a> NativeRequestColdState<'a> {
             current_native_execution_scope: 1,
             native_method_pics: std::collections::BTreeMap::new(),
             output,
-            values: Vec::new(),
-            value_slots,
             direct_value_slots,
             direct_value_next,
             direct_object_owners,
@@ -3228,7 +3164,6 @@ impl<'a> NativeRequestColdState<'a> {
             // code then checks the deadline once per 4096 loop-header visits.
             native_poll_counter: Box::new(4095),
             native_root_mutation_pending: Box::new(0),
-            free_value_slots,
             decoded_constant_cache: RefCell::new(std::collections::HashMap::new()),
             runtime_class_cache: RefCell::new(std::collections::HashMap::new()),
             trusted_class_plans: Vec::new(),
@@ -4182,7 +4117,6 @@ impl<'a> NativeRequestColdState<'a> {
         // force-recycled. Doing this after individual slots were reclaimed
         // made graph order observable and could leave an escaped empty shell.
         let _ = self.demote_all_direct_objects();
-        let cold_value_used = self.values.len();
         let direct_value_used = usize::try_from(*self.direct_value_next).unwrap_or(0);
         let direct_array_used = usize::try_from(*self.direct_array_next).unwrap_or(0);
         let direct_string_used = usize::try_from(*self.direct_string_next).unwrap_or(0);
@@ -4209,8 +4143,6 @@ impl<'a> NativeRequestColdState<'a> {
                 }
             }
         }
-        self.values.clear();
-        self.value_slots.discard_prefix(cold_value_used);
         self.direct_value_slots.discard_prefix(direct_value_used);
         self.direct_object_owners.discard_prefix(direct_value_used);
         self.direct_array_states.discard_prefix(direct_value_used);
@@ -4244,7 +4176,6 @@ impl<'a> NativeRequestColdState<'a> {
         self.direct_array_storage_ids.clear();
         self.direct_array_encode_depth = 0;
         self.class_constant_cache.clear();
-        self.free_value_slots.clear();
         let diagnostic_telemetry = std::mem::replace(
             &mut self.runtime_telemetry,
             Rc::new(RefCell::new(NativeRuntimeTelemetry::default())),
@@ -4255,7 +4186,6 @@ impl<'a> NativeRequestColdState<'a> {
         diagnostic_telemetry.reset_for_pool();
         self.worker_state
             .recycle_native_request_buffers(NativeRequestBuffers {
-                value_slots: std::mem::take(&mut self.value_slots),
                 direct_value_slots: std::mem::take(&mut self.direct_value_slots),
                 direct_value_next: std::mem::take(&mut self.direct_value_next),
                 direct_object_owners: std::mem::take(&mut self.direct_object_owners),
@@ -4270,7 +4200,6 @@ impl<'a> NativeRequestColdState<'a> {
                 direct_string_next: std::mem::take(&mut self.direct_string_next),
                 direct_string_free_heads: std::mem::take(&mut self.direct_string_free_heads),
                 direct_string_reused_bytes: std::mem::take(&mut self.direct_string_reused_bytes),
-                free_value_slots: std::mem::take(&mut self.free_value_slots),
                 fiber_suspension_states: std::mem::take(&mut self.fiber_suspension_states),
                 fiber_suspension_next: std::mem::take(&mut self.fiber_suspension_next),
                 static_property_slots: std::mem::take(&mut self.static_property_slots),
@@ -5317,7 +5246,7 @@ impl<'a> NativeRequestColdState<'a> {
 
     /// Borrows the authoritative closure record published directly by this
     /// value slot. The pointer is stable until the final encoded owner is
-    /// released; no `NativeStoredValue` mirror participates in lookup.
+    /// released; no parallel runtime-value mirror participates in lookup.
     #[allow(unsafe_code)]
     fn direct_prepared_callable(&self, index: usize) -> Option<&NativePreparedCallable> {
         let slot = *self.direct_value_slots.get(index)?;
@@ -5666,18 +5595,6 @@ impl<'a> NativeRequestColdState<'a> {
     }
 
     fn reserve_direct_value_slot(&mut self) -> Result<usize, String> {
-        if *self.direct_value_free_head != php_jit::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE {
-            let index = *self.direct_value_free_head as usize;
-            let slot = self
-                .direct_value_slots
-                .get(index)
-                .ok_or_else(|| "direct native value free-list entry is missing".to_owned())?;
-            *self.direct_value_free_head = slot.reserved;
-            *self.direct_value_reused_bytes = self
-                .direct_value_reused_bytes
-                .saturating_add(std::mem::size_of::<php_jit::JitNativeValueSlot>() as u64);
-            return Ok(index);
-        }
         let index = usize::try_from(*self.direct_value_next)
             .map_err(|_| "direct native value index overflow".to_owned())?;
         if index >= self.direct_value_slots.len() {
@@ -5703,9 +5620,122 @@ impl<'a> NativeRequestColdState<'a> {
         Ok(index)
     }
 
+    fn encode_direct_slot_index(index: usize, tag: u64) -> Result<i64, String> {
+        let runtime_index = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE))
+            .ok_or_else(|| "direct native value handle overflow".to_owned())?;
+        Ok(php_jit::jit_encode_typed_runtime_value(runtime_index, tag))
+    }
+
+    fn publish_cold_iterator(&mut self, iterator: NativeColdIterator) -> Result<i64, String> {
+        let index = self.reserve_direct_value_slot()?;
+        let direct_view = match &iterator {
+            NativeColdIterator::Array(iterator) => iterator
+                .direct
+                .as_ref()
+                .map(|direct| std::ptr::from_ref(direct.view.as_ref()) as usize as u64),
+            NativeColdIterator::User(_) | NativeColdIterator::Generator(_) => None,
+        };
+        let owner = Box::into_raw(Box::new(iterator));
+        self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
+            refcount: 1,
+            kind: if direct_view.is_some() {
+                php_jit::JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT
+            } else {
+                php_jit::JIT_NATIVE_VALUE_VIEW_COLD_ITERATOR
+            },
+            flags: if direct_view.is_some() {
+                php_jit::JIT_NATIVE_FOREACH_VIEW_ABI_VERSION
+            } else {
+                php_jit::JIT_NATIVE_COLD_ITERATOR_ABI_VERSION
+            },
+            payload: direct_view.unwrap_or(0),
+            aux: owner as usize as u64,
+            ..php_jit::JitNativeValueSlot::default()
+        };
+        Self::encode_direct_slot_index(index, php_jit::JIT_VALUE_RUNTIME_ITERATOR_TAG)
+    }
+
+    fn cold_iterator(&self, index: usize) -> Option<&NativeColdIterator> {
+        let slot = self.direct_value_slots.get(index)?;
+        if slot.refcount == 0
+            || !matches!(
+                slot.kind,
+                php_jit::JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT
+                    | php_jit::JIT_NATIVE_VALUE_VIEW_COLD_ITERATOR
+            )
+            || slot.aux == 0
+        {
+            return None;
+        }
+        // SAFETY: publication owns exactly one boxed iterator through `aux`;
+        // final direct-slot release reclaims it after all users have stopped.
+        #[allow(unsafe_code)]
+        unsafe {
+            (slot.aux as usize as *const NativeColdIterator).as_ref()
+        }
+    }
+
+    fn cold_iterator_mut(&mut self, index: usize) -> Option<&mut NativeColdIterator> {
+        let slot = self.direct_value_slots.get(index)?;
+        if slot.refcount == 0
+            || !matches!(
+                slot.kind,
+                php_jit::JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT
+                    | php_jit::JIT_NATIVE_VALUE_VIEW_COLD_ITERATOR
+            )
+            || slot.aux == 0
+        {
+            return None;
+        }
+        // SAFETY: request execution is synchronous and this mutable borrow is
+        // the only access to the request-owned iterator record.
+        #[allow(unsafe_code)]
+        unsafe {
+            (slot.aux as usize as *mut NativeColdIterator).as_mut()
+        }
+    }
+
+    fn publish_cold_generator(
+        &mut self,
+        generator: php_runtime::api::GeneratorRef,
+    ) -> Result<i64, String> {
+        let index = self.reserve_direct_value_slot()?;
+        let id = generator.id();
+        let owner = Box::into_raw(Box::new(generator));
+        self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
+            refcount: 1,
+            kind: php_jit::JIT_NATIVE_VALUE_VIEW_COLD_GENERATOR,
+            flags: php_jit::JIT_NATIVE_COLD_GENERATOR_ABI_VERSION,
+            payload: id,
+            aux: owner as usize as u64,
+            ..php_jit::JitNativeValueSlot::default()
+        };
+        self.direct_generator_handles.insert(id, index as u32);
+        Self::encode_direct_slot_index(index, php_jit::JIT_VALUE_RUNTIME_GENERATOR_TAG)
+    }
+
+    fn cold_generator(&self, index: usize) -> Option<&php_runtime::api::GeneratorRef> {
+        let slot = self.direct_value_slots.get(index)?;
+        if slot.refcount == 0
+            || slot.kind != php_jit::JIT_NATIVE_VALUE_VIEW_COLD_GENERATOR
+            || slot.flags != php_jit::JIT_NATIVE_COLD_GENERATOR_ABI_VERSION
+            || slot.aux == 0
+        {
+            return None;
+        }
+        // SAFETY: the direct slot owns this boxed GeneratorRef until final
+        // release and request execution is synchronous.
+        #[allow(unsafe_code)]
+        unsafe {
+            (slot.aux as usize as *const php_runtime::api::GeneratorRef).as_ref()
+        }
+    }
+
     /// Publishes a PHP string directly into the authoritative request-owned
     /// native byte/value plane. The Rust `PhpString` is consumed at this
-    /// boundary and is not mirrored in `NativeStoredValue`.
+    /// boundary and is not mirrored in a second runtime-value table.
     #[track_caller]
     fn encode_native_string_owner(&mut self, string: PhpString) -> Result<i64, String> {
         if let Some(index) = self.direct_string_handles.get(&string).copied() {
@@ -5811,11 +5841,7 @@ impl<'a> NativeRequestColdState<'a> {
         {
             Some(runtime_index) => runtime_index,
             None => {
-                self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
-                    reserved: *self.direct_value_free_head,
-                    ..php_jit::JitNativeValueSlot::default()
-                };
-                *self.direct_value_free_head = index as u32;
+                self.direct_value_slots[index] = php_jit::JitNativeValueSlot::default();
                 self.free_direct_string_bytes(start, capacity);
                 return Err("direct native value handle overflow".to_owned());
             }
@@ -6976,6 +7002,20 @@ impl<'a> NativeRequestColdState<'a> {
             self.direct_generator_cells.insert(index, generator.clone());
             return Ok(Value::Generator(generator));
         }
+        if slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_COLD_GENERATOR {
+            let generator = self
+                .cold_generator(index)
+                .cloned()
+                .ok_or_else(|| format!("cold native Generator {index} has no stable identity"))?;
+            return Ok(Value::Generator(generator));
+        }
+        if matches!(
+            slot.kind,
+            php_jit::JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT
+                | php_jit::JIT_NATIVE_VALUE_VIEW_COLD_ITERATOR
+        ) {
+            return Err(format!("direct native value {index} is a foreach iterator"));
+        }
         if slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE {
             let prepared = self
                 .direct_prepared_callable(index)
@@ -7262,19 +7302,9 @@ impl<'a> NativeRequestColdState<'a> {
             if let Some(direct) = Self::direct_value_index(encoded) {
                 return self.decode_direct_value(direct);
             }
-            return match self.values.get(index as usize).and_then(Option::as_ref) {
-                Some(NativeStoredValue::MaterializedGenerator(generator)) => {
-                    Ok(Value::Generator(generator.clone()))
-                }
-                Some(
-                    NativeStoredValue::ArrayIterator(_)
-                    | NativeStoredValue::Iterator(_)
-                    | NativeStoredValue::BaselineGeneratorIterator(_),
-                ) => Err(format!(
-                    "native runtime value {index} is a foreach iterator"
-                )),
-                None => Err(format!("native runtime value {index} is missing")),
-            };
+            return Err(format!(
+                "native runtime value {index} is outside the authoritative direct slot plane"
+            ));
         }
         Ok(Value::Int(encoded))
     }
@@ -7516,6 +7546,7 @@ impl<'a> NativeRequestColdState<'a> {
                             slot.kind,
                             php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_GENERATOR
                                 | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_GENERATOR
+                                | php_jit::JIT_NATIVE_VALUE_VIEW_COLD_GENERATOR
                         )
                 })
                 .ok_or_else(|| {
@@ -7533,7 +7564,7 @@ impl<'a> NativeRequestColdState<'a> {
                 php_jit::JIT_VALUE_RUNTIME_GENERATOR_TAG,
             ));
         }
-        self.encode_stored_value(NativeStoredValue::MaterializedGenerator(generator))
+        self.publish_cold_generator(generator)
     }
 
     fn encode_prepared_closure(
@@ -7701,42 +7732,6 @@ impl<'a> NativeRequestColdState<'a> {
         self.encode(value)
     }
 
-    fn encode_stored_value(&mut self, value: NativeStoredValue) -> Result<i64, String> {
-        let tag = stored_value_tag(&value);
-        let kind = stored_value_kind(&value);
-        let native_slot = stored_value_slot(&value);
-        if let Some(index) = self.free_value_slots.pop() {
-            let slot = self
-                .values
-                .get_mut(index as usize)
-                .ok_or_else(|| format!("native free value slot {index} is missing"))?;
-            if slot.is_some()
-                || self
-                    .value_slots
-                    .get(index as usize)
-                    .is_none_or(|slot| slot.refcount != 0)
-            {
-                return Err(format!("native free value slot {index} is still live"));
-            }
-            *slot = Some(value);
-            self.value_slots[index as usize] = native_slot;
-            self.record_value_table_reuse(kind);
-            return Ok(php_jit::jit_encode_typed_runtime_value(index, tag));
-        }
-        let index = u32::try_from(self.values.len())
-            .map_err(|_| "native runtime value table exhausted".to_owned())?;
-        if self.values.len() >= self.value_slots.capacity() {
-            return Err(format!(
-                "native runtime value plane exhausted at {} entries",
-                self.values.len()
-            ));
-        }
-        self.values.push(Some(value));
-        self.value_slots[index as usize] = native_slot;
-        self.record_value_table_allocation(self.values.len(), kind);
-        Ok(php_jit::jit_encode_typed_runtime_value(index, tag))
-    }
-
     /// Give a native callee an independently owned argument without routing
     /// every value through `Value::clone` and a second arena lookup.
     ///
@@ -7751,33 +7746,27 @@ impl<'a> NativeRequestColdState<'a> {
             return self.encode(globals);
         }
         if let Some(index) = Self::direct_value_index(encoded) {
-            let refcount = &mut self
+            let slot = self
                 .direct_value_slots
                 .get_mut(index)
-                .ok_or_else(|| format!("direct native value {index} is missing"))?
-                .refcount;
-            *refcount = refcount
+                .ok_or_else(|| format!("direct native value {index} is missing"))?;
+            if matches!(
+                slot.kind,
+                php_jit::JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT
+                    | php_jit::JIT_NATIVE_VALUE_VIEW_COLD_ITERATOR
+            ) {
+                return Err(format!("direct native value {index} is a foreach iterator"));
+            }
+            slot.refcount = slot
+                .refcount
                 .checked_add(1)
                 .ok_or_else(|| format!("direct native value {index} refcount overflow"))?;
             return Ok(encoded);
         }
         if let Some(index) = php_jit::jit_decode_runtime_value(encoded) {
-            let index = index as usize;
-            match self.values.get(index).and_then(Option::as_ref) {
-                Some(NativeStoredValue::MaterializedGenerator(_)) => {}
-                Some(
-                    NativeStoredValue::ArrayIterator(_)
-                    | NativeStoredValue::Iterator(_)
-                    | NativeStoredValue::BaselineGeneratorIterator(_),
-                ) => {
-                    return Err(format!(
-                        "native runtime value {index} is a foreach iterator"
-                    ));
-                }
-                None => return Err(format!("native runtime value {index} is missing")),
-            }
-            self.retain_runtime_value_index(index)?;
-            return Ok(encoded);
+            return Err(format!(
+                "native runtime value {index} is outside the authoritative direct slot plane"
+            ));
         }
         if let Some(constant) = php_jit::jit_decode_constant(encoded)
             && !matches!(
@@ -7804,24 +7793,23 @@ impl<'a> NativeRequestColdState<'a> {
         if self.is_globals_proxy(encoded) {
             return Ok(None);
         }
-        if Self::direct_value_index(encoded).is_some() {
+        if let Some(index) = Self::direct_value_index(encoded) {
+            if self.direct_value_slots.get(index).is_some_and(|slot| {
+                matches!(
+                    slot.kind,
+                    php_jit::JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT
+                        | php_jit::JIT_NATIVE_VALUE_VIEW_COLD_ITERATOR
+                )
+            }) {
+                return Ok(None);
+            }
             self.retain(encoded)?;
             return Ok(Some(encoded));
         }
         if let Some(index) = php_jit::jit_decode_runtime_value(encoded) {
-            let index = index as usize;
-            return match self.values.get(index).and_then(Option::as_ref) {
-                Some(NativeStoredValue::MaterializedGenerator(_)) => {
-                    self.retain_runtime_value_index(index)?;
-                    Ok(Some(encoded))
-                }
-                Some(
-                    NativeStoredValue::ArrayIterator(_)
-                    | NativeStoredValue::Iterator(_)
-                    | NativeStoredValue::BaselineGeneratorIterator(_),
-                ) => Ok(None),
-                None => Err(format!("native runtime value {index} is missing")),
-            };
+            return Err(format!(
+                "native runtime value {index} is outside the authoritative direct slot plane"
+            ));
         }
         if let Some(constant) = php_jit::jit_decode_constant(encoded)
             && !matches!(
@@ -8104,19 +8092,9 @@ impl<'a> NativeRequestColdState<'a> {
         let Some(index) = php_jit::jit_decode_runtime_value(encoded) else {
             return Ok(());
         };
-        let index = index as usize;
-        if self.values.get(index).and_then(Option::as_ref).is_none() {
-            return Err(format!("native runtime value {index} is missing"));
-        }
-        let refcount = &mut self
-            .value_slots
-            .get_mut(index)
-            .ok_or_else(|| format!("native runtime value {index} has no slot"))?
-            .refcount;
-        *refcount = refcount
-            .checked_add(1)
-            .ok_or_else(|| format!("native runtime value {index} refcount overflow"))?;
-        Ok(())
+        Err(format!(
+            "native runtime value {index} is outside the authoritative direct slot plane"
+        ))
     }
 
     fn native_scalar_encoding(&mut self, value: &Value) -> Option<i64> {
@@ -8141,18 +8119,9 @@ impl<'a> NativeRequestColdState<'a> {
                 ))
             });
         }
-        let Some(index) = php_jit::jit_decode_runtime_value(encoded) else {
-            return Some(false);
-        };
-        match self.values.get(index as usize).and_then(Option::as_ref) {
-            Some(NativeStoredValue::MaterializedGenerator(_)) => Some(false),
-            Some(
-                NativeStoredValue::ArrayIterator(_)
-                | NativeStoredValue::Iterator(_)
-                | NativeStoredValue::BaselineGeneratorIterator(_),
-            )
-            | None => None,
-        }
+        php_jit::jit_decode_runtime_value(encoded)
+            .is_none()
+            .then_some(false)
     }
 
     /// Copy one native string name for a cold capability lookup without
@@ -8319,12 +8288,7 @@ impl<'a> NativeRequestColdState<'a> {
             .ok()
             .and_then(|index| index.checked_add(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE))
         else {
-            self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
-                reserved: *self.direct_value_free_head,
-                ..php_jit::JitNativeValueSlot::default()
-            };
-            *self.direct_value_free_head =
-                u32::try_from(index).unwrap_or(php_jit::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE);
+            self.direct_value_slots[index] = php_jit::JitNativeValueSlot::default();
             return Err("direct native reference handle overflow".to_owned());
         };
         Ok((php_jit::JIT_VALUE_RUNTIME_REFERENCE_TAG | u64::from(runtime_index)) as i64)
@@ -8592,7 +8556,8 @@ impl<'a> NativeRequestColdState<'a> {
                     Some(NativeEncodedValueKind::Fiber)
                 }
                 php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_GENERATOR
-                | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_GENERATOR => {
+                | php_jit::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_GENERATOR
+                | php_jit::JIT_NATIVE_VALUE_VIEW_COLD_GENERATOR => {
                     Some(NativeEncodedValueKind::Generator)
                 }
                 php_jit::JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR
@@ -8602,13 +8567,8 @@ impl<'a> NativeRequestColdState<'a> {
                 _ => None,
             };
         }
-        let index = php_jit::jit_decode_runtime_value(encoded)? as usize;
-        match self.values.get(index)?.as_ref()? {
-            NativeStoredValue::MaterializedGenerator(_) => Some(NativeEncodedValueKind::Generator),
-            NativeStoredValue::ArrayIterator(_)
-            | NativeStoredValue::Iterator(_)
-            | NativeStoredValue::BaselineGeneratorIterator(_) => None,
-        }
+        let _ = php_jit::jit_decode_runtime_value(encoded)?;
+        None
     }
 
     fn native_encoded_int(&self, encoded: i64) -> Option<i64> {
@@ -9338,6 +9298,13 @@ impl<'a> NativeRequestColdState<'a> {
         }
         if let Some(index) = Self::direct_value_index(encoded) {
             let slot = self.direct_value_slots.get(index)?;
+            if matches!(
+                slot.kind,
+                php_jit::JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT
+                    | php_jit::JIT_NATIVE_VALUE_VIEW_COLD_ITERATOR
+            ) {
+                return None;
+            }
             return (slot.refcount != 0
                 && !matches!(
                     slot.kind,
@@ -9346,13 +9313,8 @@ impl<'a> NativeRequestColdState<'a> {
                 ))
             .then_some(true);
         }
-        let index = php_jit::jit_decode_runtime_value(encoded)? as usize;
-        match self.values.get(index)?.as_ref()? {
-            NativeStoredValue::MaterializedGenerator(_) => Some(true),
-            NativeStoredValue::ArrayIterator(_)
-            | NativeStoredValue::Iterator(_)
-            | NativeStoredValue::BaselineGeneratorIterator(_) => None,
-        }
+        let _ = php_jit::jit_decode_runtime_value(encoded)?;
+        None
     }
 
     /// Exact native truthiness for scalar/string/array common shapes. Objects
@@ -9400,16 +9362,13 @@ impl<'a> NativeRequestColdState<'a> {
                 php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT
                 | php_jit::JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR
                 | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR => None,
+                php_jit::JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT
+                | php_jit::JIT_NATIVE_VALUE_VIEW_COLD_ITERATOR => None,
                 _ => Some(true),
             };
         }
-        let index = php_jit::jit_decode_runtime_value(encoded)? as usize;
-        match self.values.get(index)?.as_ref()? {
-            NativeStoredValue::MaterializedGenerator(_) => Some(true),
-            NativeStoredValue::ArrayIterator(_)
-            | NativeStoredValue::Iterator(_)
-            | NativeStoredValue::BaselineGeneratorIterator(_) => None,
-        }
+        let _ = php_jit::jit_decode_runtime_value(encoded)?;
+        None
     }
 
     /// Outer `None` means a non-direct shape; inner `None` means a valid
@@ -9442,18 +9401,6 @@ impl<'a> NativeRequestColdState<'a> {
         false
     }
 
-    fn retain_runtime_value_index(&mut self, index: usize) -> Result<(), String> {
-        let refcount = &mut self
-            .value_slots
-            .get_mut(index)
-            .ok_or_else(|| format!("native runtime value {index} has no slot"))?
-            .refcount;
-        *refcount = refcount
-            .checked_add(1)
-            .ok_or_else(|| format!("native runtime value {index} refcount overflow"))?;
-        Ok(())
-    }
-
     fn release(&mut self, encoded: i64) -> Result<(), String> {
         if let Some(index) = Self::direct_value_index(encoded) {
             return self.release_direct_value_index(index);
@@ -9461,7 +9408,9 @@ impl<'a> NativeRequestColdState<'a> {
         let Some(index) = php_jit::jit_decode_runtime_value(encoded) else {
             return Ok(());
         };
-        self.release_runtime_value_index(index as usize)
+        Err(format!(
+            "native runtime value {index} is outside the authoritative direct slot plane"
+        ))
     }
 
     fn release_direct_value_index(&mut self, index: usize) -> Result<(), String> {
@@ -9471,7 +9420,10 @@ impl<'a> NativeRequestColdState<'a> {
                 .get_mut(index)
                 .ok_or_else(|| format!("direct native value {index} is missing"))?;
             if slot.refcount == 0 {
-                return Err(format!("direct native value {index} was already released"));
+                return Err(format!(
+                    "direct native value {index} was already released (retired kind {})",
+                    slot.flags
+                ));
             }
             slot.refcount -= 1;
             slot.refcount == 0
@@ -9600,6 +9552,41 @@ impl<'a> NativeRequestColdState<'a> {
         } else {
             None
         };
+        let released_cold_generator = if slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_COLD_GENERATOR
+        {
+            if slot.aux == 0 {
+                return Err(format!(
+                    "cold native Generator {index} lost its stable identity"
+                ));
+            }
+            // SAFETY: cold Generator publication created exactly one
+            // boxed identity and final direct-slot release reclaims it.
+            #[allow(unsafe_code)]
+            let generator =
+                unsafe { Box::from_raw(slot.aux as usize as *mut php_runtime::api::GeneratorRef) };
+            self.direct_generator_handles
+                .retain(|_, mapped| *mapped as usize != index);
+            Some(generator)
+        } else {
+            None
+        };
+        let released_cold_iterator = if matches!(
+            slot.kind,
+            php_jit::JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT
+                | php_jit::JIT_NATIVE_VALUE_VIEW_COLD_ITERATOR
+        ) {
+            if slot.aux == 0 {
+                return Err(format!(
+                    "cold native iterator {index} lost its stable record"
+                ));
+            }
+            // SAFETY: iterator publication created exactly one boxed record
+            // and final direct-slot release reclaims it once.
+            #[allow(unsafe_code)]
+            Some(unsafe { Box::from_raw(slot.aux as usize as *mut NativeColdIterator) })
+        } else {
+            None
+        };
         if slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_SHARED_ARRAY
             && !php_runtime::api::PhpArray::release_native_storage_refcount(slot.payload as usize)
         {
@@ -9687,13 +9674,37 @@ impl<'a> NativeRequestColdState<'a> {
                 });
             }
         }
+        if let Some(iterator) = released_cold_iterator {
+            match *iterator {
+                NativeColdIterator::Array(iterator) => {
+                    if let Some(direct) = iterator.direct {
+                        children.extend(
+                            direct
+                                .entries
+                                .iter()
+                                .flat_map(|entry| [entry.key, entry.value]),
+                        );
+                    }
+                }
+                NativeColdIterator::User(_) => {}
+                NativeColdIterator::Generator(iterator) => {
+                    self.baseline_generator_iterators
+                        .remove(&iterator.generator.id());
+                    children.extend(iterator.arguments);
+                    if let Some(BaselineGeneratorDelegation::Generator { iterator, .. }) =
+                        iterator.delegation
+                    {
+                        children.push(iterator);
+                    }
+                }
+            }
+        }
         children.extend(direct_object_children);
         self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
-            reserved: *self.direct_value_free_head,
+            flags: slot.kind,
             ..php_jit::JitNativeValueSlot::default()
         };
         self.direct_array_states[index] = php_jit::JitNativeDirectArrayState::default();
-        *self.direct_value_free_head = index as u32;
         self.direct_reference_cells.remove(&index);
         if let Some((start, capacity)) = freed_array_range {
             self.free_direct_array_entries(start, capacity);
@@ -9723,33 +9734,7 @@ impl<'a> NativeRequestColdState<'a> {
             }
         }
         drop(released_resource);
-        Ok(())
-    }
-
-    fn release_runtime_value_index(&mut self, index: usize) -> Result<(), String> {
-        let reached_zero = {
-            let refcount = &mut self
-                .value_slots
-                .get_mut(index)
-                .ok_or_else(|| format!("native runtime value {index} has no slot"))?
-                .refcount;
-            if *refcount == 0 {
-                return Err(format!("native runtime value {index} was already released"));
-            }
-            *refcount -= 1;
-            *refcount == 0
-        };
-        if reached_zero {
-            self.record_release_to_zero();
-            let value = self
-                .values
-                .get_mut(index)
-                .ok_or_else(|| format!("native runtime value {index} is missing"))?
-                .take();
-            self.value_slots[index] = php_jit::JitNativeValueSlot::default();
-            drop(value);
-            self.free_value_slots.push(index as u32);
-        }
+        drop(released_cold_generator);
         Ok(())
     }
 
@@ -9763,14 +9748,9 @@ impl<'a> NativeRequestColdState<'a> {
         let Some(index) = php_jit::jit_decode_runtime_value(encoded) else {
             return Ok(());
         };
-        if self
-            .value_slots
-            .get(index as usize)
-            .is_some_and(|slot| slot.refcount == 0)
-        {
-            return Ok(());
-        }
-        self.release(encoded)
+        Err(format!(
+            "native runtime value {index} is outside the authoritative direct slot plane"
+        ))
     }
 
     fn object_is_request_rooted(&mut self, object_id: u64) -> bool {
@@ -9791,41 +9771,6 @@ impl<'a> NativeRequestColdState<'a> {
     }
 
     fn live_native_values_contain_object(&self, object_id: u64) -> bool {
-        let cold_contains = self.values.iter().flatten().any(|stored| match stored {
-            NativeStoredValue::MaterializedGenerator(_) => false,
-            NativeStoredValue::ArrayIterator(iterator) => {
-                values_contain_object(iterator.source.iter().map(|(_, value)| value), object_id)
-            }
-            NativeStoredValue::Iterator(iterator) => {
-                values_contain_object(
-                    iterator
-                        .entries
-                        .iter()
-                        .flat_map(|(key, value)| [key, value]),
-                    object_id,
-                ) || iterator
-                    .live_object
-                    .as_ref()
-                    .is_some_and(|object| object.id() == object_id)
-                    || iterator
-                        .user_iterator
-                        .as_ref()
-                        .is_some_and(|object| object.id() == object_id)
-            }
-            NativeStoredValue::BaselineGeneratorIterator(iterator) => iterator
-                .delegation
-                .as_ref()
-                .is_some_and(|delegation| match delegation {
-                    BaselineGeneratorDelegation::Array { entries, .. } => values_contain_object(
-                        entries.iter().flat_map(|(key, value)| [key, value]),
-                        object_id,
-                    ),
-                    BaselineGeneratorDelegation::Generator { .. } => false,
-                }),
-        });
-        if cold_contains {
-            return true;
-        }
         let mut visited = std::collections::HashSet::new();
         let used = usize::try_from(*self.direct_value_next).unwrap_or(0);
         (0..used).any(|index| {
@@ -9989,6 +9934,43 @@ impl<'a> NativeRequestColdState<'a> {
                         })
                 })
             }
+            php_jit::JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT
+            | php_jit::JIT_NATIVE_VALUE_VIEW_COLD_ITERATOR => self
+                .cold_iterator(index)
+                .is_some_and(|iterator| match iterator {
+                    NativeColdIterator::Array(iterator) => values_contain_object(
+                        iterator.source.iter().map(|(_, value)| value),
+                        object_id,
+                    ),
+                    NativeColdIterator::User(iterator) => {
+                        values_contain_object(
+                            iterator
+                                .entries
+                                .iter()
+                                .flat_map(|(key, value)| [key, value]),
+                            object_id,
+                        ) || iterator
+                            .live_object
+                            .as_ref()
+                            .is_some_and(|object| object.id() == object_id)
+                            || iterator
+                                .user_iterator
+                                .as_ref()
+                                .is_some_and(|object| object.id() == object_id)
+                    }
+                    NativeColdIterator::Generator(iterator) => iterator
+                        .delegation
+                        .as_ref()
+                        .is_some_and(|delegation| match delegation {
+                            BaselineGeneratorDelegation::Array { entries, .. } => {
+                                values_contain_object(
+                                    entries.iter().flat_map(|(key, value)| [key, value]),
+                                    object_id,
+                                )
+                            }
+                            BaselineGeneratorDelegation::Generator { .. } => false,
+                        }),
+                }),
             php_jit::JIT_NATIVE_VALUE_VIEW_SHARED_ARRAY
             | php_jit::JIT_NATIVE_VALUE_VIEW_BORROWED_REFERENCE_ARRAY => {
                 php_runtime::api::PhpArray::clone_from_native_storage_refcount(
@@ -10769,33 +10751,15 @@ impl<'a> NativeRequestColdState<'a> {
             }
         }
         self.direct_array_entries[start..start + entries.len()].copy_from_slice(&entries);
-        let index = if *self.direct_value_free_head != php_jit::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE {
-            let index = *self.direct_value_free_head as usize;
-            let slot = self
-                .direct_value_slots
-                .get(index)
-                .ok_or_else(|| "direct native value free-list entry is missing".to_owned())?;
-            *self.direct_value_free_head = slot.reserved;
-            *self.direct_value_reused_bytes = self
-                .direct_value_reused_bytes
-                .saturating_add(std::mem::size_of::<php_jit::JitNativeValueSlot>() as u64);
-            index
-        } else {
-            let index = usize::try_from(*self.direct_value_next)
-                .map_err(|_| "direct native value index overflow".to_owned())?;
-            if index >= self.direct_value_slots.len() {
+        let index = match self.reserve_direct_value_slot() {
+            Ok(index) => index,
+            Err(error) => {
                 for child in retained {
                     let _ = self.release(child);
                 }
                 self.free_direct_array_entries(start, capacity);
-                return Err(format!(
-                    "direct native value arena exhausted at {} slots",
-                    index.saturating_add(1)
-                ));
+                return Err(error);
             }
-            *self.direct_value_next = u32::try_from(index + 1)
-                .map_err(|_| "direct native value index overflow".to_owned())?;
-            index
         };
         self.direct_value_slots[index] = php_jit::JitNativeValueSlot {
             refcount: 1,
@@ -11154,7 +11118,7 @@ impl<'a> NativeRequestColdState<'a> {
         live_object: Option<php_runtime::api::ObjectRef>,
         user_iterator: Option<php_runtime::api::ObjectRef>,
     ) -> Result<i64, String> {
-        self.encode_stored_value(NativeStoredValue::Iterator(Box::new(NativeIteratorState {
+        self.publish_cold_iterator(NativeColdIterator::User(Box::new(NativeIteratorState {
             entries,
             index: 0,
             live_source,
@@ -11214,7 +11178,7 @@ impl<'a> NativeRequestColdState<'a> {
             });
             Some(Box::new(NativeDirectForeachState { view, entries }))
         };
-        self.encode_stored_value(NativeStoredValue::ArrayIterator(Box::new(
+        self.publish_cold_iterator(NativeColdIterator::Array(Box::new(
             NativeArrayIteratorState {
                 source,
                 index: 0,
@@ -11917,7 +11881,7 @@ impl<'a> NativeRequestColdState<'a> {
             .into_iter()
             .map(|value| self.encode(value))
             .collect::<Result<Vec<_>, _>>()?;
-        self.encode_stored_value(NativeStoredValue::BaselineGeneratorIterator(Box::new(
+        self.publish_cold_iterator(NativeColdIterator::Generator(Box::new(
             BaselineGeneratorIteratorState {
                 generator,
                 handle: Box::new(handle),
@@ -11953,10 +11917,10 @@ impl<'a> NativeRequestColdState<'a> {
         resume_kind: php_jit::JitNativeResumeInputKind,
         resume_value: i64,
     ) -> Result<Option<(Value, Value)>, String> {
-        let index = php_jit::jit_decode_runtime_value(encoded)
+        let index = Self::direct_value_index(encoded)
             .ok_or_else(|| "native value is not a foreach iterator handle".to_owned())?;
-        let user_iterator = match self.values.get(index as usize).and_then(Option::as_ref) {
-            Some(NativeStoredValue::Iterator(iterator)) => iterator
+        let user_iterator = match self.cold_iterator(index) {
+            Some(NativeColdIterator::User(iterator)) => iterator
                 .user_iterator
                 .as_ref()
                 .map(|object| (object.clone(), iterator.user_iterator_started)),
@@ -11982,15 +11946,13 @@ impl<'a> NativeRequestColdState<'a> {
                 .ok_or_else(|| "Iterator::key() is missing".to_owned())?;
             let current = invoke_native_method(self, current, &[receiver])?;
             let key = invoke_native_method(self, key, &[receiver])?;
-            if let Some(NativeStoredValue::Iterator(iterator)) =
-                self.values.get_mut(index as usize).and_then(Option::as_mut)
-            {
+            if let Some(NativeColdIterator::User(iterator)) = self.cold_iterator_mut(index) {
                 iterator.user_iterator_started = true;
             }
             return Ok(Some((self.decode(key)?, self.decode(current)?)));
         }
-        let object_entry = match self.values.get(index as usize).and_then(Option::as_ref) {
-            Some(NativeStoredValue::Iterator(iterator)) => {
+        let object_entry = match self.cold_iterator(index) {
+            Some(NativeColdIterator::User(iterator)) => {
                 iterator.live_object.as_ref().and_then(|object| {
                     iterator
                         .entries
@@ -12011,15 +11973,13 @@ impl<'a> NativeRequestColdState<'a> {
                 Value::Reference(reference) => reference.get(),
                 value => value,
             };
-            if let Some(NativeStoredValue::Iterator(iterator)) =
-                self.values.get_mut(index as usize).and_then(Option::as_mut)
-            {
+            if let Some(NativeColdIterator::User(iterator)) = self.cold_iterator_mut(index) {
                 iterator.index = cursor.saturating_add(1);
             }
             return Ok(Some((key, value)));
         }
-        let live = match self.values.get(index as usize).and_then(Option::as_ref) {
-            Some(NativeStoredValue::Iterator(iterator)) => iterator
+        let live = match self.cold_iterator(index) {
+            Some(NativeColdIterator::User(iterator)) => iterator
                 .live_source
                 .map(|source| (source, iterator.index, iterator.live_global.clone())),
             _ => None,
@@ -12070,16 +12030,12 @@ impl<'a> NativeRequestColdState<'a> {
             let Some(entry) = entry else {
                 return Ok(None);
             };
-            if let Some(NativeStoredValue::Iterator(iterator)) =
-                self.values.get_mut(index as usize).and_then(Option::as_mut)
-            {
+            if let Some(NativeColdIterator::User(iterator)) = self.cold_iterator_mut(index) {
                 iterator.index = iterator.index.saturating_add(1);
             }
             return Ok(Some(entry));
         }
-        if let Some(NativeStoredValue::Iterator(iterator)) =
-            self.values.get_mut(index as usize).and_then(Option::as_mut)
-        {
+        if let Some(NativeColdIterator::User(iterator)) = self.cold_iterator_mut(index) {
             let entry = iterator
                 .entries
                 .get(iterator.index)
@@ -12095,8 +12051,8 @@ impl<'a> NativeRequestColdState<'a> {
             return Ok(entry);
         }
         let (generator, handle, arguments, state, delegation, finished) =
-            match self.values.get(index as usize).and_then(Option::as_ref) {
-                Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) => (
+            match self.cold_iterator(index) {
+                Some(NativeColdIterator::Generator(iterator)) => (
                     iterator.generator.clone(),
                     iterator.handle.clone(),
                     iterator.arguments.clone(),
@@ -12118,8 +12074,8 @@ impl<'a> NativeRequestColdState<'a> {
                     index: cursor,
                 } => {
                     if let Some((key, value)) = entries.get(cursor).cloned() {
-                        if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
-                            self.values.get_mut(index as usize).and_then(Option::as_mut)
+                        if let Some(NativeColdIterator::Generator(iterator)) =
+                            self.cold_iterator_mut(index)
                             && let Some(BaselineGeneratorDelegation::Array {
                                 index: saved_cursor,
                                 ..
@@ -12128,15 +12084,15 @@ impl<'a> NativeRequestColdState<'a> {
                             *saved_cursor = saved_cursor.saturating_add(1);
                         }
                         generator.suspend_forwarded(Some(key.clone()), value.clone());
-                        if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
-                            self.values.get_mut(index as usize).and_then(Option::as_mut)
+                        if let Some(NativeColdIterator::Generator(iterator)) =
+                            self.cold_iterator_mut(index)
                         {
                             iterator.yields_seen = iterator.yields_seen.saturating_add(1);
                         }
                         return Ok(Some((key, value)));
                     }
-                    if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
-                        self.values.get_mut(index as usize).and_then(Option::as_mut)
+                    if let Some(NativeColdIterator::Generator(iterator)) =
+                        self.cold_iterator_mut(index)
                     {
                         iterator.delegation = None;
                     }
@@ -12149,8 +12105,8 @@ impl<'a> NativeRequestColdState<'a> {
                 } => {
                     if let Some((key, value)) = self.baseline_iterator_next(iterator)? {
                         generator.suspend_forwarded(Some(key.clone()), value.clone());
-                        if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
-                            self.values.get_mut(index as usize).and_then(Option::as_mut)
+                        if let Some(NativeColdIterator::Generator(iterator)) =
+                            self.cold_iterator_mut(index)
                         {
                             iterator.yields_seen = iterator.yields_seen.saturating_add(1);
                         }
@@ -12159,8 +12115,8 @@ impl<'a> NativeRequestColdState<'a> {
                     effective_resume_kind = php_jit::JitNativeResumeInputKind::VALUE;
                     effective_resume_value =
                         self.encode(delegated.return_value().unwrap_or(Value::Null))?;
-                    if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
-                        self.values.get_mut(index as usize).and_then(Option::as_mut)
+                    if let Some(NativeColdIterator::Generator(iterator)) =
+                        self.cold_iterator_mut(index)
                     {
                         iterator.delegation = None;
                     }
@@ -12218,8 +12174,8 @@ impl<'a> NativeRequestColdState<'a> {
                             ));
                         }
                     };
-                    if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
-                        self.values.get_mut(index as usize).and_then(Option::as_mut)
+                    if let Some(NativeColdIterator::Generator(iterator)) =
+                        self.cold_iterator_mut(index)
                     {
                         *iterator.state = Some(state);
                         iterator.delegation = Some(delegation);
@@ -12233,13 +12189,11 @@ impl<'a> NativeRequestColdState<'a> {
                 };
                 let value = self.decode(value)?;
                 generator.suspend(key, value.clone());
-                if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
-                    self.values.get_mut(index as usize).and_then(Option::as_mut)
+                if let Some(NativeColdIterator::Generator(iterator)) = self.cold_iterator_mut(index)
                 {
                     *iterator.state = Some(state);
                 }
-                if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
-                    self.values.get_mut(index as usize).and_then(Option::as_mut)
+                if let Some(NativeColdIterator::Generator(iterator)) = self.cold_iterator_mut(index)
                 {
                     iterator.yields_seen = iterator.yields_seen.saturating_add(1);
                 }
@@ -12255,8 +12209,7 @@ impl<'a> NativeRequestColdState<'a> {
                 ..
             } => {
                 generator.close(Some(self.decode(value)?));
-                if let Some(NativeStoredValue::BaselineGeneratorIterator(iterator)) =
-                    self.values.get_mut(index as usize).and_then(Option::as_mut)
+                if let Some(NativeColdIterator::Generator(iterator)) = self.cold_iterator_mut(index)
                 {
                     iterator.finished = true;
                 }
@@ -12358,49 +12311,48 @@ impl<'a> NativeRequestColdState<'a> {
     fn baseline_array_iterator_next(&mut self, encoded: i64) -> Option<Option<(Value, Value)>> {
         if let Some(index) = Self::direct_value_index(encoded) {
             let iterator = *self.direct_value_slots.get(index)?;
-            if iterator.refcount == 0
-                || iterator.kind != php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_FOREACH
-            {
+            if iterator.refcount == 0 {
                 return None;
             }
-            let cursor = usize::try_from(iterator.aux).ok()?;
-            let length = iterator.reserved as usize;
-            if cursor >= length {
-                return Some(None);
+            if iterator.kind == php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_FOREACH {
+                let cursor = usize::try_from(iterator.aux).ok()?;
+                let length = iterator.reserved as usize;
+                if cursor >= length {
+                    return Some(None);
+                }
+                let source = Self::direct_value_index(iterator.payload as i64)?;
+                let source = *self.direct_value_slots.get(source)?;
+                let base = self.direct_array_entries.as_ptr() as usize;
+                let address = usize::try_from(source.aux).ok()?;
+                let entry_size = std::mem::size_of::<php_jit::JitNativeDirectArrayEntry>();
+                let start = address.checked_sub(base)? / entry_size;
+                let entry = *self.direct_array_entries.get(start.checked_add(cursor)?)?;
+                self.direct_value_slots[index].aux = iterator.aux.saturating_add(1);
+                let key = self.decode(entry.key).ok()?;
+                let value = self.decode(entry.value).ok()?;
+                return Some(Some((key, value)));
             }
-            let source = Self::direct_value_index(iterator.payload as i64)?;
-            let source = *self.direct_value_slots.get(source)?;
-            let base = self.direct_array_entries.as_ptr() as usize;
-            let address = usize::try_from(source.aux).ok()?;
-            let entry_size = std::mem::size_of::<php_jit::JitNativeDirectArrayEntry>();
-            let start = address.checked_sub(base)? / entry_size;
-            let entry = *self.direct_array_entries.get(start.checked_add(cursor)?)?;
-            self.direct_value_slots[index].aux = iterator.aux.saturating_add(1);
-            let key = self.decode(entry.key).ok()?;
-            let value = self.decode(entry.value).ok()?;
-            return Some(Some((key, value)));
+            let NativeColdIterator::Array(iterator) = self.cold_iterator_mut(index)? else {
+                return None;
+            };
+            return Some(
+                iterator
+                    .source
+                    .next_pair_at_cursor(&mut iterator.index)
+                    .map(|(key, value)| {
+                        let key = match key {
+                            php_runtime::api::ArrayKey::Int(key) => Value::Int(key),
+                            php_runtime::api::ArrayKey::String(key) => Value::String(key),
+                        };
+                        let value = match value {
+                            Value::Reference(reference) => reference.get(),
+                            value => value,
+                        };
+                        (key, value)
+                    }),
+            );
         }
-        let index = php_jit::jit_decode_runtime_value(encoded)? as usize;
-        let NativeStoredValue::ArrayIterator(iterator) = self.values.get_mut(index)?.as_mut()?
-        else {
-            return None;
-        };
-        Some(
-            iterator
-                .source
-                .next_pair_at_cursor(&mut iterator.index)
-                .map(|(key, value)| {
-                    let key = match key {
-                        php_runtime::api::ArrayKey::Int(key) => Value::Int(key),
-                        php_runtime::api::ArrayKey::String(key) => Value::String(key),
-                    };
-                    let value = match value {
-                        Value::Reference(reference) => reference.get(),
-                        value => value,
-                    };
-                    (key, value)
-                }),
-        )
+        None
     }
 
     fn generator_can_rewind(&self, encoded: i64) -> bool {
@@ -12410,18 +12362,15 @@ impl<'a> NativeRequestColdState<'a> {
                     && generator.lifecycle != php_runtime::api::GeneratorState::Closed
             });
         }
-        let Some(index) = php_jit::jit_decode_runtime_value(encoded) else {
+        let Some(index) = Self::direct_value_index(encoded) else {
             return false;
         };
-        self.values
-            .get(index as usize)
-            .and_then(Option::as_ref)
-            .is_some_and(|value| match value {
-                NativeStoredValue::BaselineGeneratorIterator(iterator) => {
-                    matches!(iterator.yields_seen, 0 | 1) && !iterator.finished
-                }
-                _ => false,
-            })
+        self.cold_iterator(index).is_some_and(|value| match value {
+            NativeColdIterator::Generator(iterator) => {
+                matches!(iterator.yields_seen, 0 | 1) && !iterator.finished
+            }
+            NativeColdIterator::Array(_) | NativeColdIterator::User(_) => false,
+        })
     }
 
     fn close_iterator(&mut self, encoded: i64) -> Result<(), String> {
@@ -12430,35 +12379,9 @@ impl<'a> NativeRequestColdState<'a> {
         }
         let index = php_jit::jit_decode_runtime_value(encoded)
             .ok_or_else(|| "native value is not a foreach iterator handle".to_owned())?;
-        let value = self
-            .values
-            .get_mut(index as usize)
-            .ok_or_else(|| format!("native foreach iterator {index} is missing"))?;
-        match value.take() {
-            Some(NativeStoredValue::ArrayIterator(iterator)) => {
-                if let Some(slot) = self.value_slots.get_mut(index as usize) {
-                    *slot = php_jit::JitNativeValueSlot::default();
-                }
-                if let Some(direct) = iterator.direct.as_ref() {
-                    let entries = direct.entries.to_vec();
-                    drop(iterator);
-                    self.release_direct_foreach_entries(&entries);
-                }
-                Ok(())
-            }
-            Some(
-                NativeStoredValue::Iterator(_) | NativeStoredValue::BaselineGeneratorIterator(_),
-            ) => {
-                if let Some(slot) = self.value_slots.get_mut(index as usize) {
-                    *slot = php_jit::JitNativeValueSlot::default();
-                }
-                Ok(())
-            }
-            other => {
-                *value = other;
-                Err(format!("native foreach iterator {index} is missing"))
-            }
-        }
+        Err(format!(
+            "native foreach iterator {index} is outside the authoritative direct slot plane"
+        ))
     }
 
     fn instruction_for_continuation(
@@ -12957,8 +12880,7 @@ pub(super) fn activate_native_context(
         });
     let view = php_jit::JitNativeRuntimeView {
         abi_version: php_jit::JIT_RUNTIME_ABI_VERSION,
-        value_slot_capacity: u32::try_from(context.value_slots.capacity()).unwrap_or(u32::MAX),
-        value_slots: context.value_slots.as_mut_ptr() as usize as u64,
+        reserved: 0,
         direct_value_slots: context.direct_value_slots.as_mut_ptr() as usize as u64,
         direct_value_next: std::ptr::from_mut(context.direct_value_next.as_mut()) as usize as u64,
         direct_value_free_head: std::ptr::from_mut(context.direct_value_free_head.as_mut()) as usize
@@ -15566,7 +15488,7 @@ fn resume_native_optimizing_exit_with_artifact(
             && let php_ir::InstructionKind::LoadLocal { local, .. } = &instruction.kind
             && state.local_initialized(*local)
         {
-            let stored = native_transition_stored_value_kind(context, state.slots[local.index()]);
+            let stored = native_transition_direct_value_kind(context, state.slots[local.index()]);
             let next = context
                 .instruction_for_continuation(
                     state.function_id,
@@ -15591,7 +15513,7 @@ fn resume_native_optimizing_exit_with_artifact(
         {
             let encoded = state.slots[local.index()];
             let raw = native_transition_value_kind(encoded);
-            let stored = native_transition_stored_value_kind(context, encoded);
+            let stored = native_transition_direct_value_kind(context, encoded);
             let descriptor = php_jit::jit_decode_runtime_value(encoded).map_or_else(
                 || "immediate".to_owned(),
                 |index| {
@@ -15640,7 +15562,7 @@ fn resume_native_optimizing_exit_with_artifact(
                             format!(
                                 "{}/{}",
                                 native_transition_value_kind(encoded),
-                                native_transition_stored_value_kind(context, encoded),
+                                native_transition_direct_value_kind(context, encoded),
                             )
                         },
                     )
@@ -15702,27 +15624,36 @@ fn native_transition_value_kind(encoded: i64) -> &'static str {
     }
 }
 
-fn native_transition_stored_value_kind(
+fn native_transition_direct_value_kind(
     context: &NativeRequestColdState<'_>,
     encoded: i64,
 ) -> &'static str {
     if let Some(index) = NativeRequestColdState::direct_value_index(encoded)
-        && context.direct_value_slots.get(index).is_some_and(|slot| {
-            slot.refcount != 0 && slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE
-        })
+        && let Some(slot) = context
+            .direct_value_slots
+            .get(index)
+            .filter(|slot| slot.refcount != 0)
     {
-        return "prepared_callable";
+        return match slot.kind {
+            php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE => "prepared_callable",
+            php_jit::JIT_NATIVE_VALUE_VIEW_COLD_GENERATOR => "materialized_generator",
+            php_jit::JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT => "array_iterator",
+            php_jit::JIT_NATIVE_VALUE_VIEW_COLD_ITERATOR => {
+                context
+                    .cold_iterator(index)
+                    .map_or("missing", |iterator| match iterator {
+                        NativeColdIterator::Array(_) => "array_iterator",
+                        NativeColdIterator::User(_) => "iterator",
+                        NativeColdIterator::Generator(_) => "baseline_generator_iterator",
+                    })
+            }
+            _ => native_transition_value_kind(encoded),
+        };
     }
-    let Some(index) = php_jit::jit_decode_runtime_value(encoded) else {
+    let Some(_) = php_jit::jit_decode_runtime_value(encoded) else {
         return native_transition_value_kind(encoded);
     };
-    match context.values.get(index as usize).and_then(Option::as_ref) {
-        Some(NativeStoredValue::MaterializedGenerator(_)) => "materialized_generator",
-        Some(NativeStoredValue::ArrayIterator(_)) => "array_iterator",
-        Some(NativeStoredValue::Iterator(_)) => "iterator",
-        Some(NativeStoredValue::BaselineGeneratorIterator(_)) => "baseline_generator_iterator",
-        None => "missing",
-    }
+    "missing"
 }
 
 fn native_optimizing_transition_reason(

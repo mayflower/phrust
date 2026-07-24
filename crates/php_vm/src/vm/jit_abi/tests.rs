@@ -8,7 +8,6 @@ fn native_request_pool_reuses_only_reset_worker_owned_buffers() {
 
     let mut pool = super::NativeRequestPool::default();
     let mut first = pool.checkout(37);
-    let value_slots = first.value_slots.as_mut_ptr() as usize;
     let direct_value_slots = first.direct_value_slots.as_mut_ptr() as usize;
     let fiber_states = first.fiber_suspension_states.as_mut_ptr() as usize;
     let static_properties = first.static_property_slots.as_mut_ptr() as usize;
@@ -25,7 +24,6 @@ fn native_request_pool_reuses_only_reset_worker_owned_buffers() {
     assert_eq!(pool.available.len(), 1);
 
     let mut second = pool.checkout(37);
-    assert_eq!(second.value_slots.as_mut_ptr() as usize, value_slots);
     assert_eq!(
         second.direct_value_slots.as_mut_ptr() as usize,
         direct_value_slots
@@ -45,7 +43,6 @@ fn native_request_pool_reuses_only_reset_worker_owned_buffers() {
     assert_eq!(*second.direct_string_next, 0);
     assert_eq!(*second.fiber_suspension_next, 0);
     assert_eq!(*second.static_property_next, 0);
-    assert!(second.free_value_slots.is_empty());
     assert_eq!(second.native_frame_arena.high_water_bytes(), 0);
     assert_eq!(
         second.direct_object_handles.capacity(),
@@ -295,9 +292,9 @@ fn native_backtrace_lines_use_the_retained_source_index() {
 }
 
 #[test]
-fn native_value_slots_keep_iterator_state_out_of_line() {
+fn direct_value_slots_keep_cold_iterator_state_out_of_line() {
     let value_bytes = std::mem::size_of::<php_runtime::api::Value>();
-    let slot_bytes = std::mem::size_of::<super::NativeStoredValue>();
+    let slot_bytes = std::mem::size_of::<super::NativeColdIterator>();
     assert!(
         slot_bytes <= value_bytes.saturating_add(std::mem::size_of::<usize>()),
         "native value arena slot grew to {slot_bytes} bytes for a {value_bytes}-byte PHP value"

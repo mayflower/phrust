@@ -368,21 +368,8 @@ pub(super) fn prepare_dynamic_native_entry(
         .ok_or_else(|| "dynamic native unit is missing".to_owned())?;
     let wants_optimizing =
         context.options.native_optimization == super::super::NativeOptimizationPolicy::Optimizing;
-    let prepared_tier_matches = |handle: &php_jit::JitFunctionHandle| {
-        handle.region_state_metadata().is_some_and(|metadata| {
-            metadata.compiler_tier
-                == if wants_optimizing {
-                    php_jit::region_ir::NativeCompilerTier::Optimizing
-                } else {
-                    php_jit::region_ir::NativeCompilerTier::Baseline
-                }
-        })
-    };
     if package.native_entry_signature_epochs.get(&function) == Some(&signature_epoch)
-        && package
-            .native_entries
-            .get(&function)
-            .is_some_and(prepared_tier_matches)
+        && package.native_entries.contains_key(&function)
     {
         return Ok(());
     }
@@ -390,10 +377,7 @@ pub(super) fn prepare_dynamic_native_entry(
     let external_signatures = visible_external_function_signatures(context, &compiled, function);
     let signature_hash = super::super::external_function_signatures_hash(&external_signatures);
     if package.native_entry_signature_hashes.get(&function) == Some(&signature_hash)
-        && package
-            .native_entries
-            .get(&function)
-            .is_some_and(prepared_tier_matches)
+        && package.native_entries.contains_key(&function)
     {
         context
             .dynamic_units
@@ -413,7 +397,32 @@ pub(super) fn prepare_dynamic_native_entry(
         &external_signatures,
     )?;
     publish_dynamic_unit_entry(&compiled, function, &handle);
-    let preferred = if wants_optimizing {
+    // A changed external signature invalidates the preferred target as well
+    // as the baseline entry. Publish the freshly validated baseline into both
+    // cells before an optional optimizing replacement becomes visible.
+    if let Some(address) = handle.native_entry_address()
+        && let Some(preferred) = compiled
+            .prepared_deployment_image()
+            .preferred_function_entries
+            .get(function.index())
+    {
+        preferred.store(address, std::sync::atomic::Ordering::Release);
+    }
+    let deferred_optimization = wants_optimizing
+        && context.options.tiering.enabled
+        && !context.options.tiering.native_eager;
+    let preferred = if deferred_optimization {
+        // Dynamic callback resolution is a publication boundary, not an
+        // instruction to synchronously compile a second tier. Reuse an
+        // already completed optimizing product when present; otherwise the
+        // ensuing baseline invocation records the entry and schedules the
+        // normal background upgrade.
+        context
+            .worker_state
+            .resolved_native_function(&compiled, function, context.options, &external_signatures)
+            .inspect(|optimizing| publish_dynamic_unit_entry(&compiled, function, optimizing))
+            .unwrap_or_else(|| handle.clone())
+    } else if wants_optimizing {
         let optimizing = context.worker_state.resolve_native_function(
             &compiled,
             function,

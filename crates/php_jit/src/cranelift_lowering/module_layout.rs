@@ -718,6 +718,20 @@ pub struct NativeCompilePlan {
 }
 
 impl NativeCompilePlan {
+    /// Builds the bounded fragment form even when the optimizing source
+    /// heuristics initially admit one whole function. Exact CLIF preflight
+    /// uses this when backend expansion disproves that optimistic estimate.
+    #[must_use]
+    pub(crate) fn for_bounded_fragments(region: &RegionGraph) -> Self {
+        let mut plan = Self::for_region(region);
+        plan.fragments = cost_aware_fragment_blocks(region)
+            .into_iter()
+            .enumerate()
+            .map(|(id, blocks)| fragment_plan_for_blocks(region, id, blocks))
+            .collect();
+        plan
+    }
+
     /// Cost tokens used by the bounded compiler scheduler. The estimate mixes
     /// total translation work with the largest fragment's peak regalloc shape;
     /// it is deterministic and independent of host timing noise.
