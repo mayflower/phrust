@@ -1210,10 +1210,10 @@ pub(in crate::vm) extern "C" fn jit_native_local_fetch_abi(
             context.record_local_read_reason("unknown");
             return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
         };
-        let Some((compiler_local, ordinary_function_local)) =
+        let Some((compiler_local, ordinary_function_local, direct_request_local)) =
             context.unit.functions.get(function_index).map(|function| {
                 match function.locals.get(local) {
-                    None => (true, false),
+                    None => (true, false, false),
                     Some(name) => (
                         php_ir::is_compiler_generated_local_name(name),
                         !function.flags.is_top_level
@@ -1229,6 +1229,7 @@ pub(in crate::vm) extern "C" fn jit_native_local_fetch_abi(
                                     | "_REQUEST"
                                     | "_ENV"
                             ),
+                        function.flags.is_top_level && name != "GLOBALS",
                     ),
                 }
             })
@@ -1236,7 +1237,7 @@ pub(in crate::vm) extern "C" fn jit_native_local_fetch_abi(
             context.record_local_read_reason("unknown");
             return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
         };
-        if (compiler_local || ordinary_function_local)
+        if (compiler_local || ordinary_function_local || direct_request_local)
             && context.php_handle_is_reference(value) == Some(true)
         {
             let result = match context.duplicate_dereferenced_native_value(value) {
@@ -1251,12 +1252,14 @@ pub(in crate::vm) extern "C" fn jit_native_local_fetch_abi(
             };
             if context.php_handle_is_uninitialized(result) {
                 let _ = context.release(result);
-                if ordinary_function_local && !quiet_read {
+                if (ordinary_function_local || direct_request_local) && !quiet_read {
                     let name = context.unit.functions[function_index].locals[local].clone();
                     emit_native_undefined_variable_warning(context, &name, file, start);
                 }
                 context.record_local_read_reason(if ordinary_function_local {
                     "uninitialized_warning"
+                } else if direct_request_local {
+                    "top_level_global"
                 } else {
                     "synthetic_compiler_local"
                 });
@@ -1269,6 +1272,8 @@ pub(in crate::vm) extern "C" fn jit_native_local_fetch_abi(
             }
             context.record_local_read_reason(if compiler_local {
                 "synthetic_compiler_local"
+            } else if direct_request_local {
+                "top_level_global"
             } else {
                 "reference_dereference"
             });
@@ -2092,17 +2097,28 @@ pub(in crate::vm) extern "C" fn jit_native_reference_bind_abi(
             };
             let is_top_level = function.flags.is_top_level;
             let name = function.locals.get(local as usize).cloned();
-            let request_global = is_top_level
-                && name.as_deref().is_some_and(|name| name != "GLOBALS")
-                && name
-                    .as_deref()
-                    .is_none_or(|name| !php_ir::is_compiler_generated_local_name(name));
+            let superglobal = name.as_deref().is_some_and(|name| {
+                matches!(
+                    name,
+                    "_SERVER"
+                        | "_GET"
+                        | "_POST"
+                        | "_FILES"
+                        | "_COOKIE"
+                        | "_SESSION"
+                        | "_REQUEST"
+                        | "_ENV"
+                )
+            });
+            let request_global = name.as_deref().is_some_and(|name| {
+                name != "GLOBALS"
+                    && !php_ir::is_compiler_generated_local_name(name)
+                    && (is_top_level || superglobal)
+            });
             // Region lowering appends deterministic synthetic locals for
             // reference locations. They have no PHP-visible top-level name
             // and therefore require no request-global publication.
-            if let Some(name) = name.filter(|name| {
-                is_top_level && name != "GLOBALS" && !php_ir::is_compiler_generated_local_name(name)
-            }) {
+            if let Some(name) = name.filter(|_| request_global) {
                 let Ok(value) = context.decode(encoded) else {
                     return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
                 };

@@ -1,5 +1,59 @@
 use super::*;
 
+fn dynamic_unit_local_is_superglobal(name: &str) -> bool {
+    matches!(
+        name,
+        "_GET" | "_POST" | "_COOKIE" | "_REQUEST" | "_SERVER" | "_ENV" | "_FILES" | "_SESSION"
+    )
+}
+
+pub(super) fn dynamic_unit_cross_unit_global_names(
+    compiled: &crate::compiled_unit::CompiledUnit,
+) -> std::sync::Arc<[String]> {
+    let unit = compiled.unit();
+    let mut names = std::collections::BTreeSet::new();
+    for function in &unit.functions {
+        if function.flags.is_top_level {
+            names.extend(
+                function
+                    .locals
+                    .iter()
+                    .filter(|name| {
+                        name.as_str() != "GLOBALS"
+                            && !php_ir::is_compiler_generated_local_name(name)
+                    })
+                    .cloned(),
+            );
+        } else {
+            names.extend(
+                function
+                    .locals
+                    .iter()
+                    .filter(|name| dynamic_unit_local_is_superglobal(name))
+                    .cloned(),
+            );
+        }
+        names.extend(
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .filter_map(|instruction| match &instruction.kind {
+                    php_ir::InstructionKind::BindGlobal { name, .. } => Some(name.clone()),
+                    _ => None,
+                }),
+        );
+    }
+    names.extend(
+        compiled
+            .prepared_native_global_sites()
+            .iter()
+            .flat_map(|sites| sites.iter())
+            .filter_map(|name| name.as_deref().map(str::to_owned)),
+    );
+    names.into_iter().collect::<Vec<_>>().into()
+}
+
 fn publish_dynamic_unit_entry(
     compiled: &crate::compiled_unit::CompiledUnit,
     function: php_ir::FunctionId,
@@ -164,9 +218,11 @@ pub(super) fn register_native_dynamic_unit(
     for (function, handle) in native_entries.iter() {
         publish_dynamic_unit_entry(&compiled, *function, handle);
     }
+    let cross_unit_global_names = dynamic_unit_cross_unit_global_names(&compiled);
     let unit = context.dynamic_units.len();
     context.dynamic_units.push(NativeDynamicUnit {
         compiled,
+        cross_unit_global_names,
         native_entries,
         native_entry_signature_hashes,
         native_entry_signature_epochs,

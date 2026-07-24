@@ -1587,6 +1587,7 @@ const NATIVE_METHOD_PIC_LIMIT: usize = 4;
 #[derive(Clone)]
 struct NativeDynamicUnit {
     compiled: crate::compiled_unit::CompiledUnit,
+    cross_unit_global_names: std::sync::Arc<[String]>,
     native_entries:
         std::sync::Arc<std::collections::BTreeMap<php_ir::FunctionId, php_jit::JitFunctionHandle>>,
     native_entry_signature_hashes: std::collections::BTreeMap<php_ir::FunctionId, u64>,
@@ -4294,6 +4295,7 @@ impl<'a> NativeRequestColdState<'a> {
             .collect();
         self.dynamic_units.push(NativeDynamicUnit {
             compiled: compiled.clone(),
+            cross_unit_global_names: dynamic_units::dynamic_unit_cross_unit_global_names(&compiled),
             native_entries: self.native_entries.clone(),
             native_entry_signature_hashes,
             native_entry_signature_epochs,
@@ -4614,7 +4616,10 @@ impl<'a> NativeRequestColdState<'a> {
         let Some(encoded) = self.native_global_reference_handles.get(name).copied() else {
             return Ok(());
         };
-        let Value::Reference(reference) = self.decode(encoded)? else {
+        let Value::Reference(reference) = self.decode(encoded).map_err(|error| {
+            format!("native request global ${name} could not materialize: {error}")
+        })?
+        else {
             return Err(format!(
                 "native request global ${name} lost its reference identity"
             ));
@@ -9265,7 +9270,6 @@ impl<'a> NativeRequestColdState<'a> {
             };
             replacement
         };
-
         // A direct descriptor is authoritative. Its ReferenceCell exists only
         // as a stable identity for a later cold boundary; clear any previously
         // materialized payload so root traversal cannot mistake that stale
@@ -10192,9 +10196,25 @@ impl<'a> NativeRequestColdState<'a> {
         })
     }
 
+    fn stabilize_active_dynamic_global_roots(&mut self, unit: usize) -> Result<(), String> {
+        let names = self
+            .dynamic_units
+            .get(unit)
+            .map(|package| package.cross_unit_global_names.clone())
+            .ok_or_else(|| "dynamic native unit is missing".to_owned())?;
+        let mut roots = names
+            .iter()
+            .filter_map(|name| self.native_global_reference_handles.get(name).copied())
+            .collect::<Vec<_>>();
+        roots.sort_unstable();
+        roots.dedup();
+        self.stabilize_owned_native_values_for_cross_unit(&mut roots)
+    }
+
     fn with_active_dynamic_unit<R>(
         &mut self,
         unit: usize,
+        request_local_bindings: Option<&[(String, i64)]>,
         operation: impl FnOnce(&mut Self) -> R,
     ) -> Result<R, String> {
         let compiled = self
@@ -10289,6 +10309,9 @@ impl<'a> NativeRequestColdState<'a> {
         self.prepare_trusted_static_properties();
         self.prepare_trusted_constant_fetches();
         self.prepare_trusted_request_locals();
+        let binding_result = request_local_bindings.map_or(Ok(()), |bindings| {
+            self.publish_active_entry_request_local_bindings(bindings)
+        });
         self.prepare_trusted_global_references();
         self.prepare_trusted_static_locals();
         self.prepare_trusted_class_plans();
@@ -10302,7 +10325,12 @@ impl<'a> NativeRequestColdState<'a> {
         // FunctionId N from an include indexed root FunctionId N and could
         // indirect-call arbitrary data as an address.
         let _runtime_view = activate_native_context(self);
-        let result = operation(self);
+        let result = binding_result.map(|()| operation(self));
+        let root_stabilization = if result.is_ok() {
+            self.stabilize_active_dynamic_global_roots(unit)
+        } else {
+            Ok(())
+        };
 
         let active_entries = std::mem::replace(&mut self.native_entries, previous_entries);
         self.dynamic_units
@@ -10332,7 +10360,94 @@ impl<'a> NativeRequestColdState<'a> {
         self.unit_identity = previous_identity;
         self.unit = previous_unit;
         self.compiled = previous_compiled;
-        Ok(result)
+        root_stabilization?;
+        result
+    }
+
+    fn publish_active_entry_request_local_bindings(
+        &mut self,
+        bindings: &[(String, i64)],
+    ) -> Result<(), String> {
+        let entry = self.unit.entry;
+        let locals = self
+            .unit
+            .functions
+            .get(entry.index())
+            .map(|function| function.locals.clone())
+            .ok_or_else(|| "dynamic unit entry function is missing".to_owned())?;
+        let base = self
+            .trusted_request_local_function_offsets
+            .get(entry.index())
+            .copied()
+            .and_then(|base| usize::try_from(base).ok())
+            .ok_or_else(|| "dynamic unit entry local slots are missing".to_owned())?;
+        for (name, encoded) in bindings {
+            let Some(local) = locals.iter().position(|candidate| candidate == name) else {
+                continue;
+            };
+            if self.php_handle_is_reference(*encoded) != Some(true) {
+                return Err(format!(
+                    "dynamic unit entry local ${name} has no native reference identity"
+                ));
+            }
+            let index = base
+                .checked_add(local)
+                .ok_or_else(|| "dynamic unit entry local slot overflow".to_owned())?;
+            let previous = self
+                .trusted_request_local_slots
+                .get(index)
+                .copied()
+                .ok_or_else(|| format!("dynamic unit entry local ${name} slot is missing"))?;
+            self.retain(*encoded)?;
+            self.trusted_request_local_slots[index] = php_jit::JitNativeRequestLocalSlot {
+                encoded: *encoded,
+                state: php_jit::JIT_NATIVE_REQUEST_LOCAL_PUBLISHED,
+                reserved: 0,
+            };
+            if previous.state == php_jit::JIT_NATIVE_REQUEST_LOCAL_PUBLISHED
+                && let Err(error) = self.release(previous.encoded)
+            {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn duplicate_active_entry_request_local(
+        &mut self,
+        name: &str,
+        preserve_reference: bool,
+    ) -> Result<Option<i64>, String> {
+        let entry = self.unit.entry;
+        let local = self.unit.functions.get(entry.index()).and_then(|function| {
+            function
+                .locals
+                .iter()
+                .position(|candidate| candidate == name)
+        });
+        let Some(local) = local else {
+            return Ok(None);
+        };
+        let Some(index) = self
+            .trusted_request_local_function_offsets
+            .get(entry.index())
+            .copied()
+            .and_then(|base| usize::try_from(base).ok())
+            .and_then(|base| base.checked_add(local))
+        else {
+            return Err(format!("dynamic unit entry local ${name} slot is missing"));
+        };
+        let slot = self
+            .trusted_request_local_slots
+            .get(index)
+            .copied()
+            .filter(|slot| slot.state == php_jit::JIT_NATIVE_REQUEST_LOCAL_PUBLISHED)
+            .ok_or_else(|| format!("dynamic unit entry local ${name} is unpublished"))?;
+        if preserve_reference {
+            self.duplicate_authoritative_native_value(slot.encoded)
+        } else {
+            self.duplicate_authoritative_dereferenced_native_value(slot.encoded)
+        }
     }
 
     fn direct_array_slot(&self, encoded: i64) -> Option<(usize, php_jit::JitNativeValueSlot)> {
@@ -11323,7 +11438,7 @@ impl<'a> NativeRequestColdState<'a> {
         } else {
             match target.unit {
                 Some(unit) => self
-                    .with_active_dynamic_unit(unit, operation)
+                    .with_active_dynamic_unit(unit, None, operation)
                     .map_err(E::from)?,
                 None => Err(E::from(format!(
                     "root native execution target {} cannot run inside dynamic unit {:?}",

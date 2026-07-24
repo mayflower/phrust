@@ -25241,7 +25241,7 @@ fn lower_baseline_region_instruction(
                     builder,
                     native_operations.local_fetch,
                     current,
-                    false,
+                    true,
                     ordinary_local_fast_path(function_is_top_level, function_local_names, *local),
                     function,
                     *local,
@@ -25379,7 +25379,7 @@ fn lower_baseline_region_instruction(
                     builder,
                     native_operations.local_fetch,
                     current,
-                    false,
+                    true,
                     ordinary_local_fast_path(function_is_top_level, function_local_names, *local),
                     function,
                     *local,
@@ -25727,15 +25727,21 @@ fn lower_baseline_region_instruction(
                 *local,
                 result_out,
             )?;
-            let _ = lower_guarded_value_release(
-                module,
-                builder,
-                native_operations.value_release,
-                native_dim_operation(1, function, instruction.continuation_id),
-                current,
-                result_out,
-                deopt_out,
-            )?;
+            // Request globals and superglobals borrow their canonical
+            // request-owned reference. Publishing the uninitialized payload
+            // performs PHP's unset; releasing that borrowed handle here would
+            // steal the global map's owner when the trusted slot is cleared.
+            if value_flow.local_storage(*local).is_native_frame_local() {
+                let _ = lower_guarded_value_release(
+                    module,
+                    builder,
+                    native_operations.value_release,
+                    native_dim_operation(1, function, instruction.continuation_id),
+                    current,
+                    result_out,
+                    deopt_out,
+                )?;
+            }
         }
         RegionInstructionKind::ForeachInit { iterator, source } => {
             let source = lower_region_operand(builder, locals, registers, *source)?;

@@ -3470,6 +3470,7 @@ pub(super) fn compile_region_graph_native(
                         &fragment_functions,
                         layout,
                         &functions,
+                        &value_flows[&candidate.function],
                     )?;
                     let (bytes, stack) = append_defined(
                         candidate.function,
@@ -4695,6 +4696,7 @@ fn define_region_fragment_wrapper(
     fragment_functions: &BTreeMap<u32, FuncId>,
     layout: &NativeFunctionFragmentLayout,
     relocation_functions: &BTreeMap<FunctionId, FuncId>,
+    value_flow: &ExecutableValueFlow,
 ) -> Result<DefinedRegionFunction, CraneliftLoweringError> {
     let pointer_type = module.target_config().pointer_type();
     ctx.func.signature = region_graph_signature(module, region)?;
@@ -4724,9 +4726,23 @@ fn define_region_fragment_wrapper(
             crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED),
         );
         for local in frame_layout.local_slots.keys().copied() {
+            let initial = if matches!(
+                value_flow.local_storage(local),
+                crate::region_ir::LocalStorageClass::RequestGlobal
+                    | crate::region_ir::LocalStorageClass::Superglobal
+            ) {
+                lower_trusted_request_local_reference(
+                    &mut builder,
+                    deopt_out,
+                    region.function,
+                    local,
+                )
+            } else {
+                uninitialized
+            };
             builder.ins().store(
                 MemFlagsData::new(),
-                uninitialized,
+                initial,
                 frame,
                 frame_layout.local_offset(local)?,
             );
@@ -5449,12 +5465,11 @@ fn define_region_graph_function(
         );
         for (local, storage) in &locals {
             if let NativeLocalStorage::Variable(variable) = *storage {
-                let initial = if region.compile_metadata.tier == NativeCompilerTier::Optimizing
-                    && matches!(
-                        value_flow.local_storage(*local),
-                        crate::region_ir::LocalStorageClass::RequestGlobal
-                            | crate::region_ir::LocalStorageClass::Superglobal
-                    ) {
+                let initial = if matches!(
+                    value_flow.local_storage(*local),
+                    crate::region_ir::LocalStorageClass::RequestGlobal
+                        | crate::region_ir::LocalStorageClass::Superglobal
+                ) {
                     lower_trusted_request_local_reference(
                         &mut builder,
                         deopt_out,
@@ -5486,9 +5501,23 @@ fn define_region_graph_function(
             let frame = fragment_frame.expect("inline fragment frame");
             let layout = frame_layout.expect("inline fragment frame layout");
             for local in layout.local_slots.keys().copied() {
+                let initial = if matches!(
+                    value_flow.local_storage(local),
+                    crate::region_ir::LocalStorageClass::RequestGlobal
+                        | crate::region_ir::LocalStorageClass::Superglobal
+                ) {
+                    lower_trusted_request_local_reference(
+                        &mut builder,
+                        deopt_out,
+                        region.function,
+                        local,
+                    )
+                } else {
+                    uninitialized_value
+                };
                 builder.ins().store(
                     MemFlagsData::new(),
-                    uninitialized_value,
+                    initial,
                     frame,
                     layout.local_offset(local)?,
                 );
