@@ -1339,6 +1339,46 @@ fn implicit_closure_bound_object(
         .map(RegionOperand::Local)
 }
 
+/// Returns a publication-time upper bound for every continuation ID a
+/// function can assign.
+///
+/// The executable builder emits one continuation for every source
+/// instruction and block terminator. Reference-aware call preparation may
+/// precede a call with at most one binding per argument, and `NewObject` may
+/// additionally reserve one allocation continuation. Keeping this bound next
+/// to the builder makes demand-zero runtime tables stable without constructing
+/// RegionGraphs for dormant declarations.
+#[must_use]
+pub fn native_continuation_capacity_upper_bound(
+    unit: &IrUnit,
+    function: FunctionId,
+) -> Option<usize> {
+    let function = unit.functions.get(function.index())?;
+    let mut capacity = function.blocks.len();
+    for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+        let argument_count = match &instruction.kind {
+            InstructionKind::BindReferenceFromCall { args, .. }
+            | InstructionKind::BindReferenceFromMethodCall { args, .. }
+            | InstructionKind::CallFunction { args, .. }
+            | InstructionKind::CallMethod { args, .. }
+            | InstructionKind::CallStaticMethod { args, .. }
+            | InstructionKind::CallClosure { args, .. }
+            | InstructionKind::CallCallable { args, .. }
+            | InstructionKind::NewObject { args, .. }
+            | InstructionKind::DynamicNewObject { args, .. } => args.len(),
+            _ => 0,
+        };
+        capacity = capacity
+            .saturating_add(1)
+            .saturating_add(argument_count)
+            .saturating_add(usize::from(matches!(
+                instruction.kind,
+                InstructionKind::NewObject { .. }
+            )));
+    }
+    Some(capacity)
+}
+
 impl BaselineRegionBuilder {
     pub fn build(
         unit: &IrUnit,
@@ -4952,6 +4992,18 @@ impl BaselineRegionBuilder {
                 terminator,
             });
             next_continuation = next_continuation.saturating_add(1);
+        }
+        let continuation_capacity = native_continuation_capacity_upper_bound(unit, function)
+            .expect("verified RegionGraph function must belong to its source unit");
+        if next_continuation as usize > continuation_capacity {
+            return Err(NativeCompileError::new(
+                "JIT_REGION_REJECT_CONTINUATION_CAPACITY",
+                format!(
+                    "function={} emitted={} publication-capacity={continuation_capacity}",
+                    function.raw(),
+                    next_continuation,
+                ),
+            ));
         }
         let parameter_locals = native_function_parameter_locals(unit, function)
             .expect("RegionGraph function must belong to its source unit");

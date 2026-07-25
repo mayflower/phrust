@@ -2664,11 +2664,25 @@ impl NativeRequestFastState {
         let Some(compiled) = self.symbol_query.active_compiled() else {
             return false;
         };
-        let continuations = compiled.prepared_continuation_instructions();
         let mut plan_indices = Vec::new();
         let view = self.header.active_runtime_view();
         let offsets = view.trusted_property_function_offsets as usize as *const u32;
-        for (function, instructions) in continuations.iter().enumerate() {
+        for (function, entry) in compiled
+            .prepared_deployment_image()
+            .preferred_function_entries
+            .iter()
+            .enumerate()
+        {
+            if entry.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                continue;
+            }
+            let Ok(function_id) = u32::try_from(function).map(php_ir::FunctionId::new) else {
+                continue;
+            };
+            let Some(instructions) = compiled.prepared_continuation_instructions(function_id)
+            else {
+                continue;
+            };
             let Some(base) = (function < view.trusted_property_function_count as usize)
                 .then(|| unsafe { *offsets.add(function) as usize })
             else {
@@ -2973,65 +2987,53 @@ impl NativeDynamicUnit {
 #[derive(Default)]
 struct NativeUnitRuntimeState {
     trusted_request_local_function_offsets: Vec<u32>,
-    trusted_request_local_slots: Vec<php_jit::JitNativeRequestLocalSlot>,
-    continuation_instructions:
-        std::sync::Arc<Vec<Vec<Option<std::sync::Arc<php_ir::Instruction>>>>>,
+    trusted_request_local_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeRequestLocalSlot>,
     trusted_property_function_offsets: Vec<u32>,
-    trusted_property_slots: Vec<php_jit::JitNativeTrustedPropertySlot>,
-    trusted_closure_plans: Vec<u64>,
-    trusted_constant_slots: Vec<php_jit::JitNativeTrustedConstantSlot>,
-    trusted_global_reference_slots: Vec<php_jit::JitNativeTrustedGlobalReferenceSlot>,
-    trusted_global_reference_names: Vec<Option<Box<str>>>,
-    trusted_static_local_slots: Vec<php_jit::JitNativeTrustedStaticLocalSlot>,
-    trusted_static_property_slots: Vec<php_jit::JitNativeTrustedStaticPropertySlot>,
-    trusted_instanceof_plans: Vec<php_jit::JitNativeInstanceOfPlan>,
+    trusted_property_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedPropertySlot>,
+    trusted_closure_plans: php_runtime::api::StableNativeArena<u64>,
+    trusted_constant_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedConstantSlot>,
+    trusted_global_reference_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedGlobalReferenceSlot>,
+    trusted_global_reference_names: std::collections::BTreeMap<usize, Box<str>>,
+    trusted_static_local_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedStaticLocalSlot>,
+    trusted_static_property_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedStaticPropertySlot>,
+    trusted_instanceof_plans: php_runtime::api::StableNativeArena<php_jit::JitNativeInstanceOfPlan>,
     trusted_instanceof_entries: Vec<php_jit::JitNativeInstanceOfEntry>,
-    native_callsites: std::sync::Arc<
-        Vec<Vec<Option<std::sync::Arc<crate::compiled_unit::NativeCallSiteDescriptor>>>>,
-    >,
     trusted_class_plans: Vec<php_jit::JitNativePreparedClassPlan>,
 }
 
 impl NativeUnitRuntimeState {
     fn for_compiled(compiled: &crate::compiled_unit::CompiledUnit) -> Self {
-        let continuation_instructions = compiled.prepared_continuation_instructions();
-        let (trusted_property_function_offsets, trusted_property_slots) =
-            trusted_property_storage(&continuation_instructions);
-        let trusted_closure_plans = trusted_closure_storage(
-            &continuation_instructions,
-            &compiled.prepared_native_closure_sites(),
-        );
+        let (trusted_property_function_offsets, continuation_capacity) =
+            trusted_continuation_storage(compiled.unit());
         let (trusted_request_local_function_offsets, trusted_request_local_slots) =
             trusted_request_local_storage(compiled.unit());
-        let site_count = trusted_property_slots.len();
         Self {
             trusted_request_local_function_offsets,
             trusted_request_local_slots,
-            continuation_instructions,
             trusted_property_function_offsets,
-            trusted_property_slots,
-            trusted_closure_plans,
-            trusted_constant_slots: vec![
-                php_jit::JitNativeTrustedConstantSlot::default();
-                site_count
-            ],
-            trusted_global_reference_slots: vec![
-                php_jit::JitNativeTrustedGlobalReferenceSlot::default();
-                site_count
-            ],
-            trusted_global_reference_names: (0..site_count).map(|_| None).collect(),
-            trusted_static_local_slots: vec![
-                php_jit::JitNativeTrustedStaticLocalSlot::default();
-                site_count
-            ],
-            trusted_static_property_slots: vec![
-                php_jit::JitNativeTrustedStaticPropertySlot::default(
-                );
-                site_count
-            ],
-            trusted_instanceof_plans: vec![php_jit::JitNativeInstanceOfPlan::default(); site_count],
+            trusted_property_slots: php_runtime::api::StableNativeArena::new(continuation_capacity),
+            trusted_closure_plans: php_runtime::api::StableNativeArena::new(continuation_capacity),
+            trusted_constant_slots: php_runtime::api::StableNativeArena::new(continuation_capacity),
+            trusted_global_reference_slots: php_runtime::api::StableNativeArena::new(
+                continuation_capacity,
+            ),
+            trusted_global_reference_names: std::collections::BTreeMap::new(),
+            trusted_static_local_slots: php_runtime::api::StableNativeArena::new(
+                continuation_capacity,
+            ),
+            trusted_static_property_slots: php_runtime::api::StableNativeArena::new(
+                continuation_capacity,
+            ),
+            trusted_instanceof_plans: php_runtime::api::StableNativeArena::new(
+                continuation_capacity,
+            ),
             trusted_instanceof_entries: Vec::new(),
-            native_callsites: compiled.prepared_native_callsites(),
             trusted_class_plans: Vec::new(),
         }
     }
@@ -3300,34 +3302,35 @@ pub(super) struct NativeRequestColdState<'a> {
     /// Authoritative numeric lvalue slots for top-level/include locals and
     /// superglobals, indexed by immutable `(FunctionId, LocalId)` offsets.
     trusted_request_local_function_offsets: Vec<u32>,
-    trusted_request_local_slots: Vec<php_jit::JitNativeRequestLocalSlot>,
-    continuation_instructions:
-        std::sync::Arc<Vec<Vec<Option<std::sync::Arc<php_ir::Instruction>>>>>,
+    trusted_request_local_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeRequestLocalSlot>,
     trusted_property_function_offsets: Vec<u32>,
-    trusted_property_slots: Vec<php_jit::JitNativeTrustedPropertySlot>,
+    trusted_property_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedPropertySlot>,
     /// Opaque immutable exact closure plans, flattened with the same
     /// function/continuation offsets as trusted property and lvalue plans.
-    trusted_closure_plans: Vec<u64>,
+    trusted_closure_plans: php_runtime::api::StableNativeArena<u64>,
     /// Exact global constants resolved by their cold continuation once. This
     /// parallel continuation table owns one encoded value per published slot.
-    trusted_constant_slots: Vec<php_jit::JitNativeTrustedConstantSlot>,
+    trusted_constant_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedConstantSlot>,
     /// Request-owned native literal encodings, keyed by immutable compiled
     /// unit identity. These slots remain in this request arena when include
     /// symbol metadata moves through a nested VM.
     trusted_literal_slots:
         std::collections::BTreeMap<u64, Box<[php_jit::JitNativeTrustedLiteralSlot]>>,
-    trusted_global_reference_slots: Vec<php_jit::JitNativeTrustedGlobalReferenceSlot>,
-    trusted_global_reference_names: Vec<Option<Box<str>>>,
-    trusted_static_local_slots: Vec<php_jit::JitNativeTrustedStaticLocalSlot>,
-    trusted_static_property_slots: Vec<php_jit::JitNativeTrustedStaticPropertySlot>,
+    trusted_global_reference_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedGlobalReferenceSlot>,
+    trusted_global_reference_names: std::collections::BTreeMap<usize, Box<str>>,
+    trusted_static_local_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedStaticLocalSlot>,
+    trusted_static_property_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedStaticPropertySlot>,
     /// Dense static `instanceof` plans indexed by the existing continuation
     /// offsets. Their immutable entries are rebuilt only when the active unit
     /// changes; generated code performs an exact layout-id lookup.
-    trusted_instanceof_plans: Vec<php_jit::JitNativeInstanceOfPlan>,
+    trusted_instanceof_plans: php_runtime::api::StableNativeArena<php_jit::JitNativeInstanceOfPlan>,
     trusted_instanceof_entries: Vec<php_jit::JitNativeInstanceOfEntry>,
-    native_callsites: std::sync::Arc<
-        Vec<Vec<Option<std::sync::Arc<crate::compiled_unit::NativeCallSiteDescriptor>>>>,
-    >,
     include_child: bool,
     execution_deadline_at: Option<std::time::Instant>,
     execution_deadline_mutable: bool,
@@ -3523,6 +3526,7 @@ impl<'a> NativeRequestOwner<'a> {
         // while executing an include/eval unit, publishes its active unit's
         // literal table before any native entry can observe the runtime view.
         cold.prepare_trusted_literal_slots();
+        cold.prepare_trusted_closure_plans();
         cold.prepare_trusted_constant_fetches();
         cold.prepare_trusted_request_locals();
         cold.prepare_trusted_global_references()
@@ -4251,53 +4255,41 @@ impl NativeRequestPool {
     }
 }
 
-fn trusted_property_storage(
-    continuations: &[Vec<Option<std::sync::Arc<php_ir::Instruction>>>],
-) -> (Vec<u32>, Vec<php_jit::JitNativeTrustedPropertySlot>) {
-    let mut offsets = Vec::with_capacity(continuations.len());
+fn trusted_continuation_storage(unit: &php_ir::IrUnit) -> (Vec<u32>, usize) {
+    let mut offsets = Vec::with_capacity(unit.functions.len());
     let mut count = 0_usize;
-    for function in continuations {
-        offsets.push(u32::try_from(count).unwrap_or(u32::MAX));
-        count = count.saturating_add(function.len());
+    for function_index in 0..unit.functions.len() {
+        offsets.push(
+            u32::try_from(count)
+                .expect("native continuation publication offset must fit the runtime ABI"),
+        );
+        let function = php_ir::FunctionId::new(
+            u32::try_from(function_index).expect("native function index must fit the runtime ABI"),
+        );
+        let capacity = php_jit::region_ir::native_continuation_capacity_upper_bound(unit, function)
+            .expect("native continuation publication function must exist");
+        count = count
+            .checked_add(capacity)
+            .expect("native continuation publication capacity overflow");
     }
-    (
-        offsets,
-        vec![php_jit::JitNativeTrustedPropertySlot::default(); count],
-    )
-}
-
-fn trusted_closure_storage(
-    continuations: &[Vec<Option<std::sync::Arc<php_ir::Instruction>>>],
-    sites: &[Vec<Option<Arc<crate::compiled_unit::PreparedNativeClosureSite>>>],
-) -> Vec<u64> {
-    continuations
-        .iter()
-        .enumerate()
-        .flat_map(|(function, continuations)| {
-            (0..continuations.len()).map(move |continuation| {
-                sites
-                    .get(function)
-                    .and_then(|sites| sites.get(continuation))
-                    .and_then(Option::as_ref)
-                    .map_or(0, |site| Arc::as_ptr(site) as usize as u64)
-            })
-        })
-        .collect()
+    u32::try_from(count)
+        .expect("native continuation publication capacity must fit the runtime ABI");
+    (offsets, count)
 }
 
 fn trusted_request_local_storage(
     unit: &php_ir::IrUnit,
-) -> (Vec<u32>, Vec<php_jit::JitNativeRequestLocalSlot>) {
+) -> (
+    Vec<u32>,
+    php_runtime::api::StableNativeArena<php_jit::JitNativeRequestLocalSlot>,
+) {
     let mut offsets = Vec::with_capacity(unit.functions.len());
     let mut count = 0_usize;
     for function in &unit.functions {
         offsets.push(u32::try_from(count).unwrap_or(u32::MAX));
         count = count.saturating_add(function.locals.len());
     }
-    (
-        offsets,
-        vec![php_jit::JitNativeRequestLocalSlot::default(); count],
-    )
+    (offsets, php_runtime::api::StableNativeArena::new(count))
 }
 
 fn native_request_local_name(function: &php_ir::IrFunction, local: usize) -> Option<&str> {
@@ -4395,6 +4387,82 @@ impl NativeFiberExecution {
 }
 
 impl<'a> NativeRequestColdState<'a> {
+    fn published_native_functions(&self) -> Vec<php_ir::FunctionId> {
+        let mut functions = self
+            .native_entries
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        functions.extend(
+            self.compiled
+                .prepared_deployment_image()
+                .preferred_function_entries
+                .iter()
+                .enumerate()
+                .filter_map(|(function, entry)| {
+                    (entry.load(std::sync::atomic::Ordering::Acquire) != 0)
+                        .then(|| u32::try_from(function).ok())
+                        .flatten()
+                        .map(php_ir::FunctionId::new)
+                }),
+        );
+        functions.into_iter().collect()
+    }
+
+    fn prepared_continuation_instructions(
+        &self,
+        function: php_ir::FunctionId,
+    ) -> Option<std::sync::Arc<[Option<std::sync::Arc<php_ir::Instruction>>]>> {
+        self.compiled.prepared_continuation_instructions(function)
+    }
+
+    fn published_continuation_ranges(&self) -> Vec<std::ops::Range<usize>> {
+        self.published_native_functions()
+            .into_iter()
+            .filter_map(|function| {
+                let instructions = self.prepared_continuation_instructions(function)?;
+                let base = self
+                    .trusted_property_function_offsets
+                    .get(function.index())
+                    .copied()
+                    .and_then(|base| usize::try_from(base).ok())?;
+                base.checked_add(instructions.len()).map(|end| base..end)
+            })
+            .collect()
+    }
+
+    fn published_request_local_ranges(&self) -> Vec<std::ops::Range<usize>> {
+        self.published_native_functions()
+            .into_iter()
+            .filter_map(|function| {
+                let local_count = self.unit.functions.get(function.index())?.locals.len();
+                let base = self
+                    .trusted_request_local_function_offsets
+                    .get(function.index())
+                    .copied()
+                    .and_then(|base| usize::try_from(base).ok())?;
+                base.checked_add(local_count).map(|end| base..end)
+            })
+            .collect()
+    }
+
+    /// Materialize immutable metadata and request-owned plans only for entries
+    /// already published in the active unit. Calling this after an on-demand
+    /// compilation is the single publication boundary for the newly reached
+    /// function; dormant declarations are never traversed.
+    pub(super) fn prepare_published_native_metadata(&mut self) -> Result<(), String> {
+        self.prepare_trusted_closure_plans();
+        self.prepare_trusted_constant_fetches();
+        self.prepare_trusted_request_locals();
+        self.prepare_trusted_global_references()?;
+        self.prepare_trusted_static_locals();
+        self.prepare_trusted_static_properties();
+        self.prepare_trusted_class_plans();
+        self.prepare_trusted_declared_properties();
+        self.prepare_trusted_instanceof_plans();
+        Ok(())
+    }
+
     pub(super) fn native_runtime_ptr(&mut self) -> *mut std::ffi::c_void {
         self.fast_state.cast()
     }
@@ -4748,32 +4816,24 @@ impl<'a> NativeRequestColdState<'a> {
         dynamic_constants
             .entry("STDERR".to_owned())
             .or_insert(Value::Resource(stderr));
-        let continuation_instructions = compiled.prepared_continuation_instructions();
-        let (trusted_property_function_offsets, trusted_property_slots) =
-            trusted_property_storage(&continuation_instructions);
-        let trusted_closure_plans = trusted_closure_storage(
-            &continuation_instructions,
-            &compiled.prepared_native_closure_sites(),
-        );
+        let (trusted_property_function_offsets, continuation_capacity) =
+            trusted_continuation_storage(compiled.unit());
+        let trusted_property_slots =
+            php_runtime::api::StableNativeArena::new(continuation_capacity);
+        let trusted_closure_plans = php_runtime::api::StableNativeArena::new(continuation_capacity);
         let (trusted_request_local_function_offsets, trusted_request_local_slots) =
             trusted_request_local_storage(compiled.unit());
         let trusted_constant_slots =
-            vec![php_jit::JitNativeTrustedConstantSlot::default(); trusted_property_slots.len()];
-        let trusted_global_reference_slots = vec![
-            php_jit::JitNativeTrustedGlobalReferenceSlot::default();
-            trusted_property_slots.len()
-        ];
-        let trusted_global_reference_names =
-            (0..trusted_property_slots.len()).map(|_| None).collect();
+            php_runtime::api::StableNativeArena::new(continuation_capacity);
+        let trusted_global_reference_slots =
+            php_runtime::api::StableNativeArena::new(continuation_capacity);
+        let trusted_global_reference_names = std::collections::BTreeMap::new();
         let trusted_static_local_slots =
-            vec![php_jit::JitNativeTrustedStaticLocalSlot::default(); trusted_property_slots.len()];
-        let trusted_static_property_slots = vec![
-                php_jit::JitNativeTrustedStaticPropertySlot::default();
-                trusted_property_slots.len()
-            ];
+            php_runtime::api::StableNativeArena::new(continuation_capacity);
+        let trusted_static_property_slots =
+            php_runtime::api::StableNativeArena::new(continuation_capacity);
         let trusted_instanceof_plans =
-            vec![php_jit::JitNativeInstanceOfPlan::default(); trusted_property_slots.len()];
-        let native_callsites = compiled.prepared_native_callsites();
+            php_runtime::api::StableNativeArena::new(continuation_capacity);
         let native_call_argument_capacity = compiled
             .prepared_deployment_image()
             .native_call_argument_capacity;
@@ -4939,7 +4999,6 @@ impl<'a> NativeRequestColdState<'a> {
             trusted_globals_proxy: php_jit::jit_encode_constant(php_jit::JIT_VALUE_UNINITIALIZED),
             trusted_request_local_function_offsets,
             trusted_request_local_slots,
-            continuation_instructions,
             trusted_property_function_offsets,
             trusted_property_slots,
             trusted_closure_plans,
@@ -4951,7 +5010,6 @@ impl<'a> NativeRequestColdState<'a> {
             trusted_static_property_slots,
             trusted_instanceof_plans,
             trusted_instanceof_entries: Vec::new(),
-            native_callsites,
             include_child,
             execution_deadline_at: options
                 .runtime_context
@@ -5062,10 +5120,11 @@ impl<'a> NativeRequestColdState<'a> {
         // every distinct name back into `publish_trusted_constant_name`,
         // which rescanned every function and continuation for each name.
         let mut sites = std::collections::BTreeMap::<String, Vec<(u32, u32)>>::new();
-        for (function, instructions) in self.continuation_instructions.iter().enumerate() {
-            let Ok(function) = u32::try_from(function) else {
+        for function in self.published_native_functions() {
+            let Some(instructions) = self.prepared_continuation_instructions(function) else {
                 continue;
             };
+            let function = function.raw();
             for (continuation, instruction) in instructions.iter().enumerate() {
                 let Some(instruction) = instruction.as_ref() else {
                     continue;
@@ -5154,11 +5213,11 @@ impl<'a> NativeRequestColdState<'a> {
     /// and encoding occur once here; every exact callsite receives an owned
     /// handle and generated code subsequently performs only a numeric load.
     fn publish_trusted_constant_encoding(&mut self, name: &str, encoded: i64) {
-        let continuations = std::sync::Arc::clone(&self.continuation_instructions);
-        for (function, instructions) in continuations.iter().enumerate() {
-            let Ok(function) = u32::try_from(function) else {
+        for function in self.published_native_functions() {
+            let Some(instructions) = self.prepared_continuation_instructions(function) else {
                 continue;
             };
+            let function = function.raw();
             for (continuation, instruction) in instructions.iter().enumerate() {
                 let Some(instruction) = instruction.as_ref() else {
                     continue;
@@ -5199,16 +5258,49 @@ impl<'a> NativeRequestColdState<'a> {
         Ok(())
     }
 
+    /// Publish immutable closure allocation descriptors only for functions
+    /// whose native entries are callable in this unit. Dormant declarations
+    /// retain neither a RegionGraph-derived index nor resident plan pages.
+    fn prepare_trusted_closure_plans(&mut self) {
+        for function in self.published_native_functions() {
+            let Some(sites) = self.compiled.prepared_native_closure_sites(function) else {
+                continue;
+            };
+            let Some(base) = self
+                .trusted_property_function_offsets
+                .get(function.index())
+                .copied()
+                .and_then(|base| usize::try_from(base).ok())
+            else {
+                continue;
+            };
+            for (continuation, site) in sites.iter().enumerate() {
+                let Some(site) = site.as_ref() else {
+                    continue;
+                };
+                let Some(plan) = self
+                    .trusted_closure_plans
+                    .get_mut(base.saturating_add(continuation))
+                else {
+                    continue;
+                };
+                *plan = Arc::as_ptr(site) as usize as u64;
+            }
+        }
+    }
+
     /// Publish exact declared-property slots for statically proven object
     /// classes. Visibility, hooks, readonly/type constraints, layout identity,
     /// and numeric storage location are resolved once before native entry.
     fn prepare_trusted_declared_properties(&mut self) {
-        let sites = self.compiled.prepared_native_property_sites();
         let owner = self.current_dynamic_unit;
-        for (function, instructions) in sites.iter().enumerate() {
+        for function in self.published_native_functions() {
+            let Some(instructions) = self.compiled.prepared_native_property_sites(function) else {
+                continue;
+            };
             let Some(base) = self
                 .trusted_property_function_offsets
-                .get(function)
+                .get(function.index())
                 .copied()
                 .and_then(|base| usize::try_from(base).ok())
             else {
@@ -5292,7 +5384,24 @@ impl<'a> NativeRequestColdState<'a> {
     /// an exact boolean result. A class loaded later has a new unknown layout
     /// and therefore takes the site's single baseline continuation.
     fn prepare_trusted_instanceof_plans(&mut self) {
-        self.trusted_instanceof_plans.fill(Default::default());
+        let published_functions = self.published_native_functions();
+        for function in &published_functions {
+            let Some(instructions) = self.prepared_continuation_instructions(*function) else {
+                continue;
+            };
+            let Some(base) = self
+                .trusted_property_function_offsets
+                .get(function.index())
+                .copied()
+                .and_then(|base| usize::try_from(base).ok())
+            else {
+                continue;
+            };
+            let end = base.saturating_add(instructions.len());
+            if let Some(plans) = self.trusted_instanceof_plans.get_mut(base..end) {
+                plans.fill(Default::default());
+            }
+        }
         self.trusted_instanceof_entries.clear();
 
         let mut seen = std::collections::BTreeSet::new();
@@ -5351,19 +5460,19 @@ impl<'a> NativeRequestColdState<'a> {
             })
             .collect::<Vec<_>>();
 
-        let continuations = std::sync::Arc::clone(&self.continuation_instructions);
-        for (function, instructions) in continuations.iter().enumerate() {
+        for function in published_functions {
+            let Some(instructions) = self.prepared_continuation_instructions(function) else {
+                continue;
+            };
             let Some(base) = self
                 .trusted_property_function_offsets
-                .get(function)
+                .get(function.index())
                 .copied()
                 .and_then(|base| usize::try_from(base).ok())
             else {
                 continue;
             };
-            let Ok(caller_function) = u32::try_from(function) else {
-                continue;
-            };
+            let caller_function = function.raw();
             for (continuation, instruction) in instructions.iter().enumerate() {
                 let Some(instruction) = instruction.as_ref() else {
                     continue;
@@ -5436,11 +5545,11 @@ impl<'a> NativeRequestColdState<'a> {
     /// entry. Dynamic expressions and unresolved constants remain cold and
     /// publish the same dense slot after their first baseline initialization.
     fn prepare_trusted_static_locals(&mut self) {
-        let continuations = std::sync::Arc::clone(&self.continuation_instructions);
-        for (function, instructions) in continuations.iter().enumerate() {
-            let Ok(function) = u32::try_from(function) else {
+        for function in self.published_native_functions() {
+            let Some(instructions) = self.prepared_continuation_instructions(function) else {
                 continue;
             };
+            let function = function.raw();
             for instruction in instructions.iter().flatten() {
                 let php_ir::InstructionKind::InitStaticLocal { local, default, .. } =
                     &instruction.kind
@@ -5485,11 +5594,12 @@ impl<'a> NativeRequestColdState<'a> {
     /// class names, late-static binding, typed/deferred declarations, and
     /// autoloaded classes retain their single baseline continuation.
     fn prepare_trusted_static_properties(&mut self) {
-        let continuations = std::sync::Arc::clone(&self.continuation_instructions);
-        for (function_index, function) in continuations.iter().enumerate() {
-            let Ok(caller_function) = u32::try_from(function_index) else {
+        for function_id in self.published_native_functions() {
+            let Some(function) = self.prepared_continuation_instructions(function_id) else {
                 continue;
             };
+            let function_index = function_id.index();
+            let caller_function = function_id.raw();
             for (continuation, instruction) in function.iter().enumerate() {
                 let Some(instruction) = instruction.as_ref() else {
                     continue;
@@ -5738,17 +5848,20 @@ impl<'a> NativeRequestColdState<'a> {
     }
 
     fn clear_trusted_constant_fetches(&mut self) {
-        let values = self
-            .trusted_constant_slots
-            .iter_mut()
-            .filter_map(|slot| {
-                (slot.state == php_jit::JIT_NATIVE_TRUSTED_CONSTANT_PUBLISHED).then(|| {
-                    let value = slot.value;
-                    *slot = php_jit::JitNativeTrustedConstantSlot::default();
-                    value
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut values = Vec::new();
+        for range in self.published_continuation_ranges() {
+            values.extend(
+                self.trusted_constant_slots[range]
+                    .iter_mut()
+                    .filter_map(|slot| {
+                        (slot.state == php_jit::JIT_NATIVE_TRUSTED_CONSTANT_PUBLISHED).then(|| {
+                            let value = slot.value;
+                            *slot = php_jit::JitNativeTrustedConstantSlot::default();
+                            value
+                        })
+                    }),
+            );
+        }
         for value in values {
             let _ = self.release_if_live(value);
         }
@@ -5801,12 +5914,15 @@ impl<'a> NativeRequestColdState<'a> {
         self.static_property_slots.discard_prefix(used);
         *self.static_property_next = 0;
         self.static_property_indices.clear();
-        self.trusted_static_property_slots
-            .fill(php_jit::JitNativeTrustedStaticPropertySlot::default());
+        for range in self.published_continuation_ranges() {
+            self.trusted_static_property_slots[range]
+                .fill(php_jit::JitNativeTrustedStaticPropertySlot::default());
+        }
         self.mark_roots_dirty(RootMutationReason::GlobalOrStatic);
     }
 
     pub(super) fn recycle_native_request_buffers(&mut self) {
+        dynamic_units::schedule_hot_native_functions(self);
         self.clear_trusted_constant_fetches();
         self.clear_trusted_literal_slots();
         self.clear_trusted_request_locals();
@@ -6036,7 +6152,10 @@ impl<'a> NativeRequestColdState<'a> {
         .into_boxed_slice();
         self.dynamic_units.push(NativeDynamicUnit {
             compiled: compiled.clone(),
-            cross_unit_global_names: dynamic_units::dynamic_unit_cross_unit_global_names(&compiled),
+            cross_unit_global_names: dynamic_units::dynamic_unit_cross_unit_global_names(
+                &compiled,
+                self.native_entries.keys().copied(),
+            ),
             native_entries: self.native_entries.clone(),
             native_entry_signature_hashes,
             native_entry_signature_epochs,
@@ -6240,11 +6359,15 @@ impl<'a> NativeRequestColdState<'a> {
                 "native request local ${name} was rebound to a non-reference value"
             ));
         }
-        let slot_indices = self
-            .unit
-            .functions
-            .iter()
-            .enumerate()
+        let published_functions = self.published_native_functions();
+        let slot_indices = published_functions
+            .into_iter()
+            .filter_map(|function| {
+                self.unit
+                    .functions
+                    .get(function.index())
+                    .map(|definition| (function.index(), definition))
+            })
             .flat_map(|(function, definition)| {
                 definition
                     .locals
@@ -6309,22 +6432,22 @@ impl<'a> NativeRequestColdState<'a> {
 
     fn prepare_trusted_request_locals(&mut self) {
         self.ensure_native_global_references();
-        let sites = self
-            .unit
-            .functions
-            .iter()
-            .enumerate()
-            .flat_map(|(function, definition)| {
+        let mut sites = Vec::new();
+        for function in self.published_native_functions() {
+            let Some(definition) = self.unit.functions.get(function.index()) else {
+                continue;
+            };
+            sites.extend(
                 definition
                     .locals
                     .iter()
                     .enumerate()
-                    .filter_map(move |(local, _)| {
+                    .filter_map(|(local, _)| {
                         native_request_local_name(definition, local)
-                            .map(|name| (function, local, name.to_owned()))
-                    })
-            })
-            .collect::<Vec<_>>();
+                            .map(|name| (function.index(), local, name.to_owned()))
+                    }),
+            );
+        }
         for (function, local, name) in sites {
             let Ok(encoded) = self.native_request_local_handle(&name) else {
                 continue;
@@ -6405,17 +6528,20 @@ impl<'a> NativeRequestColdState<'a> {
     }
 
     fn clear_trusted_request_locals(&mut self) {
-        let values = self
-            .trusted_request_local_slots
-            .iter_mut()
-            .filter_map(|slot| {
-                (slot.state == php_jit::JIT_NATIVE_REQUEST_LOCAL_PUBLISHED).then(|| {
-                    let encoded = slot.encoded;
-                    *slot = php_jit::JitNativeRequestLocalSlot::default();
-                    encoded
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut values = Vec::new();
+        for range in self.published_request_local_ranges() {
+            values.extend(
+                self.trusted_request_local_slots[range]
+                    .iter_mut()
+                    .filter_map(|slot| {
+                        (slot.state == php_jit::JIT_NATIVE_REQUEST_LOCAL_PUBLISHED).then(|| {
+                            let encoded = slot.encoded;
+                            *slot = php_jit::JitNativeRequestLocalSlot::default();
+                            encoded
+                        })
+                    }),
+            );
+        }
         for encoded in values {
             let _ = self.release_if_live(encoded);
         }
@@ -6427,46 +6553,40 @@ impl<'a> NativeRequestColdState<'a> {
     /// initializes that same payload to null in generated code.
     fn prepare_trusted_global_references(&mut self) -> Result<(), String> {
         self.ensure_native_global_references();
-        let continuations = std::sync::Arc::clone(&self.continuation_instructions);
-        let binding_sites = continuations
-            .iter()
-            .enumerate()
-            .flat_map(|(function, instructions)| {
-                instructions
-                    .iter()
-                    .enumerate()
-                    .filter_map(move |(continuation, instruction)| {
-                        let instruction = instruction.as_ref()?;
-                        let php_ir::InstructionKind::BindGlobal { name, .. } = &instruction.kind
-                        else {
-                            return None;
-                        };
-                        Some((function, continuation, name.clone()))
-                    })
-            })
-            .collect::<Vec<_>>();
+        let published_functions = self.published_native_functions();
+        let mut binding_sites = Vec::new();
+        for function in &published_functions {
+            let Some(instructions) = self.prepared_continuation_instructions(*function) else {
+                continue;
+            };
+            for (continuation, instruction) in instructions.iter().enumerate() {
+                let Some(instruction) = instruction.as_ref() else {
+                    continue;
+                };
+                let php_ir::InstructionKind::BindGlobal { name, .. } = &instruction.kind else {
+                    continue;
+                };
+                binding_sites.push((function.raw(), continuation, name.clone()));
+            }
+        }
         for (function, continuation, name) in binding_sites {
             let encoded = self.native_request_local_handle(&name)?;
-            let function = u32::try_from(function)
-                .map_err(|_| "native global function index exceeds the ABI".to_owned())?;
             let continuation = u32::try_from(continuation)
                 .map_err(|_| "native global continuation exceeds the ABI".to_owned())?;
             self.publish_native_global_reference(function, continuation, &name, encoded)?;
         }
-        let dimension_sites = self.compiled.prepared_native_global_sites();
-        let dimension_sites = dimension_sites
-            .iter()
-            .enumerate()
-            .flat_map(|(function, sites)| {
-                sites
-                    .iter()
-                    .enumerate()
-                    .filter_map(move |(continuation, name)| {
-                        name.as_deref()
-                            .map(|name| (function, continuation, name.to_owned()))
-                    })
-            })
-            .collect::<Vec<_>>();
+        let mut dimension_sites = Vec::new();
+        for function in published_functions {
+            let Some(sites) = self.compiled.prepared_native_global_sites(function) else {
+                continue;
+            };
+            for (continuation, name) in sites.iter().enumerate() {
+                let Some(name) = name.as_deref() else {
+                    continue;
+                };
+                dimension_sites.push((function.raw(), continuation, name.to_owned()));
+            }
+        }
         for (function, continuation, name) in dimension_sites {
             // A direct `$GLOBALS["name"]` plan may refer to a symbol that is
             // not visible yet. Its direct reference starts as uninitialized,
@@ -6475,8 +6595,6 @@ impl<'a> NativeRequestColdState<'a> {
             let encoded = self
                 .native_request_local_handle(&name)
                 .expect("constant native global must have a request reference");
-            let function =
-                u32::try_from(function).expect("native global function index must fit the ABI");
             let continuation = u32::try_from(continuation)
                 .expect("native global continuation index must fit the ABI");
             self.publish_native_global_reference(function, continuation, &name, encoded)
@@ -6545,21 +6663,25 @@ impl<'a> NativeRequestColdState<'a> {
 
     fn take_trusted_global_reference_slots(
         slots: &mut [php_jit::JitNativeTrustedGlobalReferenceSlot],
-        names: &mut [Option<Box<str>>],
+        names: &mut std::collections::BTreeMap<usize, Box<str>>,
         mut remove: impl FnMut(&php_jit::JitNativeTrustedGlobalReferenceSlot, Option<&str>) -> bool,
     ) -> Vec<i64> {
-        slots
-            .iter_mut()
-            .zip(names)
-            .filter_map(|(slot, name)| {
-                if slot.state != php_jit::JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_PUBLISHED
-                    || !remove(slot, name.as_deref())
-                {
-                    return None;
-                }
+        let removed = names
+            .iter()
+            .filter_map(|(index, name)| {
+                let slot = slots.get(*index)?;
+                (slot.state == php_jit::JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_PUBLISHED
+                    && remove(slot, Some(name.as_ref())))
+                .then_some(*index)
+            })
+            .collect::<Vec<_>>();
+        removed
+            .into_iter()
+            .filter_map(|index| {
+                names.remove(&index);
+                let slot = slots.get_mut(index)?;
                 let encoded = slot.encoded;
                 *slot = php_jit::JitNativeTrustedGlobalReferenceSlot::default();
-                *name = None;
                 Some(encoded)
             })
             .collect()
@@ -6642,7 +6764,11 @@ impl<'a> NativeRequestColdState<'a> {
         if previous.state == php_jit::JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_PUBLISHED
             && previous.encoded == encoded
             && previous.reference_identity == reference_identity
-            && self.trusted_global_reference_names[index].as_deref() == Some(name)
+            && self
+                .trusted_global_reference_names
+                .get(&index)
+                .map(Box::as_ref)
+                == Some(name)
         {
             return Ok(());
         }
@@ -6657,7 +6783,8 @@ impl<'a> NativeRequestColdState<'a> {
             reserved: 0,
             reserved_wide: 0,
         };
-        self.trusted_global_reference_names[index] = Some(name.into());
+        self.trusted_global_reference_names
+            .insert(index, name.into());
         if previous.state == php_jit::JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_PUBLISHED {
             self.release(previous.encoded)?;
         }
@@ -6665,19 +6792,11 @@ impl<'a> NativeRequestColdState<'a> {
     }
 
     fn clear_trusted_global_references(&mut self) {
-        let values = self
-            .trusted_global_reference_slots
-            .iter_mut()
-            .zip(&mut self.trusted_global_reference_names)
-            .filter_map(|(slot, name)| {
-                let published =
-                    slot.state == php_jit::JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_PUBLISHED;
-                let encoded = slot.encoded;
-                *slot = php_jit::JitNativeTrustedGlobalReferenceSlot::default();
-                *name = None;
-                published.then_some(encoded)
-            })
-            .collect::<Vec<_>>();
+        let values = Self::take_trusted_global_reference_slots(
+            &mut self.trusted_global_reference_slots,
+            &mut self.trusted_global_reference_names,
+            |_, _| true,
+        );
         for encoded in values {
             let _ = self.release_if_live(encoded);
         }
@@ -6703,11 +6822,11 @@ impl<'a> NativeRequestColdState<'a> {
         else {
             return Err("native static-local function index is missing".to_owned());
         };
-        let sites = self
-            .continuation_instructions
-            .get(function as usize)
-            .into_iter()
-            .flatten()
+        let instructions = self
+            .prepared_continuation_instructions(php_ir::FunctionId::new(function))
+            .ok_or_else(|| "native static-local function metadata is missing".to_owned())?;
+        let sites = instructions
+            .iter()
             .enumerate()
             .filter_map(|(continuation, instruction)| {
                 matches!(
@@ -6744,31 +6863,39 @@ impl<'a> NativeRequestColdState<'a> {
 
     fn clear_trusted_static_locals(&mut self) {
         let _ = self.materialize_trusted_static_locals();
-        let values = self
-            .trusted_static_local_slots
-            .iter_mut()
-            .filter_map(|slot| {
-                (slot.state == php_jit::JIT_NATIVE_TRUSTED_STATIC_LOCAL_PUBLISHED).then(|| {
-                    let encoded = slot.encoded;
-                    *slot = php_jit::JitNativeTrustedStaticLocalSlot::default();
-                    encoded
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut values = Vec::new();
+        for range in self.published_continuation_ranges() {
+            values.extend(
+                self.trusted_static_local_slots[range]
+                    .iter_mut()
+                    .filter_map(|slot| {
+                        (slot.state == php_jit::JIT_NATIVE_TRUSTED_STATIC_LOCAL_PUBLISHED).then(
+                            || {
+                                let encoded = slot.encoded;
+                                *slot = php_jit::JitNativeTrustedStaticLocalSlot::default();
+                                encoded
+                            },
+                        )
+                    }),
+            );
+        }
         for encoded in values {
             let _ = self.release_if_live(encoded);
         }
     }
 
     fn materialize_trusted_static_locals(&mut self) -> Result<(), String> {
-        let values = self
-            .trusted_static_local_slots
-            .iter()
-            .filter_map(|slot| {
-                (slot.state == php_jit::JIT_NATIVE_TRUSTED_STATIC_LOCAL_PUBLISHED)
-                    .then_some(slot.encoded)
-            })
-            .collect::<std::collections::BTreeSet<_>>();
+        let mut values = std::collections::BTreeSet::new();
+        for range in self.published_continuation_ranges() {
+            values.extend(
+                self.trusted_static_local_slots[range]
+                    .iter()
+                    .filter_map(|slot| {
+                        (slot.state == php_jit::JIT_NATIVE_TRUSTED_STATIC_LOCAL_PUBLISHED)
+                            .then_some(slot.encoded)
+                    }),
+            );
+        }
         for encoded in values {
             // Static-local cells survive compiled-unit activations and nested
             // include arenas. Move their authoritative direct payload into the
@@ -12472,7 +12599,6 @@ impl<'a> NativeRequestColdState<'a> {
         let NativeUnitRuntimeState {
             trusted_request_local_function_offsets,
             trusted_request_local_slots,
-            continuation_instructions,
             trusted_property_function_offsets,
             trusted_property_slots,
             trusted_closure_plans,
@@ -12483,7 +12609,6 @@ impl<'a> NativeRequestColdState<'a> {
             trusted_static_property_slots,
             trusted_instanceof_plans,
             trusted_instanceof_entries,
-            native_callsites,
             trusted_class_plans,
         } = replacement;
         NativeUnitRuntimeState {
@@ -12494,10 +12619,6 @@ impl<'a> NativeRequestColdState<'a> {
             trusted_request_local_slots: std::mem::replace(
                 &mut self.trusted_request_local_slots,
                 trusted_request_local_slots,
-            ),
-            continuation_instructions: std::mem::replace(
-                &mut self.continuation_instructions,
-                continuation_instructions,
             ),
             trusted_property_function_offsets: std::mem::replace(
                 &mut self.trusted_property_function_offsets,
@@ -12539,7 +12660,6 @@ impl<'a> NativeRequestColdState<'a> {
                 &mut self.trusted_instanceof_entries,
                 trusted_instanceof_entries,
             ),
-            native_callsites: std::mem::replace(&mut self.native_callsites, native_callsites),
             trusted_class_plans: std::mem::replace(
                 &mut self.trusted_class_plans,
                 trusted_class_plans,
@@ -12605,6 +12725,7 @@ impl<'a> NativeRequestColdState<'a> {
         }
         self.current_dynamic_unit = Some(unit);
         self.prepare_trusted_literal_slots();
+        self.prepare_trusted_closure_plans();
         self.prepare_trusted_static_properties();
         self.prepare_trusted_constant_fetches();
         self.prepare_trusted_request_locals();
@@ -12659,7 +12780,7 @@ impl<'a> NativeRequestColdState<'a> {
                 self.native_entries = previous_entries;
                 let empty = self.replace_active_unit_runtime_state(previous_runtime_state);
                 debug_assert!(
-                    empty.continuation_instructions.is_empty(),
+                    empty.trusted_property_function_offsets.is_empty(),
                     "inactive native unit left an unexpected runtime state installed"
                 );
             }
@@ -12670,7 +12791,7 @@ impl<'a> NativeRequestColdState<'a> {
                 self.native_entries = previous_entries;
                 let empty = self.replace_active_unit_runtime_state(previous_runtime_state);
                 debug_assert!(
-                    empty.continuation_instructions.is_empty(),
+                    empty.trusted_property_function_offsets.is_empty(),
                     "inactive native unit left an unexpected runtime state installed"
                 );
             }
@@ -14827,11 +14948,10 @@ impl<'a> NativeRequestColdState<'a> {
         function: u32,
         continuation: u32,
     ) -> Option<NativeInstructionPtr> {
-        self.continuation_instructions
-            .get(function as usize)
-            .and_then(|instructions| instructions.get(continuation as usize))
-            .and_then(Option::as_ref)
-            .map(|instruction| NativeInstructionPtr(std::sync::Arc::as_ptr(instruction)))
+        self.prepared_continuation_instructions(php_ir::FunctionId::new(function))
+            .and_then(|instructions| instructions.get(continuation as usize).cloned())
+            .flatten()
+            .map(|instruction| NativeInstructionPtr(std::sync::Arc::as_ptr(&instruction)))
     }
 
     pub(super) fn instruction_kind_debug(&self, function: u32, continuation: u32) -> String {
@@ -14845,11 +14965,11 @@ impl<'a> NativeRequestColdState<'a> {
         function: u32,
         continuation: u32,
     ) -> Option<*const crate::compiled_unit::NativeCallSiteDescriptor> {
-        self.native_callsites
-            .get(function as usize)
-            .and_then(|callsites| callsites.get(continuation as usize))
-            .and_then(Option::as_ref)
-            .map(std::sync::Arc::as_ptr)
+        self.compiled
+            .prepared_native_callsites(php_ir::FunctionId::new(function))
+            .and_then(|callsites| callsites.get(continuation as usize).cloned())
+            .flatten()
+            .map(|descriptor| std::sync::Arc::as_ptr(&descriptor))
     }
 
     fn deferred_function_argument_requires_reference(
@@ -14858,10 +14978,11 @@ impl<'a> NativeRequestColdState<'a> {
         continuation: u32,
         argument: usize,
     ) -> Option<bool> {
-        let descriptor = self
-            .native_callsites
-            .get(function as usize)
-            .and_then(|callsites| callsites.get(continuation as usize))
+        let callsites = self
+            .compiled
+            .prepared_native_callsites(php_ir::FunctionId::new(function))?;
+        let descriptor = callsites
+            .get(continuation as usize)
             .and_then(Option::as_deref)?;
         if !matches!(
             descriptor.kind,
@@ -15454,6 +15575,13 @@ pub(super) fn activate_native_context(
         )
         .unwrap_or(u32::MAX),
         trusted_preferred_function_entry_reserved: 0,
+        baseline_function_entry_counts: deployment.baseline_function_entry_counts.as_ptr() as usize
+            as u64,
+        baseline_function_entry_count: u32::try_from(
+            deployment.baseline_function_entry_counts.len(),
+        )
+        .unwrap_or(u32::MAX),
+        baseline_function_entry_reserved: 0,
         trusted_linked_functions,
         trusted_linked_function_count,
         trusted_linked_function_reserved: 0,

@@ -17,8 +17,8 @@ use crate::{
 use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    self, AbiParam, Function, InstBuilder, MemFlagsData, Signature, StackSlotData, StackSlotKind,
-    UserFuncName, types,
+    self, AbiParam, AtomicRmwOp, Function, InstBuilder, MemFlagsData, Signature, StackSlotData,
+    StackSlotKind, UserFuncName, types,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings;
@@ -1306,6 +1306,49 @@ fn lower_active_runtime_view(builder: &mut FunctionBuilder<'_>, deopt_out: ir::V
         deopt_out,
         std::mem::offset_of!(crate::JitDeoptState, runtime_view_pointer) as i32,
     )
+}
+
+/// Records one baseline-native function entry in the process-owned dense
+/// counter plane. This is emitted only by baseline function entry bodies:
+/// optimizing code contains neither a telemetry branch nor a runtime helper.
+fn lower_baseline_function_entry(
+    builder: &mut FunctionBuilder<'_>,
+    deopt_out: ir::Value,
+    function: FunctionId,
+) -> Result<(), CraneliftLoweringError> {
+    let pointer_type = builder.func.dfg.value_type(deopt_out);
+    let view = lower_active_runtime_view(builder, deopt_out);
+    let counters = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, baseline_function_entry_counts) as i32,
+    );
+    let counters = if pointer_type == types::I64 {
+        counters
+    } else {
+        builder.ins().ireduce(pointer_type, counters)
+    };
+    let byte_offset = function
+        .index()
+        .checked_mul(std::mem::size_of::<std::sync::atomic::AtomicU64>())
+        .and_then(|offset| i64::try_from(offset).ok())
+        .ok_or_else(|| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_FUNCTION_ENTRY_COUNTER",
+                "baseline function-entry counter offset does not fit the native address space",
+            )
+        })?;
+    let counter = builder.ins().iadd_imm(counters, byte_offset);
+    let one = builder.ins().iconst(types::I64, 1);
+    let _ = builder.ins().atomic_rmw(
+        types::I64,
+        MemFlagsData::new(),
+        AtomicRmwOp::Add,
+        counter,
+        one,
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

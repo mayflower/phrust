@@ -128,10 +128,10 @@ fn submit_native_optimization_job(job: impl FnOnce() + Send + 'static) -> bool {
         }
         sender
     });
-    // A full queue blocks only the cold compile-miss edge. Published warm
-    // calls never enter this service, and the fixed queue prevents one thread
-    // allocation per reached PHP function.
-    sender.send(Box::new(job)).is_ok()
+    // Optimization is never allowed to delay a request. Request completion
+    // submits the hottest candidates first; a full queue rejects the colder
+    // tail and lets a later request reconsider it after more entry evidence.
+    sender.try_send(Box::new(job)).is_ok()
 }
 
 impl Default for VmWorkerState {
@@ -571,17 +571,14 @@ impl VmWorkerState {
         }
     }
 
-    /// Requests the optimizing product for one function that has already
-    /// acquired a callable baseline body through compile-on-demand.
-    ///
-    /// This is invoked only on the cold unpublished-cell edge. It never runs
-    /// from a published warm call: generated baseline and optimizing callers
-    /// both load the deployment's atomic function cell directly.
-    fn schedule_on_demand_optimization(
+    /// Requests the optimizing product for a baseline function whose direct
+    /// process-owned entry counter proves it is hot.
+    fn schedule_hot_on_demand_optimization(
         &self,
         unit: CompiledUnit,
         function: php_ir::FunctionId,
         external_signatures: Vec<php_jit::JitExternalFunctionSignature>,
+        entries: u64,
     ) {
         if !self.background_tiering
             || !self.tiering_options.enabled
@@ -599,10 +596,7 @@ impl VmWorkerState {
             return;
         }
         self.schedule_background_optimization(
-            BackgroundTieringDecision {
-                key,
-                entries: self.tiering_options.function_entry_threshold.max(1),
-            },
+            BackgroundTieringDecision { key, entries },
             unit,
             function,
             external_signatures,
@@ -2349,6 +2343,58 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn server_worker_uses_direct_entry_heat_for_on_demand_callee() {
+        let mut tiering = crate::tiering::TieringOptions::default();
+        tiering.collect_stats = true;
+        tiering.function_entry_threshold = 2;
+        tiering.native_max_functions = 2;
+        let worker = VmWorkerState::new_with_background_tiering(tiering.clone());
+        let options = VmOptions {
+            native_optimization: NativeOptimizationPolicy::Optimizing,
+            native_cache: php_jit::NativeCacheMode::Off,
+            tiering,
+            ..VmOptions::default()
+        };
+        let unit = direct_call_unit_with_identity(9_951, "native-hot-callee.php");
+        let callee = unit
+            .unit()
+            .function_table
+            .iter()
+            .find_map(|entry| (entry.name == "callee").then_some(entry.function))
+            .expect("callee function id");
+
+        for _ in 0..2 {
+            let result = Vm::with_options_and_worker_state(options.clone(), worker.clone())
+                .execute(unit.clone());
+            assert_eq!(result.return_value, Some(Value::Int(42)), "{result:#?}");
+        }
+        assert!(
+            unit.prepared_deployment_image()
+                .baseline_function_entry_counts[callee.index()]
+            .load(std::sync::atomic::Ordering::Relaxed)
+                >= 2
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let deployment = unit.prepared_deployment_image();
+            let baseline = deployment.native_function_entries[callee.index()]
+                .load(std::sync::atomic::Ordering::Acquire);
+            let preferred = deployment.preferred_function_entries[callee.index()]
+                .load(std::sync::atomic::Ordering::Acquire);
+            if baseline != 0 && preferred != baseline {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "hot on-demand callee did not publish an optimizing preferred entry"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn declaration_heavy_unit() -> CompiledUnit {
         let mut builder = IrBuilder::new(UnitId::new(9_901));
         let file = builder.add_file("function-on-demand-breadth.php");
@@ -2426,6 +2472,44 @@ mod tests {
             InstructionKind::CallFunction {
                 dst: result,
                 name: "callee".to_owned(),
+                args: Vec::new(),
+            },
+            span,
+        );
+        builder.terminate_return(entry, entry_block, Some(Operand::Register(result)), span);
+        builder.set_entry(entry);
+        CompiledUnit::new(builder.finish())
+    }
+
+    fn request_local_on_demand_unit() -> CompiledUnit {
+        let mut builder = IrBuilder::new(UnitId::new(9_947));
+        let file = builder.add_file("native-request-local-on-demand.php");
+        let span = IrSpan::new(file, 0, 24);
+        let callee = builder.start_function("read_server", FunctionFlags::default(), span);
+        let server = builder.intern_local(callee, "_SERVER");
+        let callee_block = builder.append_block(callee);
+        let value = builder.alloc_register(callee);
+        builder.emit(
+            callee,
+            callee_block,
+            InstructionKind::LoadLocal {
+                dst: value,
+                local: server,
+            },
+            span,
+        );
+        builder.terminate_return(callee, callee_block, Some(Operand::Register(value)), span);
+        builder.register_function_name("read_server", callee);
+
+        let entry = builder.start_function("main", FunctionFlags::default(), span);
+        let entry_block = builder.append_block(entry);
+        let result = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::CallFunction {
+                dst: result,
+                name: "read_server".to_owned(),
                 args: Vec::new(),
             },
             span,
@@ -3396,6 +3480,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn same_unit_call_resolves_on_demand_then_calls_native() {
         let worker = VmWorkerState::new(crate::tiering::TieringOptions::default());
+        let unit = direct_call_unit();
         let result = Vm::with_options_and_worker_state(
             VmOptions {
                 collect_counters: true,
@@ -3403,7 +3488,7 @@ mod tests {
             },
             worker.clone(),
         )
-        .execute(direct_call_unit());
+        .execute(unit.clone());
 
         assert_eq!(result.return_value, Some(Value::Int(42)), "{result:#?}");
         let counters = result.counters.expect("diagnostic counters");
@@ -3417,6 +3502,40 @@ mod tests {
         assert_eq!(compile_stats.entries, 2);
         assert_eq!(compile_stats.misses, 2);
         assert_eq!(compile_stats.insertions, 2);
+        assert_eq!(
+            unit.prepared_deployment_image()
+                .baseline_function_entry_counts
+                .iter()
+                .map(|entries| entries.load(std::sync::atomic::Ordering::Relaxed))
+                .sum::<u64>(),
+            2,
+            "root and on-demand callee must each update their direct baseline-entry counter"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pooled_request_republishes_metadata_for_process_published_callee() {
+        let worker = VmWorkerState::new(crate::tiering::TieringOptions::default());
+        let unit = request_local_on_demand_unit();
+        let options = VmOptions {
+            native_cache: php_jit::NativeCacheMode::Off,
+            ..VmOptions::default()
+        };
+
+        let first = Vm::with_options_and_worker_state(options.clone(), worker.clone())
+            .execute(unit.clone());
+        assert!(first.status.is_success(), "{first:#?}");
+        let compile_stats = worker.native_compile_cache_stats();
+        assert_eq!(compile_stats.entries, 2);
+
+        let second = Vm::with_options_and_worker_state(options, worker.clone()).execute(unit);
+        assert!(second.status.is_success(), "{second:#?}");
+        assert_eq!(second.return_value, first.return_value);
+        assert_eq!(
+            worker.native_compile_cache_stats().misses,
+            compile_stats.misses
+        );
     }
 
     #[test]
@@ -4156,6 +4275,11 @@ mod tests {
         assert_eq!(stats.entries, 1);
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.insertions, 1);
+        assert_eq!(
+            unit.prepared_unit_stats().continuation_index_runs,
+            1,
+            "dormant declarations must not build RegionGraph-derived runtime metadata"
+        );
 
         let manager = php_jit::global_code_manager().expect("global code manager");
         let mut published = 0;

@@ -6210,6 +6210,9 @@ fn define_region_fragment_wrapper(
         let deopt_out = params[3];
         let resume_id = params[4];
         let resume_state = params[5];
+        if region.compile_metadata.tier == NativeCompilerTier::Baseline {
+            lower_baseline_function_entry(&mut builder, deopt_out, region.function)?;
+        }
         let frame_layout = &layout.frame;
         let frame_bytes = frame_layout.frame_bytes()?;
         let frame_slot = builder.create_sized_stack_slot(StackSlotData::new(
@@ -6753,6 +6756,11 @@ fn define_region_graph_function(
             } else {
                 (params[1], params[2], params[3], params[4], params[5], None)
             };
+        if region.compile_metadata.tier == NativeCompilerTier::Baseline
+            && (fragment.is_none() || inline_fragment_entry)
+        {
+            lower_baseline_function_entry(&mut builder, deopt_out, region.function)?;
+        }
         let (native_call_helper, native_dynamic_code_helper, mut native_operations) =
             match tier_operations {
                 NativeTierOperations::Baseline {

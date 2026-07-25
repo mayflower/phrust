@@ -9,6 +9,7 @@ fn dynamic_unit_local_is_superglobal(name: &str) -> bool {
 
 pub(super) fn dynamic_unit_cross_unit_global_names(
     compiled: &crate::compiled_unit::CompiledUnit,
+    published_functions: impl IntoIterator<Item = php_ir::FunctionId>,
 ) -> std::sync::Arc<[String]> {
     let unit = compiled.unit();
     let mut names = std::collections::BTreeSet::new();
@@ -44,13 +45,32 @@ pub(super) fn dynamic_unit_cross_unit_global_names(
                 }),
         );
     }
-    names.extend(
+    let mut published_functions = published_functions
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    published_functions.extend(
         compiled
-            .prepared_native_global_sites()
+            .prepared_deployment_image()
+            .preferred_function_entries
             .iter()
-            .flat_map(|sites| sites.iter())
-            .filter_map(|name| name.as_deref().map(str::to_owned)),
+            .enumerate()
+            .filter_map(|(function, entry)| {
+                (entry.load(std::sync::atomic::Ordering::Acquire) != 0)
+                    .then(|| u32::try_from(function).ok())
+                    .flatten()
+                    .map(php_ir::FunctionId::new)
+            }),
     );
+    for function in published_functions {
+        let Some(sites) = compiled.prepared_native_global_sites(function) else {
+            continue;
+        };
+        names.extend(
+            sites
+                .iter()
+                .filter_map(|name| name.as_deref().map(str::to_owned)),
+        );
+    }
     names.into_iter().collect::<Vec<_>>().into()
 }
 
@@ -114,10 +134,9 @@ pub(in crate::vm) extern "C" fn jit_native_function_resolve_abi(
             let function = php_ir::FunctionId::new(function);
             // This helper is imported exclusively by streaming-baseline
             // artifacts. Keep the tier boundary physical: the current call
-            // always enters the baseline callee. A foreground production
-            // worker also compiles the actually reached optimizing product
-            // here and publishes it only to the preferred cell for later
-            // optimizing callers.
+            // always enters the baseline callee. Background workers select
+            // optimizing products later from direct baseline-entry counts;
+            // merely reaching a declaration is no longer sufficient.
             let handle = ensure_native_baseline_entry(context, function)?;
             let address = handle.native_entry_address().ok_or_else(|| {
                 format!(
@@ -126,33 +145,32 @@ pub(in crate::vm) extern "C" fn jit_native_function_resolve_abi(
                 )
             })?;
             context.publish_native_entry_address(function, address);
+            let mut preferred = handle.clone();
             if context.options.native_optimization
                 == super::super::NativeOptimizationPolicy::Optimizing
                 && context.options.tiering.enabled
+                && !context
+                    .worker_state
+                    .defers_optimizing_compilation(context.options)
             {
                 let compiled = context.compiled.clone();
                 let external_signatures =
                     visible_external_function_signatures(context, &compiled, function);
-                if context
-                    .worker_state
-                    .defers_optimizing_compilation(context.options)
-                {
-                    context.worker_state.schedule_on_demand_optimization(
-                        compiled,
-                        function,
-                        external_signatures,
-                    );
-                } else {
-                    let optimizing = context.worker_state.resolve_native_function(
-                        &compiled,
-                        function,
-                        context.options,
-                        &external_signatures,
-                    )?;
-                    std::sync::Arc::make_mut(&mut context.native_entries)
-                        .insert(function, optimizing);
-                }
+                preferred = context.worker_state.resolve_native_function(
+                    &compiled,
+                    function,
+                    context.options,
+                    &external_signatures,
+                )?;
             }
+            // The current streaming-baseline call enters `address`, while
+            // later optimizing callers use `preferred`. Both artifacts consume
+            // the same function-scoped native metadata, so publish the reached
+            // function before returning either executable address. Previously
+            // this resolver bypassed the active-entry installation boundary;
+            // demand-zero request-local slots therefore remained empty and
+            // generated code interpreted encoded zero as a direct-slot handle.
+            install_active_native_entry(context, function, preferred)?;
             Ok(address)
         })
     }));
@@ -231,7 +249,8 @@ pub(super) fn register_native_dynamic_unit(
     for (function, handle) in native_entries.iter() {
         publish_dynamic_unit_entry(&compiled, *function, handle);
     }
-    let cross_unit_global_names = dynamic_unit_cross_unit_global_names(&compiled);
+    let cross_unit_global_names =
+        dynamic_unit_cross_unit_global_names(&compiled, native_entries.keys().copied());
     let runtime_state = NativeUnitRuntimeState::for_compiled(&compiled);
     let linked_functions = vec![
         php_jit::JitNativeLinkedFunction::default();
@@ -376,6 +395,26 @@ pub(in crate::vm) fn native_entries_from_records(
         .collect())
 }
 
+fn install_active_native_entry(
+    context: &mut NativeRequestColdState<'_>,
+    function: php_ir::FunctionId,
+    handle: php_jit::JitFunctionHandle,
+) -> Result<php_jit::JitFunctionHandle, String> {
+    std::sync::Arc::make_mut(&mut context.native_entries).insert(function, handle.clone());
+    if let Some(unit) = context.current_dynamic_unit {
+        let names = dynamic_unit_cross_unit_global_names(
+            &context.compiled,
+            context.native_entries.keys().copied(),
+        );
+        if let Some(package) = context.dynamic_units.get_mut(unit) {
+            package.cross_unit_global_names = names;
+        }
+    }
+    context.prepare_published_native_metadata()?;
+    let _runtime_view = activate_native_context(context);
+    Ok(handle)
+}
+
 pub(super) fn ensure_native_entry(
     context: &mut NativeRequestColdState<'_>,
     function: php_ir::FunctionId,
@@ -391,8 +430,7 @@ pub(super) fn ensure_native_entry(
         } else {
             ensure_native_baseline_entry(context, function)?
         };
-        std::sync::Arc::make_mut(&mut context.native_entries).insert(function, handle.clone());
-        return Ok(handle);
+        return install_active_native_entry(context, function, handle);
     }
 
     if context
@@ -405,8 +443,7 @@ pub(super) fn ensure_native_entry(
             context.options,
             &external_signatures,
         ) {
-            std::sync::Arc::make_mut(&mut context.native_entries).insert(function, handle.clone());
-            return Ok(handle);
+            return install_active_native_entry(context, function, handle);
         }
 
         let handle = if let Some(handle) = context.native_entries.get(&function) {
@@ -414,13 +451,7 @@ pub(super) fn ensure_native_entry(
         } else {
             ensure_native_baseline_entry(context, function)?
         };
-        context.worker_state.schedule_on_demand_optimization(
-            context.compiled.clone(),
-            function,
-            external_signatures,
-        );
-        std::sync::Arc::make_mut(&mut context.native_entries).insert(function, handle.clone());
-        return Ok(handle);
+        return install_active_native_entry(context, function, handle);
     }
 
     if let Some(handle) = context.native_entries.get(&function)
@@ -439,12 +470,7 @@ pub(super) fn ensure_native_entry(
         context.options,
         &external_signatures,
     )?;
-    std::sync::Arc::make_mut(&mut context.native_entries).insert(function, handle);
-    context
-        .native_entries
-        .get(&function)
-        .cloned()
-        .ok_or_else(|| format!("native function entry {} was not published", function.raw()))
+    install_active_native_entry(context, function, handle)
 }
 
 pub(super) fn ensure_native_baseline_entry(
@@ -569,6 +595,27 @@ pub(super) fn prepare_dynamic_native_entry(
     } else {
         std::sync::Arc::make_mut(&mut package.native_entries).insert(function, preferred);
     }
+    let published_functions = if active_unit {
+        context.native_entries.keys().copied().collect::<Vec<_>>()
+    } else {
+        context
+            .dynamic_units
+            .get(unit)
+            .into_iter()
+            .flat_map(|package| package.native_entries.keys().copied())
+            .collect()
+    };
+    let cross_unit_global_names =
+        dynamic_unit_cross_unit_global_names(&compiled, published_functions);
+    if let Some(package) = context.dynamic_units.get_mut(unit) {
+        package.cross_unit_global_names = cross_unit_global_names;
+    }
+    if active_unit {
+        context.prepare_published_native_metadata()?;
+        let _runtime_view = activate_native_context(context);
+    } else {
+        context.with_active_dynamic_unit(unit, None, |_| ())?;
+    }
     // Only a published caller can expose one of its immutable cross-unit
     // links. Prepare that caller's newly reachable targets now; dormant
     // declarations remain code-free until their own publication boundary.
@@ -596,6 +643,65 @@ pub(super) fn visible_external_function_signatures_for_unit(
         context,
         compiled.prepared_unit_external_function_calls(),
     )
+}
+
+/// At the request boundary, select only baseline functions whose direct
+/// process-owned entry counters reached the worker threshold. Generated warm
+/// calls remain a single preferred-cell load; no runtime tiering helper or
+/// branch is introduced.
+pub(super) fn schedule_hot_native_functions(context: &NativeRequestColdState<'_>) {
+    if !context.worker_state.background_tiering
+        || !context.worker_state.tiering_options.enabled
+        || context.worker_state.tiering_options.native_eager
+    {
+        return;
+    }
+    let threshold = context
+        .worker_state
+        .tiering_options
+        .function_entry_threshold
+        .max(1);
+    let mut candidates = Vec::new();
+    for package in &context.dynamic_units {
+        let deployment = package.compiled.prepared_deployment_image();
+        for (index, ((baseline, preferred), entries)) in deployment
+            .native_function_entries
+            .iter()
+            .zip(deployment.preferred_function_entries.iter())
+            .zip(deployment.baseline_function_entry_counts.iter())
+            .enumerate()
+        {
+            let baseline = baseline.load(std::sync::atomic::Ordering::Acquire);
+            if baseline == 0 || preferred.load(std::sync::atomic::Ordering::Acquire) != baseline {
+                continue;
+            }
+            let entries = entries.load(std::sync::atomic::Ordering::Relaxed);
+            if entries < threshold {
+                continue;
+            }
+            let Ok(function) = u32::try_from(index).map(php_ir::FunctionId::new) else {
+                continue;
+            };
+            candidates.push((entries, package.compiled.clone(), function));
+        }
+    }
+    candidates.sort_unstable_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.2.raw().cmp(&right.2.raw()))
+    });
+    candidates.truncate(super::super::NATIVE_OPTIMIZATION_QUEUE_CAPACITY);
+    for (entries, compiled, function) in candidates {
+        let external_signatures =
+            visible_external_function_signatures(context, &compiled, function);
+        context.worker_state.schedule_hot_on_demand_optimization(
+            compiled,
+            function,
+            external_signatures,
+            entries,
+        );
+    }
 }
 
 #[derive(Clone)]

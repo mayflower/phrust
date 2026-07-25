@@ -50,7 +50,7 @@ pub use executable::{
     RegionInstructionKind, RegionMethodIdentity, RegionNativeCall, RegionNativeClosureCapture,
     RegionNativeControl, RegionNativeDynamicCode, RegionNativeSuspend, RegionOperand,
     RegionOsrEntryPoint, RegionStableCallback, RegionTerminator, RegionUnaryOp,
-    build_baseline_region,
+    build_baseline_region, native_continuation_capacity_upper_bound,
 };
 pub use ids::{ConstId, EntryId, ExitId, NodeId, RegionId, SnapshotId, VmSlotId};
 pub use node::{

@@ -167,7 +167,7 @@ impl SymbolIndex {
 struct PreparedUnit {
     ir_verification_errors: OnceLock<usize>,
     class_validation: OnceLock<PreparedClassValidation>,
-    native_indexes: OnceLock<PreparedNativeIndexes>,
+    native_function_indexes: Box<[OnceLock<Arc<PreparedNativeFunctionIndexes>>]>,
     ir_fingerprint: OnceLock<String>,
     function_ir_fingerprint_context: OnceLock<php_jit::StableFunctionIrFingerprintContext>,
     function_ir_fingerprints: Box<[OnceLock<String>]>,
@@ -200,6 +200,10 @@ pub(crate) struct PreparedDeploymentNativeImage {
     /// baseline initializes its cell and an optimizing publication atomically
     /// replaces that target, so generated calls never select a tier.
     pub preferred_function_entries: Box<[std::sync::atomic::AtomicUsize]>,
+    /// Process-stable direct baseline-entry counters indexed by `FunctionId`.
+    /// Baseline CLIF updates these counters and the request-completion
+    /// coordinator consumes them to select optimizing candidates.
+    pub baseline_function_entry_counts: Box<[std::sync::atomic::AtomicU64]>,
 }
 
 impl PreparedUnit {
@@ -216,7 +220,7 @@ impl PreparedUnit {
         Self {
             ir_verification_errors: OnceLock::new(),
             class_validation: OnceLock::new(),
-            native_indexes: OnceLock::new(),
+            native_function_indexes: (0..function_count).map(|_| OnceLock::new()).collect(),
             ir_fingerprint: OnceLock::new(),
             function_ir_fingerprint_context: OnceLock::new(),
             function_ir_fingerprints: fingerprint_slots.into_boxed_slice(),
@@ -285,12 +289,12 @@ pub(crate) struct PreparedNativeFunctionMetadata {
 }
 
 #[derive(Debug)]
-struct PreparedNativeIndexes {
-    continuation_instructions: Arc<Vec<Vec<Option<Arc<php_ir::Instruction>>>>>,
-    callsites: Arc<Vec<Vec<Option<Arc<NativeCallSiteDescriptor>>>>>,
-    property_sites: Arc<Vec<Vec<Option<PreparedNativePropertySite>>>>,
-    closure_sites: Arc<Vec<Vec<Option<Arc<PreparedNativeClosureSite>>>>>,
-    global_sites: Arc<Vec<Vec<Option<Arc<str>>>>>,
+struct PreparedNativeFunctionIndexes {
+    continuation_instructions: Arc<[Option<Arc<php_ir::Instruction>>]>,
+    callsites: Arc<[Option<Arc<NativeCallSiteDescriptor>>]>,
+    property_sites: Arc<[Option<PreparedNativePropertySite>]>,
+    closure_sites: Arc<[Option<Arc<PreparedNativeClosureSite>>]>,
+    global_sites: Arc<[Option<Arc<str>>]>,
 }
 
 #[derive(Clone, Debug)]
@@ -690,6 +694,9 @@ impl CompiledUnit {
                 preferred_function_entries: (0..unit.functions.len())
                     .map(|_| std::sync::atomic::AtomicUsize::new(0))
                     .collect(),
+                baseline_function_entry_counts: (0..unit.functions.len())
+                    .map(|_| std::sync::atomic::AtomicU64::new(0))
+                    .collect(),
             }
         })
     }
@@ -906,32 +913,33 @@ impl CompiledUnit {
         })
     }
 
-    fn prepared_native_indexes(&self) -> &PreparedNativeIndexes {
-        self.inner.prepared.native_indexes.get_or_init(|| {
+    fn prepared_native_function_indexes(
+        &self,
+        function: FunctionId,
+    ) -> Option<&Arc<PreparedNativeFunctionIndexes>> {
+        let slot = self
+            .inner
+            .prepared
+            .native_function_indexes
+            .get(function.index())?;
+        Some(slot.get_or_init(|| {
             self.inner
                 .prepared
                 .continuation_index_runs
                 .fetch_add(1, Ordering::Relaxed);
-            let mut instructions = Vec::with_capacity(self.inner.unit.functions.len());
-            let mut callsites = Vec::with_capacity(self.inner.unit.functions.len());
-            let mut property_sites = Vec::with_capacity(self.inner.unit.functions.len());
-            let mut closure_sites = Vec::with_capacity(self.inner.unit.functions.len());
-            let mut global_sites = Vec::with_capacity(self.inner.unit.functions.len());
+            let mut function_instructions = Vec::new();
+            let mut function_callsites = Vec::new();
+            let mut function_property_sites = Vec::new();
+            let mut function_closure_sites = Vec::new();
+            let mut function_global_sites = Vec::new();
             let metadata = php_jit::region_ir::CompileMetadata::default();
-            for function_index in 0..self.inner.unit.functions.len() {
-                let function = FunctionId::new(function_index as u32);
-                let mut function_instructions = Vec::new();
-                let mut function_callsites = Vec::new();
-                let mut function_property_sites = Vec::new();
-                let mut function_closure_sites = Vec::new();
-                let mut function_global_sites = Vec::new();
-                if let Ok(region) = php_jit::region_ir::BaselineRegionBuilder::build(
-                    &self.inner.unit,
-                    function,
-                    &metadata,
-                ) {
-                    for block in &region.blocks {
-                        for instruction in &block.instructions {
+            if let Ok(region) = php_jit::region_ir::BaselineRegionBuilder::build(
+                &self.inner.unit,
+                function,
+                &metadata,
+            ) {
+                for block in &region.blocks {
+                    for instruction in &block.instructions {
                             let semantic_instruction = Arc::new(php_ir::Instruction {
                                 id: instruction.id,
                                 span: instruction.span,
@@ -1130,51 +1138,57 @@ impl CompiledUnit {
                                         method_pic: PersistentNativeMethodPic::default(),
                                     }));
                             }
-                        }
                     }
                 }
-                instructions.push(function_instructions);
-                callsites.push(function_callsites);
-                property_sites.push(function_property_sites);
-                closure_sites.push(function_closure_sites);
-                global_sites.push(function_global_sites);
             }
-            PreparedNativeIndexes {
-                continuation_instructions: Arc::new(instructions),
-                callsites: Arc::new(callsites),
-                property_sites: Arc::new(property_sites),
-                closure_sites: Arc::new(closure_sites),
-                global_sites: Arc::new(global_sites),
-            }
-        })
+            Arc::new(PreparedNativeFunctionIndexes {
+                continuation_instructions: function_instructions.into(),
+                callsites: function_callsites.into(),
+                property_sites: function_property_sites.into(),
+                closure_sites: function_closure_sites.into(),
+                global_sites: function_global_sites.into(),
+            })
+        }))
     }
 
     pub(crate) fn prepared_continuation_instructions(
         &self,
-    ) -> Arc<Vec<Vec<Option<Arc<php_ir::Instruction>>>>> {
-        Arc::clone(&self.prepared_native_indexes().continuation_instructions)
+        function: FunctionId,
+    ) -> Option<Arc<[Option<Arc<php_ir::Instruction>>]>> {
+        self.prepared_native_function_indexes(function)
+            .map(|indexes| Arc::clone(&indexes.continuation_instructions))
     }
 
     pub(crate) fn prepared_native_callsites(
         &self,
-    ) -> Arc<Vec<Vec<Option<Arc<NativeCallSiteDescriptor>>>>> {
-        Arc::clone(&self.prepared_native_indexes().callsites)
+        function: FunctionId,
+    ) -> Option<Arc<[Option<Arc<NativeCallSiteDescriptor>>]>> {
+        self.prepared_native_function_indexes(function)
+            .map(|indexes| Arc::clone(&indexes.callsites))
     }
 
     pub(crate) fn prepared_native_property_sites(
         &self,
-    ) -> Arc<Vec<Vec<Option<PreparedNativePropertySite>>>> {
-        Arc::clone(&self.prepared_native_indexes().property_sites)
+        function: FunctionId,
+    ) -> Option<Arc<[Option<PreparedNativePropertySite>]>> {
+        self.prepared_native_function_indexes(function)
+            .map(|indexes| Arc::clone(&indexes.property_sites))
     }
 
     pub(crate) fn prepared_native_closure_sites(
         &self,
-    ) -> Arc<Vec<Vec<Option<Arc<PreparedNativeClosureSite>>>>> {
-        Arc::clone(&self.prepared_native_indexes().closure_sites)
+        function: FunctionId,
+    ) -> Option<Arc<[Option<Arc<PreparedNativeClosureSite>>]>> {
+        self.prepared_native_function_indexes(function)
+            .map(|indexes| Arc::clone(&indexes.closure_sites))
     }
 
-    pub(crate) fn prepared_native_global_sites(&self) -> Arc<Vec<Vec<Option<Arc<str>>>>> {
-        Arc::clone(&self.prepared_native_indexes().global_sites)
+    pub(crate) fn prepared_native_global_sites(
+        &self,
+        function: FunctionId,
+    ) -> Option<Arc<[Option<Arc<str>>]>> {
+        self.prepared_native_function_indexes(function)
+            .map(|indexes| Arc::clone(&indexes.global_sites))
     }
 
     fn prepared_external_function_call_index(&self) -> &PreparedExternalFunctionCalls {
@@ -1979,10 +1993,22 @@ mod tests {
 
     #[test]
     fn continuation_instruction_index_is_shared_per_compiled_unit() {
-        let compiled = CompiledUnit::new(IrUnit::new(UnitId::new(0)));
+        let mut builder = php_ir::IrBuilder::new(UnitId::new(0));
+        let file = builder.add_file("continuation-index.php");
+        let span = IrSpan::new(file, 0, 1);
+        let entry = builder.start_function("main", php_ir::FunctionFlags::default(), span);
+        let block = builder.append_block(entry);
+        builder.terminate_return(entry, block, None, span);
+        builder.set_entry(entry);
+        let compiled = CompiledUnit::new(builder.finish());
+        let entry = compiled.unit().entry;
 
-        let first = compiled.prepared_continuation_instructions();
-        let second = compiled.prepared_continuation_instructions();
+        let first = compiled
+            .prepared_continuation_instructions(entry)
+            .expect("entry continuation index");
+        let second = compiled
+            .prepared_continuation_instructions(entry)
+            .expect("entry continuation index");
         let first_ir_fingerprint = compiled.prepared_ir_fingerprint();
         let second_ir_fingerprint = compiled.prepared_ir_fingerprint();
         let first_dependency_identity = compiled.prepared_dependency_identity();
@@ -2004,6 +2030,31 @@ mod tests {
         assert_eq!(compiled.prepared_unit_stats().continuation_index_runs, 1);
         assert_eq!(compiled.prepared_unit_stats().ir_fingerprint_runs, 1);
         assert_eq!(compiled.prepared_unit_stats().dependency_identity_runs, 1);
+    }
+
+    #[test]
+    fn continuation_indexes_are_prepared_only_for_reached_functions() {
+        let mut builder = php_ir::IrBuilder::new(UnitId::new(1));
+        let file = builder.add_file("function-on-demand-index.php");
+        let span = IrSpan::new(file, 0, 1);
+        let entry = builder.start_function("main", php_ir::FunctionFlags::default(), span);
+        let entry_block = builder.append_block(entry);
+        builder.terminate_return(entry, entry_block, None, span);
+        let dormant = builder.start_function("dormant", php_ir::FunctionFlags::default(), span);
+        let dormant_block = builder.append_block(dormant);
+        builder.terminate_return(dormant, dormant_block, None, span);
+        builder.set_entry(entry);
+        let compiled = CompiledUnit::new(builder.finish());
+
+        let _entry = compiled
+            .prepared_continuation_instructions(entry)
+            .expect("entry continuation index");
+        assert_eq!(compiled.prepared_unit_stats().continuation_index_runs, 1);
+
+        let _dormant = compiled
+            .prepared_continuation_instructions(dormant)
+            .expect("dormant continuation index");
+        assert_eq!(compiled.prepared_unit_stats().continuation_index_runs, 2);
     }
 
     #[test]
