@@ -32682,7 +32682,36 @@ fn lower_baseline_region_instruction(
                 result_out,
             )?;
             define_local_variable(builder, locals, *source, reference)?;
-            define_local_variable(builder, locals, *target, reference)?;
+            if target != source {
+                let previous = use_local_variable(builder, locals, *target)?;
+                if instruction.live_locals.contains(target)
+                    && value_release_required(value_flow.local_fact(*target))
+                {
+                    let _ = lower_guarded_value_release(
+                        module,
+                        builder,
+                        native_operations.value_release,
+                        native_dim_operation(1, function, instruction.continuation_id),
+                        previous,
+                        result_out,
+                        deopt_out,
+                    )?;
+                }
+                // Each frame-local binding owns its encoded reference handle.
+                // The source keeps the owner's original count; installing the
+                // same alias in a distinct target local creates one additional
+                // owner that frame cleanup releases independently.
+                let _ = lower_guarded_value_release(
+                    module,
+                    builder,
+                    native_operations.value_release,
+                    native_dim_operation(0, function, instruction.continuation_id),
+                    reference,
+                    result_out,
+                    deopt_out,
+                )?;
+                define_local_variable(builder, locals, *target, reference)?;
+            }
             publish_native_reference_local(
                 module,
                 builder,
@@ -32692,15 +32721,17 @@ fn lower_baseline_region_instruction(
                 *source,
                 result_out,
             )?;
-            publish_native_reference_local(
-                module,
-                builder,
-                native_reference_publish,
-                reference,
-                function,
-                *target,
-                result_out,
-            )?;
+            if target != source {
+                publish_native_reference_local(
+                    module,
+                    builder,
+                    native_reference_publish,
+                    reference,
+                    function,
+                    *target,
+                    result_out,
+                )?;
+            }
         }
         RegionInstructionKind::BindReferenceDim {
             target,
