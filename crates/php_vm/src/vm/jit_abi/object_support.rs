@@ -239,7 +239,7 @@ pub(super) fn execute_native_array_object(
                 display_class_name.clone(),
             );
             if let Some(array) = arguments.first()
-                && let Ok(Value::Array(array)) = context.decode(*array)
+                && let Ok(Value::Array(array)) = context.decode_baseline_value(*array)
             {
                 for (key, value) in array.iter() {
                     let name = match key {
@@ -268,7 +268,7 @@ pub(super) fn execute_native_array_object(
                     let argument = arguments
                         .first()
                         .ok_or_else(|| "ReflectionFunction expects a function".to_owned())?;
-                    let value = match context.decode(*argument)? {
+                    let value = match context.decode_baseline_value(*argument)? {
                         Value::Reference(reference) => reference.get(),
                         value => value,
                     };
@@ -368,7 +368,7 @@ pub(super) fn execute_native_array_object(
                             arguments.len()
                         ));
                     }
-                    let owner = match context.decode(arguments[0])? {
+                    let owner = match context.decode_baseline_value(arguments[0])? {
                         Value::Reference(reference) => reference.get(),
                         value => value,
                     };
@@ -382,7 +382,7 @@ pub(super) fn execute_native_array_object(
                             );
                         }
                     };
-                    let method = match context.decode(arguments[1])? {
+                    let method = match context.decode_baseline_value(arguments[1])? {
                         Value::Reference(reference) => reference.get(),
                         value => value,
                     };
@@ -455,7 +455,7 @@ pub(super) fn execute_native_array_object(
                             arguments.len()
                         ));
                     }
-                    let owner = match context.decode(arguments[0])? {
+                    let owner = match context.decode_baseline_value(arguments[0])? {
                         Value::Reference(reference) => reference.get(),
                         value => value,
                     };
@@ -469,7 +469,7 @@ pub(super) fn execute_native_array_object(
                             );
                         }
                     };
-                    let member = match context.decode(arguments[1])? {
+                    let member = match context.decode_baseline_value(arguments[1])? {
                         Value::Reference(reference) => reference.get(),
                         value => value,
                     };
@@ -533,7 +533,7 @@ pub(super) fn execute_native_array_object(
                 }
                 let name = arguments
                     .first()
-                    .map(|value| context.decode(*value))
+                    .map(|value| context.decode_baseline_value(*value))
                     .transpose()?
                     .map(native_object_dereference_value)
                     .and_then(|value| match value {
@@ -553,7 +553,7 @@ pub(super) fn execute_native_array_object(
                 if class_name.to_ascii_lowercase().contains("case") {
                     let case = arguments
                         .get(1)
-                        .map(|value| context.decode(*value))
+                        .map(|value| context.decode_baseline_value(*value))
                         .transpose()?
                         .map(native_object_dereference_value)
                         .and_then(|value| match value {
@@ -580,7 +580,7 @@ pub(super) fn execute_native_array_object(
             let Some(object) = arguments.first() else {
                 return Some(Err("ArrayObject receiver is missing".to_owned()));
             };
-            let Ok(Value::Object(object)) = context.decode(*object) else {
+            let Ok(Value::Object(object)) = context.decode_baseline_value(*object) else {
                 return Some(Err("ArrayObject receiver is invalid".to_owned()));
             };
             if !object.class_name().eq_ignore_ascii_case("arrayobject") {
@@ -597,7 +597,7 @@ pub(super) fn execute_native_array_object(
         }
         php_ir::InstructionKind::CallMethod { method, .. } => {
             let receiver = arguments.first().copied()?;
-            let Ok(Value::Object(object)) = context.decode(receiver) else {
+            let Ok(Value::Object(object)) = context.decode_baseline_value(receiver) else {
                 return None;
             };
             if !object
@@ -615,11 +615,11 @@ pub(super) fn execute_native_array_object(
                 };
                 let class_name = object.class_name().to_ascii_lowercase();
                 match method.to_ascii_lowercase().as_str() {
-                    "getname" => context.encode(property("name")),
-                    "getarguments" => context.encode(property("arguments")),
+                    "getname" => context.encode_baseline_value(property("name")),
+                    "getarguments" => context.encode_baseline_value(property("arguments")),
                     "getattributes" => {
                         if !matches!(property("attributes"), Value::Null) {
-                            return context.encode(property("attributes"));
+                            return context.encode_baseline_value(property("attributes"));
                         }
                         let attributes =
                             if class_name == "reflectionclass" || class_name == "reflectionenum" {
@@ -647,36 +647,40 @@ pub(super) fn execute_native_array_object(
                             } else {
                                 None
                             };
-                        context.encode(match attributes {
+                        context.encode_baseline_value(match attributes {
                             Some(attributes) => native_reflection_attributes(context, attributes)?,
                             None => Value::Array(php_runtime::api::PhpArray::new()),
                         })
                     }
-                    "getreturntype" => context.encode(property("return_type")),
-                    "gettype" => context.encode(property("type")),
-                    "getparameters" => context.encode(property("parameters")),
+                    "getreturntype" => context.encode_baseline_value(property("return_type")),
+                    "gettype" => context.encode_baseline_value(property("type")),
+                    "getparameters" => context.encode_baseline_value(property("parameters")),
                     "getnumberofparameters" => match property("parameters") {
                         Value::Array(parameters) => {
-                            context.encode(Value::Int(parameters.len() as i64))
+                            context.encode_baseline_value(Value::Int(parameters.len() as i64))
                         }
-                        _ => context.encode(Value::Int(0)),
+                        _ => context.encode_baseline_value(Value::Int(0)),
                     },
-                    "getnumberofrequiredparameters" => context.encode(property("required")),
-                    "isinternal" => context.encode(property("internal")),
-                    "getfilename" => context.encode(property("file_name")),
-                    "isclosure" => context.encode(property("is_closure")),
-                    "getstaticvariables" => context.encode(property("static_variables")),
-                    "getclosurescopeclass" => context.encode(Value::Null),
-                    "isbuiltin" => context.encode(Value::Bool(true)),
-                    "isoptional" => context.encode(property("optional")),
-                    "ispassedbyreference" => context.encode(property("by_ref")),
-                    "getdefaultvalue" => context.encode(property("default")),
-                    "isstatic" => context.encode(property("static")),
-                    "isprivate" => context.encode(property("private")),
-                    "isprotected" => context.encode(property("protected")),
-                    "getvalue" => context.encode(property("value")),
-                    "getbackingvalue" => context.encode(property("value")),
-                    "getdoccomment" => context.encode(Value::Bool(false)),
+                    "getnumberofrequiredparameters" => {
+                        context.encode_baseline_value(property("required"))
+                    }
+                    "isinternal" => context.encode_baseline_value(property("internal")),
+                    "getfilename" => context.encode_baseline_value(property("file_name")),
+                    "isclosure" => context.encode_baseline_value(property("is_closure")),
+                    "getstaticvariables" => {
+                        context.encode_baseline_value(property("static_variables"))
+                    }
+                    "getclosurescopeclass" => context.encode_baseline_value(Value::Null),
+                    "isbuiltin" => context.encode_baseline_value(Value::Bool(true)),
+                    "isoptional" => context.encode_baseline_value(property("optional")),
+                    "ispassedbyreference" => context.encode_baseline_value(property("by_ref")),
+                    "getdefaultvalue" => context.encode_baseline_value(property("default")),
+                    "isstatic" => context.encode_baseline_value(property("static")),
+                    "isprivate" => context.encode_baseline_value(property("private")),
+                    "isprotected" => context.encode_baseline_value(property("protected")),
+                    "getvalue" => context.encode_baseline_value(property("value")),
+                    "getbackingvalue" => context.encode_baseline_value(property("value")),
+                    "getdoccomment" => context.encode_baseline_value(Value::Bool(false)),
                     "getdeclaringclass" => {
                         let name = string_property("declaring_class").unwrap_or_default();
                         context.encode_native_object_owner(native_metadata_object(
@@ -707,7 +711,7 @@ pub(super) fn execute_native_array_object(
                                 "isbacked" => class.enum_backing_type.is_some(),
                                 _ => false,
                             });
-                        context.encode(Value::Bool(value))
+                        context.encode_baseline_value(Value::Bool(value))
                     }
                     "getbackingtype" => {
                         let name = string_property("name").unwrap_or_default();
@@ -722,7 +726,7 @@ pub(super) fn execute_native_array_object(
                                 php_ir::ClassEnumBackingType::String => "string",
                             })
                             .unwrap_or("mixed");
-                        context.encode(native_reflection_type(&match type_name {
+                        context.encode_baseline_value(native_reflection_type(&match type_name {
                             "int" => php_ir::IrReturnType::Int,
                             "string" => php_ir::IrReturnType::String,
                             _ => php_ir::IrReturnType::Mixed,
@@ -767,7 +771,7 @@ pub(super) fn execute_native_array_object(
                             .ok_or_else(|| "reflection class metadata is missing".to_owned())?;
                         let requested = arguments
                             .get(1)
-                            .map(|value| context.decode(*value))
+                            .map(|value| context.decode_baseline_value(*value))
                             .transpose()?
                             .map(native_object_dereference_value)
                             .and_then(|value| match value {
@@ -814,7 +818,9 @@ pub(super) fn execute_native_array_object(
                             })
                             .collect::<Result<Vec<_>, _>>()?;
                         if requested.is_some() {
-                            context.encode(methods.into_iter().next().unwrap_or(Value::Null))
+                            context.encode_baseline_value(
+                                methods.into_iter().next().unwrap_or(Value::Null),
+                            )
                         } else {
                             context.encode_native_array_owner(
                                 php_runtime::api::PhpArray::from_packed(methods),
@@ -827,7 +833,7 @@ pub(super) fn execute_native_array_object(
                             .ok_or_else(|| "reflection class metadata is missing".to_owned())?;
                         let requested = arguments
                             .get(1)
-                            .map(|value| context.decode(*value))
+                            .map(|value| context.decode_baseline_value(*value))
                             .transpose()?
                             .map(native_object_dereference_value)
                             .and_then(|value| match value {
@@ -877,7 +883,9 @@ pub(super) fn execute_native_array_object(
                             })
                             .collect::<Result<Vec<_>, _>>()?;
                         if requested.is_some() {
-                            context.encode(properties.into_iter().next().unwrap_or(Value::Null))
+                            context.encode_baseline_value(
+                                properties.into_iter().next().unwrap_or(Value::Null),
+                            )
                         } else {
                             context.encode_native_array_owner(
                                 php_runtime::api::PhpArray::from_packed(properties),
@@ -896,7 +904,7 @@ pub(super) fn execute_native_array_object(
                         };
                         let requested = arguments
                             .get(1)
-                            .map(|value| context.decode(*value))
+                            .map(|value| context.decode_baseline_value(*value))
                             .transpose()?
                             .and_then(|value| match value {
                                 Value::String(value) => Some(value.to_string_lossy()),
@@ -954,7 +962,7 @@ pub(super) fn execute_native_array_object(
                             .transpose()?
                             .unwrap_or(Value::Null);
                         if method.eq_ignore_ascii_case("getConstant") {
-                            return context.encode(value);
+                            return context.encode_baseline_value(value);
                         }
                         let entry =
                             entry.ok_or_else(|| "reflection constant is missing".to_owned())?;
@@ -1039,7 +1047,7 @@ pub(super) fn execute_native_array_object(
                         let owner = string_property("name").unwrap_or_default();
                         let requested = arguments
                             .get(1)
-                            .map(|value| context.decode(*value))
+                            .map(|value| context.decode_baseline_value(*value))
                             .transpose()?
                             .map(native_object_dereference_value)
                             .and_then(|value| match value {
@@ -1063,13 +1071,13 @@ pub(super) fn execute_native_array_object(
                                 &owner, &requested,
                             )
                             .is_some();
-                        context.encode(Value::Bool(exists))
+                        context.encode_baseline_value(Value::Bool(exists))
                     }
                     "hasproperty" => {
                         let owner = string_property("name").unwrap_or_default();
                         let requested = arguments
                             .get(1)
-                            .map(|value| context.decode(*value))
+                            .map(|value| context.decode_baseline_value(*value))
                             .transpose()?
                             .map(native_object_dereference_value)
                             .and_then(|value| match value {
@@ -1089,7 +1097,7 @@ pub(super) fn execute_native_array_object(
                                 &owner, &requested,
                             )
                             .is_some();
-                        context.encode(Value::Bool(exists))
+                        context.encode_baseline_value(Value::Bool(exists))
                     }
                     "newinstance" => {
                         let name = string_property("name").unwrap_or_default();

@@ -86,9 +86,9 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     ),
 ];
 
-pub(in crate::builtins::modules) const ZLIB_ENCODING_RAW: i64 = -15;
-pub(in crate::builtins::modules) const ZLIB_ENCODING_GZIP: i64 = 31;
-pub(in crate::builtins::modules) const ZLIB_ENCODING_DEFLATE: i64 = 15;
+pub const ZLIB_ENCODING_RAW: i64 = -15;
+pub const ZLIB_ENCODING_GZIP: i64 = 31;
+pub const ZLIB_ENCODING_DEFLATE: i64 = 15;
 pub(in crate::builtins::modules) const ZLIB_SYNC_FLUSH: i64 = 2;
 pub(in crate::builtins::modules) const ZLIB_FINISH: i64 = 4;
 pub(in crate::builtins::modules) const ZLIB_OK: i64 = 0;
@@ -508,12 +508,11 @@ fn builtin_gzencode(
         return Err(arity_error("gzencode", "one to three argument(s)"));
     }
     let input = string_arg("gzencode", &args[0])?;
-    let level = compression_level("gzencode", args.get(1))?;
-    let mut encoder = GzEncoder::new(Vec::new(), level);
-    if encoder.write_all(input.as_bytes()).is_err() {
-        return Ok(Value::Bool(false));
-    }
-    Ok(encoder.finish().map_or(Value::Bool(false), Value::string))
+    let level = compression_level_value("gzencode", args.get(1))?;
+    Ok(
+        native_zlib_encode(input.as_bytes(), ZLIB_ENCODING_GZIP, level)
+            .map_or(Value::Bool(false), Value::string),
+    )
 }
 
 fn builtin_gzcompress(
@@ -525,12 +524,11 @@ fn builtin_gzcompress(
         return Err(arity_error("gzcompress", "one to three argument(s)"));
     }
     let input = string_arg("gzcompress", &args[0])?;
-    let level = compression_level("gzcompress", args.get(1))?;
-    let mut encoder = ZlibEncoder::new(Vec::new(), level);
-    if encoder.write_all(input.as_bytes()).is_err() {
-        return Ok(Value::Bool(false));
-    }
-    Ok(encoder.finish().map_or(Value::Bool(false), Value::string))
+    let level = compression_level_value("gzcompress", args.get(1))?;
+    Ok(
+        native_zlib_encode(input.as_bytes(), ZLIB_ENCODING_DEFLATE, level)
+            .map_or(Value::Bool(false), Value::string),
+    )
 }
 
 fn builtin_gzdeflate(
@@ -542,12 +540,11 @@ fn builtin_gzdeflate(
         return Err(arity_error("gzdeflate", "one to three argument(s)"));
     }
     let input = string_arg("gzdeflate", &args[0])?;
-    let level = compression_level("gzdeflate", args.get(1))?;
-    let mut encoder = DeflateEncoder::new(Vec::new(), level);
-    if encoder.write_all(input.as_bytes()).is_err() {
-        return Ok(Value::Bool(false));
-    }
-    Ok(encoder.finish().map_or(Value::Bool(false), Value::string))
+    let level = compression_level_value("gzdeflate", args.get(1))?;
+    Ok(
+        native_zlib_encode(input.as_bytes(), ZLIB_ENCODING_RAW, level)
+            .map_or(Value::Bool(false), Value::string),
+    )
 }
 
 fn builtin_gzdecode(
@@ -559,10 +556,12 @@ fn builtin_gzdecode(
         return Err(arity_error("gzdecode", "one or two argument(s)"));
     }
     let input = string_arg("gzdecode", &args[0])?;
-    decode_with(
-        GzDecoder::new(input.as_bytes()),
+    Ok(native_zlib_decode(
+        input.as_bytes(),
+        ZLIB_ENCODING_GZIP,
         max_length("gzdecode", args.get(1))?,
     )
+    .map_or(Value::Bool(false), Value::string))
 }
 
 fn builtin_gzuncompress(
@@ -574,10 +573,12 @@ fn builtin_gzuncompress(
         return Err(arity_error("gzuncompress", "one or two argument(s)"));
     }
     let input = string_arg("gzuncompress", &args[0])?;
-    decode_with(
-        ZlibDecoder::new(input.as_bytes()),
+    Ok(native_zlib_decode(
+        input.as_bytes(),
+        ZLIB_ENCODING_DEFLATE,
         max_length("gzuncompress", args.get(1))?,
     )
+    .map_or(Value::Bool(false), Value::string))
 }
 
 fn builtin_gzinflate(
@@ -589,10 +590,12 @@ fn builtin_gzinflate(
         return Err(arity_error("gzinflate", "one or two argument(s)"));
     }
     let input = string_arg("gzinflate", &args[0])?;
-    decode_with(
-        DeflateDecoder::new(input.as_bytes()),
+    Ok(native_zlib_decode(
+        input.as_bytes(),
+        ZLIB_ENCODING_RAW,
         max_length("gzinflate", args.get(1))?,
     )
+    .map_or(Value::Bool(false), Value::string))
 }
 
 fn builtin_zlib_decode(
@@ -605,16 +608,8 @@ fn builtin_zlib_decode(
     }
     let input = string_arg("zlib_decode", &args[0])?;
     let max_length = max_length("zlib_decode", args.get(1))?;
-    let bytes = input.as_bytes();
-    let gzip = decode_with(GzDecoder::new(bytes), max_length);
-    if !matches!(gzip, Ok(Value::Bool(false))) {
-        return gzip;
-    }
-    let zlib = decode_with(ZlibDecoder::new(bytes), max_length);
-    if !matches!(zlib, Ok(Value::Bool(false))) {
-        return zlib;
-    }
-    decode_with(DeflateDecoder::new(bytes), max_length)
+    Ok(native_zlib_decode_auto(input.as_bytes(), max_length)
+        .map_or(Value::Bool(false), Value::string))
 }
 
 fn builtin_zlib_encode(
@@ -627,31 +622,66 @@ fn builtin_zlib_encode(
     }
     let input = string_arg("zlib_encode", &args[0])?;
     let encoding = int_arg("zlib_encode", &args[1])?;
-    let level = compression_level("zlib_encode", args.get(2))?;
+    let level = compression_level_value("zlib_encode", args.get(2))?;
+    Ok(native_zlib_encode(input.as_bytes(), encoding, level)
+        .map_or(Value::Bool(false), Value::string))
+}
+
+fn native_compression_level(level: i64) -> Compression {
+    if level < 0 {
+        Compression::default()
+    } else {
+        Compression::new(level.clamp(0, 9) as u32)
+    }
+}
+
+pub fn native_zlib_encode(input: &[u8], encoding: i64, level: i64) -> Option<Vec<u8>> {
+    let level = native_compression_level(level);
     match encoding {
         ZLIB_ENCODING_RAW => {
             let mut encoder = DeflateEncoder::new(Vec::new(), level);
-            if encoder.write_all(input.as_bytes()).is_err() {
-                return Ok(Value::Bool(false));
-            }
-            Ok(encoder.finish().map_or(Value::Bool(false), Value::string))
+            encoder.write_all(input).ok()?;
+            encoder.finish().ok()
         }
         ZLIB_ENCODING_GZIP => {
             let mut encoder = GzEncoder::new(Vec::new(), level);
-            if encoder.write_all(input.as_bytes()).is_err() {
-                return Ok(Value::Bool(false));
-            }
-            Ok(encoder.finish().map_or(Value::Bool(false), Value::string))
+            encoder.write_all(input).ok()?;
+            encoder.finish().ok()
         }
         ZLIB_ENCODING_DEFLATE => {
             let mut encoder = ZlibEncoder::new(Vec::new(), level);
-            if encoder.write_all(input.as_bytes()).is_err() {
-                return Ok(Value::Bool(false));
-            }
-            Ok(encoder.finish().map_or(Value::Bool(false), Value::string))
+            encoder.write_all(input).ok()?;
+            encoder.finish().ok()
         }
-        _ => Ok(Value::Bool(false)),
+        _ => None,
     }
+}
+
+pub fn native_zlib_decode(
+    input: &[u8],
+    encoding: i64,
+    max_length: Option<usize>,
+) -> Option<Vec<u8>> {
+    match encoding {
+        ZLIB_ENCODING_RAW => native_decode_with(DeflateDecoder::new(input), max_length),
+        ZLIB_ENCODING_GZIP => native_decode_with(GzDecoder::new(input), max_length),
+        ZLIB_ENCODING_DEFLATE => native_decode_with(ZlibDecoder::new(input), max_length),
+        _ => None,
+    }
+}
+
+pub fn native_zlib_decode_auto(input: &[u8], max_length: Option<usize>) -> Option<Vec<u8>> {
+    native_zlib_decode(input, ZLIB_ENCODING_GZIP, max_length)
+        .or_else(|| native_zlib_decode(input, ZLIB_ENCODING_DEFLATE, max_length))
+        .or_else(|| native_zlib_decode(input, ZLIB_ENCODING_RAW, max_length))
+}
+
+fn native_decode_with(mut decoder: impl Read, max_length: Option<usize>) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    decoder.read_to_end(&mut output).ok()?;
+    max_length
+        .is_none_or(|max_length| output.len() <= max_length)
+        .then_some(output)
 }
 
 fn builtin_zlib_get_coding_type(
@@ -843,19 +873,14 @@ fn zlib_inflate_add_read_len(object: &ObjectRef, bytes_read: usize) {
     );
 }
 
-fn compression_level(
+fn compression_level_value(
     name: &str,
     value: Option<&Value>,
-) -> Result<Compression, crate::builtins::BuiltinError> {
-    let level = value
+) -> Result<i64, crate::builtins::BuiltinError> {
+    Ok(value
         .map(|value| int_arg(name, value))
         .transpose()?
-        .unwrap_or(-1);
-    Ok(if level < 0 {
-        Compression::default()
-    } else {
-        Compression::new(level.clamp(0, 9) as u32)
-    })
+        .unwrap_or(-1))
 }
 
 fn max_length(
@@ -939,6 +964,28 @@ fn read_line_limited(resource: &ResourceRef, limit: usize) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::OutputBuffer;
+
+    #[test]
+    fn native_stateless_codec_family_roundtrips_without_values() {
+        for encoding in [ZLIB_ENCODING_RAW, ZLIB_ENCODING_GZIP, ZLIB_ENCODING_DEFLATE] {
+            let encoded =
+                native_zlib_encode(b"native zlib payload", encoding, 6).expect("encode succeeds");
+            assert_eq!(
+                native_zlib_decode(&encoded, encoding, None),
+                Some(b"native zlib payload".to_vec())
+            );
+            assert_eq!(native_zlib_decode(&encoded, encoding, Some(4)), None);
+            assert_eq!(
+                native_zlib_decode_auto(&encoded, None),
+                Some(b"native zlib payload".to_vec())
+            );
+        }
+        assert_eq!(native_zlib_encode(b"payload", 999, -1), None);
+        assert_eq!(
+            native_zlib_decode(b"invalid", ZLIB_ENCODING_GZIP, None),
+            None
+        );
+    }
 
     #[test]
     fn deflate_context_buffers_until_finish() {

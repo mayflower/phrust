@@ -475,6 +475,11 @@ struct ManagerState {
     cache: HashMap<CraneliftCodeKey, JitFunctionHandle>,
     function_cells: HashMap<NativeFunctionCellIdentity, Arc<NativeIndirectionCell>>,
     function_publications: HashMap<NativeFunctionKey, JitFunctionHandle>,
+    /// Latest machine-code specialization for each published PHP function
+    /// tier. Request contexts retain any older generation they are currently
+    /// executing; the process cache must not pin every superseded
+    /// external-signature variant indefinitely.
+    function_code_keys: HashMap<NativeFunctionKey, CraneliftCodeKey>,
     compiling: HashSet<CraneliftCodeKey>,
     compile_failures: HashMap<CraneliftCodeKey, String>,
 }
@@ -548,6 +553,7 @@ impl CraneliftCodeManager {
                 cache: HashMap::new(),
                 function_cells: HashMap::new(),
                 function_publications: HashMap::new(),
+                function_code_keys: HashMap::new(),
                 compiling: HashSet::new(),
                 compile_failures: HashMap::new(),
             }),
@@ -919,9 +925,44 @@ impl CraneliftCodeManager {
                             },
                         ));
                     }
-                    let generation = match regalloc_mode_for_admission(admission) {
-                        NativeRegallocMode::Fast => Arc::clone(&state.active_fast),
-                        NativeRegallocMode::Quality => Arc::clone(&state.active_quality),
+                    let regalloc = regalloc_mode_for_admission(admission);
+                    let supersedes_published_specialization = function_key
+                        .as_ref()
+                        .and_then(|function_key| state.function_code_keys.get(function_key))
+                        .is_some_and(|published| published != &key);
+                    let generation = if supersedes_published_specialization {
+                        // The first publication may share a compact arena with
+                        // unrelated functions. Once this function acquires a
+                        // second external-signature specialization, keep that
+                        // replacement in its own reclaimable generation.
+                        // Otherwise one still-current neighbor pins every
+                        // superseded multi-megabyte variant in the shared
+                        // arena for the process lifetime.
+                        let id = state.next_generation;
+                        state.next_generation = state.next_generation.saturating_add(1);
+                        let generation = match Self::new_generation(
+                            id,
+                            &self.helpers,
+                            &self.metrics,
+                            regalloc,
+                        ) {
+                            Ok(generation) => generation,
+                            Err(error) => {
+                                if let Some(cell) = &function_cell {
+                                    cell.reset_declared();
+                                }
+                                state.compiling.remove(&key);
+                                self.state_changed.notify_all();
+                                return Err(ManagedCompileError::Manager(error));
+                            }
+                        };
+                        state.generations.push_back(Arc::clone(&generation));
+                        generation
+                    } else {
+                        match regalloc {
+                            NativeRegallocMode::Fast => Arc::clone(&state.active_fast),
+                            NativeRegallocMode::Quality => Arc::clone(&state.active_quality),
+                        }
                     };
                     break (generation, evictions_before, function_cell);
                 }
@@ -1009,10 +1050,24 @@ impl CraneliftCodeManager {
             ManagedCompileError::Manager(CraneliftCodeManagerError::Poisoned("state"))
         })?;
         self.publish_function_entries(&mut state, &key, function_key.as_ref(), &handle);
+        if let Some(function_key) = function_key
+            && let Some(previous) = state
+                .function_code_keys
+                .insert(function_key.clone(), key.clone())
+            && previous != key
+        {
+            state.cache.remove(&previous);
+            state.compile_failures.remove(&previous);
+        }
         state.cache.insert(key.clone(), handle.clone());
         state.compile_failures.remove(&key);
 
-        if generation.bytes.load(Ordering::Relaxed) >= self.generation_limit {
+        let generation_is_active = match generation.regalloc {
+            NativeRegallocMode::Fast => generation.id == state.active_fast.id,
+            NativeRegallocMode::Quality => generation.id == state.active_quality.id,
+        };
+        if generation_is_active && generation.bytes.load(Ordering::Relaxed) >= self.generation_limit
+        {
             let id = state.next_generation;
             state.next_generation = state.next_generation.saturating_add(1);
             if let Ok(next) =
@@ -1068,6 +1123,10 @@ impl CraneliftCodeManager {
             state
                 .cache
                 .retain(|_, handle| handle.code_generation_id() != Some(retired_id));
+            let cached = state.cache.keys().cloned().collect::<HashSet<_>>();
+            state
+                .function_code_keys
+                .retain(|_, code_key| cached.contains(code_key));
             let retired_keys = state
                 .function_publications
                 .iter()
@@ -1497,6 +1556,56 @@ mod tests {
         assert_ne!(old.code_generation_id(), new.code_generation_id());
         assert_eq!(old.invoke_i64(&[], JIT_RUNTIME_ABI_HASH), Ok(10));
         assert_eq!(new.invoke_i64(&[], JIT_RUNTIME_ABI_HASH), Ok(20));
+    }
+
+    #[test]
+    fn newer_function_specialization_does_not_pin_old_process_cache_entry() {
+        let manager = CraneliftCodeManager::new(1024 * 1024, 1).unwrap();
+        let function_key = crate::native_function_key("deployment".to_owned(), 0, 0, 0, false, 0);
+        let first_key = key(81, 0);
+        let mut second_key = first_key.clone();
+        second_key.dependency_identity = "dependency-81-signature-2".to_owned();
+        second_key.specialization = "test-constant-v2".to_owned();
+
+        let first = manager
+            .compile_once_with_scratch(
+                first_key.clone(),
+                Some(function_key.clone()),
+                &[],
+                |module, _context, _builder_context, symbol| compile_constant(module, symbol, 10),
+            )
+            .unwrap();
+        assert_eq!(first.disposition, CraneliftCodeCacheDisposition::Compiled);
+        let first_generation = first.handle.code_generation_id();
+        drop(first);
+        let second = manager
+            .compile_once_with_scratch(
+                second_key,
+                Some(function_key.clone()),
+                &[],
+                |module, _context, _builder_context, symbol| compile_constant(module, symbol, 20),
+            )
+            .unwrap();
+        assert_eq!(second.disposition, CraneliftCodeCacheDisposition::Compiled);
+        let second_generation = second.handle.code_generation_id();
+        assert_ne!(
+            first_generation, second_generation,
+            "a replacement specialization must own a reclaimable generation"
+        );
+        drop(second);
+
+        let recompiled = manager
+            .compile_once_with_scratch(
+                first_key,
+                Some(function_key),
+                &[],
+                |module, _context, _builder_context, symbol| compile_constant(module, symbol, 10),
+            )
+            .unwrap();
+        assert_eq!(
+            recompiled.disposition,
+            CraneliftCodeCacheDisposition::Compiled
+        );
     }
 
     #[test]

@@ -194,11 +194,18 @@ fn json_decode_failure(
     }
 }
 
-/// Temporary typed parse tree returned by the exact associative JSON decoder.
-/// It contains JSON data only and is consumed immediately into authoritative
-/// native slots; it is not a second PHP value representation.
-#[derive(Debug)]
-pub enum NativeJsonDecodedValue {
+/// One array key in a temporary decoded native tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeDecodedArrayKey {
+    Int(i64),
+    String(Vec<u8>),
+}
+
+/// Temporary typed parse tree consumed immediately into authoritative native
+/// slots. It is shared by exact structured decoders and is not a second PHP
+/// value representation.
+#[derive(Debug, PartialEq)]
+pub enum NativeDecodedValue {
     Null,
     Bool(bool),
     Int(i64),
@@ -206,28 +213,29 @@ pub enum NativeJsonDecodedValue {
     String(Vec<u8>),
     Array(Vec<Self>),
     Object(Vec<(Vec<u8>, Self)>),
+    KeyedArray(Vec<(NativeDecodedArrayKey, Self)>),
 }
 
-fn native_json_decoded_value(value: JsonValue) -> NativeJsonDecodedValue {
+fn native_json_decoded_value(value: JsonValue) -> NativeDecodedValue {
     match value {
-        JsonValue::Null => NativeJsonDecodedValue::Null,
-        JsonValue::Bool(value) => NativeJsonDecodedValue::Bool(value),
+        JsonValue::Null => NativeDecodedValue::Null,
+        JsonValue::Bool(value) => NativeDecodedValue::Bool(value),
         JsonValue::Number(value) => value.as_i64().map_or_else(
             || {
-                NativeJsonDecodedValue::Float(
+                NativeDecodedValue::Float(
                     value
                         .as_f64()
                         .or_else(|| value.to_string().parse().ok())
                         .unwrap_or(0.0),
                 )
             },
-            NativeJsonDecodedValue::Int,
+            NativeDecodedValue::Int,
         ),
-        JsonValue::String(value) => NativeJsonDecodedValue::String(value.into_bytes()),
-        JsonValue::Array(values) => NativeJsonDecodedValue::Array(
-            values.into_iter().map(native_json_decoded_value).collect(),
-        ),
-        JsonValue::Object(values) => NativeJsonDecodedValue::Object(
+        JsonValue::String(value) => NativeDecodedValue::String(value.into_bytes()),
+        JsonValue::Array(values) => {
+            NativeDecodedValue::Array(values.into_iter().map(native_json_decoded_value).collect())
+        }
+        JsonValue::Object(values) => NativeDecodedValue::Object(
             values
                 .into_iter()
                 .map(|(key, value)| (key.into_bytes(), native_json_decoded_value(value)))
@@ -243,7 +251,7 @@ pub fn decode_native_json_associative(
     state: &mut crate::builtins::JsonRequestState,
     input: &[u8],
     depth: i64,
-) -> Result<NativeJsonDecodedValue, BuiltinError> {
+) -> Result<NativeDecodedValue, BuiltinError> {
     if depth <= 0 {
         return Err(argument_value_error(
             "json_decode",
@@ -262,7 +270,7 @@ pub fn decode_native_json_associative(
         Ok(input) => input,
         Err(code) => {
             state.set(code);
-            return Ok(NativeJsonDecodedValue::Null);
+            return Ok(NativeDecodedValue::Null);
         }
     };
     match serde_json::from_str::<JsonValue>(&input) {
@@ -272,11 +280,11 @@ pub fn decode_native_json_associative(
         }
         Ok(_) => {
             state.set(JSON_ERROR_DEPTH);
-            Ok(NativeJsonDecodedValue::Null)
+            Ok(NativeDecodedValue::Null)
         }
         Err(error) => {
             state.set(classify_json_decode_error(&input, &error));
-            Ok(NativeJsonDecodedValue::Null)
+            Ok(NativeDecodedValue::Null)
         }
     }
 }

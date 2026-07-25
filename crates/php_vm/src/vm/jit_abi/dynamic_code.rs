@@ -163,7 +163,7 @@ fn execute_native_include(
     let path = String::from_utf8_lossy(
         &native_string(
             context
-                .decode(request.source.payload as i64)
+                .decode_baseline_value(request.source.payload as i64)
                 .map_err(|error| NativeIncludeFailure::Execution(error.into()))?,
         )
         .map_err(|error| NativeIncludeFailure::Execution(error.into()))?,
@@ -397,7 +397,7 @@ fn execute_native_eval(
     request: &php_jit::JitNativeDynamicCodeRequest,
 ) -> Result<NativeDynamicCodeOutcome, String> {
     let source = String::from_utf8_lossy(&native_string(
-        context.decode(request.source.payload as i64)?,
+        context.decode_baseline_value(request.source.payload as i64)?,
     )?)
     .into_owned();
     let compiler = context
@@ -435,7 +435,7 @@ fn execute_native_eval(
         for (index, name) in caller_locals.iter().enumerate() {
             // SAFETY: Generated code owns this synchronous caller-local frame.
             let encoded = unsafe { caller_frame.add(index).read() };
-            let value = context.decode(encoded)?;
+            let value = context.decode_baseline_value(encoded)?;
             if matches!(value, Value::Uninitialized) {
                 continue;
             }
@@ -527,7 +527,7 @@ fn execute_native_eval(
     }
     let returned_symbols =
         NATIVE_INCLUDE_SYMBOLS.with(|symbols| symbols.borrow_mut().take().unwrap_or_default());
-    context.restore_include_symbols(returned_symbols);
+    context.restore_include_symbols(returned_symbols)?;
     let exports = NATIVE_INCLUDE_EXPORTS.with(|exports| exports.borrow_mut().take());
     context.inherited_globals = returned_globals;
     context.reconcile_trusted_global_references()?;
@@ -537,14 +537,14 @@ fn execute_native_eval(
             let Some(value) = context.inherited_globals.get(name).cloned() else {
                 continue;
             };
-            let encoded = context.encode(value)?;
+            let encoded = context.encode_baseline_value(value)?;
             // SAFETY: This is the same synchronous caller-local frame read above.
             unsafe { caller_frame.add(index).write(encoded) };
         }
     }
     context.output.write_bytes(result.output.as_bytes());
     if let Some(exit_code) = result.process_exit_code {
-        let value = context.encode(Value::Int(i64::from(exit_code)))?;
+        let value = context.encode_baseline_value(Value::Int(i64::from(exit_code)))?;
         return Ok(NativeDynamicCodeOutcome::Exit(value));
     }
     if !result.status.is_success() {
@@ -555,7 +555,7 @@ fn execute_native_eval(
         .map(|exports| register_native_dynamic_unit(context, dynamic_unit, exports))
         .transpose()?;
     context
-        .encode(native_value_with_owner_unit(
+        .encode_baseline_value(native_value_with_owner_unit(
             result.return_value.unwrap_or(Value::Null),
             owner_unit,
         ))
@@ -570,7 +570,7 @@ fn finish_native_dynamic_call_control(
         NativeCallControl::Rethrow => {
             let value = context
                 .take_pending_throwable()
-                .and_then(|throwable| context.encode(throwable).ok());
+                .and_then(|throwable| context.encode_baseline_value(throwable).ok());
             (php_jit::JitCallStatus::THROW, value)
         }
         NativeCallControl::Throw { class, message } => (
@@ -597,7 +597,7 @@ fn render_native_include_failure(
     _message: &str,
 ) -> Result<i64, String> {
     let path = String::from_utf8_lossy(&native_string(
-        context.decode(request.source.payload as i64)?,
+        context.decode_baseline_value(request.source.payload as i64)?,
     )?)
     .into_owned();
     let source_path = context
@@ -622,7 +622,7 @@ fn render_native_include_failure(
                 "\nWarning: include({path}): Failed to open stream: No such file or directory in {source_path} on line {line}\n\nWarning: include(): Failed opening '{path}' for inclusion (include_path='.:') in {source_path} on line {line}\n"
             ));
         }
-        return context.encode(Value::Bool(false));
+        return context.encode_baseline_value(Value::Bool(false));
     }
     let fatal = format!("Failed opening required '{path}' (include_path='.:')");
     if context.error_reporting & 2 != 0 {
@@ -652,7 +652,7 @@ fn invoke_native_include(
     runtime: *mut NativeRequestFastState,
     request: &php_jit::JitNativeDynamicCodeRequest,
 ) -> (php_jit::JitCallStatus, Option<i64>) {
-    with_native_context_for(runtime, "include", |context| {
+    with_baseline_native_context_for(runtime, "include", |context| {
         match execute_native_include(context, request) {
             Ok(NativeDynamicCodeOutcome::Returned(value)) => {
                 (php_jit::JitCallStatus::RETURN, Some(value))
@@ -674,40 +674,6 @@ fn invoke_native_include(
     .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
 }
 
-/// Exact cold include boundary for optimizing code. The include unit is
-/// compiled, published, and invoked through its native entry, then control
-/// returns to the same optimizing caller frame.
-pub(in crate::vm) extern "C" fn jit_native_include_abi(
-    runtime: *mut NativeRequestFastState,
-    kind: u32,
-    caller_function_id: u32,
-    continuation_id: u32,
-    source: i64,
-    caller_frame: u64,
-) -> php_jit::JitNativeControlResult {
-    debug_assert!(!runtime.is_null());
-    let _ = with_native_context_for(runtime, "include", |context| {
-        context.mark_roots_dirty(RootMutationReason::GlobalOrStatic);
-    });
-    let request = php_jit::JitNativeDynamicCodeRequest {
-        kind: php_jit::JitNativeDynamicCodeKind(kind),
-        caller_function_id,
-        continuation_id,
-        source: php_jit::JitAbiSlot {
-            tag: 3,
-            flags: 0,
-            payload: source as u64,
-        },
-        caller_frame,
-        ..php_jit::JitNativeDynamicCodeRequest::default()
-    };
-    let (status, value) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        invoke_native_include(runtime, &request)
-    }))
-    .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None));
-    php_jit::JitNativeControlResult::control(status, status.0, value.unwrap_or(0))
-}
-
 /// Native dynamic-code compiler boundary. Includes are resolved, compiled to
 /// Cranelift entries, published, and invoked without entering an interpreter.
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
@@ -721,7 +687,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
     if request.is_null() || out.is_null() {
         return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
-    let _ = with_native_context_for(runtime, "dynamic_code", |context| {
+    let _ = with_baseline_native_context_for(runtime, "dynamic_code", |context| {
         context.mark_roots_dirty(RootMutationReason::GlobalOrStatic);
     });
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -741,7 +707,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
         ) {
             invoke_native_include(runtime, request)
         } else if request.kind == php_jit::JitNativeDynamicCodeKind::EVAL {
-            with_native_context_for(runtime, "dynamic_code", |context| match execute_native_eval(context, request) {
+            with_baseline_native_context_for(runtime, "dynamic_code", |context| match execute_native_eval(context, request) {
                 Ok(NativeDynamicCodeOutcome::Returned(value)) => {
                     (php_jit::JitCallStatus::RETURN, Some(value))
                 }
@@ -755,7 +721,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
             })
             .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
         } else if request.kind == php_jit::JitNativeDynamicCodeKind::DECLARE_FUNCTION {
-            with_native_context_for(runtime, "dynamic_code", |context| {
+            with_baseline_native_context_for(runtime, "dynamic_code", |context| {
                 let function = php_ir::FunctionId::new(request.declared_function_id);
                 let Some(target) = context.unit.functions.get(function.index()) else {
                     return (php_jit::JitCallStatus::RUNTIME_ERROR, None);
@@ -786,14 +752,14 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
                         .insert(normalized.clone(), function);
                 }
                 context.publish_function_names([normalized]);
-                match context.encode(Value::Null) {
+                match context.encode_baseline_value(Value::Null) {
                     Ok(value) => (php_jit::JitCallStatus::RETURN, Some(value)),
                     Err(_) => (php_jit::JitCallStatus::RUNTIME_ERROR, None),
                 }
             })
             .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
         } else if request.kind == php_jit::JitNativeDynamicCodeKind::DECLARE_CLASS {
-            with_native_context_for(runtime, "dynamic_code", |context| {
+            with_baseline_native_context_for(runtime, "dynamic_code", |context| {
                 let class =
                     context.unit.classes.iter().find(|class| {
                         stable_native_symbol_hash(&class.name) == request.symbol_hash
@@ -821,14 +787,14 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
                         .insert(normalized.clone(), unit);
                 }
                 context.dynamic_classes.insert(normalized);
-                match context.encode(Value::Null) {
+                match context.encode_baseline_value(Value::Null) {
                     Ok(value) => (php_jit::JitCallStatus::RETURN, Some(value)),
                     Err(_) => (php_jit::JitCallStatus::RUNTIME_ERROR, None),
                 }
             })
             .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
         } else if request.kind == php_jit::JitNativeDynamicCodeKind::REGISTER_CONSTANT {
-            with_native_context_for(runtime, "dynamic_code", |context| {
+            with_baseline_native_context_for(runtime, "dynamic_code", |context| {
                 let instruction = context
                     .instruction_for_continuation(
                         request.caller_function_id,
@@ -844,7 +810,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
                 if stable_native_symbol_hash(name) != request.symbol_hash {
                     return (php_jit::JitCallStatus::ABI_MISMATCH, None);
                 }
-                let value = match context.decode(request.source.payload as i64) {
+                let value = match context.decode_baseline_value(request.source.payload as i64) {
                     Ok(value) => dereference_native_assignment_value(value),
                     Err(_) => return (php_jit::JitCallStatus::RUNTIME_ERROR, None),
                 };
@@ -859,16 +825,21 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
                         "\nWarning: Constant {name} already defined, this will be an error in PHP 9 in {path} on line {line}\n"
                     ));
                 } else {
-                    context.insert_dynamic_constant(name.clone(), value);
+                    if context
+                        .insert_dynamic_constant(name.clone(), value)
+                        .is_err()
+                    {
+                        return (php_jit::JitCallStatus::RUNTIME_ERROR, None);
+                    }
                 }
-                match context.encode(Value::Null) {
+                match context.encode_baseline_value(Value::Null) {
                     Ok(value) => (php_jit::JitCallStatus::RETURN, Some(value)),
                     Err(_) => (php_jit::JitCallStatus::RUNTIME_ERROR, None),
                 }
             })
             .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
         } else if request.kind == php_jit::JitNativeDynamicCodeKind::EMIT_DIAGNOSTIC {
-            with_native_context_for(runtime, "dynamic_code", |context| {
+            with_baseline_native_context_for(runtime, "dynamic_code", |context| {
                 let instruction = context
                     .instruction_for_continuation(
                         request.caller_function_id,
@@ -897,14 +868,14 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
                     &instruction,
                     *leading_newline,
                 ) {
-                    Ok(()) => match context.encode(Value::Null) {
+                    Ok(()) => match context.encode_baseline_value(Value::Null) {
                         Ok(value) => (php_jit::JitCallStatus::RETURN, Some(value)),
                         Err(_) => (php_jit::JitCallStatus::RUNTIME_ERROR, None),
                     },
                     Err(error) if error == "E_PHP_RETHROW" => {
                         let value = context
                             .take_pending_throwable()
-                            .and_then(|value| context.encode(value).ok());
+                            .and_then(|value| context.encode_baseline_value(value).ok());
                         (php_jit::JitCallStatus::THROW, value)
                     }
                     Err(error) => {
@@ -915,7 +886,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
             })
             .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
         } else if request.kind == php_jit::JitNativeDynamicCodeKind::MAKE_CLOSURE {
-            with_native_context_for(runtime, "dynamic_code", |context| {
+            with_baseline_native_context_for(runtime, "dynamic_code", |context| {
                 let captures = context
                     .instruction_for_continuation(
                         request.caller_function_id,
@@ -928,34 +899,90 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
                         _ => None,
                     })
                     .unwrap_or_default();
+                let caller_frame = request.caller_frame as *mut i64;
                 let mut captured_values = Vec::with_capacity(captures.len());
-                for capture in captures {
+                let capture_descriptors = captures
+                    .iter()
+                    .map(|capture| (capture.name.clone(), capture.by_ref))
+                    .collect::<Vec<_>>();
+                for capture in &captures {
                     let php_ir::Operand::Local(local) = capture.src else {
+                        for captured in captured_values {
+                            let _ = context.release_if_live(captured);
+                        }
                         return (php_jit::JitCallStatus::RUNTIME_ERROR, None);
                     };
-                    if request.caller_frame == 0 {
+                    if caller_frame.is_null() {
+                        for captured in captured_values {
+                            let _ = context.release_if_live(captured);
+                        }
                         return (php_jit::JitCallStatus::RUNTIME_ERROR, None);
                     }
                     // SAFETY: generated code passes its live caller-local frame for the
                     // duration of this synchronous closure construction request.
-                    let encoded =
-                        unsafe { *((request.caller_frame as *const i64).add(local.index())) };
-                    let value = match context.decode(encoded) {
-                        Ok(value) => value,
-                        Err(_) => return (php_jit::JitCallStatus::RUNTIME_ERROR, None),
-                    };
+                    let caller_slot = unsafe { caller_frame.add(local.index()) };
+                    let encoded = unsafe { caller_slot.read() };
                     let captured = if capture.by_ref {
-                        let reference = match value {
-                            Value::Reference(reference) => reference,
-                            value => php_runtime::api::ReferenceCell::new(value),
-                        };
-                        php_runtime::api::ClosureCaptureValue::by_reference(capture.name, reference)
+                        if context.php_handle_is_reference(encoded) == Some(true) {
+                            match context.duplicate_authoritative_native_value(encoded) {
+                                Ok(Some(reference)) => reference,
+                                _ => {
+                                    for captured in captured_values {
+                                        let _ = context.release_if_live(captured);
+                                    }
+                                    return (php_jit::JitCallStatus::RUNTIME_ERROR, None);
+                                }
+                            }
+                        } else {
+                            // Ownership of the old local value moves into the
+                            // direct reference payload. The caller frame keeps
+                            // the first reference owner and the closure gets a
+                            // retained owner for the same alias identity.
+                            let reference =
+                                match context.encode_direct_reference_payload_owned(encoded) {
+                                    Ok(reference) => reference,
+                                    Err(_) => {
+                                        for captured in captured_values {
+                                            let _ = context.release_if_live(captured);
+                                        }
+                                        return (php_jit::JitCallStatus::RUNTIME_ERROR, None);
+                                    }
+                                };
+                            unsafe { caller_slot.write(reference) };
+                            if context.retain(reference).is_err() {
+                                for captured in captured_values {
+                                    let _ = context.release_if_live(captured);
+                                }
+                                return (php_jit::JitCallStatus::RUNTIME_ERROR, None);
+                            }
+                            reference
+                        }
                     } else {
-                        let value = match value {
-                            Value::Reference(reference) => reference.get(),
-                            value => value,
-                        };
-                        php_runtime::api::ClosureCaptureValue::by_value(capture.name, value)
+                        match context
+                            .duplicate_authoritative_dereferenced_native_value(encoded)
+                        {
+                            Ok(Some(value)) => value,
+                            Ok(None) => {
+                                let value = context
+                                    .decode_dereferenced_native_value(encoded)
+                                    .and_then(|value| context.encode_baseline_call_value(value));
+                                match value {
+                                    Ok(value) => value,
+                                    Err(_) => {
+                                        for captured in captured_values {
+                                            let _ = context.release_if_live(captured);
+                                        }
+                                        return (php_jit::JitCallStatus::RUNTIME_ERROR, None);
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                for captured in captured_values {
+                                    let _ = context.release_if_live(captured);
+                                }
+                                return (php_jit::JitCallStatus::RUNTIME_ERROR, None);
+                            }
+                        }
                     };
                     captured_values.push(captured);
                 }
@@ -997,12 +1024,10 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
                     called_class,
                     declaring_class: scope_class,
                 };
-                let mut closure = php_runtime::api::ClosurePayload::new(
-                    request.declared_function_id,
-                    captured_values,
-                )
-                .with_debug(debug)
-                .with_context(closure_context);
+                let closure =
+                    php_runtime::api::ClosurePayload::new(request.declared_function_id, Vec::new())
+                        .with_debug(debug)
+                        .with_context(closure_context);
                 let binds_this = context
                     .unit
                     .functions
@@ -1013,18 +1038,45 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
                         .functions
                         .get(request.caller_function_id as usize)
                         .is_some_and(|function| function.flags.is_method);
-                if binds_this && request.caller_frame != 0 {
-                    // SAFETY: generated code passes its live caller-local frame for this request.
-                    let encoded = unsafe { *(request.caller_frame as *const i64) };
-                    let value = context.decode(encoded).map(|value| match value {
-                        Value::Reference(reference) => reference.get(),
-                        value => value,
-                    });
-                    if let Ok(Value::Object(object)) = value {
-                        closure = closure.with_bound_this(Some(object));
+                let implicit_this = if binds_this {
+                    if caller_frame.is_null() {
+                        for captured in captured_values {
+                            let _ = context.release_if_live(captured);
+                        }
+                        return (php_jit::JitCallStatus::RUNTIME_ERROR, None);
                     }
-                }
-                match context.encode(Value::closure(closure)) {
+                    // SAFETY: generated code passes its live caller-local frame for this request.
+                    let encoded = unsafe { caller_frame.read() };
+                    let value = context
+                        .duplicate_authoritative_dereferenced_native_value(encoded)
+                        .and_then(|value| {
+                            value.map_or_else(
+                                || {
+                                    context
+                                        .decode_dereferenced_native_value(encoded)
+                                        .and_then(|value| context.encode_baseline_call_value(value))
+                                },
+                                Ok,
+                            )
+                        });
+                    match value {
+                        Ok(value) => Some(value),
+                        Err(_) => {
+                            for captured in captured_values {
+                                let _ = context.release_if_live(captured);
+                            }
+                            return (php_jit::JitCallStatus::RUNTIME_ERROR, None);
+                        }
+                    }
+                } else {
+                    None
+                };
+                match context.publish_prepared_closure_owned(NativePreparedClosure::new(
+                    closure,
+                    std::sync::Arc::from(capture_descriptors),
+                    implicit_this,
+                    captured_values.into_boxed_slice(),
+                )) {
                     Ok(value) => (php_jit::JitCallStatus::RETURN, Some(value)),
                     Err(_) => (php_jit::JitCallStatus::RUNTIME_ERROR, None),
                 }

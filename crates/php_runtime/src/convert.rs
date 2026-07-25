@@ -345,7 +345,7 @@ pub fn to_array_php(value: &Value) -> Result<PhpArray, String> {
             let mut array = PhpArray::new();
             for (name, value) in object.array_cast_snapshot() {
                 array.insert(
-                    crate::ArrayKey::String(PhpString::from_bytes(name.into_bytes())),
+                    crate::ArrayKey::from_php_string(PhpString::from_bytes(name.into_bytes())),
                     value,
                 );
             }
@@ -397,6 +397,12 @@ pub fn identical(left: &Value, right: &Value) -> bool {
 /// Loose equality for runtime-semantics comparison cases.
 pub fn equal(left: &Value, right: &Value) -> Result<bool, String> {
     match (left, right) {
+        // PHP converts both operands to boolean before equality whenever
+        // either side is a boolean. Null follows the same truthiness rule
+        // except for the dedicated null/string comparison in `compare`.
+        (Value::Bool(_) | Value::Null, _) | (_, Value::Bool(_) | Value::Null) => {
+            Ok(compare(left, right)? == Ordering::Equal)
+        }
         (Value::Array(left), Value::Array(right)) => arrays_equal(left, right),
         (Value::Array(_), _) | (_, Value::Array(_)) => Ok(false),
         (Value::Object(left), Value::Object(right)) => objects_equal(left, right),
@@ -437,7 +443,16 @@ pub fn compare(left: &Value, right: &Value) -> Result<Ordering, String> {
             }
             return Ok(left.as_bytes().cmp(right.as_bytes()));
         }
-        (Value::Bool(_), _) | (_, Value::Bool(_)) | (Value::Null, _) | (_, Value::Null) => {
+        (Value::Bool(_), _) | (_, Value::Bool(_)) => {
+            return Ok(to_bool(left)?.cmp(&to_bool(right)?));
+        }
+        (Value::Null, Value::String(right)) => {
+            return Ok(b"".as_slice().cmp(right.as_bytes()));
+        }
+        (Value::String(left), Value::Null) => {
+            return Ok(left.as_bytes().cmp(b"".as_slice()));
+        }
+        (Value::Null, _) | (_, Value::Null) => {
             return Ok(to_bool(left)?.cmp(&to_bool(right)?));
         }
         _ => {}
@@ -475,6 +490,9 @@ pub fn compare_php(left: &Value, right: &Value) -> Result<Ordering, String> {
 }
 
 fn compare_numbers(left: NumericValue, right: NumericValue) -> Result<Ordering, String> {
+    if let (NumericValue::Int(left), NumericValue::Int(right)) = (left, right) {
+        return Ok(left.cmp(&right));
+    }
     if left.as_f64().is_nan() || right.as_f64().is_nan() {
         return Ok(Ordering::Greater);
     }
@@ -492,9 +510,9 @@ pub(crate) fn numeric_comparison_is_unordered(left: &Value, right: &Value) -> bo
     match (left, right) {
         (Value::Reference(left), right) => numeric_comparison_is_unordered(&left.get(), right),
         (left, Value::Reference(right)) => numeric_comparison_is_unordered(left, &right.get()),
-        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
-            matches!(left, Value::Float(value) if value.to_f64().is_nan())
-                || matches!(right, Value::Float(value) if value.to_f64().is_nan())
+        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_) | Value::String(_))
+        | (Value::String(_), Value::Int(_) | Value::Float(_)) => {
+            is_nan_number(left) || is_nan_number(right)
         }
         _ => false,
     }
@@ -516,7 +534,7 @@ fn compare_number_and_string(left: &Value, right: &Value) -> Result<Ordering, St
                 return compare_numbers(to_number(number)?, string);
             }
             if is_nan_number(number) {
-                return Ok(Ordering::Less);
+                return Ok(Ordering::Greater);
             }
             Ok(to_string(number)?.as_bytes().cmp(string.as_bytes()))
         }
@@ -992,6 +1010,12 @@ mod tests {
             compare_php(&Value::string(b"2".to_vec()), &Value::Int(10)).unwrap(),
             Ordering::Less
         );
+        let empty = Value::Array(crate::PhpArray::new());
+        let mut populated = crate::PhpArray::new();
+        populated.append(Value::Int(1));
+        assert!(equal(&empty, &Value::Null).unwrap());
+        assert!(equal(&empty, &Value::Bool(false)).unwrap());
+        assert!(equal(&Value::Array(populated), &Value::Bool(true)).unwrap());
     }
 
     #[test]
@@ -1006,6 +1030,12 @@ mod tests {
 
     #[test]
     fn compare_uses_php8_numeric_string_rules_without_arithmetic_errors() {
+        assert!(!equal(&Value::Null, &Value::string(b"0".to_vec())).unwrap());
+        assert!(equal(&Value::Null, &Value::string(Vec::new())).unwrap());
+        assert_eq!(
+            compare(&Value::Null, &Value::string(b"0".to_vec())).unwrap(),
+            Ordering::Less
+        );
         assert!(equal(&Value::Int(42), &Value::string(b" 42".to_vec())).unwrap());
         assert!(!equal(&Value::Int(42), &Value::string(b"42abc".to_vec())).unwrap());
         assert!(!equal(&Value::Int(0), &Value::string(b"foo".to_vec())).unwrap());
@@ -1047,6 +1077,26 @@ mod tests {
             .unwrap()
         );
         assert!(!equal(&Value::float(f64::NAN), &Value::string(b"NAN".to_vec())).unwrap());
+        assert_eq!(
+            compare(
+                &Value::string(b"9007199254740993".to_vec()),
+                &Value::string(b"9007199254740992".to_vec())
+            )
+            .unwrap(),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare(&Value::float(f64::NAN), &Value::string(b"NAN".to_vec())).unwrap(),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare(&Value::string(b"NAN".to_vec()), &Value::float(f64::NAN)).unwrap(),
+            Ordering::Greater
+        );
+        assert!(numeric_comparison_is_unordered(
+            &Value::float(f64::NAN),
+            &Value::string(b"NAN".to_vec())
+        ));
     }
 
     #[test]
@@ -1159,6 +1209,7 @@ mod tests {
             &Value::Object(one.clone()),
             &Value::Object(clone.clone())
         ));
+        assert!(equal(&Value::Object(one.clone()), &Value::Bool(true)).unwrap());
         assert!(equal(&Value::Object(one), &Value::Object(clone)).unwrap());
     }
 }

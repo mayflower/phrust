@@ -13,37 +13,55 @@ pub use result::VmResult;
 use crate::compiled_unit::CompiledUnit;
 use jit_abi::{
     NativeRequestOwner, activate_native_context, jit_baseline_native_builtin_dispatch_abi,
-    jit_baseline_native_builtin_dispatch_diagnostic_abi, jit_native_argument_check_abi,
-    jit_native_array_fetch_abi, jit_native_array_insert_abi, jit_native_array_insert_local_abi,
+    jit_baseline_native_builtin_dispatch_diagnostic_abi, jit_native_acos_f64_abi,
+    jit_native_acosh_f64_abi, jit_native_argument_check_abi, jit_native_array_cast_abi,
+    jit_native_array_compare_abi, jit_native_array_equal_abi, jit_native_array_fetch_abi,
+    jit_native_array_identical_abi, jit_native_array_insert_abi, jit_native_array_insert_local_abi,
     jit_native_array_new_abi, jit_native_array_spread_abi, jit_native_array_unset_abi,
-    jit_native_basename_abi, jit_native_binary_abi, jit_native_call_dispatch_abi,
-    jit_native_call_dispatch_diagnostic_abi, jit_native_cast_abi, jit_native_class_exists_abi,
-    jit_native_compare_abi, jit_native_constant_fetch_abi, jit_native_define_abi,
-    jit_native_defined_abi, jit_native_dirname_abi, jit_native_dynamic_code_abi,
-    jit_native_echo_abi, jit_native_echo_bytes_abi, jit_native_echo_float_abi,
-    jit_native_echo_int_abi, jit_native_enum_exists_abi, jit_native_exception_new_abi,
-    jit_native_execution_poll_abi, jit_native_fclose_abi, jit_native_file_exists_abi,
-    jit_native_float_to_int_abi, jit_native_float_to_string_abi, jit_native_fopen_abi,
-    jit_native_foreach_cleanup_abi, jit_native_foreach_init_abi, jit_native_foreach_next_abi,
+    jit_native_asin_f64_abi, jit_native_asinh_f64_abi, jit_native_atan_f64_abi,
+    jit_native_atan2_f64_abi, jit_native_atanh_f64_abi, jit_native_base_convert_abi,
+    jit_native_basename_abi, jit_native_binary_abi, jit_native_bindec_abi,
+    jit_native_call_dispatch_abi, jit_native_call_dispatch_diagnostic_abi, jit_native_cast_abi,
+    jit_native_class_exists_abi, jit_native_compare_abi, jit_native_constant_fetch_abi,
+    jit_native_cos_f64_abi, jit_native_cosh_f64_abi, jit_native_decbin_abi, jit_native_dechex_abi,
+    jit_native_decoct_abi, jit_native_define_abi, jit_native_defined_abi,
+    jit_native_deg2rad_f64_abi, jit_native_dirname_abi, jit_native_dynamic_code_abi,
+    jit_native_dynamic_property_slot_abi, jit_native_echo_abi, jit_native_echo_bytes_abi,
+    jit_native_enum_exists_abi, jit_native_exception_new_abi, jit_native_execution_poll_abi,
+    jit_native_exp_f64_abi, jit_native_expm1_f64_abi, jit_native_fclose_abi,
+    jit_native_file_exists_abi, jit_native_float_cast_abi, jit_native_float_to_string_abi,
+    jit_native_fmod_f64_abi, jit_native_fopen_abi, jit_native_foreach_cleanup_abi,
+    jit_native_foreach_init_abi, jit_native_foreach_next_abi, jit_native_fpow_f64_abi,
     jit_native_frame_alloc_abi, jit_native_frame_release_abi, jit_native_function_exists_abi,
-    jit_native_function_resolve_abi, jit_native_fwrite_abi, jit_native_include_abi,
-    jit_native_interface_exists_abi, jit_native_json_decode_abi, jit_native_json_encode_abi,
-    jit_native_json_last_error_abi, jit_native_json_last_error_msg_abi,
-    jit_native_json_validate_abi, jit_native_local_fetch_abi, jit_native_local_store_abi,
-    jit_native_method_exists_abi, jit_native_object_class_name_abi, jit_native_object_clone_abi,
-    jit_native_object_clone_with_abi, jit_native_object_new_abi, jit_native_plain_object_clone_abi,
-    jit_native_preg_filter_abi, jit_native_preg_grep_abi, jit_native_preg_last_error_abi,
-    jit_native_preg_last_error_msg_abi, jit_native_preg_match_abi, jit_native_preg_match_all_abi,
-    jit_native_preg_quote_abi, jit_native_preg_replace_abi, jit_native_preg_split_abi,
-    jit_native_prepared_closure_new_abi, jit_native_prepared_object_new_abi, jit_native_printf_abi,
-    jit_native_property_assign_abi, jit_native_property_exists_abi, jit_native_property_fetch_abi,
+    jit_native_function_resolve_abi, jit_native_fwrite_abi, jit_native_gzcompress_abi,
+    jit_native_gzdecode_abi, jit_native_gzdeflate_abi, jit_native_gzencode_abi,
+    jit_native_gzinflate_abi, jit_native_gzuncompress_abi, jit_native_hash_abi,
+    jit_native_hash_equals_abi, jit_native_hash_hmac_abi, jit_native_hexdec_abi,
+    jit_native_hypot_f64_abi, jit_native_inet_ntop_abi, jit_native_inet_pton_abi,
+    jit_native_int_cast_abi, jit_native_interface_exists_abi, jit_native_ip2long_abi,
+    jit_native_json_decode_abi, jit_native_json_encode_abi, jit_native_json_last_error_abi,
+    jit_native_json_last_error_msg_abi, jit_native_json_validate_abi, jit_native_local_fetch_abi,
+    jit_native_local_store_abi, jit_native_log_f64_abi, jit_native_log1p_f64_abi,
+    jit_native_log10_f64_abi, jit_native_long2ip_abi, jit_native_md5_abi,
+    jit_native_method_exists_abi, jit_native_numeric_string_abi, jit_native_object_cast_abi,
+    jit_native_object_class_name_abi, jit_native_object_clone_abi,
+    jit_native_object_clone_with_abi, jit_native_object_compare_abi, jit_native_object_equal_abi,
+    jit_native_object_new_abi, jit_native_octdec_abi, jit_native_plain_object_clone_abi,
+    jit_native_pow_f64_abi, jit_native_preg_filter_abi, jit_native_preg_grep_abi,
+    jit_native_preg_last_error_abi, jit_native_preg_last_error_msg_abi, jit_native_preg_match_abi,
+    jit_native_preg_match_all_abi, jit_native_preg_quote_abi, jit_native_preg_replace_abi,
+    jit_native_preg_split_abi, jit_native_prepared_closure_new_abi,
+    jit_native_prepared_object_new_abi, jit_native_printf_abi, jit_native_property_assign_abi,
+    jit_native_property_exists_abi, jit_native_property_fetch_abi, jit_native_rad2deg_f64_abi,
     jit_native_realpath_abi, jit_native_reference_bind_abi, jit_native_return_check_abi,
-    jit_native_runtime_fatal_abi, jit_native_semantic_dispatch_abi,
-    jit_native_semantic_dispatch_diagnostic_abi, jit_native_sprintf_abi,
-    jit_native_stable_length_abi, jit_native_string_predicate_abi, jit_native_trait_exists_abi,
-    jit_native_truthy_abi, jit_native_type_predicate_abi, jit_native_unary_abi,
-    jit_native_value_release_abi, jit_native_vprintf_abi, jit_native_vsprintf_abi,
-    resume_native_optimizing_exit,
+    jit_native_round_f64_abi, jit_native_runtime_fatal_abi, jit_native_semantic_dispatch_abi,
+    jit_native_semantic_dispatch_diagnostic_abi, jit_native_sha1_abi, jit_native_sin_f64_abi,
+    jit_native_sinh_f64_abi, jit_native_sprintf_abi, jit_native_stable_length_abi,
+    jit_native_string_cast_abi, jit_native_string_predicate_abi, jit_native_tan_f64_abi,
+    jit_native_tanh_f64_abi, jit_native_trait_exists_abi, jit_native_truthy_abi,
+    jit_native_type_predicate_abi, jit_native_unary_abi, jit_native_value_release_abi,
+    jit_native_vprintf_abi, jit_native_vsprintf_abi, jit_native_zlib_decode_abi,
+    jit_native_zlib_encode_abi, resume_native_optimizing_exit,
 };
 use php_runtime::api::{OutputBuffer, Value};
 use std::collections::{HashMap, HashSet};
@@ -240,6 +258,16 @@ impl VmWorkerState {
         ),
         String,
     > {
+        // Every statically named non-local call owns an immutable source-unit
+        // link slot, even when its declaration is not visible yet. Root units
+        // are compiled before request-time includes execute, so relying only
+        // on the currently visible signature set would permanently lower
+        // those calls to the generic baseline dispatcher. Complete the
+        // compile-time set with late-bound link records here; publication
+        // fills the same slots once the target unit is declared.
+        let external_signatures =
+            linked_external_function_signatures(unit, function, external_signatures);
+        let external_signatures = external_signatures.as_slice();
         if options.native_optimization == NativeOptimizationPolicy::Optimizing {
             self.prepare_native_baseline_entry(unit, function, options, external_signatures)?;
         }
@@ -726,6 +754,8 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn external_function_signatures_hash(signatures: &[php_jit::JitExternalFunctionSignature]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for signature in signatures {
+        hash = (hash ^ u64::from(signature.link_index)).wrapping_mul(0x0000_0100_0000_01b3);
+        hash = (hash ^ u64::from(signature.published)).wrapping_mul(0x0000_0100_0000_01b3);
         for byte in signature.name.bytes() {
             hash =
                 (hash ^ u64::from(byte.to_ascii_lowercase())).wrapping_mul(0x0000_0100_0000_01b3);
@@ -737,6 +767,14 @@ fn external_function_signatures_hash(signatures: &[php_jit::JitExternalFunctionS
             }
             hash = (hash ^ u64::from(parameter.by_ref)).wrapping_mul(0x0000_0100_0000_01b3);
             hash = (hash ^ u64::from(parameter.variadic)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash = (hash ^ u64::from(signature.native_arity)).wrapping_mul(0x0000_0100_0000_01b3);
+        hash = (hash ^ u64::from(signature.requires_non_reference_trampoline))
+            .wrapping_mul(0x0000_0100_0000_01b3);
+        hash =
+            (hash ^ u64::from(signature.returns_by_reference)).wrapping_mul(0x0000_0100_0000_01b3);
+        for byte in format!("{:?}", signature.native_params).bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
     hash
@@ -1206,7 +1244,10 @@ impl Vm {
         });
         context.output.flush_all_buffers();
         drop(guard);
-        let publish_error = context.publish_include_globals().err();
+        let publish_error = context
+            .materialize_native_session_state()
+            .and_then(|()| context.publish_include_globals())
+            .err();
         let native_execution_time_nanos = native_execution_started_at.map_or(0, |started_at| {
             started_at.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
         });
@@ -1498,6 +1539,37 @@ impl Vm {
         }
         result
     }
+}
+
+fn linked_external_function_signatures(
+    unit: &CompiledUnit,
+    function: php_ir::FunctionId,
+    published: &[php_jit::JitExternalFunctionSignature],
+) -> Vec<php_jit::JitExternalFunctionSignature> {
+    unit.prepared_external_function_calls(function)
+        .iter()
+        .map(|call| {
+            published
+                .iter()
+                .find(|signature| {
+                    signature
+                        .name
+                        .trim_start_matches('\\')
+                        .eq_ignore_ascii_case(call.source_name.trim_start_matches('\\'))
+                })
+                .cloned()
+                .unwrap_or_else(|| php_jit::JitExternalFunctionSignature {
+                    name: call.source_name.to_string(),
+                    link_index: call.link_index,
+                    published: false,
+                    params: Vec::new(),
+                    native_params: Vec::new(),
+                    native_arity: 0,
+                    requires_non_reference_trampoline: false,
+                    returns_by_reference: false,
+                })
+        })
+        .collect()
 }
 
 pub(super) fn compile_native_function_graph(
@@ -1811,7 +1883,6 @@ fn runtime_helper_addresses(diagnostic: bool) -> php_jit::JitRuntimeHelperAddres
         native_enum_exists: jit_native_enum_exists_abi as *const () as usize,
         native_method_exists: jit_native_method_exists_abi as *const () as usize,
         native_property_exists: jit_native_property_exists_abi as *const () as usize,
-        native_include: jit_native_include_abi as *const () as usize,
         native_preg_match: jit_native_preg_match_abi as *const () as usize,
         native_preg_match_all: jit_native_preg_match_all_abi as *const () as usize,
         native_preg_replace: jit_native_preg_replace_abi as *const () as usize,
@@ -1830,6 +1901,28 @@ fn runtime_helper_addresses(diagnostic: bool) -> php_jit::JitRuntimeHelperAddres
         native_printf: jit_native_printf_abi as *const () as usize,
         native_vsprintf: jit_native_vsprintf_abi as *const () as usize,
         native_vprintf: jit_native_vprintf_abi as *const () as usize,
+        native_md5: jit_native_md5_abi as *const () as usize,
+        native_sha1: jit_native_sha1_abi as *const () as usize,
+        native_crc32: jit_abi::jit_native_crc32_abi as *const () as usize,
+        native_hash: jit_native_hash_abi as *const () as usize,
+        native_hash_hmac: jit_native_hash_hmac_abi as *const () as usize,
+        native_hash_equals: jit_native_hash_equals_abi as *const () as usize,
+        native_base64_encode: jit_abi::jit_native_base64_encode_abi as *const () as usize,
+        native_base64_decode: jit_abi::jit_native_base64_decode_abi as *const () as usize,
+        native_bin2hex: jit_abi::jit_native_bin2hex_abi as *const () as usize,
+        native_hex2bin: jit_abi::jit_native_hex2bin_abi as *const () as usize,
+        native_quoted_printable_decode: jit_abi::jit_native_quoted_printable_decode_abi as *const ()
+            as usize,
+        native_urlencode: jit_abi::jit_native_urlencode_abi as *const () as usize,
+        native_rawurlencode: jit_abi::jit_native_rawurlencode_abi as *const () as usize,
+        native_urldecode: jit_abi::jit_native_urldecode_abi as *const () as usize,
+        native_rawurldecode: jit_abi::jit_native_rawurldecode_abi as *const () as usize,
+        native_convert_uuencode: jit_abi::jit_native_convert_uuencode_abi as *const () as usize,
+        native_convert_uudecode: jit_abi::jit_native_convert_uudecode_abi as *const () as usize,
+        native_addcslashes: jit_abi::jit_native_addcslashes_abi as *const () as usize,
+        native_stripcslashes: jit_abi::jit_native_stripcslashes_abi as *const () as usize,
+        native_stripslashes: jit_abi::jit_native_stripslashes_abi as *const () as usize,
+        native_quotemeta: jit_abi::jit_native_quotemeta_abi as *const () as usize,
         native_basename: jit_native_basename_abi as *const () as usize,
         native_dirname: jit_native_dirname_abi as *const () as usize,
         native_realpath: jit_native_realpath_abi as *const () as usize,
@@ -1872,14 +1965,115 @@ fn runtime_helper_addresses(diagnostic: bool) -> php_jit::JitRuntimeHelperAddres
         native_cast: helper_address!(jit_native_cast_abi, jit_abi::jit_native_cast_diagnostic_abi),
         native_echo: helper_address!(jit_native_echo_abi, jit_abi::jit_native_echo_diagnostic_abi),
         native_echo_bytes: jit_native_echo_bytes_abi as *const () as usize,
-        native_echo_int: jit_native_echo_int_abi as *const () as usize,
-        native_echo_float: jit_native_echo_float_abi as *const () as usize,
         native_float_to_string: jit_native_float_to_string_abi as *const () as usize,
-        native_float_to_int: jit_native_float_to_int_abi as *const () as usize,
+        native_numeric_string: jit_native_numeric_string_abi as *const () as usize,
+        native_pow_f64: jit_native_pow_f64_abi as *const () as usize,
+        native_fmod_f64: jit_native_fmod_f64_abi as *const () as usize,
+        native_round_f64: jit_native_round_f64_abi as *const () as usize,
+        native_pure_math: [
+            jit_native_acos_f64_abi as *const () as usize,
+            jit_native_acosh_f64_abi as *const () as usize,
+            jit_native_asin_f64_abi as *const () as usize,
+            jit_native_asinh_f64_abi as *const () as usize,
+            jit_native_atan_f64_abi as *const () as usize,
+            jit_native_atan2_f64_abi as *const () as usize,
+            jit_native_atanh_f64_abi as *const () as usize,
+            jit_native_cos_f64_abi as *const () as usize,
+            jit_native_cosh_f64_abi as *const () as usize,
+            jit_native_deg2rad_f64_abi as *const () as usize,
+            jit_native_exp_f64_abi as *const () as usize,
+            jit_native_expm1_f64_abi as *const () as usize,
+            jit_native_fpow_f64_abi as *const () as usize,
+            jit_native_hypot_f64_abi as *const () as usize,
+            jit_native_log_f64_abi as *const () as usize,
+            jit_native_log10_f64_abi as *const () as usize,
+            jit_native_log1p_f64_abi as *const () as usize,
+            jit_native_rad2deg_f64_abi as *const () as usize,
+            jit_native_sin_f64_abi as *const () as usize,
+            jit_native_sinh_f64_abi as *const () as usize,
+            jit_native_tan_f64_abi as *const () as usize,
+            jit_native_tanh_f64_abi as *const () as usize,
+        ],
+        native_base_conversion: [
+            jit_native_base_convert_abi as *const () as usize,
+            jit_native_bindec_abi as *const () as usize,
+            jit_native_decbin_abi as *const () as usize,
+            jit_native_dechex_abi as *const () as usize,
+            jit_native_decoct_abi as *const () as usize,
+            jit_native_hexdec_abi as *const () as usize,
+            jit_native_octdec_abi as *const () as usize,
+        ],
+        native_string_search_compare: [
+            jit_abi::jit_native_strstr_abi as *const () as usize,
+            jit_abi::jit_native_stristr_abi as *const () as usize,
+            jit_abi::jit_native_strrchr_abi as *const () as usize,
+            jit_abi::jit_native_strpbrk_abi as *const () as usize,
+            jit_abi::jit_native_substr_compare_abi as *const () as usize,
+            jit_abi::jit_native_strnatcmp_abi as *const () as usize,
+            jit_abi::jit_native_strnatcasecmp_abi as *const () as usize,
+        ],
+        native_string_rewrite: [
+            jit_abi::jit_native_ucwords_abi as *const () as usize,
+            jit_abi::jit_native_str_pad_abi as *const () as usize,
+            jit_abi::jit_native_strtr_abi as *const () as usize,
+            jit_abi::jit_native_strip_tags_abi as *const () as usize,
+            jit_abi::jit_native_substr_replace_abi as *const () as usize,
+        ],
+        native_html_codec: [
+            jit_abi::jit_native_htmlspecialchars_abi as *const () as usize,
+            jit_abi::jit_native_htmlentities_abi as *const () as usize,
+            jit_abi::jit_native_html_entity_decode_abi as *const () as usize,
+            jit_abi::jit_native_htmlspecialchars_decode_abi as *const () as usize,
+        ],
+        native_url_query: [
+            jit_abi::jit_native_parse_url_abi as *const () as usize,
+            jit_abi::jit_native_parse_str_abi as *const () as usize,
+            jit_abi::jit_native_http_build_query_abi as *const () as usize,
+        ],
+        native_array_preserving_sort: [
+            jit_abi::jit_native_asort_abi as *const () as usize,
+            jit_abi::jit_native_arsort_abi as *const () as usize,
+            jit_abi::jit_native_ksort_abi as *const () as usize,
+            jit_abi::jit_native_krsort_abi as *const () as usize,
+            jit_abi::jit_native_natsort_abi as *const () as usize,
+            jit_abi::jit_native_natcasesort_abi as *const () as usize,
+        ],
+        native_frame_introspection: [
+            jit_abi::jit_native_func_num_args_abi as *const () as usize,
+            jit_abi::jit_native_func_get_arg_abi as *const () as usize,
+            jit_abi::jit_native_func_get_args_abi as *const () as usize,
+        ],
+        native_network_address: [
+            jit_native_ip2long_abi as *const () as usize,
+            jit_native_long2ip_abi as *const () as usize,
+            jit_native_inet_pton_abi as *const () as usize,
+            jit_native_inet_ntop_abi as *const () as usize,
+        ],
+        native_compression_codec: [
+            jit_native_gzencode_abi as *const () as usize,
+            jit_native_gzcompress_abi as *const () as usize,
+            jit_native_gzdeflate_abi as *const () as usize,
+            jit_native_gzdecode_abi as *const () as usize,
+            jit_native_gzuncompress_abi as *const () as usize,
+            jit_native_gzinflate_abi as *const () as usize,
+            jit_native_zlib_decode_abi as *const () as usize,
+            jit_native_zlib_encode_abi as *const () as usize,
+        ],
+        native_array_identical: jit_native_array_identical_abi as *const () as usize,
+        native_array_equal: jit_native_array_equal_abi as *const () as usize,
+        native_array_compare: jit_native_array_compare_abi as *const () as usize,
+        native_array_cast: jit_native_array_cast_abi as *const () as usize,
+        native_int_cast: jit_native_int_cast_abi as *const () as usize,
+        native_float_cast: jit_native_float_cast_abi as *const () as usize,
+        native_string_cast: jit_native_string_cast_abi as *const () as usize,
+        native_object_equal: jit_native_object_equal_abi as *const () as usize,
+        native_object_compare: jit_native_object_compare_abi as *const () as usize,
+        native_object_cast: jit_native_object_cast_abi as *const () as usize,
         native_object_class_name: jit_native_object_class_name_abi as *const () as usize,
         native_prepared_object_new: jit_native_prepared_object_new_abi as *const () as usize,
         native_prepared_closure_new: jit_native_prepared_closure_new_abi as *const () as usize,
         native_plain_object_clone: jit_native_plain_object_clone_abi as *const () as usize,
+        native_dynamic_property_slot: jit_native_dynamic_property_slot_abi as *const () as usize,
         native_local_fetch: helper_address!(
             jit_native_local_fetch_abi,
             jit_abi::jit_native_local_fetch_diagnostic_abi
@@ -3686,17 +3880,13 @@ mod tests {
 
         assert_eq!(
             result.status.exit_status(),
-            php_runtime::api::ExitStatus::RuntimeError,
-            "{result:#?}"
-        );
-        assert_eq!(
-            result.diagnostics.first().map(|diagnostic| diagnostic.id()),
-            Some("E_PHP_VM_RETURN_TYPE_MISMATCH"),
+            php_runtime::api::ExitStatus::Fatal,
             "{result:#?}"
         );
         assert!(
-            result.status.message().is_some_and(|message| message
-                .contains("invalid_return(): Return value must be of type string, array returned")),
+            String::from_utf8_lossy(result.output.as_bytes()).contains(
+                "Uncaught TypeError: invalid_return(): Return value must be of type string, array returned"
+            ),
             "{result:#?}"
         );
     }

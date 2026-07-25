@@ -251,15 +251,21 @@ struct PreparedExternalFunctionCalls {
     whole_unit: Box<[PreparedExternalFunctionCall]>,
 }
 
-/// A statically named call that may resolve to a function in another unit.
+/// A statically named call that may resolve to a function or exact method in
+/// another unit.
 ///
 /// Whether the target is currently visible and has by-reference parameters is
 /// intentionally resolved at runtime. Only the source-IR scan and name
-/// normalization are prepared here because those are immutable.
+/// normalization are prepared here because those are immutable. Methods use
+/// the collision-free `class::method` spelling already used by function
+/// metadata; their link slot still points directly at the declaring unit's
+/// published function entry.
 #[derive(Debug)]
 pub(crate) struct PreparedExternalFunctionCall {
     pub normalized_name: Box<str>,
     pub source_name: Box<str>,
+    /// Dense immutable slot in the source unit's linked-function table.
+    pub link_index: u32,
 }
 
 /// Immutable userland-call metadata shared by every invocation of a function.
@@ -1180,6 +1186,13 @@ impl CompiledUnit {
                 .iter()
                 .map(|entry| entry.name.to_ascii_lowercase())
                 .collect::<std::collections::HashSet<_>>();
+            let local_classes = self
+                .inner
+                .unit
+                .classes
+                .iter()
+                .map(|class| class.name.trim_start_matches('\\').to_ascii_lowercase())
+                .collect::<std::collections::HashSet<_>>();
             let mut whole_unit = BTreeMap::<String, String>::new();
             let by_function = self
                 .inner
@@ -1188,19 +1201,106 @@ impl CompiledUnit {
                 .iter()
                 .map(|function| {
                     let mut calls = BTreeMap::<String, String>::new();
+                    let mut external_object_registers = BTreeMap::<php_ir::RegId, String>::new();
+                    let mut external_object_locals = BTreeMap::<php_ir::LocalId, String>::new();
                     for instruction in function.blocks.iter().flat_map(|block| &block.instructions)
                     {
-                        let name = match &instruction.kind {
+                        match &instruction.kind {
                             php_ir::InstructionKind::CallFunction { name, .. }
-                            | php_ir::InstructionKind::BindReferenceFromCall { name, .. } => name,
-                            _ => continue,
-                        };
-                        let normalized = name.to_ascii_lowercase();
-                        if local_functions.contains(&normalized) {
-                            continue;
+                            | php_ir::InstructionKind::BindReferenceFromCall { name, .. } => {
+                                let normalized = name.to_ascii_lowercase();
+                                if local_functions.contains(&normalized) {
+                                    continue;
+                                }
+                                calls.insert(normalized.clone(), name.clone());
+                                whole_unit.insert(normalized, name.clone());
+                            }
+                            php_ir::InstructionKind::NewObject {
+                                dst, class_name, ..
+                            } => {
+                                let normalized_class =
+                                    class_name.trim_start_matches('\\').to_ascii_lowercase();
+                                if !local_classes.contains(&normalized_class) {
+                                    external_object_registers.insert(
+                                        *dst,
+                                        class_name.trim_start_matches('\\').to_owned(),
+                                    );
+                                    let source_name = format!(
+                                        "{}::__construct",
+                                        class_name.trim_start_matches('\\')
+                                    );
+                                    let normalized = source_name.to_ascii_lowercase();
+                                    calls.insert(normalized.clone(), source_name.clone());
+                                    whole_unit.insert(normalized, source_name);
+                                }
+                            }
+                            php_ir::InstructionKind::Move { dst, src }
+                            | php_ir::InstructionKind::CloneObject { dst, object: src } => {
+                                if let php_ir::Operand::Register(source) = src
+                                    && let Some(class) =
+                                        external_object_registers.get(source).cloned()
+                                {
+                                    external_object_registers.insert(*dst, class);
+                                }
+                            }
+                            php_ir::InstructionKind::LoadLocal { dst, local }
+                            | php_ir::InstructionKind::LoadLocalQuiet { dst, local } => {
+                                if let Some(class) = external_object_locals.get(local).cloned() {
+                                    external_object_registers.insert(*dst, class);
+                                }
+                            }
+                            php_ir::InstructionKind::StoreLocal { local, src } => {
+                                if let php_ir::Operand::Register(source) = src
+                                    && let Some(class) =
+                                        external_object_registers.get(source).cloned()
+                                {
+                                    external_object_locals.insert(*local, class);
+                                } else {
+                                    external_object_locals.remove(local);
+                                }
+                            }
+                            php_ir::InstructionKind::CallMethod { object, method, .. }
+                            | php_ir::InstructionKind::BindReferenceFromMethodCall {
+                                object,
+                                method,
+                                ..
+                            } => {
+                                let Some(class) = (match object {
+                                    php_ir::Operand::Register(register) => {
+                                        external_object_registers.get(register)
+                                    }
+                                    php_ir::Operand::Local(local) => {
+                                        external_object_locals.get(local)
+                                    }
+                                    _ => None,
+                                }) else {
+                                    continue;
+                                };
+                                let source_name = format!("{class}::{method}");
+                                let normalized = source_name.to_ascii_lowercase();
+                                calls.insert(normalized.clone(), source_name.clone());
+                                whole_unit.insert(normalized, source_name);
+                            }
+                            php_ir::InstructionKind::CallStaticMethod {
+                                class_name,
+                                method,
+                                ..
+                            } => {
+                                let normalized_class =
+                                    class_name.trim_start_matches('\\').to_ascii_lowercase();
+                                if matches!(normalized_class.as_str(), "self" | "parent" | "static")
+                                    || local_classes.contains(&normalized_class)
+                                {
+                                    continue;
+                                }
+                                let source_name =
+                                    format!("{}::{method}", class_name.trim_start_matches('\\'));
+                                let normalized = source_name.to_ascii_lowercase();
+                                calls.insert(normalized.clone(), source_name.clone());
+                                whole_unit.insert(normalized, source_name);
+                            }
+                            _ => {}
                         }
-                        calls.insert(normalized.clone(), name.clone());
-                        whole_unit.insert(normalized, name.clone());
                     }
                     calls
                         .into_iter()
@@ -1208,26 +1308,48 @@ impl CompiledUnit {
                             |(normalized_name, source_name)| PreparedExternalFunctionCall {
                                 normalized_name: normalized_name.into_boxed_str(),
                                 source_name: source_name.into_boxed_str(),
+                                link_index: 0,
                             },
                         )
                         .collect::<Vec<_>>()
                         .into_boxed_slice()
                 })
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            let whole_unit = whole_unit
+                .collect::<Vec<_>>();
+            let mut whole_unit = whole_unit
                 .into_iter()
                 .map(
                     |(normalized_name, source_name)| PreparedExternalFunctionCall {
                         normalized_name: normalized_name.into_boxed_str(),
                         source_name: source_name.into_boxed_str(),
+                        link_index: 0,
                     },
                 )
+                .collect::<Vec<_>>();
+            let link_indexes = whole_unit
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(index, call)| {
+                    let index = u32::try_from(index).ok()?;
+                    call.link_index = index;
+                    Some((call.normalized_name.to_string(), index))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let by_function = by_function
+                .into_iter()
+                .map(|mut calls| {
+                    for call in &mut calls {
+                        call.link_index = link_indexes
+                            .get(call.normalized_name.as_ref())
+                            .copied()
+                            .expect("per-function external call must have a unit link slot");
+                    }
+                    calls
+                })
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
             PreparedExternalFunctionCalls {
                 by_function,
-                whole_unit,
+                whole_unit: whole_unit.into_boxed_slice(),
             }
         })
     }

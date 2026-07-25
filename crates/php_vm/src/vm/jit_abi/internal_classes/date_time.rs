@@ -110,7 +110,7 @@ pub(in crate::vm::jit_abi) fn construct_native_date_time(
                 _ => unreachable!(),
             },
         )
-        .and_then(|object| context.encode(Value::Object(object)));
+        .and_then(|object| context.encode_baseline_value(Value::Object(object)));
     Some(result)
 }
 
@@ -265,7 +265,7 @@ pub(in crate::vm::jit_abi) fn execute_native_date_time_instruction(
         } => construct_native_date_time(context, display_class_name, arguments),
         php_ir::InstructionKind::CallMethod { method, .. } => {
             let receiver = arguments.first().copied()?;
-            let receiver = match context.decode(receiver) {
+            let receiver = match context.decode_baseline_value(receiver) {
                 Ok(Value::Reference(reference)) => reference.get(),
                 Ok(value) => value,
                 Err(error) => return Some(Err(error)),
@@ -289,7 +289,7 @@ pub(in crate::vm::jit_abi) fn execute_native_date_time_instruction(
                     "dateinterval" => call_interval_method(&object, method, arguments),
                     _ => unreachable!(),
                 })
-                .and_then(|value| context.encode(value));
+                .and_then(|value| context.encode_baseline_value(value));
             Some(result)
         }
         _ => None,

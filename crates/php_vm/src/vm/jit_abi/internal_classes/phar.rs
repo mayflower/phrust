@@ -29,7 +29,7 @@ pub(in crate::vm::jit_abi) fn execute_native_phar_instruction(
             .into_iter()
             .map(|signature| Value::String(PhpString::from_bytes(signature.as_bytes().to_vec())))
             .collect();
-        context.encode(Value::Array(php_runtime::api::PhpArray::from_packed(
+        context.encode_baseline_value(Value::Array(php_runtime::api::PhpArray::from_packed(
             signatures,
         )))
     })())

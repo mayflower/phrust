@@ -605,7 +605,7 @@ pub(in crate::vm) extern "C" fn jit_native_preg_match_abi(
         Err(_) => return exact_query_baseline(),
     };
     if argument_count >= 3 {
-        let Some(captures) = fast.publish_native_json_decoded(result.captures) else {
+        let Some(captures) = fast.publish_native_decoded(result.captures) else {
             return exact_query_baseline();
         };
         if !fast.replace_empty_direct_reference(argument_2, captures) {
@@ -663,7 +663,7 @@ pub(in crate::vm) extern "C" fn jit_native_preg_match_all_abi(
         Err(_) => return exact_query_baseline(),
     };
     if argument_count >= 3 {
-        let Some(captures) = fast.publish_native_json_decoded(result.captures) else {
+        let Some(captures) = fast.publish_native_decoded(result.captures) else {
             return exact_query_baseline();
         };
         if !fast.replace_empty_direct_reference(argument_2, captures) {
@@ -781,7 +781,7 @@ pub(in crate::vm) extern "C" fn jit_native_preg_split_abi(
     let Some(result) = fast.native_preg_split(argument_0, argument_1, limit, flags) else {
         return exact_query_baseline();
     };
-    match fast.publish_native_json_decoded(result) {
+    match fast.publish_native_decoded(result) {
         Some(value) => php_jit::JitNativeControlResult::returning(value),
         None => exact_query_baseline(),
     }
@@ -985,7 +985,7 @@ pub(in crate::vm) extern "C" fn jit_native_json_decode_abi(
         Ok(decoded) => decoded,
         Err(_) => return exact_query_baseline(),
     };
-    match fast.publish_native_json_decoded(decoded) {
+    match fast.publish_native_decoded(decoded) {
         Some(value) => php_jit::JitNativeControlResult::returning(value),
         None => exact_query_baseline(),
     }
@@ -1156,6 +1156,1436 @@ exact_native_format_abi!(jit_native_sprintf_abi, "sprintf", false, false);
 exact_native_format_abi!(jit_native_printf_abi, "printf", false, true);
 exact_native_format_abi!(jit_native_vsprintf_abi, "vsprintf", true, false);
 exact_native_format_abi!(jit_native_vprintf_abi, "vprintf", true, true);
+
+fn exact_native_boolean_flag(fast: &NativeRequestFastState, value: i64) -> Option<bool> {
+    match fast.native_printf_scalar(value)? {
+        php_runtime::api::NativePrintfScalar::Null => Some(false),
+        php_runtime::api::NativePrintfScalar::Bool(value) => Some(value),
+        php_runtime::api::NativePrintfScalar::Int(value) => Some(value != 0),
+        php_runtime::api::NativePrintfScalar::Float(value) => Some(value != 0.0),
+        php_runtime::api::NativePrintfScalar::String(value) => {
+            Some(!value.is_empty() && value != b"0")
+        }
+    }
+}
+
+fn exact_native_integer(fast: &NativeRequestFastState, value: i64) -> Option<i64> {
+    match fast.native_printf_scalar(value)? {
+        php_runtime::api::NativePrintfScalar::Int(value) => Some(value),
+        _ => None,
+    }
+}
+
+macro_rules! exact_native_fixed_digest_abi {
+    ($abi:ident, $digest:path) => {
+        pub(in crate::vm) extern "C" fn $abi(
+            runtime: *mut NativeRequestFastState,
+            argument_count: u32,
+            argument_0: i64,
+            argument_1: i64,
+            _argument_2: i64,
+            _argument_3: i64,
+            _argument_4: i64,
+            _argument_5: i64,
+        ) -> php_jit::JitNativeControlResult {
+            debug_assert!((1..=2).contains(&argument_count));
+            #[allow(unsafe_code)]
+            let fast = unsafe { &mut *runtime };
+            let Some(input) = fast.native_string_view(argument_0) else {
+                return exact_query_baseline();
+            };
+            let raw = if argument_count == 2 {
+                let Some(raw) = exact_native_boolean_flag(fast, argument_1) else {
+                    return exact_query_baseline();
+                };
+                raw
+            } else {
+                false
+            };
+            let digest = $digest(input, raw);
+            fast.publish_direct_string_bytes(&digest).map_or_else(
+                |_| exact_query_baseline(),
+                php_jit::JitNativeControlResult::returning,
+            )
+        }
+    };
+}
+
+exact_native_fixed_digest_abi!(jit_native_md5_abi, php_runtime::api::native_md5);
+exact_native_fixed_digest_abi!(jit_native_sha1_abi, php_runtime::api::native_sha1);
+
+pub(in crate::vm) extern "C" fn jit_native_crc32_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    _argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert_eq!(argument_count, 1);
+    #[allow(unsafe_code)]
+    let fast = unsafe { &*runtime };
+    let Some(input) = fast.native_string_view(argument_0) else {
+        return exact_query_baseline();
+    };
+    php_jit::JitNativeControlResult::returning(php_runtime::api::native_crc32(input))
+}
+
+pub(in crate::vm) extern "C" fn jit_native_hash_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!((2..=4).contains(&argument_count));
+    // Hash options carry algorithm-specific arrays and intentionally use the
+    // instruction's one exact baseline continuation until that representation
+    // is published as native metadata.
+    if argument_count == 4 {
+        return exact_query_baseline();
+    }
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let (Some(algorithm), Some(input)) = (
+        fast.native_string_view(argument_0),
+        fast.native_string_view(argument_1),
+    ) else {
+        return exact_query_baseline();
+    };
+    let binary = if argument_count == 3 {
+        let Some(binary) = exact_native_boolean_flag(fast, argument_2) else {
+            return exact_query_baseline();
+        };
+        binary
+    } else {
+        false
+    };
+    let Some(digest) = php_runtime::api::native_hash(algorithm, input, binary) else {
+        return exact_query_baseline();
+    };
+    fast.publish_direct_string_bytes(&digest).map_or_else(
+        |_| exact_query_baseline(),
+        php_jit::JitNativeControlResult::returning,
+    )
+}
+
+pub(in crate::vm) extern "C" fn jit_native_hash_hmac_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    argument_2: i64,
+    argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!((3..=4).contains(&argument_count));
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let (Some(algorithm), Some(input), Some(key)) = (
+        fast.native_string_view(argument_0),
+        fast.native_string_view(argument_1),
+        fast.native_string_view(argument_2),
+    ) else {
+        return exact_query_baseline();
+    };
+    let binary = if argument_count == 4 {
+        let Some(binary) = exact_native_boolean_flag(fast, argument_3) else {
+            return exact_query_baseline();
+        };
+        binary
+    } else {
+        false
+    };
+    let Some(digest) = php_runtime::api::native_hash_hmac(algorithm, input, key, binary) else {
+        return exact_query_baseline();
+    };
+    fast.publish_direct_string_bytes(&digest).map_or_else(
+        |_| exact_query_baseline(),
+        php_jit::JitNativeControlResult::returning,
+    )
+}
+
+pub(in crate::vm) extern "C" fn jit_native_hash_equals_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert_eq!(argument_count, 2);
+    #[allow(unsafe_code)]
+    let fast = unsafe { &*runtime };
+    let (Some(known), Some(user)) = (
+        fast.native_string_view(argument_0),
+        fast.native_string_view(argument_1),
+    ) else {
+        return exact_query_baseline();
+    };
+    if known.len() != user.len() {
+        return exact_query_return_bool(false);
+    }
+    let difference = known
+        .iter()
+        .zip(user)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        });
+    exact_query_return_bool(difference == 0)
+}
+
+macro_rules! exact_native_unary_byte_codec_abi {
+    ($abi:ident, $codec:path) => {
+        pub(in crate::vm) extern "C" fn $abi(
+            runtime: *mut NativeRequestFastState,
+            argument_count: u32,
+            argument_0: i64,
+            _argument_1: i64,
+            _argument_2: i64,
+            _argument_3: i64,
+            _argument_4: i64,
+            _argument_5: i64,
+        ) -> php_jit::JitNativeControlResult {
+            debug_assert_eq!(argument_count, 1);
+            #[allow(unsafe_code)]
+            let fast = unsafe { &mut *runtime };
+            let Some(input) = fast.native_string_view(argument_0) else {
+                return exact_query_baseline();
+            };
+            let output = $codec(input);
+            fast.publish_direct_string_bytes(&output).map_or_else(
+                |_| exact_query_baseline(),
+                php_jit::JitNativeControlResult::returning,
+            )
+        }
+    };
+}
+
+macro_rules! exact_native_fallible_unary_byte_codec_abi {
+    ($abi:ident, $codec:path) => {
+        pub(in crate::vm) extern "C" fn $abi(
+            runtime: *mut NativeRequestFastState,
+            argument_count: u32,
+            argument_0: i64,
+            _argument_1: i64,
+            _argument_2: i64,
+            _argument_3: i64,
+            _argument_4: i64,
+            _argument_5: i64,
+        ) -> php_jit::JitNativeControlResult {
+            debug_assert_eq!(argument_count, 1);
+            #[allow(unsafe_code)]
+            let fast = unsafe { &mut *runtime };
+            let Some(input) = fast.native_string_view(argument_0) else {
+                return exact_query_baseline();
+            };
+            let Some(output) = $codec(input) else {
+                return exact_query_baseline();
+            };
+            fast.publish_direct_string_bytes(&output).map_or_else(
+                |_| exact_query_baseline(),
+                php_jit::JitNativeControlResult::returning,
+            )
+        }
+    };
+}
+
+exact_native_unary_byte_codec_abi!(
+    jit_native_base64_encode_abi,
+    php_runtime::api::native_base64_encode
+);
+exact_native_unary_byte_codec_abi!(jit_native_bin2hex_abi, php_runtime::api::native_bin2hex);
+exact_native_fallible_unary_byte_codec_abi!(
+    jit_native_hex2bin_abi,
+    php_runtime::api::native_hex2bin
+);
+exact_native_unary_byte_codec_abi!(
+    jit_native_quoted_printable_decode_abi,
+    php_runtime::api::native_quoted_printable_decode
+);
+exact_native_unary_byte_codec_abi!(jit_native_urlencode_abi, php_runtime::api::native_urlencode);
+exact_native_unary_byte_codec_abi!(
+    jit_native_rawurlencode_abi,
+    php_runtime::api::native_rawurlencode
+);
+exact_native_unary_byte_codec_abi!(jit_native_urldecode_abi, php_runtime::api::native_urldecode);
+exact_native_unary_byte_codec_abi!(
+    jit_native_rawurldecode_abi,
+    php_runtime::api::native_rawurldecode
+);
+exact_native_unary_byte_codec_abi!(
+    jit_native_convert_uuencode_abi,
+    php_runtime::api::native_convert_uuencode
+);
+exact_native_fallible_unary_byte_codec_abi!(
+    jit_native_convert_uudecode_abi,
+    php_runtime::api::native_convert_uudecode
+);
+exact_native_unary_byte_codec_abi!(
+    jit_native_stripcslashes_abi,
+    php_runtime::api::native_stripcslashes
+);
+exact_native_unary_byte_codec_abi!(
+    jit_native_stripslashes_abi,
+    php_runtime::api::native_stripslashes
+);
+exact_native_unary_byte_codec_abi!(jit_native_quotemeta_abi, php_runtime::api::native_quotemeta);
+
+pub(in crate::vm) extern "C" fn jit_native_addcslashes_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert_eq!(argument_count, 2);
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let (Some(input), Some(charlist)) = (
+        fast.native_string_view(argument_0),
+        fast.native_string_view(argument_1),
+    ) else {
+        return exact_query_baseline();
+    };
+    let output = php_runtime::api::native_addcslashes(input, charlist);
+    fast.publish_direct_string_bytes(&output).map_or_else(
+        |_| exact_query_baseline(),
+        php_jit::JitNativeControlResult::returning,
+    )
+}
+
+fn exact_native_optional_string(
+    fast: &mut NativeRequestFastState,
+    output: Option<Vec<u8>>,
+) -> php_jit::JitNativeControlResult {
+    output.map_or_else(
+        || exact_query_return_bool(false),
+        |output| {
+            fast.publish_direct_string_bytes(&output).map_or_else(
+                |_| exact_query_baseline(),
+                php_jit::JitNativeControlResult::returning,
+            )
+        },
+    )
+}
+
+fn exact_native_string_output(
+    fast: &mut NativeRequestFastState,
+    output: Vec<u8>,
+) -> php_jit::JitNativeControlResult {
+    fast.publish_direct_string_bytes(&output).map_or_else(
+        |_| exact_query_baseline(),
+        php_jit::JitNativeControlResult::returning,
+    )
+}
+
+macro_rules! exact_native_string_search_slice_abi {
+    ($abi:ident, $case_insensitive:literal) => {
+        pub(in crate::vm) extern "C" fn $abi(
+            runtime: *mut NativeRequestFastState,
+            argument_count: u32,
+            argument_0: i64,
+            argument_1: i64,
+            argument_2: i64,
+            _argument_3: i64,
+            _argument_4: i64,
+            _argument_5: i64,
+        ) -> php_jit::JitNativeControlResult {
+            debug_assert!((2..=3).contains(&argument_count));
+            #[allow(unsafe_code)]
+            let fast = unsafe { &mut *runtime };
+            let before_needle = if argument_count == 3 {
+                let Some(before_needle) = exact_native_boolean_flag(fast, argument_2) else {
+                    return exact_query_baseline();
+                };
+                before_needle
+            } else {
+                false
+            };
+            let output = {
+                let (Some(haystack), Some(needle)) = (
+                    fast.native_string_view(argument_0),
+                    fast.native_string_view(argument_1),
+                ) else {
+                    return exact_query_baseline();
+                };
+                php_runtime::api::native_string_search_slice(
+                    haystack,
+                    needle,
+                    $case_insensitive,
+                    before_needle,
+                )
+            };
+            exact_native_optional_string(fast, output)
+        }
+    };
+}
+
+exact_native_string_search_slice_abi!(jit_native_strstr_abi, false);
+exact_native_string_search_slice_abi!(jit_native_stristr_abi, true);
+
+pub(in crate::vm) extern "C" fn jit_native_strrchr_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!((2..=3).contains(&argument_count));
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let before_needle = if argument_count == 3 {
+        let Some(before_needle) = exact_native_boolean_flag(fast, argument_2) else {
+            return exact_query_baseline();
+        };
+        before_needle
+    } else {
+        false
+    };
+    let output = {
+        let (Some(haystack), Some(needle)) = (
+            fast.native_string_view(argument_0),
+            fast.native_string_view(argument_1),
+        ) else {
+            return exact_query_baseline();
+        };
+        let needle = needle.first().copied().unwrap_or(0);
+        php_runtime::api::native_strrchr(haystack, needle, before_needle)
+    };
+    exact_native_optional_string(fast, output)
+}
+
+pub(in crate::vm) extern "C" fn jit_native_strpbrk_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert_eq!(argument_count, 2);
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let (Some(haystack), Some(characters)) = (
+        fast.native_string_view(argument_0),
+        fast.native_string_view(argument_1),
+    ) else {
+        return exact_query_baseline();
+    };
+    if characters.is_empty() {
+        return exact_query_baseline();
+    }
+    let output = php_runtime::api::native_strpbrk(haystack, characters);
+    exact_native_optional_string(fast, output)
+}
+
+pub(in crate::vm) extern "C" fn jit_native_substr_compare_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    argument_2: i64,
+    argument_3: i64,
+    argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!((3..=5).contains(&argument_count));
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let Some(offset) = exact_native_integer(fast, argument_2) else {
+        return exact_query_baseline();
+    };
+    let length = if argument_count >= 4 && argument_3 != php_jit::jit_encode_constant(u32::MAX) {
+        let Some(length) = exact_native_integer(fast, argument_3) else {
+            return exact_query_baseline();
+        };
+        let Ok(length) = usize::try_from(length) else {
+            return exact_query_baseline();
+        };
+        Some(length)
+    } else {
+        None
+    };
+    let case_insensitive = if argument_count == 5 {
+        let Some(case_insensitive) = exact_native_boolean_flag(fast, argument_4) else {
+            return exact_query_baseline();
+        };
+        case_insensitive
+    } else {
+        false
+    };
+    let output = {
+        let (Some(main), Some(other)) = (
+            fast.native_string_view(argument_0),
+            fast.native_string_view(argument_1),
+        ) else {
+            return exact_query_baseline();
+        };
+        php_runtime::api::native_substr_compare(main, other, offset, length, case_insensitive)
+    };
+    output.map_or_else(
+        exact_query_baseline,
+        php_jit::JitNativeControlResult::returning,
+    )
+}
+
+macro_rules! exact_native_natural_compare_abi {
+    ($abi:ident, $case_insensitive:literal) => {
+        pub(in crate::vm) extern "C" fn $abi(
+            runtime: *mut NativeRequestFastState,
+            argument_count: u32,
+            argument_0: i64,
+            argument_1: i64,
+            _argument_2: i64,
+            _argument_3: i64,
+            _argument_4: i64,
+            _argument_5: i64,
+        ) -> php_jit::JitNativeControlResult {
+            debug_assert_eq!(argument_count, 2);
+            #[allow(unsafe_code)]
+            let fast = unsafe { &*runtime };
+            let (Some(left), Some(right)) = (
+                fast.native_string_view(argument_0),
+                fast.native_string_view(argument_1),
+            ) else {
+                return exact_query_baseline();
+            };
+            php_jit::JitNativeControlResult::returning(php_runtime::api::native_natural_compare(
+                left,
+                right,
+                $case_insensitive,
+            ))
+        }
+    };
+}
+
+exact_native_natural_compare_abi!(jit_native_strnatcmp_abi, false);
+exact_native_natural_compare_abi!(jit_native_strnatcasecmp_abi, true);
+
+pub(in crate::vm) extern "C" fn jit_native_ucwords_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!((1..=2).contains(&argument_count));
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let output = {
+        let Some(input) = fast.native_string_view(argument_0) else {
+            return exact_query_baseline();
+        };
+        let delimiters = if argument_count == 2 {
+            let Some(delimiters) = fast.native_string_view(argument_1) else {
+                return exact_query_baseline();
+            };
+            Some(delimiters)
+        } else {
+            None
+        };
+        php_runtime::api::native_ucwords(input, delimiters)
+    };
+    exact_native_string_output(fast, output)
+}
+
+pub(in crate::vm) extern "C" fn jit_native_str_pad_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    argument_2: i64,
+    argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!((2..=4).contains(&argument_count));
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let Some(length) = exact_native_integer(fast, argument_1) else {
+        return exact_query_baseline();
+    };
+    let Ok(target) = usize::try_from(length) else {
+        return exact_query_baseline();
+    };
+    let pad_type = if argument_count == 4 {
+        let Some(pad_type) = exact_native_integer(fast, argument_3) else {
+            return exact_query_baseline();
+        };
+        pad_type
+    } else {
+        1
+    };
+    let output = {
+        let Some(input) = fast.native_string_view(argument_0) else {
+            return exact_query_baseline();
+        };
+        let pad = if argument_count >= 3 {
+            let Some(pad) = fast.native_string_view(argument_2) else {
+                return exact_query_baseline();
+            };
+            if pad.is_empty() {
+                return exact_query_baseline();
+            }
+            pad
+        } else {
+            b" "
+        };
+        php_runtime::api::native_str_pad(input, target, pad, pad_type)
+    };
+    exact_native_string_output(fast, output)
+}
+
+pub(in crate::vm) extern "C" fn jit_native_strtr_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!((2..=3).contains(&argument_count));
+    if argument_count != 3 {
+        return exact_query_baseline();
+    }
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let output = {
+        let (Some(subject), Some(from), Some(to)) = (
+            fast.native_string_view(argument_0),
+            fast.native_string_view(argument_1),
+            fast.native_string_view(argument_2),
+        ) else {
+            return exact_query_baseline();
+        };
+        php_runtime::api::native_strtr(subject, from, to)
+    };
+    exact_native_string_output(fast, output)
+}
+
+pub(in crate::vm) extern "C" fn jit_native_strip_tags_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!((1..=2).contains(&argument_count));
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let output = {
+        let Some(input) = fast.native_string_view(argument_0) else {
+            return exact_query_baseline();
+        };
+        let allowed = if argument_count == 2 {
+            let Some(allowed) = fast.native_string_view(argument_1) else {
+                return exact_query_baseline();
+            };
+            Some(allowed)
+        } else {
+            None
+        };
+        php_runtime::api::native_strip_tags(input, allowed)
+    };
+    exact_native_string_output(fast, output)
+}
+
+pub(in crate::vm) extern "C" fn jit_native_substr_replace_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    argument_2: i64,
+    argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!((3..=4).contains(&argument_count));
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let Some(offset) = exact_native_integer(fast, argument_2) else {
+        return exact_query_baseline();
+    };
+    let length = if argument_count == 4 && argument_3 != php_jit::jit_encode_constant(u32::MAX) {
+        let Some(length) = exact_native_integer(fast, argument_3) else {
+            return exact_query_baseline();
+        };
+        Some(length)
+    } else {
+        None
+    };
+    let output = {
+        let (Some(subject), Some(replacement)) = (
+            fast.native_string_view(argument_0),
+            fast.native_string_view(argument_1),
+        ) else {
+            return exact_query_baseline();
+        };
+        php_runtime::api::native_substr_replace(subject, replacement, offset, length)
+    };
+    output.map_or_else(exact_query_baseline, |output| {
+        exact_native_string_output(fast, output)
+    })
+}
+
+macro_rules! exact_native_html_encode_abi {
+    ($abi:ident, $native:path) => {
+        pub(in crate::vm) extern "C" fn $abi(
+            runtime: *mut NativeRequestFastState,
+            argument_count: u32,
+            argument_0: i64,
+            argument_1: i64,
+            argument_2: i64,
+            argument_3: i64,
+            _argument_4: i64,
+            _argument_5: i64,
+        ) -> php_jit::JitNativeControlResult {
+            debug_assert!((1..=4).contains(&argument_count));
+            #[allow(unsafe_code)]
+            let fast = unsafe { &mut *runtime };
+            let flags = if argument_count >= 2 {
+                let Some(flags) = exact_native_integer(fast, argument_1) else {
+                    return exact_query_baseline();
+                };
+                flags
+            } else {
+                php_runtime::api::NATIVE_HTML_ESCAPE_DEFAULT_FLAGS
+            };
+            if argument_count >= 3
+                && argument_2 != php_jit::jit_encode_constant(u32::MAX)
+                && fast.native_string_view(argument_2).is_none()
+            {
+                return exact_query_baseline();
+            }
+            let double_encode = if argument_count == 4 {
+                let Some(double_encode) = exact_native_boolean_flag(fast, argument_3) else {
+                    return exact_query_baseline();
+                };
+                double_encode
+            } else {
+                true
+            };
+            let output = {
+                let Some(input) = fast.native_string_view(argument_0) else {
+                    return exact_query_baseline();
+                };
+                $native(input, flags, double_encode)
+            };
+            exact_native_string_output(fast, output)
+        }
+    };
+}
+
+exact_native_html_encode_abi!(
+    jit_native_htmlspecialchars_abi,
+    php_runtime::api::native_htmlspecialchars
+);
+exact_native_html_encode_abi!(
+    jit_native_htmlentities_abi,
+    php_runtime::api::native_htmlentities
+);
+
+pub(in crate::vm) extern "C" fn jit_native_html_entity_decode_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!((1..=3).contains(&argument_count));
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let flags = if argument_count >= 2 {
+        let Some(flags) = exact_native_integer(fast, argument_1) else {
+            return exact_query_baseline();
+        };
+        flags
+    } else {
+        php_runtime::api::NATIVE_HTML_ESCAPE_DEFAULT_FLAGS
+    };
+    if argument_count == 3
+        && argument_2 != php_jit::jit_encode_constant(u32::MAX)
+        && fast.native_string_view(argument_2).is_none()
+    {
+        return exact_query_baseline();
+    }
+    let output = {
+        let Some(input) = fast.native_string_view(argument_0) else {
+            return exact_query_baseline();
+        };
+        php_runtime::api::native_html_entity_decode(input, flags)
+    };
+    exact_native_string_output(fast, output)
+}
+
+pub(in crate::vm) extern "C" fn jit_native_htmlspecialchars_decode_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!((1..=2).contains(&argument_count));
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let flags = if argument_count == 2 {
+        let Some(flags) = exact_native_integer(fast, argument_1) else {
+            return exact_query_baseline();
+        };
+        flags
+    } else {
+        php_runtime::api::NATIVE_HTML_ESCAPE_DEFAULT_FLAGS
+    };
+    let output = {
+        let Some(input) = fast.native_string_view(argument_0) else {
+            return exact_query_baseline();
+        };
+        php_runtime::api::native_htmlspecialchars_decode(input, flags)
+    };
+    exact_native_string_output(fast, output)
+}
+
+pub(in crate::vm) extern "C" fn jit_native_http_build_query_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    argument_2: i64,
+    argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!((1..=4).contains(&argument_count));
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let output = {
+        let numeric_prefix = if argument_count >= 2 {
+            let Some(prefix) = fast.native_string_view(argument_1) else {
+                return exact_query_baseline();
+            };
+            Some(prefix)
+        } else {
+            None
+        };
+        let separator =
+            if argument_count < 3 || argument_2 == php_jit::jit_encode_constant(u32::MAX) {
+                let Some(separator) = fast.native_arg_separator_output() else {
+                    return exact_query_baseline();
+                };
+                separator.as_bytes()
+            } else {
+                let Some(separator) = fast.native_string_view(argument_2) else {
+                    return exact_query_baseline();
+                };
+                separator
+            };
+        let raw_encoding = if argument_count == 4 {
+            let Some(encoding) = exact_native_integer(fast, argument_3) else {
+                return exact_query_baseline();
+            };
+            encoding == php_runtime::api::NATIVE_PHP_QUERY_RFC3986
+        } else {
+            false
+        };
+        fast.native_http_build_query(argument_0, numeric_prefix, separator, raw_encoding)
+    };
+    output.map_or_else(exact_query_baseline, |output| {
+        exact_native_string_output(fast, output)
+    })
+}
+
+pub(in crate::vm) extern "C" fn jit_native_parse_url_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!(argument_count == 1 || argument_count == 2);
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let component = if argument_count == 2 {
+        let Some(component) = exact_native_integer(fast, argument_1) else {
+            return exact_query_baseline();
+        };
+        Some(component)
+    } else {
+        None
+    };
+    match fast.native_parse_url(argument_0, component) {
+        Some(Ok(Some(value))) => fast.publish_native_decoded(value).map_or_else(
+            exact_query_baseline,
+            php_jit::JitNativeControlResult::returning,
+        ),
+        Some(Ok(None)) => exact_query_return_bool(false),
+        Some(Err(_)) | None => exact_query_baseline(),
+    }
+}
+
+pub(in crate::vm) extern "C" fn jit_native_parse_str_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert_eq!(argument_count, 2);
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    if !fast.direct_reference_accepts_immediate_replace(argument_1) {
+        return exact_query_baseline();
+    }
+    let Some(value) = fast.native_parse_str(argument_0) else {
+        return exact_query_baseline();
+    };
+    let Some(array) = fast.publish_native_decoded(value) else {
+        return exact_query_baseline();
+    };
+    if !fast.replace_empty_direct_reference(argument_1, array) {
+        return exact_query_baseline();
+    }
+    php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(u32::MAX))
+}
+
+macro_rules! exact_native_preserving_sort_abi {
+    ($abi:ident, $operation:literal, $fixed_arity:literal) => {
+        pub(in crate::vm) extern "C" fn $abi(
+            runtime: *mut NativeRequestFastState,
+            argument_count: u32,
+            argument_0: i64,
+            argument_1: i64,
+            _argument_2: i64,
+            _argument_3: i64,
+            _argument_4: i64,
+            _argument_5: i64,
+        ) -> php_jit::JitNativeControlResult {
+            if $fixed_arity {
+                debug_assert_eq!(argument_count, 1);
+            } else {
+                debug_assert!(argument_count == 1 || argument_count == 2);
+            }
+            #[allow(unsafe_code)]
+            let fast = unsafe { &mut *runtime };
+            let flags = if argument_count == 2 {
+                let Some(flags) = exact_native_integer(fast, argument_1) else {
+                    return exact_query_baseline();
+                };
+                flags
+            } else {
+                0
+            };
+            if fast
+                .native_sort_preserving_keys(argument_0, $operation, flags)
+                .is_none()
+            {
+                return exact_query_baseline();
+            }
+            exact_query_return_bool(true)
+        }
+    };
+}
+
+exact_native_preserving_sort_abi!(jit_native_asort_abi, 0, false);
+exact_native_preserving_sort_abi!(jit_native_arsort_abi, 1, false);
+exact_native_preserving_sort_abi!(jit_native_ksort_abi, 2, false);
+exact_native_preserving_sort_abi!(jit_native_krsort_abi, 3, false);
+exact_native_preserving_sort_abi!(jit_native_natsort_abi, 4, true);
+exact_native_preserving_sort_abi!(jit_native_natcasesort_abi, 5, true);
+
+pub(in crate::vm) extern "C" fn jit_native_func_num_args_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    _argument_0: i64,
+    _argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert_eq!(argument_count, 0);
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    fast.native_func_num_args().map_or_else(
+        |_| exact_query_baseline(),
+        php_jit::JitNativeControlResult::returning,
+    )
+}
+
+pub(in crate::vm) extern "C" fn jit_native_func_get_arg_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    _argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert_eq!(argument_count, 1);
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let Some(index) = fast
+        .native_printf_scalar(argument_0)
+        .and_then(|value| match value {
+            php_runtime::api::NativePrintfScalar::Int(index) => usize::try_from(index).ok(),
+            _ => None,
+        })
+    else {
+        return exact_query_baseline();
+    };
+    match fast.native_func_get_arg(index) {
+        Ok(Some(value)) => php_jit::JitNativeControlResult::returning(value),
+        Ok(None) | Err(_) => exact_query_baseline(),
+    }
+}
+
+pub(in crate::vm) extern "C" fn jit_native_func_get_args_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    _argument_0: i64,
+    _argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert_eq!(argument_count, 0);
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    fast.native_func_get_args().map_or_else(
+        |_| exact_query_baseline(),
+        php_jit::JitNativeControlResult::returning,
+    )
+}
+
+pub(in crate::vm) extern "C" fn jit_native_base64_decode_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!((1..=2).contains(&argument_count));
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let Some(input) = fast.native_string_view(argument_0) else {
+        return exact_query_baseline();
+    };
+    let strict = if argument_count == 2 {
+        let Some(strict) = exact_native_boolean_flag(fast, argument_1) else {
+            return exact_query_baseline();
+        };
+        strict
+    } else {
+        false
+    };
+    let Ok(output) = php_runtime::api::native_base64_decode(input, strict) else {
+        return exact_query_return_bool(false);
+    };
+    fast.publish_direct_string_bytes(&output).map_or_else(
+        |_| exact_query_baseline(),
+        php_jit::JitNativeControlResult::returning,
+    )
+}
+
+fn exact_native_parsed_base_result(
+    fast: &mut NativeRequestFastState,
+    parsed: php_runtime::api::NativeParsedBaseNumber,
+) -> php_jit::JitNativeControlResult {
+    let encoded = match parsed {
+        php_runtime::api::NativeParsedBaseNumber::Int(value) => fast.publish_direct_int(value),
+        php_runtime::api::NativeParsedBaseNumber::Float(value) => fast.publish_direct_float(value),
+    };
+    encoded.map_or_else(
+        |_| exact_query_baseline(),
+        php_jit::JitNativeControlResult::returning,
+    )
+}
+
+macro_rules! exact_native_parse_base_abi {
+    ($abi:ident, $base:literal) => {
+        pub(in crate::vm) extern "C" fn $abi(
+            runtime: *mut NativeRequestFastState,
+            argument_count: u32,
+            argument_0: i64,
+            _argument_1: i64,
+            _argument_2: i64,
+            _argument_3: i64,
+            _argument_4: i64,
+            _argument_5: i64,
+        ) -> php_jit::JitNativeControlResult {
+            debug_assert_eq!(argument_count, 1);
+            #[allow(unsafe_code)]
+            let fast = unsafe { &mut *runtime };
+            let Some(input) = fast.native_string_view(argument_0) else {
+                return exact_query_baseline();
+            };
+            let Some(parsed) = php_runtime::api::native_parse_base_digits(input, $base) else {
+                return exact_query_baseline();
+            };
+            exact_native_parsed_base_result(fast, parsed)
+        }
+    };
+}
+
+exact_native_parse_base_abi!(jit_native_bindec_abi, 2);
+exact_native_parse_base_abi!(jit_native_hexdec_abi, 16);
+exact_native_parse_base_abi!(jit_native_octdec_abi, 8);
+
+macro_rules! exact_native_decimal_to_base_abi {
+    ($abi:ident, $base:literal) => {
+        pub(in crate::vm) extern "C" fn $abi(
+            runtime: *mut NativeRequestFastState,
+            argument_count: u32,
+            argument_0: i64,
+            _argument_1: i64,
+            _argument_2: i64,
+            _argument_3: i64,
+            _argument_4: i64,
+            _argument_5: i64,
+        ) -> php_jit::JitNativeControlResult {
+            debug_assert_eq!(argument_count, 1);
+            #[allow(unsafe_code)]
+            let fast = unsafe { &mut *runtime };
+            let Some(value) = exact_native_integer(fast, argument_0) else {
+                return exact_query_baseline();
+            };
+            let Some(output) = php_runtime::api::native_decimal_to_base(value, $base) else {
+                return exact_query_baseline();
+            };
+            fast.publish_direct_string_bytes(&output).map_or_else(
+                |_| exact_query_baseline(),
+                php_jit::JitNativeControlResult::returning,
+            )
+        }
+    };
+}
+
+exact_native_decimal_to_base_abi!(jit_native_decbin_abi, 2);
+exact_native_decimal_to_base_abi!(jit_native_dechex_abi, 16);
+exact_native_decimal_to_base_abi!(jit_native_decoct_abi, 8);
+
+pub(in crate::vm) extern "C" fn jit_native_base_convert_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert_eq!(argument_count, 3);
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let (Some(from_base), Some(to_base)) = (
+        exact_native_integer(fast, argument_1).and_then(|base| u32::try_from(base).ok()),
+        exact_native_integer(fast, argument_2).and_then(|base| u32::try_from(base).ok()),
+    ) else {
+        return exact_query_baseline();
+    };
+    let Some(input) = fast.native_string_view(argument_0) else {
+        return exact_query_baseline();
+    };
+    let Some(output) = php_runtime::api::native_base_convert(input, from_base, to_base) else {
+        return exact_query_baseline();
+    };
+    fast.publish_direct_string_bytes(&output).map_or_else(
+        |_| exact_query_baseline(),
+        php_jit::JitNativeControlResult::returning,
+    )
+}
+
+pub(in crate::vm) extern "C" fn jit_native_ip2long_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    _argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert_eq!(argument_count, 1);
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let Some(address) = fast.native_string_view(argument_0) else {
+        return exact_query_baseline();
+    };
+    let Some(value) = php_runtime::api::native_ip2long(address) else {
+        return exact_query_return_bool(false);
+    };
+    fast.publish_direct_int(value).map_or_else(
+        |_| exact_query_baseline(),
+        php_jit::JitNativeControlResult::returning,
+    )
+}
+
+pub(in crate::vm) extern "C" fn jit_native_long2ip_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    _argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert_eq!(argument_count, 1);
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let Some(address) = exact_native_integer(fast, argument_0) else {
+        return exact_query_baseline();
+    };
+    let output = php_runtime::api::native_long2ip(address);
+    fast.publish_direct_string_bytes(&output).map_or_else(
+        |_| exact_query_baseline(),
+        php_jit::JitNativeControlResult::returning,
+    )
+}
+
+macro_rules! exact_native_network_string_abi {
+    ($abi:ident, $operation:path) => {
+        pub(in crate::vm) extern "C" fn $abi(
+            runtime: *mut NativeRequestFastState,
+            argument_count: u32,
+            argument_0: i64,
+            _argument_1: i64,
+            _argument_2: i64,
+            _argument_3: i64,
+            _argument_4: i64,
+            _argument_5: i64,
+        ) -> php_jit::JitNativeControlResult {
+            debug_assert_eq!(argument_count, 1);
+            #[allow(unsafe_code)]
+            let fast = unsafe { &mut *runtime };
+            let Some(input) = fast.native_string_view(argument_0) else {
+                return exact_query_baseline();
+            };
+            let Some(output) = $operation(input) else {
+                return exact_query_return_bool(false);
+            };
+            fast.publish_direct_string_bytes(&output).map_or_else(
+                |_| exact_query_baseline(),
+                php_jit::JitNativeControlResult::returning,
+            )
+        }
+    };
+}
+
+exact_native_network_string_abi!(jit_native_inet_pton_abi, php_runtime::api::native_inet_pton);
+exact_native_network_string_abi!(jit_native_inet_ntop_abi, php_runtime::api::native_inet_ntop);
+
+fn exact_native_max_length(
+    fast: &NativeRequestFastState,
+    argument_count: u32,
+    encoded: i64,
+) -> Option<Option<usize>> {
+    if argument_count == 1 {
+        return Some(None);
+    }
+    let length = exact_native_integer(fast, encoded)?;
+    Some((length > 0).then(|| length as usize))
+}
+
+macro_rules! exact_native_compression_encode_abi {
+    ($abi:ident, $encoding:expr) => {
+        pub(in crate::vm) extern "C" fn $abi(
+            runtime: *mut NativeRequestFastState,
+            argument_count: u32,
+            argument_0: i64,
+            argument_1: i64,
+            _argument_2: i64,
+            _argument_3: i64,
+            _argument_4: i64,
+            _argument_5: i64,
+        ) -> php_jit::JitNativeControlResult {
+            debug_assert!((1..=3).contains(&argument_count));
+            #[allow(unsafe_code)]
+            let fast = unsafe { &mut *runtime };
+            let level = if argument_count >= 2 {
+                let Some(level) = exact_native_integer(fast, argument_1) else {
+                    return exact_query_baseline();
+                };
+                level
+            } else {
+                -1
+            };
+            let Some(input) = fast.native_string_view(argument_0) else {
+                return exact_query_baseline();
+            };
+            let Some(output) = php_runtime::api::native_zlib_encode(input, $encoding, level) else {
+                return exact_query_return_bool(false);
+            };
+            fast.publish_direct_string_bytes(&output).map_or_else(
+                |_| exact_query_baseline(),
+                php_jit::JitNativeControlResult::returning,
+            )
+        }
+    };
+}
+
+exact_native_compression_encode_abi!(
+    jit_native_gzencode_abi,
+    php_runtime::api::ZLIB_ENCODING_GZIP
+);
+exact_native_compression_encode_abi!(
+    jit_native_gzcompress_abi,
+    php_runtime::api::ZLIB_ENCODING_DEFLATE
+);
+exact_native_compression_encode_abi!(
+    jit_native_gzdeflate_abi,
+    php_runtime::api::ZLIB_ENCODING_RAW
+);
+
+macro_rules! exact_native_compression_decode_abi {
+    ($abi:ident, $encoding:expr) => {
+        pub(in crate::vm) extern "C" fn $abi(
+            runtime: *mut NativeRequestFastState,
+            argument_count: u32,
+            argument_0: i64,
+            argument_1: i64,
+            _argument_2: i64,
+            _argument_3: i64,
+            _argument_4: i64,
+            _argument_5: i64,
+        ) -> php_jit::JitNativeControlResult {
+            debug_assert!((1..=2).contains(&argument_count));
+            #[allow(unsafe_code)]
+            let fast = unsafe { &mut *runtime };
+            let Some(max_length) = exact_native_max_length(fast, argument_count, argument_1) else {
+                return exact_query_baseline();
+            };
+            let Some(input) = fast.native_string_view(argument_0) else {
+                return exact_query_baseline();
+            };
+            let Some(output) = php_runtime::api::native_zlib_decode(input, $encoding, max_length)
+            else {
+                return exact_query_return_bool(false);
+            };
+            fast.publish_direct_string_bytes(&output).map_or_else(
+                |_| exact_query_baseline(),
+                php_jit::JitNativeControlResult::returning,
+            )
+        }
+    };
+}
+
+exact_native_compression_decode_abi!(
+    jit_native_gzdecode_abi,
+    php_runtime::api::ZLIB_ENCODING_GZIP
+);
+exact_native_compression_decode_abi!(
+    jit_native_gzuncompress_abi,
+    php_runtime::api::ZLIB_ENCODING_DEFLATE
+);
+exact_native_compression_decode_abi!(
+    jit_native_gzinflate_abi,
+    php_runtime::api::ZLIB_ENCODING_RAW
+);
+
+pub(in crate::vm) extern "C" fn jit_native_zlib_decode_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    _argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!((1..=2).contains(&argument_count));
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let Some(max_length) = exact_native_max_length(fast, argument_count, argument_1) else {
+        return exact_query_baseline();
+    };
+    let Some(input) = fast.native_string_view(argument_0) else {
+        return exact_query_baseline();
+    };
+    let Some(output) = php_runtime::api::native_zlib_decode_auto(input, max_length) else {
+        return exact_query_return_bool(false);
+    };
+    fast.publish_direct_string_bytes(&output).map_or_else(
+        |_| exact_query_baseline(),
+        php_jit::JitNativeControlResult::returning,
+    )
+}
+
+pub(in crate::vm) extern "C" fn jit_native_zlib_encode_abi(
+    runtime: *mut NativeRequestFastState,
+    argument_count: u32,
+    argument_0: i64,
+    argument_1: i64,
+    argument_2: i64,
+    _argument_3: i64,
+    _argument_4: i64,
+    _argument_5: i64,
+) -> php_jit::JitNativeControlResult {
+    debug_assert!((2..=3).contains(&argument_count));
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let (Some(encoding), Some(level)) = (
+        exact_native_integer(fast, argument_1),
+        if argument_count == 3 {
+            exact_native_integer(fast, argument_2)
+        } else {
+            Some(-1)
+        },
+    ) else {
+        return exact_query_baseline();
+    };
+    let Some(input) = fast.native_string_view(argument_0) else {
+        return exact_query_baseline();
+    };
+    let Some(output) = php_runtime::api::native_zlib_encode(input, encoding, level) else {
+        return exact_query_return_bool(false);
+    };
+    fast.publish_direct_string_bytes(&output).map_or_else(
+        |_| exact_query_baseline(),
+        php_jit::JitNativeControlResult::returning,
+    )
+}
 
 fn exact_native_path(
     runtime: *mut NativeRequestFastState,
@@ -1443,7 +2873,7 @@ unsafe fn jit_baseline_native_builtin_dispatch_impl<const DIAGNOSTIC: bool>(
     };
     let callsite_span =
         php_ir::IrSpan::new(php_ir::FileId::new(source_file), source_start, source_end);
-    let outcome = with_native_context_for(runtime, "call_dispatch", |context| {
+    let outcome = with_baseline_native_context_for(runtime, "call_dispatch", |context| {
         let prepared = crate::compiled_unit::PreparedNativeBuiltin::for_dense_id(
             builtin_id,
             argument_count as usize,
@@ -1492,7 +2922,8 @@ unsafe fn jit_baseline_native_builtin_dispatch_impl<const DIAGNOSTIC: bool>(
         let result = if matches!(
             entry.execution_kind(),
             php_runtime::api::BuiltinExecutionKind::Runtime
-        ) {
+        ) && entry.name() != "set_time_limit"
+        {
             execute_baseline_prepared_runtime_builtin(context, arguments, callsite_span, prepared)
                 .map_err(NativeCallControl::from_baseline_error)
         } else {
@@ -1549,18 +2980,18 @@ pub(super) fn finish_native_dispatch_outcome(
     let (status, value) = match outcome {
         Some(Ok(value)) => (php_jit::JitCallStatus::RETURN, Some(value)),
         Some(Err(NativeCallControl::Rethrow)) => {
-            let value = with_native_context_for(runtime, "call_dispatch", |context| {
+            let value = with_baseline_native_context_for(runtime, "call_dispatch", |context| {
                 let mut throwable = context.take_pending_throwable()?;
                 if let Some(span) = callsite_span {
                     throwable = native_throwable_with_call_source(context, throwable, span);
                 }
-                context.encode(throwable).ok()
+                context.encode_baseline_value(throwable).ok()
             })
             .flatten();
             (php_jit::JitCallStatus::THROW, value)
         }
         Some(Err(NativeCallControl::Throw { class, message })) => {
-            let value = with_native_context_for(runtime, "call_dispatch", |context| {
+            let value = with_baseline_native_context_for(runtime, "call_dispatch", |context| {
                 callsite_span
                     .and_then(|span| {
                         encode_native_throwable_at(context, &class, &message, span).ok()
@@ -1579,7 +3010,7 @@ pub(super) fn finish_native_dispatch_outcome(
                 // complete synchronous baseline-native dispatch.
                 unsafe { transition_state.write(*state) };
             }
-            let value = with_native_context_for(runtime, "call_dispatch", |context| {
+            let value = with_baseline_native_context_for(runtime, "call_dispatch", |context| {
                 context.pending_fiber_suspension_value.take()
             })
             .flatten();
@@ -1590,7 +3021,7 @@ pub(super) fn finish_native_dispatch_outcome(
             (php_jit::JitCallStatus::RUNTIME_ERROR, None)
         }
         Some(Err(NativeCallControl::RuntimeError(message))) => {
-            let _ = with_native_context_for(runtime, "call_dispatch", |context| {
+            let _ = with_baseline_native_context_for(runtime, "call_dispatch", |context| {
                 publish_native_call_diagnostic(context, message)
             });
             (php_jit::JitCallStatus::RUNTIME_ERROR, None)
@@ -1688,7 +3119,7 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                 }
             };
         let mut callsite_span = None;
-        let outcome = with_native_context_for(
+        let outcome = with_baseline_native_context_for(
             runtime,
             "call_dispatch",
             |context| -> NativeCallResult {
@@ -2158,7 +3589,7 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     if throwable_parent {
                         let message = encoded
                             .first()
-                            .map(|message| context.decode(*message))
+                            .map(|message| context.decode_baseline_value(*message))
                             .transpose()?
                             .map(native_string)
                             .transpose()?
@@ -2226,7 +3657,7 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     || method.eq_ignore_ascii_case("getPrevious"))
                 && let Some(receiver) = encoded.first()
             {
-                let decoded = context.decode(*receiver)?;
+                let decoded = context.decode_baseline_value(*receiver)?;
                 let name = if method.eq_ignore_ascii_case("getTrace") {
                     "trace"
                 } else if method.eq_ignore_ascii_case("getCode") {
@@ -2267,7 +3698,91 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                         .into());
                     }
                 };
-                return Ok(context.encode(value)?);
+                return Ok(context.encode_baseline_value(value)?);
+            }
+            if let php_ir::InstructionKind::BindReferenceFromMethodCall {
+                method, args, ..
+            } = &instruction.kind
+                && let Some(receiver) = encoded.first()
+            {
+                let object = if let Some(object) = context.native_query_object(*receiver) {
+                    object
+                } else {
+                    let receiver_value = match context.decode_baseline_value(*receiver).map_err(|error| {
+                        format!("{method}() native receiver could not be decoded: {error}")
+                    })? {
+                        Value::Reference(reference) => reference.get(),
+                        value => value,
+                    };
+                    let Value::Object(object) = receiver_value else {
+                        return Err(format!(
+                            "Call to a member function {method}() on {}",
+                            native_value_type_name(&receiver_value),
+                        )
+                        .into());
+                    };
+                    object
+                };
+                let class_name = object.class_name();
+                let local = native_calling_class(context, frame.function_id)
+                    .and_then(|class| {
+                        class
+                            .methods
+                            .iter()
+                            .find(|entry| {
+                                entry.name.eq_ignore_ascii_case(method) && entry.flags.is_private
+                            })
+                            .map(|entry| entry.function)
+                    })
+                    .or_else(|| native_method_in_hierarchy(context, &class_name, method));
+                if let Some(function) = local {
+                    if let Some(error) =
+                        native_method_access_error(context, function, frame.function_id, false)
+                    {
+                        return Err(format!("E_PHP_THROW:Error:{error}").into());
+                    }
+                    let is_static = context.unit.classes.iter().any(|class| {
+                        class
+                            .methods
+                            .iter()
+                            .any(|entry| entry.function == function && entry.flags.is_static)
+                    });
+                    let arguments = if is_static { &encoded[1..] } else { &encoded };
+                    return Ok(invoke_native_function_with_metadata_strict(
+                        context,
+                        function,
+                        arguments,
+                        Some(args),
+                        context.unit.strict_types_for_span(instruction.span),
+                    )?);
+                }
+                if let Some((function, entry)) =
+                    native_external_method(context, &class_name, method)
+                {
+                    if let Some(error) = native_external_method_access_error(
+                        context,
+                        function,
+                        frame.function_id,
+                        false,
+                    ) {
+                        return Err(format!("E_PHP_THROW:Error:{error}").into());
+                    }
+                    let arguments = if entry.flags.is_static {
+                        &encoded[1..]
+                    } else {
+                        &encoded
+                    };
+                    return Ok(invoke_native_external_function_with_metadata(
+                        context,
+                        function,
+                        arguments,
+                        Some(descriptor.arguments.as_ref()),
+                        Some(class_name),
+                        context
+                            .unit
+                            .strict_types_for_function(php_ir::FunctionId::new(frame.function_id)),
+                    )?);
+                }
             }
             if let php_ir::InstructionKind::CallMethod { method, args, .. } = &instruction.kind
                 && let Some(receiver) = encoded.first()
@@ -2279,7 +3794,7 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     // nested property graph around every method call.
                     object
                 } else {
-                    let receiver_value = match context.decode(*receiver).map_err(|error| {
+                    let receiver_value = match context.decode_baseline_value(*receiver).map_err(|error| {
                         format!("{method}() native receiver could not be decoded: {error}")
                     })? {
                         Value::Reference(reference) => reference.get(),
@@ -2528,7 +4043,7 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     ) {
                         return Ok(result?);
                     }
-                    let closure = context.decode(closure)?;
+                    let closure = context.decode_baseline_value(closure)?;
                     let Value::Callable(callable) = closure else {
                         return Err("Closure::bind() expects a closure".into());
                     };
@@ -2541,15 +4056,15 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                         encoded
                             .get(1)
                             .copied()
-                            .map(|value| context.decode(value))
+                            .map(|value| context.decode_baseline_value(value))
                             .transpose()?,
                         encoded
                             .get(2)
                             .copied()
-                            .map(|value| context.decode(value))
+                            .map(|value| context.decode_baseline_value(value))
                             .transpose()?,
                     )?;
-                    return Ok(context.encode(rebound)?);
+                    return Ok(context.encode_baseline_value(rebound)?);
                 }
                 let resolved_class = match class_name.to_ascii_lowercase().as_str() {
                     "self" => native_calling_class(context, frame.function_id)
@@ -2969,7 +4484,7 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                 php_ir::InstructionKind::CallMethod { method, .. } => {
                     let class_name = encoded
                         .first()
-                        .and_then(|receiver| context.decode(*receiver).ok())
+                        .and_then(|receiver| context.decode_baseline_value(*receiver).ok())
                         .and_then(|receiver| match receiver {
                             Value::Reference(reference) => match reference.get() {
                                 Value::Object(object) => Some(object.class_name()),
@@ -3255,13 +4770,13 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
             }
             Some(Err(NativeCallControl::Rethrow)) => {
                 let source_span = callsite_span;
-                let value = with_native_context_for(runtime, "call_dispatch", |context| {
+                let value = with_baseline_native_context_for(runtime, "call_dispatch", |context| {
                     let mut throwable = context.take_pending_throwable()?;
                     if let Some(source_span) = source_span {
                         throwable =
                             native_throwable_with_call_source(context, throwable, source_span);
                     }
-                    context.encode(throwable).ok()
+                    context.encode_baseline_value(throwable).ok()
                 })
                 .flatten();
                 (
@@ -3272,7 +4787,7 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
             }
             Some(Err(NativeCallControl::Throw { class, message })) => {
                 let source_span = callsite_span;
-                let value = with_native_context_for(runtime, "call_dispatch", |context| {
+                let value = with_baseline_native_context_for(runtime, "call_dispatch", |context| {
                     let target = (!compact_arguments
                         && frame.flags & php_jit::JitNativeCallFrame::FLAG_DIRECT_BUILTIN == 0
                         && frame.target.function_id != u32::MAX)
@@ -3286,10 +4801,12 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                         let encoded =
                             encode_native_throwable_at(context, &class, &message, target_span)
                                 .ok()?;
-                        let throwable = context.decode(encoded).ok()?;
+                        let throwable = context.decode_baseline_value(encoded).ok()?;
                         let arguments = arguments
                             .iter()
-                            .map(|argument| context.decode(argument.value.payload as i64))
+                            .map(|argument| {
+                                context.decode_baseline_value(argument.value.payload as i64)
+                            })
                             .collect::<Result<Vec<_>, _>>()
                             .ok()?;
                         let mut throwable =
@@ -3298,7 +4815,7 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                             throwable =
                                 native_throwable_with_call_source(context, throwable, source_span);
                         }
-                        return context.encode(throwable).ok();
+                        return context.encode_baseline_value(throwable).ok();
                     }
                     source_span
                         .and_then(|span| {
@@ -3328,7 +4845,7 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                             .write(*state);
                     }
                 }
-                let value = with_native_context_for(runtime, "call_dispatch", |context| {
+                let value = with_baseline_native_context_for(runtime, "call_dispatch", |context| {
                     context.pending_fiber_suspension_value.take()
                 })
                 .flatten();
@@ -3349,7 +4866,7 @@ unsafe fn jit_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                 None,
             ),
             Some(Err(NativeCallControl::RuntimeError(message))) => {
-                let _ = with_native_context_for(runtime, "call_dispatch", |context| {
+                let _ = with_baseline_native_context_for(runtime, "call_dispatch", |context| {
                     publish_native_call_diagnostic(context, message)
                 });
                 (

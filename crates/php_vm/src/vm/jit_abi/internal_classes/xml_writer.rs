@@ -41,7 +41,7 @@ pub(in crate::vm::jit_abi) fn construct_native_xml_writer(
             expect_arity("XMLWriter::__construct", arguments.len(), 0, 0)?;
             Ok(php_runtime::api::xml::new_xml_writer())
         })
-        .and_then(|object| context.encode(Value::Object(object)));
+        .and_then(|object| context.encode_baseline_value(Value::Object(object)));
     Some(result)
 }
 
@@ -192,12 +192,14 @@ fn execute_static_factory(
     match method.to_ascii_lowercase().as_str() {
         "tomemory" => {
             expect_arity("XMLWriter::toMemory", arguments.len(), 0, 0)?;
-            context.encode(Value::Object(new_memory_writer()))
+            context.encode_baseline_value(Value::Object(new_memory_writer()))
         }
         "touri" => {
             expect_arity("XMLWriter::toUri", arguments.len(), 1, 1)?;
             let uri = string_argument("XMLWriter::toUri", arguments[0].clone())?;
-            context.encode(open_uri_writer(context, &uri).map_or(Value::Bool(false), Value::Object))
+            context.encode_baseline_value(
+                open_uri_writer(context, &uri).map_or(Value::Bool(false), Value::Object),
+            )
         }
         _ => Err(format!(
             "E_PHP_VM_UNKNOWN_METHOD: static method XMLWriter::{method} is not implemented"
@@ -216,7 +218,7 @@ pub(in crate::vm::jit_abi) fn execute_native_xml_writer_instruction(
         } => construct_native_xml_writer(context, display_class_name, arguments),
         php_ir::InstructionKind::CallMethod { method, .. } => {
             let receiver = arguments.first().copied()?;
-            let receiver = match context.decode(receiver) {
+            let receiver = match context.decode_baseline_value(receiver) {
                 Ok(Value::Reference(reference)) => reference.get(),
                 Ok(value) => value,
                 Err(error) => return Some(Err(error)),
@@ -229,7 +231,7 @@ pub(in crate::vm::jit_abi) fn execute_native_xml_writer_instruction(
             }
             let result = decode_arguments(context, &arguments[1..])
                 .and_then(|arguments| call_xml_writer_method(context, &object, method, arguments))
-                .and_then(|value| context.encode(value));
+                .and_then(|value| context.encode_baseline_value(value));
             Some(result)
         }
         php_ir::InstructionKind::CallStaticMethod {
@@ -251,13 +253,13 @@ pub(in crate::vm::jit_abi) fn execute_native_xml_writer_builtin(
         match name {
             "xmlwriter_open_memory" => {
                 expect_arity("xmlwriter_open_memory", arguments.len(), 0, 0)?;
-                context.encode(Value::Object(new_memory_writer()))
+                context.encode_baseline_value(Value::Object(new_memory_writer()))
             }
             "xmlwriter_open_uri" => {
                 expect_arity("xmlwriter_open_uri", arguments.len(), 1, 1)?;
                 let values = decode_arguments(context, arguments)?;
                 let uri = string_argument("xmlwriter_open_uri", values[0].clone())?;
-                context.encode(
+                context.encode_baseline_value(
                     open_uri_writer(context, &uri).map_or(Value::Bool(false), Value::Object),
                 )
             }
@@ -265,7 +267,7 @@ pub(in crate::vm::jit_abi) fn execute_native_xml_writer_builtin(
                 let Some((receiver, arguments)) = arguments.split_first() else {
                     return Err(format!("{name} expects an XMLWriter argument"));
                 };
-                let receiver = match context.decode(*receiver)? {
+                let receiver = match context.decode_baseline_value(*receiver)? {
                     Value::Reference(reference) => reference.get(),
                     value => value,
                 };
@@ -278,7 +280,7 @@ pub(in crate::vm::jit_abi) fn execute_native_xml_writer_builtin(
                 let method = name.trim_start_matches("xmlwriter_").replace('_', "");
                 let values = decode_arguments(context, arguments)?;
                 let value = call_xml_writer_method(context, &object, &method, values)?;
-                context.encode(value)
+                context.encode_baseline_value(value)
             }
         }
     })();

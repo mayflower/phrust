@@ -184,7 +184,7 @@ pub(super) fn initialize_native_throwable_parent(
             .ok_or_else(|| format!("{class}::__construct() has no active object receiver"))?;
         let message = arguments
             .first()
-            .map(|value| context.decode(*value))
+            .map(|value| context.decode_baseline_value(*value))
             .transpose()?
             .map(native_string)
             .transpose()?
@@ -194,7 +194,7 @@ pub(super) fn initialize_native_throwable_parent(
             );
         let code = arguments
             .get(1)
-            .map(|value| context.decode(*value))
+            .map(|value| context.decode_baseline_value(*value))
             .transpose()?
             .map_or(Value::Int(0), |value| match value {
                 Value::Reference(reference) => reference.get(),
@@ -202,7 +202,7 @@ pub(super) fn initialize_native_throwable_parent(
             });
         let previous = arguments
             .get(2)
-            .map(|value| context.decode(*value))
+            .map(|value| context.decode_baseline_value(*value))
             .transpose()?
             .map_or(Value::Null, |value| match value {
                 Value::Reference(reference) => reference.get(),
@@ -211,7 +211,7 @@ pub(super) fn initialize_native_throwable_parent(
         object.set_property("message", message);
         object.set_property("code", code);
         object.set_property("previous", previous);
-        context.encode(Value::Null)
+        context.encode_baseline_value(Value::Null)
     })())
 }
 

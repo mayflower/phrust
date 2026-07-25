@@ -83,6 +83,84 @@ struct ParsedBaseNumber {
     overflowed: bool,
 }
 
+/// Result of parsing one authoritative native byte string as a PHP base
+/// conversion operand. Invalid digits are deliberately rejected so the exact
+/// optimizing handler can take the instruction's single baseline continuation
+/// and emit PHP's deprecation there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NativeParsedBaseNumber {
+    Int(i64),
+    Float(f64),
+}
+
+fn parse_native_base_number(input: &[u8], base: u32) -> Option<ParsedBaseNumber> {
+    if !(2..=36).contains(&base) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(input);
+    let text = text.trim();
+    let mut int_value = 0_u128;
+    let mut float_value = 0.0_f64;
+    let mut overflowed = false;
+    for (index, character) in text.chars().enumerate() {
+        if index == 1 && text.starts_with('0') && base_prefix_matches(character, base) {
+            continue;
+        }
+        let digit = character.to_digit(36)?;
+        if digit >= base {
+            return None;
+        }
+        float_value = (float_value * f64::from(base)) + f64::from(digit);
+        if !overflowed {
+            match int_value
+                .checked_mul(u128::from(base))
+                .and_then(|value| value.checked_add(u128::from(digit)))
+            {
+                Some(value) => int_value = value,
+                None => overflowed = true,
+            }
+        }
+    }
+    Some(ParsedBaseNumber {
+        int_value,
+        float_value,
+        overflowed,
+    })
+}
+
+/// Parses the string-producing members of PHP's base-conversion family
+/// without constructing a runtime `Value`.
+pub fn native_parse_base_digits(input: &[u8], base: u32) -> Option<NativeParsedBaseNumber> {
+    let parsed = parse_native_base_number(input, base)?;
+    if !parsed.overflowed && parsed.int_value <= i64::MAX as u128 {
+        Some(NativeParsedBaseNumber::Int(parsed.int_value as i64))
+    } else {
+        Some(NativeParsedBaseNumber::Float(parsed.float_value))
+    }
+}
+
+/// Converts a native byte string between validated bases. Invalid digits
+/// return `None` so PHP-visible diagnostics remain on the exact baseline
+/// continuation.
+pub fn native_base_convert(input: &[u8], from_base: u32, to_base: u32) -> Option<Vec<u8>> {
+    if !(2..=36).contains(&to_base) {
+        return None;
+    }
+    let parsed = parse_native_base_number(input, from_base)?;
+    let output = if parsed.overflowed {
+        format_f64_base(parsed.float_value, to_base)
+    } else {
+        format_u128_base(parsed.int_value, to_base)
+    };
+    Some(output.into_bytes())
+}
+
+/// Formats an already validated native integer using PHP's unsigned
+/// two's-complement behavior for decimal-to-base builtins.
+pub fn native_decimal_to_base(value: i64, base: u32) -> Option<Vec<u8>> {
+    (matches!(base, 2 | 8 | 16)).then(|| format_u128_base(value as u64 as u128, base).into_bytes())
+}
+
 fn unary_float_builtin(
     name: &str,
     args: &[Value],
@@ -500,7 +578,9 @@ fn php_round_helper(integral: f64, value: f64, exponent: f64, places: i32, mode:
     }
 }
 
-fn php_round(value: f64, places: i64, mode: i64) -> f64 {
+/// Exact pure numeric core shared by the baseline builtin and generated
+/// native `round` calls after argument coercion and mode validation.
+pub fn native_round_f64(value: f64, places: i64, mode: i64) -> f64 {
     if !value.is_finite() || value == 0.0 {
         return value;
     }
@@ -866,7 +946,7 @@ pub(in crate::builtins::modules) fn builtin_round(
             "round(): Argument #3 ($mode) must be a valid rounding mode (RoundingMode::*)",
         ));
     }
-    Ok(Value::float(php_round(value, precision, mode)))
+    Ok(Value::float(native_round_f64(value, precision, mode)))
 }
 
 pub(in crate::builtins::modules) fn builtin_floor(
@@ -1302,29 +1382,50 @@ pub(in crate::builtins::modules) fn builtin_number_format(
 
 #[cfg(test)]
 mod tests {
-    use super::{number_format_rounded_integer_digits, php_round};
+    use super::{
+        NativeParsedBaseNumber, native_base_convert, native_decimal_to_base,
+        native_parse_base_digits, native_round_f64, number_format_rounded_integer_digits,
+    };
     use crate::Value;
 
     #[test]
+    fn native_base_conversion_family_preserves_php_numeric_shapes() {
+        assert_eq!(
+            native_base_convert(b"ff", 16, 2),
+            Some(b"11111111".to_vec())
+        );
+        assert_eq!(
+            native_parse_base_digits(b"101010", 2),
+            Some(NativeParsedBaseNumber::Int(42))
+        );
+        assert_eq!(
+            native_decimal_to_base(-1, 16),
+            Some(b"ffffffffffffffff".to_vec())
+        );
+        assert_eq!(native_parse_base_digits(b"10x1", 2), None);
+        assert_eq!(native_base_convert(b"10", 1, 10), None);
+    }
+
+    #[test]
     fn round_matches_php_prerounding_and_large_exponents() {
-        assert_eq!(php_round(0.285, 2, 1), 0.29);
-        assert_eq!(php_round(12.3456789000e10, 14, 1), 123456789000.0);
-        assert_eq!(php_round(2e-23, 23, 1), 2e-23);
-        assert_eq!(php_round(1e-23, 23, 1), 1e-23);
-        assert_eq!(php_round(2e24, -24, 1), 2e24);
-        assert_eq!(php_round(1e24, -24, 1), 1e24);
+        assert_eq!(native_round_f64(0.285, 2, 1), 0.29);
+        assert_eq!(native_round_f64(12.3456789000e10, 14, 1), 123456789000.0);
+        assert_eq!(native_round_f64(2e-23, 23, 1), 2e-23);
+        assert_eq!(native_round_f64(1e-23, 23, 1), 1e-23);
+        assert_eq!(native_round_f64(2e24, -24, 1), 2e24);
+        assert_eq!(native_round_f64(1e24, -24, 1), 1e24);
     }
 
     #[test]
     fn round_mode_numbers_match_php_constants() {
-        assert_eq!(php_round(0.61, 0, 5), 1.0);
-        assert_eq!(php_round(-0.61, 0, 5), -0.0);
-        assert_eq!(php_round(0.61, 0, 6), 0.0);
-        assert_eq!(php_round(-0.61, 0, 6), -1.0);
-        assert_eq!(php_round(0.61, 0, 7), 0.0);
-        assert_eq!(php_round(-0.61, 0, 7), -0.0);
-        assert_eq!(php_round(0.61, 0, 8), 1.0);
-        assert_eq!(php_round(-0.61, 0, 8), -1.0);
+        assert_eq!(native_round_f64(0.61, 0, 5), 1.0);
+        assert_eq!(native_round_f64(-0.61, 0, 5), -0.0);
+        assert_eq!(native_round_f64(0.61, 0, 6), 0.0);
+        assert_eq!(native_round_f64(-0.61, 0, 6), -1.0);
+        assert_eq!(native_round_f64(0.61, 0, 7), 0.0);
+        assert_eq!(native_round_f64(-0.61, 0, 7), -0.0);
+        assert_eq!(native_round_f64(0.61, 0, 8), 1.0);
+        assert_eq!(native_round_f64(-0.61, 0, 8), -1.0);
     }
 
     #[test]

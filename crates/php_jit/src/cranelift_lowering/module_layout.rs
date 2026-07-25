@@ -35,7 +35,13 @@ pub const OPTIMIZING_REGION_MAX_VIRTUAL_VALUES: usize = 768;
 // planner may still group several cheap chunks and exact preflight can split
 // those groups again without rebuilding PHP semantics.
 const MAX_BASELINE_REGION_BLOCK_INSTRUCTIONS_BEFORE_SPLIT: usize = 16;
-const MAX_OPTIMIZING_REGION_BLOCK_INSTRUCTIONS_BEFORE_SPLIT: usize = 64;
+// Exact optimizing lowering can expand a straight-line string/array chain by
+// roughly two orders of magnitude in CLIF blocks.  A 31-instruction WordPress
+// concat chunk already crosses the 70% pre-regalloc margin by itself, leaving
+// exact refinement with no inter-block cut.  Sixteen keeps each chunk
+// independently preflightable while the fragment planner remains free to
+// group adjacent cheap chunks into one compiled function.
+const MAX_OPTIMIZING_REGION_BLOCK_INSTRUCTIONS_BEFORE_SPLIT: usize = 16;
 const MAX_REGION_BLOCK_ESTIMATED_CLIF_BLOCKS: usize = 192;
 
 fn maximum_region_block_instructions(
@@ -249,32 +255,41 @@ pub(super) fn split_region_blocks_at_boundaries(
             } else {
                 entry_live_locals.clone()
             };
-            let (source_terminator, terminator, terminator_span, continuation, live, state) =
-                if is_last {
-                    (
-                        remap_source_terminator(&block.source_terminator, &first_block),
-                        remap_region_terminator(&block.terminator, &first_block),
-                        block.terminator_span,
-                        block.terminator_continuation_id,
-                        block.terminator_live_locals.clone(),
-                        block.terminator_state_locals.clone(),
-                    )
-                } else {
-                    let target = chunk_ids[old_index][chunk_index + 1];
-                    let next_live = block.instructions[end].live_locals.clone();
-                    let continuation = next_continuation;
-                    next_continuation = next_continuation.saturating_add(1);
-                    (
-                        TerminatorKind::Jump { target },
-                        RegionTerminator::Jump { target },
-                        instructions
-                            .last()
-                            .map_or(block.terminator_span, |instruction| instruction.span),
-                        continuation,
-                        next_live.clone(),
-                        next_live,
-                    )
-                };
+            let (
+                source_terminator,
+                terminator,
+                terminator_span,
+                continuation,
+                live,
+                live_registers,
+                state,
+            ) = if is_last {
+                (
+                    remap_source_terminator(&block.source_terminator, &first_block),
+                    remap_region_terminator(&block.terminator, &first_block),
+                    block.terminator_span,
+                    block.terminator_continuation_id,
+                    block.terminator_live_locals.clone(),
+                    block.terminator_live_registers.clone(),
+                    block.terminator_state_locals.clone(),
+                )
+            } else {
+                let target = chunk_ids[old_index][chunk_index + 1];
+                let next_live = block.instructions[end].live_locals.clone();
+                let continuation = next_continuation;
+                next_continuation = next_continuation.saturating_add(1);
+                (
+                    TerminatorKind::Jump { target },
+                    RegionTerminator::Jump { target },
+                    instructions
+                        .last()
+                        .map_or(block.terminator_span, |instruction| instruction.span),
+                    continuation,
+                    next_live.clone(),
+                    None,
+                    next_live,
+                )
+            };
             blocks.push(RegionBlock {
                 id,
                 source_block: old_id,
@@ -289,6 +304,7 @@ pub(super) fn split_region_blocks_at_boundaries(
                 terminator_span,
                 terminator_continuation_id: continuation,
                 terminator_live_locals: live,
+                terminator_live_registers: live_registers,
                 terminator_state_locals: state,
                 source_terminator,
                 terminator,
@@ -1196,6 +1212,57 @@ mod tests {
             coarse.refine_fragment_into(&region, 0, 2).is_some(),
             "exact preflight must be able to refine an underestimated source block"
         );
+    }
+
+    #[test]
+    fn optimizing_straight_line_block_keeps_exact_preflight_cut_points() {
+        let mut builder = IrBuilder::new(UnitId::new(7));
+        let file = builder.add_file("optimizing-preflight-cut.php");
+        let span = IrSpan::new(file, 0, 1);
+        let function =
+            builder.start_function("optimizing_preflight_cut", FunctionFlags::default(), span);
+        let block = builder.append_block(function);
+        let mut result = None;
+        for value in 0..92 {
+            let constant = builder.add_constant(php_ir::IrConstant::Int(value));
+            let register = builder.alloc_register(function);
+            builder.emit_load_const(function, block, register, constant, span);
+            result = Some(register);
+        }
+        builder.terminate_return(function, block, result.map(php_ir::Operand::Register), span);
+        let unit = builder.finish();
+        let region = BaselineRegionBuilder::build(
+            &unit,
+            function,
+            &CompileMetadata {
+                ir_fingerprint: "optimizing-preflight-cut".to_owned(),
+                tier: NativeCompilerTier::Optimizing,
+                helper_abi_hash: 0,
+                target_cpu: "test".to_owned(),
+                semantic_config_hash: 0,
+                dependency_identity: "test".to_owned(),
+            },
+        )
+        .unwrap();
+        let region = split_oversized_region_blocks(region);
+        region.verify().unwrap();
+
+        assert_eq!(
+            region
+                .blocks
+                .iter()
+                .map(|block| block.instructions.len())
+                .collect::<Vec<_>>(),
+            vec![16, 16, 16, 16, 16, 12]
+        );
+        let plan = NativeCompilePlan::for_region(&region);
+        let mut coarse = plan.clone();
+        coarse.fragments = vec![fragment_plan_for_blocks(
+            &region,
+            0,
+            region.blocks.iter().map(|block| block.id).collect(),
+        )];
+        assert!(coarse.refine_fragment_into(&region, 0, 3).is_some());
     }
 
     #[test]

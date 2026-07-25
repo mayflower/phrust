@@ -110,7 +110,7 @@ pub(in crate::vm) extern "C" fn jit_native_function_resolve_abi(
         return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
     };
     let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        with_native_context_for(runtime, "function_resolve", |context| {
+        with_baseline_native_context_for(runtime, "function_resolve", |context| {
             let function = php_ir::FunctionId::new(function);
             // This helper is imported exclusively by streaming-baseline
             // artifacts. Keep the tier boundary physical: the current call
@@ -164,7 +164,7 @@ pub(in crate::vm) extern "C" fn jit_native_function_resolve_abi(
             0
         }
         Ok(Some(Err(message))) => {
-            let _ = with_native_context_for(runtime, "function_resolve", |context| {
+            let _ = with_baseline_native_context_for(runtime, "function_resolve", |context| {
                 publish_native_call_diagnostic(context, message)
             });
             php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
@@ -198,6 +198,10 @@ pub(super) fn register_native_dynamic_unit(
         .iter()
         .map(|(name, _)| name.to_ascii_lowercase())
         .collect::<Vec<_>>();
+    let published_class_names = classes
+        .iter()
+        .map(|name| normalized_class_name(name).into_owned())
+        .collect::<Vec<_>>();
     for (name, _) in &functions {
         if context.function_id(name).is_some() || context.external_function(name).is_some() {
             return Err(format!("Cannot redeclare function {name}()"));
@@ -216,14 +220,7 @@ pub(super) fn register_native_dynamic_unit(
             ));
         }
     }
-    let adds_by_reference_signature = functions.iter().any(|(_, function)| {
-        compiled
-            .unit()
-            .functions
-            .get(function.index())
-            .is_some_and(|function| function.params.iter().any(|parameter| parameter.by_ref))
-    });
-    if adds_by_reference_signature {
+    if !functions.is_empty() || !classes.is_empty() {
         context.external_signature_epoch = context.external_signature_epoch.saturating_add(1);
     }
     let native_entry_signature_epochs = native_entries
@@ -235,6 +232,12 @@ pub(super) fn register_native_dynamic_unit(
         publish_dynamic_unit_entry(&compiled, *function, handle);
     }
     let cross_unit_global_names = dynamic_unit_cross_unit_global_names(&compiled);
+    let runtime_state = NativeUnitRuntimeState::for_compiled(&compiled);
+    let linked_functions = vec![
+        php_jit::JitNativeLinkedFunction::default();
+        compiled.prepared_unit_external_function_calls().len()
+    ]
+    .into_boxed_slice();
     let unit = context.dynamic_units.len();
     context.dynamic_units.push(NativeDynamicUnit {
         compiled,
@@ -242,18 +245,37 @@ pub(super) fn register_native_dynamic_unit(
         native_entries,
         native_entry_signature_hashes,
         native_entry_signature_epochs,
+        runtime_state,
+        linked_functions,
+        published_runtime_view: Box::default(),
     });
-    for (name, function) in functions {
+    for (name, function) in &functions {
         context.external_functions.insert(
             name.to_ascii_lowercase(),
-            NativeDynamicFunction { unit, function },
+            NativeDynamicFunction {
+                unit,
+                function: *function,
+            },
         );
     }
-    context.publish_function_names(published_function_names);
-    for class in classes {
+    // Class ownership must be visible before declaration-time link
+    // preparation. Otherwise an already compiled caller can only discover a
+    // newly included method on its first invocation, which would put dynamic
+    // method dispatch back into the optimizing hot path.
+    for class in &classes {
         context.external_class_units.insert(class.clone(), unit);
-        context.dynamic_classes.insert(class);
+        context.dynamic_classes.insert(class.clone());
     }
+    // Publish the inactive unit's stable runtime view once at declaration
+    // time. Late-linked optimizing callers can then enter its already
+    // published native frame on the first PHP invocation; they never need an
+    // operation-local resolver transition merely to initialize table
+    // addresses.
+    context.with_active_dynamic_unit(unit, None, |_| ())?;
+    prepare_linked_function_entries(context)?;
+    prepare_resolved_external_callers(context, &published_function_names, &published_class_names)?;
+    refresh_linked_function_records(context);
+    context.publish_function_names(published_function_names);
     for (name, value) in constants {
         if context.lookup_constant(&name).is_ok() {
             let declaration = context.dynamic_units.get(unit).and_then(|package| {
@@ -286,7 +308,7 @@ pub(super) fn register_native_dynamic_unit(
                 "\nWarning: Constant {name} already defined, this will be an error in PHP 9 in {path} on line {line}\n"
             ));
         } else {
-            context.insert_dynamic_constant(name, value);
+            context.insert_dynamic_constant(name, value)?;
         }
     }
     context
@@ -453,6 +475,7 @@ pub(super) fn prepare_dynamic_native_entry(
     function: php_ir::FunctionId,
 ) -> Result<(), String> {
     let signature_epoch = context.external_signature_epoch;
+    let active_unit = context.current_dynamic_unit == Some(unit);
     let package = context
         .dynamic_units
         .get(unit)
@@ -460,8 +483,13 @@ pub(super) fn prepare_dynamic_native_entry(
     let wants_optimizing = context.options.native_optimization
         == super::super::NativeOptimizationPolicy::Optimizing
         && context.options.tiering.enabled;
+    let has_native_entry = if active_unit {
+        context.native_entries.contains_key(&function)
+    } else {
+        package.native_entries.contains_key(&function)
+    };
     if package.native_entry_signature_epochs.get(&function) == Some(&signature_epoch)
-        && package.native_entries.contains_key(&function)
+        && has_native_entry
     {
         return Ok(());
     }
@@ -469,7 +497,7 @@ pub(super) fn prepare_dynamic_native_entry(
     let external_signatures = visible_external_function_signatures(context, &compiled, function);
     let signature_hash = super::super::external_function_signatures_hash(&external_signatures);
     if package.native_entry_signature_hashes.get(&function) == Some(&signature_hash)
-        && package.native_entries.contains_key(&function)
+        && has_native_entry
     {
         context
             .dynamic_units
@@ -536,7 +564,11 @@ pub(super) fn prepare_dynamic_native_entry(
     package
         .native_entry_signature_epochs
         .insert(function, signature_epoch);
-    std::sync::Arc::make_mut(&mut package.native_entries).insert(function, preferred);
+    if active_unit {
+        std::sync::Arc::make_mut(&mut context.native_entries).insert(function, preferred);
+    } else {
+        std::sync::Arc::make_mut(&mut package.native_entries).insert(function, preferred);
+    }
     Ok(())
 }
 
@@ -561,27 +593,252 @@ pub(super) fn visible_external_function_signatures_for_unit(
     )
 }
 
+#[derive(Clone)]
+enum PreparedExternalCallTarget {
+    Function(NativeDynamicFunction),
+    Method {
+        target: NativeDynamicFunction,
+        entry: php_ir::module::ClassMethodEntry,
+    },
+    Class {
+        unit: usize,
+    },
+}
+
+impl PreparedExternalCallTarget {
+    fn function(&self) -> Option<NativeDynamicFunction> {
+        match self {
+            Self::Function(target) | Self::Method { target, .. } => Some(*target),
+            Self::Class { .. } => None,
+        }
+    }
+
+    fn unit(&self) -> usize {
+        match self {
+            Self::Function(target) | Self::Method { target, .. } => target.unit,
+            Self::Class { unit } => *unit,
+        }
+    }
+}
+
+fn prepared_external_class_unit(
+    context: &NativeRequestColdState<'_>,
+    class_name: &str,
+) -> Option<usize> {
+    let requested = normalized_class_name(class_name);
+    let class_name = context
+        .class_aliases
+        .get(requested.as_ref())
+        .map_or(requested.as_ref(), String::as_str);
+    context
+        .external_class_units
+        .get(class_name)
+        .copied()
+        .or_else(|| context.deployment_classes.contains(class_name).then_some(0))
+}
+
+/// Resolves an immutable external method identity without consulting the
+/// currently active unit.
+///
+/// Declaration-time publication deliberately activates the unit being
+/// published. The ordinary runtime lookup excludes that unit to distinguish
+/// local from external calls, but a caller link prepared at this boundary
+/// must still be able to point at the newly active target.
+fn prepared_external_method_target(
+    context: &NativeRequestColdState<'_>,
+    class_name: &str,
+    method: &str,
+) -> Option<(NativeDynamicFunction, php_ir::module::ClassMethodEntry)> {
+    let requested = normalized_class_name(class_name);
+    let mut class_name = context
+        .class_aliases
+        .get(requested.as_ref())
+        .cloned()
+        .unwrap_or_else(|| requested.into_owned());
+    let mut unit = context
+        .external_class_units
+        .get(&class_name)
+        .copied()
+        .or_else(|| {
+            context
+                .deployment_classes
+                .contains(class_name.as_str())
+                .then_some(0)
+        })?;
+    let mut visited = std::collections::BTreeSet::new();
+    loop {
+        if !visited.insert((unit, class_name.clone())) {
+            return None;
+        }
+        let package = context.dynamic_units.get(unit)?;
+        let class = package.compiled.lookup_unit_class_handle(&class_name)?;
+        if let Some(entry) = class
+            .methods
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(method))
+            .cloned()
+        {
+            return Some((
+                NativeDynamicFunction {
+                    unit,
+                    function: entry.function,
+                },
+                entry,
+            ));
+        }
+        class_name = normalized_class_name(class.parent.as_deref()?).into_owned();
+        if package
+            .compiled
+            .lookup_unit_class_handle(&class_name)
+            .is_none()
+        {
+            unit = context
+                .external_class_units
+                .get(&class_name)
+                .copied()
+                .or_else(|| {
+                    context
+                        .deployment_classes
+                        .contains(class_name.as_str())
+                        .then_some(0)
+                })?;
+        }
+    }
+}
+
+fn prepared_external_class_plan(
+    context: &NativeRequestColdState<'_>,
+    class_name: &str,
+) -> Option<u64> {
+    let requested = normalized_class_name(class_name);
+    let class_name = context
+        .class_aliases
+        .get(requested.as_ref())
+        .map_or(requested.as_ref(), String::as_str);
+    let unit = prepared_external_class_unit(context, class_name)?;
+    let package = context.dynamic_units.get(unit)?;
+    let class_index = package
+        .compiled
+        .unit()
+        .classes
+        .iter()
+        .position(|class| normalized_class_name(&class.name).as_ref() == class_name)?;
+    let view = package.published_runtime_view.as_ref();
+    if view.abi_version != php_jit::JIT_RUNTIME_ABI_VERSION
+        || class_index >= view.trusted_class_plan_count as usize
+        || view.trusted_class_plans == 0
+    {
+        return None;
+    }
+    // SAFETY: the published runtime view owns a stable class-plan array for
+    // the complete request activation and the checked dense index belongs to
+    // the target unit.
+    #[allow(unsafe_code)]
+    let plan = unsafe {
+        *(view.trusted_class_plans as usize as *const php_jit::JitNativePreparedClassPlan)
+            .add(class_index)
+    };
+    (plan.state == php_jit::JIT_NATIVE_PREPARED_CLASS_ALLOCATABLE && plan.prepared != 0)
+        .then_some(plan.prepared)
+}
+
+fn prepared_external_call_target(
+    context: &NativeRequestColdState<'_>,
+    call: &crate::compiled_unit::PreparedExternalFunctionCall,
+) -> Option<PreparedExternalCallTarget> {
+    if let Some((class, method)) = call.source_name.rsplit_once("::") {
+        if let Some((target, entry)) = prepared_external_method_target(context, class, method) {
+            return Some(PreparedExternalCallTarget::Method { target, entry });
+        }
+        if method.eq_ignore_ascii_case("__construct") {
+            return prepared_external_class_unit(context, class)
+                .map(|unit| PreparedExternalCallTarget::Class { unit });
+        }
+        return None;
+    }
+    context
+        .external_functions
+        .get(call.normalized_name.as_ref())
+        .copied()
+        .or_else(|| {
+            context
+                .deployment_functions
+                .get(call.normalized_name.as_ref())
+                .copied()
+                .map(|function| NativeDynamicFunction { unit: 0, function })
+        })
+        .map(PreparedExternalCallTarget::Function)
+}
+
 pub(super) fn collect_visible_external_function_signatures(
     context: &NativeRequestColdState<'_>,
     calls: &[crate::compiled_unit::PreparedExternalFunctionCall],
 ) -> Vec<php_jit::JitExternalFunctionSignature> {
     calls
         .iter()
-        .filter_map(|call| {
-            let target = context
-                .external_functions
-                .get(call.normalized_name.as_ref())?;
-            let function = context
-                .dynamic_units
-                .get(target.unit)?
-                .compiled
-                .unit()
-                .functions
-                .get(target.function.index())?;
-            Some(php_jit::JitExternalFunctionSignature {
+        .map(|call| {
+            let target = prepared_external_call_target(context, call);
+            let function = target.as_ref().and_then(|target| {
+                let target = target.function()?;
+                context
+                    .dynamic_units
+                    .get(target.unit)?
+                    .compiled
+                    .unit()
+                    .functions
+                    .get(target.function.index())
+            });
+            let method_entry = match target.as_ref() {
+                Some(PreparedExternalCallTarget::Method { entry, .. }) => Some(entry),
+                Some(
+                    PreparedExternalCallTarget::Function(_)
+                    | PreparedExternalCallTarget::Class { .. },
+                )
+                | None => None,
+            };
+            let constructor_plan_ready = call
+                .source_name
+                .rsplit_once("::")
+                .filter(|(_, method)| method.eq_ignore_ascii_case("__construct"))
+                .is_none_or(|(class, _)| prepared_external_class_plan(context, class).is_some());
+            let class_only = matches!(target, Some(PreparedExternalCallTarget::Class { .. }));
+            let published = (function.is_some() || class_only)
+                && method_entry
+                    .is_none_or(|entry| !entry.flags.is_private && !entry.flags.is_protected)
+                && constructor_plan_ready;
+            if class_only && published {
+                return php_jit::JitExternalFunctionSignature {
+                    name: call.source_name.to_string(),
+                    link_index: call.link_index,
+                    published: true,
+                    params: Vec::new(),
+                    native_params: Vec::new(),
+                    // Zero distinguishes an allocation-only external class
+                    // from a constructor frame, whose hidden receiver makes
+                    // the native arity at least one.
+                    native_arity: 0,
+                    requires_non_reference_trampoline: false,
+                    returns_by_reference: false,
+                };
+            }
+            let Some(function) = function.filter(|_| published) else {
+                return php_jit::JitExternalFunctionSignature {
+                    name: call.source_name.to_string(),
+                    link_index: call.link_index,
+                    published: false,
+                    params: Vec::new(),
+                    native_params: Vec::new(),
+                    native_arity: 0,
+                    requires_non_reference_trampoline: false,
+                    returns_by_reference: false,
+                };
+            };
+            php_jit::JitExternalFunctionSignature {
                 // Match the source unit's call target. The lowering lookup is
                 // intentionally independent of the publishing unit's spelling.
                 name: call.source_name.to_string(),
+                link_index: call.link_index,
+                published: true,
                 params: function
                     .params
                     .iter()
@@ -591,9 +848,232 @@ pub(super) fn collect_visible_external_function_signatures(
                         variadic: parameter.variadic,
                     })
                     .collect(),
-            })
+                native_params: function.params.clone(),
+                native_arity: u32::try_from(
+                    function.params.len()
+                        + usize::from(method_entry.is_some_and(|entry| !entry.flags.is_static)),
+                )
+                .unwrap_or(u32::MAX),
+                requires_non_reference_trampoline: function.blocks.iter().any(|block| {
+                    block.instructions.iter().any(|instruction| {
+                        matches!(
+                            instruction.kind,
+                            php_ir::InstructionKind::EnterTry { .. }
+                                | php_ir::InstructionKind::LeaveTry
+                                | php_ir::InstructionKind::Throw { .. }
+                                | php_ir::InstructionKind::Yield { .. }
+                                | php_ir::InstructionKind::YieldFrom { .. }
+                        ) || method_entry.is_some()
+                            && matches!(
+                                &instruction.kind,
+                                php_ir::InstructionKind::FetchClassConstant {
+                                    class_name,
+                                    ..
+                                }
+                                    | php_ir::InstructionKind::CallStaticMethod {
+                                        class_name,
+                                        ..
+                                    } if class_name.eq_ignore_ascii_case("static")
+                            )
+                    })
+                }) || function.attributes.iter().any(
+                    |attribute| {
+                        attribute
+                            .resolved_name
+                            .as_deref()
+                            .or(attribute.fallback_name.as_deref())
+                            .unwrap_or(&attribute.name)
+                            .trim_start_matches('\\')
+                            .eq_ignore_ascii_case("deprecated")
+                    },
+                ),
+                returns_by_reference: function.returns_by_ref,
+            }
         })
         .collect()
+}
+
+/// Publishes code for every immutable cross-unit link that became resolvable
+/// at a declaration boundary.
+///
+/// Compilation and signature validation belong here, before generated code
+/// can observe the link. The compiled call itself then loads an already
+/// published preferred entry and never enters the operation-local resolver
+/// transition merely because this is the target's first invocation.
+fn prepare_linked_function_entries(context: &mut NativeRequestColdState<'_>) -> Result<(), String> {
+    let targets = context
+        .dynamic_units
+        .iter()
+        .flat_map(|caller| caller.compiled.prepared_unit_external_function_calls())
+        .filter_map(|call| prepared_external_call_target(context, call))
+        .filter_map(|target| target.function())
+        .filter(|target| {
+            context
+                .dynamic_units
+                .get(target.unit)
+                .and_then(|package| {
+                    package
+                        .compiled
+                        .prepared_deployment_image()
+                        .preferred_function_entries
+                        .get(target.function.index())
+                })
+                .is_some_and(|entry| entry.load(std::sync::atomic::Ordering::Acquire) == 0)
+        })
+        .map(|target| (target.unit, target.function))
+        .collect::<std::collections::BTreeSet<_>>();
+    for (unit, function) in targets {
+        prepare_dynamic_native_entry(context, unit, function)?;
+    }
+    Ok(())
+}
+
+/// Recompile already published callers whose immutable external-call index
+/// now resolves against declarations added by the current publication.
+///
+/// This is deliberately a declaration-time operation. Generated optimizing
+/// code must not discover a typed/default/variadic/reference signature at its
+/// first invocation and enter an operation-local fallback before it can pack
+/// the authoritative native frame.
+fn prepare_resolved_external_callers(
+    context: &mut NativeRequestColdState<'_>,
+    published_names: &[String],
+    published_classes: &[String],
+) -> Result<(), String> {
+    if published_names.is_empty() && published_classes.is_empty() {
+        return Ok(());
+    }
+    let published_names = published_names
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    let published_classes = published_classes
+        .iter()
+        .map(|name| normalized_class_name(name).into_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut callers = Vec::new();
+    for (unit, package) in context.dynamic_units.iter().enumerate() {
+        for function in 0..package.compiled.unit().functions.len() {
+            let function = php_ir::FunctionId::new(
+                u32::try_from(function).expect("function index must fit the native ABI"),
+            );
+            let resolves_published_name = package
+                .compiled
+                .prepared_external_function_calls(function)
+                .iter()
+                .any(|call| {
+                    published_names.contains(call.normalized_name.as_ref())
+                        || call
+                            .normalized_name
+                            .rsplit_once("::")
+                            .is_some_and(|(class, _)| published_classes.contains(class))
+                });
+            let has_native_entry = if context.current_dynamic_unit == Some(unit) {
+                context.native_entries.contains_key(&function)
+            } else {
+                package.native_entries.contains_key(&function)
+            };
+            if resolves_published_name && has_native_entry {
+                callers.push((unit, function));
+            }
+        }
+    }
+    for (unit, function) in callers {
+        prepare_dynamic_native_entry(context, unit, function)?;
+    }
+    Ok(())
+}
+
+pub(super) fn refresh_linked_function_records(context: &mut NativeRequestColdState<'_>) {
+    let calls = context
+        .dynamic_units
+        .iter()
+        .enumerate()
+        .flat_map(|(caller_unit, caller)| {
+            caller
+                .compiled
+                .prepared_unit_external_function_calls()
+                .iter()
+                .map(move |call| {
+                    (
+                        caller_unit,
+                        call.link_index,
+                        call.normalized_name.to_string(),
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    let records = calls
+        .into_iter()
+        .filter_map(|(caller_unit, link_index, normalized_name)| {
+            let call = context
+                .dynamic_units
+                .get(caller_unit)?
+                .compiled
+                .prepared_unit_external_function_calls()
+                .iter()
+                .find(|call| {
+                    call.link_index == link_index
+                        && call.normalized_name.as_ref() == normalized_name
+                })?;
+            let target = prepared_external_call_target(context, call)?;
+            let target_unit = context.dynamic_units.get(target.unit())?;
+            let view_ready =
+                target_unit.published_runtime_view.abi_version == php_jit::JIT_RUNTIME_ABI_VERSION;
+            if !view_ready {
+                return None;
+            }
+            let (preferred_entry, baseline_entry) =
+                target.function().map_or(Some((0, 0)), |function| {
+                    let deployment = target_unit.compiled.prepared_deployment_image();
+                    Some((
+                        std::ptr::from_ref(
+                            deployment
+                                .preferred_function_entries
+                                .get(function.function.index())?,
+                        ) as usize as u64,
+                        std::ptr::from_ref(
+                            deployment
+                                .native_function_entries
+                                .get(function.function.index())?,
+                        ) as usize as u64,
+                    ))
+                })?;
+            let prepared_class = call
+                .source_name
+                .rsplit_once("::")
+                .and_then(|(class, _)| prepared_external_class_plan(context, class))
+                .unwrap_or(0);
+            if matches!(target, PreparedExternalCallTarget::Class { .. }) && prepared_class == 0 {
+                return None;
+            }
+            Some((
+                caller_unit,
+                link_index,
+                php_jit::JitNativeLinkedFunction {
+                    preferred_entry,
+                    baseline_entry,
+                    runtime_view: std::ptr::from_ref(target_unit.published_runtime_view.as_ref())
+                        as usize as u64,
+                    prepared_class,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    for package in &mut context.dynamic_units {
+        package
+            .linked_functions
+            .fill(php_jit::JitNativeLinkedFunction::default());
+    }
+    for (unit, link_index, record) in records {
+        if let Some(slot) = context
+            .dynamic_units
+            .get_mut(unit)
+            .and_then(|package| package.linked_functions.get_mut(link_index as usize))
+        {
+            *slot = record;
+        }
+    }
 }
 
 pub(super) fn native_include_uses_implicit_return(unit: &php_ir::IrUnit) -> bool {

@@ -710,13 +710,7 @@ fn builtin_ip2long(
         return Err(arity_error("ip2long", "one argument"));
     }
     let address = string_arg("ip2long", &args[0])?;
-    let Ok(address) = std::str::from_utf8(address.as_bytes()) else {
-        return Ok(Value::Bool(false));
-    };
-    let Some(octets) = parse_php_ipv4(address) else {
-        return Ok(Value::Bool(false));
-    };
-    Ok(Value::Int(i64::from(u32::from_be_bytes(octets))))
+    Ok(native_ip2long(address.as_bytes()).map_or(Value::Bool(false), Value::Int))
 }
 
 fn builtin_long2ip(
@@ -727,8 +721,10 @@ fn builtin_long2ip(
     if args.len() != 1 {
         return Err(arity_error("long2ip", "one argument"));
     }
-    let address = int_arg("long2ip", &args[0])? as u32;
-    Ok(Value::string(std::net::Ipv4Addr::from(address).to_string()))
+    let address = int_arg("long2ip", &args[0])?;
+    Ok(Value::string(
+        String::from_utf8(native_long2ip(address)).expect("IPv4 text is ASCII"),
+    ))
 }
 
 fn parse_php_ipv4(address: &str) -> Option<[u8; 4]> {
@@ -747,6 +743,44 @@ fn parse_php_ipv4(address: &str) -> Option<[u8; 4]> {
     parts.next().is_none().then_some(octets)
 }
 
+pub fn native_ip2long(address: &[u8]) -> Option<i64> {
+    let address = std::str::from_utf8(address).ok()?;
+    parse_php_ipv4(address).map(|octets| i64::from(u32::from_be_bytes(octets)))
+}
+
+pub fn native_long2ip(address: i64) -> Vec<u8> {
+    std::net::Ipv4Addr::from(address as u32)
+        .to_string()
+        .into_bytes()
+}
+
+pub fn native_inet_pton(address: &[u8]) -> Option<Vec<u8>> {
+    let address = std::str::from_utf8(address).ok()?;
+    address
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|address| match address {
+            std::net::IpAddr::V4(address) => address.octets().to_vec(),
+            std::net::IpAddr::V6(address) => address.octets().to_vec(),
+        })
+}
+
+pub fn native_inet_ntop(packed: &[u8]) -> Option<Vec<u8>> {
+    match packed.len() {
+        4 => Some(
+            std::net::Ipv4Addr::new(packed[0], packed[1], packed[2], packed[3])
+                .to_string()
+                .into_bytes(),
+        ),
+        16 => {
+            let mut octets = [0; 16];
+            octets.copy_from_slice(packed);
+            Some(std::net::Ipv6Addr::from(octets).to_string().into_bytes())
+        }
+        _ => None,
+    }
+}
+
 fn builtin_inet_pton(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -756,16 +790,7 @@ fn builtin_inet_pton(
         return Err(arity_error("inet_pton", "one argument"));
     }
     let address = string_arg("inet_pton", &args[0])?;
-    let Ok(address) = std::str::from_utf8(address.as_bytes()) else {
-        return Ok(Value::Bool(false));
-    };
-    match address.parse::<std::net::IpAddr>() {
-        Ok(addr) => Ok(Value::string(match addr {
-            std::net::IpAddr::V4(addr) => addr.octets().to_vec(),
-            std::net::IpAddr::V6(addr) => addr.octets().to_vec(),
-        })),
-        Err(_) => Ok(Value::Bool(false)),
-    }
+    Ok(native_inet_pton(address.as_bytes()).map_or(Value::Bool(false), Value::string))
 }
 
 fn builtin_inet_ntop(
@@ -777,18 +802,7 @@ fn builtin_inet_ntop(
         return Err(arity_error("inet_ntop", "one argument"));
     }
     let packed = string_arg("inet_ntop", &args[0])?;
-    let packed = packed.as_bytes();
-    match packed.len() {
-        4 => Ok(Value::string(
-            std::net::Ipv4Addr::new(packed[0], packed[1], packed[2], packed[3]).to_string(),
-        )),
-        16 => {
-            let mut octets = [0; 16];
-            octets.copy_from_slice(packed);
-            Ok(Value::string(std::net::Ipv6Addr::from(octets).to_string()))
-        }
-        _ => Ok(Value::Bool(false)),
-    }
+    Ok(native_inet_ntop(packed.as_bytes()).map_or(Value::Bool(false), Value::string))
 }
 
 fn socket_id_arg(name: &str, value: &Value) -> Result<i64, BuiltinError> {
@@ -875,7 +889,9 @@ fn socket_runtime_class() -> ClassEntry {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_php_ipv4;
+    use super::{
+        native_inet_ntop, native_inet_pton, native_ip2long, native_long2ip, parse_php_ipv4,
+    };
 
     #[test]
     fn php_ipv4_parser_accepts_only_four_canonical_decimal_octets() {
@@ -893,5 +909,16 @@ mod tests {
         ] {
             assert_eq!(parse_php_ipv4(rejected), None, "accepted {rejected:?}");
         }
+    }
+
+    #[test]
+    fn native_network_address_family_roundtrips_without_values() {
+        assert_eq!(native_ip2long(b"127.0.0.1"), Some(2_130_706_433));
+        assert_eq!(native_long2ip(4_294_967_295), b"255.255.255.255");
+        assert_eq!(native_inet_pton(b"192.0.2.1"), Some(vec![192, 0, 2, 1]));
+        let packed = native_inet_pton(b"2001:db8::1").expect("valid IPv6");
+        assert_eq!(native_inet_ntop(&packed), Some(b"2001:db8::1".to_vec()));
+        assert_eq!(native_ip2long(b"01.2.3.4"), None);
+        assert_eq!(native_inet_ntop(b"short"), None);
     }
 }

@@ -6,7 +6,7 @@ pub(super) fn decode_arguments(
 ) -> Result<Vec<Value>, String> {
     arguments
         .iter()
-        .map(|encoded| match context.decode(*encoded)? {
+        .map(|encoded| match context.decode_baseline_value(*encoded)? {
             Value::Reference(reference) => Ok(reference.get()),
             value => Ok(value),
         })

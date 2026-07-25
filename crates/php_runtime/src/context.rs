@@ -1108,6 +1108,17 @@ pub fn input_pairs_array(pairs: &[(String, String)], ini: &RuntimeIniOptions) ->
     array
 }
 
+#[cfg(feature = "full-runtime")]
+pub(crate) fn native_input_pairs_value(
+    pairs: &[(String, String)],
+    ini: &RuntimeIniOptions,
+) -> crate::builtins::NativeDecodedValue {
+    let mut builder = InputArrayBuilder::new(ini);
+    let mut entries = Vec::new();
+    builder.insert_native_pairs(&mut entries, pairs);
+    crate::builtins::NativeDecodedValue::KeyedArray(entries)
+}
+
 fn raw_input_pairs_array(pairs: &[(String, String)], ini: &RuntimeIniOptions) -> PhpArray {
     let mut array = PhpArray::new();
     InputArrayBuilder::raw(ini).insert_pairs(&mut array, pairs);
@@ -1181,6 +1192,26 @@ impl InputArrayBuilder {
         }
     }
 
+    #[cfg(feature = "full-runtime")]
+    fn insert_native_pairs(
+        &mut self,
+        array: &mut Vec<(
+            crate::builtins::NativeDecodedArrayKey,
+            crate::builtins::NativeDecodedValue,
+        )>,
+        pairs: &[(String, String)],
+    ) {
+        for (key, value) in pairs {
+            if !self.consume_var() {
+                break;
+            }
+            let Some(segments) = parse_input_key_segments(key, self.max_input_nesting_level) else {
+                continue;
+            };
+            insert_native_input_at(array, &segments, self.filter_value_bytes(value));
+        }
+    }
+
     fn consume_var(&mut self) -> bool {
         if self.remaining_vars == 0 {
             return false;
@@ -1190,19 +1221,91 @@ impl InputArrayBuilder {
     }
 
     fn filter_value(&self, value: &str) -> Value {
+        Value::string(self.filter_value_bytes(value))
+    }
+
+    fn filter_value_bytes(&self, value: &str) -> Vec<u8> {
         match self.default_filter {
-            RuntimeInputFilter::UnsafeRaw => Value::string(filter_unsafe_raw_input(
-                value,
-                self.default_input_filter_flags(),
-            )),
-            RuntimeInputFilter::Stripped => Value::string(encode_input_stripped(value)),
-            RuntimeInputFilter::SpecialChars => Value::string(encode_input_special_chars(value)),
+            RuntimeInputFilter::UnsafeRaw => {
+                filter_unsafe_raw_input(value, self.default_input_filter_flags())
+            }
+            RuntimeInputFilter::Stripped => encode_input_stripped(value),
+            RuntimeInputFilter::SpecialChars => encode_input_special_chars(value),
         }
     }
 
     fn default_input_filter_flags(&self) -> i64 {
         self.default_filter_flags
     }
+}
+
+#[cfg(feature = "full-runtime")]
+fn native_decoded_array_key(key: &ArrayKey) -> crate::builtins::NativeDecodedArrayKey {
+    match key {
+        ArrayKey::Int(value) => crate::builtins::NativeDecodedArrayKey::Int(*value),
+        ArrayKey::String(value) => {
+            crate::builtins::NativeDecodedArrayKey::String(value.as_bytes().to_vec())
+        }
+    }
+}
+
+#[cfg(feature = "full-runtime")]
+fn insert_native_input_at(
+    array: &mut Vec<(
+        crate::builtins::NativeDecodedArrayKey,
+        crate::builtins::NativeDecodedValue,
+    )>,
+    segments: &[InputKeySegment],
+    value: Vec<u8>,
+) {
+    let Some((head, tail)) = segments.split_first() else {
+        return;
+    };
+    let key = match head {
+        InputKeySegment::Key(key) => native_decoded_array_key(key),
+        InputKeySegment::Append => {
+            let next = array
+                .iter()
+                .filter_map(|(key, _)| match key {
+                    crate::builtins::NativeDecodedArrayKey::Int(value) => {
+                        Some(value.saturating_add(1))
+                    }
+                    crate::builtins::NativeDecodedArrayKey::String(_) => None,
+                })
+                .max()
+                .unwrap_or(0);
+            crate::builtins::NativeDecodedArrayKey::Int(next)
+        }
+    };
+    if tail.is_empty() {
+        let value = crate::builtins::NativeDecodedValue::String(value);
+        if let Some((_, current)) = array.iter_mut().find(|(candidate, _)| *candidate == key) {
+            *current = value;
+        } else {
+            array.push((key, value));
+        }
+        return;
+    }
+    let index = array
+        .iter()
+        .position(|(candidate, _)| *candidate == key)
+        .unwrap_or_else(|| {
+            array.push((
+                key,
+                crate::builtins::NativeDecodedValue::KeyedArray(Vec::new()),
+            ));
+            array.len() - 1
+        });
+    if !matches!(
+        array[index].1,
+        crate::builtins::NativeDecodedValue::KeyedArray(_)
+    ) {
+        array[index].1 = crate::builtins::NativeDecodedValue::KeyedArray(Vec::new());
+    }
+    let crate::builtins::NativeDecodedValue::KeyedArray(child) = &mut array[index].1 else {
+        unreachable!("native input child was initialized as an array");
+    };
+    insert_native_input_at(child, tail, value);
 }
 
 const FILTER_FLAG_STRIP_LOW: i64 = 4;

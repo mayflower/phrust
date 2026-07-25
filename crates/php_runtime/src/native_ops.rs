@@ -1000,7 +1000,11 @@ fn native_power(lhs: NumericValue, rhs: NumericValue) -> Value {
 }
 
 fn native_bitwise(op: NativeBinaryOp, lhs: &Value, rhs: &Value) -> Result<Value, String> {
-    if let (Value::String(lhs), Value::String(rhs)) = (lhs, rhs) {
+    if matches!(
+        op,
+        NativeBinaryOp::BitAnd | NativeBinaryOp::BitOr | NativeBinaryOp::BitXor
+    ) && let (Value::String(lhs), Value::String(rhs)) = (lhs, rhs)
+    {
         let bytes = match op {
             NativeBinaryOp::BitAnd => lhs
                 .as_bytes()

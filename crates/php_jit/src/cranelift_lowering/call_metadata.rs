@@ -115,6 +115,532 @@ pub(super) fn stable_builtin_error_reporting(target: &RegionCallTarget) -> bool 
     !normalized.contains('\\') && normalized.eq_ignore_ascii_case("error_reporting")
 }
 
+/// Scalar math primitives whose ordinary int/float forms are emitted over
+/// native numeric slots. Each discriminant is compile-time lowering metadata,
+/// never a runtime operation ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableScalarMathBuiltin {
+    Abs,
+    Ceil,
+    Floor,
+    Sqrt,
+    Fdiv,
+    Fmod,
+    IsFinite,
+    IsInfinite,
+    IsNan,
+    Pi,
+}
+
+impl StableScalarMathBuiltin {
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::Fdiv | Self::Fmod => arity == 2,
+            Self::Pi => arity == 0,
+            Self::Abs
+            | Self::Ceil
+            | Self::Floor
+            | Self::Sqrt
+            | Self::IsFinite
+            | Self::IsInfinite
+            | Self::IsNan => arity == 1,
+        }
+    }
+}
+
+pub(super) fn stable_builtin_scalar_math(
+    target: &RegionCallTarget,
+) -> Option<StableScalarMathBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "abs" => Some(StableScalarMathBuiltin::Abs),
+        "ceil" => Some(StableScalarMathBuiltin::Ceil),
+        "floor" => Some(StableScalarMathBuiltin::Floor),
+        "sqrt" => Some(StableScalarMathBuiltin::Sqrt),
+        "fdiv" => Some(StableScalarMathBuiltin::Fdiv),
+        "fmod" => Some(StableScalarMathBuiltin::Fmod),
+        "is_finite" => Some(StableScalarMathBuiltin::IsFinite),
+        "is_infinite" => Some(StableScalarMathBuiltin::IsInfinite),
+        "is_nan" => Some(StableScalarMathBuiltin::IsNan),
+        "pi" => Some(StableScalarMathBuiltin::Pi),
+        _ => None,
+    }
+}
+
+/// Stateless transcendental math builtins whose ordinary numeric forms call
+/// one exact, compile-time-selected pure symbol. The index is publication
+/// metadata only: generated code never passes it to a runtime dispatcher.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StablePureMathBuiltin {
+    Acos,
+    Acosh,
+    Asin,
+    Asinh,
+    Atan,
+    Atan2,
+    Atanh,
+    Cos,
+    Cosh,
+    Deg2Rad,
+    Exp,
+    Expm1,
+    Fpow,
+    Hypot,
+    Log,
+    Log10,
+    Log1p,
+    Rad2Deg,
+    Sin,
+    Sinh,
+    Tan,
+    Tanh,
+}
+
+impl StablePureMathBuiltin {
+    pub(super) const COUNT: usize = 22;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::Acos => 0,
+            Self::Acosh => 1,
+            Self::Asin => 2,
+            Self::Asinh => 3,
+            Self::Atan => 4,
+            Self::Atan2 => 5,
+            Self::Atanh => 6,
+            Self::Cos => 7,
+            Self::Cosh => 8,
+            Self::Deg2Rad => 9,
+            Self::Exp => 10,
+            Self::Expm1 => 11,
+            Self::Fpow => 12,
+            Self::Hypot => 13,
+            Self::Log => 14,
+            Self::Log10 => 15,
+            Self::Log1p => 16,
+            Self::Rad2Deg => 17,
+            Self::Sin => 18,
+            Self::Sinh => 19,
+            Self::Tan => 20,
+            Self::Tanh => 21,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::Acos => "phrust_native_acos_f64",
+            Self::Acosh => "phrust_native_acosh_f64",
+            Self::Asin => "phrust_native_asin_f64",
+            Self::Asinh => "phrust_native_asinh_f64",
+            Self::Atan => "phrust_native_atan_f64",
+            Self::Atan2 => "phrust_native_atan2_f64",
+            Self::Atanh => "phrust_native_atanh_f64",
+            Self::Cos => "phrust_native_cos_f64",
+            Self::Cosh => "phrust_native_cosh_f64",
+            Self::Deg2Rad => "phrust_native_deg2rad_f64",
+            Self::Exp => "phrust_native_exp_f64",
+            Self::Expm1 => "phrust_native_expm1_f64",
+            Self::Fpow => "phrust_native_fpow_f64",
+            Self::Hypot => "phrust_native_hypot_f64",
+            Self::Log => "phrust_native_log_f64",
+            Self::Log10 => "phrust_native_log10_f64",
+            Self::Log1p => "phrust_native_log1p_f64",
+            Self::Rad2Deg => "phrust_native_rad2deg_f64",
+            Self::Sin => "phrust_native_sin_f64",
+            Self::Sinh => "phrust_native_sinh_f64",
+            Self::Tan => "phrust_native_tan_f64",
+            Self::Tanh => "phrust_native_tanh_f64",
+        }
+    }
+
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::Atan2 | Self::Fpow | Self::Hypot => arity == 2,
+            Self::Acos
+            | Self::Acosh
+            | Self::Asin
+            | Self::Asinh
+            | Self::Atan
+            | Self::Atanh
+            | Self::Cos
+            | Self::Cosh
+            | Self::Deg2Rad
+            | Self::Exp
+            | Self::Expm1
+            | Self::Log
+            | Self::Log10
+            | Self::Log1p
+            | Self::Rad2Deg
+            | Self::Sin
+            | Self::Sinh
+            | Self::Tan
+            | Self::Tanh => arity == 1,
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [
+            Self::Acos,
+            Self::Acosh,
+            Self::Asin,
+            Self::Asinh,
+            Self::Atan,
+            Self::Atan2,
+            Self::Atanh,
+            Self::Cos,
+            Self::Cosh,
+            Self::Deg2Rad,
+            Self::Exp,
+            Self::Expm1,
+            Self::Fpow,
+            Self::Hypot,
+            Self::Log,
+            Self::Log10,
+            Self::Log1p,
+            Self::Rad2Deg,
+            Self::Sin,
+            Self::Sinh,
+            Self::Tan,
+            Self::Tanh,
+        ]
+    }
+}
+
+pub(super) fn stable_builtin_pure_math(target: &RegionCallTarget) -> Option<StablePureMathBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "acos" => Some(StablePureMathBuiltin::Acos),
+        "acosh" => Some(StablePureMathBuiltin::Acosh),
+        "asin" => Some(StablePureMathBuiltin::Asin),
+        "asinh" => Some(StablePureMathBuiltin::Asinh),
+        "atan" => Some(StablePureMathBuiltin::Atan),
+        "atan2" => Some(StablePureMathBuiltin::Atan2),
+        "atanh" => Some(StablePureMathBuiltin::Atanh),
+        "cos" => Some(StablePureMathBuiltin::Cos),
+        "cosh" => Some(StablePureMathBuiltin::Cosh),
+        "deg2rad" => Some(StablePureMathBuiltin::Deg2Rad),
+        "exp" => Some(StablePureMathBuiltin::Exp),
+        "expm1" => Some(StablePureMathBuiltin::Expm1),
+        "fpow" => Some(StablePureMathBuiltin::Fpow),
+        "hypot" => Some(StablePureMathBuiltin::Hypot),
+        "log" => Some(StablePureMathBuiltin::Log),
+        "log10" => Some(StablePureMathBuiltin::Log10),
+        "log1p" => Some(StablePureMathBuiltin::Log1p),
+        "rad2deg" => Some(StablePureMathBuiltin::Rad2Deg),
+        "sin" => Some(StablePureMathBuiltin::Sin),
+        "sinh" => Some(StablePureMathBuiltin::Sinh),
+        "tan" => Some(StablePureMathBuiltin::Tan),
+        "tanh" => Some(StablePureMathBuiltin::Tanh),
+        _ => None,
+    }
+}
+
+/// Scalar conversion and type-name consumers that can stay on the same native
+/// value representation as casts and tag tests. Optional or reference-mutating
+/// forms deliberately remain on their one baseline continuation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableScalarConsumerBuiltin {
+    BoolVal,
+    FloatVal,
+    IntVal,
+    StrVal,
+    GetType,
+    GetDebugType,
+}
+
+pub(super) fn stable_builtin_scalar_consumer(
+    target: &RegionCallTarget,
+) -> Option<StableScalarConsumerBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "boolval" => Some(StableScalarConsumerBuiltin::BoolVal),
+        "floatval" => Some(StableScalarConsumerBuiltin::FloatVal),
+        "intval" => Some(StableScalarConsumerBuiltin::IntVal),
+        "strval" => Some(StableScalarConsumerBuiltin::StrVal),
+        "gettype" => Some(StableScalarConsumerBuiltin::GetType),
+        "get_debug_type" => Some(StableScalarConsumerBuiltin::GetDebugType),
+        _ => None,
+    }
+}
+
+/// Numeric builtins that are the function-form counterparts of native
+/// arithmetic or one exact pure numeric call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableNumericOperatorBuiltin {
+    Pow,
+    IntDiv,
+    Round,
+}
+
+impl StableNumericOperatorBuiltin {
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::Pow | Self::IntDiv => arity == 2,
+            Self::Round => arity >= 1 && arity <= 3,
+        }
+    }
+}
+
+pub(super) fn stable_builtin_numeric_operator(
+    target: &RegionCallTarget,
+) -> Option<StableNumericOperatorBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "pow" => Some(StableNumericOperatorBuiltin::Pow),
+        "intdiv" => Some(StableNumericOperatorBuiltin::IntDiv),
+        "round" => Some(StableNumericOperatorBuiltin::Round),
+        _ => None,
+    }
+}
+
+/// Exact native handlers for PHP's complete integer/base conversion family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableBaseConversionBuiltin {
+    BaseConvert,
+    BinDec,
+    DecBin,
+    DecHex,
+    DecOct,
+    HexDec,
+    OctDec,
+}
+
+impl StableBaseConversionBuiltin {
+    pub(super) const COUNT: usize = 7;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::BaseConvert => 0,
+            Self::BinDec => 1,
+            Self::DecBin => 2,
+            Self::DecHex => 3,
+            Self::DecOct => 4,
+            Self::HexDec => 5,
+            Self::OctDec => 6,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::BaseConvert => "phrust_native_base_convert",
+            Self::BinDec => "phrust_native_bindec",
+            Self::DecBin => "phrust_native_decbin",
+            Self::DecHex => "phrust_native_dechex",
+            Self::DecOct => "phrust_native_decoct",
+            Self::HexDec => "phrust_native_hexdec",
+            Self::OctDec => "phrust_native_octdec",
+        }
+    }
+
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::BaseConvert => arity == 3,
+            _ => arity == 1,
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [
+            Self::BaseConvert,
+            Self::BinDec,
+            Self::DecBin,
+            Self::DecHex,
+            Self::DecOct,
+            Self::HexDec,
+            Self::OctDec,
+        ]
+    }
+}
+
+pub(super) fn stable_builtin_base_conversion(
+    target: &RegionCallTarget,
+) -> Option<StableBaseConversionBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "base_convert" => Some(StableBaseConversionBuiltin::BaseConvert),
+        "bindec" => Some(StableBaseConversionBuiltin::BinDec),
+        "decbin" => Some(StableBaseConversionBuiltin::DecBin),
+        "dechex" => Some(StableBaseConversionBuiltin::DecHex),
+        "decoct" => Some(StableBaseConversionBuiltin::DecOct),
+        "hexdec" => Some(StableBaseConversionBuiltin::HexDec),
+        "octdec" => Some(StableBaseConversionBuiltin::OctDec),
+        _ => None,
+    }
+}
+
+/// Exact stateless conversions between textual and packed network addresses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableNetworkAddressBuiltin {
+    Ip2Long,
+    Long2Ip,
+    InetPton,
+    InetNtop,
+}
+
+impl StableNetworkAddressBuiltin {
+    pub(super) const COUNT: usize = 4;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::Ip2Long => 0,
+            Self::Long2Ip => 1,
+            Self::InetPton => 2,
+            Self::InetNtop => 3,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::Ip2Long => "phrust_native_ip2long",
+            Self::Long2Ip => "phrust_native_long2ip",
+            Self::InetPton => "phrust_native_inet_pton",
+            Self::InetNtop => "phrust_native_inet_ntop",
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [Self::Ip2Long, Self::Long2Ip, Self::InetPton, Self::InetNtop]
+    }
+}
+
+pub(super) fn stable_builtin_network_address(
+    target: &RegionCallTarget,
+) -> Option<StableNetworkAddressBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "ip2long" => Some(StableNetworkAddressBuiltin::Ip2Long),
+        "long2ip" => Some(StableNetworkAddressBuiltin::Long2Ip),
+        "inet_pton" => Some(StableNetworkAddressBuiltin::InetPton),
+        "inet_ntop" => Some(StableNetworkAddressBuiltin::InetNtop),
+        _ => None,
+    }
+}
+
+/// Complete stateless zlib/gzip encode-decode family over native byte strings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableCompressionCodecBuiltin {
+    GzEncode,
+    GzCompress,
+    GzDeflate,
+    GzDecode,
+    GzUncompress,
+    GzInflate,
+    ZlibDecode,
+    ZlibEncode,
+}
+
+impl StableCompressionCodecBuiltin {
+    pub(super) const COUNT: usize = 8;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::GzEncode => 0,
+            Self::GzCompress => 1,
+            Self::GzDeflate => 2,
+            Self::GzDecode => 3,
+            Self::GzUncompress => 4,
+            Self::GzInflate => 5,
+            Self::ZlibDecode => 6,
+            Self::ZlibEncode => 7,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::GzEncode => "phrust_native_gzencode",
+            Self::GzCompress => "phrust_native_gzcompress",
+            Self::GzDeflate => "phrust_native_gzdeflate",
+            Self::GzDecode => "phrust_native_gzdecode",
+            Self::GzUncompress => "phrust_native_gzuncompress",
+            Self::GzInflate => "phrust_native_gzinflate",
+            Self::ZlibDecode => "phrust_native_zlib_decode",
+            Self::ZlibEncode => "phrust_native_zlib_encode",
+        }
+    }
+
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::GzEncode | Self::GzCompress | Self::GzDeflate => arity >= 1 && arity <= 3,
+            Self::GzDecode | Self::GzUncompress | Self::GzInflate | Self::ZlibDecode => {
+                arity >= 1 && arity <= 2
+            }
+            Self::ZlibEncode => arity >= 2 && arity <= 3,
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [
+            Self::GzEncode,
+            Self::GzCompress,
+            Self::GzDeflate,
+            Self::GzDecode,
+            Self::GzUncompress,
+            Self::GzInflate,
+            Self::ZlibDecode,
+            Self::ZlibEncode,
+        ]
+    }
+}
+
+pub(super) fn stable_builtin_compression_codec(
+    target: &RegionCallTarget,
+) -> Option<StableCompressionCodecBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "gzencode" => Some(StableCompressionCodecBuiltin::GzEncode),
+        "gzcompress" => Some(StableCompressionCodecBuiltin::GzCompress),
+        "gzdeflate" => Some(StableCompressionCodecBuiltin::GzDeflate),
+        "gzdecode" => Some(StableCompressionCodecBuiltin::GzDecode),
+        "gzuncompress" => Some(StableCompressionCodecBuiltin::GzUncompress),
+        "gzinflate" => Some(StableCompressionCodecBuiltin::GzInflate),
+        "zlib_decode" => Some(StableCompressionCodecBuiltin::ZlibDecode),
+        "zlib_encode" => Some(StableCompressionCodecBuiltin::ZlibEncode),
+        _ => None,
+    }
+}
+
 /// Exact symbol operations. The selector is part of the dedicated native ABI
 /// and never enters the prepared builtin dispatcher.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -440,6 +966,500 @@ pub(super) fn stable_builtin_format(target: &RegionCallTarget) -> Option<StableF
     }
 }
 
+/// Exact stateless digest/checksum operations. Each selector resolves to one
+/// fixed native symbol; it is never passed to a runtime dispatcher.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableHashBuiltin {
+    Md5,
+    Sha1,
+    Crc32,
+    Hash,
+    HashHmac,
+    HashEquals,
+}
+
+impl StableHashBuiltin {
+    pub(super) const COUNT: usize = 6;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::Md5 => 0,
+            Self::Sha1 => 1,
+            Self::Crc32 => 2,
+            Self::Hash => 3,
+            Self::HashHmac => 4,
+            Self::HashEquals => 5,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::Md5 => "phrust_native_md5",
+            Self::Sha1 => "phrust_native_sha1",
+            Self::Crc32 => "phrust_native_crc32",
+            Self::Hash => "phrust_native_hash",
+            Self::HashHmac => "phrust_native_hash_hmac",
+            Self::HashEquals => "phrust_native_hash_equals",
+        }
+    }
+
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::Md5 | Self::Sha1 => arity == 1 || arity == 2,
+            Self::Crc32 => arity == 1,
+            Self::Hash => arity >= 2 && arity <= 4,
+            Self::HashHmac => arity == 3 || arity == 4,
+            Self::HashEquals => arity == 2,
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [
+            Self::Md5,
+            Self::Sha1,
+            Self::Crc32,
+            Self::Hash,
+            Self::HashHmac,
+            Self::HashEquals,
+        ]
+    }
+}
+
+pub(super) fn stable_builtin_hash(target: &RegionCallTarget) -> Option<StableHashBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "md5" => Some(StableHashBuiltin::Md5),
+        "sha1" => Some(StableHashBuiltin::Sha1),
+        "crc32" => Some(StableHashBuiltin::Crc32),
+        "hash" => Some(StableHashBuiltin::Hash),
+        "hash_hmac" => Some(StableHashBuiltin::HashHmac),
+        "hash_equals" => Some(StableHashBuiltin::HashEquals),
+        _ => None,
+    }
+}
+
+/// Exact byte-to-byte codec operations over authoritative native strings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableByteCodecBuiltin {
+    Base64Encode,
+    Base64Decode,
+    Bin2Hex,
+    Hex2Bin,
+    QuotedPrintableDecode,
+    UrlEncode,
+    RawUrlEncode,
+    UrlDecode,
+    RawUrlDecode,
+    UuEncode,
+    UuDecode,
+    AddCSlashes,
+    StripCSlashes,
+    StripSlashes,
+    QuoteMeta,
+}
+
+impl StableByteCodecBuiltin {
+    pub(super) const COUNT: usize = 15;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::Base64Encode => 0,
+            Self::Base64Decode => 1,
+            Self::Bin2Hex => 2,
+            Self::Hex2Bin => 3,
+            Self::QuotedPrintableDecode => 4,
+            Self::UrlEncode => 5,
+            Self::RawUrlEncode => 6,
+            Self::UrlDecode => 7,
+            Self::RawUrlDecode => 8,
+            Self::UuEncode => 9,
+            Self::UuDecode => 10,
+            Self::AddCSlashes => 11,
+            Self::StripCSlashes => 12,
+            Self::StripSlashes => 13,
+            Self::QuoteMeta => 14,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::Base64Encode => "phrust_native_base64_encode",
+            Self::Base64Decode => "phrust_native_base64_decode",
+            Self::Bin2Hex => "phrust_native_bin2hex",
+            Self::Hex2Bin => "phrust_native_hex2bin",
+            Self::QuotedPrintableDecode => "phrust_native_quoted_printable_decode",
+            Self::UrlEncode => "phrust_native_urlencode",
+            Self::RawUrlEncode => "phrust_native_rawurlencode",
+            Self::UrlDecode => "phrust_native_urldecode",
+            Self::RawUrlDecode => "phrust_native_rawurldecode",
+            Self::UuEncode => "phrust_native_convert_uuencode",
+            Self::UuDecode => "phrust_native_convert_uudecode",
+            Self::AddCSlashes => "phrust_native_addcslashes",
+            Self::StripCSlashes => "phrust_native_stripcslashes",
+            Self::StripSlashes => "phrust_native_stripslashes",
+            Self::QuoteMeta => "phrust_native_quotemeta",
+        }
+    }
+
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::Base64Decode => arity == 1 || arity == 2,
+            Self::AddCSlashes => arity == 2,
+            Self::Base64Encode
+            | Self::Bin2Hex
+            | Self::Hex2Bin
+            | Self::QuotedPrintableDecode
+            | Self::UrlEncode
+            | Self::RawUrlEncode
+            | Self::UrlDecode
+            | Self::RawUrlDecode
+            | Self::UuEncode
+            | Self::UuDecode
+            | Self::StripCSlashes
+            | Self::StripSlashes
+            | Self::QuoteMeta => arity == 1,
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [
+            Self::Base64Encode,
+            Self::Base64Decode,
+            Self::Bin2Hex,
+            Self::Hex2Bin,
+            Self::QuotedPrintableDecode,
+            Self::UrlEncode,
+            Self::RawUrlEncode,
+            Self::UrlDecode,
+            Self::RawUrlDecode,
+            Self::UuEncode,
+            Self::UuDecode,
+            Self::AddCSlashes,
+            Self::StripCSlashes,
+            Self::StripSlashes,
+            Self::QuoteMeta,
+        ]
+    }
+}
+
+pub(super) fn stable_builtin_byte_codec(
+    target: &RegionCallTarget,
+) -> Option<StableByteCodecBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "base64_encode" => Some(StableByteCodecBuiltin::Base64Encode),
+        "base64_decode" => Some(StableByteCodecBuiltin::Base64Decode),
+        "bin2hex" => Some(StableByteCodecBuiltin::Bin2Hex),
+        "hex2bin" => Some(StableByteCodecBuiltin::Hex2Bin),
+        "quoted_printable_decode" => Some(StableByteCodecBuiltin::QuotedPrintableDecode),
+        "urlencode" => Some(StableByteCodecBuiltin::UrlEncode),
+        "rawurlencode" => Some(StableByteCodecBuiltin::RawUrlEncode),
+        "urldecode" => Some(StableByteCodecBuiltin::UrlDecode),
+        "rawurldecode" => Some(StableByteCodecBuiltin::RawUrlDecode),
+        "convert_uuencode" => Some(StableByteCodecBuiltin::UuEncode),
+        "convert_uudecode" => Some(StableByteCodecBuiltin::UuDecode),
+        "addcslashes" => Some(StableByteCodecBuiltin::AddCSlashes),
+        "stripcslashes" => Some(StableByteCodecBuiltin::StripCSlashes),
+        "stripslashes" => Some(StableByteCodecBuiltin::StripSlashes),
+        "quotemeta" => Some(StableByteCodecBuiltin::QuoteMeta),
+        _ => None,
+    }
+}
+
+/// Exact native searches and comparisons over authoritative byte strings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableStringSearchCompareBuiltin {
+    StrStr,
+    StrIStr,
+    StrRChr,
+    StrPBrk,
+    SubstrCompare,
+    StrNatCmp,
+    StrNatCaseCmp,
+}
+
+impl StableStringSearchCompareBuiltin {
+    pub(super) const COUNT: usize = 7;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::StrStr => 0,
+            Self::StrIStr => 1,
+            Self::StrRChr => 2,
+            Self::StrPBrk => 3,
+            Self::SubstrCompare => 4,
+            Self::StrNatCmp => 5,
+            Self::StrNatCaseCmp => 6,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::StrStr => "phrust_native_strstr",
+            Self::StrIStr => "phrust_native_stristr",
+            Self::StrRChr => "phrust_native_strrchr",
+            Self::StrPBrk => "phrust_native_strpbrk",
+            Self::SubstrCompare => "phrust_native_substr_compare",
+            Self::StrNatCmp => "phrust_native_strnatcmp",
+            Self::StrNatCaseCmp => "phrust_native_strnatcasecmp",
+        }
+    }
+
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::StrStr | Self::StrIStr | Self::StrRChr => arity == 2 || arity == 3,
+            Self::StrPBrk | Self::StrNatCmp | Self::StrNatCaseCmp => arity == 2,
+            Self::SubstrCompare => arity >= 3 && arity <= 5,
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [
+            Self::StrStr,
+            Self::StrIStr,
+            Self::StrRChr,
+            Self::StrPBrk,
+            Self::SubstrCompare,
+            Self::StrNatCmp,
+            Self::StrNatCaseCmp,
+        ]
+    }
+}
+
+pub(super) fn stable_builtin_string_search_compare(
+    target: &RegionCallTarget,
+) -> Option<StableStringSearchCompareBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "strstr" => Some(StableStringSearchCompareBuiltin::StrStr),
+        "stristr" => Some(StableStringSearchCompareBuiltin::StrIStr),
+        "strrchr" => Some(StableStringSearchCompareBuiltin::StrRChr),
+        "strpbrk" => Some(StableStringSearchCompareBuiltin::StrPBrk),
+        "substr_compare" => Some(StableStringSearchCompareBuiltin::SubstrCompare),
+        "strnatcmp" => Some(StableStringSearchCompareBuiltin::StrNatCmp),
+        "strnatcasecmp" => Some(StableStringSearchCompareBuiltin::StrNatCaseCmp),
+        _ => None,
+    }
+}
+
+/// Exact native byte-rewrite handlers selected at compilation time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableStringRewriteBuiltin {
+    UcWords,
+    StrPad,
+    StrTr,
+    StripTags,
+    SubstrReplace,
+}
+
+impl StableStringRewriteBuiltin {
+    pub(super) const COUNT: usize = 5;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::UcWords => 0,
+            Self::StrPad => 1,
+            Self::StrTr => 2,
+            Self::StripTags => 3,
+            Self::SubstrReplace => 4,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::UcWords => "phrust_native_ucwords",
+            Self::StrPad => "phrust_native_str_pad",
+            Self::StrTr => "phrust_native_strtr",
+            Self::StripTags => "phrust_native_strip_tags",
+            Self::SubstrReplace => "phrust_native_substr_replace",
+        }
+    }
+
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::UcWords | Self::StripTags => arity == 1 || arity == 2,
+            Self::StrPad => arity >= 2 && arity <= 4,
+            Self::SubstrReplace => arity == 3 || arity == 4,
+            Self::StrTr => arity == 2 || arity == 3,
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [
+            Self::UcWords,
+            Self::StrPad,
+            Self::StrTr,
+            Self::StripTags,
+            Self::SubstrReplace,
+        ]
+    }
+}
+
+pub(super) fn stable_builtin_string_rewrite(
+    target: &RegionCallTarget,
+) -> Option<StableStringRewriteBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "ucwords" => Some(StableStringRewriteBuiltin::UcWords),
+        "str_pad" => Some(StableStringRewriteBuiltin::StrPad),
+        "strtr" => Some(StableStringRewriteBuiltin::StrTr),
+        "strip_tags" => Some(StableStringRewriteBuiltin::StripTags),
+        "substr_replace" => Some(StableStringRewriteBuiltin::SubstrReplace),
+        _ => None,
+    }
+}
+
+/// Exact stateless HTML entity codecs over authoritative native bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableHtmlCodecBuiltin {
+    HtmlSpecialChars,
+    HtmlEntities,
+    HtmlEntityDecode,
+    HtmlSpecialCharsDecode,
+}
+
+impl StableHtmlCodecBuiltin {
+    pub(super) const COUNT: usize = 4;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::HtmlSpecialChars => 0,
+            Self::HtmlEntities => 1,
+            Self::HtmlEntityDecode => 2,
+            Self::HtmlSpecialCharsDecode => 3,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::HtmlSpecialChars => "phrust_native_htmlspecialchars",
+            Self::HtmlEntities => "phrust_native_htmlentities",
+            Self::HtmlEntityDecode => "phrust_native_html_entity_decode",
+            Self::HtmlSpecialCharsDecode => "phrust_native_htmlspecialchars_decode",
+        }
+    }
+
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::HtmlSpecialChars | Self::HtmlEntities => arity >= 1 && arity <= 4,
+            Self::HtmlEntityDecode => arity >= 1 && arity <= 3,
+            Self::HtmlSpecialCharsDecode => arity == 1 || arity == 2,
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [
+            Self::HtmlSpecialChars,
+            Self::HtmlEntities,
+            Self::HtmlEntityDecode,
+            Self::HtmlSpecialCharsDecode,
+        ]
+    }
+}
+
+pub(super) fn stable_builtin_html_codec(
+    target: &RegionCallTarget,
+) -> Option<StableHtmlCodecBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "htmlspecialchars" => Some(StableHtmlCodecBuiltin::HtmlSpecialChars),
+        "htmlentities" => Some(StableHtmlCodecBuiltin::HtmlEntities),
+        "html_entity_decode" => Some(StableHtmlCodecBuiltin::HtmlEntityDecode),
+        "htmlspecialchars_decode" => Some(StableHtmlCodecBuiltin::HtmlSpecialCharsDecode),
+        _ => None,
+    }
+}
+
+/// Exact URL/query transforms over authoritative native strings and arrays.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableUrlQueryBuiltin {
+    ParseUrl,
+    ParseStr,
+    HttpBuildQuery,
+}
+
+impl StableUrlQueryBuiltin {
+    pub(super) const COUNT: usize = 3;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::ParseUrl => 0,
+            Self::ParseStr => 1,
+            Self::HttpBuildQuery => 2,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::ParseUrl => "phrust_native_parse_url",
+            Self::ParseStr => "phrust_native_parse_str",
+            Self::HttpBuildQuery => "phrust_native_http_build_query",
+        }
+    }
+
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::ParseUrl => arity == 1 || arity == 2,
+            Self::ParseStr => arity == 2,
+            Self::HttpBuildQuery => arity >= 1 && arity <= 4,
+        }
+    }
+
+    pub(super) const fn argument_is_by_reference(self, index: usize) -> bool {
+        matches!(self, Self::ParseStr) && index == 1
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [Self::ParseUrl, Self::ParseStr, Self::HttpBuildQuery]
+    }
+}
+
+pub(super) fn stable_builtin_url_query(target: &RegionCallTarget) -> Option<StableUrlQueryBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "parse_url" => Some(StableUrlQueryBuiltin::ParseUrl),
+        "parse_str" => Some(StableUrlQueryBuiltin::ParseStr),
+        "http_build_query" => Some(StableUrlQueryBuiltin::HttpBuildQuery),
+        _ => None,
+    }
+}
+
 /// Exact prepared path/filesystem handlers selected at compile time.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StablePathBuiltin {
@@ -722,6 +1742,225 @@ pub(super) fn stable_builtin_array_projection(target: &RegionCallTarget) -> Opti
     }
 }
 
+/// Direct constructors whose result is an authoritative native array.
+pub(super) fn stable_builtin_array_constructor(target: &RegionCallTarget) -> Option<u32> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "array_fill" => Some(0),
+        "array_fill_keys" => Some(1),
+        "array_combine" => Some(2),
+        "array_flip" => Some(3),
+        _ => None,
+    }
+}
+
+/// Representation-complete array shape operations. The selector covers the
+/// remaining pure constructors/transforms that still entered the baseline
+/// prepared-builtin executor as one family.
+pub(super) fn stable_builtin_array_shape(target: &RegionCallTarget) -> Option<u32> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "range" => Some(0),
+        "array_pad" => Some(1),
+        "array_chunk" => Some(2),
+        "array_column" => Some(3),
+        "array_unique" => Some(4),
+        _ => None,
+    }
+}
+
+/// Key-preserving, callback-free array sorts over authoritative direct
+/// entries. Each operation has a fixed ABI; comparison mode remains a
+/// PHP-visible argument and unsupported modes take one baseline continuation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableArrayPreservingSortBuiltin {
+    Asort,
+    Arsort,
+    Ksort,
+    Krsort,
+    Natsort,
+    Natcasesort,
+}
+
+impl StableArrayPreservingSortBuiltin {
+    pub(super) const COUNT: usize = 6;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::Asort => 0,
+            Self::Arsort => 1,
+            Self::Ksort => 2,
+            Self::Krsort => 3,
+            Self::Natsort => 4,
+            Self::Natcasesort => 5,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::Asort => "phrust_native_asort",
+            Self::Arsort => "phrust_native_arsort",
+            Self::Ksort => "phrust_native_ksort",
+            Self::Krsort => "phrust_native_krsort",
+            Self::Natsort => "phrust_native_natsort",
+            Self::Natcasesort => "phrust_native_natcasesort",
+        }
+    }
+
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::Natsort | Self::Natcasesort => arity == 1,
+            _ => arity == 1 || arity == 2,
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [
+            Self::Asort,
+            Self::Arsort,
+            Self::Ksort,
+            Self::Krsort,
+            Self::Natsort,
+            Self::Natcasesort,
+        ]
+    }
+}
+
+pub(super) fn stable_builtin_array_preserving_sort(
+    target: &RegionCallTarget,
+) -> Option<StableArrayPreservingSortBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "asort" => Some(StableArrayPreservingSortBuiltin::Asort),
+        "arsort" => Some(StableArrayPreservingSortBuiltin::Arsort),
+        "ksort" => Some(StableArrayPreservingSortBuiltin::Ksort),
+        "krsort" => Some(StableArrayPreservingSortBuiltin::Krsort),
+        "natsort" => Some(StableArrayPreservingSortBuiltin::Natsort),
+        "natcasesort" => Some(StableArrayPreservingSortBuiltin::Natcasesort),
+        _ => None,
+    }
+}
+
+/// Introspection over the active native PHP call frame. The frame already
+/// carries authoritative native encodings; these fixed handlers expose that
+/// view without entering the generic builtin dispatcher or materializing
+/// Rust `Value` trees.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableFrameIntrospectionBuiltin {
+    FuncNumArgs,
+    FuncGetArg,
+    FuncGetArgs,
+}
+
+impl StableFrameIntrospectionBuiltin {
+    pub(super) const COUNT: usize = 3;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::FuncNumArgs => 0,
+            Self::FuncGetArg => 1,
+            Self::FuncGetArgs => 2,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::FuncNumArgs => "phrust_native_func_num_args",
+            Self::FuncGetArg => "phrust_native_func_get_arg",
+            Self::FuncGetArgs => "phrust_native_func_get_args",
+        }
+    }
+
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::FuncGetArg => arity == 1,
+            Self::FuncNumArgs | Self::FuncGetArgs => arity == 0,
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [Self::FuncNumArgs, Self::FuncGetArg, Self::FuncGetArgs]
+    }
+}
+
+pub(super) fn stable_builtin_frame_introspection(
+    target: &RegionCallTarget,
+) -> Option<StableFrameIntrospectionBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "func_num_args" => Some(StableFrameIntrospectionBuiltin::FuncNumArgs),
+        "func_get_arg" => Some(StableFrameIntrospectionBuiltin::FuncGetArg),
+        "func_get_args" => Some(StableFrameIntrospectionBuiltin::FuncGetArgs),
+        _ => None,
+    }
+}
+
+/// Non-callback array set and overlay operations over authoritative direct
+/// entries. Callback comparators and recursive overlays remain distinct
+/// baseline semantics instead of being smuggled through this fixed family.
+pub(super) fn stable_builtin_array_set(target: &RegionCallTarget) -> Option<u32> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "array_diff" => Some(0),
+        "array_diff_assoc" => Some(1),
+        "array_diff_key" => Some(2),
+        "array_intersect" => Some(3),
+        "array_intersect_assoc" => Some(4),
+        "array_intersect_key" => Some(5),
+        "array_replace" => Some(6),
+        _ => None,
+    }
+}
+
+/// Callback-neutral array transforms. The selector distinguishes
+/// `array_map(null, $array)` from `array_filter($array[, null])`; callable
+/// forms deliberately take the single baseline continuation until callback
+/// invocation itself is native inside the generated loop.
+pub(super) fn stable_builtin_callback_neutral_array(target: &RegionCallTarget) -> Option<u32> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "array_map" => Some(0),
+        "array_filter" => Some(1),
+        _ => None,
+    }
+}
+
 /// Strict native array membership operations. The selector distinguishes a
 /// boolean membership result from the matching key result.
 pub(super) fn stable_builtin_array_lookup(target: &RegionCallTarget) -> Option<u32> {
@@ -920,17 +2159,19 @@ pub(super) fn known_user_argument_requires_reference(
     } = &call.target
     {
         let normalized = name.trim_start_matches('\\');
-        let has_local_metadata = function_params.values().any(|(candidate, ..)| {
-            candidate
+        let has_local_metadata = function_params.values().any(|metadata| {
+            metadata
+                .name
                 .trim_start_matches('\\')
                 .eq_ignore_ascii_case(normalized)
         });
         if !has_local_metadata {
             let signature = external_function_signatures.iter().find(|signature| {
-                signature
-                    .name
-                    .trim_start_matches('\\')
-                    .eq_ignore_ascii_case(normalized)
+                signature.published
+                    && signature
+                        .name
+                        .trim_start_matches('\\')
+                        .eq_ignore_ascii_case(normalized)
             })?;
             let parameter = argument.name.as_deref().map_or_else(
                 || {
@@ -968,8 +2209,9 @@ pub(super) fn known_user_argument_requires_reference(
             function: None,
         } => {
             let normalized = name.trim_start_matches('\\');
-            vec![function_params.values().find(|(candidate, ..)| {
-                candidate
+            vec![function_params.values().find(|metadata| {
+                metadata
+                    .name
                     .trim_start_matches('\\')
                     .eq_ignore_ascii_case(normalized)
             })?]
@@ -982,13 +2224,13 @@ pub(super) fn known_user_argument_requires_reference(
             let resolved_class = if matches!(class_name.as_str(), "self" | "static") {
                 function_params
                     .get(&caller)
-                    .and_then(|(name, ..)| name.rsplit_once("::").map(|(class, _)| class))
+                    .and_then(|metadata| metadata.name.rsplit_once("::").map(|(class, _)| class))
             } else {
                 Some(class_name.trim_start_matches('\\'))
             };
             let exact = resolved_class.and_then(|class| {
-                function_params.values().find(|(candidate, ..)| {
-                    candidate.rsplit_once("::").is_some_and(
+                function_params.values().find(|metadata| {
+                    metadata.name.rsplit_once("::").is_some_and(
                         |(candidate_class, candidate_method)| {
                             candidate_class
                                 .trim_start_matches('\\')
@@ -1002,7 +2244,7 @@ pub(super) fn known_user_argument_requires_reference(
                 || {
                     function_params
                         .values()
-                        .filter(|(candidate, ..)| method_matches(candidate, method))
+                        .filter(|metadata| method_matches(&metadata.name, method))
                         .collect()
                 },
                 |metadata| vec![metadata],
@@ -1011,19 +2253,22 @@ pub(super) fn known_user_argument_requires_reference(
         RegionCallTarget::Method { .. } => unreachable!("handled before metadata lookup"),
         RegionCallTarget::Constructor { class_name, .. } => function_params
             .values()
-            .filter(|(candidate, ..)| {
-                candidate.rsplit_once("::").is_some_and(|(class, method)| {
-                    class
-                        .trim_start_matches('\\')
-                        .eq_ignore_ascii_case(class_name.trim_start_matches('\\'))
-                        && method.eq_ignore_ascii_case("__construct")
-                })
+            .filter(|metadata| {
+                metadata
+                    .name
+                    .rsplit_once("::")
+                    .is_some_and(|(class, method)| {
+                        class
+                            .trim_start_matches('\\')
+                            .eq_ignore_ascii_case(class_name.trim_start_matches('\\'))
+                            && method.eq_ignore_ascii_case("__construct")
+                    })
             })
             .collect(),
         _ => return None,
     };
     let mut requirements = metadata.into_iter().map(|metadata| {
-        let parameters = &metadata.1;
+        let parameters = &metadata.params;
         argument
             .name
             .as_deref()

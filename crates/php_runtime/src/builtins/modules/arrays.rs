@@ -1432,23 +1432,31 @@ pub(in crate::builtins::modules) fn builtin_array_pad(
             "must not exceed the maximum allowed array size",
         ));
     }
-    let pad_value = materialize_array_builtin_value(&args[2]);
-    let mut values = array
-        .iter()
-        .map(|(_, value)| materialize_array_builtin_value(value))
-        .collect::<Vec<_>>();
     let target_len = target.unsigned_abs() as usize;
-    if target_len > values.len() {
-        let pad_count = target_len - values.len();
-        if target < 0 {
-            let mut padded = vec![pad_value; pad_count];
-            padded.extend(values);
-            values = padded;
-        } else {
-            values.extend(std::iter::repeat_n(pad_value, pad_count));
-        }
+    if target_len <= array.len() {
+        return Ok(materialize_array_builtin_array(&array));
     }
-    Ok(Value::packed_array(values))
+    let pad_value = materialize_array_builtin_value(&args[2]);
+    let pad_count = target_len - array.len();
+    let mut entries = Vec::with_capacity(target_len);
+    if target < 0 {
+        entries.extend(std::iter::repeat_n(
+            (ArrayKey::Int(0), pad_value.clone()),
+            pad_count,
+        ));
+    }
+    entries.extend(
+        array
+            .iter()
+            .map(|(key, value)| (key, materialize_array_builtin_value(value))),
+    );
+    if target > 0 {
+        entries.extend(std::iter::repeat_n(
+            (ArrayKey::Int(0), pad_value),
+            pad_count,
+        ));
+    }
+    Ok(Value::Array(array_from_entries_reindex_ints(entries)))
 }
 
 pub(in crate::builtins::modules) fn builtin_array_chunk(

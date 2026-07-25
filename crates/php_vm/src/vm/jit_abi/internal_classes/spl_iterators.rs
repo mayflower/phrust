@@ -76,7 +76,7 @@ pub(in crate::vm::jit_abi) fn construct_native_spl_iterator(
             "arrayiterator" | "recursivearrayiterator" => {
                 let entries = arguments
                     .first()
-                    .map(|value| context.decode(*value))
+                    .map(|value| context.decode_baseline_value(*value))
                     .transpose()?
                     .map(dereference)
                     .unwrap_or_else(|| Value::Array(php_runtime::api::PhpArray::new()));
@@ -94,7 +94,7 @@ pub(in crate::vm::jit_abi) fn construct_native_spl_iterator(
                     .ok_or_else(|| {
                         "RecursiveIteratorIterator::__construct() expects an iterator".to_owned()
                     })
-                    .and_then(|value| context.decode(*value))?;
+                    .and_then(|value| context.decode_baseline_value(*value))?;
                 let inner = dereference(inner);
                 let Value::Object(inner) = inner else {
                     return Err(
@@ -109,7 +109,7 @@ pub(in crate::vm::jit_abi) fn construct_native_spl_iterator(
                     .ok_or_else(|| {
                         "RecursiveDirectoryIterator::__construct() expects a path".to_owned()
                     })
-                    .and_then(|value| context.decode(*value))
+                    .and_then(|value| context.decode_baseline_value(*value))
                     .map(dereference)
                     .and_then(native_string)?;
                 let path = std::path::PathBuf::from(String::from_utf8_lossy(&path).into_owned());
@@ -130,7 +130,7 @@ pub(in crate::vm::jit_abi) fn construct_native_spl_iterator(
                 let inner = arguments
                     .first()
                     .ok_or_else(|| format!("{display}::__construct() expects an iterator"))
-                    .and_then(|value| context.decode(*value))
+                    .and_then(|value| context.decode_baseline_value(*value))
                     .map(dereference)?;
                 let Value::Object(inner) = inner else {
                     return Err(format!("{display}::__construct() expects an iterator"));
@@ -138,7 +138,7 @@ pub(in crate::vm::jit_abi) fn construct_native_spl_iterator(
                 let pattern = arguments
                     .get(1)
                     .ok_or_else(|| format!("{display}::__construct() expects a regex"))
-                    .and_then(|value| context.decode(*value))
+                    .and_then(|value| context.decode_baseline_value(*value))
                     .map(dereference)
                     .and_then(native_string)?;
                 let pattern = PhpString::from_bytes(pattern);
@@ -148,7 +148,7 @@ pub(in crate::vm::jit_abi) fn construct_native_spl_iterator(
                     .map_err(|error| format!("{display} regex is invalid: {}", error.message()))?;
                 let mode = arguments
                     .get(2)
-                    .map(|value| context.decode(*value))
+                    .map(|value| context.decode_baseline_value(*value))
                     .transpose()?
                     .map(dereference)
                     .and_then(|value| match value {
@@ -194,7 +194,7 @@ pub(in crate::vm::jit_abi) fn construct_native_spl_iterator(
             }
             _ => return Err(format!("unsupported SPL iterator class {display}")),
         }
-        context.encode(Value::Object(object))
+        context.encode_baseline_value(Value::Object(object))
     })();
     Some(result)
 }

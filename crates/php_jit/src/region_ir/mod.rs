@@ -8,7 +8,7 @@
 ///
 /// Increment this whenever serialized cache identity or lowering semantics can
 /// no longer be shared with code produced from an earlier Region IR shape.
-pub const REGION_IR_SCHEMA_VERSION: u32 = 17;
+pub const REGION_IR_SCHEMA_VERSION: u32 = 19;
 
 mod bind;
 mod builder;
@@ -43,12 +43,14 @@ pub use coverage::{
 pub use dump::dump_region_graph;
 pub(crate) use executable::native_function_parameter_locals;
 pub use executable::{
-    BaselineRegionBuilder, CompileMetadata, NativeCompileError, NativeCompilerTier, RegionBinaryOp,
-    RegionBlock, RegionCallResult, RegionCallTarget, RegionCastOp, RegionCompareOpCode,
+    BaselineRegionBuilder, CompileMetadata, NativeCompileError, NativeCompilerTier,
+    RegionArrayCallbackCall, RegionArrayCallbackOperation, RegionBinaryOp, RegionBlock,
+    RegionCallResult, RegionCallTarget, RegionCastOp, RegionCompareOpCode,
     RegionDeclarationMetadata, RegionExceptionRegion, RegionGraph, RegionInstruction,
     RegionInstructionKind, RegionMethodIdentity, RegionNativeCall, RegionNativeClosureCapture,
     RegionNativeControl, RegionNativeDynamicCode, RegionNativeSuspend, RegionOperand,
-    RegionOsrEntryPoint, RegionTerminator, RegionUnaryOp, build_baseline_region,
+    RegionOsrEntryPoint, RegionStableCallback, RegionTerminator, RegionUnaryOp,
+    build_baseline_region,
 };
 pub use ids::{ConstId, EntryId, ExitId, NodeId, RegionId, SnapshotId, VmSlotId};
 pub use node::{

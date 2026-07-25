@@ -17,6 +17,8 @@ pub(super) struct NativeBacktraceFrame {
     /// cloning PHP values on every call; exceptional/introspection paths
     /// materialize values lazily while the synchronous caller still owns them.
     pub(super) arguments: NativeTraceArguments,
+    /// Leading visible arguments backed by mutable fixed parameter locals.
+    pub(super) fixed_argument_count: u32,
 }
 
 /// Persistent, structurally shared function visibility for nested PHP units.

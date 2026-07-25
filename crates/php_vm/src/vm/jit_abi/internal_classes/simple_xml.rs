@@ -24,7 +24,7 @@ pub(in crate::vm::jit_abi) fn construct_native_simple_xml(
                 ),
             }
         })
-        .and_then(|object| context.encode(Value::Object(object)));
+        .and_then(|object| context.encode_baseline_value(Value::Object(object)));
     Some(result)
 }
 
@@ -125,7 +125,7 @@ pub(in crate::vm::jit_abi) fn execute_native_simple_xml_instruction(
         } => construct_native_simple_xml(context, display_class_name, arguments),
         php_ir::InstructionKind::CallMethod { method, .. } => {
             let receiver = arguments.first().copied()?;
-            let receiver = match context.decode(receiver) {
+            let receiver = match context.decode_baseline_value(receiver) {
                 Ok(Value::Reference(reference)) => reference.get(),
                 Ok(value) => value,
                 Err(error) => return Some(Err(error)),
@@ -138,7 +138,7 @@ pub(in crate::vm::jit_abi) fn execute_native_simple_xml_instruction(
             }
             let result = decode_arguments(context, &arguments[1..])
                 .and_then(|arguments| call_simple_xml_method(context, &object, method, arguments))
-                .and_then(|value| context.encode(value));
+                .and_then(|value| context.encode_baseline_value(value));
             Some(result)
         }
         _ => None,

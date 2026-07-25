@@ -1,6 +1,7 @@
 use super::*;
 use crate::region_ir::{
-    SsaOwnership, analyze_baseline_value_ownership, analyze_executable_value_flow,
+    SsaCertainty, SsaOwnership, SsaValueClass, SsaValueFact, analyze_baseline_value_ownership,
+    analyze_executable_value_flow,
 };
 use php_ir::instruction::{ClosureCaptureArg, IrCallDimTarget, IrCallPropertyTarget};
 use php_ir::{
@@ -283,6 +284,54 @@ fn known_by_reference_dimension_binds_the_existing_slot_identity() {
         })
         .expect("native call");
     assert_eq!(call.args[0].by_ref_local, Some(binding.0));
+    assert!(call.args[0].by_ref_dim.is_none());
+    assert!(call.args[0].by_ref_property.is_none());
+    assert!(call.args[0].by_ref_property_dim.is_none());
+
+    let optimizing_region = BaselineRegionBuilder::build(
+        &unit,
+        caller,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+    )
+    .expect("optimizing by-reference dimension region");
+    let optimizing_call_instruction = optimizing_region.blocks[0]
+        .instructions
+        .iter()
+        .find(|instruction| matches!(instruction.kind, RegionInstructionKind::NativeCall(_)))
+        .expect("optimizing native call");
+    let RegionInstructionKind::NativeCall(optimizing_call) = &optimizing_call_instruction.kind
+    else {
+        unreachable!("filtered native call")
+    };
+    assert!(optimizing_call.args[0].by_ref_local.is_some());
+    assert!(optimizing_call.args[0].by_ref_dim.is_none());
+    assert!(optimizing_call.args[0].by_ref_property.is_none());
+    assert!(optimizing_call.args[0].by_ref_property_dim.is_none());
+    assert!(!optimizing_call_instruction.register_uses().contains(&key));
+
+    let mut noncanonical = optimizing_region.clone();
+    let noncanonical_call = noncanonical.blocks[0]
+        .instructions
+        .iter_mut()
+        .find_map(|instruction| match &mut instruction.kind {
+            RegionInstructionKind::NativeCall(call) => Some(call),
+            _ => None,
+        })
+        .expect("noncanonical native call");
+    noncanonical_call.args[0].by_ref_dim = Some(IrCallDimTarget {
+        local: array,
+        dims: vec![Operand::Register(key)],
+    });
+    let error = noncanonical
+        .verify()
+        .expect_err("optimizing call must reject a second lvalue authority");
+    assert_eq!(
+        error.code,
+        "JIT_REGION_REJECT_NONCANONICAL_REFERENCE_ARGUMENT"
+    );
 }
 
 #[test]
@@ -861,6 +910,15 @@ fn property_assignment_borrows_implicit_method_receiver() {
         flow.register_fact(receiver).ownership,
         SsaOwnership::Borrowed
     );
+    assert_eq!(
+        flow.local_fact(this),
+        SsaValueFact {
+            class: SsaValueClass::MixedHandle,
+            certainty: SsaCertainty::Unknown,
+            ownership: SsaOwnership::Borrowed,
+        }
+    );
+    assert_eq!(flow.register_fact(receiver), flow.local_fact(this));
     flow.verify_ownership(&region)
         .expect("property receiver borrow should verify");
 
@@ -1172,6 +1230,169 @@ fn named_user_call_prepares_native_parameter_order() {
     assert_eq!(
         call.args[1].value_kind,
         IrCallArgValueKind::ByRefLocationPlaceholder
+    );
+    let plan = call
+        .prepared_argument_plan(&unit.functions[function.index()].params)
+        .expect("named call has a native argument trace plan");
+    assert_eq!(plan.visible_fixed_count, 3);
+    assert!(plan.visible_variadic_sources.is_empty());
+    assert!(plan.extra_sources.is_empty());
+}
+
+#[test]
+fn native_argument_trace_plan_preserves_php_visible_shapes() {
+    let parameter = |name: &str, local: u32, variadic: bool| IrParam {
+        name: name.to_owned(),
+        local: LocalId::new(local),
+        required: false,
+        default: (!variadic).then_some(IrConstant::Null),
+        type_: None,
+        by_ref: false,
+        variadic,
+        attributes: Vec::new(),
+    };
+    let argument = |source: u32, name: Option<&str>| IrCallArg {
+        name: name.map(str::to_owned),
+        value: Operand::Constant(ConstId::new(source)),
+        unpack: false,
+        value_kind: IrCallArgValueKind::Direct,
+        by_ref_local: None,
+        by_ref_dim: None,
+        by_ref_property: None,
+        by_ref_property_dim: None,
+    };
+
+    let fixed = [parameter("first", 0, false), parameter("second", 1, false)];
+    let named = [argument(0, Some("second"))];
+    let plan = prepared_call_argument_plan(&named, &fixed).expect("fixed named argument plan");
+    assert_eq!(plan.parameter_sources, vec![None, Some(0)]);
+    assert_eq!(plan.visible_fixed_count, 2);
+    assert!(plan.visible_variadic_sources.is_empty());
+    assert!(plan.extra_sources.is_empty());
+
+    let variadic = [
+        parameter("first", 0, false),
+        parameter("second", 1, false),
+        parameter("rest", 2, true),
+    ];
+    let positional = [argument(0, None), argument(1, None), argument(2, None)];
+    let plan =
+        prepared_call_argument_plan(&positional, &variadic).expect("positional variadic plan");
+    assert_eq!(plan.parameter_sources, vec![Some(0), Some(1), Some(2)]);
+    assert_eq!(plan.visible_fixed_count, 2);
+    assert_eq!(plan.visible_variadic_sources, vec![2]);
+    assert!(plan.extra_sources.is_empty());
+
+    let nonvariadic = [parameter("first", 0, false)];
+    let plan =
+        prepared_call_argument_plan(&positional, &nonvariadic).expect("surplus argument plan");
+    assert_eq!(plan.parameter_sources, vec![Some(0)]);
+    assert_eq!(plan.visible_fixed_count, 1);
+    assert!(plan.visible_variadic_sources.is_empty());
+    assert_eq!(plan.extra_sources, vec![1, 2]);
+
+    let unknown_named = [argument(0, Some("unknown"))];
+    assert!(
+        prepared_call_argument_plan(&unknown_named, &variadic).is_none(),
+        "keyed unknown named variadics keep one baseline continuation"
+    );
+}
+
+#[test]
+fn optimizing_caller_keeps_frame_introspection_target_as_a_direct_callee() {
+    let mut builder = IrBuilder::new(UnitId::new(9_802));
+    let file = builder.add_file("direct-frame-introspection-target.php");
+    let span = IrSpan::new(file, 0, 40);
+    let target = builder.start_function("frame_target", FunctionFlags::default(), span);
+    builder.register_function_name("frame_target", target);
+    let parameter = builder.intern_local(target, "value");
+    builder.push_param(
+        target,
+        IrParam {
+            name: "value".to_owned(),
+            local: parameter,
+            required: true,
+            default: None,
+            type_: None,
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let target_block = builder.append_block(target);
+    let observed = builder.alloc_register(target);
+    builder.emit(
+        target,
+        target_block,
+        InstructionKind::CallFunction {
+            dst: observed,
+            name: "func_get_args".to_owned(),
+            args: Vec::new(),
+        },
+        span,
+    );
+    builder.terminate_return(
+        target,
+        target_block,
+        Some(Operand::Register(observed)),
+        span,
+    );
+
+    let caller = builder.start_function("frame_caller", FunctionFlags::default(), span);
+    let caller_block = builder.append_block(caller);
+    let supplied = builder.intern_constant(IrConstant::Int(7));
+    let result = builder.alloc_register(caller);
+    builder.emit(
+        caller,
+        caller_block,
+        InstructionKind::CallFunction {
+            dst: result,
+            name: "frame_target".to_owned(),
+            args: vec![IrCallArg {
+                name: None,
+                value: Operand::Constant(supplied),
+                unpack: false,
+                value_kind: IrCallArgValueKind::Direct,
+                by_ref_local: None,
+                by_ref_dim: None,
+                by_ref_property: None,
+                by_ref_property_dim: None,
+            }],
+        },
+        span,
+    );
+    builder.terminate_return(caller, caller_block, Some(Operand::Register(result)), span);
+    let unit = builder.finish();
+    let region = BaselineRegionBuilder::build(
+        &unit,
+        caller,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+    )
+    .expect("optimizing direct frame-introspection caller");
+    let call = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::NativeCall(call)
+                if call.direct_compiled_target() == Some(target) =>
+            {
+                Some(call)
+            }
+            _ => None,
+        })
+        .expect("frame-introspection target remains a direct compiled callee");
+    assert_eq!(
+        call.prepared_argument_plan(&unit.functions[target.index()].params)
+            .map(|plan| (
+                plan.visible_fixed_count,
+                plan.visible_variadic_sources,
+                plan.extra_sources,
+            )),
+        Some((1, Vec::new(), Vec::new()))
     );
 }
 
@@ -1833,6 +2054,163 @@ fn direct_closure_call_reads_the_authoritative_prepared_capture() {
 }
 
 #[test]
+fn optimizing_call_user_func_array_uses_prepared_closure_and_keeps_baseline_original() {
+    let mut builder = IrBuilder::new(UnitId::new(102));
+    let file = builder.add_file("closure-call-user-func-array.php");
+    let span = IrSpan::new(file, 0, 20);
+    let closure = builder.start_function(
+        "{closure}",
+        FunctionFlags {
+            is_closure: true,
+            ..FunctionFlags::default()
+        },
+        span,
+    );
+    let captured = builder.intern_local(closure, "offset");
+    builder.push_capture(
+        closure,
+        IrCapture {
+            name: "offset".to_owned(),
+            local: captured,
+            by_ref: false,
+        },
+    );
+    let value = builder.intern_local(closure, "value");
+    builder.push_param(
+        closure,
+        IrParam {
+            name: "value".to_owned(),
+            local: value,
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Int),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let closure_block = builder.append_block(closure);
+    builder.terminate_return(closure, closure_block, Some(Operand::Local(value)), span);
+
+    let main = builder.start_function(
+        "closure_call_user_func_array",
+        FunctionFlags::default(),
+        span,
+    );
+    let values = builder.intern_local(main, "values");
+    builder.push_param(
+        main,
+        IrParam {
+            name: "values".to_owned(),
+            local: values,
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Array),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let offset = builder.intern_local(main, "offset");
+    let five = builder.intern_constant(IrConstant::Int(5));
+    let block = builder.append_block(main);
+    builder.emit(
+        main,
+        block,
+        InstructionKind::StoreLocal {
+            local: offset,
+            src: Operand::Constant(five),
+        },
+        span,
+    );
+    let callable = builder.alloc_register(main);
+    builder.emit(
+        main,
+        block,
+        InstructionKind::MakeClosure {
+            dst: callable,
+            function: closure,
+            captures: vec![ClosureCaptureArg {
+                name: "offset".to_owned(),
+                src: Operand::Local(offset),
+                by_ref: false,
+            }],
+        },
+        span,
+    );
+    let result = builder.alloc_register(main);
+    let argument = |value| IrCallArg {
+        name: None,
+        value,
+        unpack: false,
+        value_kind: IrCallArgValueKind::Direct,
+        by_ref_local: None,
+        by_ref_dim: None,
+        by_ref_property: None,
+        by_ref_property_dim: None,
+    };
+    builder.emit(
+        main,
+        block,
+        InstructionKind::CallFunction {
+            dst: result,
+            name: "call_user_func_array".to_owned(),
+            args: vec![
+                argument(Operand::Register(callable)),
+                argument(Operand::Local(values)),
+            ],
+        },
+        span,
+    );
+    builder.terminate_return(main, block, Some(Operand::Register(result)), span);
+
+    let unit = builder.finish();
+    let optimizing = BaselineRegionBuilder::build(
+        &unit,
+        main,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+    )
+    .expect("optimizing closure call_user_func_array region");
+    let direct = optimizing.blocks[0]
+        .instructions
+        .iter()
+        .find_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::NativeCall(call)
+                if matches!(
+                    call.target,
+                    RegionCallTarget::Closure {
+                        function: Some(candidate),
+                        capture_count: 1,
+                        ..
+                    } if candidate == closure
+                ) =>
+            {
+                Some(call)
+            }
+            _ => None,
+        })
+        .expect("prepared closure unpack call");
+    assert_eq!(direct.argument_operand_offset, 1);
+    assert_eq!(direct.trailing_unpack_argument(), Some(0));
+    assert_eq!(direct.direct_compiled_unpack_target(), Some(closure));
+
+    let baseline = BaselineRegionBuilder::build(&unit, main, &CompileMetadata::default())
+        .expect("baseline closure call_user_func_array region");
+    assert!(baseline.blocks[0].instructions.iter().any(|instruction| {
+        matches!(
+            &instruction.kind,
+            RegionInstructionKind::NativeCall(RegionNativeCall {
+                target: RegionCallTarget::Function { name, function: None },
+                ..
+            }) if name.eq_ignore_ascii_case("call_user_func_array")
+        )
+    }));
+}
+
+#[test]
 fn known_closure_bind_preserves_the_runtime_closure_value() {
     let mut builder = IrBuilder::new(UnitId::new(96));
     let file = builder.add_file("closure-bind.php");
@@ -1925,4 +2303,978 @@ fn known_closure_bind_preserves_the_runtime_closure_value() {
             ..
         }) if *candidate == bound && class_name == "Closure" && method == "bind"
     ));
+}
+
+#[test]
+fn optimizing_array_callback_carries_exact_prepared_closure_plan() {
+    let mut builder = IrBuilder::new(UnitId::new(97));
+    let file = builder.add_file("array-callback-closure.php");
+    let span = IrSpan::new(file, 0, 20);
+    let closure = builder.start_function(
+        "{closure}",
+        FunctionFlags {
+            is_closure: true,
+            ..FunctionFlags::default()
+        },
+        span,
+    );
+    let captured = builder.intern_local(closure, "offset");
+    builder.push_capture(
+        closure,
+        IrCapture {
+            name: "offset".to_owned(),
+            local: captured,
+            by_ref: false,
+        },
+    );
+    let value = builder.intern_local(closure, "value");
+    builder.push_param(
+        closure,
+        IrParam {
+            name: "value".to_owned(),
+            local: value,
+            required: true,
+            default: None,
+            type_: None,
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let closure_block = builder.append_block(closure);
+    builder.terminate_return(closure, closure_block, Some(Operand::Local(value)), span);
+
+    let function = builder.start_function("map_closure", FunctionFlags::default(), span);
+    let array = builder.intern_local(function, "array");
+    builder.push_param(
+        function,
+        IrParam {
+            name: "array".to_owned(),
+            local: array,
+            required: true,
+            default: None,
+            type_: None,
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let offset = builder.intern_local(function, "offset");
+    let block = builder.append_block(function);
+    let one = builder.intern_constant(IrConstant::Int(1));
+    builder.emit(
+        function,
+        block,
+        InstructionKind::StoreLocal {
+            local: offset,
+            src: Operand::Constant(one),
+        },
+        span,
+    );
+    let callable = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::MakeClosure {
+            dst: callable,
+            function: closure,
+            captures: vec![ClosureCaptureArg {
+                name: "offset".to_owned(),
+                src: Operand::Local(offset),
+                by_ref: false,
+            }],
+        },
+        span,
+    );
+    let mapped = builder.alloc_register(function);
+    let argument = |value| IrCallArg {
+        name: None,
+        value,
+        unpack: false,
+        value_kind: IrCallArgValueKind::Direct,
+        by_ref_local: None,
+        by_ref_dim: None,
+        by_ref_property: None,
+        by_ref_property_dim: None,
+    };
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: mapped,
+            name: "array_map".to_owned(),
+            args: vec![
+                argument(Operand::Register(callable)),
+                argument(Operand::Local(array)),
+            ],
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(mapped)), span);
+    let unit = builder.finish();
+    let region = BaselineRegionBuilder::build(
+        &unit,
+        function,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+    )
+    .expect("optimizing closure callback region");
+    let instruction = region.blocks[0]
+        .instructions
+        .iter()
+        .find(|instruction| matches!(instruction.kind, RegionInstructionKind::ArrayCallback(_)))
+        .expect("native array callback");
+    let RegionInstructionKind::ArrayCallback(call) = &instruction.kind else {
+        unreachable!("filtered above");
+    };
+    assert_eq!(call.callback.function, Some(closure));
+    assert_eq!(
+        call.callback.closure,
+        Some(RegionOperand::Register(callable))
+    );
+    assert_eq!(call.callback.bound_object_count, 0);
+    assert_eq!(call.callback.capture_count, 1);
+    assert!(instruction.register_uses().contains(&callable));
+    assert_eq!(region.direct_callees(), vec![closure]);
+}
+
+#[test]
+fn optimizing_array_callback_uses_closure_returned_by_native_factory() {
+    let mut builder = IrBuilder::new(UnitId::new(98));
+    let file = builder.add_file("array-callback-closure-factory.php");
+    let span = IrSpan::new(file, 0, 20);
+    let closure = builder.start_function(
+        "{closure}",
+        FunctionFlags {
+            is_closure: true,
+            ..FunctionFlags::default()
+        },
+        span,
+    );
+    let captured = builder.intern_local(closure, "offset");
+    builder.push_capture(
+        closure,
+        IrCapture {
+            name: "offset".to_owned(),
+            local: captured,
+            by_ref: false,
+        },
+    );
+    let value = builder.intern_local(closure, "value");
+    builder.push_param(
+        closure,
+        IrParam {
+            name: "value".to_owned(),
+            local: value,
+            required: true,
+            default: None,
+            type_: None,
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let closure_block = builder.append_block(closure);
+    builder.terminate_return(closure, closure_block, Some(Operand::Local(value)), span);
+
+    let factory = builder.start_function("adder_factory", FunctionFlags::default(), span);
+    builder.register_function_name("adder_factory", factory);
+    let offset = builder.intern_local(factory, "offset");
+    builder.push_param(
+        factory,
+        IrParam {
+            name: "offset".to_owned(),
+            local: offset,
+            required: true,
+            default: None,
+            type_: None,
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let factory_block = builder.append_block(factory);
+    let closure_value = builder.alloc_register(factory);
+    builder.emit(
+        factory,
+        factory_block,
+        InstructionKind::MakeClosure {
+            dst: closure_value,
+            function: closure,
+            captures: vec![ClosureCaptureArg {
+                name: "offset".to_owned(),
+                src: Operand::Local(offset),
+                by_ref: false,
+            }],
+        },
+        span,
+    );
+    builder.terminate_return(
+        factory,
+        factory_block,
+        Some(Operand::Register(closure_value)),
+        span,
+    );
+
+    let function = builder.start_function("map_factory_closure", FunctionFlags::default(), span);
+    let array = builder.intern_local(function, "array");
+    builder.push_param(
+        function,
+        IrParam {
+            name: "array".to_owned(),
+            local: array,
+            required: true,
+            default: None,
+            type_: None,
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let block = builder.append_block(function);
+    let argument = |value| IrCallArg {
+        name: None,
+        value,
+        unpack: false,
+        value_kind: IrCallArgValueKind::Direct,
+        by_ref_local: None,
+        by_ref_dim: None,
+        by_ref_property: None,
+        by_ref_property_dim: None,
+    };
+    let six = builder.intern_constant(IrConstant::Int(6));
+    let callable = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: callable,
+            name: "adder_factory".to_owned(),
+            args: vec![argument(Operand::Constant(six))],
+        },
+        span,
+    );
+    let mapped = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: mapped,
+            name: "array_map".to_owned(),
+            args: vec![
+                argument(Operand::Register(callable)),
+                argument(Operand::Local(array)),
+            ],
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(mapped)), span);
+
+    let unit = builder.finish();
+    let region = BaselineRegionBuilder::build(
+        &unit,
+        function,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+    )
+    .expect("optimizing factory closure callback region");
+    let instruction = region.blocks[0]
+        .instructions
+        .iter()
+        .find(|instruction| matches!(instruction.kind, RegionInstructionKind::ArrayCallback(_)))
+        .expect("native array callback");
+    let RegionInstructionKind::ArrayCallback(call) = &instruction.kind else {
+        unreachable!("filtered above");
+    };
+    assert_eq!(call.callback.function, Some(closure));
+    assert_eq!(
+        call.callback.closure,
+        Some(RegionOperand::Register(callable))
+    );
+    assert_eq!(call.callback.bound_object_count, 0);
+    assert_eq!(call.callback.capture_count, 1);
+    assert!(instruction.register_uses().contains(&callable));
+    assert!(region.direct_callees().contains(&factory));
+    assert!(region.direct_callees().contains(&closure));
+}
+
+#[test]
+fn published_external_static_method_stays_linked_across_callback_families() {
+    let mut builder = IrBuilder::new(UnitId::new(100));
+    let file = builder.add_file("linked-static-method-callback.php");
+    let span = IrSpan::new(file, 0, 20);
+    let function = builder.start_function(
+        "linked_static_method_callback",
+        FunctionFlags::default(),
+        span,
+    );
+    let values = builder.intern_local(function, "values");
+    builder.push_param(
+        function,
+        IrParam {
+            name: "values".to_owned(),
+            local: values,
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Array),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let callback = builder.intern_constant(IrConstant::String("ExternalCallbacks::map".to_owned()));
+    let callback_class =
+        builder.intern_constant(IrConstant::String("ExternalCallbacks".to_owned()));
+    let callback_method = builder.intern_constant(IrConstant::String("map".to_owned()));
+    let four = builder.intern_constant(IrConstant::Int(4));
+    let block = builder.append_block(function);
+    let argument = |value| IrCallArg {
+        name: None,
+        value,
+        unpack: false,
+        value_kind: IrCallArgValueKind::Direct,
+        by_ref_local: None,
+        by_ref_dim: None,
+        by_ref_property: None,
+        by_ref_property_dim: None,
+    };
+
+    let mapped = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: mapped,
+            name: "array_map".to_owned(),
+            args: vec![
+                argument(Operand::Constant(callback)),
+                argument(Operand::Local(values)),
+            ],
+        },
+        span,
+    );
+    let callable_array = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::NewArray {
+            dst: callable_array,
+        },
+        span,
+    );
+    let class_value = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::LoadConst {
+            dst: class_value,
+            constant: callback_class,
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::ArrayInsert {
+            array: callable_array,
+            key: None,
+            value: Operand::Register(class_value),
+            by_ref_local: None,
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::Discard {
+            src: Operand::Register(class_value),
+        },
+        span,
+    );
+    let method_value = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::LoadConst {
+            dst: method_value,
+            constant: callback_method,
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::ArrayInsert {
+            array: callable_array,
+            key: None,
+            value: Operand::Register(method_value),
+            by_ref_local: None,
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::Discard {
+            src: Operand::Register(method_value),
+        },
+        span,
+    );
+    let array_mapped = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: array_mapped,
+            name: "array_map".to_owned(),
+            args: vec![
+                argument(Operand::Register(callable_array)),
+                argument(Operand::Local(values)),
+            ],
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::Discard {
+            src: Operand::Register(callable_array),
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::Discard {
+            src: Operand::Register(array_mapped),
+        },
+        span,
+    );
+    let called = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: called,
+            name: "call_user_func".to_owned(),
+            args: vec![
+                argument(Operand::Constant(callback)),
+                argument(Operand::Constant(four)),
+            ],
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::Discard {
+            src: Operand::Register(called),
+        },
+        span,
+    );
+    let called_array = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: called_array,
+            name: "call_user_func_array".to_owned(),
+            args: vec![
+                argument(Operand::Constant(callback)),
+                argument(Operand::Local(values)),
+            ],
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::Discard {
+            src: Operand::Register(called_array),
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(mapped)), span);
+
+    let unit = builder.finish();
+    let signature = crate::JitExternalFunctionSignature {
+        name: "ExternalCallbacks::map".to_owned(),
+        link_index: 7,
+        published: true,
+        params: vec![crate::JitExternalParameterSignature {
+            name: "value".to_owned(),
+            by_ref: false,
+            variadic: false,
+        }],
+        native_params: vec![IrParam {
+            name: "value".to_owned(),
+            local: LocalId::new(0),
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Int),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        }],
+        native_arity: 1,
+        requires_non_reference_trampoline: false,
+        returns_by_reference: false,
+    };
+    let region = BaselineRegionBuilder::build_with_external_function_signatures(
+        &unit,
+        function,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+        &[signature],
+    )
+    .expect("linked static callback region");
+
+    let callbacks = region.blocks[0]
+        .instructions
+        .iter()
+        .filter_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::ArrayCallback(call) => Some(call),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(callbacks.len(), 2);
+    let callback = callbacks[0];
+    assert_eq!(callback.callback.name, "ExternalCallbacks::map");
+    assert_eq!(callback.callback.function, None);
+
+    let linked_calls = region.blocks[0]
+        .instructions
+        .iter()
+        .filter_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::NativeCall(call)
+                if matches!(
+                    &call.target,
+                    RegionCallTarget::Function {
+                        name,
+                        function: None
+                    } if name == "ExternalCallbacks::map"
+                ) =>
+            {
+                Some(call)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(linked_calls.len(), 2);
+    assert!(linked_calls.iter().any(|call| call.direct_arity == Some(1)));
+    assert!(region.blocks[0].instructions.iter().all(|instruction| {
+        !matches!(
+            instruction.kind,
+            RegionInstructionKind::NativeCall(RegionNativeCall {
+                target: RegionCallTarget::StaticMethod { .. },
+                ..
+            })
+        )
+    }));
+    assert!(region.blocks[0].instructions.iter().all(|instruction| {
+        !matches!(
+            instruction.kind,
+            RegionInstructionKind::NewArray { .. } | RegionInstructionKind::ArrayInsert { .. }
+        )
+    }));
+    assert!(region.blocks[0].instructions.iter().any(|instruction| {
+        matches!(
+            instruction.kind,
+            RegionInstructionKind::Discard {
+                src: RegionOperand::Register(register)
+            } if register == class_value
+        )
+    }));
+    assert!(region.blocks[0].instructions.iter().any(|instruction| {
+        matches!(
+            instruction.kind,
+            RegionInstructionKind::Discard {
+                src: RegionOperand::Register(register)
+            } if register == method_value
+        )
+    }));
+}
+
+#[test]
+fn exact_external_instance_callback_carries_receiver_without_callable_array() {
+    let mut builder = IrBuilder::new(UnitId::new(101));
+    let file = builder.add_file("linked-instance-method-callback.php");
+    let span = IrSpan::new(file, 0, 20);
+    let function = builder.start_function(
+        "linked_instance_method_callback",
+        FunctionFlags::default(),
+        span,
+    );
+    let values = builder.intern_local(function, "values");
+    builder.push_param(
+        function,
+        IrParam {
+            name: "values".to_owned(),
+            local: values,
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Array),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let method = builder.intern_constant(IrConstant::String("map".to_owned()));
+    let four = builder.intern_constant(IrConstant::Int(4));
+    let block = builder.append_block(function);
+    let object = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::NewObject {
+            dst: object,
+            class_name: "ExternalCallbacks".to_owned(),
+            display_class_name: "ExternalCallbacks".to_owned(),
+            args: Vec::new(),
+        },
+        span,
+    );
+    let callable = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::NewArray { dst: callable },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::ArrayInsert {
+            array: callable,
+            key: None,
+            value: Operand::Register(object),
+            by_ref_local: None,
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::Discard {
+            src: Operand::Register(object),
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::ArrayInsert {
+            array: callable,
+            key: None,
+            value: Operand::Constant(method),
+            by_ref_local: None,
+        },
+        span,
+    );
+    let mapped = builder.alloc_register(function);
+    let argument = |value| IrCallArg {
+        name: None,
+        value,
+        unpack: false,
+        value_kind: IrCallArgValueKind::Direct,
+        by_ref_local: None,
+        by_ref_dim: None,
+        by_ref_property: None,
+        by_ref_property_dim: None,
+    };
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: mapped,
+            name: "array_map".to_owned(),
+            args: vec![
+                argument(Operand::Register(callable)),
+                argument(Operand::Local(values)),
+            ],
+        },
+        span,
+    );
+    let called = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: called,
+            name: "call_user_func".to_owned(),
+            args: vec![
+                argument(Operand::Register(callable)),
+                argument(Operand::Constant(four)),
+            ],
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::Discard {
+            src: Operand::Register(called),
+        },
+        span,
+    );
+    let called_array = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: called_array,
+            name: "call_user_func_array".to_owned(),
+            args: vec![
+                argument(Operand::Register(callable)),
+                argument(Operand::Local(values)),
+            ],
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::Discard {
+            src: Operand::Register(called_array),
+        },
+        span,
+    );
+    let invoked = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallCallable {
+            dst: invoked,
+            callee: Operand::Register(callable),
+            args: vec![argument(Operand::Constant(four))],
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::Discard {
+            src: Operand::Register(invoked),
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::Discard {
+            src: Operand::Register(callable),
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(mapped)), span);
+
+    let unit = builder.finish();
+    let signatures = [
+        crate::JitExternalFunctionSignature {
+            name: "ExternalCallbacks::__construct".to_owned(),
+            link_index: 6,
+            published: true,
+            params: Vec::new(),
+            native_params: Vec::new(),
+            native_arity: 0,
+            requires_non_reference_trampoline: false,
+            returns_by_reference: false,
+        },
+        crate::JitExternalFunctionSignature {
+            name: "ExternalCallbacks::map".to_owned(),
+            link_index: 7,
+            published: true,
+            params: vec![crate::JitExternalParameterSignature {
+                name: "value".to_owned(),
+                by_ref: false,
+                variadic: false,
+            }],
+            native_params: vec![IrParam {
+                name: "value".to_owned(),
+                local: LocalId::new(1),
+                required: true,
+                default: None,
+                type_: Some(IrReturnType::Int),
+                by_ref: false,
+                variadic: false,
+                attributes: Vec::new(),
+            }],
+            native_arity: 2,
+            requires_non_reference_trampoline: false,
+            returns_by_reference: false,
+        },
+    ];
+    let region = BaselineRegionBuilder::build_with_external_function_signatures(
+        &unit,
+        function,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+        &signatures,
+    )
+    .expect("linked instance callback region");
+
+    let instruction = region.blocks[0]
+        .instructions
+        .iter()
+        .find(|instruction| matches!(instruction.kind, RegionInstructionKind::ArrayCallback(_)))
+        .expect("external instance array callback");
+    let RegionInstructionKind::ArrayCallback(call) = &instruction.kind else {
+        unreachable!("filtered above");
+    };
+    assert_eq!(call.callback.name, "ExternalCallbacks::map");
+    assert_eq!(call.callback.function, None);
+    assert_eq!(
+        call.callback.receiver,
+        Some(RegionOperand::Register(object))
+    );
+    assert_eq!(call.callback.bound_object_count, 1);
+    assert_eq!(call.callback.capture_count, 0);
+    assert!(instruction.register_uses().contains(&object));
+    assert!(!instruction.register_uses().contains(&callable));
+    let linked_calls = region.blocks[0]
+        .instructions
+        .iter()
+        .filter_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::NativeCall(call)
+                if matches!(
+                    &call.target,
+                    RegionCallTarget::Function {
+                        name,
+                        function: None
+                    } if name == "ExternalCallbacks::map"
+                ) =>
+            {
+                Some(call)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(linked_calls.len(), 3);
+    assert!(linked_calls.iter().all(|call| {
+        call.argument_operand_offset == 1
+            && call.operands.first() == Some(&Some(RegionOperand::Register(object)))
+    }));
+    assert!(linked_calls.iter().any(|call| call.direct_arity == Some(2)));
+    assert!(
+        linked_calls
+            .iter()
+            .any(|call| call.trailing_unpack_argument() == Some(0))
+    );
+    assert!(region.blocks[0].instructions.iter().all(|instruction| {
+        !matches!(
+            instruction.kind,
+            RegionInstructionKind::NewArray { .. } | RegionInstructionKind::ArrayInsert { .. }
+        )
+    }));
+    assert!(region.blocks[0].instructions.iter().any(|instruction| {
+        matches!(
+            instruction.kind,
+            RegionInstructionKind::Discard {
+                src: RegionOperand::Register(register)
+            } if register == object
+        )
+    }));
+}
+
+#[test]
+fn optimizing_linked_reference_return_uses_published_native_signature() {
+    let mut builder = IrBuilder::new(UnitId::new(99));
+    let file = builder.add_file("linked-reference-return.php");
+    let span = IrSpan::new(file, 0, 20);
+    let function = builder.start_function(
+        "linked_reference_return_wrapper",
+        FunctionFlags::default(),
+        span,
+    );
+    let reference = builder.intern_local(function, "reference");
+    let block = builder.append_block(function);
+    let four = builder.intern_constant(IrConstant::Int(4));
+    builder.emit(
+        function,
+        block,
+        InstructionKind::BindReferenceFromCall {
+            target: reference,
+            name: "linked_reference_target".to_owned(),
+            args: vec![IrCallArg {
+                name: None,
+                value: Operand::Constant(four),
+                unpack: false,
+                value_kind: IrCallArgValueKind::Direct,
+                by_ref_local: None,
+                by_ref_dim: None,
+                by_ref_property: None,
+                by_ref_property_dim: None,
+            }],
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Local(reference)), span);
+    let unit = builder.finish();
+    let region = BaselineRegionBuilder::build_with_external_function_signatures(
+        &unit,
+        function,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+        &[crate::JitExternalFunctionSignature {
+            name: "linked_reference_target".to_owned(),
+            link_index: 3,
+            published: true,
+            params: vec![crate::JitExternalParameterSignature {
+                name: "value".to_owned(),
+                by_ref: false,
+                variadic: false,
+            }],
+            native_params: vec![IrParam {
+                name: "value".to_owned(),
+                local: LocalId::new(0),
+                required: true,
+                default: None,
+                type_: Some(IrReturnType::Int),
+                by_ref: false,
+                variadic: false,
+                attributes: Vec::new(),
+            }],
+            native_arity: 1,
+            requires_non_reference_trampoline: false,
+            returns_by_reference: true,
+        }],
+    )
+    .expect("optimizing linked reference-return region");
+    let instruction = region.blocks[0]
+        .instructions
+        .iter()
+        .find(|instruction| {
+            matches!(
+                instruction.kind,
+                RegionInstructionKind::NativeCall(RegionNativeCall {
+                    result: RegionCallResult::ReferenceLocal(candidate),
+                    ..
+                }) if candidate == reference
+            )
+        })
+        .expect("linked reference-return native call");
+    let RegionInstructionKind::NativeCall(call) = &instruction.kind else {
+        unreachable!("filtered above");
+    };
+    assert_eq!(
+        call.target,
+        RegionCallTarget::Function {
+            name: "linked_reference_target".to_owned(),
+            function: None,
+        }
+    );
+    assert_eq!(call.direct_arity, Some(1));
+    assert_eq!(call.operands, vec![Some(RegionOperand::I64(4))]);
+    assert!(call.returns_by_reference);
+    assert!(!call.variadic);
 }

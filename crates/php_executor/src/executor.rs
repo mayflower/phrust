@@ -356,13 +356,17 @@ echo $created, "\n";
     }
 
     #[test]
-    fn dynamic_scalar_constants_remain_native_through_define_query_and_fetch() {
+    fn dynamic_constants_remain_native_through_define_query_and_fetch() {
         let output = PhpExecutor::default().execute_source(PhpExecutionInput {
             source: r#"<?php
 define('NATIVE_INT_CONSTANT', 41);
 define('NATIVE_STRING_CONSTANT', 'native');
+define('NATIVE_ARRAY_CONSTANT', ['07' => 'leading', 7 => ['nested', 2 => 'integer']]);
 echo NATIVE_INT_CONSTANT + 1, "\n";
 echo NATIVE_STRING_CONSTANT, "\n";
+echo NATIVE_ARRAY_CONSTANT['07'], "\n";
+echo NATIVE_ARRAY_CONSTANT[7][0], "\n";
+echo NATIVE_ARRAY_CONSTANT[7][2], "\n";
 echo defined('NATIVE_STRING_CONSTANT') ? "defined\n" : "missing\n";
 "#
             .to_owned(),
@@ -382,7 +386,10 @@ echo defined('NATIVE_STRING_CONSTANT') ? "defined\n" : "missing\n";
             String::from_utf8_lossy(&output.stdout),
             output.diagnostics_text
         );
-        assert_eq!(output.stdout, b"42\nnative\ndefined\n");
+        assert_eq!(
+            output.stdout,
+            b"42\nnative\nleading\nnested\ninteger\ndefined\n"
+        );
     }
 
     #[test]

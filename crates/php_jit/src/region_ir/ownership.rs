@@ -60,6 +60,11 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         result: HelperResultOwnership::None,
         may_alias_input: false,
     };
+    let borrowed = |inputs| HelperOwnershipContract {
+        inputs,
+        result: HelperResultOwnership::Borrowed,
+        may_alias_input: false,
+    };
     match name {
         name if name.starts_with("phrust_native_preg_")
             || name.starts_with("phrust_native_json_")
@@ -78,6 +83,55 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
                     | "phrust_native_printf"
                     | "phrust_native_vsprintf"
                     | "phrust_native_vprintf"
+                    | "phrust_native_md5"
+                    | "phrust_native_sha1"
+                    | "phrust_native_crc32"
+                    | "phrust_native_hash"
+                    | "phrust_native_hash_hmac"
+                    | "phrust_native_hash_equals"
+                    | "phrust_native_base64_encode"
+                    | "phrust_native_base64_decode"
+                    | "phrust_native_bin2hex"
+                    | "phrust_native_hex2bin"
+                    | "phrust_native_quoted_printable_decode"
+                    | "phrust_native_urlencode"
+                    | "phrust_native_rawurlencode"
+                    | "phrust_native_urldecode"
+                    | "phrust_native_rawurldecode"
+                    | "phrust_native_convert_uuencode"
+                    | "phrust_native_convert_uudecode"
+                    | "phrust_native_addcslashes"
+                    | "phrust_native_stripcslashes"
+                    | "phrust_native_stripslashes"
+                    | "phrust_native_quotemeta"
+                    | "phrust_native_strstr"
+                    | "phrust_native_stristr"
+                    | "phrust_native_strrchr"
+                    | "phrust_native_strpbrk"
+                    | "phrust_native_substr_compare"
+                    | "phrust_native_strnatcmp"
+                    | "phrust_native_strnatcasecmp"
+                    | "phrust_native_ucwords"
+                    | "phrust_native_str_pad"
+                    | "phrust_native_strtr"
+                    | "phrust_native_strip_tags"
+                    | "phrust_native_substr_replace"
+                    | "phrust_native_htmlspecialchars"
+                    | "phrust_native_htmlentities"
+                    | "phrust_native_html_entity_decode"
+                    | "phrust_native_htmlspecialchars_decode"
+                    | "phrust_native_parse_url"
+                    | "phrust_native_parse_str"
+                    | "phrust_native_http_build_query"
+                    | "phrust_native_asort"
+                    | "phrust_native_arsort"
+                    | "phrust_native_ksort"
+                    | "phrust_native_krsort"
+                    | "phrust_native_natsort"
+                    | "phrust_native_natcasesort"
+                    | "phrust_native_func_num_args"
+                    | "phrust_native_func_get_arg"
+                    | "phrust_native_func_get_args"
                     | "phrust_native_basename"
                     | "phrust_native_dirname"
                     | "phrust_native_realpath"
@@ -89,7 +143,6 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         {
             Some(owned(BORROW_6, false))
         }
-        "phrust_native_include" => Some(owned(BORROW_1, false)),
         "phrust_jit_native_call_dispatch"
         | "phrust_baseline_native_builtin_dispatch"
         | "phrust_jit_native_semantic_dispatch"
@@ -113,6 +166,7 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         | "phrust_native_array_spread"
         | "phrust_native_object_clone_with" => Some(owned(BORROW_2, true)),
         "phrust_native_string_predicate" => Some(owned(BORROW_2, false)),
+        "phrust_native_dynamic_property_slot" => Some(borrowed(BORROW_2)),
         "phrust_native_local_store"
         | "phrust_native_reference_bind"
         | "phrust_native_property_fetch"

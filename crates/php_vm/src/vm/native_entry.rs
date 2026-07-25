@@ -88,7 +88,10 @@ impl Vm {
         });
         context.output.flush_all_buffers();
         drop(guard);
-        let publish_error = context.publish_include_globals().err();
+        let publish_error = context
+            .materialize_native_session_state()
+            .and_then(|()| context.publish_include_globals())
+            .err();
         let native_execution_time_nanos = native_execution_started_at.map_or(0, |started_at| {
             started_at.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
         });

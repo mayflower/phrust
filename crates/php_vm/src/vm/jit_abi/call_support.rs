@@ -81,7 +81,7 @@ fn expand_baseline_user_call_arguments(
 
         // Baseline-only compatibility: optimizing calls accept only direct
         // array entries and transition before entering this binder.
-        let Value::Array(array) = context.decode(*value)? else {
+        let Value::Array(array) = context.decode_baseline_value(*value)? else {
             return Err(NativeCallControl::from(
                 "Only arrays and Traversables can be unpacked",
             ));
@@ -91,7 +91,7 @@ fn expand_baseline_user_call_arguments(
                 php_runtime::api::ArrayKey::Int(_) => None,
                 php_runtime::api::ArrayKey::String(name) => Some(name.to_string_lossy()),
             };
-            let encoded = context.encode(value.clone())?;
+            let encoded = context.encode_baseline_value(value.clone())?;
             compatibility_owners.push(encoded);
             supplied.push(NativeSuppliedCallArgument {
                 name,
@@ -141,7 +141,7 @@ fn bind_baseline_by_value_parameter(
 
     // Baseline-only compatibility. Optimizing calls transition before an
     // argument would be reconstructed through the Rust value plane.
-    let mut value = match context.decode(argument) {
+    let mut value = match context.decode_baseline_value(argument) {
         Ok(value) => value,
         Err(error) => {
             context.release(argument)?;
@@ -236,7 +236,7 @@ fn bind_baseline_by_reference_parameter(
     let Some(type_) = type_ else {
         // A materialized/compatibility reference is still one stable arena
         // identity; the callee receives its own native owner.
-        if let Value::Reference(reference) = context.decode(argument)?
+        if let Value::Reference(reference) = context.decode_baseline_value(argument)?
             && matches!(reference.get(), Value::Uninitialized)
         {
             reference.set(Value::Null);
@@ -263,7 +263,7 @@ fn bind_baseline_materialized_reference_parameter(
     parameter_index: usize,
     parameter_name: &str,
 ) -> NativeCallResult {
-    let Value::Reference(reference) = context.decode(argument)? else {
+    let Value::Reference(reference) = context.decode_baseline_value(argument)? else {
         return Err(NativeCallControl::throw(
             "Error",
             format!(
@@ -300,7 +300,7 @@ pub(super) fn native_catch_matches(
     value: i64,
 ) -> bool {
     let class = context
-        .decode(value)
+        .decode_baseline_value(value)
         .ok()
         .and_then(super::super::native_exception_fields)
         .map(|(class, _, _)| class);
@@ -507,17 +507,23 @@ fn bind_baseline_function_with_metadata_strict<R>(
             }
         }
 
-        // Introspection observes supplied arguments in bound parameter order,
-        // followed by accepted surplus/variadic arguments. Direct handles are
-        // borrowed from the caller; compatibility-unpack owners remain live
-        // until the synchronous callee returns below.
-        let visible_arguments = assigned
+        // PHP exposes fixed arguments through their bound parameter slots.
+        // A named argument can therefore make preceding defaults visible:
+        // f(b: 2) reports [$a_default, 2]. Positional variadic and surplus
+        // values follow that fixed prefix; unknown named variadics belong
+        // only to the variadic array and are not counted by func_num_args().
+        let positional_variadic_count = variadic
             .iter()
-            .flatten()
-            .chain(variadic.iter().filter(|argument| argument.name.is_none()))
-            .chain(&extra)
-            .map(|argument| argument.value)
-            .collect::<request_state::NativeTraceArguments>();
+            .filter(|argument| argument.name.is_none())
+            .count();
+        let fixed_visible_count = if positional_variadic_count != 0 || !extra.is_empty() {
+            fixed_count
+        } else {
+            assigned
+                .iter()
+                .rposition(Option::is_some)
+                .map_or(0, |index| index + 1)
+        };
 
         for (index, parameter) in target_params.iter().enumerate() {
             if parameter.variadic {
@@ -611,6 +617,28 @@ fn bind_baseline_function_with_metadata_strict<R>(
             }
         }
 
+        let mut visible_arguments = bound
+            .iter()
+            .skip(leading)
+            .take(fixed_visible_count)
+            .copied()
+            .collect::<request_state::NativeTraceArguments>();
+        if let Some(variadic_index) = variadic_index {
+            let variadic_array = bound
+                .get(leading + variadic_index)
+                .copied()
+                .ok_or_else(|| "native variadic frame slot is missing".to_owned())?;
+            let entries = context
+                .direct_array_entries_for(variadic_array)
+                .ok_or_else(|| "native variadic frame array is unavailable".to_owned())?;
+            visible_arguments.extend(
+                entries
+                    .iter()
+                    .filter(|entry| context.native_encoded_int(entry.key).is_some())
+                    .map(|entry| entry.value),
+            );
+        }
+        visible_arguments.extend(extra.iter().map(|argument| argument.value));
         Ok(visible_arguments)
     })();
 
@@ -746,7 +774,7 @@ pub(super) fn bind_native_property_reference_arguments(
 
         // Dynamic/magic properties have no admitted numeric slot and are
         // therefore already at the explicit cold call boundary.
-        let mut receiver = context.decode(argument.property_receiver)?;
+        let mut receiver = context.decode_baseline_value(argument.property_receiver)?;
         for _ in 0..16 {
             let Value::Reference(reference) = receiver else {
                 break;
@@ -881,11 +909,11 @@ pub(super) fn expand_native_unpack_arguments(
                 continue;
             }
             // Traversable and compatibility arrays are explicit cold shapes.
-            let Value::Array(array) = context.decode(*value)? else {
+            let Value::Array(array) = context.decode_baseline_value(*value)? else {
                 return Err("Only arrays and Traversables can be unpacked".to_owned());
             };
             for (_, value) in array.iter() {
-                expanded.push(context.encode(value.clone())?);
+                expanded.push(context.encode_baseline_value(value.clone())?);
             }
         } else {
             expanded.push(*value);
@@ -942,7 +970,7 @@ fn native_builtin_default_encoded(
             Ok(value) => Ok(value),
             Err(_) => context
                 .lookup_constant(expression)
-                .and_then(|value| context.encode(value)),
+                .and_then(|value| context.encode_baseline_value(value)),
         },
     }
 }
@@ -1233,7 +1261,7 @@ fn invoke_native_closure_payload(
         let encoded = if let Some(encoded) = prepared_implicit_this {
             encoded
         } else {
-            let encoded = context.encode(
+            let encoded = context.encode_baseline_value(
                 closure
                     .bound_this
                     .as_ref()
@@ -1511,7 +1539,7 @@ pub(super) fn execute_native_dynamic_callable(
     }
     // Boxed compatibility callables are baseline carriers. Optimizing
     // dispatch transitions before this materializing branch.
-    let callee = match context.decode(*callee) {
+    let callee = match context.decode_baseline_value(*callee) {
         Ok(value) => dereference_native_callable_value(value),
         Err(error) => return Some(Err(error.into())),
     };
@@ -1632,7 +1660,7 @@ pub(super) fn execute_native_dynamic_constructor(
     } else {
         // A non-native class-name carrier is already on the explicit dynamic
         // baseline boundary. Do not make ordinary direct strings traverse it.
-        let class_name = match context.decode(*class_name) {
+        let class_name = match context.decode_baseline_value(*class_name) {
             Ok(Value::Reference(reference)) => reference.get(),
             Ok(value) => value,
             Err(error) => return Some(Err(error)),
@@ -1860,7 +1888,7 @@ pub(super) fn execute_native_generator_method(
         })();
         return Some(result);
     }
-    let generator = match context.decode(*receiver) {
+    let generator = match context.decode_baseline_value(*receiver) {
         Ok(Value::Generator(generator)) => generator,
         Ok(_) => return None,
         Err(error) => return Some(Err(error)),
@@ -1883,28 +1911,28 @@ pub(super) fn execute_native_generator_method(
                             .to_owned(),
                     );
                 }
-                context.encode(Value::Null)
+                context.encode_baseline_value(Value::Null)
             }
             "valid" => {
                 ensure_started(context)?;
-                context.encode(Value::Bool(
+                context.encode_baseline_value(Value::Bool(
                     generator.state() == php_runtime::api::GeneratorState::Suspended,
                 ))
             }
             "current" => {
                 ensure_started(context)?;
-                context.encode(generator.current_value().unwrap_or(Value::Null))
+                context.encode_baseline_value(generator.current_value().unwrap_or(Value::Null))
             }
             "key" => {
                 ensure_started(context)?;
-                context.encode(generator.current_key().unwrap_or(Value::Null))
+                context.encode_baseline_value(generator.current_key().unwrap_or(Value::Null))
             }
             "next" => {
                 ensure_started(context)?;
                 if generator.state() == php_runtime::api::GeneratorState::Suspended {
                     let _ = context.baseline_iterator_next(iterator)?;
                 }
-                context.encode(Value::Null)
+                context.encode_baseline_value(Value::Null)
             }
             "send" => {
                 ensure_started(context)?;
@@ -1917,7 +1945,7 @@ pub(super) fn execute_native_generator_method(
                     php_jit::JitNativeResumeInputKind::VALUE,
                     value,
                 )?;
-                context.encode(next.map_or(Value::Null, |(_, value)| value))
+                context.encode_baseline_value(next.map_or(Value::Null, |(_, value)| value))
             }
             "throw" => {
                 ensure_started(context)?;
@@ -1930,7 +1958,7 @@ pub(super) fn execute_native_generator_method(
                     php_jit::JitNativeResumeInputKind::THROW,
                     value,
                 )?;
-                context.encode(next.map_or(Value::Null, |(_, value)| value))
+                context.encode_baseline_value(next.map_or(Value::Null, |(_, value)| value))
             }
             "getreturn" => {
                 if generator.state() != php_runtime::api::GeneratorState::Closed {
@@ -1938,7 +1966,7 @@ pub(super) fn execute_native_generator_method(
                         "Cannot get return value of a generator that hasn't returned".to_owned(),
                     );
                 }
-                context.encode(generator.return_value().unwrap_or(Value::Null))
+                context.encode_baseline_value(generator.return_value().unwrap_or(Value::Null))
             }
             _ => Err(format!("Call to undefined method Generator::{method}()")),
         }
@@ -2096,7 +2124,7 @@ pub(super) fn finish_native_fiber_outcome(
             context.discard_native_fiber_suspension_states();
             context.set_fiber_receiver_state(fiber, php_runtime::api::FiberState::Errored)?;
             let (class, message, _) = context
-                .decode(value)
+                .decode_baseline_value(value)
                 .ok()
                 .and_then(super::super::native_exception_fields)
                 .unwrap_or_else(|| {
@@ -2798,9 +2826,9 @@ pub(super) fn invoke_native_callable_value_from(
     caller_function: Option<u32>,
 ) -> Result<i64, String> {
     let mut encoded = Vec::with_capacity(arguments.len() + 1);
-    encoded.push(context.encode(callable)?);
+    encoded.push(context.encode_baseline_value(callable)?);
     for argument in arguments {
-        encoded.push(context.encode(argument.clone())?);
+        encoded.push(context.encode_baseline_value(argument.clone())?);
     }
     let result = invoke_native_encoded_callable_value_from(
         context,

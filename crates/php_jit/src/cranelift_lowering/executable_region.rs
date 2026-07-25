@@ -1,4 +1,5 @@
 use super::*;
+use crate::region_ir::{RegionPropertyName, RegionSemanticOp};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug)]
@@ -302,6 +303,14 @@ impl NativeFunctionFragmentLayout {
                             instruction,
                             region.compile_metadata.tier,
                         ) {
+                            registers.extend(
+                                register_liveness
+                                    .transition_live
+                                    .get(&instruction.continuation_id)
+                                    .into_iter()
+                                    .flatten()
+                                    .copied(),
+                            );
                             stored_registers.extend(
                                 register_liveness
                                     .transition_live
@@ -322,6 +331,14 @@ impl NativeFunctionFragmentLayout {
                             .filter(|register| !block_definitions.contains(register)),
                     );
                     if block_terminator_has_native_transition(block, region.compile_metadata.tier) {
+                        registers.extend(
+                            register_liveness
+                                .transition_live
+                                .get(&block.terminator_continuation_id)
+                                .into_iter()
+                                .flatten()
+                                .copied(),
+                        );
                         stored_registers.extend(
                             register_liveness
                                 .transition_live
@@ -475,6 +492,161 @@ fn region_contains(
         .any(|instruction| predicate(&instruction.kind))
 }
 
+fn optimizing_compiled_call_params<'a>(
+    call: &RegionNativeCall,
+    unit: &'a IrUnit,
+    external_function_signatures: &'a [crate::JitExternalFunctionSignature],
+) -> Option<&'a [php_ir::IrParam]> {
+    if let Some(function) = call
+        .direct_compiled_target()
+        .or_else(|| call.direct_compiled_unpack_target())
+    {
+        return unit
+            .functions
+            .get(function.index())
+            .map(|function| function.params.as_slice());
+    }
+    let RegionCallTarget::Function {
+        name,
+        function: None,
+    } = &call.target
+    else {
+        return None;
+    };
+    external_function_signatures
+        .iter()
+        .find(|signature| {
+            signature.published
+                && signature
+                    .name
+                    .trim_start_matches('\\')
+                    .eq_ignore_ascii_case(name.trim_start_matches('\\'))
+        })
+        .map(|signature| signature.native_params.as_slice())
+}
+
+#[derive(Clone, Copy, Default)]
+struct OptimizingCallScalarHelperNeeds {
+    numeric_string: bool,
+    string_cast: bool,
+}
+
+fn optimizing_call_scalar_helper_needs(
+    call: &RegionNativeCall,
+    unit: &IrUnit,
+    external_function_signatures: &[crate::JitExternalFunctionSignature],
+    value_flow: &ExecutableValueFlow,
+    constants: &[IrConstant],
+) -> OptimizingCallScalarHelperNeeds {
+    use php_ir::IrReturnType as Type;
+
+    let Some(parameters) =
+        optimizing_compiled_call_params(call, unit, external_function_signatures)
+    else {
+        return OptimizingCallScalarHelperNeeds::default();
+    };
+    let mut needs = OptimizingCallScalarHelperNeeds::default();
+    let mut consider = |parameter: &php_ir::IrParam, operand: Option<RegionOperand>| {
+        let Some(type_) = parameter.type_.as_ref() else {
+            return;
+        };
+        if !parameter.by_ref
+            && operand.is_some_and(|operand| {
+                optimizing_fact_satisfies_type(
+                    lowering_operand_fact(value_flow, constants, operand),
+                    type_,
+                )
+            })
+        {
+            return;
+        }
+        let scalar_type = match type_ {
+            Type::Nullable { inner } => inner.as_ref(),
+            type_ => type_,
+        };
+        match (call.caller_strict_types, scalar_type) {
+            (false, Type::Int | Type::Float) => {
+                needs.numeric_string = true;
+            }
+            (false, Type::String) => needs.string_cast = true,
+            _ => {}
+        }
+    };
+
+    if let Some(unpack) = call.trailing_unpack_argument() {
+        for (index, parameter) in parameters.iter().enumerate() {
+            let operand = (index < unpack)
+                .then(|| {
+                    call.operands
+                        .get(call.argument_operand_offset.saturating_add(index))
+                        .copied()
+                        .flatten()
+                })
+                .flatten();
+            consider(parameter, operand);
+        }
+    } else {
+        for (index, operand) in call
+            .operands
+            .iter()
+            .skip(call.argument_operand_offset)
+            .enumerate()
+        {
+            let Some(parameter) = parameters
+                .get(index)
+                .or_else(|| parameters.last().filter(|parameter| parameter.variadic))
+            else {
+                continue;
+            };
+            consider(parameter, *operand);
+        }
+    }
+    needs
+}
+
+fn optimizing_return_scalar_helper_needs(
+    region: &RegionGraph,
+    value_flow: &ExecutableValueFlow,
+    constants: &[IrConstant],
+    strict: bool,
+) -> OptimizingCallScalarHelperNeeds {
+    use php_ir::IrReturnType as Type;
+
+    let Some(return_type) = region.return_type.as_ref() else {
+        return OptimizingCallScalarHelperNeeds::default();
+    };
+    let scalar_type = match return_type {
+        Type::Nullable { inner } => inner.as_ref(),
+        return_type => return_type,
+    };
+    let mut needs = OptimizingCallScalarHelperNeeds::default();
+    for block in &region.blocks {
+        let requires_scalar_boundary = match &block.terminator {
+            RegionTerminator::Return {
+                value,
+                finally: None,
+            } => !optimizing_fact_satisfies_type(
+                lowering_operand_fact(value_flow, constants, *value),
+                return_type,
+            ),
+            // The local's SSA fact describes the reference container. Its
+            // authoritative payload still requires the declared return
+            // coercion and writeback boundary.
+            RegionTerminator::ReturnReference { finally: None, .. } => true,
+            _ => false,
+        };
+        if !requires_scalar_boundary {
+            continue;
+        }
+        match (strict, scalar_type) {
+            (false, Type::Int | Type::Float) => needs.numeric_string = true,
+            (false, Type::String) => needs.string_cast = true,
+            _ => {}
+        }
+    }
+    needs
+}
+
 fn native_transition_successors(terminator: &RegionTerminator) -> Vec<BlockId> {
     match terminator {
         RegionTerminator::Jump { target } => vec![*target],
@@ -542,6 +714,7 @@ pub(super) fn instruction_has_native_transition(
             | RegionInstructionKind::ForeachNext { .. }
             | RegionInstructionKind::ForeachCleanup { .. }
             | RegionInstructionKind::FetchProperty { .. }
+            | RegionInstructionKind::ArrayCallback(_)
             | RegionInstructionKind::NativeCall(_)
             | RegionInstructionKind::NativeDynamicCode(_)
     )
@@ -579,6 +752,7 @@ fn optimizing_instruction_family_is_direct(kind: &RegionInstructionKind) -> bool
         | RegionInstructionKind::ForeachNext { .. }
         | RegionInstructionKind::ForeachCleanup { .. }
         | RegionInstructionKind::FetchProperty { .. }
+        | RegionInstructionKind::ArrayCallback(_)
         | RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::Include { .. })
         | RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::MakeClosure {
             ..
@@ -652,7 +826,10 @@ fn instruction_has_native_resume_entry(
     match tier {
         NativeCompilerTier::Baseline => instruction_has_native_transition(instruction, tier),
         NativeCompilerTier::Optimizing => {
-            matches!(instruction.kind, RegionInstructionKind::NativeCall(_))
+            matches!(
+                instruction.kind,
+                RegionInstructionKind::ArrayCallback(_) | RegionInstructionKind::NativeCall(_)
+            )
         }
     }
 }
@@ -883,11 +1060,19 @@ fn native_register_live_in(region: &RegionGraph) -> BTreeMap<BlockId, BTreeSet<R
                 .flat_map(|successor| live_in[successor].iter().copied())
                 .collect::<BTreeSet<_>>();
             live.extend(block.terminator.register_uses());
+            live.extend(block.terminator_live_registers.iter().flatten().copied());
             for instruction in block.instructions.iter().rev() {
                 for defined in region_instruction_defined_registers(&instruction.kind) {
                     live.remove(&defined);
                 }
                 live.extend(instruction.register_uses());
+                live.extend(
+                    instruction
+                        .transition_live_registers
+                        .iter()
+                        .flatten()
+                        .copied(),
+                );
             }
             if live != live_in[index] {
                 live_in[index] = live;
@@ -926,7 +1111,10 @@ impl NativeRegisterLiveness {
             if block_terminator_has_native_transition(block, region.compile_metadata.tier) {
                 transition_live.insert(
                     block.terminator_continuation_id,
-                    live.iter().copied().collect(),
+                    block
+                        .terminator_live_registers
+                        .clone()
+                        .unwrap_or_else(|| live.iter().copied().collect()),
                 );
             }
             for instruction in block.instructions.iter().rev() {
@@ -934,15 +1122,84 @@ impl NativeRegisterLiveness {
                     live.remove(&defined);
                 }
                 live.extend(instruction.register_uses());
+                live.extend(
+                    instruction
+                        .transition_live_registers
+                        .iter()
+                        .flatten()
+                        .copied(),
+                );
                 if instruction_has_sparse_snapshot(instruction, region.compile_metadata.tier) {
-                    transition_live
-                        .insert(instruction.continuation_id, live.iter().copied().collect());
+                    transition_live.insert(
+                        instruction.continuation_id,
+                        instruction
+                            .transition_live_registers
+                            .clone()
+                            .unwrap_or_else(|| live.iter().copied().collect()),
+                    );
                 }
             }
         }
         Self {
             block_live_in,
             transition_live,
+        }
+    }
+}
+
+fn native_register_state_points(region: &RegionGraph) -> BTreeMap<u32, Vec<RegId>> {
+    let block_live_in = native_register_live_in(region);
+    let mut state_points = BTreeMap::new();
+    for block in &region.blocks {
+        let mut live = native_transition_successors(&block.terminator)
+            .into_iter()
+            .filter_map(|successor| block_live_in.get(&successor))
+            .flat_map(|registers| registers.iter().copied())
+            .collect::<BTreeSet<_>>();
+        live.extend(block.terminator.register_uses());
+        state_points.insert(
+            block.terminator_continuation_id,
+            live.iter().copied().collect(),
+        );
+        for instruction in block.instructions.iter().rev() {
+            for defined in region_instruction_defined_registers(&instruction.kind) {
+                live.remove(&defined);
+            }
+            live.extend(instruction.register_uses());
+            state_points.insert(instruction.continuation_id, live.iter().copied().collect());
+        }
+    }
+    state_points
+}
+
+fn pin_native_transition_registers(
+    region: &mut RegionGraph,
+    source_state_points: &BTreeMap<u32, Vec<RegId>>,
+) {
+    for block in &mut region.blocks {
+        block.terminator_live_registers = None;
+        for instruction in &mut block.instructions {
+            instruction.transition_live_registers = None;
+        }
+    }
+    for block in &mut region.blocks {
+        if block_terminator_has_native_transition(block, region.compile_metadata.tier) {
+            block.terminator_live_registers = Some(
+                source_state_points
+                    .get(&block.terminator_continuation_id)
+                    .cloned()
+                    .expect("native terminator continuation belongs to the source region"),
+            );
+        }
+        for instruction in &mut block.instructions {
+            if instruction_has_sparse_snapshot(instruction, region.compile_metadata.tier) {
+                instruction.transition_live_registers = Some(
+                    source_state_points
+                        .get(&instruction.continuation_id)
+                        .cloned()
+                        .expect("native instruction continuation belongs to the source region"),
+                );
+            }
         }
     }
 }
@@ -961,7 +1218,6 @@ fn ir_function_requires_non_reference_trampoline(function: &php_ir::IrFunction) 
                 php_ir::InstructionKind::EnterTry { .. }
                     | php_ir::InstructionKind::LeaveTry
                     | php_ir::InstructionKind::Throw { .. }
-                    | php_ir::InstructionKind::MakeClosure { .. }
                     | php_ir::InstructionKind::Yield { .. }
                     | php_ir::InstructionKind::YieldFrom { .. }
             )
@@ -1018,6 +1274,48 @@ fn declare_native_helper(
         inline_runtime_view: false,
         runtime: None,
     })
+}
+
+fn declare_native_pure_handler(
+    module: &mut JITModule,
+    symbol: &str,
+    signature: &ir::Signature,
+    address: usize,
+) -> Result<NativeHelper, CraneliftLoweringError> {
+    let import_symbol = native_helper_import_symbol(symbol, address);
+    let function = module
+        .declare_function(&import_symbol, Linkage::Import, signature)
+        .map_err(|error| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_NATIVE_OPERATION",
+                format!("failed to declare pure {symbol}: {error}"),
+            )
+        })?;
+    Ok(NativeHelper {
+        function,
+        terminal_exit: None,
+        inline_runtime_view: false,
+        runtime: None,
+    })
+}
+
+fn declare_native_control_handler(
+    module: &mut JITModule,
+    needed: bool,
+    symbol: &str,
+    argument_count: usize,
+    address: impl FnOnce() -> usize,
+) -> Result<Option<NativeHelper>, CraneliftLoweringError> {
+    if !needed {
+        return Ok(None);
+    }
+    let mut signature = module.make_signature();
+    for _ in 0..argument_count {
+        signature.params.push(AbiParam::new(types::I64));
+    }
+    signature.returns.push(AbiParam::new(types::I64));
+    signature.returns.push(AbiParam::new(types::I64));
+    declare_native_helper(module, symbol, &signature, address()).map(Some)
 }
 
 pub(super) fn compile_region_graph_native(
@@ -1173,12 +1471,33 @@ pub(super) fn compile_region_graph_native(
             break;
         }
     }
+    let resolver_target = |target: FunctionId| {
+        runtime_helpers.native_function_resolve != 0
+            && !regions.contains_key(&target)
+            && unit
+                .functions
+                .get(target.index())
+                .is_some_and(|function| !ir_function_requires_trampoline(function))
+    };
+    let needs_function_resolver = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            let RegionInstructionKind::NativeCall(call) = kind else {
+                return false;
+            };
+            !matches!(call.result, RegionCallResult::ReferenceLocal(_))
+                && call
+                    .args
+                    .iter()
+                    .all(|argument| argument.name.is_none() && !argument.unpack)
+                && call.direct_compiled_target().is_some_and(resolver_target)
+        })
+    });
     let needs_call_trampoline = regions.values().any(|region| {
         region.has_native_trampoline_calls()
             || region
                 .direct_callees()
                 .iter()
-                .any(|callee| !regions.contains_key(callee))
+                .any(|callee| !regions.contains_key(callee) && !resolver_target(*callee))
             || region_contains(region, |kind| {
                 matches!(
                     kind,
@@ -1194,26 +1513,6 @@ pub(super) fn compile_region_graph_native(
                 )
             })
     });
-    let needs_function_resolver = runtime_helpers.native_function_resolve != 0
-        && regions.values().any(|region| {
-            region_contains(region, |kind| {
-                let RegionInstructionKind::NativeCall(call) = kind else {
-                    return false;
-                };
-                !matches!(call.result, RegionCallResult::ReferenceLocal(_))
-                    && call
-                        .args
-                        .iter()
-                        .all(|argument| argument.name.is_none() && !argument.unpack)
-                    && call.direct_compiled_target().is_some_and(|target| {
-                        !regions.contains_key(&target)
-                            && unit
-                                .functions
-                                .get(target.index())
-                                .is_some_and(|function| !ir_function_requires_trampoline(function))
-                    })
-            })
-        });
     let needs_builtin_dispatch = regions.values().any(|region| {
         region_contains(region, |kind| {
             matches!(kind, RegionInstructionKind::NativeCall(call)
@@ -1261,6 +1560,126 @@ pub(super) fn compile_region_graph_native(
                 })
             })
     });
+    let needs_exact_hash: [bool; StableHashBuiltin::COUNT] = std::array::from_fn(|index| {
+        !baseline_helper_imports
+            && regions.values().any(|region| {
+                region_contains(region, |kind| {
+                    matches!(kind, RegionInstructionKind::NativeCall(call)
+                        if stable_builtin_hash(&call.target)
+                            .is_some_and(|builtin| builtin.index() == index))
+                })
+            })
+    });
+    let needs_exact_byte_codec: [bool; StableByteCodecBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_byte_codec(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_string_search_compare: [bool; StableStringSearchCompareBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_string_search_compare(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_string_rewrite: [bool; StableStringRewriteBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_string_rewrite(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_html_codec: [bool; StableHtmlCodecBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_html_codec(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_url_query: [bool; StableUrlQueryBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_url_query(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_array_preserving_sort: [bool; StableArrayPreservingSortBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_array_preserving_sort(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_frame_introspection: [bool; StableFrameIntrospectionBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_frame_introspection(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_base_conversion: [bool; StableBaseConversionBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_base_conversion(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_network_address: [bool; StableNetworkAddressBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_network_address(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_compression_codec: [bool; StableCompressionCodecBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_compression_codec(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
     let needs_exact_path: [bool; StablePathBuiltin::COUNT] = std::array::from_fn(|index| {
         !baseline_helper_imports
             && regions.values().any(|region| {
@@ -1271,6 +1690,32 @@ pub(super) fn compile_region_graph_native(
                 })
             })
     });
+    let needs_exact_pure_math: [bool; StablePureMathBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        let RegionInstructionKind::NativeCall(call) = kind else {
+                            return false;
+                        };
+                        stable_builtin_pure_math(&call.target).is_some_and(|builtin| {
+                            builtin.index() == index
+                                && builtin.accepts_arity(call.args.len())
+                                && call.args.iter().enumerate().all(|(argument, metadata)| {
+                                    metadata.name.is_none()
+                                        && !metadata.unpack
+                                        && call
+                                            .operands
+                                            .get(
+                                                call.argument_operand_offset
+                                                    .saturating_add(argument),
+                                            )
+                                            .is_some_and(Option::is_some)
+                                })
+                        })
+                    })
+                })
+        });
     let needs_semantic_dispatch = regions.values().any(|region| {
         region_contains(region, |kind| {
             matches!(kind, RegionInstructionKind::NativeCall(call)
@@ -1316,29 +1761,11 @@ pub(super) fn compile_region_graph_native(
             "include, eval, or runtime declaration requires the native dynamic-code compiler",
         ));
     }
-    let needs_exact_include = !baseline_helper_imports
-        && regions.values().any(|region| {
-            region_contains(region, |kind| {
-                matches!(
-                    kind,
-                    RegionInstructionKind::NativeDynamicCode(
-                        RegionNativeDynamicCode::Include { .. }
-                    )
-                )
-            })
-        });
-    if needs_exact_include && runtime_helpers.native_include == 0 {
-        return Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_NATIVE_INCLUDE",
-            "optimizing include requires its exact native compiler/invoker",
-        ));
-    }
     let native_call_symbol = NATIVE_CALL_DISPATCH_SYMBOL.to_owned();
     let native_builtin_dispatch_symbol = BASELINE_NATIVE_BUILTIN_DISPATCH_SYMBOL.to_owned();
     let native_semantic_dispatch_symbol = NATIVE_SEMANTIC_DISPATCH_SYMBOL.to_owned();
     let native_function_resolve_symbol = NATIVE_FUNCTION_RESOLVE_SYMBOL.to_owned();
     let native_dynamic_code_symbol = NATIVE_DYNAMIC_CODE_SYMBOL.to_owned();
-    let native_include_symbol = NATIVE_INCLUDE_SYMBOL.to_owned();
     let needs_unary = regions.values().any(|region| {
         region_contains(region, |kind| {
             matches!(
@@ -1378,22 +1805,218 @@ pub(super) fn compile_region_graph_native(
         region_contains(region, |kind| {
             matches!(
                 kind,
-                RegionInstructionKind::Cast {
-                    op: RegionCastOp::String,
+                RegionInstructionKind::Binary {
+                    op: RegionBinaryOp::Concat,
+                    ..
+                } | RegionInstructionKind::Echo { .. }
+                    | RegionInstructionKind::Compare { .. }
+            ) || matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_array_lookup(&call.target).is_some())
+        })
+    });
+    let call_scalar_helper_needs = regions.iter().fold(
+        OptimizingCallScalarHelperNeeds::default(),
+        |mut needs, (function, region)| {
+            let value_flow = &value_flows[function];
+            let return_needs = optimizing_return_scalar_helper_needs(
+                region,
+                value_flow,
+                &unit.constants,
+                region.strict_types,
+            );
+            needs.numeric_string |= return_needs.numeric_string;
+            needs.string_cast |= return_needs.string_cast;
+            for call in region
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .filter_map(|instruction| {
+                    let RegionInstructionKind::NativeCall(call) = &instruction.kind else {
+                        return None;
+                    };
+                    Some(call)
+                })
+            {
+                let call_needs = optimizing_call_scalar_helper_needs(
+                    call,
+                    unit,
+                    &request.external_function_signatures,
+                    value_flow,
+                    &unit.constants,
+                );
+                needs.numeric_string |= call_needs.numeric_string;
+                needs.string_cast |= call_needs.string_cast;
+            }
+            needs
+        },
+    );
+    let needs_numeric_string = call_scalar_helper_needs.numeric_string
+        || regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(
+                    kind,
+                    RegionInstructionKind::Compare { .. }
+                        | RegionInstructionKind::Cast {
+                            op: RegionCastOp::Int | RegionCastOp::Float,
+                            ..
+                        }
+                        | RegionInstructionKind::Binary {
+                            op: RegionBinaryOp::Add
+                                | RegionBinaryOp::Sub
+                                | RegionBinaryOp::Mul
+                                | RegionBinaryOp::Div
+                                | RegionBinaryOp::Mod
+                                | RegionBinaryOp::Pow
+                                | RegionBinaryOp::BitAnd
+                                | RegionBinaryOp::BitOr
+                                | RegionBinaryOp::BitXor
+                                | RegionBinaryOp::ShiftLeft
+                                | RegionBinaryOp::ShiftRight,
+                            ..
+                        }
+                        | RegionInstructionKind::Unary {
+                            op: RegionUnaryOp::Plus | RegionUnaryOp::Minus,
+                            ..
+                        }
+                ) || matches!(
+                kind,
+                RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_array_lookup(&call.target).is_some()
+                        || matches!(
+                            stable_builtin_scalar_consumer(&call.target),
+                            Some(
+                                StableScalarConsumerBuiltin::FloatVal
+                                    | StableScalarConsumerBuiltin::IntVal
+                                    | StableScalarConsumerBuiltin::StrVal
+                            )
+                        )
+                        || stable_builtin_numeric_operator(&call.target)
+                            == Some(StableNumericOperatorBuiltin::Pow)
+                )
+            })
+        });
+    let needs_pow_f64 = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(
+                kind,
+                RegionInstructionKind::Binary {
+                    op: RegionBinaryOp::Pow,
+                    ..
+                }
+            ) || matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_numeric_operator(&call.target)
+                        == Some(StableNumericOperatorBuiltin::Pow))
+        })
+    });
+    let needs_fmod_f64 = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(kind, RegionInstructionKind::NativeCall(call)
+                if stable_builtin_scalar_math(&call.target)
+                    == Some(StableScalarMathBuiltin::Fmod))
+        })
+    });
+    let needs_round_f64 = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(kind, RegionInstructionKind::NativeCall(call)
+                if stable_builtin_numeric_operator(&call.target)
+                    == Some(StableNumericOperatorBuiltin::Round))
+        })
+    });
+    let needs_array_identical = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(
+                kind,
+                RegionInstructionKind::Compare {
+                    op: RegionCompareOpCode::Identical | RegionCompareOpCode::NotIdentical,
                     ..
                 }
             )
         })
     });
-    let needs_float_to_int = regions.values().any(|region| {
+    let needs_array_equal = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(
+                kind,
+                RegionInstructionKind::Compare {
+                    op: RegionCompareOpCode::Equal | RegionCompareOpCode::NotEqual,
+                    ..
+                }
+            )
+        })
+    });
+    let needs_array_compare = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(
+                kind,
+                RegionInstructionKind::Compare {
+                    op: RegionCompareOpCode::Less
+                        | RegionCompareOpCode::LessEqual
+                        | RegionCompareOpCode::Greater
+                        | RegionCompareOpCode::GreaterEqual
+                        | RegionCompareOpCode::Spaceship,
+                    ..
+                }
+            )
+        })
+    });
+    let needs_array_cast = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(
+                kind,
+                RegionInstructionKind::Cast {
+                    op: RegionCastOp::Array,
+                    ..
+                }
+            )
+        })
+    });
+    let needs_int_cast = regions.values().any(|region| {
         region_contains(region, |kind| {
             matches!(
                 kind,
                 RegionInstructionKind::Cast {
                     op: RegionCastOp::Int,
                     ..
-                } | RegionInstructionKind::Unary {
-                    op: RegionUnaryOp::BitNot,
+                }
+            )
+        })
+    });
+    let needs_float_cast = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(
+                kind,
+                RegionInstructionKind::Cast {
+                    op: RegionCastOp::Float,
+                    ..
+                }
+            )
+        })
+    });
+    let needs_string_cast = call_scalar_helper_needs.string_cast
+        || regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(
+                    kind,
+                    RegionInstructionKind::Cast {
+                        op: RegionCastOp::String,
+                        ..
+                    }
+                ) || matches!(kind, RegionInstructionKind::NativeCall(call)
+                if stable_builtin_scalar_consumer(&call.target)
+                    == Some(StableScalarConsumerBuiltin::StrVal))
+            })
+        });
+    // Compare operands are dynamically typed at this boundary. Loose
+    // equality and ordering therefore publish both exact compound lanes;
+    // generated code selects arrays, objects, or direct scalar CLIF.
+    let needs_object_equal = needs_array_equal;
+    let needs_object_compare = needs_array_compare;
+    let needs_object_cast = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(
+                kind,
+                RegionInstructionKind::Cast {
+                    op: RegionCastOp::Object,
                     ..
                 }
             )
@@ -1407,7 +2030,9 @@ pub(super) fn compile_region_graph_native(
                     prepared_class: None,
                     ..
                 }
-            )
+            ) || matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_scalar_consumer(&call.target)
+                        == Some(StableScalarConsumerBuiltin::GetDebugType))
         })
     });
     let needs_echo = regions.values().any(|region| {
@@ -1536,6 +2161,44 @@ pub(super) fn compile_region_graph_native(
                     | RegionInstructionKind::BindReferenceIntoPropertyDim { .. }
                     | RegionInstructionKind::BindReferenceDimFromProperty { .. }
             )
+        })
+    });
+    let needs_dynamic_property_slot = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(kind, RegionInstructionKind::NativeCall(call)
+            if matches!(
+                &call.target,
+                RegionCallTarget::Semantic {
+                    operation: RegionSemanticOp::PropertyFetch {
+                        property: RegionPropertyName::Dynamic(_),
+                        ..
+                    } | RegionSemanticOp::PropertyAssign {
+                        property: RegionPropertyName::Dynamic(_),
+                        ..
+                    } | RegionSemanticOp::PropertyIsset {
+                        property: RegionPropertyName::Dynamic(_),
+                        ..
+                    } | RegionSemanticOp::PropertyEmpty {
+                        property: RegionPropertyName::Dynamic(_),
+                        ..
+                    } | RegionSemanticOp::PropertyUnset {
+                        property: RegionPropertyName::Dynamic(_),
+                        ..
+                    } | RegionSemanticOp::PropertyDimAssign {
+                        property: RegionPropertyName::Dynamic(_),
+                        ..
+                    } | RegionSemanticOp::PropertyDimIsset {
+                        property: RegionPropertyName::Dynamic(_),
+                        ..
+                    } | RegionSemanticOp::PropertyDimEmpty {
+                        property: RegionPropertyName::Dynamic(_),
+                        ..
+                    } | RegionSemanticOp::PropertyDimUnset {
+                        property: RegionPropertyName::Dynamic(_),
+                        ..
+                    }
+                }
+            ))
         })
     });
     let needs_object_clone = regions.values().any(|region| {
@@ -1707,7 +2370,20 @@ pub(super) fn compile_region_graph_native(
     let needs_binary = baseline_helper_imports && needs_binary;
     let needs_compare = baseline_helper_imports && needs_compare;
     let needs_float_to_string = !baseline_helper_imports && needs_float_to_string;
-    let needs_float_to_int = !baseline_helper_imports && needs_float_to_int;
+    let needs_numeric_string = !baseline_helper_imports && needs_numeric_string;
+    let needs_pow_f64 = !baseline_helper_imports && needs_pow_f64;
+    let needs_fmod_f64 = !baseline_helper_imports && needs_fmod_f64;
+    let needs_round_f64 = !baseline_helper_imports && needs_round_f64;
+    let needs_array_identical = !baseline_helper_imports && needs_array_identical;
+    let needs_array_equal = !baseline_helper_imports && needs_array_equal;
+    let needs_array_compare = !baseline_helper_imports && needs_array_compare;
+    let needs_array_cast = !baseline_helper_imports && needs_array_cast;
+    let needs_int_cast = !baseline_helper_imports && needs_int_cast;
+    let needs_float_cast = !baseline_helper_imports && needs_float_cast;
+    let needs_string_cast = !baseline_helper_imports && needs_string_cast;
+    let needs_object_equal = !baseline_helper_imports && needs_object_equal;
+    let needs_object_compare = !baseline_helper_imports && needs_object_compare;
+    let needs_object_cast = !baseline_helper_imports && needs_object_cast;
     let needs_object_class_name = !baseline_helper_imports && needs_object_class_name;
     let needs_cast = baseline_helper_imports && needs_cast;
     let needs_direct_echo = !baseline_helper_imports && needs_echo;
@@ -1727,6 +2403,7 @@ pub(super) fn compile_region_graph_native(
     let needs_property_assign = baseline_helper_imports && needs_property_assign;
     let needs_object_clone = baseline_helper_imports && needs_object_clone;
     let needs_plain_object_clone = !baseline_helper_imports && needs_plain_object_clone;
+    let needs_dynamic_property_slot = !baseline_helper_imports && needs_dynamic_property_slot;
     let needs_object_clone_with = baseline_helper_imports && needs_object_clone_with;
     let needs_array_insert = baseline_helper_imports && needs_array_insert;
     let needs_array_fetch = baseline_helper_imports && needs_array_fetch;
@@ -1853,6 +2530,207 @@ pub(super) fn compile_region_graph_native(
         }
         imports.push((builtin.symbol().to_owned(), address));
     }
+    for builtin in StableHashBuiltin::all() {
+        if !needs_exact_hash[builtin.index()] {
+            continue;
+        }
+        let address = match builtin {
+            StableHashBuiltin::Md5 => runtime_helpers.native_md5,
+            StableHashBuiltin::Sha1 => runtime_helpers.native_sha1,
+            StableHashBuiltin::Crc32 => runtime_helpers.native_crc32,
+            StableHashBuiltin::Hash => runtime_helpers.native_hash,
+            StableHashBuiltin::HashHmac => runtime_helpers.native_hash_hmac,
+            StableHashBuiltin::HashEquals => runtime_helpers.native_hash_equals,
+        };
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_HASH",
+                format!(
+                    "prepared hash builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableByteCodecBuiltin::all() {
+        if !needs_exact_byte_codec[builtin.index()] {
+            continue;
+        }
+        let address = match builtin {
+            StableByteCodecBuiltin::Base64Encode => runtime_helpers.native_base64_encode,
+            StableByteCodecBuiltin::Base64Decode => runtime_helpers.native_base64_decode,
+            StableByteCodecBuiltin::Bin2Hex => runtime_helpers.native_bin2hex,
+            StableByteCodecBuiltin::Hex2Bin => runtime_helpers.native_hex2bin,
+            StableByteCodecBuiltin::QuotedPrintableDecode => {
+                runtime_helpers.native_quoted_printable_decode
+            }
+            StableByteCodecBuiltin::UrlEncode => runtime_helpers.native_urlencode,
+            StableByteCodecBuiltin::RawUrlEncode => runtime_helpers.native_rawurlencode,
+            StableByteCodecBuiltin::UrlDecode => runtime_helpers.native_urldecode,
+            StableByteCodecBuiltin::RawUrlDecode => runtime_helpers.native_rawurldecode,
+            StableByteCodecBuiltin::UuEncode => runtime_helpers.native_convert_uuencode,
+            StableByteCodecBuiltin::UuDecode => runtime_helpers.native_convert_uudecode,
+            StableByteCodecBuiltin::AddCSlashes => runtime_helpers.native_addcslashes,
+            StableByteCodecBuiltin::StripCSlashes => runtime_helpers.native_stripcslashes,
+            StableByteCodecBuiltin::StripSlashes => runtime_helpers.native_stripslashes,
+            StableByteCodecBuiltin::QuoteMeta => runtime_helpers.native_quotemeta,
+        };
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_BYTE_CODEC",
+                format!(
+                    "prepared byte-codec builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableStringSearchCompareBuiltin::all() {
+        if !needs_exact_string_search_compare[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_string_search_compare[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_STRING_SEARCH_COMPARE",
+                format!(
+                    "prepared string search/compare builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableStringRewriteBuiltin::all() {
+        if !needs_exact_string_rewrite[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_string_rewrite[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_STRING_REWRITE",
+                format!(
+                    "prepared string rewrite builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableHtmlCodecBuiltin::all() {
+        if !needs_exact_html_codec[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_html_codec[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_HTML_CODEC",
+                format!(
+                    "prepared HTML codec builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableUrlQueryBuiltin::all() {
+        if !needs_exact_url_query[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_url_query[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_URL_QUERY",
+                format!(
+                    "prepared URL/query builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableArrayPreservingSortBuiltin::all() {
+        if !needs_exact_array_preserving_sort[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_array_preserving_sort[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_ARRAY_PRESERVING_SORT",
+                format!(
+                    "prepared key-preserving sort requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableFrameIntrospectionBuiltin::all() {
+        if !needs_exact_frame_introspection[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_frame_introspection[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_FRAME_INTROSPECTION",
+                format!(
+                    "prepared frame-introspection builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableBaseConversionBuiltin::all() {
+        if !needs_exact_base_conversion[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_base_conversion[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_BASE_CONVERSION",
+                format!(
+                    "prepared base-conversion builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableNetworkAddressBuiltin::all() {
+        if !needs_exact_network_address[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_network_address[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_NETWORK_ADDRESS",
+                format!(
+                    "prepared network-address builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableCompressionCodecBuiltin::all() {
+        if !needs_exact_compression_codec[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_compression_codec[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_COMPRESSION_CODEC",
+                format!(
+                    "prepared compression-codec builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
     for builtin in StablePathBuiltin::all() {
         if !needs_exact_path[builtin.index()] {
             continue;
@@ -1903,12 +2781,6 @@ pub(super) fn compile_region_graph_native(
         imports.push((
             native_dynamic_code_symbol.clone(),
             runtime_helpers.native_dynamic_code,
-        ));
-    }
-    if needs_exact_include {
-        imports.push((
-            native_include_symbol.clone(),
-            runtime_helpers.native_include,
         ));
     }
     for (needed, configured, fallback, symbol) in [
@@ -2121,32 +2993,14 @@ pub(super) fn compile_region_graph_native(
         }
     }
     if needs_direct_echo {
-        for (configured, fallback, symbol) in [
-            (
-                runtime_helpers.native_echo_bytes,
-                test_native_echo_bytes_fallback as *const () as usize,
-                "phrust_native_echo_bytes",
-            ),
-            (
-                runtime_helpers.native_echo_int,
-                test_native_echo_int_fallback as *const () as usize,
-                "phrust_native_echo_int",
-            ),
-            (
-                runtime_helpers.native_echo_float,
-                test_native_echo_float_fallback as *const () as usize,
-                "phrust_native_echo_float",
-            ),
-        ] {
-            imports.push((
-                symbol.to_owned(),
-                if configured == 0 {
-                    fallback
-                } else {
-                    configured
-                },
-            ));
-        }
+        imports.push((
+            "phrust_native_echo_bytes".to_owned(),
+            if runtime_helpers.native_echo_bytes == 0 {
+                test_native_echo_bytes_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_echo_bytes
+            },
+        ));
     }
     if needs_float_to_string {
         imports.push((
@@ -2158,13 +3012,135 @@ pub(super) fn compile_region_graph_native(
             },
         ));
     }
-    if needs_float_to_int {
+    if needs_numeric_string {
         imports.push((
-            "phrust_native_float_to_int".to_owned(),
-            if runtime_helpers.native_float_to_int == 0 {
-                test_native_float_to_int_fallback as *const () as usize
+            "phrust_native_numeric_string".to_owned(),
+            if runtime_helpers.native_numeric_string == 0 {
+                test_native_numeric_string_fallback as *const () as usize
             } else {
-                runtime_helpers.native_float_to_int
+                runtime_helpers.native_numeric_string
+            },
+        ));
+    }
+    if needs_pow_f64 {
+        imports.push((
+            "phrust_native_pow_f64".to_owned(),
+            if runtime_helpers.native_pow_f64 == 0 {
+                test_native_pow_f64_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_pow_f64
+            },
+        ));
+    }
+    if needs_fmod_f64 {
+        imports.push((
+            "phrust_native_fmod_f64".to_owned(),
+            if runtime_helpers.native_fmod_f64 == 0 {
+                test_native_fmod_f64_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_fmod_f64
+            },
+        ));
+    }
+    if needs_round_f64 {
+        imports.push((
+            "phrust_native_round_f64".to_owned(),
+            if runtime_helpers.native_round_f64 == 0 {
+                test_native_round_f64_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_round_f64
+            },
+        ));
+    }
+    for builtin in StablePureMathBuiltin::all() {
+        if !needs_exact_pure_math[builtin.index()] {
+            continue;
+        }
+        let configured = runtime_helpers.native_pure_math[builtin.index()];
+        imports.push((
+            builtin.symbol().to_owned(),
+            if configured == 0 {
+                test_native_pure_math_fallback(builtin)
+            } else {
+                configured
+            },
+        ));
+    }
+    for (needed, configured, symbol) in [
+        (
+            needs_array_identical,
+            runtime_helpers.native_array_identical,
+            "phrust_native_array_identical",
+        ),
+        (
+            needs_array_equal,
+            runtime_helpers.native_array_equal,
+            "phrust_native_array_equal",
+        ),
+        (
+            needs_array_compare,
+            runtime_helpers.native_array_compare,
+            "phrust_native_array_compare",
+        ),
+        (
+            needs_object_equal,
+            runtime_helpers.native_object_equal,
+            "phrust_native_object_equal",
+        ),
+        (
+            needs_object_compare,
+            runtime_helpers.native_object_compare,
+            "phrust_native_object_compare",
+        ),
+    ] {
+        if needed {
+            imports.push((
+                symbol.to_owned(),
+                if configured == 0 {
+                    test_native_array_comparison_fallback as *const () as usize
+                } else {
+                    configured
+                },
+            ));
+        }
+    }
+    if needs_array_cast {
+        imports.push((
+            "phrust_native_array_cast".to_owned(),
+            if runtime_helpers.native_array_cast == 0 {
+                test_native_array_cast_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_array_cast
+            },
+        ));
+    }
+    if needs_int_cast {
+        imports.push((
+            "phrust_native_int_cast".to_owned(),
+            if runtime_helpers.native_int_cast == 0 {
+                test_native_int_cast_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_int_cast
+            },
+        ));
+    }
+    if needs_float_cast {
+        imports.push((
+            "phrust_native_float_cast".to_owned(),
+            if runtime_helpers.native_float_cast == 0 {
+                test_native_float_cast_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_float_cast
+            },
+        ));
+    }
+    if needs_string_cast {
+        imports.push((
+            "phrust_native_string_cast".to_owned(),
+            if runtime_helpers.native_string_cast == 0 {
+                test_native_string_cast_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_string_cast
             },
         ));
     }
@@ -2175,6 +3151,16 @@ pub(super) fn compile_region_graph_native(
                 test_native_object_class_name_fallback as *const () as usize
             } else {
                 runtime_helpers.native_object_class_name
+            },
+        ));
+    }
+    if needs_object_cast {
+        imports.push((
+            "phrust_native_object_cast".to_owned(),
+            if runtime_helpers.native_object_cast == 0 {
+                test_native_object_cast_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_object_cast
             },
         ));
     }
@@ -2205,6 +3191,16 @@ pub(super) fn compile_region_graph_native(
                 test_native_plain_object_clone_fallback as *const () as usize
             } else {
                 runtime_helpers.native_plain_object_clone
+            },
+        ));
+    }
+    if needs_dynamic_property_slot {
+        imports.push((
+            "phrust_native_dynamic_property_slot".to_owned(),
+            if runtime_helpers.native_dynamic_property_slot == 0 {
+                test_native_dynamic_property_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_dynamic_property_slot
             },
         ));
     }
@@ -2294,25 +3290,6 @@ pub(super) fn compile_region_graph_native(
             } else {
                 None
             };
-            let native_include = if needs_exact_include {
-                let pointer_type = module.target_config().pointer_type();
-                let mut signature = module.make_signature();
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(types::I64));
-                signature.params.push(AbiParam::new(pointer_type));
-                signature.returns.push(AbiParam::new(types::I64));
-                signature.returns.push(AbiParam::new(types::I64));
-                Some(declare_native_helper(
-                    module,
-                    &native_include_symbol,
-                    &signature,
-                    helper_address(&native_include_symbol),
-                )?)
-            } else {
-                None
-            };
             let mut native_operations = NativeOperationFunctions::default();
             let pointer_type = module.target_config().pointer_type();
             let mut exact_symbol_query = [None; StableSymbolQueryBuiltin::COUNT];
@@ -2391,6 +3368,218 @@ pub(super) fn compile_region_graph_native(
                     helper_address(builtin.symbol()),
                 )?);
             }
+            let mut exact_hash = [None; StableHashBuiltin::COUNT];
+            for builtin in StableHashBuiltin::all() {
+                if !needs_exact_hash[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_hash[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_byte_codec = [None; StableByteCodecBuiltin::COUNT];
+            for builtin in StableByteCodecBuiltin::all() {
+                if !needs_exact_byte_codec[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_byte_codec[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_string_search_compare =
+                [None; StableStringSearchCompareBuiltin::COUNT];
+            for builtin in StableStringSearchCompareBuiltin::all() {
+                if !needs_exact_string_search_compare[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_string_search_compare[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_string_rewrite = [None; StableStringRewriteBuiltin::COUNT];
+            for builtin in StableStringRewriteBuiltin::all() {
+                if !needs_exact_string_rewrite[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_string_rewrite[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_html_codec = [None; StableHtmlCodecBuiltin::COUNT];
+            for builtin in StableHtmlCodecBuiltin::all() {
+                if !needs_exact_html_codec[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_html_codec[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_url_query = [None; StableUrlQueryBuiltin::COUNT];
+            for builtin in StableUrlQueryBuiltin::all() {
+                if !needs_exact_url_query[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_url_query[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_array_preserving_sort =
+                [None; StableArrayPreservingSortBuiltin::COUNT];
+            for builtin in StableArrayPreservingSortBuiltin::all() {
+                if !needs_exact_array_preserving_sort[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_array_preserving_sort[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_frame_introspection =
+                [None; StableFrameIntrospectionBuiltin::COUNT];
+            for builtin in StableFrameIntrospectionBuiltin::all() {
+                if !needs_exact_frame_introspection[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_frame_introspection[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_base_conversion = [None; StableBaseConversionBuiltin::COUNT];
+            for builtin in StableBaseConversionBuiltin::all() {
+                if !needs_exact_base_conversion[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_base_conversion[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_network_address = [None; StableNetworkAddressBuiltin::COUNT];
+            for builtin in StableNetworkAddressBuiltin::all() {
+                if !needs_exact_network_address[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_network_address[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_compression_codec = [None; StableCompressionCodecBuiltin::COUNT];
+            for builtin in StableCompressionCodecBuiltin::all() {
+                if !needs_exact_compression_codec[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_compression_codec[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
             let mut exact_path = [None; StablePathBuiltin::COUNT];
             for builtin in StablePathBuiltin::all() {
                 if !needs_exact_path[builtin.index()] {
@@ -2410,7 +3599,7 @@ pub(super) fn compile_region_graph_native(
                     helper_address(builtin.symbol()),
                 )?);
             }
-            let (echo_bytes, echo_int, echo_float) = if needs_direct_echo {
+            let echo_bytes = if needs_direct_echo {
                 let mut bytes_signature = module.make_signature();
                 bytes_signature.params.push(AbiParam::new(pointer_type));
                 bytes_signature.params.push(AbiParam::new(types::I64));
@@ -2420,25 +3609,9 @@ pub(super) fn compile_region_graph_native(
                     &bytes_signature,
                     helper_address("phrust_native_echo_bytes"),
                 )?;
-                let mut int_signature = module.make_signature();
-                int_signature.params.push(AbiParam::new(types::I64));
-                let int = declare_native_helper(
-                    module,
-                    "phrust_native_echo_int",
-                    &int_signature,
-                    helper_address("phrust_native_echo_int"),
-                )?;
-                let mut float_signature = module.make_signature();
-                float_signature.params.push(AbiParam::new(types::F64));
-                let float = declare_native_helper(
-                    module,
-                    "phrust_native_echo_float",
-                    &float_signature,
-                    helper_address("phrust_native_echo_float"),
-                )?;
-                (Some(bytes), Some(int), Some(float))
+                Some(bytes)
             } else {
-                (None, None, None)
+                None
             };
             let float_to_string = if needs_float_to_string {
                 let mut signature = module.make_signature();
@@ -2454,23 +3627,157 @@ pub(super) fn compile_region_graph_native(
             } else {
                 None
             };
-            let float_to_int = if needs_float_to_int {
+            let numeric_string = if needs_numeric_string {
                 let mut signature = module.make_signature();
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(types::F64));
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.params.push(AbiParam::new(types::I64));
                 signature.returns.push(AbiParam::new(types::I64));
                 signature.returns.push(AbiParam::new(types::I64));
-                Some(declare_native_helper(
+                Some(declare_native_pure_handler(
                     module,
-                    "phrust_native_float_to_int",
+                    "phrust_native_numeric_string",
                     &signature,
-                    helper_address("phrust_native_float_to_int"),
+                    helper_address("phrust_native_numeric_string"),
                 )?)
             } else {
                 None
             };
+            let pow_f64 = if needs_pow_f64 {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::F64));
+                signature.params.push(AbiParam::new(types::F64));
+                signature.returns.push(AbiParam::new(types::F64));
+                Some(declare_native_pure_handler(
+                    module,
+                    "phrust_native_pow_f64",
+                    &signature,
+                    helper_address("phrust_native_pow_f64"),
+                )?)
+            } else {
+                None
+            };
+            let fmod_f64 = if needs_fmod_f64 {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::F64));
+                signature.params.push(AbiParam::new(types::F64));
+                signature.returns.push(AbiParam::new(types::F64));
+                Some(declare_native_pure_handler(
+                    module,
+                    "phrust_native_fmod_f64",
+                    &signature,
+                    helper_address("phrust_native_fmod_f64"),
+                )?)
+            } else {
+                None
+            };
+            let round_f64 = if needs_round_f64 {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::F64));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::F64));
+                Some(declare_native_pure_handler(
+                    module,
+                    "phrust_native_round_f64",
+                    &signature,
+                    helper_address("phrust_native_round_f64"),
+                )?)
+            } else {
+                None
+            };
+            let mut pure_math = [None; StablePureMathBuiltin::COUNT];
+            for builtin in StablePureMathBuiltin::all() {
+                if !needs_exact_pure_math[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                for _ in 0..if builtin.accepts_arity(2) { 2 } else { 1 } {
+                    signature.params.push(AbiParam::new(types::F64));
+                }
+                signature.returns.push(AbiParam::new(types::F64));
+                pure_math[builtin.index()] = Some(declare_native_pure_handler(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let declare_array_comparison =
+                |module: &mut JITModule,
+                 needed: bool,
+                 symbol: &str|
+                 -> Result<Option<NativeHelper>, CraneliftLoweringError> {
+                    if !needed {
+                        return Ok(None);
+                    }
+                    let mut signature = module.make_signature();
+                    signature.params.push(AbiParam::new(types::I64));
+                    signature.params.push(AbiParam::new(types::I64));
+                    signature.returns.push(AbiParam::new(types::I64));
+                    signature.returns.push(AbiParam::new(types::I64));
+                    declare_native_helper(module, symbol, &signature, helper_address(symbol))
+                        .map(Some)
+                };
+            let array_identical = declare_array_comparison(
+                module,
+                needs_array_identical,
+                "phrust_native_array_identical",
+            )?;
+            let array_equal = declare_array_comparison(
+                module,
+                needs_array_equal,
+                "phrust_native_array_equal",
+            )?;
+            let array_compare = declare_array_comparison(
+                module,
+                needs_array_compare,
+                "phrust_native_array_compare",
+            )?;
+            let array_cast = declare_native_control_handler(
+                module,
+                needs_array_cast,
+                "phrust_native_array_cast",
+                1,
+                || helper_address("phrust_native_array_cast"),
+            )?;
+            let int_cast = declare_native_control_handler(
+                module,
+                needs_int_cast,
+                "phrust_native_int_cast",
+                1,
+                || helper_address("phrust_native_int_cast"),
+            )?;
+            let float_cast = declare_native_control_handler(
+                module,
+                needs_float_cast,
+                "phrust_native_float_cast",
+                1,
+                || helper_address("phrust_native_float_cast"),
+            )?;
+            let string_cast = declare_native_control_handler(
+                module,
+                needs_string_cast,
+                "phrust_native_string_cast",
+                1,
+                || helper_address("phrust_native_string_cast"),
+            )?;
+            let object_equal = declare_array_comparison(
+                module,
+                needs_object_equal,
+                "phrust_native_object_equal",
+            )?;
+            let object_compare = declare_array_comparison(
+                module,
+                needs_object_compare,
+                "phrust_native_object_compare",
+            )?;
+            let object_cast = declare_native_control_handler(
+                module,
+                needs_object_cast,
+                "phrust_native_object_cast",
+                1,
+                || helper_address("phrust_native_object_cast"),
+            )?;
             let object_class_name = if needs_object_class_name {
                 let mut signature = module.make_signature();
                 signature.params.push(AbiParam::new(types::I64));
@@ -2529,6 +3836,13 @@ pub(super) fn compile_region_graph_native(
             } else {
                 None
             };
+            let dynamic_property_slot = declare_native_control_handler(
+                module,
+                needs_dynamic_property_slot,
+                "phrust_native_dynamic_property_slot",
+                2,
+                || helper_address("phrust_native_dynamic_property_slot"),
+            )?;
             if needs_builtin_dispatch {
                 let mut signature = module.make_signature();
                 signature.params.push(AbiParam::new(types::I32));
@@ -3016,20 +4330,43 @@ pub(super) fn compile_region_graph_native(
                 functions.insert(value_release_commit_symbol, value_release_commit);
                 NativeTierOperations::Optimizing {
                     operations: NativeOptimizingOperations {
-                        include: native_include,
                         echo_bytes,
-                        echo_int,
-                        echo_float,
                         float_to_string,
-                        float_to_int,
+                        numeric_string,
+                        pow_f64,
+                        fmod_f64,
+                        round_f64,
+                        pure_math,
+                        array_identical,
+                        array_equal,
+                        array_compare,
+                        array_cast,
+                        int_cast,
+                        float_cast,
+                        string_cast,
+                        object_equal,
+                        object_compare,
+                        object_cast,
                         object_class_name,
                         prepared_object_new,
                         prepared_closure_new,
                         plain_object_clone,
+                        dynamic_property_slot,
                         exact_symbol_query,
                         exact_pcre,
                         exact_json,
                         exact_format,
+                        exact_hash,
+                        exact_byte_codec,
+                        exact_string_search_compare,
+                        exact_string_rewrite,
+                        exact_html_codec,
+                        exact_url_query,
+                        exact_array_preserving_sort,
+                        exact_frame_introspection,
+                        exact_base_conversion,
+                        exact_network_address,
+                        exact_compression_codec,
                         exact_path,
                         array_ensure_unique,
                         array_ensure_unique_symbol,
@@ -3094,34 +4431,39 @@ pub(super) fn compile_region_graph_native(
                             .len();
                     Some((
                         function_id,
-                        (
-                            function.name.clone(),
-                            function.params.clone(),
-                            ir_function_requires_trampoline(function),
+                        NativeFunctionMetadata {
+                            name: function.name.clone(),
+                            params: function.params.clone(),
+                            requires_trampoline: ir_function_requires_trampoline(function),
                             native_arity,
-                            (function.params.iter().any(|parameter| parameter.by_ref)
+                            reference_only_trampoline: (function
+                                .params
+                                .iter()
+                                .any(|parameter| parameter.by_ref)
                                 || function.returns_by_ref)
                                 && !ir_function_requires_non_reference_trampoline(function),
-                        ),
+                            returns_by_reference: function.returns_by_ref,
+                        },
                     ))
                 })
                 .collect::<BTreeMap<_, _>>();
             function_params.extend(regions.iter().map(|(function, region)| {
+                let ir_function = &unit.functions[function.index()];
                 (
                     *function,
-                    (
-                        unit.functions[function.index()].name.clone(),
-                        region.params.clone(),
-                        trampoline_functions.contains(function),
-                        region.arity(),
-                        unit.functions
-                            .get(function.index())
-                            .is_some_and(|function| {
-                                (function.params.iter().any(|parameter| parameter.by_ref)
-                                    || function.returns_by_ref)
-                                    && !ir_function_requires_non_reference_trampoline(function)
-                            }),
-                    ),
+                    NativeFunctionMetadata {
+                        name: ir_function.name.clone(),
+                        params: region.params.clone(),
+                        requires_trampoline: trampoline_functions.contains(function),
+                        native_arity: region.arity(),
+                        reference_only_trampoline: (ir_function
+                            .params
+                            .iter()
+                            .any(|parameter| parameter.by_ref)
+                            || ir_function.returns_by_ref)
+                            && !ir_function_requires_non_reference_trampoline(ir_function),
+                        returns_by_reference: ir_function.returns_by_ref,
+                    },
                 )
             }));
             let mut preflighted_whole = None;
@@ -3721,25 +5063,16 @@ pub(super) fn compile_region_graph_native(
                                 if call.direct_compiled_target().is_some_and(|target| {
                                     (regions.contains_key(&target) || needs_function_resolver)
                                         && function_params.get(&target).is_some_and(
-                                            |(
-                                                _,
-                                                params,
-                                                requires_trampoline,
-                                                arity,
-                                                reference_only_trampoline,
-                                            )| {
-                                                *arity == call.operands.len()
-                                                    && (!*requires_trampoline
-                                                        || (*reference_only_trampoline
-                                                            && params.iter().enumerate().all(
+                                            |metadata| {
+                                                metadata.native_arity == call.operands.len()
+                                                    && (!metadata.requires_trampoline
+                                                        || (metadata.reference_only_trampoline
+                                                            && metadata.params.iter().enumerate().all(
                                                                 |(index, parameter)| {
-                                                                    !parameter.by_ref
+                                                                        !parameter.by_ref
                                                                         || call.args.get(index).is_some_and(
                                                                             |argument| {
                                                                                 argument.by_ref_local.is_some()
-                                                                                    && argument.by_ref_dim.is_none()
-                                                                                    && argument.by_ref_property.is_none()
-                                                                                    && argument.by_ref_property_dim.is_none()
                                                                             },
                                                                         )
                                                                 },
@@ -3769,8 +5102,8 @@ pub(super) fn compile_region_graph_native(
                                         (regions.contains_key(&target) || needs_function_resolver)
                                             && function_params
                                                 .get(&target)
-                                                .is_some_and(|(_, _, requires_trampoline, _, _)| {
-                                                    !requires_trampoline
+                                                .is_some_and(|metadata| {
+                                                    !metadata.requires_trampoline
                                                 })
                                             && !matches!(
                                                 call.result,
@@ -3855,17 +5188,28 @@ pub(super) fn compile_region_graph_native(
                             if matches!(
                                 symbol.as_str(),
                                 "phrust_native_define"
-                                    | "phrust_native_include"
                                     | "phrust_native_defined"
                                     | "phrust_native_echo_bytes"
-                                    | "phrust_native_echo_int"
-                                    | "phrust_native_echo_float"
                                     | "phrust_native_float_to_string"
-                                    | "phrust_native_float_to_int"
+                                    | "phrust_native_numeric_string"
+                                    | "phrust_native_pow_f64"
+                                    | "phrust_native_fmod_f64"
+                                    | "phrust_native_round_f64"
+                                    | "phrust_native_array_identical"
+                                    | "phrust_native_array_equal"
+                                    | "phrust_native_array_compare"
+                                    | "phrust_native_array_cast"
+                                    | "phrust_native_int_cast"
+                                    | "phrust_native_float_cast"
+                                    | "phrust_native_string_cast"
+                                    | "phrust_native_object_equal"
+                                    | "phrust_native_object_compare"
+                                    | "phrust_native_object_cast"
                                     | "phrust_native_object_class_name"
                                     | "phrust_native_prepared_object_new"
                                     | "phrust_native_prepared_closure_new"
                                     | "phrust_native_plain_object_clone"
+                                    | "phrust_native_dynamic_property_slot"
                                     | "phrust_native_function_exists"
                                     | "phrust_native_class_exists"
                                     | "phrust_native_interface_exists"
@@ -3876,12 +5220,63 @@ pub(super) fn compile_region_graph_native(
                             )
                                 || symbol.starts_with("phrust_native_preg_")
                                 || symbol.starts_with("phrust_native_json_")
+                                || StablePureMathBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || StableBaseConversionBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || StableNetworkAddressBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || StableCompressionCodecBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || StableStringSearchCompareBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || StableStringRewriteBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || StableHtmlCodecBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || StableUrlQueryBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || StableArrayPreservingSortBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || StableFrameIntrospectionBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
                                 || matches!(
                                     symbol.as_str(),
                                     "phrust_native_sprintf"
                                         | "phrust_native_printf"
                                         | "phrust_native_vsprintf"
                                         | "phrust_native_vprintf"
+                                        | "phrust_native_md5"
+                                        | "phrust_native_sha1"
+                                        | "phrust_native_crc32"
+                                        | "phrust_native_hash"
+                                        | "phrust_native_hash_hmac"
+                                        | "phrust_native_hash_equals"
+                                        | "phrust_native_base64_encode"
+                                        | "phrust_native_base64_decode"
+                                        | "phrust_native_bin2hex"
+                                        | "phrust_native_hex2bin"
+                                        | "phrust_native_quoted_printable_decode"
+                                        | "phrust_native_urlencode"
+                                        | "phrust_native_rawurlencode"
+                                        | "phrust_native_urldecode"
+                                        | "phrust_native_rawurldecode"
+                                        | "phrust_native_convert_uuencode"
+                                        | "phrust_native_convert_uudecode"
+                                        | "phrust_native_addcslashes"
+                                        | "phrust_native_stripcslashes"
+                                        | "phrust_native_stripslashes"
+                                        | "phrust_native_quotemeta"
                                         | "phrust_native_basename"
                                         | "phrust_native_dirname"
                                         | "phrust_native_realpath"
@@ -3954,16 +5349,39 @@ pub(super) fn select_native_region_tier(
     _plan: &NativeCompilePlan,
     _constants: &[IrConstant],
 ) {
+    let source_register_state = (candidate.compile_metadata.tier == NativeCompilerTier::Optimizing)
+        .then(|| {
+            let mut source = candidate.clone();
+            for block in &mut source.blocks {
+                block.terminator_live_registers = None;
+                for instruction in &mut block.instructions {
+                    instruction.transition_live_registers = None;
+                }
+            }
+            native_register_state_points(&source)
+        });
     // Baseline and optimizing code must share real CFG boundaries around a
     // baseline-only island.  Otherwise baseline has no edge on which it can
     // re-enter the published optimizing continuation and one unsupported
     // operation silently downgrades the rest of the PHP block.
     *candidate = prepare_optimizing_baseline_islands(candidate.clone());
     if candidate.compile_metadata.tier == NativeCompilerTier::Optimizing {
+        pin_native_transition_registers(
+            candidate,
+            source_register_state
+                .as_ref()
+                .expect("optimizing tier owns source register state"),
+        );
         let _ = crate::region_ir::opt::optimize_executable_region(candidate);
         // Optimization may remove instructions, but it must not collapse a
         // direct/unsupported family boundary into one lowering block.
         *candidate = prepare_optimizing_baseline_islands(candidate.clone());
+        pin_native_transition_registers(
+            candidate,
+            source_register_state
+                .as_ref()
+                .expect("optimizing tier owns source register state"),
+        );
     }
 }
 
@@ -4037,6 +5455,7 @@ fn region_instruction_result_register(kind: &RegionInstructionKind) -> Option<Re
         | RegionInstructionKind::ForeachInitRef { iterator: dst, .. }
         | RegionInstructionKind::ForeachNext { has_value: dst, .. }
         | RegionInstructionKind::ForeachNextRef { has_value: dst, .. } => Some(*dst),
+        RegionInstructionKind::ArrayCallback(call) => Some(call.result),
         RegionInstructionKind::RuntimeFatal { dst: Some(dst), .. } => Some(*dst),
         RegionInstructionKind::NativeCall(RegionNativeCall {
             result: RegionCallResult::Register(dst),
@@ -4807,6 +6226,9 @@ fn define_region_fragment_wrapper(
                     )
                 })?,
             );
+            if value_flow.owns_parameter_at_entry(*local) {
+                lower_optimizing_retain(&mut builder, value, deopt_out);
+            }
             builder.ins().store(
                 MemFlagsData::new(),
                 value,
@@ -5543,6 +6965,9 @@ fn define_region_graph_function(
                         )
                     })?,
                 );
+                if value_flow.owns_parameter_at_entry(*param) {
+                    lower_optimizing_retain(&mut builder, value, deopt_out);
+                }
                 define_local_variable(&mut builder, &locals, *param, value)?;
             }
         } else if inline_fragment_entry {
@@ -5582,6 +7007,9 @@ fn define_region_graph_function(
                         )
                     })?,
                 );
+                if value_flow.owns_parameter_at_entry(*local) {
+                    lower_optimizing_retain(&mut builder, value, deopt_out);
+                }
                 builder.ins().store(
                     MemFlagsData::new(),
                     value,
@@ -6248,14 +7676,12 @@ fn define_region_graph_function(
                 let count_visits = builder.create_block();
                 let poll = builder.create_block();
                 let continue_execution = builder.create_block();
-                let runtime_view_offset =
-                    std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
+                let runtime_view = lower_active_runtime_view(&mut builder, deopt_out);
                 let counter_address = builder.ins().load(
                     types::I64,
                     MemFlagsData::new(),
-                    deopt_out,
-                    runtime_view_offset
-                        + std::mem::offset_of!(crate::JitNativeRuntimeView, poll_counter) as i32,
+                    runtime_view,
+                    std::mem::offset_of!(crate::JitNativeRuntimeView, poll_counter) as i32,
                 );
                 let pointer_type = module.target_config().pointer_type();
                 let counter_address = if pointer_type == types::I64 {
@@ -6346,6 +7772,7 @@ fn define_region_graph_function(
                             &value_flow,
                             inline_constants,
                             function_params,
+                            external_function_signatures,
                             runtime,
                             result_out,
                             deopt_out,
@@ -6399,6 +7826,7 @@ fn define_region_graph_function(
                         pending_status,
                         pending_value,
                         region.function,
+                        region.return_type.is_some(),
                         region.local_count,
                         native_version,
                         region.flags.is_top_level,
@@ -6460,6 +7888,7 @@ fn define_region_graph_function(
                     let value_release_commit =
                         module.declare_func_in_func(operations.value_release_commit, builder.func);
                     lower_optimizing_region_terminator(
+                        module,
                         &mut builder,
                         &blocks,
                         &locals,
@@ -6477,6 +7906,11 @@ fn define_region_graph_function(
                         native_version,
                         value_release_validate,
                         value_release_commit,
+                        operations.numeric_string,
+                        operations
+                            .string_cast
+                            .map(|helper| helper.with_runtime(runtime)),
+                        region.strict_types,
                         region.return_type.as_ref(),
                         &region_block.terminator,
                         constants,
@@ -7335,18 +8769,18 @@ fn lower_free_direct_array_entries(
     capacity: ir::Value,
 ) {
     let pointer_type = builder.func.dfg.value_type(deopt_out);
-    let view = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
+    let view = lower_active_runtime_view(builder, deopt_out);
     let arena = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
-        deopt_out,
-        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_array_entries) as i32,
+        view,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, direct_array_entries) as i32,
     );
     let free_heads = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
-        deopt_out,
-        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_array_free_heads) as i32,
+        view,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, direct_array_free_heads) as i32,
     );
     let leading = builder.ins().clz(capacity);
     let ceiling = builder.ins().iconst(types::I32, 31);
@@ -7379,18 +8813,18 @@ fn lower_free_direct_string_bytes(
     reserved: ir::Value,
 ) {
     let pointer_type = builder.func.dfg.value_type(deopt_out);
-    let view = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
+    let view = lower_active_runtime_view(builder, deopt_out);
     let arena = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
-        deopt_out,
-        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_string_bytes) as i32,
+        view,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, direct_string_bytes) as i32,
     );
     let free_heads = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
-        deopt_out,
-        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_string_free_heads) as i32,
+        view,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, direct_string_free_heads) as i32,
     );
     let capacity = builder.ins().ushr_imm(
         reserved,
@@ -7841,18 +9275,18 @@ fn lower_direct_array_ensure_unique_body(builder: &mut FunctionBuilder<'_>) {
     builder.switch_to_block(allocate);
     let destination_capacity = builder.block_params(allocate)[0];
     let clone = builder.block_params(allocate)[1];
-    let view = std::mem::offset_of!(crate::JitDeoptState, runtime_view) as i32;
+    let view = lower_active_runtime_view(builder, deopt_out);
     let arena = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
-        deopt_out,
-        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_array_entries) as i32,
+        view,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, direct_array_entries) as i32,
     );
     let free_heads = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
-        deopt_out,
-        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_array_free_heads) as i32,
+        view,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, direct_array_free_heads) as i32,
     );
     let leading = builder.ins().clz(destination_capacity);
     let ceiling = builder.ins().iconst(types::I32, 31);
@@ -7893,8 +9327,8 @@ fn lower_direct_array_ensure_unique_body(builder: &mut FunctionBuilder<'_>) {
     let next_ptr = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
-        deopt_out,
-        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_array_next) as i32,
+        view,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, direct_array_next) as i32,
     );
     let next_entry = builder
         .ins()
@@ -7932,8 +9366,8 @@ fn lower_direct_array_ensure_unique_body(builder: &mut FunctionBuilder<'_>) {
     let slots = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
-        deopt_out,
-        view + std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_slots) as i32,
+        view,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_slots) as i32,
     );
     let wide_new_index = builder.ins().uextend(pointer_type, new_index);
     let new_slot_offset = builder.ins().ishl_imm(wide_new_index, 5);
@@ -8914,6 +10348,49 @@ fn region_graph_metadata<'a>(
 
 #[cfg(test)]
 mod tests {
-    // Module-layout invariants are tested in `module_layout`; executable tests
-    // exercise the resulting multi-function publication and invocation path.
+    use super::*;
+
+    #[test]
+    fn direct_native_closure_construction_does_not_require_a_trampoline() {
+        let mut builder = php_ir::IrBuilder::new(php_ir::UnitId::new(7_001));
+        let file = builder.add_file("direct-native-closure.php");
+        let span = php_ir::IrSpan::new(file, 0, 1);
+
+        let closure = builder.start_function(
+            "direct_native_closure_body",
+            php_ir::FunctionFlags::default(),
+            span,
+        );
+        let closure_block = builder.append_block(closure);
+        builder.terminate_return(closure, closure_block, None, span);
+
+        let factory = builder.start_function(
+            "direct_native_closure_factory",
+            php_ir::FunctionFlags::default(),
+            span,
+        );
+        let factory_block = builder.append_block(factory);
+        let result = builder.alloc_register(factory);
+        builder.emit(
+            factory,
+            factory_block,
+            php_ir::InstructionKind::MakeClosure {
+                dst: result,
+                function: closure,
+                captures: Vec::new(),
+            },
+            span,
+        );
+        builder.terminate_return(
+            factory,
+            factory_block,
+            Some(php_ir::Operand::Register(result)),
+            span,
+        );
+
+        let unit = builder.finish();
+        let function = &unit.functions[factory.index()];
+        assert!(!ir_function_requires_non_reference_trampoline(function));
+        assert!(!ir_function_requires_trampoline(function));
+    }
 }

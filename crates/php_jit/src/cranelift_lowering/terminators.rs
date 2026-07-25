@@ -203,6 +203,22 @@ fn lower_optimizing_require_authoritative_return(
     Ok(())
 }
 
+fn lower_terminator_storage_value(
+    builder: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    operand: RegionOperand,
+    constants: &[IrConstant],
+    deopt_out: ir::Value,
+) -> (ir::Value, Option<ir::Value>) {
+    if let RegionOperand::Constant(index) = operand
+        && constant_requires_native_storage(constants, index)
+    {
+        let (value, borrowed) = lower_native_literal_value(builder, value, index, deopt_out);
+        return (value, Some(borrowed));
+    }
+    (value, None)
+}
+
 fn lower_optimizing_frame_cleanup(
     builder: &mut FunctionBuilder<'_>,
     cleanup: &[(LocalId, ir::Value)],
@@ -724,18 +740,52 @@ pub(super) fn lower_region_terminator(
         RegionTerminator::Return { value, finally } => {
             let operand = *value;
             let value = lower_region_operand(builder, locals, registers, operand)?;
-            let value = if return_check_required {
-                let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
-                lower_native_value_operation(
+            let fact = lowering_operand_fact(value_flow, constants, operand);
+            let (value, literal_borrowed) =
+                lower_terminator_storage_value(builder, value, operand, constants, deopt_out);
+            let value = if return_check_required && finally.is_none() {
+                let checked = lower_native_return_check_with_frame_cleanup(
                     module,
                     builder,
-                    native_operations.return_check,
-                    0,
-                    &[value, function_value],
+                    native_operations,
+                    function,
+                    value,
+                    matches!(operand, RegionOperand::Register(_))
+                        && fact.ownership == SsaOwnership::Owned
+                        && fact.has_runtime_lifecycle(),
+                    locals,
+                    value_flow,
                     result_out,
-                )?
+                    deopt_out,
+                )?;
+                let unchanged = builder.ins().icmp(IntCC::Equal, checked, value);
+                let preserve = builder.create_block();
+                let converted = builder.create_block();
+                let done = builder.create_block();
+                builder.ins().brif(unchanged, preserve, &[], converted, &[]);
+
+                builder.switch_to_block(preserve);
+                if fact.ownership == SsaOwnership::Borrowed {
+                    lower_guarded_value_release(
+                        module,
+                        builder,
+                        native_operations.value_release,
+                        native_dim_operation(0, function, 0),
+                        checked,
+                        result_out,
+                        deopt_out,
+                    )?;
+                } else if let Some(literal_borrowed) = literal_borrowed {
+                    lower_optimizing_retain_if(builder, checked, literal_borrowed, deopt_out);
+                }
+                builder.ins().jump(done, &[]);
+
+                builder.switch_to_block(converted);
+                builder.ins().jump(done, &[]);
+
+                builder.switch_to_block(done);
+                checked
             } else {
-                let fact = lowering_operand_fact(value_flow, constants, operand);
                 if fact.ownership == SsaOwnership::Borrowed {
                     lower_guarded_value_release(
                         module,
@@ -746,6 +796,9 @@ pub(super) fn lower_region_terminator(
                         result_out,
                         deopt_out,
                     )?
+                } else if let Some(literal_borrowed) = literal_borrowed {
+                    lower_optimizing_retain_if(builder, value, literal_borrowed, deopt_out);
+                    value
                 } else {
                     value
                 }
@@ -778,6 +831,22 @@ pub(super) fn lower_region_terminator(
             // it lets the caller install a recycled direct-reference slot and
             // breaks aliases such as `$b =& identity_ref($a)`.
             let local_value = use_local_variable(builder, locals, *local)?;
+            let local_value = if return_check_required && finally.is_none() {
+                lower_native_return_check_with_frame_cleanup(
+                    module,
+                    builder,
+                    native_operations,
+                    function,
+                    local_value,
+                    false,
+                    locals,
+                    value_flow,
+                    result_out,
+                    deopt_out,
+                )?
+            } else {
+                local_value
+            };
             let value = lower_guarded_value_release(
                 module,
                 builder,
@@ -812,6 +881,8 @@ pub(super) fn lower_region_terminator(
             let value = if let Some(operand) = *value {
                 let value = lower_region_operand(builder, locals, registers, operand)?;
                 let fact = lowering_operand_fact(value_flow, constants, operand);
+                let (value, literal_borrowed) =
+                    lower_terminator_storage_value(builder, value, operand, constants, deopt_out);
                 if fact.ownership == SsaOwnership::Borrowed {
                     lower_guarded_value_release(
                         module,
@@ -822,6 +893,9 @@ pub(super) fn lower_region_terminator(
                         result_out,
                         deopt_out,
                     )?
+                } else if let Some(literal_borrowed) = literal_borrowed {
+                    lower_optimizing_retain_if(builder, value, literal_borrowed, deopt_out);
+                    value
                 } else {
                     value
                 }
@@ -858,6 +932,7 @@ pub(super) fn lower_region_terminator(
 /// silently becoming reachable by optimized code.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn lower_optimizing_region_terminator(
+    module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     blocks: &BTreeMap<BlockId, ir::Block>,
     locals: &NativeLocalMap,
@@ -872,6 +947,9 @@ pub(super) fn lower_optimizing_region_terminator(
     native_version: u32,
     value_release_validate: ir::FuncRef,
     value_release_commit: ir::FuncRef,
+    numeric_string: Option<NativeHelper>,
+    string_cast: Option<NativeHelper>,
+    strict_types: bool,
     return_type: Option<&php_ir::IrReturnType>,
     terminator: &RegionTerminator,
     constants: &[IrConstant],
@@ -965,46 +1043,142 @@ pub(super) fn lower_optimizing_region_terminator(
             value,
             finally: None,
         } => {
+            let operand = *value;
             let return_check_required = return_type.is_some_and(|return_type| {
                 !optimizing_fact_satisfies_type(
-                    lowering_operand_fact(value_flow, constants, *value),
+                    lowering_operand_fact(value_flow, constants, operand),
                     return_type,
                 )
             });
-            let fact = lowering_operand_fact(value_flow, constants, *value);
-            let reference_local = match *value {
+            let fact = lowering_operand_fact(value_flow, constants, operand);
+            let reference_local = match operand {
                 RegionOperand::Local(local) => value_flow.local_storage(local).is_reference_slot(),
                 _ => false,
             };
-            let value = lower_region_operand(builder, locals, registers, *value)?;
+            let value = lower_region_operand(builder, locals, registers, operand)?;
             let value = if reference_local {
                 lower_optimizing_terminator_reference_local(builder, value, transition)?
             } else {
                 value
             };
+            let (mut value, literal_borrowed) =
+                lower_terminator_storage_value(builder, value, operand, constants, deopt_out);
+            let original_value = value;
+            let mut coerced_owner = false;
             if return_check_required {
-                let Some(matches_return_type) = return_type.and_then(|type_| {
-                    lower_optimizing_type_guard(builder, value, type_, deopt_out)
-                }) else {
-                    transition.emit(builder)?;
-                    return Ok(EmittedOptimizingInstruction {
-                        class: crate::JitProductionLoweringClass::BaselineFragmentTransition,
-                        operation_local_transition: false,
-                    });
+                let mut live_values = Vec::with_capacity(live_registers.len());
+                for register in live_registers {
+                    live_values.push((
+                        *register,
+                        use_region_register(builder, registers, *register)?,
+                    ));
+                }
+                let operation_transition = NativeOptimizingTransition {
+                    result_out,
+                    deopt_out,
+                    function,
+                    local_count,
+                    continuation_id,
+                    live_locals,
+                    locals,
+                    live_values: &live_values,
+                    native_version,
+                    value_release_validate,
+                    value_release_commit,
+                    array_insert_admitted: None,
+                    emitted_transition: &emitted_transition,
                 };
-                let admitted = builder.create_block();
-                let rejected = builder.create_block();
-                builder
-                    .ins()
-                    .brif(matches_return_type, admitted, &[], rejected, &[]);
-                builder.switch_to_block(rejected);
-                transition.emit(builder)?;
-                builder.ins().jump(admitted, &[]);
-                builder.switch_to_block(admitted);
+                let return_type = return_type.expect("return check retains a declared type");
+                if let Some(plan) = lower_optimizing_call_scalar_coercion_plan(
+                    module,
+                    builder,
+                    0,
+                    value,
+                    Some(operand),
+                    None,
+                    constants,
+                    return_type,
+                    strict_types,
+                    numeric_string,
+                    operation_transition,
+                )? {
+                    if let Some(matches_return_type) = plan.admission {
+                        let admitted = builder.create_block();
+                        let rejected = builder.create_block();
+                        builder
+                            .ins()
+                            .brif(matches_return_type, admitted, &[], rejected, &[]);
+                        builder.switch_to_block(rejected);
+                        let _ = operation_transition.emit_value(builder)?;
+                        builder.ins().jump(admitted, &[]);
+                        builder.switch_to_block(admitted);
+                    }
+                    value = if let Some(skip) = plan.skip_conversion {
+                        let preserve = builder.create_block();
+                        let convert = builder.create_block();
+                        let merge = builder.create_block();
+                        builder.append_block_param(merge, types::I64);
+                        builder.ins().brif(skip, preserve, &[], convert, &[]);
+
+                        builder.switch_to_block(preserve);
+                        builder.ins().jump(merge, &[plan.original_value.into()]);
+
+                        builder.switch_to_block(convert);
+                        let converted = lower_optimizing_apply_call_scalar_coercion(
+                            module,
+                            builder,
+                            plan.coercion,
+                            plan.original_value,
+                            string_cast,
+                            operation_transition,
+                        )?;
+                        builder.ins().jump(merge, &[converted.into()]);
+
+                        builder.switch_to_block(merge);
+                        builder.block_params(merge)[0]
+                    } else {
+                        lower_optimizing_apply_call_scalar_coercion(
+                            module,
+                            builder,
+                            plan.coercion,
+                            plan.original_value,
+                            string_cast,
+                            operation_transition,
+                        )?
+                    };
+                    coerced_owner = true;
+                    if matches!(operand, RegionOperand::Register(_))
+                        && fact.ownership == SsaOwnership::Owned
+                        && fact.has_runtime_lifecycle()
+                    {
+                        lower_optimizing_release(builder, original_value, operation_transition)?;
+                    }
+                } else {
+                    let Some(matches_return_type) =
+                        lower_optimizing_type_guard(builder, value, return_type, deopt_out)
+                    else {
+                        transition.emit(builder)?;
+                        return Ok(EmittedOptimizingInstruction {
+                            class: crate::JitProductionLoweringClass::BaselineFragmentTransition,
+                            operation_local_transition: false,
+                        });
+                    };
+                    let admitted = builder.create_block();
+                    let rejected = builder.create_block();
+                    builder
+                        .ins()
+                        .brif(matches_return_type, admitted, &[], rejected, &[]);
+                    builder.switch_to_block(rejected);
+                    transition.emit(builder)?;
+                    builder.ins().jump(admitted, &[]);
+                    builder.switch_to_block(admitted);
+                }
             }
             lower_optimizing_require_authoritative_return(builder, value, false, transition)?;
-            if reference_local || fact.ownership == SsaOwnership::Borrowed {
+            if !coerced_owner && (reference_local || fact.ownership == SsaOwnership::Borrowed) {
                 lower_optimizing_retain(builder, value, deopt_out);
+            } else if !coerced_owner && let Some(literal_borrowed) = literal_borrowed {
+                lower_optimizing_retain_if(builder, value, literal_borrowed, deopt_out);
             }
             let cleanup = frame_cleanup_locals
                 .iter()
@@ -1030,8 +1204,122 @@ pub(super) fn lower_optimizing_region_terminator(
             // both cases. Direct compiled callers consume this owner when
             // they install the returned alias.
             let value = use_local_variable(builder, locals, *local)?;
+            let mut live_values = Vec::with_capacity(live_registers.len());
+            for register in live_registers {
+                live_values.push((
+                    *register,
+                    use_region_register(builder, registers, *register)?,
+                ));
+            }
+            let operation_transition = NativeOptimizingTransition {
+                result_out,
+                deopt_out,
+                function,
+                local_count,
+                continuation_id,
+                live_locals,
+                locals,
+                live_values: &live_values,
+                native_version,
+                value_release_validate,
+                value_release_commit,
+                array_insert_admitted: None,
+                emitted_transition: &emitted_transition,
+            };
+            let value = lower_optimizing_bind_direct_local_reference_with_owner(
+                builder,
+                value,
+                true,
+                operation_transition,
+            )?;
+            if let Some(return_type) = return_type {
+                let payload =
+                    lower_optimizing_reference_scalar(builder, value, false, operation_transition)?;
+                if let Some(plan) = lower_optimizing_call_scalar_coercion_plan(
+                    module,
+                    builder,
+                    0,
+                    payload,
+                    None,
+                    Some(value),
+                    constants,
+                    return_type,
+                    strict_types,
+                    numeric_string,
+                    operation_transition,
+                )? {
+                    if let Some(matches_return_type) = plan.admission {
+                        let admitted = builder.create_block();
+                        let rejected = builder.create_block();
+                        builder
+                            .ins()
+                            .brif(matches_return_type, admitted, &[], rejected, &[]);
+                        builder.switch_to_block(rejected);
+                        let _ = operation_transition.emit_value(builder)?;
+                        builder.ins().jump(admitted, &[]);
+                        builder.switch_to_block(admitted);
+                    }
+                    let replacement = if let Some(skip) = plan.skip_conversion {
+                        let preserve = builder.create_block();
+                        let convert = builder.create_block();
+                        let merge = builder.create_block();
+                        builder.append_block_param(merge, types::I64);
+                        builder.ins().brif(skip, preserve, &[], convert, &[]);
+
+                        builder.switch_to_block(preserve);
+                        builder.ins().jump(merge, &[plan.original_value.into()]);
+
+                        builder.switch_to_block(convert);
+                        let converted = lower_optimizing_apply_call_scalar_coercion(
+                            module,
+                            builder,
+                            plan.coercion,
+                            plan.original_value,
+                            string_cast,
+                            operation_transition,
+                        )?;
+                        builder.ins().jump(merge, &[converted.into()]);
+
+                        builder.switch_to_block(merge);
+                        builder.block_params(merge)[0]
+                    } else {
+                        lower_optimizing_apply_call_scalar_coercion(
+                            module,
+                            builder,
+                            plan.coercion,
+                            plan.original_value,
+                            string_cast,
+                            operation_transition,
+                        )?
+                    };
+                    lower_optimizing_replace_admitted_reference_payload_owned(
+                        builder,
+                        value,
+                        replacement,
+                        operation_transition,
+                    )?;
+                } else {
+                    let Some(matches_return_type) =
+                        lower_optimizing_type_guard(builder, payload, return_type, deopt_out)
+                    else {
+                        transition.emit(builder)?;
+                        return Ok(EmittedOptimizingInstruction {
+                            class: crate::JitProductionLoweringClass::BaselineFragmentTransition,
+                            operation_local_transition: false,
+                        });
+                    };
+                    let admitted = builder.create_block();
+                    let rejected = builder.create_block();
+                    builder
+                        .ins()
+                        .brif(matches_return_type, admitted, &[], rejected, &[]);
+                    builder.switch_to_block(rejected);
+                    transition.emit(builder)?;
+                    builder.ins().jump(admitted, &[]);
+                    builder.switch_to_block(admitted);
+                }
+            }
             lower_optimizing_require_authoritative_return(builder, value, true, transition)?;
-            lower_optimizing_retain(builder, value, deopt_out);
             let cleanup = frame_cleanup_locals
                 .iter()
                 .copied()
@@ -1051,10 +1339,12 @@ pub(super) fn lower_optimizing_region_terminator(
             value,
             finally: None,
         } => {
-            let reference_local = value.is_some_and(|value| {
+            let operand = *value;
+            let fact = operand.map(|value| lowering_operand_fact(value_flow, constants, value));
+            let reference_local = operand.is_some_and(|value| {
                 matches!(value, RegionOperand::Local(local) if value_flow.local_storage(local).is_reference_slot())
             });
-            let value = value
+            let value = operand
                 .map(|value| lower_region_operand(builder, locals, registers, value))
                 .transpose()?
                 .unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
@@ -1066,6 +1356,19 @@ pub(super) fn lower_optimizing_region_terminator(
             } else {
                 value
             };
+            let (value, literal_borrowed) = match (operand, fact) {
+                (Some(operand), Some(_)) => {
+                    lower_terminator_storage_value(builder, value, operand, constants, deopt_out)
+                }
+                _ => (value, None),
+            };
+            if !reference_local {
+                if fact.is_some_and(|fact| fact.ownership == SsaOwnership::Borrowed) {
+                    lower_optimizing_retain(builder, value, deopt_out);
+                } else if let Some(literal_borrowed) = literal_borrowed {
+                    lower_optimizing_retain_if(builder, value, literal_borrowed, deopt_out);
+                }
+            }
             let cleanup = frame_cleanup_locals
                 .iter()
                 .copied()

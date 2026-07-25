@@ -3572,18 +3572,13 @@ pub(in crate::builtins::modules) fn string_search_slice(
             Value::string(haystack.as_bytes().to_vec())
         });
     }
-    Ok(
-        find_bytes_from(haystack.as_bytes(), needle.as_bytes(), 0, case_insensitive).map_or(
-            Value::Bool(false),
-            |index| {
-                if before_needle {
-                    Value::string(haystack.as_bytes()[..index].to_vec())
-                } else {
-                    Value::string(haystack.as_bytes()[index..].to_vec())
-                }
-            },
-        ),
+    Ok(super::strings::native_string_search_slice(
+        haystack.as_bytes(),
+        needle.as_bytes(),
+        case_insensitive,
+        before_needle,
     )
+    .map_or(Value::Bool(false), Value::string))
 }
 
 pub(in crate::builtins::modules) fn string_span(
@@ -3826,19 +3821,14 @@ pub(in crate::builtins::modules) fn substr_replace_one(
     length: Option<i64>,
 ) -> BuiltinResult {
     let subject = string_arg(name, subject)?;
-    let start = normalize_offset(subject.len(), offset);
-    let replace_len = byte_substring_length(name, subject.len(), start, length)?;
-    let end = start + replace_len;
-    let mut output = Vec::with_capacity(
-        subject
-            .len()
-            .saturating_sub(replace_len)
-            .saturating_add(replacement.len()),
-    );
-    output.extend_from_slice(&subject.as_bytes()[..start]);
-    output.extend_from_slice(replacement.as_bytes());
-    output.extend_from_slice(&subject.as_bytes()[end..]);
-    Ok(Value::string(output))
+    super::strings::native_substr_replace(
+        subject.as_bytes(),
+        replacement.as_bytes(),
+        offset,
+        length,
+    )
+    .map(Value::string)
+    .ok_or_else(|| value_error(name, "length is out of range"))
 }
 
 pub(in crate::builtins::modules) fn substr_replace_indexed_string_arg(
@@ -4245,20 +4235,6 @@ pub(in crate::builtins::modules) fn decode_c_octal_escape(input: &[u8]) -> (u8, 
         consumed += 1;
     }
     (value as u8, consumed)
-}
-
-pub(in crate::builtins::modules) fn natural_compare_builtin(
-    name: &str,
-    args: &[Value],
-    case_insensitive: bool,
-) -> BuiltinResult {
-    let left = string_arg(name, &args[0])?;
-    let right = string_arg(name, &args[1])?;
-    Ok(Value::Int(ordering_to_i64(natural_compare_bytes(
-        left.as_bytes(),
-        right.as_bytes(),
-        case_insensitive,
-    ))))
 }
 
 pub(in crate::builtins::modules) fn ordering_to_i64(ordering: std::cmp::Ordering) -> i64 {
@@ -12429,6 +12405,63 @@ mod tests {
         assert_eq!(
             call("parse_url", vec![Value::string("x://::abc/?")], &mut output,),
             Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn native_url_query_parsers_preserve_typed_structure() {
+        use crate::api::{NativeDecodedArrayKey as Key, NativeDecodedValue as Native};
+
+        assert_eq!(
+            crate::api::native_parse_url(b"http://user:pass@example.com:8080/a?x=1#fragment", None,),
+            Ok(Some(Native::Object(vec![
+                (b"scheme".to_vec(), Native::String(b"http".to_vec())),
+                (b"host".to_vec(), Native::String(b"example.com".to_vec())),
+                (b"port".to_vec(), Native::Int(8080)),
+                (b"user".to_vec(), Native::String(b"user".to_vec())),
+                (b"pass".to_vec(), Native::String(b"pass".to_vec())),
+                (b"path".to_vec(), Native::String(b"/a".to_vec())),
+                (b"query".to_vec(), Native::String(b"x=1".to_vec())),
+                (b"fragment".to_vec(), Native::String(b"fragment".to_vec()),),
+            ])))
+        );
+        assert_eq!(
+            crate::api::native_parse_url(b"http://example.com/a", Some(1)),
+            Ok(Some(Native::String(b"example.com".to_vec())))
+        );
+        assert_eq!(crate::api::native_parse_url(b"x://::abc/?", None), Ok(None));
+        assert_eq!(
+            crate::api::native_parse_url(b"http://example.com", Some(99)),
+            Err(99)
+        );
+
+        let ini = RuntimeIniOptions::default();
+        assert_eq!(
+            crate::api::native_parse_str(
+                b"plain=first&plain=last&list[]=a&list[]=b&nested[x]=y&12=numeric",
+                &ini,
+            ),
+            Native::KeyedArray(vec![
+                (
+                    Key::String(b"plain".to_vec()),
+                    Native::String(b"last".to_vec()),
+                ),
+                (
+                    Key::String(b"list".to_vec()),
+                    Native::KeyedArray(vec![
+                        (Key::Int(0), Native::String(b"a".to_vec())),
+                        (Key::Int(1), Native::String(b"b".to_vec())),
+                    ]),
+                ),
+                (
+                    Key::String(b"nested".to_vec()),
+                    Native::KeyedArray(vec![(
+                        Key::String(b"x".to_vec()),
+                        Native::String(b"y".to_vec()),
+                    )]),
+                ),
+                (Key::Int(12), Native::String(b"numeric".to_vec())),
+            ])
         );
     }
 

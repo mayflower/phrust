@@ -76,13 +76,13 @@ exact_pcre_builtin!(exact_preg_last_error_msg => preg_last_error_msg);
 #[derive(Debug)]
 pub struct NativePregMatchResult {
     pub matched: bool,
-    pub captures: super::json::NativeJsonDecodedValue,
+    pub captures: super::json::NativeDecodedValue,
 }
 
 #[derive(Debug)]
 pub struct NativePregMatchAllResult {
     pub count: i64,
-    pub captures: super::json::NativeJsonDecodedValue,
+    pub captures: super::json::NativeDecodedValue,
 }
 
 #[derive(Debug)]
@@ -135,7 +135,7 @@ pub fn native_preg_match(
         state.last_error_mut().clear();
         return Ok(Some(NativePregMatchResult {
             matched: false,
-            captures: super::json::NativeJsonDecodedValue::Array(Vec::new()),
+            captures: super::json::NativeDecodedValue::Array(Vec::new()),
         }));
     };
     if captures.mark().is_some() {
@@ -153,35 +153,33 @@ pub fn native_preg_match(
     for index in 0..count {
         let value = match captures.get(index) {
             Some(capture) if flags & pcre::PREG_OFFSET_CAPTURE != 0 => {
-                super::json::NativeJsonDecodedValue::Array(vec![
-                    super::json::NativeJsonDecodedValue::String(capture.as_bytes().to_vec()),
-                    super::json::NativeJsonDecodedValue::Int(capture.start() as i64),
+                super::json::NativeDecodedValue::Array(vec![
+                    super::json::NativeDecodedValue::String(capture.as_bytes().to_vec()),
+                    super::json::NativeDecodedValue::Int(capture.start() as i64),
                 ])
             }
-            Some(capture) => {
-                super::json::NativeJsonDecodedValue::String(capture.as_bytes().to_vec())
-            }
+            Some(capture) => super::json::NativeDecodedValue::String(capture.as_bytes().to_vec()),
             None if flags & pcre::PREG_OFFSET_CAPTURE != 0 => {
-                super::json::NativeJsonDecodedValue::Array(vec![
+                super::json::NativeDecodedValue::Array(vec![
                     if flags & pcre::PREG_UNMATCHED_AS_NULL != 0 {
-                        super::json::NativeJsonDecodedValue::Null
+                        super::json::NativeDecodedValue::Null
                     } else {
-                        super::json::NativeJsonDecodedValue::String(Vec::new())
+                        super::json::NativeDecodedValue::String(Vec::new())
                     },
-                    super::json::NativeJsonDecodedValue::Int(-1),
+                    super::json::NativeDecodedValue::Int(-1),
                 ])
             }
             None if flags & pcre::PREG_UNMATCHED_AS_NULL != 0 => {
-                super::json::NativeJsonDecodedValue::Null
+                super::json::NativeDecodedValue::Null
             }
-            None => super::json::NativeJsonDecodedValue::String(Vec::new()),
+            None => super::json::NativeDecodedValue::String(Vec::new()),
         };
         output.push(value);
     }
     state.last_error_mut().clear();
     Ok(Some(NativePregMatchResult {
         matched: true,
-        captures: super::json::NativeJsonDecodedValue::Array(output),
+        captures: super::json::NativeDecodedValue::Array(output),
     }))
 }
 
@@ -238,30 +236,30 @@ pub fn native_preg_match_all(
                 for index in 0..count {
                     let value = match captures.get(index) {
                         Some(capture) if flags & pcre::PREG_OFFSET_CAPTURE != 0 => {
-                            super::json::NativeJsonDecodedValue::Array(vec![
-                                super::json::NativeJsonDecodedValue::String(
+                            super::json::NativeDecodedValue::Array(vec![
+                                super::json::NativeDecodedValue::String(
                                     capture.as_bytes().to_vec(),
                                 ),
-                                super::json::NativeJsonDecodedValue::Int(capture.start() as i64),
+                                super::json::NativeDecodedValue::Int(capture.start() as i64),
                             ])
                         }
                         Some(capture) => {
-                            super::json::NativeJsonDecodedValue::String(capture.as_bytes().to_vec())
+                            super::json::NativeDecodedValue::String(capture.as_bytes().to_vec())
                         }
                         None if flags & pcre::PREG_OFFSET_CAPTURE != 0 => {
-                            super::json::NativeJsonDecodedValue::Array(vec![
+                            super::json::NativeDecodedValue::Array(vec![
                                 if flags & pcre::PREG_UNMATCHED_AS_NULL != 0 {
-                                    super::json::NativeJsonDecodedValue::Null
+                                    super::json::NativeDecodedValue::Null
                                 } else {
-                                    super::json::NativeJsonDecodedValue::String(Vec::new())
+                                    super::json::NativeDecodedValue::String(Vec::new())
                                 },
-                                super::json::NativeJsonDecodedValue::Int(-1),
+                                super::json::NativeDecodedValue::Int(-1),
                             ])
                         }
                         None if flags & pcre::PREG_UNMATCHED_AS_NULL != 0 => {
-                            super::json::NativeJsonDecodedValue::Null
+                            super::json::NativeDecodedValue::Null
                         }
-                        None => super::json::NativeJsonDecodedValue::String(Vec::new()),
+                        None => super::json::NativeDecodedValue::String(Vec::new()),
                     };
                     row.push(value);
                 }
@@ -279,10 +277,10 @@ pub fn native_preg_match_all(
     }
     let count = matches.len() as i64;
     let captures = if set_order {
-        super::json::NativeJsonDecodedValue::Array(
+        super::json::NativeDecodedValue::Array(
             matches
                 .into_iter()
-                .map(super::json::NativeJsonDecodedValue::Array)
+                .map(super::json::NativeDecodedValue::Array)
                 .collect(),
         )
     } else {
@@ -293,10 +291,10 @@ pub fn native_preg_match_all(
                 columns[index].push(value);
             }
         }
-        super::json::NativeJsonDecodedValue::Array(
+        super::json::NativeDecodedValue::Array(
             columns
                 .into_iter()
-                .map(super::json::NativeJsonDecodedValue::Array)
+                .map(super::json::NativeDecodedValue::Array)
                 .collect(),
         )
     };
@@ -366,7 +364,7 @@ pub fn native_preg_split(
     subject: &[u8],
     limit: i64,
     flags: i64,
-) -> Option<super::json::NativeJsonDecodedValue> {
+) -> Option<super::json::NativeDecodedValue> {
     let compiled = state
         .cache_mut()
         .compile_bytes_with_limits(pattern, limits)
@@ -379,15 +377,15 @@ pub fn native_preg_split(
     let mut last_end = 0usize;
     let mut emitted = 0i64;
     let append =
-        |pieces: &mut Vec<super::json::NativeJsonDecodedValue>, bytes: &[u8], offset: usize| {
+        |pieces: &mut Vec<super::json::NativeDecodedValue>, bytes: &[u8], offset: usize| {
             if flags & pcre::PREG_SPLIT_NO_EMPTY != 0 && bytes.is_empty() {
                 return;
             }
-            let value = super::json::NativeJsonDecodedValue::String(bytes.to_vec());
+            let value = super::json::NativeDecodedValue::String(bytes.to_vec());
             pieces.push(if flags & pcre::PREG_SPLIT_OFFSET_CAPTURE != 0 {
-                super::json::NativeJsonDecodedValue::Array(vec![
+                super::json::NativeDecodedValue::Array(vec![
                     value,
-                    super::json::NativeJsonDecodedValue::Int(offset as i64),
+                    super::json::NativeDecodedValue::Int(offset as i64),
                 ])
             } else {
                 value
@@ -429,7 +427,7 @@ pub fn native_preg_split(
     }
     append(&mut pieces, &subject[last_end..], last_end);
     state.last_error_mut().clear();
-    Some(super::json::NativeJsonDecodedValue::Array(pieces))
+    Some(super::json::NativeDecodedValue::Array(pieces))
 }
 
 /// Selects the input strings matched by `preg_grep` without constructing a

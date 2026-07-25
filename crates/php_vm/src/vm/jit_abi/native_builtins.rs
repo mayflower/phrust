@@ -127,7 +127,7 @@ fn prepare_native_sysvshm_serialization(
     } else {
         return Ok(());
     };
-    let result = context.decode(result)?;
+    let result = context.decode_baseline_value(result)?;
     let Value::Array(serialized) = result else {
         return Err(format!(
             "E_PHP_THROW:TypeError:{}::__serialize() must return an array",
@@ -337,7 +337,7 @@ fn native_var_dump_with_context(
     if let Some(debug) = debug {
         let receiver = context.encode_native_object_owner(object.clone())?;
         let result = invoke_native_method(context, debug, &[receiver])?;
-        let Value::Array(array) = context.decode(result)? else {
+        let Value::Array(array) = context.decode_baseline_value(result)? else {
             return Err("__debugInfo() must return an array".to_owned());
         };
         entries.extend(array.iter().map(|(key, value)| {
@@ -757,7 +757,9 @@ fn native_array_key_number(key: &php_runtime::api::ArrayKey) -> f64 {
     }
 }
 
-fn execute_native_key_sort(
+/// Baseline-only compatibility for key sorts whose array/reference shape
+/// cannot be mutated through authoritative native entries.
+fn execute_baseline_key_sort(
     context: &mut NativeRequestColdState<'_>,
     arguments: &[i64],
     reverse: bool,
@@ -765,7 +767,7 @@ fn execute_native_key_sort(
     let Some(target) = arguments.first() else {
         return Err("ksort() expects an array passed by reference".to_owned());
     };
-    let Value::Reference(reference) = context.decode(*target)? else {
+    let Value::Reference(reference) = context.decode_baseline_value(*target)? else {
         return Err("ksort(): Argument #1 ($array) must be passed by reference".to_owned());
     };
     let Value::Array(array) = reference.get() else {
@@ -773,7 +775,7 @@ fn execute_native_key_sort(
     };
     let flags = arguments
         .get(1)
-        .map(|value| context.decode(*value))
+        .map(|value| context.decode_baseline_value(*value))
         .transpose()?
         .map_or(0, |value| match value {
             Value::Int(value) => value,
@@ -812,10 +814,12 @@ fn execute_native_key_sort(
         sorted.insert(key, value);
     }
     context.set_native_reference_value(&reference, Value::Array(sorted))?;
-    context.encode(Value::Bool(true))
+    context.encode_baseline_value(Value::Bool(true))
 }
 
-fn execute_native_callback_sort(
+/// Baseline-only callback sort. Callback invocation is intentionally not
+/// smuggled through the fixed non-callback sort ABIs.
+fn execute_baseline_callback_sort(
     context: &mut NativeRequestColdState<'_>,
     arguments: &[i64],
     source: &php_ir::Instruction,
@@ -825,13 +829,13 @@ fn execute_native_callback_sort(
     let [target, callback] = arguments else {
         return Err("array callback sort expects exactly 2 arguments".to_owned());
     };
-    let Value::Reference(reference) = context.decode(*target)? else {
+    let Value::Reference(reference) = context.decode_baseline_value(*target)? else {
         return Err("array callback sort expects an array passed by reference".to_owned());
     };
     let Value::Array(array) = reference.get() else {
         return Err("array callback sort expects an array".to_owned());
     };
-    let callback = match context.decode(*callback)? {
+    let callback = match context.decode_baseline_value(*callback)? {
         Value::Reference(reference) => reference.get(),
         callback => callback,
     };
@@ -859,7 +863,7 @@ fn execute_native_callback_sort(
                 source,
                 None,
             )?;
-            let ordering = match context.decode(result)? {
+            let ordering = match context.decode_baseline_value(result)? {
                 Value::Int(value) => value,
                 Value::Float(value) => value.to_f64() as i64,
                 Value::String(value) => value.to_string_lossy().parse::<i64>().unwrap_or(0),
@@ -882,13 +886,48 @@ fn execute_native_callback_sort(
         }
     }
     context.set_native_reference_value(&reference, Value::Array(sorted))?;
-    context.encode(Value::Bool(true))
+    context.encode_baseline_value(Value::Bool(true))
 }
 
 fn native_array_key_value(key: &php_runtime::api::ArrayKey) -> Value {
     match key {
         php_runtime::api::ArrayKey::Int(key) => Value::Int(*key),
         php_runtime::api::ArrayKey::String(key) => Value::String(key.clone()),
+    }
+}
+
+/// Baseline implementation of the array-callback by-value contract.
+///
+/// PHP's array_map/filter/reduce APIs never lend their element slots to a
+/// callback. A callback parameter declared by-reference therefore receives a
+/// warning and a temporary reference around a copied value. Reuse the same
+/// encoded binder used by call_user_func so closures, methods, and named
+/// functions all observe that rule without teaching the optimizing callback
+/// loop about cold warning dispatch.
+fn invoke_native_array_callback_by_value(
+    context: &mut NativeRequestColdState<'_>,
+    callback: Value,
+    arguments: &[Value],
+    source: &php_ir::Instruction,
+) -> Result<i64, String> {
+    let mut encoded = Vec::with_capacity(arguments.len() + 1);
+    let result = (|| -> NativeCallResult {
+        encoded.push(context.encode_baseline_value(callback)?);
+        for argument in arguments {
+            encoded.push(context.encode_baseline_value(argument.clone())?);
+        }
+        execute_native_call_user_func_encoded(context, &encoded, source, None)
+    })();
+    let mut release_error = None;
+    for value in encoded {
+        if let Err(error) = context.release_if_live(value) {
+            release_error.get_or_insert(error);
+        }
+    }
+    match (result, release_error) {
+        (Err(control), _) => Err(control.into_baseline_error()),
+        (Ok(_), Some(error)) => Err(error),
+        (Ok(value), None) => Ok(value),
     }
 }
 
@@ -903,13 +942,13 @@ fn execute_native_array_map(
     if arrays.is_empty() {
         return Err("array_map() expects at least 2 arguments".to_owned());
     }
-    let callback = match context.decode(*callback)? {
+    let callback = match context.decode_baseline_value(*callback)? {
         Value::Reference(reference) => reference.get(),
         callback => callback,
     };
     let arrays = arrays
         .iter()
-        .map(|array| match context.decode(*array)? {
+        .map(|array| match context.decode_baseline_value(*array)? {
             Value::Reference(reference) => match reference.get() {
                 Value::Array(array) => Ok(array),
                 _ => Err("array_map(): array argument must be of type array".to_owned()),
@@ -940,8 +979,8 @@ fn execute_native_array_map(
             Value::Array(php_runtime::api::PhpArray::from_packed(values))
         } else {
             let encoded =
-                invoke_native_callable_value(context, callback.clone(), &values, source, None)?;
-            context.decode(encoded)?
+                invoke_native_array_callback_by_value(context, callback.clone(), &values, source)?;
+            context.decode_baseline_value(encoded)?
         };
         if arrays.len() == 1 {
             let (key, _) = &entries[0][index];
@@ -961,7 +1000,7 @@ fn execute_native_array_filter(
     let Some(array) = arguments.first() else {
         return Err("array_filter() expects at least 1 argument".to_owned());
     };
-    let array = match context.decode(*array)? {
+    let array = match context.decode_baseline_value(*array)? {
         Value::Reference(reference) => match reference.get() {
             Value::Array(array) => array,
             _ => return Err("array_filter(): argument #1 must be of type array".to_owned()),
@@ -971,7 +1010,7 @@ fn execute_native_array_filter(
     };
     let callback = arguments
         .get(1)
-        .map(|callback| context.decode(*callback))
+        .map(|callback| context.decode_baseline_value(*callback))
         .transpose()?
         .map(|callback| match callback {
             Value::Reference(reference) => reference.get(),
@@ -980,7 +1019,7 @@ fn execute_native_array_filter(
         .filter(|callback| !matches!(callback, Value::Null));
     let mode = arguments
         .get(2)
-        .map(|mode| context.decode(*mode))
+        .map(|mode| context.decode_baseline_value(*mode))
         .transpose()?
         .map_or(0, |mode| match mode {
             Value::Int(mode) => mode,
@@ -995,14 +1034,13 @@ fn execute_native_array_filter(
                 2 => vec![key_value],
                 _ => vec![value.clone()],
             };
-            let encoded = invoke_native_callable_value(
+            let encoded = invoke_native_array_callback_by_value(
                 context,
                 callback.clone(),
                 &callback_arguments,
                 source,
-                None,
             )?;
-            native_property_truthy(&context.decode(encoded)?)
+            native_property_truthy(&context.decode_baseline_value(encoded)?)
         } else {
             native_property_truthy(value)
         };
@@ -1018,7 +1056,7 @@ fn native_array_argument(
     encoded: i64,
     function: &str,
 ) -> Result<php_runtime::api::PhpArray, String> {
-    let value = match context.decode(encoded)? {
+    let value = match context.decode_baseline_value(encoded)? {
         Value::Reference(reference) => reference.get(),
         value => value,
     };
@@ -1040,26 +1078,25 @@ fn execute_native_array_reduce(
         return Err("array_reduce() expects 2 or 3 arguments".to_owned());
     }
     let array = native_array_argument(context, arguments[0], "array_reduce")?;
-    let callback = match context.decode(arguments[1])? {
+    let callback = match context.decode_baseline_value(arguments[1])? {
         Value::Reference(reference) => reference.get(),
         value => value,
     };
     let mut carry = arguments
         .get(2)
-        .map(|value| context.decode(*value))
+        .map(|value| context.decode_baseline_value(*value))
         .transpose()?
         .unwrap_or(Value::Null);
     for (_, value) in array.iter() {
-        let encoded = invoke_native_callable_value(
+        let encoded = invoke_native_array_callback_by_value(
             context,
             callback.clone(),
             &[carry, value.clone()],
             source,
-            None,
         )?;
-        carry = context.decode(encoded)?;
+        carry = context.decode_baseline_value(encoded)?;
     }
-    context.encode(carry)
+    context.encode_baseline_value(carry)
 }
 
 fn execute_native_array_walk(
@@ -1070,7 +1107,7 @@ fn execute_native_array_walk(
     if !(2..=3).contains(&arguments.len()) {
         return Err("array_walk() expects 2 or 3 arguments".to_owned());
     }
-    let Value::Reference(root) = context.decode(arguments[0])? else {
+    let Value::Reference(root) = context.decode_baseline_value(arguments[0])? else {
         return Err("array_walk(): Argument #1 ($array) must be passed by reference".to_owned());
     };
     let Value::Array(mut array) = root.get() else {
@@ -1079,13 +1116,13 @@ fn execute_native_array_walk(
                 .to_owned(),
         );
     };
-    let callback = match context.decode(arguments[1])? {
+    let callback = match context.decode_baseline_value(arguments[1])? {
         Value::Reference(reference) => reference.get(),
         value => value,
     };
     let userdata = arguments
         .get(2)
-        .map(|value| context.decode(*value))
+        .map(|value| context.decode_baseline_value(*value))
         .transpose()?;
     let keys = array.iter().map(|(key, _)| key).collect::<Vec<_>>();
     let mut entries = Vec::with_capacity(keys.len());
@@ -1106,7 +1143,7 @@ fn execute_native_array_walk(
         }
         let _ = invoke_native_callable_value(context, callback.clone(), &values, source, None)?;
     }
-    context.encode(Value::Bool(true))
+    context.encode_baseline_value(Value::Bool(true))
 }
 
 fn walk_native_array_recursive(
@@ -1171,7 +1208,7 @@ fn execute_native_array_walk_recursive(
     if !(2..=3).contains(&arguments.len()) {
         return Err("array_walk_recursive() expects 2 or 3 arguments".to_owned());
     }
-    let Value::Reference(root) = context.decode(arguments[0])? else {
+    let Value::Reference(root) = context.decode_baseline_value(arguments[0])? else {
         return Err(
             "array_walk_recursive(): Argument #1 ($array) must be passed by reference".to_owned(),
         );
@@ -1182,17 +1219,17 @@ fn execute_native_array_walk_recursive(
                 .to_owned(),
         );
     };
-    let callback = match context.decode(arguments[1])? {
+    let callback = match context.decode_baseline_value(arguments[1])? {
         Value::Reference(reference) => reference.get(),
         value => value,
     };
     let userdata = arguments
         .get(2)
-        .map(|value| context.decode(*value))
+        .map(|value| context.decode_baseline_value(*value))
         .transpose()?;
     walk_native_array_recursive(context, &mut array, &callback, userdata.as_ref(), source)?;
     root.set(Value::Array(array));
-    context.encode(Value::Bool(true))
+    context.encode_baseline_value(Value::Bool(true))
 }
 
 fn execute_native_array_predicate(
@@ -1205,7 +1242,7 @@ fn execute_native_array_predicate(
         return Err(format!("{name}() expects exactly 2 arguments"));
     };
     let array = native_array_argument(context, *array, name)?;
-    let callback = match context.decode(*callback)? {
+    let callback = match context.decode_baseline_value(*callback)? {
         Value::Reference(reference) => reference.get(),
         value => value,
     };
@@ -1217,19 +1254,21 @@ fn execute_native_array_predicate(
             source,
             None,
         )?;
-        if native_property_truthy(&context.decode(encoded)?) {
+        if native_property_truthy(&context.decode_baseline_value(encoded)?) {
             match name {
-                "array_any" => return context.encode(Value::Bool(true)),
-                "array_find" => return context.encode(value.clone()),
-                "array_find_key" => return context.encode(native_array_key_value(&key)),
+                "array_any" => return context.encode_baseline_value(Value::Bool(true)),
+                "array_find" => return context.encode_baseline_value(value.clone()),
+                "array_find_key" => {
+                    return context.encode_baseline_value(native_array_key_value(&key));
+                }
                 "array_all" => continue,
                 _ => {}
             }
         } else if name == "array_all" {
-            return context.encode(Value::Bool(false));
+            return context.encode_baseline_value(Value::Bool(false));
         }
     }
-    context.encode(match name {
+    context.encode_baseline_value(match name {
         "array_all" => Value::Bool(true),
         "array_any" => Value::Bool(false),
         _ => Value::Null,
@@ -1243,7 +1282,7 @@ fn execute_native_iterator_to_array(
     if !(1..=2).contains(&arguments.len()) {
         return Err("iterator_to_array() expects 1 or 2 arguments".to_owned());
     }
-    let iterator = match context.decode(arguments[0])? {
+    let iterator = match context.decode_baseline_value(arguments[0])? {
         Value::Reference(reference) => reference.get(),
         value => value,
     };
@@ -1255,7 +1294,7 @@ fn execute_native_iterator_to_array(
     };
     let preserve_keys = arguments
         .get(1)
-        .map(|value| context.decode(*value))
+        .map(|value| context.decode_baseline_value(*value))
         .transpose()?
         .is_none_or(|value| native_property_truthy(&value));
     let class_name = iterator.class_name();
@@ -1271,7 +1310,7 @@ fn execute_native_iterator_to_array(
             context.unit.strict_types,
             None,
         )?;
-        iterator = match context.decode(encoded)? {
+        iterator = match context.decode_baseline_value(encoded)? {
             Value::Reference(reference) => match reference.get() {
                 Value::Object(iterator) => iterator,
                 _ => {
@@ -1308,7 +1347,7 @@ fn execute_native_iterator_to_array(
                 context.unit.strict_types,
                 None,
             )?;
-            context.decode(encoded)
+            context.decode_baseline_value(encoded)
         };
         let _ = invoke(context, "rewind")?;
         let mut entries = Vec::new();
@@ -1398,7 +1437,9 @@ fn native_natural_compare(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
     left.len().cmp(&right.len())
 }
 
-fn execute_native_value_sort(
+/// Baseline-only compatibility for value sorts rejected by the exact direct
+/// entry handler (COW arrays, materialized references, or unsupported modes).
+fn execute_baseline_value_sort(
     context: &mut NativeRequestColdState<'_>,
     name: &str,
     arguments: &[i64],
@@ -1406,7 +1447,7 @@ fn execute_native_value_sort(
     let Some(target) = arguments.first() else {
         return Err(format!("{name}() expects an array passed by reference"));
     };
-    let Value::Reference(reference) = context.decode(*target)? else {
+    let Value::Reference(reference) = context.decode_baseline_value(*target)? else {
         return Err(format!(
             "{name}(): Argument #1 ($array) must be passed by reference"
         ));
@@ -1418,7 +1459,7 @@ fn execute_native_value_sort(
     };
     let flags = arguments
         .get(1)
-        .map(|value| context.decode(*value))
+        .map(|value| context.decode_baseline_value(*value))
         .transpose()?
         .map_or(0, |value| match value {
             Value::Int(value) => value,
@@ -1482,7 +1523,7 @@ fn execute_native_value_sort(
         }
     }
     context.set_native_reference_value(&reference, Value::Array(sorted))?;
-    context.encode(Value::Bool(true))
+    context.encode_baseline_value(Value::Bool(true))
 }
 
 pub(super) fn native_builtin_class(
@@ -1593,8 +1634,9 @@ fn execute_native_preg_replace_callback(
     if !(3..=6).contains(&arguments.len()) {
         return Err("preg_replace_callback() expects 3 to 6 arguments".to_owned());
     }
-    let pattern = PhpString::from_bytes(native_string(context.decode(arguments[0])?)?);
-    let callback = match context.decode(arguments[1])? {
+    let pattern =
+        PhpString::from_bytes(native_string(context.decode_baseline_value(arguments[0])?)?);
+    let callback = match context.decode_baseline_value(arguments[1])? {
         Value::Reference(reference) => reference.get(),
         callback => callback,
     };
@@ -1604,13 +1646,13 @@ fn execute_native_preg_replace_callback(
                 .to_owned(),
         );
     }
-    let subject = match context.decode(arguments[2])? {
+    let subject = match context.decode_baseline_value(arguments[2])? {
         Value::Reference(reference) => reference.get(),
         subject => subject,
     };
     let limit = arguments
         .get(3)
-        .map(|limit| context.decode(*limit))
+        .map(|limit| context.decode_baseline_value(*limit))
         .transpose()?
         .map_or(-1, |limit| match limit {
             Value::Int(limit) => limit,
@@ -1631,7 +1673,7 @@ fn execute_native_preg_replace_callback(
                 source,
                 true,
             )?;
-            return context.encode(Value::Null);
+            return context.encode_baseline_value(Value::Null);
         }
     };
     let replace = |context: &mut NativeRequestColdState<'_>,
@@ -1679,7 +1721,7 @@ fn execute_native_preg_replace_callback(
                     source,
                     None,
                 )?;
-                output.extend_from_slice(&native_string(context.decode(encoded)?)?);
+                output.extend_from_slice(&native_string(context.decode_baseline_value(encoded)?)?);
                 last_end = full.end();
                 local_count += 1;
                 *count += 1;
@@ -1713,11 +1755,11 @@ fn execute_native_preg_replace_callback(
         }
     };
     if let Some(count_argument) = arguments.get(4)
-        && let Value::Reference(reference) = context.decode(*count_argument)?
+        && let Value::Reference(reference) = context.decode_baseline_value(*count_argument)?
     {
         context.set_native_reference_value(&reference, Value::Int(count))?;
     }
-    context.encode(result)
+    context.encode_baseline_value(result)
 }
 
 fn execute_native_preg_replace_callback_array(
@@ -1727,7 +1769,7 @@ fn execute_native_preg_replace_callback_array(
     if !(2..=5).contains(&arguments.len()) {
         return Ok(None);
     }
-    let patterns = match context.decode(arguments[0])? {
+    let patterns = match context.decode_baseline_value(arguments[0])? {
         Value::Reference(reference) => reference.get(),
         patterns => patterns,
     };
@@ -1738,15 +1780,15 @@ fn execute_native_preg_replace_callback_array(
         return Ok(None);
     }
     if let Some(count) = arguments.get(3)
-        && let Value::Reference(reference) = context.decode(*count)?
+        && let Value::Reference(reference) = context.decode_baseline_value(*count)?
     {
         context.set_native_reference_value(&reference, Value::Int(0))?;
     }
-    let subject = match context.decode(arguments[1])? {
+    let subject = match context.decode_baseline_value(arguments[1])? {
         Value::Reference(reference) => reference.get(),
         subject => subject,
     };
-    context.encode(subject).map(Some)
+    context.encode_baseline_value(subject).map(Some)
 }
 
 fn native_ir_function_has_no_by_ref_parameters(function: &php_ir::IrFunction) -> Option<bool> {
@@ -2308,7 +2350,7 @@ fn native_builtin_type_predicate(
     encoded: i64,
     predicate: fn(&Value) -> bool,
 ) -> Result<bool, String> {
-    let value = context.decode(encoded)?;
+    let value = context.decode_baseline_value(encoded)?;
     Ok(match value {
         Value::Reference(reference) => predicate(&reference.get()),
         value => predicate(&value),
@@ -2388,13 +2430,13 @@ fn execute_native_read_builtin_fast(
                 return Ok(None);
             };
             let length = i64::try_from(length).map_err(|_| "count() result overflow".to_owned())?;
-            context.encode(Value::Int(length)).map(Some)
+            context.encode_baseline_value(Value::Int(length)).map(Some)
         }
         ("array_key_exists" | "key_exists", [key, array]) => {
             if context.direct_array_slot(*array).is_none() {
                 return Ok(None);
             }
-            let key = match context.decode(*key)? {
+            let key = match context.decode_baseline_value(*key)? {
                 Value::Reference(reference) => reference.get(),
                 key => key,
             };
@@ -2442,12 +2484,12 @@ fn execute_native_read_builtin_fast(
             })))
         }
         ("strlen", [value]) => {
-            let Value::String(value) = context.decode(*value)? else {
+            let Value::String(value) = context.decode_baseline_value(*value)? else {
                 return Ok(None);
             };
             let length =
                 i64::try_from(value.len()).map_err(|_| "strlen() result overflow".to_owned())?;
-            context.encode(Value::Int(length)).map(Some)
+            context.encode_baseline_value(Value::Int(length)).map(Some)
         }
         _ => Ok(None),
     }
@@ -2491,7 +2533,7 @@ pub(super) fn execute_baseline_prepared_runtime_builtin(
                 })
                 .is_some_and(|parameter| parameter.by_ref);
             if by_ref {
-                context.decode(*argument)
+                context.decode_baseline_value(*argument)
             } else {
                 context.decode_dereferenced_native_value(*argument)
             }
@@ -2519,6 +2561,9 @@ pub(super) fn execute_baseline_prepared_runtime_builtin(
             | php_runtime::api::BuiltinHandlerKind::Json
             | php_runtime::api::BuiltinHandlerKind::Pcre
     );
+    if name.starts_with("session_") {
+        context.materialize_native_session_state()?;
+    }
     let (result, diagnostics) = if lightweight_handler {
         let mut builtin = php_runtime::api::BuiltinContext::with_borrowed_runtime_request_state(
             &mut context.output,
@@ -2609,7 +2654,7 @@ pub(super) fn execute_baseline_prepared_runtime_builtin(
         }
     }
     match result {
-        Ok(value) => context.encode(value),
+        Ok(value) => context.encode_baseline_value(value),
         Err(error) => {
             let id = error.diagnostic_id().to_ascii_uppercase();
             let class = if id.contains("ARITY") || id.contains("ARGUMENT_COUNT") {
@@ -2636,7 +2681,7 @@ fn execute_exact_native_array_fill_keys(
     let source = context.direct_array_entries_for(*keys)?.to_vec();
     let mut normalized = Vec::<php_runtime::api::ArrayKey>::with_capacity(source.len());
     for entry in source {
-        let mut key = context.decode(entry.value).ok()?;
+        let mut key = context.decode_baseline_value(entry.value).ok()?;
         for _ in 0..16 {
             let Value::Reference(reference) = key else {
                 break;
@@ -2656,7 +2701,7 @@ fn execute_exact_native_array_fill_keys(
     let mut entries = Vec::<php_jit::JitNativeDirectArrayEntry>::with_capacity(normalized.len());
     for key in normalized {
         let key = match key {
-            php_runtime::api::ArrayKey::Int(key) => context.encode(Value::Int(key)),
+            php_runtime::api::ArrayKey::Int(key) => context.encode_baseline_value(Value::Int(key)),
             php_runtime::api::ArrayKey::String(key) => context.encode_native_string_owner(key),
         };
         let key = match key {
@@ -2704,11 +2749,11 @@ fn execute_native_call_user_func_array_control(
     ) {
         return result;
     }
-    let callback = match context.decode(*callback)? {
+    let callback = match context.decode_baseline_value(*callback)? {
         Value::Reference(reference) => reference.get(),
         value => value,
     };
-    let arguments = match context.decode(*arguments)? {
+    let arguments = match context.decode_baseline_value(*arguments)? {
         Value::Reference(reference) => reference.get(),
         value => value,
     };
@@ -2822,7 +2867,7 @@ fn execute_native_call_user_func_array_control(
         _ => "dynamic callable".to_owned(),
     };
     let mut encoded = Vec::with_capacity(values.len() + 1);
-    encoded.push(context.encode(callback)?);
+    encoded.push(context.encode_baseline_value(callback)?);
     for value in values {
         encoded.push(context.encode_baseline_call_value(value)?);
     }
@@ -2885,6 +2930,103 @@ pub(super) fn execute_baseline_native_builtin_control(
     }
 }
 
+/// Reconstructs the PHP-visible argument vector for the cold compatibility
+/// continuation. Direct compiled callers publish the original positional
+/// tail in the native runtime view, while fixed parameters are read from the
+/// callee's current local slots so assignments made before `func_get_arg(s)`
+/// remain observable.
+fn baseline_visible_call_arguments(
+    context: &NativeRequestColdState<'_>,
+    caller_locals: Option<(u32, &[php_jit::JitAbiSlot])>,
+) -> Result<Vec<i64>, String> {
+    // SAFETY: the fast state is separately allocated for the request and the
+    // active linked view, when selected, is owned by the active dynamic-unit
+    // package for the complete synchronous call.
+    #[allow(unsafe_code)]
+    let view = unsafe { &*context.fast_state }.header.active_runtime_view();
+    let count = usize::try_from(view.active_call_argument_count)
+        .map_err(|_| "active native call argument count is invalid".to_owned())?;
+    let matching_baseline_frame = caller_locals.and_then(|(function_id, _)| {
+        let function = context.unit.functions.get(function_id as usize)?;
+        context.call_frames.last().filter(|frame| {
+            frame
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.name.eq_ignore_ascii_case(&function.name))
+        })
+    });
+    let mut visible = if let Some(frame) = matching_baseline_frame {
+        frame.arguments.to_vec()
+    } else if view.active_call_tail_arguments != 0 {
+        let fixed_count = usize::try_from(view.active_call_fixed_argument_count)
+            .map_err(|_| "active native fixed argument count is invalid".to_owned())?;
+        let mut values = if fixed_count == 0 {
+            Vec::new()
+        } else {
+            if view.active_call_arguments == 0 {
+                return Err("active native fixed argument range is unavailable".to_owned());
+            }
+            // SAFETY: direct call lowering keeps the fixed stack prefix live
+            // until the synchronous callee or its baseline continuation
+            // returns.
+            #[allow(unsafe_code)]
+            unsafe {
+                std::slice::from_raw_parts(
+                    view.active_call_arguments as usize as *const i64,
+                    fixed_count,
+                )
+                .to_vec()
+            }
+        };
+        let tail = context
+            .direct_array_entries_for(view.active_call_tail_arguments)
+            .ok_or_else(|| "active native tail argument array is unavailable".to_owned())?;
+        values.extend(tail.iter().map(|entry| entry.value));
+        values
+    } else if view.active_call_arguments == 0 {
+        context
+            .call_frames
+            .last()
+            .map(|frame| frame.arguments.to_vec())
+            .unwrap_or_default()
+    } else if count == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: direct call lowering keeps its stack range alive until the
+        // baseline continuation returns; ordinary baseline frames publish a
+        // request-owned NativeTraceArguments allocation.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::slice::from_raw_parts(view.active_call_arguments as usize as *const i64, count)
+                .to_vec()
+        }
+    };
+    let fixed_count = usize::try_from(
+        matching_baseline_frame.map_or(view.active_call_fixed_argument_count, |frame| {
+            frame.fixed_argument_count
+        }),
+    )
+    .unwrap_or(usize::MAX)
+    .min(visible.len());
+    let Some((function_id, slots)) = caller_locals else {
+        return Ok(visible);
+    };
+    let function = context
+        .unit
+        .functions
+        .get(function_id as usize)
+        .ok_or_else(|| "active native caller function metadata is missing".to_owned())?;
+    for (index, parameter) in function.params.iter().take(fixed_count).enumerate() {
+        if parameter.variadic {
+            break;
+        }
+        if let Some(slot) = slots.get(parameter.local.index()) {
+            visible[index] = slot.payload as i64;
+        }
+    }
+    Ok(visible)
+}
+
 /// Baseline-native compatibility executor for builtins without an admitted
 /// exact handler. This must not be imported by optimizing artifacts.
 pub(super) fn execute_baseline_native_builtin(
@@ -2900,6 +3042,7 @@ pub(super) fn execute_baseline_native_builtin(
             prepared.entry.execution_kind(),
             php_runtime::api::BuiltinExecutionKind::Runtime
         )
+        && prepared.entry.name() != "set_time_limit"
     {
         return execute_baseline_prepared_runtime_builtin(
             context,
@@ -2964,11 +3107,11 @@ pub(super) fn execute_baseline_native_builtin(
                 .iter()
                 .map(|path| Value::string(path.to_string_lossy().into_owned()))
                 .collect();
-            context.encode(Value::packed_array(files))
+            context.encode_baseline_value(Value::packed_array(files))
         }
         "ob_start" => {
             context.output.start_buffer();
-            context.encode(Value::Bool(true))
+            context.encode_baseline_value(Value::Bool(true))
         }
         "ob_get_clean" => {
             let bytes = context
@@ -2983,10 +3126,12 @@ pub(super) fn execute_baseline_native_builtin(
                 .current_buffer_bytes()
                 .map(|bytes| Value::String(PhpString::from_bytes(bytes.to_vec())))
                 .unwrap_or(Value::Bool(false));
-            context.encode(value)
+            context.encode_baseline_value(value)
         }
-        "ob_get_level" => context.encode(Value::Int(context.output.buffer_level() as i64)),
-        "ob_get_length" => context.encode(
+        "ob_get_level" => {
+            context.encode_baseline_value(Value::Int(context.output.buffer_level() as i64))
+        }
+        "ob_get_length" => context.encode_baseline_value(
             context
                 .output
                 .current_buffer_len()
@@ -2994,11 +3139,11 @@ pub(super) fn execute_baseline_native_builtin(
         ),
         "ob_end_flush" => {
             let value = context.output.pop_buffer_flush().is_some();
-            context.encode(Value::Bool(value))
+            context.encode_baseline_value(Value::Bool(value))
         }
         "ob_end_clean" => {
             let value = context.output.pop_buffer_clean().is_some();
-            context.encode(Value::Bool(value))
+            context.encode_baseline_value(Value::Bool(value))
         }
         "array_map" => execute_native_array_map(context, arguments, source),
         "array_filter" => execute_native_array_filter(context, arguments, source),
@@ -3021,22 +3166,18 @@ pub(super) fn execute_baseline_native_builtin(
             }
         }
         "sort" | "rsort" | "asort" | "arsort" | "natsort" | "natcasesort" => {
-            execute_native_value_sort(context, &normalized, arguments)
+            execute_baseline_value_sort(context, &normalized, arguments)
         }
-        "ksort" => execute_native_key_sort(context, arguments, false),
-        "krsort" => execute_native_key_sort(context, arguments, true),
-        "usort" => execute_native_callback_sort(context, arguments, source, false, false),
-        "uasort" => execute_native_callback_sort(context, arguments, source, false, true),
-        "uksort" => execute_native_callback_sort(context, arguments, source, true, true),
+        "ksort" => execute_baseline_key_sort(context, arguments, false),
+        "krsort" => execute_baseline_key_sort(context, arguments, true),
+        "usort" => execute_baseline_callback_sort(context, arguments, source, false, false),
+        "uasort" => execute_baseline_callback_sort(context, arguments, source, false, true),
+        "uksort" => execute_baseline_callback_sort(context, arguments, source, true, true),
         "func_get_args" => {
-            let arguments = context
-                .call_frames
-                .last()
-                .map(|frame| frame.arguments.clone())
-                .unwrap_or_default();
+            let arguments = baseline_visible_call_arguments(context, caller_locals)?;
             let values = arguments
                 .iter()
-                .map(|argument| context.decode(*argument))
+                .map(|argument| context.decode_baseline_value(*argument))
                 .collect::<Result<Vec<_>, _>>()?;
             context.encode_native_array_owner(php_runtime::api::PhpArray::from_packed(values))
         }
@@ -3053,7 +3194,10 @@ pub(super) fn execute_baseline_native_builtin(
                 .clone();
             let mut names = Vec::new();
             for argument in arguments {
-                collect_native_compact_names(context.decode(*argument)?, &mut names)?;
+                collect_native_compact_names(
+                    context.decode_baseline_value(*argument)?,
+                    &mut names,
+                )?;
             }
             let mut result = php_runtime::api::PhpArray::new();
             for name in names {
@@ -3066,7 +3210,7 @@ pub(super) fn execute_baseline_native_builtin(
                 // PHP's compact() copies the current value into the result. It
                 // never exposes the caller's reference container, even when
                 // the source variable was explicitly bound by reference.
-                let value = match context.decode(slot.payload as i64)? {
+                let value = match context.decode_baseline_value(slot.payload as i64)? {
                     Value::Reference(reference) => reference.get(),
                     value => value,
                 };
@@ -3082,10 +3226,13 @@ pub(super) fn execute_baseline_native_builtin(
         "implode" => {
             let (separator, values) = match arguments {
                 [values] => (Vec::new(), *values),
-                [separator, values] => (native_string(context.decode(*separator)?)?, *values),
+                [separator, values] => (
+                    native_string(context.decode_baseline_value(*separator)?)?,
+                    *values,
+                ),
                 _ => return Err("implode() expects 1 or 2 arguments".to_owned()),
             };
-            let values = match context.decode(values)? {
+            let values = match context.decode_baseline_value(values)? {
                 Value::Reference(reference) => reference.get(),
                 values => values,
             };
@@ -3110,8 +3257,9 @@ pub(super) fn execute_baseline_native_builtin(
                 return Err("define() expects a name and value".to_owned());
             };
             let name =
-                String::from_utf8_lossy(&native_string(context.decode(*name)?)?).into_owned();
-            let value = context.decode(*value)?;
+                String::from_utf8_lossy(&native_string(context.decode_baseline_value(*name)?)?)
+                    .into_owned();
+            let value = context.decode_baseline_value(*value)?;
             if context.dynamic_constants.contains_key(&name)
                 || context.lookup_constant(&name).is_ok()
             {
@@ -3124,19 +3272,20 @@ pub(super) fn execute_baseline_native_builtin(
                 context.output.write_bytes(format!(
                     "\nWarning: Constant {name} already defined, this will be an error in PHP 9 in {path} on line {line}\n"
                 ));
-                return context.encode(Value::Bool(false));
+                return context.encode_baseline_value(Value::Bool(false));
             }
-            context.insert_dynamic_constant(name, value);
+            context.insert_dynamic_constant(name, value)?;
             context.mark_roots_dirty(RootMutationReason::GlobalOrStatic);
-            context.encode(Value::Bool(true))
+            context.encode_baseline_value(Value::Bool(true))
         }
         "defined" => {
             let [name] = arguments else {
                 return Err("defined() expects exactly 1 argument".to_owned());
             };
             let name =
-                String::from_utf8_lossy(&native_string(context.decode(*name)?)?).into_owned();
-            context.encode(Value::Bool(
+                String::from_utf8_lossy(&native_string(context.decode_baseline_value(*name)?)?)
+                    .into_owned();
+            context.encode_baseline_value(Value::Bool(
                 context.lookup_constant(&name).is_ok()
                     || native_internal_class_constant_exists(&name),
             ))
@@ -3146,14 +3295,15 @@ pub(super) fn execute_baseline_native_builtin(
                 return Err("constant() expects exactly 1 argument".to_owned());
             };
             let name =
-                String::from_utf8_lossy(&native_string(context.decode(*name)?)?).into_owned();
-            context.encode(context.lookup_constant(&name)?)
+                String::from_utf8_lossy(&native_string(context.decode_baseline_value(*name)?)?)
+                    .into_owned();
+            context.encode_baseline_value(context.lookup_constant(&name)?)
         }
         "print" => {
             let [value] = arguments else {
                 return Err("print expects exactly 1 argument".to_owned());
             };
-            let value = context.decode(*value)?;
+            let value = context.decode_baseline_value(*value)?;
             let mut operation = php_runtime::api::NativeOperationContext::default();
             let status = php_runtime::api::native_echo(&mut operation, &mut context.output, &value);
             if status != php_runtime::api::NativeOperationStatus::Ok {
@@ -3165,7 +3315,7 @@ pub(super) fn execute_baseline_native_builtin(
             let [value] = arguments else {
                 return Err("gettype() expects exactly 1 argument".to_owned());
             };
-            let mut value = context.decode(*value)?;
+            let mut value = context.decode_baseline_value(*value)?;
             for _ in 0..16 {
                 let Value::Reference(reference) = value else {
                     break;
@@ -3191,62 +3341,62 @@ pub(super) fn execute_baseline_native_builtin(
             let [value] = arguments else {
                 return Err("is_int() expects exactly 1 argument".to_owned());
             };
-            let value = context.decode(*value)?;
+            let value = context.decode_baseline_value(*value)?;
             let value = match value {
                 Value::Reference(reference) => reference.get(),
                 value => value,
             };
-            context.encode(Value::Bool(matches!(value, Value::Int(_))))
+            context.encode_baseline_value(Value::Bool(matches!(value, Value::Int(_))))
         }
         "is_string" => {
             let [value] = arguments else {
                 return Err("is_string() expects exactly 1 argument".to_owned());
             };
-            let value = context.decode(*value)?;
+            let value = context.decode_baseline_value(*value)?;
             let value = match value {
                 Value::Reference(reference) => reference.get(),
                 value => value,
             };
-            context.encode(Value::Bool(matches!(value, Value::String(_))))
+            context.encode_baseline_value(Value::Bool(matches!(value, Value::String(_))))
         }
         "is_bool" => {
             let [value] = arguments else {
                 return Err("is_bool() expects exactly 1 argument".to_owned());
             };
-            let value = context.decode(*value)?;
+            let value = context.decode_baseline_value(*value)?;
             let value = match value {
                 Value::Reference(reference) => reference.get(),
                 value => value,
             };
-            context.encode(Value::Bool(matches!(value, Value::Bool(_))))
+            context.encode_baseline_value(Value::Bool(matches!(value, Value::Bool(_))))
         }
         "is_null" => {
             let [value] = arguments else {
                 return Err("is_null() expects exactly 1 argument".to_owned());
             };
-            let value = context.decode(*value)?;
+            let value = context.decode_baseline_value(*value)?;
             let value = match value {
                 Value::Reference(reference) => reference.get(),
                 value => value,
             };
-            context.encode(Value::Bool(matches!(value, Value::Null)))
+            context.encode_baseline_value(Value::Bool(matches!(value, Value::Null)))
         }
         "is_array" => {
             let [value] = arguments else {
                 return Err("is_array() expects exactly 1 argument".to_owned());
             };
-            let value = context.decode(*value)?;
+            let value = context.decode_baseline_value(*value)?;
             let value = match value {
                 Value::Reference(reference) => reference.get(),
                 value => value,
             };
-            context.encode(Value::Bool(matches!(value, Value::Array(_))))
+            context.encode_baseline_value(Value::Bool(matches!(value, Value::Array(_))))
         }
         "strlen" => {
             let [value] = arguments else {
                 return Err("strlen() expects exactly 1 argument".to_owned());
             };
-            let decoded = context.decode(*value)?;
+            let decoded = context.decode_baseline_value(*value)?;
             let bytes = native_string(decoded.clone()).map_err(|_| {
                 format!(
                     "E_PHP_THROW:TypeError:strlen(): Argument #1 ($string) must be of type string, {} given",
@@ -3259,10 +3409,10 @@ pub(super) fn execute_baseline_native_builtin(
             let [value, ..] = arguments else {
                 return Err("trim() expects at least 1 argument".to_owned());
             };
-            let bytes = native_string(context.decode(*value)?)?;
+            let bytes = native_string(context.decode_baseline_value(*value)?)?;
             let characters = arguments
                 .get(1)
-                .map(|value| context.decode(*value))
+                .map(|value| context.decode_baseline_value(*value))
                 .transpose()?
                 .map(native_string)
                 .transpose()?
@@ -3285,7 +3435,7 @@ pub(super) fn execute_baseline_native_builtin(
                         .to_owned(),
                 );
             };
-            let mut bytes = native_string(context.decode(*value)?).map_err(|_| {
+            let mut bytes = native_string(context.decode_baseline_value(*value)?).map_err(|_| {
                 "E_PHP_THROW:TypeError:strtoupper(): Argument #1 ($string) must be of type string, array given"
                     .to_owned()
             })?;
@@ -3296,7 +3446,7 @@ pub(super) fn execute_baseline_native_builtin(
             let [value, ..] = arguments else {
                 return Err("count() expects an argument".to_owned());
             };
-            let value = match context.decode(*value)? {
+            let value = match context.decode_baseline_value(*value)? {
                 Value::Reference(reference) => reference.get(),
                 value => value,
             };
@@ -3304,13 +3454,13 @@ pub(super) fn execute_baseline_native_builtin(
                 if object.class_name().eq_ignore_ascii_case("ArrayIterator")
                     && let Some(Value::Array(entries)) = object.get_property("__entries")
                 {
-                    return context.encode(Value::Int(entries.len() as i64));
+                    return context.encode_baseline_value(Value::Int(entries.len() as i64));
                 }
                 if let Some(entries) = native_dom_collection_entries(&object) {
-                    return context.encode(Value::Int(entries.len() as i64));
+                    return context.encode_baseline_value(Value::Int(entries.len() as i64));
                 }
                 if let Some(count) = native_simple_xml_count(&object) {
-                    return context.encode(Value::Int(count));
+                    return context.encode_baseline_value(Value::Int(count));
                 }
                 let function = native_method_in_hierarchy(context, &object.class_name(), "count")
                     .ok_or_else(|| {
@@ -3329,7 +3479,7 @@ pub(super) fn execute_baseline_native_builtin(
             };
             let recursive = arguments
                 .get(1)
-                .map(|mode| context.decode(*mode))
+                .map(|mode| context.decode_baseline_value(*mode))
                 .transpose()?
                 .is_some_and(|mode| matches!(mode, Value::Int(1)));
             fn count_array(array: &php_runtime::api::PhpArray, recursive: bool) -> usize {
@@ -3356,17 +3506,17 @@ pub(super) fn execute_baseline_native_builtin(
         "var_dump" => {
             let mut output = Vec::new();
             for argument in arguments {
-                let value = context.decode(*argument)?;
+                let value = context.decode_baseline_value(*argument)?;
                 native_var_dump_with_context(context, &value, 0, &mut output)?;
             }
             context.output.write_bytes(output);
-            context.encode(Value::Null)
+            context.encode_baseline_value(Value::Null)
         }
         "get_class" => {
             let Some(value) = arguments.first() else {
                 return Err("get_class() without an object context is unavailable".to_owned());
             };
-            let value = match context.decode(*value)? {
+            let value = match context.decode_baseline_value(*value)? {
                 Value::Reference(reference) => reference.get(),
                 value => value,
             };
@@ -3387,22 +3537,22 @@ pub(super) fn execute_baseline_native_builtin(
         }
         "get_parent_class" => {
             let Some(value) = arguments.first() else {
-                return context.encode(Value::Bool(false));
+                return context.encode_baseline_value(Value::Bool(false));
             };
-            let class_name = match context.decode(*value)? {
+            let class_name = match context.decode_baseline_value(*value)? {
                 Value::Reference(reference) => match reference.get() {
                     Value::Object(object) => object.class_name(),
                     Value::String(name) => name.to_string_lossy(),
-                    _ => return context.encode(Value::Bool(false)),
+                    _ => return context.encode_baseline_value(Value::Bool(false)),
                 },
                 Value::Object(object) => object.class_name(),
                 Value::String(name) => name.to_string_lossy(),
-                _ => return context.encode(Value::Bool(false)),
+                _ => return context.encode_baseline_value(Value::Bool(false)),
             };
             let Some(parent) =
                 native_builtin_class(context, &class_name).and_then(|class| class.parent.clone())
             else {
-                return context.encode(Value::Bool(false));
+                return context.encode_baseline_value(Value::Bool(false));
             };
             let display = native_builtin_class(context, &parent)
                 .map_or(parent, |class| class.display_name.clone());
@@ -3412,32 +3562,33 @@ pub(super) fn execute_baseline_native_builtin(
             let [target, parent, rest @ ..] = arguments else {
                 return Err("is_subclass_of() expects 2 or 3 arguments".to_owned());
             };
-            let target_value = match context.decode(*target)? {
+            let target_value = match context.decode_baseline_value(*target)? {
                 Value::Reference(reference) => reference.get(),
                 value => value,
             };
             let allow_string = rest
                 .first()
-                .map(|value| context.decode(*value))
+                .map(|value| context.decode_baseline_value(*value))
                 .transpose()?
                 .is_none_or(|value| native_property_truthy(&value));
             let class_name = match target_value {
                 Value::Object(object) => object.class_name(),
                 Value::String(name) if allow_string => name.to_string_lossy(),
-                _ => return context.encode(Value::Bool(false)),
+                _ => return context.encode_baseline_value(Value::Bool(false)),
             };
-            let parent = String::from_utf8_lossy(&native_string(context.decode(*parent)?)?)
-                .to_ascii_lowercase();
+            let parent =
+                String::from_utf8_lossy(&native_string(context.decode_baseline_value(*parent)?)?)
+                    .to_ascii_lowercase();
             let mut current =
                 native_builtin_class(context, &class_name).and_then(|class| class.parent.clone());
             while let Some(candidate) = current {
                 if normalize_class_name(&candidate) == parent {
-                    return context.encode(Value::Bool(true));
+                    return context.encode_baseline_value(Value::Bool(true));
                 }
                 current = native_builtin_class(context, &candidate)
                     .and_then(|class| class.parent.clone());
             }
-            context.encode(Value::Bool(false))
+            context.encode_baseline_value(Value::Bool(false))
         }
         "sys_get_temp_dir" => context.encode_native_string_owner(PhpString::from_bytes(
             std::env::temp_dir().to_string_lossy().as_bytes().to_vec(),
@@ -3446,7 +3597,7 @@ pub(super) fn execute_baseline_native_builtin(
             let [directory] = arguments else {
                 return Err("chdir() expects exactly 1 argument".to_owned());
             };
-            let directory = native_string(context.decode(*directory)?)?;
+            let directory = native_string(context.decode_baseline_value(*directory)?)?;
             let directory =
                 std::path::PathBuf::from(String::from_utf8_lossy(&directory).into_owned());
             let resolved = if directory.is_absolute() {
@@ -3456,10 +3607,10 @@ pub(super) fn execute_baseline_native_builtin(
             };
             let resolved = resolved.canonicalize().map_err(|error| error.to_string())?;
             if !resolved.is_dir() {
-                return context.encode(Value::Bool(false));
+                return context.encode_baseline_value(Value::Bool(false));
             }
             context.cwd = resolved;
-            context.encode(Value::Bool(true))
+            context.encode_baseline_value(Value::Bool(true))
         }
         "getcwd" => context.encode_native_string_owner(PhpString::from_bytes(
             context.cwd.to_string_lossy().as_bytes().to_vec(),
@@ -3467,7 +3618,7 @@ pub(super) fn execute_baseline_native_builtin(
         "getenv" => {
             let name = arguments
                 .first()
-                .map(|name| context.decode(*name))
+                .map(|name| context.decode_baseline_value(*name))
                 .transpose()?;
             if name.as_ref().is_none_or(|name| matches!(name, Value::Null)) {
                 let mut values = php_runtime::api::PhpArray::new();
@@ -3489,17 +3640,19 @@ pub(super) fn execute_baseline_native_builtin(
                     .map_or(Value::Bool(false), |(_, value)| {
                         Value::String(PhpString::from_bytes(value.as_bytes().to_vec()))
                     });
-                context.encode(value)
+                context.encode_baseline_value(value)
             } else {
-                context.encode(Value::Bool(false))
+                context.encode_baseline_value(Value::Bool(false))
             }
         }
         "putenv" => {
             let Some(assignment) = arguments.first() else {
                 return Err("putenv() expects exactly 1 argument".to_owned());
             };
-            let assignment =
-                String::from_utf8_lossy(&native_string(context.decode(*assignment)?)?).into_owned();
+            let assignment = String::from_utf8_lossy(&native_string(
+                context.decode_baseline_value(*assignment)?,
+            )?)
+            .into_owned();
             if assignment.is_empty() {
                 return Err("E_PHP_THROW:ValueError:putenv(): Argument #1 ($assignment) must have a valid syntax".to_owned());
             }
@@ -3517,7 +3670,7 @@ pub(super) fn execute_baseline_native_builtin(
                 environment.push((name.to_owned(), value));
                 environment.sort();
             }
-            context.encode(Value::Bool(true))
+            context.encode_baseline_value(Value::Bool(true))
         }
         "php_sapi_name" => context.encode_native_string_owner(PhpString::from_bytes(
             context
@@ -3530,7 +3683,7 @@ pub(super) fn execute_baseline_native_builtin(
         "php_uname" => {
             let mode = arguments
                 .first()
-                .map(|mode| context.decode(*mode))
+                .map(|mode| context.decode_baseline_value(*mode))
                 .transpose()?
                 .map(native_string)
                 .transpose()?
@@ -3559,26 +3712,30 @@ pub(super) fn execute_baseline_native_builtin(
                 .get("ignore_user_abort")
                 .is_some_and(|value| value != "0" && !value.is_empty());
             if let Some(value) = arguments.first() {
-                let enabled = php_runtime::api::to_bool(&context.decode(*value)?)?;
+                let enabled = php_runtime::api::to_bool(&context.decode_baseline_value(*value)?)?;
                 context
                     .ini_registry
                     .set("ignore_user_abort", if enabled { "1" } else { "0" });
             }
-            context.encode(Value::Int(i64::from(previous)))
+            context.encode_baseline_value(Value::Int(i64::from(previous)))
         }
         "ini_set" | "set_include_path" => {
             let (name, value) = if normalized == "set_include_path" {
                 let [value] = arguments else {
                     return Err("set_include_path() expects exactly 1 argument".to_owned());
                 };
-                ("include_path".to_owned(), context.decode(*value)?)
+                (
+                    "include_path".to_owned(),
+                    context.decode_baseline_value(*value)?,
+                )
             } else {
                 let [name, value] = arguments else {
                     return Err("ini_set() expects exactly 2 arguments".to_owned());
                 };
                 (
-                    String::from_utf8_lossy(&native_string(context.decode(*name)?)?).into_owned(),
-                    context.decode(*value)?,
+                    String::from_utf8_lossy(&native_string(context.decode_baseline_value(*name)?)?)
+                        .into_owned(),
+                    context.decode_baseline_value(*value)?,
                 )
             };
             let value = if normalized == "ini_set" {
@@ -3596,7 +3753,7 @@ pub(super) fn execute_baseline_native_builtin(
             if name.eq_ignore_ascii_case("display_errors") && previous.is_some() {
                 context.display_errors = context.ini_registry.get("display_errors") == Some("1");
             }
-            context.encode(previous.map_or(Value::Bool(false), |previous| {
+            context.encode_baseline_value(previous.map_or(Value::Bool(false), |previous| {
                 Value::String(PhpString::from_bytes(previous.into_bytes()))
             }))
         }
@@ -3607,9 +3764,10 @@ pub(super) fn execute_baseline_native_builtin(
                 let [name] = arguments else {
                     return Err("ini_get() expects exactly 1 argument".to_owned());
                 };
-                String::from_utf8_lossy(&native_string(context.decode(*name)?)?).into_owned()
+                String::from_utf8_lossy(&native_string(context.decode_baseline_value(*name)?)?)
+                    .into_owned()
             };
-            context.encode(
+            context.encode_baseline_value(
                 context
                     .ini_registry
                     .get(&name)
@@ -3623,8 +3781,9 @@ pub(super) fn execute_baseline_native_builtin(
                 return Err("get_cfg_var() expects exactly 1 argument".to_owned());
             };
             let name =
-                String::from_utf8_lossy(&native_string(context.decode(*name)?)?).into_owned();
-            context.encode(
+                String::from_utf8_lossy(&native_string(context.decode_baseline_value(*name)?)?)
+                    .into_owned();
+            context.encode_baseline_value(
                 context
                     .ini_registry
                     .cfg_var(&name)
@@ -3636,7 +3795,7 @@ pub(super) fn execute_baseline_native_builtin(
         "ini_get_all" => {
             let extension = arguments
                 .first()
-                .map(|value| context.decode(*value))
+                .map(|value| context.decode_baseline_value(*value))
                 .transpose()?
                 .and_then(|value| match value {
                     Value::Null => None,
@@ -3648,7 +3807,7 @@ pub(super) fn execute_baseline_native_builtin(
                 .get(1)
                 .map(|value| {
                     context
-                        .decode(*value)
+                        .decode_baseline_value(*value)
                         .map(|value| native_property_truthy(&value))
                 })
                 .transpose()?
@@ -3696,8 +3855,8 @@ pub(super) fn execute_baseline_native_builtin(
             let [directory, prefix, ..] = arguments else {
                 return Err("tempnam() expects a directory and prefix".to_owned());
             };
-            let directory = native_string(context.decode(*directory)?)?;
-            let prefix = native_string(context.decode(*prefix)?)?;
+            let directory = native_string(context.decode_baseline_value(*directory)?)?;
+            let prefix = native_string(context.decode_baseline_value(*prefix)?)?;
             let directory =
                 std::path::PathBuf::from(String::from_utf8_lossy(&directory).into_owned());
             let directory = if directory.is_absolute() {
@@ -3711,7 +3870,7 @@ pub(super) fn execute_baseline_native_builtin(
                 .filesystem
                 .allows_path(&directory)
             {
-                return context.encode(Value::Bool(false));
+                return context.encode_baseline_value(Value::Bool(false));
             }
             let prefix = String::from_utf8_lossy(&prefix);
             let mut created = None;
@@ -3788,7 +3947,7 @@ pub(super) fn execute_baseline_native_builtin(
                 return Err("fclose() expects exactly 1 argument".to_owned());
             };
             if let Some(resource) = context.native_resource(*resource) {
-                return context.encode(Value::Bool(resource.close()));
+                return context.encode_baseline_value(Value::Bool(resource.close()));
             }
             Err("fclose() expects a stream resource".to_owned())
         }
@@ -3796,7 +3955,7 @@ pub(super) fn execute_baseline_native_builtin(
             let [path, ..] = arguments else {
                 return Err("file_get_contents() expects a path".to_owned());
             };
-            let path = native_string(context.decode(*path)?)?;
+            let path = native_string(context.decode_baseline_value(*path)?)?;
             let bytes = std::fs::read(String::from_utf8_lossy(&path).as_ref())
                 .map_err(|error| error.to_string())?;
             context.encode_native_string_owner(PhpString::from_bytes(bytes))
@@ -3806,11 +3965,11 @@ pub(super) fn execute_baseline_native_builtin(
             let [path, data, rest @ ..] = arguments else {
                 return Err("file_put_contents() expects a path and data".to_owned());
             };
-            let path = native_string(context.decode(*path)?)?;
-            let data = native_string(context.decode(*data)?)?;
+            let path = native_string(context.decode_baseline_value(*path)?)?;
+            let data = native_string(context.decode_baseline_value(*data)?)?;
             let flags = rest
                 .first()
-                .map(|flags| context.decode(*flags))
+                .map(|flags| context.decode_baseline_value(*flags))
                 .transpose()?
                 .and_then(|flags| match flags {
                     Value::Int(flags) => Some(flags),
@@ -3834,10 +3993,10 @@ pub(super) fn execute_baseline_native_builtin(
             let [path, ..] = arguments else {
                 return Err("unlink() expects a path".to_owned());
             };
-            let path = native_string(context.decode(*path)?)?;
+            let path = native_string(context.decode_baseline_value(*path)?)?;
             std::fs::remove_file(String::from_utf8_lossy(&path).as_ref())
                 .map_err(|error| error.to_string())?;
-            context.encode(Value::Bool(true))
+            context.encode_baseline_value(Value::Bool(true))
         }
         "call_user_func" | "forward_static_call" => execute_native_callback_builtin_control(
             context,
@@ -3852,16 +4011,16 @@ pub(super) fn execute_baseline_native_builtin(
             let Some(callback) = arguments.first() else {
                 return Err("spl_autoload_register() expects a callback".to_owned());
             };
-            let callback = context.decode(*callback)?;
+            let callback = context.decode_baseline_value(*callback)?;
             context.autoload_callbacks.push(callback);
             context.mark_roots_dirty(RootMutationReason::CallbackOrHandler);
-            context.encode(Value::Bool(true))
+            context.encode_baseline_value(Value::Bool(true))
         }
         "spl_autoload_unregister" => {
             let Some(callback) = arguments.first() else {
                 return Err("spl_autoload_unregister() expects a callback".to_owned());
             };
-            let callback = context.decode(*callback)?;
+            let callback = context.decode_baseline_value(*callback)?;
             let previous = context.autoload_callbacks.len();
             context
                 .autoload_callbacks
@@ -3869,7 +4028,7 @@ pub(super) fn execute_baseline_native_builtin(
             if context.autoload_callbacks.len() != previous {
                 context.mark_roots_dirty(RootMutationReason::CallbackOrHandler);
             }
-            context.encode(Value::Bool(context.autoload_callbacks.len() != previous))
+            context.encode_baseline_value(Value::Bool(context.autoload_callbacks.len() != previous))
         }
         "spl_autoload_functions" => context.encode_native_array_owner(
             php_runtime::api::PhpArray::from_packed(context.autoload_callbacks.clone()),
@@ -3878,10 +4037,10 @@ pub(super) fn execute_baseline_native_builtin(
             let Some((callback, arguments)) = arguments.split_first() else {
                 return Err("register_shutdown_function() expects a callback".to_owned());
             };
-            let callback = context.decode(*callback)?;
+            let callback = context.decode_baseline_value(*callback)?;
             let arguments = arguments
                 .iter()
-                .map(|argument| context.decode(*argument))
+                .map(|argument| context.decode_baseline_value(*argument))
                 .collect::<Result<Vec<_>, _>>()?;
             context.shutdown_callbacks.push(NativeShutdownCallback {
                 callable: callback,
@@ -3889,16 +4048,18 @@ pub(super) fn execute_baseline_native_builtin(
                 source: source.clone(),
             });
             context.mark_roots_dirty(RootMutationReason::CallbackOrHandler);
-            context.encode(Value::Null)
+            context.encode_baseline_value(Value::Null)
         }
         "class_alias" => {
             let [original, alias, ..] = arguments else {
                 return Err("class_alias() expects an original and alias".to_owned());
             };
             let original =
-                String::from_utf8_lossy(&native_string(context.decode(*original)?)?).into_owned();
+                String::from_utf8_lossy(&native_string(context.decode_baseline_value(*original)?)?)
+                    .into_owned();
             let alias =
-                String::from_utf8_lossy(&native_string(context.decode(*alias)?)?).into_owned();
+                String::from_utf8_lossy(&native_string(context.decode_baseline_value(*alias)?)?)
+                    .into_owned();
             let normalized_original = normalize_class_name(&original);
             let normalized_alias = normalize_class_name(&alias);
             let exists = context
@@ -3908,19 +4069,19 @@ pub(super) fn execute_baseline_native_builtin(
                 .any(|class| class.name == normalized_original)
                 || native_external_class_exists(context, &normalized_original);
             if !exists {
-                return context.encode(Value::Bool(false));
+                return context.encode_baseline_value(Value::Bool(false));
             }
             context
                 .class_aliases
                 .insert(normalized_alias.clone(), normalized_original);
             context.dynamic_classes.insert(normalized_alias);
-            context.encode(Value::Bool(true))
+            context.encode_baseline_value(Value::Bool(true))
         }
         "get_object_vars" | "get_mangled_object_vars" => {
             let Some(object) = arguments.first() else {
                 return Err(format!("{normalized}() expects exactly 1 argument"));
             };
-            let object = match context.decode(*object)? {
+            let object = match context.decode_baseline_value(*object)? {
                 Value::Reference(reference) => reference.get(),
                 value => value,
             };
@@ -3941,15 +4102,15 @@ pub(super) fn execute_baseline_native_builtin(
             let Some(target) = arguments.first() else {
                 return Err("get_class_methods() expects exactly 1 argument".to_owned());
             };
-            let class_name = match context.decode(*target)? {
+            let class_name = match context.decode_baseline_value(*target)? {
                 Value::Reference(reference) => match reference.get() {
                     Value::Object(object) => object.class_name(),
                     Value::String(name) => name.to_string_lossy(),
-                    _ => return context.encode(Value::Bool(false)),
+                    _ => return context.encode_baseline_value(Value::Bool(false)),
                 },
                 Value::Object(object) => object.class_name(),
                 Value::String(name) => name.to_string_lossy(),
-                _ => return context.encode(Value::Bool(false)),
+                _ => return context.encode_baseline_value(Value::Bool(false)),
             };
             let caller_class = native_builtin_caller_class(context, caller_locals);
             let mut seen = std::collections::BTreeSet::new();
@@ -3978,7 +4139,8 @@ pub(super) fn execute_baseline_native_builtin(
                 return Err("get_class_vars() expects exactly 1 argument".to_owned());
             };
             let class_name =
-                String::from_utf8_lossy(&native_string(context.decode(*target)?)?).into_owned();
+                String::from_utf8_lossy(&native_string(context.decode_baseline_value(*target)?)?)
+                    .into_owned();
             let caller_class = native_builtin_caller_class(context, caller_locals);
             let mut properties = php_runtime::api::PhpArray::new();
             for class in native_builtin_class_lineage(context, &class_name)
@@ -4023,26 +4185,28 @@ pub(super) fn execute_baseline_native_builtin(
             let Some(name) = arguments.first() else {
                 return Err("function_exists() expects exactly 1 argument".to_owned());
             };
-            let name = String::from_utf8_lossy(&native_string(context.decode(*name)?)?)
-                .to_ascii_lowercase();
+            let name =
+                String::from_utf8_lossy(&native_string(context.decode_baseline_value(*name)?)?)
+                    .to_ascii_lowercase();
             let exists = context.function_id(&name).is_some()
                 || context.external_function(&name).is_some()
                 || context.visible_function_names.contains(&name)
                 || native_php_function_exists(&name);
-            context.encode(Value::Bool(exists))
+            context.encode_baseline_value(Value::Bool(exists))
         }
         "method_exists" | "property_exists" => {
             let [target, member] = arguments else {
                 return Err(format!("{normalized}() expects exactly 2 arguments"));
             };
-            let target = native_dereference_value(context.decode(*target)?);
+            let target = native_dereference_value(context.decode_baseline_value(*target)?);
             let (class_name, object) = match target {
                 Value::Object(object) => (object.class_name(), Some(object)),
                 Value::String(class) => (class.to_string_lossy(), None),
-                _ => return context.encode(Value::Bool(false)),
+                _ => return context.encode_baseline_value(Value::Bool(false)),
             };
             let member =
-                String::from_utf8_lossy(&native_string(context.decode(*member)?)?).into_owned();
+                String::from_utf8_lossy(&native_string(context.decode_baseline_value(*member)?)?)
+                    .into_owned();
             let exists = (normalized == "property_exists"
                 && object
                     .as_ref()
@@ -4080,14 +4244,15 @@ pub(super) fn execute_baseline_native_builtin(
                         &member,
                     )
                     .is_some());
-            context.encode(Value::Bool(exists))
+            context.encode_baseline_value(Value::Bool(exists))
         }
         "class_exists" | "interface_exists" | "trait_exists" | "enum_exists" => {
             let Some(name) = arguments.first() else {
                 return Err(format!("{normalized}() expects a class name"));
             };
             let name =
-                String::from_utf8_lossy(&native_string(context.decode(*name)?)?).into_owned();
+                String::from_utf8_lossy(&native_string(context.decode_baseline_value(*name)?)?)
+                    .into_owned();
             let normalized_name = normalize_class_name(&name);
             let matches_kind = |class: &php_ir::ClassEntry| match normalized.as_ref() {
                 "interface_exists" => class.flags.is_interface,
@@ -4130,7 +4295,7 @@ pub(super) fn execute_baseline_native_builtin(
             }
             let autoload = arguments
                 .get(1)
-                .map(|value| context.decode(*value))
+                .map(|value| context.decode_baseline_value(*value))
                 .transpose()?
                 .is_none_or(|value| native_property_truthy(&value));
             if !exists && autoload && context.autoload_in_progress.insert(normalized_name.clone()) {
@@ -4159,7 +4324,7 @@ pub(super) fn execute_baseline_native_builtin(
                     return Err(error);
                 }
             }
-            context.encode(Value::Bool(exists))
+            context.encode_baseline_value(Value::Bool(exists))
         }
         "call_user_func_array" => execute_native_callback_builtin_control(
             context,
@@ -4171,11 +4336,8 @@ pub(super) fn execute_baseline_native_builtin(
         .expect("callback builtin arm must be typed")
         .map_err(String::from),
         "func_num_args" => {
-            let count = context
-                .call_frames
-                .last()
-                .map_or(0, |frame| frame.arguments.len());
-            context.encode(Value::Int(i64::try_from(count).unwrap_or(i64::MAX)))
+            let count = baseline_visible_call_arguments(context, caller_locals)?.len();
+            context.encode_baseline_value(Value::Int(i64::try_from(count).unwrap_or(i64::MAX)))
         }
         "debug_backtrace" => {
             let strict = context.unit.strict_types_for_span(source.span);
@@ -4252,7 +4414,7 @@ pub(super) fn execute_baseline_native_builtin(
                         let arguments = frame
                             .arguments
                             .iter()
-                            .map(|argument| context.decode(*argument))
+                            .map(|argument| context.decode_baseline_value(*argument))
                             .collect::<Result<Vec<_>, _>>()?;
                         insert(
                             "args",
@@ -4274,23 +4436,24 @@ pub(super) fn execute_baseline_native_builtin(
                 context.unit.strict_types_for_span(source.span),
             )?
             .ok_or_else(|| "func_get_arg(): argument #1 must be of type int".to_owned())?;
+            let visible = baseline_visible_call_arguments(context, caller_locals)?;
             let Some(value) = usize::try_from(index)
                 .ok()
-                .and_then(|index| context.call_frames.last()?.arguments.get(index))
+                .and_then(|index| visible.get(index))
                 .copied()
             else {
                 return Err(format!(
-                    "func_get_arg(): argument #{index} not passed to function"
+                    "E_PHP_THROW:Error:func_get_arg(): argument #{index} not passed to function"
                 ));
             };
-            let value = context.decode(value)?;
-            context.encode(value)
+            let value = context.decode_baseline_value(value)?;
+            context.encode_baseline_value(value)
         }
         "is_callable" => {
             let Some(value) = arguments.first() else {
                 return Err("is_callable() expects a value".to_owned());
             };
-            let value = context.decode(*value)?;
+            let value = context.decode_baseline_value(*value)?;
             let autoload_class = match &value {
                 Value::String(value) => value
                     .to_string_lossy()
@@ -4310,7 +4473,7 @@ pub(super) fn execute_baseline_native_builtin(
                 native_autoload_class(context, &class, source)?;
             }
             let callable = native_value_is_callable(context, &value);
-            context.encode(Value::Bool(callable))
+            context.encode_baseline_value(Value::Bool(callable))
         }
         "get_defined_functions" => {
             let internal = php_extensions::BuiltinRegistry::new()
@@ -4356,7 +4519,7 @@ pub(super) fn execute_baseline_native_builtin(
         "get_defined_constants" => {
             let categorized = arguments
                 .first()
-                .map(|value| context.decode(*value))
+                .map(|value| context.decode_baseline_value(*value))
                 .transpose()?
                 .is_some_and(|value| native_property_truthy(&value));
             let mut core = php_runtime::api::PhpArray::new();
@@ -4399,13 +4562,13 @@ pub(super) fn execute_baseline_native_builtin(
             let name = arguments
                 .first()
                 .ok_or_else(|| "extension_loaded() expects exactly 1 argument".to_owned())?;
-            let name = native_string(context.decode(*name)?)?;
+            let name = native_string(context.decode_baseline_value(*name)?)?;
             let name = String::from_utf8_lossy(&name);
             let loaded = php_std::introspection::extension_loaded(
                 php_std::ExtensionRegistry::standard_library(),
                 &name,
             );
-            context.encode(Value::Bool(loaded))
+            context.encode_baseline_value(Value::Bool(loaded))
         }
         "get_loaded_extensions" => {
             let names = php_std::ExtensionRegistry::standard_library()
@@ -4439,7 +4602,7 @@ pub(super) fn execute_baseline_native_builtin(
                 }
                 3 => {
                     let Some(destination) = arguments.get(2) else {
-                        return context.encode(Value::Bool(false));
+                        return context.encode_baseline_value(Value::Bool(false));
                     };
                     let destination = native_encoded_string(context, *destination)?;
                     let destination =
@@ -4470,7 +4633,7 @@ pub(super) fn execute_baseline_native_builtin(
                 // process or filesystem capability.
                 _ => false,
             };
-            context.encode(Value::Bool(success))
+            context.encode_baseline_value(Value::Bool(success))
         }
         "error_reporting" => {
             let previous = context.error_reporting;
@@ -4482,26 +4645,26 @@ pub(super) fn execute_baseline_native_builtin(
                 )?
                 .ok_or_else(|| "error_reporting() expects an int".to_owned())?;
             }
-            context.encode(Value::Int(previous))
+            context.encode_baseline_value(Value::Int(previous))
         }
         "error_get_last" => {
             if !arguments.is_empty() {
                 return Err("error_get_last() expects exactly 0 arguments".to_owned());
             }
-            context.encode(context.last_error_value())
+            context.encode_baseline_value(context.last_error_value())
         }
         "error_clear_last" => {
             if !arguments.is_empty() {
                 return Err("error_clear_last() expects exactly 0 arguments".to_owned());
             }
             context.last_error = None;
-            context.encode(Value::Null)
+            context.encode_baseline_value(Value::Null)
         }
         "set_error_handler" => {
             let Some(callback) = arguments.first() else {
                 return Err("set_error_handler() expects a callback".to_owned());
             };
-            let callback = match context.decode(*callback)? {
+            let callback = match context.decode_baseline_value(*callback)? {
                 Value::Reference(reference) => reference.get(),
                 value => value,
             };
@@ -4518,7 +4681,7 @@ pub(super) fn execute_baseline_native_builtin(
                 .unwrap_or(Value::Null);
             let levels = arguments
                 .get(1)
-                .map(|levels| context.decode(*levels))
+                .map(|levels| context.decode_baseline_value(*levels))
                 .transpose()?
                 .map_or(-1, |levels| match levels {
                     Value::Reference(reference) => match reference.get() {
@@ -4532,19 +4695,19 @@ pub(super) fn execute_baseline_native_builtin(
                 .error_handlers
                 .push(NativeErrorHandler { callback, levels });
             context.mark_roots_dirty(RootMutationReason::CallbackOrHandler);
-            context.encode(previous)
+            context.encode_baseline_value(previous)
         }
         "restore_error_handler" => {
             if context.error_handlers.pop().is_some() {
                 context.mark_roots_dirty(RootMutationReason::CallbackOrHandler);
             }
-            context.encode(Value::Bool(true))
+            context.encode_baseline_value(Value::Bool(true))
         }
         "set_exception_handler" => {
             let Some(callback) = arguments.first() else {
                 return Err("set_exception_handler() expects a callback".to_owned());
             };
-            let callback = match context.decode(*callback)? {
+            let callback = match context.decode_baseline_value(*callback)? {
                 Value::Reference(reference) => reference.get(),
                 value => value,
             };
@@ -4561,15 +4724,15 @@ pub(super) fn execute_baseline_native_builtin(
                 .unwrap_or(Value::Null);
             context.exception_handlers.push(callback);
             context.mark_roots_dirty(RootMutationReason::CallbackOrHandler);
-            context.encode(previous)
+            context.encode_baseline_value(previous)
         }
         "restore_exception_handler" => {
             if context.exception_handlers.pop().is_some() {
                 context.mark_roots_dirty(RootMutationReason::CallbackOrHandler);
             }
-            context.encode(Value::Bool(true))
+            context.encode_baseline_value(Value::Bool(true))
         }
-        "get_exception_handler" => context.encode(
+        "get_exception_handler" => context.encode_baseline_value(
             context
                 .exception_handlers
                 .last()
@@ -4581,10 +4744,11 @@ pub(super) fn execute_baseline_native_builtin(
                 return Err(format!("{normalized}() expects a message"));
             };
             let message =
-                String::from_utf8_lossy(&native_string(context.decode(*message)?)?).into_owned();
+                String::from_utf8_lossy(&native_string(context.decode_baseline_value(*message)?)?)
+                    .into_owned();
             let level = arguments
                 .get(1)
-                .map(|level| context.decode(*level))
+                .map(|level| context.decode_baseline_value(*level))
                 .transpose()?
                 .map_or(1024, |level| match level {
                     Value::Int(level) => level,
@@ -4600,31 +4764,23 @@ pub(super) fn execute_baseline_native_builtin(
                 ));
             }
             emit_native_php_warning(context, level, &message, source)?;
-            context.encode(Value::Bool(true))
+            context.encode_baseline_value(Value::Bool(true))
         }
         "settype" => {
             let [target, type_name] = arguments else {
                 return Err("settype() expects exactly 2 arguments".to_owned());
             };
-            let Value::Reference(target) = context.decode(*target)? else {
+            let Value::Reference(target) = context.decode_baseline_value(*target)? else {
                 return Err("settype(): Argument #1 ($var) must be passed by reference".to_owned());
             };
-            let type_name = String::from_utf8_lossy(&native_string(context.decode(*type_name)?)?)
-                .to_ascii_lowercase();
+            let type_name = String::from_utf8_lossy(&native_string(
+                context.decode_baseline_value(*type_name)?,
+            )?)
+            .to_ascii_lowercase();
             let current = target.get();
             let replacement = match type_name.as_str() {
                 "null" => Value::Null,
-                "bool" | "boolean" => {
-                    if matches!(current, Value::Float(value) if value.to_f64().is_nan()) {
-                        emit_native_php_warning(
-                            context,
-                            2,
-                            "unexpected NAN value was coerced to bool",
-                            source,
-                        )?;
-                    }
-                    Value::Bool(native_property_truthy(&current))
-                }
+                "bool" | "boolean" => Value::Bool(native_property_truthy(&current)),
                 "int" | "integer" => match current {
                     Value::String(value) => {
                         let classified =
@@ -4665,31 +4821,13 @@ pub(super) fn execute_baseline_native_builtin(
                     }
                     value => Value::String(PhpString::from_bytes(native_string(value)?)),
                 },
-                "array" => {
-                    let nan = matches!(current, Value::Float(value) if value.to_f64().is_nan());
-                    if nan {
-                        emit_native_php_warning(
-                            context,
-                            2,
-                            "unexpected NAN value was coerced to array",
-                            source,
-                        )?;
+                "array" => match current {
+                    Value::Array(array) => Value::Array(array),
+                    Value::Null | Value::Uninitialized => {
+                        Value::Array(php_runtime::api::PhpArray::new())
                     }
-                    let current = target.get();
-                    if nan {
-                        Value::Array(php_runtime::api::PhpArray::from_packed(vec![current]))
-                    } else {
-                        match current {
-                            Value::Array(array) => Value::Array(array),
-                            Value::Null | Value::Uninitialized => {
-                                Value::Array(php_runtime::api::PhpArray::new())
-                            }
-                            value => {
-                                Value::Array(php_runtime::api::PhpArray::from_packed(vec![value]))
-                            }
-                        }
-                    }
-                }
+                    value => Value::Array(php_runtime::api::PhpArray::from_packed(vec![value])),
+                },
                 "object" => match current {
                     Value::Object(object) => Value::Object(object),
                     Value::Array(array) => {
@@ -4723,13 +4861,13 @@ pub(super) fn execute_baseline_native_builtin(
                 }
             };
             context.set_native_reference_value(&target, replacement)?;
-            context.encode(Value::Bool(true))
+            context.encode_baseline_value(Value::Bool(true))
         }
         "set_time_limit" => {
             let [seconds] = arguments else {
                 return Err("set_time_limit() expects exactly 1 argument".to_owned());
             };
-            let seconds = match context.decode(*seconds)? {
+            let seconds = match context.decode_baseline_value(*seconds)? {
                 Value::Int(seconds) => seconds,
                 Value::Reference(reference) => match reference.get() {
                     Value::Int(seconds) => seconds,
@@ -4744,7 +4882,7 @@ pub(super) fn execute_baseline_native_builtin(
                 );
             }
             context.reset_execution_deadline_seconds(seconds as u64);
-            context.encode(Value::Bool(true))
+            context.encode_baseline_value(Value::Bool(true))
         }
         _ => {
             let entry = prepared
@@ -4762,7 +4900,7 @@ pub(super) fn execute_baseline_native_builtin(
                 .iter()
                 .enumerate()
                 .map(|(index, argument)| {
-                    let value = context.decode(*argument)?;
+                    let value = context.decode_baseline_value(*argument)?;
                     let by_ref = metadata
                         .and_then(|function| {
                             function.params.get(index).or_else(|| {
@@ -4784,6 +4922,9 @@ pub(super) fn execute_baseline_native_builtin(
                 .collect::<Result<Vec<_>, _>>()?;
             if normalized == "shm_put_var" {
                 prepare_native_sysvshm_serialization(context, &mut values)?;
+            }
+            if normalized.starts_with("session_") {
+                context.materialize_native_session_state()?;
             }
             let span = php_runtime::api::RuntimeSourceSpan {
                 file: context
@@ -4854,7 +4995,7 @@ pub(super) fn execute_baseline_native_builtin(
                 emit_native_php_diagnostic(context, errno, diagnostic.message(), source, true)?;
             }
             match result {
-                Ok(value) => context.encode(value),
+                Ok(value) => context.encode_baseline_value(value),
                 Err(error) => {
                     let id = error.diagnostic_id().to_ascii_uppercase();
                     let class = if id.contains("ARITY") || id.contains("ARGUMENT_COUNT") {
@@ -5028,10 +5169,12 @@ fn validate_native_builtin_types_with_info(
     let values = arguments
         .iter()
         .map(|argument| {
-            context.decode(*argument).map(|value| match value {
-                Value::Reference(reference) => reference.get(),
-                value => value,
-            })
+            context
+                .decode_baseline_value(*argument)
+                .map(|value| match value {
+                    Value::Reference(reference) => reference.get(),
+                    value => value,
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mode = if context.unit.strict_types_for_span(source) {

@@ -51,7 +51,7 @@ pub(in crate::vm::jit_abi) fn construct_native_mysqli_class(
             "report_mode",
             Value::Int(context.mysql_state.borrow().report_flags()),
         );
-        context.encode(Value::Object(object))
+        context.encode_baseline_value(Value::Object(object))
     });
     Some(result)
 }

@@ -72,7 +72,7 @@ pub(in crate::vm) extern "C" fn jit_native_semantic_dispatch_diagnostic_abi(
 #[allow(unsafe_code)]
 unsafe fn jit_native_semantic_dispatch_impl<const DIAGNOSTIC: bool>(
     runtime: *mut NativeRequestFastState,
-    _unit_identity: u64,
+    unit_identity: u64,
     function: u32,
     continuation: u32,
     operation: u32,
@@ -91,45 +91,51 @@ unsafe fn jit_native_semantic_dispatch_impl<const DIAGNOSTIC: bool>(
     } else {
         unsafe { std::slice::from_raw_parts(operands, operand_count as usize) }
     };
-    // SAFETY: every native entry receives the live request state directly and
-    // helpers cannot outlive the synchronous request invocation.
-    let context = unsafe { native_cold_context(runtime) };
-    // SAFETY: function/continuation are constants emitted together with this
-    // immutable callsite table. Artifact publication rejects mismatched code.
-    let descriptor = unsafe {
-        &*context
-            .prepared_native_callsite(function, continuation)
-            .unwrap_unchecked()
-    };
-    debug_assert!(matches!(
-        descriptor.kind,
-        crate::compiled_unit::NativeCallSiteKind::Semantic
-    ));
     // SAFETY: RegionSemanticOperationId is append-only and the compiler emits
     // only a validated enum discriminant from the prepared Region IR.
     let operation = unsafe {
         std::mem::transmute::<u32, php_jit::region_ir::RegionSemanticOperationId>(operation)
     };
     let helper_id = semantic_operation_helper_id(operation);
-    if DIAGNOSTIC {
-        context.enter_runtime_helper(helper_id);
-    }
-    let instruction = descriptor.semantic_instruction();
-    let outcome = execute_native_semantic_operation(
-        context,
-        operation,
-        instruction,
-        operands,
-        function,
-        continuation,
-    );
-    if DIAGNOSTIC {
-        context.exit_runtime_helper(helper_id);
-    }
+    let dispatched = with_baseline_native_context_for_unit(runtime, unit_identity, |context| {
+        // SAFETY: function/continuation are constants emitted together with
+        // this immutable unit callsite table. Artifact publication rejects
+        // mismatched code before native entry.
+        let descriptor = unsafe {
+            &*context
+                .prepared_native_callsite(function, continuation)
+                .unwrap_unchecked()
+        };
+        debug_assert!(matches!(
+            descriptor.kind,
+            crate::compiled_unit::NativeCallSiteKind::Semantic
+        ));
+        if DIAGNOSTIC {
+            context.enter_runtime_helper(helper_id);
+        }
+        let instruction = descriptor.semantic_instruction();
+        let outcome = execute_native_semantic_operation(
+            context,
+            operation,
+            instruction,
+            operands,
+            function,
+            continuation,
+        );
+        if DIAGNOSTIC {
+            context.exit_runtime_helper(helper_id);
+        }
+        (
+            outcome.map_err(NativeCallControl::from_baseline_error),
+            descriptor.span,
+        )
+    });
+    let (outcome, callsite_span) =
+        dispatched.map_or((None, None), |(outcome, span)| (Some(outcome), Some(span)));
     super::call_dispatch::finish_native_dispatch_outcome(
         runtime,
-        Some(outcome.map_err(NativeCallControl::from_baseline_error)),
-        Some(descriptor.span),
+        outcome,
+        callsite_span,
         transition_state,
         out,
     )
@@ -254,7 +260,7 @@ fn execute_bound_closure_class(
     let [bound_object] = arguments else {
         return Err("bound closure class operation requires one object".to_owned());
     };
-    let Value::Object(object) = context.decode(*bound_object)? else {
+    let Value::Object(object) = context.decode_baseline_value(*bound_object)? else {
         return Err("bound closure class operation requires an object".to_owned());
     };
     let class_name = object.class_name();
@@ -264,7 +270,7 @@ fn execute_bound_closure_class(
         .iter()
         .find(|class| class.name == normalize_class_name(&class_name))
         .map_or(class_name, |class| class.display_name.clone());
-    context.encode(Value::String(PhpString::from_bytes(
+    context.encode_baseline_value(Value::String(PhpString::from_bytes(
         display_name.as_bytes().to_vec(),
     )))
 }
