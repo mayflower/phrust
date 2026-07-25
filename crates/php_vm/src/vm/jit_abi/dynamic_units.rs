@@ -569,6 +569,11 @@ pub(super) fn prepare_dynamic_native_entry(
     } else {
         std::sync::Arc::make_mut(&mut package.native_entries).insert(function, preferred);
     }
+    // Only a published caller can expose one of its immutable cross-unit
+    // links. Prepare that caller's newly reachable targets now; dormant
+    // declarations remain code-free until their own publication boundary.
+    prepare_linked_function_entries(context)?;
+    refresh_linked_function_records(context);
     Ok(())
 }
 
@@ -901,27 +906,40 @@ pub(super) fn collect_visible_external_function_signatures(
 /// published preferred entry and never enters the operation-local resolver
 /// transition merely because this is the target's first invocation.
 fn prepare_linked_function_entries(context: &mut NativeRequestColdState<'_>) -> Result<(), String> {
-    let targets = context
-        .dynamic_units
-        .iter()
-        .flat_map(|caller| caller.compiled.prepared_unit_external_function_calls())
-        .filter_map(|call| prepared_external_call_target(context, call))
-        .filter_map(|target| target.function())
-        .filter(|target| {
-            context
-                .dynamic_units
-                .get(target.unit)
-                .and_then(|package| {
-                    package
-                        .compiled
-                        .prepared_deployment_image()
-                        .preferred_function_entries
-                        .get(target.function.index())
-                })
-                .is_some_and(|entry| entry.load(std::sync::atomic::Ordering::Acquire) == 0)
-        })
-        .map(|target| (target.unit, target.function))
-        .collect::<std::collections::BTreeSet<_>>();
+    let mut targets = std::collections::BTreeSet::new();
+    for (caller_unit, caller) in context.dynamic_units.iter().enumerate() {
+        let published_callers = if context.current_dynamic_unit == Some(caller_unit) {
+            context.native_entries.keys().copied().collect::<Vec<_>>()
+        } else {
+            caller.native_entries.keys().copied().collect::<Vec<_>>()
+        };
+        for caller_function in published_callers {
+            for call in caller
+                .compiled
+                .prepared_external_function_calls(caller_function)
+            {
+                let Some(target) = prepared_external_call_target(context, call)
+                    .and_then(|target| target.function())
+                else {
+                    continue;
+                };
+                let unpublished = context
+                    .dynamic_units
+                    .get(target.unit)
+                    .and_then(|package| {
+                        package
+                            .compiled
+                            .prepared_deployment_image()
+                            .preferred_function_entries
+                            .get(target.function.index())
+                    })
+                    .is_some_and(|entry| entry.load(std::sync::atomic::Ordering::Acquire) == 0);
+                if unpublished {
+                    targets.insert((target.unit, target.function));
+                }
+            }
+        }
+    }
     for (unit, function) in targets {
         prepare_dynamic_native_entry(context, unit, function)?;
     }

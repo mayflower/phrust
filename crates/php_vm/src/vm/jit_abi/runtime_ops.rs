@@ -2661,21 +2661,20 @@ pub(in crate::vm) extern "C" fn jit_native_reference_bind_abi(
                     php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
                 };
             }
-            let Ok(value) = context.decode_baseline_value(encoded) else {
-                return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
-            };
-            if matches!(value, Value::Reference(_)) {
-                return if write_native_value(out, encoded) {
-                    0
-                } else {
-                    php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
-                };
+            match context.php_handle_is_reference(encoded) {
+                Some(true) => {
+                    return if write_native_value(out, encoded) {
+                        0
+                    } else {
+                        php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
+                    };
+                }
+                Some(false) => {}
+                None => return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
             }
-            let reference = php_runtime::api::ReferenceCell::new(value);
-            context
-                .explicit_reference_ids
-                .insert(reference.gc_debug_id());
-            let Ok(reference) = context.encode_native_reference_owner(reference) else {
+            // The caller moves its encoded owner into the new direct
+            // reference; no compatibility ReferenceCell is materialized.
+            let Ok(reference) = context.encode_direct_reference_payload_owned(encoded) else {
                 return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
             };
             return if write_native_value(out, reference) {
@@ -3033,22 +3032,21 @@ pub(in crate::vm) extern "C" fn jit_native_reference_bind_abi(
                 _ => php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
             };
         }
-        let Ok(value) = context.decode_baseline_value(encoded) else {
-            return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
-        };
-        if matches!(value, Value::Reference(_)) {
-            return if write_native_value(out, encoded) {
-                0
-            } else {
-                php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
-            };
+        match context.php_handle_is_reference(encoded) {
+            Some(true) => {
+                return if write_native_value(out, encoded) {
+                    0
+                } else {
+                    php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
+                };
+            }
+            Some(false) => {}
+            None => return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
         }
-        let reference = php_runtime::api::ReferenceCell::new(value);
-        context
-            .explicit_reference_ids
-            .insert(reference.gc_debug_id());
-        match context.encode_native_reference_owner(reference) {
-            Ok(value) if write_native_value(out, value) => 0,
+        // Ordinary local aliasing moves the local's existing owner into the
+        // authoritative native reference slot.
+        match context.encode_direct_reference_payload_owned(encoded) {
+            Ok(reference) if write_native_value(out, reference) => 0,
             _ => php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
         }
     })

@@ -4649,10 +4649,40 @@ pub(super) fn compile_region_graph_native(
                                     .blocks
                                     .iter()
                                     .map(|block| {
+                                        let region_block = &region.blocks[block.index()];
+                                        let instructions = region_block
+                                            .instructions
+                                            .iter()
+                                            .map(|instruction| {
+                                                let manifest =
+                                                    crate::region_ir::baseline_instruction_lowering(
+                                                        &instruction.source_kind,
+                                                    );
+                                                format!(
+                                                    "{}(uses={},live={})",
+                                                    manifest.variant,
+                                                    instruction.register_uses().len(),
+                                                    instruction.live_locals.len(),
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join("+");
                                         format!(
-                                            "{}:{}",
+                                            "{}(source={}):instructions={}:{}:entry-live={}:terminator={}:terminator-live={}:terminator-registers={}",
                                             block.raw(),
-                                            region.blocks[block.index()].instructions.len()
+                                            region_block.source_block.raw(),
+                                            region_block.instructions.len(),
+                                            instructions,
+                                            region_block.entry_live_locals.len(),
+                                            crate::region_ir::baseline_terminator_lowering(
+                                                &region_block.source_terminator,
+                                            )
+                                            .variant,
+                                            region_block.terminator_live_locals.len(),
+                                            region_block
+                                                .terminator_live_registers
+                                                .as_ref()
+                                                .map_or(0, Vec::len),
                                         )
                                     })
                                     .collect::<Vec<_>>()

@@ -1455,6 +1455,7 @@ pub(super) fn lower_owned_frame_locals(
     result_out: ir::Value,
     deopt_out: ir::Value,
 ) -> Result<(), CraneliftLoweringError> {
+    let mut owned_values = Vec::new();
     for local in locals.keys() {
         let fact = value_flow.local_fact(*local);
         let bound_reference_owner = value_flow.local_storage(*local)
@@ -1463,17 +1464,94 @@ pub(super) fn lower_owned_frame_locals(
             && (bound_reference_owner
                 || (fact.has_runtime_lifecycle() && fact.ownership == SsaOwnership::Owned))
         {
-            let value = use_local_variable(builder, locals, *local)?;
-            let _ = lower_guarded_value_release(
-                module,
-                builder,
-                native_operations.value_release,
-                native_frame_cleanup_operation(function),
-                value,
-                result_out,
-                deopt_out,
-            )?;
+            owned_values.push(use_local_variable(builder, locals, *local)?);
         }
     }
+    let Some(first) = owned_values.first().copied() else {
+        return Ok(());
+    };
+    if owned_values.len() == 1 {
+        let _ = lower_guarded_value_release(
+            module,
+            builder,
+            native_operations.value_release,
+            native_frame_cleanup_operation(function),
+            first,
+            result_out,
+            deopt_out,
+        )?;
+        return Ok(());
+    }
+
+    // Frame cleanup is semantically ordered but its owner count is not a
+    // compile-time code-size dimension. Materialize the already-selected
+    // encoded owners into a compact native stack vector and emit one direct
+    // CLIF release loop. Previously the guarded release CFG was duplicated
+    // once per local, making ordinary large functions structurally
+    // uncompileable before regalloc. The loop retains the same direct shared
+    // decrement and the same cold baseline final-release continuation.
+    let owner_count = owned_values.len();
+    let bytes = owner_count
+        .checked_mul(std::mem::size_of::<u64>())
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(|| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_FRAME_CLEANUP_SIZE",
+                format!(
+                    "function {} frame cleanup vector does not fit a native stack slot",
+                    function.raw()
+                ),
+            )
+        })?;
+    let values =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, bytes, 3));
+    for (index, value) in owned_values.into_iter().enumerate() {
+        let offset = index
+            .checked_mul(std::mem::size_of::<u64>())
+            .and_then(|offset| i32::try_from(offset).ok())
+            .ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_FRAME_CLEANUP_SIZE",
+                    "frame cleanup vector offset does not fit i32",
+                )
+            })?;
+        builder.ins().stack_store(value, values, offset);
+    }
+
+    let pointer_type = module.target_config().pointer_type();
+    let scan = builder.create_block();
+    let complete = builder.create_block();
+    builder.append_block_param(scan, pointer_type);
+    let base = builder.ins().stack_addr(pointer_type, values, 0);
+    let zero = builder.ins().iconst(pointer_type, 0);
+    builder.ins().jump(scan, &[zero.into()]);
+
+    builder.switch_to_block(scan);
+    let index = builder.block_params(scan)[0];
+    let byte_offset = builder.ins().ishl_imm(index, 3);
+    let address = builder.ins().iadd(base, byte_offset);
+    let value = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), address, 0);
+    let _ = lower_guarded_value_release(
+        module,
+        builder,
+        native_operations.value_release,
+        native_frame_cleanup_operation(function),
+        value,
+        result_out,
+        deopt_out,
+    )?;
+    let next = builder.ins().iadd_imm(index, 1);
+    let more = builder.ins().icmp_imm(
+        IntCC::UnsignedLessThan,
+        next,
+        i64::try_from(owner_count).unwrap_or(i64::MAX),
+    );
+    builder
+        .ins()
+        .brif(more, scan, &[next.into()], complete, &[]);
+
+    builder.switch_to_block(complete);
     Ok(())
 }

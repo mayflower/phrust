@@ -150,11 +150,17 @@ impl ServerEngineState {
         } else {
             base_options.optimization_level
         };
-        // Warm server requests must not compete with speculative Cranelift
-        // work. Compile the selected production tier on demand and keep the
-        // worker cache stable instead of scheduling threshold-based
-        // background recompilation.
-        let worker_state = VmWorkerState::new(base_options.vm_options.tiering.clone());
+        // A cold request compiles only the reached baseline-native bodies.
+        // Repeated request entries may publish the optimizing tier outside
+        // the request-critical compilation path; published calls still load
+        // the native entry cells directly without a runtime tiering branch.
+        let mut worker_tiering = base_options.vm_options.tiering.clone();
+        // The first completed request is enough evidence to prepare the
+        // persistent root's optimizing product. Waiting for the generic VM
+        // entry threshold keeps normal server warmups baseline-native even
+        // though the worker owns stable publication cells across requests.
+        worker_tiering.function_entry_threshold = 1;
+        let worker_state = VmWorkerState::new_with_background_tiering(worker_tiering);
         Self {
             engine_profile,
             native_cache,
