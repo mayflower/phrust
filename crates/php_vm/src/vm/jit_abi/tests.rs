@@ -2,6 +2,219 @@ use super::native_builtins::format_native_php_diagnostic;
 use super::{dereference_native_callable_value, native_backtrace_frame};
 
 #[test]
+fn exact_execution_poll_uses_only_published_deadline_capability() {
+    use php_ir::builder::IrBuilder;
+    use php_ir::{FunctionFlags, IrSpan, UnitId};
+
+    let mut builder = IrBuilder::new(UnitId::new(9_941));
+    let file = builder.add_file("native-exact-deadline-poll.php");
+    let span = IrSpan::new(file, 0, 16);
+    let entry = builder.start_function("main", FunctionFlags::default(), span);
+    let block = builder.append_block(entry);
+    builder.terminate_return(entry, block, None, span);
+    builder.set_entry(entry);
+    let compiled = crate::compiled_unit::CompiledUnit::new(builder.finish());
+    let options = super::super::VmOptions {
+        runtime_context: php_runtime::api::RuntimeContext::controlled_cli(
+            "native-exact-deadline-poll.php",
+            Vec::new(),
+        )
+        .with_execution_time_limit(Some(std::time::Duration::ZERO)),
+        ..super::super::VmOptions::default()
+    };
+    let worker = super::super::VmWorkerState::default();
+    let mut context = super::NativeRequestOwner::new(
+        &compiled,
+        compiled.artifact_identity(),
+        &options,
+        &worker,
+        php_runtime::api::OutputBuffer::new(),
+        std::sync::Arc::new(std::collections::BTreeMap::new()),
+    );
+    let runtime = context.fast_state;
+    let _activation = super::activate_native_context(&mut context);
+
+    let status = super::runtime_ops::jit_native_execution_poll_abi(runtime);
+
+    assert_eq!(status, php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32);
+    assert_eq!(
+        context
+            .diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.id()),
+        Some("E_PHP_VM_EXECUTION_TIMEOUT")
+    );
+}
+
+#[test]
+fn root_deployment_attachment_publishes_its_dynamic_execution_scope() {
+    use php_ir::builder::IrBuilder;
+    use php_ir::{FunctionFlags, IrSpan, UnitId};
+
+    let mut builder = IrBuilder::new(UnitId::new(9_942));
+    let file = builder.add_file("native-root-execution-scope.php");
+    let span = IrSpan::new(file, 0, 16);
+    let entry = builder.start_function("main", FunctionFlags::default(), span);
+    let block = builder.append_block(entry);
+    builder.terminate_return(entry, block, None, span);
+    builder.set_entry(entry);
+    let compiled = crate::compiled_unit::CompiledUnit::new(builder.finish());
+    let options = super::super::VmOptions::default();
+    let worker = super::super::VmWorkerState::default();
+    let mut context = super::NativeRequestOwner::new(
+        &compiled,
+        compiled.artifact_identity(),
+        &options,
+        &worker,
+        php_runtime::api::OutputBuffer::new(),
+        std::sync::Arc::new(std::collections::BTreeMap::new()),
+    );
+
+    context.attach_root_deployment_image(compiled.clone());
+
+    assert_eq!(context.current_dynamic_unit, Some(0));
+    let scope = context
+        .native_execution_scopes
+        .get(context.current_native_execution_scope as usize - 1)
+        .expect("attached deployment keeps a published execution scope");
+    assert_eq!(
+        scope.unit,
+        Some(0),
+        "closures created by the root deployment must retain its unit-local function owner"
+    );
+}
+
+#[test]
+fn native_root_mutation_invalidates_cross_unit_graph_cache() {
+    use php_ir::builder::IrBuilder;
+    use php_ir::{FunctionFlags, IrSpan, UnitId};
+
+    let mut builder = IrBuilder::new(UnitId::new(9_943));
+    let file = builder.add_file("native-root-mutation.php");
+    let span = IrSpan::new(file, 0, 16);
+    let entry = builder.start_function("main", FunctionFlags::default(), span);
+    let block = builder.append_block(entry);
+    builder.terminate_return(entry, block, None, span);
+    builder.set_entry(entry);
+    let compiled = crate::compiled_unit::CompiledUnit::new(builder.finish());
+    let options = super::super::VmOptions::default();
+    let worker = super::super::VmWorkerState::default();
+    let mut context = super::NativeRequestOwner::new(
+        &compiled,
+        compiled.artifact_identity(),
+        &options,
+        &worker,
+        php_runtime::api::OutputBuffer::new(),
+        std::sync::Arc::new(std::collections::BTreeMap::new()),
+    );
+
+    context.cross_unit_stable_values.extend([7, 11]);
+    *context.native_root_mutation_pending = 1;
+    context.consume_native_root_mutation();
+
+    assert!(
+        context.cross_unit_stable_values.is_empty(),
+        "a native store may have inserted a new unit-local literal"
+    );
+    assert_eq!(*context.native_root_mutation_pending, 0);
+}
+
+#[test]
+fn shutdown_object_sweep_balances_native_receiver_ownership() {
+    use php_ir::builder::IrBuilder;
+    use php_ir::{FunctionFlags, IrSpan, UnitId};
+
+    let mut builder = IrBuilder::new(UnitId::new(9_944));
+    let file = builder.add_file("native-shutdown-object-sweep.php");
+    let span = IrSpan::new(file, 0, 16);
+    let entry = builder.start_function("main", FunctionFlags::default(), span);
+    let block = builder.append_block(entry);
+    builder.terminate_return(entry, block, None, span);
+    builder.set_entry(entry);
+    let compiled = crate::compiled_unit::CompiledUnit::new(builder.finish());
+    let options = super::super::VmOptions::default();
+    let worker = super::super::VmWorkerState::default();
+    let mut context = super::NativeRequestOwner::new(
+        &compiled,
+        compiled.artifact_identity(),
+        &options,
+        &worker,
+        php_runtime::api::OutputBuffer::new(),
+        std::sync::Arc::new(std::collections::BTreeMap::new()),
+    );
+    let class = php_runtime::api::ClassEntry {
+        name: "PlainShutdownObject".to_owned().into(),
+        parent: None,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor_id: None,
+        flags: php_runtime::api::ClassFlags::default(),
+    };
+    let objects = (0..3)
+        .map(|_| php_runtime::api::ObjectRef::new(&class))
+        .collect::<Vec<_>>();
+    let encoded = objects
+        .iter()
+        .cloned()
+        .map(|object| {
+            context
+                .encode_native_object_owner(object)
+                .expect("plain object enters the authoritative native plane")
+        })
+        .collect::<Vec<_>>();
+    let indices = encoded
+        .iter()
+        .map(|value| {
+            php_jit::jit_decode_runtime_value(*value)
+                .expect("direct object runtime index")
+                .checked_sub(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE)
+                .expect("direct object slot index") as usize
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        indices
+            .iter()
+            .all(|index| context.direct_value_slots[*index].refcount == 1)
+    );
+
+    context
+        .run_shutdown_callbacks()
+        .expect("native shutdown object sweep");
+
+    assert!(
+        indices
+            .iter()
+            .all(|index| context.direct_value_slots[*index].refcount == 1),
+        "shutdown must release each temporary destructor receiver"
+    );
+    assert!(
+        context.destroyed_objects.is_empty(),
+        "objects without __destruct need no shutdown publication"
+    );
+    assert!(context.shutdown_destructor_queue.is_none());
+
+    context
+        .run_shutdown_callbacks()
+        .expect("repeated shutdown sweep is idempotent");
+    assert!(
+        indices
+            .iter()
+            .all(|index| context.direct_value_slots[*index].refcount == 1)
+    );
+
+    for value in encoded {
+        context
+            .release(value)
+            .expect("test releases the original native object owner");
+    }
+}
+
+#[test]
 #[allow(unsafe_code)]
 fn object_cast_maps_authoritative_array_properties_and_preserves_identity() {
     let mut slots =
@@ -373,6 +586,104 @@ fn exact_parse_str_publishes_keyed_native_array_through_direct_reference() {
             .native_http_build_query(published, None, b"&", false)
             .expect("published parse_str array remains authoritative native data"),
         b"plain=value&list%5B0%5D=a&list%5B1%5D=b&12=numeric"
+    );
+}
+
+#[test]
+fn exact_serialization_roundtrip_never_materializes_the_value_plane() {
+    let key = b"x";
+    let mut buffers = super::NativeRequestBuffers::default();
+    *buffers.direct_value_next = 2;
+    *buffers.direct_array_next = 4;
+    buffers.direct_array_entries[0] = php_jit::JitNativeDirectArrayEntry { key: 0, value: 7 };
+    buffers.direct_array_entries[1] = php_jit::JitNativeDirectArrayEntry {
+        key: php_jit::jit_encode_typed_runtime_value(
+            php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 1,
+            php_jit::JIT_VALUE_RUNTIME_STRING_TAG,
+        ),
+        value: php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE),
+    };
+    buffers.direct_value_slots[0] = php_jit::JitNativeValueSlot {
+        refcount: 1,
+        kind: php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY,
+        flags: php_jit::JIT_NATIVE_DIRECT_ARRAY_ABI_VERSION,
+        reserved: 4,
+        payload: 2,
+        aux: buffers.direct_array_entries.as_ptr() as usize as u64,
+    };
+    buffers.direct_value_slots[1] = php_jit::JitNativeValueSlot {
+        refcount: 1,
+        kind: php_jit::JIT_NATIVE_VALUE_VIEW_STRING,
+        flags: php_jit::JIT_NATIVE_STRING_VIEW_ABI_VERSION,
+        payload: key.len() as u64,
+        aux: key.as_ptr() as usize as u64,
+        ..php_jit::JitNativeValueSlot::default()
+    };
+    let ini = php_runtime::api::IniRegistry::default();
+    let runtime_view = php_jit::JitNativeRuntimeView {
+        abi_version: php_jit::JIT_RUNTIME_ABI_VERSION,
+        direct_value_slots: buffers.direct_value_slots.as_mut_ptr() as usize as u64,
+        direct_value_next: std::ptr::from_mut(buffers.direct_value_next.as_mut()) as usize as u64,
+        direct_value_free_head: std::ptr::from_mut(buffers.direct_value_free_head.as_mut()) as usize
+            as u64,
+        direct_value_reused_bytes: std::ptr::from_mut(buffers.direct_value_reused_bytes.as_mut())
+            as usize as u64,
+        direct_array_states: buffers.direct_array_states.as_mut_ptr() as usize as u64,
+        direct_array_entries: buffers.direct_array_entries.as_mut_ptr() as usize as u64,
+        direct_array_next: std::ptr::from_mut(buffers.direct_array_next.as_mut()) as usize as u64,
+        direct_string_bytes: buffers.direct_string_bytes.as_mut_ptr() as usize as u64,
+        direct_string_next: std::ptr::from_mut(buffers.direct_string_next.as_mut()) as usize as u64,
+        direct_string_free_heads: buffers.direct_string_free_heads.as_mut_ptr() as usize as u64,
+        direct_string_reused_bytes: std::ptr::from_mut(buffers.direct_string_reused_bytes.as_mut())
+            as usize as u64,
+        ..php_jit::JitNativeRuntimeView::default()
+    };
+    let mut fast = super::NativeRequestFastState {
+        header: php_jit::JitNativeFastStateHeader {
+            abi_version: php_jit::JIT_RUNTIME_ABI_VERSION,
+            flags: 0,
+            runtime_view_pointer: 0,
+            runtime_view,
+        },
+        ini_registry: std::ptr::from_ref(&ini),
+        ..super::NativeRequestFastState::default()
+    };
+    let input = php_jit::jit_encode_typed_runtime_value(
+        php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
+        php_jit::JIT_VALUE_RUNTIME_ARRAY_TAG,
+    );
+    let serialized = super::call_dispatch::jit_native_serialize_abi(
+        std::ptr::from_mut(&mut fast),
+        1,
+        input,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    assert_eq!(serialized.status, php_jit::JitCallStatus::RETURN);
+    assert_eq!(
+        fast.native_string_view(serialized.value)
+            .expect("serialize publishes a direct native string"),
+        b"a:2:{i:0;i:7;s:1:\"x\";b:1;}"
+    );
+
+    let decoded = super::call_dispatch::jit_native_unserialize_abi(
+        std::ptr::from_mut(&mut fast),
+        1,
+        serialized.value,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    assert_eq!(decoded.status, php_jit::JitCallStatus::RETURN);
+    assert_eq!(
+        fast.native_serialize(decoded.value)
+            .expect("unserialize publishes an authoritative direct array"),
+        b"a:2:{i:0;i:7;s:1:\"x\";b:1;}"
     );
 }
 

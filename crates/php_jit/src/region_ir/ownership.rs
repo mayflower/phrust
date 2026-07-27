@@ -129,6 +129,19 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
                     | "phrust_native_krsort"
                     | "phrust_native_natsort"
                     | "phrust_native_natcasesort"
+                    | "phrust_native_spl_object_hash"
+                    | "phrust_native_spl_object_id"
+                    | "phrust_native_serialize"
+                    | "phrust_native_unserialize"
+                    | "phrust_native_get_object_vars"
+                    | "phrust_native_get_mangled_object_vars"
+                    | "phrust_native_get_parent_class"
+                    | "phrust_native_is_subclass_of"
+                    | "phrust_native_extension_loaded"
+                    | "phrust_native_get_loaded_extensions"
+                    | "phrust_native_ini_get"
+                    | "phrust_native_get_cfg_var"
+                    | "phrust_native_get_include_path"
                     | "phrust_native_func_num_args"
                     | "phrust_native_func_get_arg"
                     | "phrust_native_func_get_args"
@@ -136,9 +149,35 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
                     | "phrust_native_dirname"
                     | "phrust_native_realpath"
                     | "phrust_native_file_exists"
+                    | "phrust_native_is_file"
+                    | "phrust_native_is_dir"
+                    | "phrust_native_is_readable"
+                    | "phrust_native_is_writable"
+                    | "phrust_native_filesize"
+                    | "phrust_native_filemtime"
+                    | "phrust_native_file_get_contents"
                     | "phrust_native_fopen"
                     | "phrust_native_fwrite"
                     | "phrust_native_fclose"
+                    | "phrust_native_fread"
+                    | "phrust_native_fgets"
+                    | "phrust_native_fgetc"
+                    | "phrust_native_feof"
+                    | "phrust_native_fflush"
+                    | "phrust_native_fseek"
+                    | "phrust_native_ftell"
+                    | "phrust_native_ftruncate"
+                    | "phrust_native_rewind"
+                    | "phrust_native_stream_get_contents"
+                    | "phrust_native_stream_copy_to_stream"
+                    | "phrust_native_ob_start"
+                    | "phrust_native_ob_get_clean"
+                    | "phrust_native_ob_get_contents"
+                    | "phrust_native_ob_get_flush"
+                    | "phrust_native_ob_get_length"
+                    | "phrust_native_ob_get_level"
+                    | "phrust_native_ob_end_flush"
+                    | "phrust_native_ob_end_clean"
             ) =>
         {
             Some(owned(BORROW_6, false))
@@ -149,7 +188,8 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         | "phrust_jit_native_dynamic_code" => Some(owned(NONE, false)),
         "phrust_jit_native_function_resolve"
         | "phrust_native_frame_alloc"
-        | "phrust_native_frame_release" => Some(none(NONE)),
+        | "phrust_native_frame_release"
+        | "phrust_native_numeric_string" => Some(none(NONE)),
         "phrust_native_unary"
         | "phrust_native_cast"
         | "phrust_native_type_predicate"
@@ -157,6 +197,11 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         | "phrust_native_local_fetch"
         | "phrust_native_return_check"
         | "phrust_native_object_clone"
+        | "phrust_native_object_cast"
+        | "phrust_native_array_cast"
+        | "phrust_native_int_cast"
+        | "phrust_native_float_cast"
+        | "phrust_native_string_cast"
         | "phrust_native_foreach_init"
         | "phrust_native_constant_fetch" => Some(owned(BORROW_1, true)),
         "phrust_native_binary"
@@ -177,6 +222,7 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         "phrust_native_array_new" | "phrust_native_object_new" | "phrust_native_exception_new" => {
             Some(owned(NONE, false))
         }
+        "phrust_native_prepared_exception_new" => Some(owned(BORROW_1, false)),
         "phrust_native_value_release" => Some(none(CONSUME_1)),
         "phrust_native_echo"
         | "phrust_native_foreach_cleanup"

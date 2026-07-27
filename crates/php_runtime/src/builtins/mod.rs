@@ -29,7 +29,9 @@ pub use modules::curl::{CurlNetworkTestOverride, set_curl_network_tests_override
 pub use modules::fileinfo::validate_fileinfo_options;
 #[doc(hidden)]
 pub use modules::filesystem::{
-    native_basename, native_dirname, native_file_exists, native_realpath,
+    native_basename, native_dirname, native_file_exists, native_file_get_contents,
+    native_filemtime, native_filesize, native_is_dir, native_is_file, native_is_readable,
+    native_is_writable, native_realpath,
 };
 #[doc(hidden)]
 pub use modules::igbinary::{

@@ -505,6 +505,7 @@ fn execute_native_eval(
         NATIVE_INCLUDE_GLOBALS.with(|globals| globals.borrow_mut().take().unwrap_or_default());
     context.dynamic_constants = NATIVE_INCLUDE_CONSTANTS
         .with(|constants| constants.borrow_mut().take().unwrap_or_default());
+    context.promote_cold_dynamic_constants()?;
     context.prepare_trusted_constant_fetches();
     if let Some(returned_ini) = NATIVE_INCLUDE_INI.with(|ini| ini.borrow_mut().take()) {
         context.ini_registry = returned_ini;
@@ -577,6 +578,20 @@ fn finish_native_dynamic_call_control(
             php_jit::JitCallStatus::THROW,
             encode_native_throwable(context, &class, &message).ok(),
         ),
+        NativeCallControl::ArgumentCount {
+            function,
+            passed,
+            required,
+            target_span,
+        } => {
+            let message =
+                native_argument_count_message(context, &function, passed, required, target_span);
+            (
+                php_jit::JitCallStatus::THROW,
+                encode_native_throwable_at(context, "ArgumentCountError", &message, target_span)
+                    .ok(),
+            )
+        }
         NativeCallControl::Propagate { status, value } => (status, Some(value)),
         NativeCallControl::SuspendFiber { .. } => (
             php_jit::JitCallStatus::SUSPEND_FIBER,
@@ -1028,25 +1043,22 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
                     php_runtime::api::ClosurePayload::new(request.declared_function_id, Vec::new())
                         .with_debug(debug)
                         .with_context(closure_context);
-                let binds_this = context
-                    .unit
-                    .functions
-                    .get(request.declared_function_id as usize)
-                    .is_some_and(|function| !function.flags.is_static)
-                    && context
-                        .unit
-                        .functions
-                        .get(request.caller_function_id as usize)
-                        .is_some_and(|function| function.flags.is_method);
-                let implicit_this = if binds_this {
+                let bound_this_local = php_jit::region_ir::native_closure_bound_this_local(
+                    &context.unit,
+                    php_ir::FunctionId::new(request.caller_function_id),
+                    php_ir::FunctionId::new(request.declared_function_id),
+                );
+                let implicit_this = if let Some(bound_this_local) = bound_this_local {
                     if caller_frame.is_null() {
                         for captured in captured_values {
                             let _ = context.release_if_live(captured);
                         }
                         return (php_jit::JitCallStatus::RUNTIME_ERROR, None);
                     }
-                    // SAFETY: generated code passes its live caller-local frame for this request.
-                    let encoded = unsafe { caller_frame.read() };
+                    // SAFETY: publication resolved the exact `$this` local
+                    // for this caller/Closure pair, and generated code passes
+                    // its full live caller-local frame for this request.
+                    let encoded = unsafe { caller_frame.add(bound_this_local.index()).read() };
                     let value = context
                         .duplicate_authoritative_dereferenced_native_value(encoded)
                         .and_then(|value| {

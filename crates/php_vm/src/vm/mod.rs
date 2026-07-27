@@ -28,35 +28,43 @@ use jit_abi::{
     jit_native_deg2rad_f64_abi, jit_native_dirname_abi, jit_native_dynamic_code_abi,
     jit_native_dynamic_property_slot_abi, jit_native_echo_abi, jit_native_echo_bytes_abi,
     jit_native_enum_exists_abi, jit_native_exception_new_abi, jit_native_execution_poll_abi,
-    jit_native_exp_f64_abi, jit_native_expm1_f64_abi, jit_native_fclose_abi,
-    jit_native_file_exists_abi, jit_native_float_cast_abi, jit_native_float_to_string_abi,
-    jit_native_fmod_f64_abi, jit_native_fopen_abi, jit_native_foreach_cleanup_abi,
-    jit_native_foreach_init_abi, jit_native_foreach_next_abi, jit_native_fpow_f64_abi,
-    jit_native_frame_alloc_abi, jit_native_frame_release_abi, jit_native_function_exists_abi,
-    jit_native_function_resolve_abi, jit_native_fwrite_abi, jit_native_gzcompress_abi,
-    jit_native_gzdecode_abi, jit_native_gzdeflate_abi, jit_native_gzencode_abi,
-    jit_native_gzinflate_abi, jit_native_gzuncompress_abi, jit_native_hash_abi,
-    jit_native_hash_equals_abi, jit_native_hash_hmac_abi, jit_native_hexdec_abi,
-    jit_native_hypot_f64_abi, jit_native_inet_ntop_abi, jit_native_inet_pton_abi,
-    jit_native_int_cast_abi, jit_native_interface_exists_abi, jit_native_ip2long_abi,
+    jit_native_exp_f64_abi, jit_native_expm1_f64_abi, jit_native_fclose_abi, jit_native_feof_abi,
+    jit_native_fflush_abi, jit_native_fgetc_abi, jit_native_fgets_abi, jit_native_file_exists_abi,
+    jit_native_file_get_contents_abi, jit_native_filemtime_abi, jit_native_filesize_abi,
+    jit_native_float_cast_abi, jit_native_float_to_string_abi, jit_native_fmod_f64_abi,
+    jit_native_fopen_abi, jit_native_foreach_cleanup_abi, jit_native_foreach_init_abi,
+    jit_native_foreach_next_abi, jit_native_fpow_f64_abi, jit_native_frame_alloc_abi,
+    jit_native_frame_release_abi, jit_native_fread_abi, jit_native_fseek_abi, jit_native_ftell_abi,
+    jit_native_ftruncate_abi, jit_native_function_exists_abi, jit_native_function_resolve_abi,
+    jit_native_fwrite_abi, jit_native_gzcompress_abi, jit_native_gzdecode_abi,
+    jit_native_gzdeflate_abi, jit_native_gzencode_abi, jit_native_gzinflate_abi,
+    jit_native_gzuncompress_abi, jit_native_hash_abi, jit_native_hash_equals_abi,
+    jit_native_hash_hmac_abi, jit_native_hexdec_abi, jit_native_hypot_f64_abi,
+    jit_native_inet_ntop_abi, jit_native_inet_pton_abi, jit_native_int_cast_abi,
+    jit_native_interface_exists_abi, jit_native_ip2long_abi, jit_native_is_dir_abi,
+    jit_native_is_file_abi, jit_native_is_readable_abi, jit_native_is_writable_abi,
     jit_native_json_decode_abi, jit_native_json_encode_abi, jit_native_json_last_error_abi,
     jit_native_json_last_error_msg_abi, jit_native_json_validate_abi, jit_native_local_fetch_abi,
     jit_native_local_store_abi, jit_native_log_f64_abi, jit_native_log1p_f64_abi,
     jit_native_log10_f64_abi, jit_native_long2ip_abi, jit_native_md5_abi,
-    jit_native_method_exists_abi, jit_native_numeric_string_abi, jit_native_object_cast_abi,
-    jit_native_object_class_name_abi, jit_native_object_clone_abi,
-    jit_native_object_clone_with_abi, jit_native_object_compare_abi, jit_native_object_equal_abi,
-    jit_native_object_new_abi, jit_native_octdec_abi, jit_native_plain_object_clone_abi,
-    jit_native_pow_f64_abi, jit_native_preg_filter_abi, jit_native_preg_grep_abi,
-    jit_native_preg_last_error_abi, jit_native_preg_last_error_msg_abi, jit_native_preg_match_abi,
-    jit_native_preg_match_all_abi, jit_native_preg_quote_abi, jit_native_preg_replace_abi,
-    jit_native_preg_split_abi, jit_native_prepared_closure_new_abi,
-    jit_native_prepared_object_new_abi, jit_native_printf_abi, jit_native_property_assign_abi,
-    jit_native_property_exists_abi, jit_native_property_fetch_abi, jit_native_rad2deg_f64_abi,
-    jit_native_realpath_abi, jit_native_reference_bind_abi, jit_native_return_check_abi,
+    jit_native_method_exists_abi, jit_native_numeric_string_abi, jit_native_ob_end_clean_abi,
+    jit_native_ob_end_flush_abi, jit_native_ob_get_clean_abi, jit_native_ob_get_contents_abi,
+    jit_native_ob_get_flush_abi, jit_native_ob_get_length_abi, jit_native_ob_get_level_abi,
+    jit_native_ob_start_abi, jit_native_object_cast_abi, jit_native_object_class_name_abi,
+    jit_native_object_clone_abi, jit_native_object_clone_with_abi, jit_native_object_compare_abi,
+    jit_native_object_equal_abi, jit_native_object_new_abi, jit_native_octdec_abi,
+    jit_native_plain_object_clone_abi, jit_native_pow_f64_abi, jit_native_preg_filter_abi,
+    jit_native_preg_grep_abi, jit_native_preg_last_error_abi, jit_native_preg_last_error_msg_abi,
+    jit_native_preg_match_abi, jit_native_preg_match_all_abi, jit_native_preg_quote_abi,
+    jit_native_preg_replace_abi, jit_native_preg_split_abi, jit_native_prepared_closure_new_abi,
+    jit_native_prepared_exception_new_abi, jit_native_prepared_object_new_abi,
+    jit_native_printf_abi, jit_native_property_assign_abi, jit_native_property_exists_abi,
+    jit_native_property_fetch_abi, jit_native_rad2deg_f64_abi, jit_native_realpath_abi,
+    jit_native_reference_bind_abi, jit_native_return_check_abi, jit_native_rewind_abi,
     jit_native_round_f64_abi, jit_native_runtime_fatal_abi, jit_native_semantic_dispatch_abi,
     jit_native_semantic_dispatch_diagnostic_abi, jit_native_sha1_abi, jit_native_sin_f64_abi,
     jit_native_sinh_f64_abi, jit_native_sprintf_abi, jit_native_stable_length_abi,
+    jit_native_stream_copy_to_stream_abi, jit_native_stream_get_contents_abi,
     jit_native_string_cast_abi, jit_native_string_predicate_abi, jit_native_tan_f64_abi,
     jit_native_tanh_f64_abi, jit_native_trait_exists_abi, jit_native_truthy_abi,
     jit_native_type_predicate_abi, jit_native_unary_abi, jit_native_value_release_abi,
@@ -94,14 +102,58 @@ struct BackgroundTieringDecision {
     entries: u64,
 }
 
+struct BackgroundOptimizationWork {
+    decision: BackgroundTieringDecision,
+    unit: CompiledUnit,
+    function: php_ir::FunctionId,
+    compile_options: BackgroundCompileOptions,
+    external_signatures: Vec<php_jit::JitExternalFunctionSignature>,
+}
+
+#[derive(Clone, Debug)]
+struct BackgroundCompileOptions {
+    collect_counters: bool,
+    native_cache: php_jit::NativeCacheMode,
+    native_cache_dir: std::path::PathBuf,
+}
+
+impl BackgroundCompileOptions {
+    fn from_vm_options(options: &VmOptions) -> Self {
+        Self {
+            collect_counters: options.collect_counters,
+            native_cache: options.native_cache,
+            native_cache_dir: options.native_cache_dir.clone(),
+        }
+    }
+
+    fn optimizing_vm_options(&self) -> VmOptions {
+        VmOptions {
+            collect_counters: self.collect_counters,
+            native_cache: self.native_cache,
+            native_cache_dir: self.native_cache_dir.clone(),
+            native_optimization: NativeOptimizationPolicy::Optimizing,
+            tiering: crate::tiering::TieringOptions {
+                enabled: false,
+                ..crate::tiering::TieringOptions::default()
+            },
+            ..VmOptions::default()
+        }
+    }
+}
+
 static PROCESS_LOADED_NATIVE_UNITS: std::sync::OnceLock<
     Arc<native_compile_cache::LoadedNativeUnitRegistry>,
 > = std::sync::OnceLock::new();
 
 type NativeOptimizationJob = Box<dyn FnOnce() + Send + 'static>;
 
-const NATIVE_OPTIMIZATION_WORKERS: usize = 2;
-const NATIVE_OPTIMIZATION_QUEUE_CAPACITY: usize = 128;
+/// Optimizing Cranelift compilation has a large transient working set. One
+/// process-wide compiler preserves request parallelism while preventing two
+/// independent code generators from doubling RSS and competing for the same
+/// CPU after a request boundary.
+const NATIVE_OPTIMIZATION_WORKERS: usize = 1;
+const NATIVE_OPTIMIZATION_QUEUE_CAPACITY: usize = 1;
+const NATIVE_OPTIMIZATION_BATCH_CAPACITY: usize = 128;
 
 static NATIVE_OPTIMIZATION_QUEUE: OnceLock<mpsc::SyncSender<NativeOptimizationJob>> =
     OnceLock::new();
@@ -241,7 +293,24 @@ impl VmWorkerState {
         ),
         String,
     > {
-        self.compile_native_with_priority(unit, function, options, external_signatures, false)
+        let compiled =
+            self.compile_native_with_priority(unit, function, options, external_signatures, false)?;
+        if let Some(handle) = compiled
+            .0
+            .iter()
+            .find(|record| record.function == function)
+            .and_then(|record| record.result.handle.as_ref())
+        {
+            self.prepare_and_publish_optimizing_entry(
+                unit,
+                function,
+                options,
+                external_signatures,
+                handle,
+                false,
+            )?;
+        }
+        Ok(compiled)
     }
 
     fn compile_native_with_priority(
@@ -268,9 +337,6 @@ impl VmWorkerState {
         let external_signatures =
             linked_external_function_signatures(unit, function, external_signatures);
         let external_signatures = external_signatures.as_slice();
-        if options.native_optimization == NativeOptimizationPolicy::Optimizing {
-            self.prepare_native_baseline_entry(unit, function, options, external_signatures)?;
-        }
         let function_metadata = unit
             .unit()
             .functions
@@ -337,29 +403,6 @@ impl VmWorkerState {
         } else {
             self.native_compiles.get_or_compile(key, compile)
         }?;
-        if options.native_optimization == NativeOptimizationPolicy::Optimizing {
-            for record in compiled.0.iter() {
-                let Some(address) = record
-                    .result
-                    .handle
-                    .as_ref()
-                    .and_then(php_jit::JitFunctionHandle::native_entry_address)
-                else {
-                    continue;
-                };
-                let preferred = unit
-                    .prepared_deployment_image()
-                    .preferred_function_entries
-                    .get(record.function.index())
-                    .ok_or_else(|| {
-                        format!(
-                            "optimizing function {} has no preferred publication cell",
-                            record.function.raw()
-                        )
-                    })?;
-                preferred.store(address, std::sync::atomic::Ordering::Release);
-            }
-        }
         if std::env::var_os("PHRUST_NATIVE_COMPILE_FUNCTION_LOG").is_some()
             && compiled.1.compiled()
             && let Some(record) = compiled.0.first()
@@ -414,6 +457,7 @@ impl VmWorkerState {
                 )
             })?;
         let mut address = baseline_cell.load(std::sync::atomic::Ordering::Acquire);
+        let mut resolved = None;
         if address == 0 {
             let mut baseline_options = options.clone();
             baseline_options.native_optimization = NativeOptimizationPolicy::Baseline;
@@ -431,6 +475,26 @@ impl VmWorkerState {
                 )
             })?;
             baseline_cell.store(address, std::sync::atomic::Ordering::Release);
+            resolved = Some(baseline);
+        }
+        if let Some(metadata) = resolved
+            .as_ref()
+            .and_then(php_jit::JitFunctionHandle::region_state_metadata)
+        {
+            // Publish the caller cell before descending so recursive and
+            // mutually recursive call graphs terminate on the already
+            // installed address. Every statically known native call can then
+            // load its exact target directly on the caller's first entry.
+            for callee in metadata
+                .direct_callees
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                let callee_signatures =
+                    linked_external_function_signatures(unit, callee, external_signatures);
+                self.prepare_native_baseline_entry(unit, callee, options, &callee_signatures)?;
+            }
         }
         let _ = preferred.compare_exchange(
             0,
@@ -464,11 +528,11 @@ impl VmWorkerState {
         {
             return None;
         }
-        let key = native_compile_cache::NativeCompileCacheKey::new(
-            unit.cache_identity(),
+        let key = native_compile_cache_key(
+            unit,
             function,
             NativeOptimizationPolicy::Optimizing.opt_level(),
-            external_function_signatures_hash(external_signatures),
+            external_signatures,
         );
         let mut state = lock_unpoisoned(&self.tiering_state);
         state.stats.function_entry_count = state.stats.function_entry_count.saturating_add(1);
@@ -487,98 +551,156 @@ impl VmWorkerState {
         decision: BackgroundTieringDecision,
         unit: CompiledUnit,
         function: php_ir::FunctionId,
+        options: &VmOptions,
         external_signatures: Vec<php_jit::JitExternalFunctionSignature>,
     ) {
-        if decision.entries < self.tiering_options.function_entry_threshold.max(1) {
+        if !self.claim_background_optimization(decision) {
             return;
         }
+        let work = BackgroundOptimizationWork {
+            decision,
+            unit,
+            function,
+            compile_options: BackgroundCompileOptions::from_vm_options(options),
+            external_signatures,
+        };
+        let worker = self.clone();
+        let submitted = submit_native_optimization_job(move || {
+            worker.run_background_optimization(work);
+        });
+        if !submitted {
+            self.reject_submitted_optimizations(std::slice::from_ref(&decision));
+        }
+    }
+
+    fn claim_background_optimization(&self, decision: BackgroundTieringDecision) -> bool {
+        if decision.entries < self.tiering_options.function_entry_threshold.max(1) {
+            return false;
+        }
+        if self.native_compiles.contains(decision.key) {
+            return false;
+        }
+        let mut state = lock_unpoisoned(&self.tiering_state);
+        if state.scheduled.contains(&decision.key) || state.failed.contains(&decision.key) {
+            return false;
+        }
+        let reserved_functions = u64::try_from(state.scheduled.len()).unwrap_or(u64::MAX);
+        if state
+            .stats
+            .native_compiled_functions
+            .saturating_add(reserved_functions)
+            >= self.tiering_options.native_max_functions
+            || state.stats.native_compile_budget_used_us
+                >= self.tiering_options.native_max_compile_us
+        {
+            state.stats.native_compile_budget_rejections = state
+                .stats
+                .native_compile_budget_rejections
+                .saturating_add(1);
+            return false;
+        }
+        state.scheduled.insert(decision.key);
+        state.stats.optimized_candidates = state.stats.optimized_candidates.saturating_add(1);
+        true
+    }
+
+    fn reject_submitted_optimizations(&self, decisions: &[BackgroundTieringDecision]) {
+        if decisions.is_empty() {
+            return;
+        }
+        let mut state = lock_unpoisoned(&self.tiering_state);
+        for decision in decisions {
+            state.scheduled.remove(&decision.key);
+        }
+        state.stats.native_compile_budget_rejections = state
+            .stats
+            .native_compile_budget_rejections
+            .saturating_add(u64::try_from(decisions.len()).unwrap_or(u64::MAX));
+    }
+
+    fn run_background_optimization(&self, work: BackgroundOptimizationWork) {
         {
             let mut state = lock_unpoisoned(&self.tiering_state);
-            if state.scheduled.contains(&decision.key) || state.failed.contains(&decision.key) {
+            if !state.scheduled.contains(&work.decision.key) {
                 return;
             }
             if state.stats.native_compiled_functions >= self.tiering_options.native_max_functions
                 || state.stats.native_compile_budget_used_us
                     >= self.tiering_options.native_max_compile_us
             {
+                state.scheduled.remove(&work.decision.key);
                 state.stats.native_compile_budget_rejections = state
                     .stats
                     .native_compile_budget_rejections
                     .saturating_add(1);
                 return;
             }
-            state.scheduled.insert(decision.key);
-            state.stats.optimized_candidates = state.stats.optimized_candidates.saturating_add(1);
         }
-
-        let worker = self.clone();
-        let submitted = submit_native_optimization_job(move || {
-            let started = Instant::now();
-            let mut options = VmOptions::default();
-            options.native_optimization = NativeOptimizationPolicy::Optimizing;
-            options.tiering.enabled = false;
-            let result = worker.compile_native_with_priority(
-                &unit,
-                function,
-                &options,
-                &external_signatures,
-                true,
-            );
-            let published_optimizing_entry = result
-                .as_ref()
-                .ok()
-                .and_then(|(records, _)| {
-                    records
-                        .iter()
-                        .find(|record| record.function == function)
-                        .and_then(|record| record.result.handle.as_ref())
+        let started = Instant::now();
+        let options = work.compile_options.optimizing_vm_options();
+        let result = self.resolve_native_function_with_priority(
+            &work.unit,
+            work.function,
+            &options,
+            &work.external_signatures,
+            true,
+        );
+        let completed_optimizing_entry = result
+            .as_ref()
+            .ok()
+            .filter(|handle| {
+                handle.region_state_metadata().is_some_and(|metadata| {
+                    metadata.compiler_tier == php_jit::region_ir::NativeCompilerTier::Optimizing
                 })
-                .filter(|handle| {
-                    handle.region_state_metadata().is_some_and(|metadata| {
-                        metadata.compiler_tier == php_jit::region_ir::NativeCompilerTier::Optimizing
-                    })
-                })
-                .and_then(php_jit::JitFunctionHandle::native_entry_address);
-            if let Some(address) = published_optimizing_entry
-                && let Some(cell) = unit
-                    .prepared_deployment_image()
-                    .preferred_function_entries
-                    .get(function.index())
-            {
-                cell.store(address, std::sync::atomic::Ordering::Release);
-            }
-            let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-            let mut state = lock_unpoisoned(&worker.tiering_state);
-            state.scheduled.remove(&decision.key);
-            state.stats.native_compile_budget_used_us = state
-                .stats
-                .native_compile_budget_used_us
-                .saturating_add(elapsed_us);
-            if published_optimizing_entry.is_some() {
-                state.stats.native_compiled_functions =
-                    state.stats.native_compiled_functions.saturating_add(1);
-            } else {
-                state.failed.insert(decision.key);
-            }
-        });
-        if !submitted {
-            let mut state = lock_unpoisoned(&self.tiering_state);
-            state.scheduled.remove(&decision.key);
-            state.stats.native_compile_budget_rejections = state
-                .stats
-                .native_compile_budget_rejections
-                .saturating_add(1);
+            })
+            .and_then(php_jit::JitFunctionHandle::native_entry_address);
+        // A caller with immutable external links may only become preferred at
+        // a request-owned declaration boundary. The background worker has no
+        // live runtime view in which it could prepare and validate those target
+        // cells; publishing here would let an in-flight request observe new
+        // code against its older link graph. Link-free and same-unit products
+        // are already fully prepared by `prepare_and_publish_optimizing_entry`
+        // and remain safe to publish immediately.
+        let publishable_optimizing_entry = work
+            .external_signatures
+            .is_empty()
+            .then_some(completed_optimizing_entry)
+            .flatten();
+        if let Some(address) = publishable_optimizing_entry
+            && let Some(cell) = work
+                .unit
+                .prepared_deployment_image()
+                .preferred_function_entries
+                .get(work.function.index())
+        {
+            cell.store(address, std::sync::atomic::Ordering::Release);
+        }
+        let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        let mut state = lock_unpoisoned(&self.tiering_state);
+        state.scheduled.remove(&work.decision.key);
+        state.stats.native_compile_budget_used_us = state
+            .stats
+            .native_compile_budget_used_us
+            .saturating_add(elapsed_us);
+        if completed_optimizing_entry.is_some() {
+            state.stats.native_compiled_functions =
+                state.stats.native_compiled_functions.saturating_add(1);
+        } else {
+            state.failed.insert(work.decision.key);
         }
     }
 
-    /// Requests the optimizing product for a baseline function whose direct
-    /// process-owned entry counter proves it is hot.
-    fn schedule_hot_on_demand_optimization(
+    /// Requests one serialized optimizing batch for baseline functions whose
+    /// direct process-owned entry counters prove they are hot.
+    fn schedule_hot_on_demand_optimizations(
         &self,
-        unit: CompiledUnit,
-        function: php_ir::FunctionId,
-        external_signatures: Vec<php_jit::JitExternalFunctionSignature>,
-        entries: u64,
+        options: &VmOptions,
+        candidates: Vec<(
+            CompiledUnit,
+            php_ir::FunctionId,
+            Vec<php_jit::JitExternalFunctionSignature>,
+            u64,
+        )>,
     ) {
         if !self.background_tiering
             || !self.tiering_options.enabled
@@ -586,21 +708,40 @@ impl VmWorkerState {
         {
             return;
         }
-        let key = native_compile_cache::NativeCompileCacheKey::new(
-            unit.cache_identity(),
-            function,
-            NativeOptimizationPolicy::Optimizing.opt_level(),
-            external_function_signatures_hash(&external_signatures),
-        );
-        if self.native_compiles.contains(key) {
+        let mut work = Vec::with_capacity(candidates.len());
+        for (unit, function, external_signatures, entries) in candidates {
+            let decision = BackgroundTieringDecision {
+                key: native_compile_cache_key(
+                    &unit,
+                    function,
+                    NativeOptimizationPolicy::Optimizing.opt_level(),
+                    &external_signatures,
+                ),
+                entries,
+            };
+            if self.claim_background_optimization(decision) {
+                work.push(BackgroundOptimizationWork {
+                    decision,
+                    unit,
+                    function,
+                    compile_options: BackgroundCompileOptions::from_vm_options(options),
+                    external_signatures,
+                });
+            }
+        }
+        if work.is_empty() {
             return;
         }
-        self.schedule_background_optimization(
-            BackgroundTieringDecision { key, entries },
-            unit,
-            function,
-            external_signatures,
-        );
+        let decisions = work.iter().map(|work| work.decision).collect::<Vec<_>>();
+        let worker = self.clone();
+        let submitted = submit_native_optimization_job(move || {
+            for work in work {
+                worker.run_background_optimization(work);
+            }
+        });
+        if !submitted {
+            self.reject_submitted_optimizations(&decisions);
+        }
     }
 
     fn resolve_native_function(
@@ -610,21 +751,82 @@ impl VmWorkerState {
         options: &VmOptions,
         external_signatures: &[php_jit::JitExternalFunctionSignature],
     ) -> Result<php_jit::JitFunctionHandle, String> {
-        let external_signatures_hash = external_function_signatures_hash(external_signatures);
-        let fast_key = native_compile_cache::NativeCompileCacheKey::new(
-            unit.cache_identity(),
+        self.resolve_native_function_with_priority(
+            unit,
+            function,
+            options,
+            external_signatures,
+            false,
+        )
+    }
+
+    fn resolve_native_function_with_priority(
+        &self,
+        unit: &CompiledUnit,
+        function: php_ir::FunctionId,
+        options: &VmOptions,
+        external_signatures: &[php_jit::JitExternalFunctionSignature],
+        background: bool,
+    ) -> Result<php_jit::JitFunctionHandle, String> {
+        let linked_external_signatures =
+            linked_external_function_signatures(unit, function, external_signatures);
+        let fast_key = native_compile_cache_key(
+            unit,
             function,
             options.native_optimization.opt_level(),
-            external_signatures_hash,
+            &linked_external_signatures,
         );
         if let Some(handle) = self.resolved_native_entries.get(fast_key) {
+            self.prepare_and_publish_optimizing_entry(
+                unit,
+                function,
+                options,
+                external_signatures,
+                &handle,
+                background,
+            )?;
             return Ok(handle);
         }
-        let handle =
-            self.resolve_native_function_cold(unit, function, options, external_signatures)?;
-        self.resolved_native_entries
-            .insert(fast_key, handle.clone());
+        let handle = self.resolve_native_function_cold(
+            unit,
+            function,
+            options,
+            external_signatures,
+            background,
+        )?;
+        self.prepare_and_publish_optimizing_entry(
+            unit,
+            function,
+            options,
+            external_signatures,
+            &handle,
+            background,
+        )?;
+        // Cross-unit background products are compilation-complete but not yet
+        // publication-ready: only a request-owned declaration boundary can
+        // prepare their exact linked runtime views. Keeping them out of the
+        // resolved-entry fast map prevents an in-flight request from adopting
+        // one through dynamic dispatch before that boundary. The compile cache
+        // retains the handle for zero-recompile adoption by the next request.
+        if !background || linked_external_signatures.is_empty() {
+            self.resolved_native_entries
+                .insert(fast_key, handle.clone());
+        }
         Ok(handle)
+    }
+
+    fn has_compiled_optimizing_function(
+        &self,
+        unit: &CompiledUnit,
+        function: php_ir::FunctionId,
+        external_signatures: &[php_jit::JitExternalFunctionSignature],
+    ) -> bool {
+        self.native_compiles.contains(native_compile_cache_key(
+            unit,
+            function,
+            NativeOptimizationPolicy::Optimizing.opt_level(),
+            external_signatures,
+        ))
     }
 
     fn resolved_native_function(
@@ -634,13 +836,12 @@ impl VmWorkerState {
         options: &VmOptions,
         external_signatures: &[php_jit::JitExternalFunctionSignature],
     ) -> Option<php_jit::JitFunctionHandle> {
-        self.resolved_native_entries
-            .get(native_compile_cache::NativeCompileCacheKey::new(
-                unit.cache_identity(),
-                function,
-                options.native_optimization.opt_level(),
-                external_function_signatures_hash(external_signatures),
-            ))
+        self.resolved_native_entries.get(native_compile_cache_key(
+            unit,
+            function,
+            options.native_optimization.opt_level(),
+            external_signatures,
+        ))
     }
 
     fn resolve_native_function_cold(
@@ -649,6 +850,7 @@ impl VmWorkerState {
         function: php_ir::FunctionId,
         options: &VmOptions,
         external_signatures: &[php_jit::JitExternalFunctionSignature],
+        background: bool,
     ) -> Result<php_jit::JitFunctionHandle, String> {
         let cache = if options.native_cache == php_jit::NativeCacheMode::Off {
             None
@@ -676,7 +878,13 @@ impl VmWorkerState {
                             },
                             || {
                                 let (records, _) = self
-                                    .compile_native(unit, function, options, external_signatures)
+                                    .compile_native_with_priority(
+                                        unit,
+                                        function,
+                                        options,
+                                        external_signatures,
+                                        background,
+                                    )
                                     .map_err(php_jit::NativeCacheError::InvalidHeader)?;
                                 let image = cache_image(identity.clone(), function, &records)?;
                                 compiled_records = Some(records);
@@ -732,10 +940,66 @@ impl VmWorkerState {
             }
         }
 
-        let (records, _) = self.compile_native(unit, function, options, external_signatures)?;
+        let (records, _) = self.compile_native_with_priority(
+            unit,
+            function,
+            options,
+            external_signatures,
+            background,
+        )?;
         jit_abi::native_entries_from_records(&records)?
             .remove(&function)
             .ok_or_else(|| format!("native function entry {} was not published", function.raw()))
+    }
+
+    /// Loads one already persisted native function without compiling on a
+    /// miss. Request-time dynamic-unit publication uses this to adopt a warm
+    /// optimizing artifact while retaining the baseline continuation for a
+    /// genuinely cold deployment.
+    fn load_cached_native_function(
+        &self,
+        unit: &CompiledUnit,
+        function: php_ir::FunctionId,
+        options: &VmOptions,
+        external_signatures: &[php_jit::JitExternalFunctionSignature],
+    ) -> Result<Option<php_jit::JitFunctionHandle>, String> {
+        let key = native_compile_cache_key(
+            unit,
+            function,
+            options.native_optimization.opt_level(),
+            external_signatures,
+        );
+        if let Some(handle) = self.resolved_native_entries.get(key) {
+            return Ok(Some(handle));
+        }
+        if options.native_cache == php_jit::NativeCacheMode::Off {
+            return Ok(None);
+        }
+        let cache = php_jit::NativeArtifactCache::new(php_jit::NativeCacheConfig {
+            mode: options.native_cache,
+            directory: options.native_cache_dir.clone(),
+            ..php_jit::NativeCacheConfig::default()
+        })
+        .map_err(|error| format!("E_NATIVE_CACHE_SETUP: {error}"))?;
+        if !cache.config().mode.can_read() {
+            return Ok(None);
+        }
+        let identity = native_cache_identity(unit, function, options, external_signatures)
+            .map_err(|error| format!("E_NATIVE_CACHE_IDENTITY: {error}"))?;
+        let loaded = self
+            .get_or_load_native_unit(&identity, || {
+                cache.load(&identity, |stable_id| {
+                    resolve_native_cache_helper(stable_id, options.collect_counters)
+                })
+            })
+            .map_err(|error| format!("E_NATIVE_CACHE_ARTIFACT: {error}"))?;
+        let Some(handle) =
+            loaded.and_then(|loaded| loaded.native_entries().get(&function).cloned())
+        else {
+            return Ok(None);
+        };
+        self.resolved_native_entries.insert(key, handle.clone());
+        Ok(Some(handle))
     }
 }
 
@@ -769,6 +1033,10 @@ fn external_function_signatures_hash(signatures: &[php_jit::JitExternalFunctionS
             (hash ^ u64::from(signature.returns_by_reference)).wrapping_mul(0x0000_0100_0000_01b3);
         for byte in format!("{:?}", signature.native_params).bytes() {
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        for default in &signature.native_default_constant_indices {
+            let encoded = default.map_or(u64::MAX, u64::from);
+            hash = (hash ^ encoded).wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
     hash
@@ -821,15 +1089,68 @@ impl Vm {
         if unit.unit().functions.get(entry.index()).is_none() {
             return 0;
         }
-        self.compile_native(unit, entry).map_or(0, |records| {
-            records
-                .0
-                .iter()
-                .filter(|record| {
-                    matches!(record.result.status, php_jit::JitCompileStatus::Compiled)
-                })
-                .count() as u64
-        })
+        let deployment = unit.prepared_deployment_image();
+        if self.options.native_optimization == NativeOptimizationPolicy::Optimizing {
+            let mut baseline_options = self.options.clone();
+            baseline_options.native_optimization =
+                if self.options.tiering.enabled && !self.options.tiering.native_eager {
+                    NativeOptimizationPolicy::TieredBaseline
+                } else {
+                    NativeOptimizationPolicy::Baseline
+                };
+            baseline_options.tiering.enabled = false;
+            let Ok(baseline) =
+                self.worker_state
+                    .resolve_native_function(unit, entry, &baseline_options, &[])
+            else {
+                return 0;
+            };
+            let Some(baseline_address) = baseline.native_entry_address() else {
+                return 0;
+            };
+            if let Some(cell) = deployment.native_function_entries.get(entry.index()) {
+                cell.store(baseline_address, std::sync::atomic::Ordering::Release);
+            }
+            let Ok(optimizing) =
+                self.worker_state
+                    .resolve_native_function(unit, entry, &self.options, &[])
+            else {
+                return 0;
+            };
+            let Some(address) = optimizing.native_entry_address() else {
+                return 0;
+            };
+            if !optimizing.region_state_metadata().is_some_and(|metadata| {
+                metadata.compiler_tier == php_jit::region_ir::NativeCompilerTier::Optimizing
+            }) {
+                return 0;
+            }
+            if let Some(preferred) = deployment.preferred_function_entries.get(entry.index()) {
+                preferred.store(address, std::sync::atomic::Ordering::Release);
+            }
+        } else {
+            let Ok(handle) =
+                self.worker_state
+                    .resolve_native_function(unit, entry, &self.options, &[])
+            else {
+                return 0;
+            };
+            let Some(address) = handle.native_entry_address() else {
+                return 0;
+            };
+            if let Some(baseline) = deployment.native_function_entries.get(entry.index()) {
+                baseline.store(address, std::sync::atomic::Ordering::Release);
+            }
+            if let Some(preferred) = deployment.preferred_function_entries.get(entry.index()) {
+                let _ = preferred.compare_exchange(
+                    0,
+                    address,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                );
+            }
+        }
+        1
     }
 
     /// Compiles one selected function with the production Cranelift helper ABI
@@ -944,6 +1265,7 @@ impl Vm {
                     decision,
                     unit,
                     entry,
+                    &self.options,
                     external_signatures.to_vec(),
                 );
             }
@@ -990,21 +1312,29 @@ impl Vm {
                             },
                             || {
                                 let compile_started = Instant::now();
-                                let (records, disposition) = match self
-                                    .compile_native_with_external_function_signatures(
+                                // The loaded-unit registry still owns its cold
+                                // publication lock while this cache producer
+                                // runs. Compile the artifact without preparing
+                                // nested baseline artifacts here; the loaded
+                                // entry performs that publication transaction
+                                // after the registry lock has been released.
+                                let (records, disposition) =
+                                    match self.worker_state.compile_native_with_priority(
                                         &unit,
                                         entry,
+                                        &self.options,
                                         external_signatures,
+                                        false,
                                     ) {
-                                    Ok(records) => records,
-                                    Err(error) => {
-                                        native_compile_time += compile_started.elapsed();
-                                        cached_compile_error = Some(error.clone());
-                                        return Err(php_jit::NativeCacheError::InvalidHeader(
-                                            error,
-                                        ));
-                                    }
-                                };
+                                        Ok(records) => records,
+                                        Err(error) => {
+                                            native_compile_time += compile_started.elapsed();
+                                            cached_compile_error = Some(error.clone());
+                                            return Err(php_jit::NativeCacheError::InvalidHeader(
+                                                error,
+                                            ));
+                                        }
+                                    };
                                 if disposition.compiled() {
                                     native_compile_time += compile_started.elapsed();
                                 }
@@ -1018,7 +1348,13 @@ impl Vm {
                 cache_load_time += cache_started.elapsed().saturating_sub(native_compile_time);
                 let cache_error = match result {
                     Ok(Some(loaded)) => {
-                        let result = self.execute_cached_entry(&unit, loaded, entry, output);
+                        let result = self.execute_cached_entry(
+                            &unit,
+                            loaded,
+                            entry,
+                            external_signatures,
+                            output,
+                        );
                         return self.attach_native_cache_metrics(
                             result,
                             cache,
@@ -1065,7 +1401,13 @@ impl Vm {
                 });
                 cache_load_time += cache_started.elapsed();
                 if let Ok(Some(loaded)) = loaded {
-                    let result = self.execute_cached_entry(&unit, loaded, entry, output);
+                    let result = self.execute_cached_entry(
+                        &unit,
+                        loaded,
+                        entry,
+                        external_signatures,
+                        output,
+                    );
                     return self.attach_native_cache_metrics(
                         result,
                         cache,
@@ -1390,21 +1732,6 @@ impl Vm {
         )
     }
 
-    fn compile_native(
-        &self,
-        unit: &CompiledUnit,
-        function: php_ir::FunctionId,
-    ) -> Result<
-        (
-            Arc<[php_jit::JitUnitCompileRecord]>,
-            native_compile_cache::NativeCompileCacheDisposition,
-        ),
-        String,
-    > {
-        self.worker_state
-            .compile_native(unit, function, &self.options, &[])
-    }
-
     fn compile_native_with_external_function_signatures(
         &self,
         unit: &CompiledUnit,
@@ -1558,6 +1885,7 @@ fn linked_external_function_signatures(
                     published: false,
                     params: Vec::new(),
                     native_params: Vec::new(),
+                    native_default_constant_indices: Vec::new(),
                     native_arity: 0,
                     requires_non_reference_trampoline: false,
                     returns_by_reference: false,
@@ -1566,6 +1894,29 @@ fn linked_external_function_signatures(
         .collect()
 }
 
+/// Builds every worker-local native key from the immutable source call-link
+/// set. Callers may supply no currently visible declarations, but compilation
+/// still lowers one late-bound slot per prepared external call. Hashing the
+/// raw visibility slice here made tiering look for a different artifact than
+/// the compiler stored and forced every subsequent request back through the
+/// baseline tier.
+fn native_compile_cache_key(
+    unit: &CompiledUnit,
+    function: php_ir::FunctionId,
+    optimization_level: u8,
+    external_signatures: &[php_jit::JitExternalFunctionSignature],
+) -> native_compile_cache::NativeCompileCacheKey {
+    let external_signatures =
+        linked_external_function_signatures(unit, function, external_signatures);
+    native_compile_cache::NativeCompileCacheKey::new(
+        unit.cache_identity(),
+        function,
+        optimization_level,
+        external_function_signatures_hash(&external_signatures),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn compile_native_function_graph(
     unit: &php_ir::IrUnit,
     function: php_ir::FunctionId,
@@ -1712,6 +2063,9 @@ fn native_exception_detailed_output(
         ));
     }
     let detailed_message = match &frames[0] {
+        _ if class.eq_ignore_ascii_case("ArgumentCountError") => {
+            format!("{message} in {file}:{line}")
+        }
         (_, _, _, _, true) => format!("{message} in {file}:{line}"),
         (Some(call_file), Some(call_line), _, _, false) => format!(
             "{message}, called in {call_file} on line {call_line} and defined in {file}:{line}"
@@ -1811,7 +2165,9 @@ fn native_cache_identity(
         .prepared_function_ir_fingerprint(function)
         .map(str::to_owned)
         .unwrap_or_else(|| php_jit::stable_function_ir_fingerprint(unit.unit(), function));
-    let external_signatures_hash = external_function_signatures_hash(external_signatures);
+    let external_signatures =
+        linked_external_function_signatures(unit, function, external_signatures);
+    let external_signatures_hash = external_function_signatures_hash(&external_signatures);
     Ok(php_jit::NativeCacheIdentity {
         source_hash: format!("compiled-function-source-v3-{function_ir_hash}"),
         ir_hash: format!(
@@ -1921,9 +2277,37 @@ fn runtime_helper_addresses(diagnostic: bool) -> php_jit::JitRuntimeHelperAddres
         native_dirname: jit_native_dirname_abi as *const () as usize,
         native_realpath: jit_native_realpath_abi as *const () as usize,
         native_file_exists: jit_native_file_exists_abi as *const () as usize,
+        native_is_file: jit_native_is_file_abi as *const () as usize,
+        native_is_dir: jit_native_is_dir_abi as *const () as usize,
+        native_is_readable: jit_native_is_readable_abi as *const () as usize,
+        native_is_writable: jit_native_is_writable_abi as *const () as usize,
+        native_filesize: jit_native_filesize_abi as *const () as usize,
+        native_filemtime: jit_native_filemtime_abi as *const () as usize,
+        native_file_get_contents: jit_native_file_get_contents_abi as *const () as usize,
         native_fopen: jit_native_fopen_abi as *const () as usize,
         native_fwrite: jit_native_fwrite_abi as *const () as usize,
         native_fclose: jit_native_fclose_abi as *const () as usize,
+        native_fread: jit_native_fread_abi as *const () as usize,
+        native_fgets: jit_native_fgets_abi as *const () as usize,
+        native_fgetc: jit_native_fgetc_abi as *const () as usize,
+        native_feof: jit_native_feof_abi as *const () as usize,
+        native_fflush: jit_native_fflush_abi as *const () as usize,
+        native_fseek: jit_native_fseek_abi as *const () as usize,
+        native_ftell: jit_native_ftell_abi as *const () as usize,
+        native_ftruncate: jit_native_ftruncate_abi as *const () as usize,
+        native_rewind: jit_native_rewind_abi as *const () as usize,
+        native_stream_get_contents: jit_native_stream_get_contents_abi as *const () as usize,
+        native_stream_copy_to_stream: jit_native_stream_copy_to_stream_abi as *const () as usize,
+        native_output_buffer: [
+            jit_native_ob_start_abi as *const () as usize,
+            jit_native_ob_get_clean_abi as *const () as usize,
+            jit_native_ob_get_contents_abi as *const () as usize,
+            jit_native_ob_get_flush_abi as *const () as usize,
+            jit_native_ob_get_length_abi as *const () as usize,
+            jit_native_ob_get_level_abi as *const () as usize,
+            jit_native_ob_end_flush_abi as *const () as usize,
+            jit_native_ob_end_clean_abi as *const () as usize,
+        ],
         native_semantic_dispatch: helper_address!(
             jit_native_semantic_dispatch_abi,
             jit_native_semantic_dispatch_diagnostic_abi
@@ -2032,6 +2416,49 @@ fn runtime_helper_addresses(diagnostic: bool) -> php_jit::JitRuntimeHelperAddres
             jit_abi::jit_native_natsort_abi as *const () as usize,
             jit_abi::jit_native_natcasesort_abi as *const () as usize,
         ],
+        native_object_identity: [
+            jit_abi::jit_native_spl_object_hash_abi as *const () as usize,
+            jit_abi::jit_native_spl_object_id_abi as *const () as usize,
+        ],
+        native_serialization: [
+            jit_abi::jit_native_serialize_abi as *const () as usize,
+            jit_abi::jit_native_unserialize_abi as *const () as usize,
+        ],
+        native_object_vars: [
+            jit_abi::jit_native_get_object_vars_abi as *const () as usize,
+            jit_abi::jit_native_get_mangled_object_vars_abi as *const () as usize,
+        ],
+        native_class_lineage: [
+            jit_abi::jit_native_get_parent_class_abi as *const () as usize,
+            jit_abi::jit_native_is_subclass_of_abi as *const () as usize,
+        ],
+        native_extension_query: [
+            jit_abi::jit_native_extension_loaded_abi as *const () as usize,
+            jit_abi::jit_native_get_loaded_extensions_abi as *const () as usize,
+        ],
+        native_ini_query: [
+            jit_abi::jit_native_ini_get_abi as *const () as usize,
+            jit_abi::jit_native_get_cfg_var_abi as *const () as usize,
+            jit_abi::jit_native_get_include_path_abi as *const () as usize,
+        ],
+        native_request_query: [
+            jit_abi::jit_native_sys_get_temp_dir_abi as *const () as usize,
+            jit_abi::jit_native_getcwd_abi as *const () as usize,
+            jit_abi::jit_native_getenv_abi as *const () as usize,
+            jit_abi::jit_native_php_sapi_name_abi as *const () as usize,
+            jit_abi::jit_native_php_uname_abi as *const () as usize,
+            jit_abi::jit_native_get_current_user_abi as *const () as usize,
+            jit_abi::jit_native_get_included_files_abi as *const () as usize,
+        ],
+        native_declaration_inventory: [
+            jit_abi::jit_native_get_defined_functions_abi as *const () as usize,
+            jit_abi::jit_native_get_declared_classes_abi as *const () as usize,
+            jit_abi::jit_native_get_declared_interfaces_abi as *const () as usize,
+            jit_abi::jit_native_get_declared_traits_abi as *const () as usize,
+        ],
+        native_constant_inventory: jit_abi::jit_native_get_defined_constants_abi as *const ()
+            as usize,
+        native_compact: jit_abi::jit_native_compact_abi as *const () as usize,
         native_frame_introspection: [
             jit_abi::jit_native_func_num_args_abi as *const () as usize,
             jit_abi::jit_native_func_get_arg_abi as *const () as usize,
@@ -2065,6 +2492,7 @@ fn runtime_helper_addresses(diagnostic: bool) -> php_jit::JitRuntimeHelperAddres
         native_object_cast: jit_native_object_cast_abi as *const () as usize,
         native_object_class_name: jit_native_object_class_name_abi as *const () as usize,
         native_prepared_object_new: jit_native_prepared_object_new_abi as *const () as usize,
+        native_prepared_exception_new: jit_native_prepared_exception_new_abi as *const () as usize,
         native_prepared_closure_new: jit_native_prepared_closure_new_abi as *const () as usize,
         native_plain_object_clone: jit_native_plain_object_clone_abi as *const () as usize,
         native_dynamic_property_slot: jit_native_dynamic_property_slot_abi as *const () as usize,
@@ -2264,13 +2692,21 @@ mod tests {
         CompiledUnit::new(builder.finish())
     }
 
+    fn background_tiering_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        lock_unpoisoned(LOCK.get_or_init(|| Mutex::new(())))
+    }
+
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn server_worker_publishes_optimized_entry_after_hot_baseline_threshold() {
-        let mut tiering = crate::tiering::TieringOptions::default();
-        tiering.collect_stats = true;
-        tiering.function_entry_threshold = 2;
-        tiering.native_max_functions = 1;
+        let _guard = background_tiering_test_guard();
+        let tiering = crate::tiering::TieringOptions {
+            collect_stats: true,
+            function_entry_threshold: 2,
+            native_max_functions: 1,
+            ..crate::tiering::TieringOptions::default()
+        };
         let worker = VmWorkerState::new_with_background_tiering(tiering.clone());
         let options = VmOptions {
             native_optimization: NativeOptimizationPolicy::Optimizing,
@@ -2345,11 +2781,326 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
+    fn background_cross_unit_optimizer_waits_for_foreground_publication_boundary() {
+        let _guard = background_tiering_test_guard();
+        let tiering = crate::tiering::TieringOptions {
+            collect_stats: true,
+            function_entry_threshold: 1,
+            native_max_functions: 1,
+            ..crate::tiering::TieringOptions::default()
+        };
+        let worker = VmWorkerState::new_with_background_tiering(tiering.clone());
+        let unit = external_call_unit();
+        let function = unit.unit().entry;
+        let link_index = unit.prepared_external_function_calls(function)[0].link_index;
+        let external_signatures = vec![php_jit::JitExternalFunctionSignature {
+            name: "external_helper".to_owned(),
+            link_index,
+            published: true,
+            params: Vec::new(),
+            native_params: Vec::new(),
+            native_default_constant_indices: Vec::new(),
+            native_arity: 0,
+            requires_non_reference_trampoline: false,
+            returns_by_reference: false,
+        }];
+        let optimizing = VmOptions {
+            native_optimization: NativeOptimizationPolicy::Optimizing,
+            native_cache: php_jit::NativeCacheMode::Off,
+            tiering,
+            ..VmOptions::default()
+        };
+        let mut baseline = optimizing.clone();
+        baseline.native_optimization = NativeOptimizationPolicy::TieredBaseline;
+        baseline.tiering.enabled = false;
+        let baseline_address = worker
+            .prepare_native_baseline_entry(&unit, function, &baseline, &external_signatures)
+            .expect("cross-unit baseline publication");
+        let decision = worker
+            .background_tiering_decision(&unit, function, &optimizing, &external_signatures)
+            .expect("hot cross-unit optimizer decision");
+        worker.schedule_background_optimization(
+            decision,
+            unit.clone(),
+            function,
+            &optimizing,
+            external_signatures.clone(),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while worker.tiering_stats().native_compiled_functions == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(worker.tiering_stats().native_compiled_functions, 1);
+        assert_eq!(
+            unit.prepared_deployment_image().preferred_function_entries[function.index()]
+                .load(std::sync::atomic::Ordering::Acquire),
+            baseline_address,
+            "background code must not become visible against an in-flight request's link graph"
+        );
+        assert!(
+            worker
+                .resolved_native_function(&unit, function, &optimizing, &external_signatures,)
+                .is_none(),
+            "dynamic dispatch must not adopt the unpublished background product"
+        );
+        assert!(worker.has_compiled_optimizing_function(&unit, function, &external_signatures,));
+
+        let adopted = worker
+            .resolve_native_function(&unit, function, &optimizing, &external_signatures)
+            .expect("foreground publication boundary must adopt the compiled product")
+            .native_entry_address()
+            .expect("adopted optimizer address");
+        assert_ne!(adopted, baseline_address);
+        assert_eq!(
+            unit.prepared_deployment_image().preferred_function_entries[function.index()]
+                .load(std::sync::atomic::Ordering::Acquire),
+            adopted
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn worker_reuses_pre_and_post_declaration_native_abi_variants() {
+        let worker = VmWorkerState::new(crate::tiering::TieringOptions::default());
+        let unit = external_call_unit();
+        let function = unit.unit().entry;
+        let call = &unit.prepared_external_function_calls(function)[0];
+        let unpublished = php_jit::JitExternalFunctionSignature {
+            name: call.source_name.to_string(),
+            link_index: call.link_index,
+            published: false,
+            params: Vec::new(),
+            native_params: Vec::new(),
+            native_default_constant_indices: Vec::new(),
+            native_arity: 0,
+            requires_non_reference_trampoline: false,
+            returns_by_reference: false,
+        };
+        let published = php_jit::JitExternalFunctionSignature {
+            published: true,
+            ..unpublished.clone()
+        };
+        let options = VmOptions {
+            native_optimization: NativeOptimizationPolicy::Baseline,
+            native_cache: php_jit::NativeCacheMode::Off,
+            ..VmOptions::default()
+        };
+
+        worker
+            .resolve_native_function(
+                &unit,
+                function,
+                &options,
+                std::slice::from_ref(&unpublished),
+            )
+            .expect("pre-declaration native ABI");
+        worker
+            .resolve_native_function(&unit, function, &options, &[published])
+            .expect("post-declaration native ABI");
+        let after_both = worker.native_compile_cache_stats();
+        assert_eq!(after_both.entries, 2);
+        assert_eq!(after_both.misses, 2);
+
+        let resolved_hits = worker.resolved_native_entry_hits();
+        worker
+            .resolve_native_function(&unit, function, &options, &[unpublished])
+            .expect("warm pre-declaration native ABI");
+        assert_eq!(worker.native_compile_cache_stats(), after_both);
+        assert_eq!(worker.resolved_native_entry_hits(), resolved_hits + 1);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn prewarm_resolves_and_publishes_the_optimizing_entry_without_execution() {
+        let unit = returning_unit(7_302);
+        let options = VmOptions {
+            native_optimization: NativeOptimizationPolicy::Optimizing,
+            native_cache: php_jit::NativeCacheMode::Off,
+            ..VmOptions::default()
+        };
+        let vm = Vm::with_options_and_worker_state(
+            options,
+            VmWorkerState::new(crate::tiering::TieringOptions::default()),
+        );
+
+        assert_eq!(vm.prewarm_cranelift(&unit), 1);
+        let deployment = unit.prepared_deployment_image();
+        let baseline = deployment.native_function_entries[unit.unit().entry.index()]
+            .load(std::sync::atomic::Ordering::Acquire);
+        let preferred = deployment.preferred_function_entries[unit.unit().entry.index()]
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert_ne!(baseline, 0, "optimizing prewarm must publish its baseline");
+        assert_ne!(
+            preferred, 0,
+            "optimizing prewarm must publish its preferred entry"
+        );
+        assert_ne!(
+            preferred, baseline,
+            "prewarm must leave the optimizing entry preferred"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn cold_prewarm_persists_exactly_the_requested_baseline_and_optimizing_tiers() {
+        let directory = std::env::temp_dir().join(format!(
+            "phrust-vm-cold-prewarm-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let worker = VmWorkerState::isolated_for_restart_test();
+        let options = VmOptions {
+            native_optimization: NativeOptimizationPolicy::Optimizing,
+            native_cache: php_jit::NativeCacheMode::ReadWrite,
+            native_cache_dir: directory.clone(),
+            ..VmOptions::default()
+        };
+        let unit = returning_unit(7_304);
+        let vm = Vm::with_options_and_worker_state(options.clone(), worker.clone());
+
+        assert_eq!(vm.prewarm_cranelift(&unit), 1);
+        let stats = worker.native_compile_cache_stats();
+        assert_eq!(
+            stats.misses, 2,
+            "cold optimizing prewarm must compile one baseline and one optimizer"
+        );
+        let mut baseline_options = options.clone();
+        baseline_options.native_optimization = NativeOptimizationPolicy::TieredBaseline;
+        baseline_options.tiering.enabled = false;
+        for identity in [
+            native_cache_identity(&unit, unit.unit().entry, &baseline_options, &[]).unwrap(),
+            native_cache_identity(&unit, unit.unit().entry, &options, &[]).unwrap(),
+        ] {
+            assert!(
+                directory
+                    .join(format!("{}.pna", identity.cache_key()))
+                    .is_file()
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|value| value == "pna"))
+                .count(),
+            2,
+            "cold prewarm must not compile an unused third baseline policy"
+        );
+        let before = worker.native_compile_cache_stats();
+        assert_eq!(vm.prewarm_cranelift(&unit), 1);
+        let after = worker.native_compile_cache_stats();
+        assert_eq!(after.misses, before.misses);
+        assert_eq!(after.compile_time_nanos, before.compile_time_nanos);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn background_optimization_persists_and_prewarm_reloads_both_tiers() {
+        let _guard = background_tiering_test_guard();
+        let directory = std::env::temp_dir().join(format!(
+            "phrust-vm-background-prewarm-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let tiering = crate::tiering::TieringOptions {
+            function_entry_threshold: 2,
+            native_max_functions: 1,
+            ..crate::tiering::TieringOptions::default()
+        };
+        let worker = VmWorkerState::new_with_background_tiering(tiering.clone());
+        let options = VmOptions {
+            native_optimization: NativeOptimizationPolicy::Optimizing,
+            native_cache: php_jit::NativeCacheMode::ReadWrite,
+            native_cache_dir: directory.clone(),
+            tiering,
+            ..VmOptions::default()
+        };
+        let unit = returning_unit(7_303);
+
+        for _ in 0..2 {
+            let result = Vm::with_options_and_worker_state(options.clone(), worker.clone())
+                .execute(unit.clone());
+            assert_eq!(result.return_value, Some(Value::Int(7_303)), "{result:#?}");
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while worker.tiering_stats().native_compiled_functions == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(worker.tiering_stats().native_compiled_functions, 1);
+        let mut baseline_options = options.clone();
+        baseline_options.native_optimization = NativeOptimizationPolicy::TieredBaseline;
+        baseline_options.tiering.enabled = false;
+        let baseline_identity =
+            native_cache_identity(&unit, unit.unit().entry, &baseline_options, &[]).unwrap();
+        let optimizing_identity =
+            native_cache_identity(&unit, unit.unit().entry, &options, &[]).unwrap();
+        assert!(
+            directory
+                .join(format!("{}.pna", baseline_identity.cache_key()))
+                .is_file(),
+            "background tiering must persist the baseline artifact"
+        );
+        assert!(
+            directory
+                .join(format!("{}.pna", optimizing_identity.cache_key()))
+                .is_file(),
+            "background tiering must persist the optimizing artifact"
+        );
+        let artifacts = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "pna")
+            })
+            .count();
+        assert_eq!(
+            artifacts, 2,
+            "background publication must persist baseline and optimizing artifacts"
+        );
+
+        let restarted = CompiledUnit::from(unit.unit().clone());
+        let restart_worker = VmWorkerState::isolated_for_restart_test();
+        let restart_options = VmOptions {
+            native_optimization: NativeOptimizationPolicy::Optimizing,
+            native_cache: php_jit::NativeCacheMode::Read,
+            native_cache_dir: directory.clone(),
+            ..VmOptions::default()
+        };
+        let vm = Vm::with_options_and_worker_state(restart_options, restart_worker.clone());
+        assert_eq!(vm.prewarm_cranelift(&restarted), 1);
+        assert_eq!(restart_worker.native_compile_cache_stats().misses, 0);
+        let deployment = restarted.prepared_deployment_image();
+        let baseline = deployment.native_function_entries[restarted.unit().entry.index()]
+            .load(std::sync::atomic::Ordering::Acquire);
+        let preferred = deployment.preferred_function_entries[restarted.unit().entry.index()]
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert_ne!(baseline, 0);
+        assert_ne!(preferred, 0);
+        assert_ne!(preferred, baseline);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
     fn server_worker_uses_direct_entry_heat_for_on_demand_callee() {
-        let mut tiering = crate::tiering::TieringOptions::default();
-        tiering.collect_stats = true;
-        tiering.function_entry_threshold = 2;
-        tiering.native_max_functions = 2;
+        let _guard = background_tiering_test_guard();
+        let tiering = crate::tiering::TieringOptions {
+            collect_stats: true,
+            function_entry_threshold: 2,
+            native_max_functions: 2,
+            ..crate::tiering::TieringOptions::default()
+        };
         let worker = VmWorkerState::new_with_background_tiering(tiering.clone());
         let options = VmOptions {
             native_optimization: NativeOptimizationPolicy::Optimizing,
@@ -2393,6 +3144,23 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        let baseline_entries_before = unit
+            .prepared_deployment_image()
+            .baseline_function_entry_counts[callee.index()]
+        .load(std::sync::atomic::Ordering::Acquire);
+        let optimized = Vm::with_options_and_worker_state(options, worker).execute(unit.clone());
+        assert_eq!(
+            optimized.return_value,
+            Some(Value::Int(42)),
+            "{optimized:#?}"
+        );
+        assert_eq!(
+            unit.prepared_deployment_image()
+                .baseline_function_entry_counts[callee.index()]
+            .load(std::sync::atomic::Ordering::Acquire),
+            baseline_entries_before,
+            "the baseline caller must consume the published optimizing entry"
+        );
     }
 
     fn declaration_heavy_unit() -> CompiledUnit {
@@ -2439,6 +3207,28 @@ mod tests {
 
     fn direct_call_unit() -> CompiledUnit {
         direct_call_unit_with_identity(993, "native-direct-counter.php")
+    }
+
+    fn external_call_unit() -> CompiledUnit {
+        let mut builder = IrBuilder::new(UnitId::new(9_954));
+        let file = builder.add_file("native-background-external-publication.php");
+        let span = IrSpan::new(file, 0, 32);
+        let entry = builder.start_function("main", FunctionFlags::default(), span);
+        let block = builder.append_block(entry);
+        let result = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            block,
+            InstructionKind::CallFunction {
+                dst: result,
+                name: "external_helper".to_owned(),
+                args: Vec::new(),
+            },
+            span,
+        );
+        builder.terminate_return(entry, block, Some(Operand::Register(result)), span);
+        builder.set_entry(entry);
+        CompiledUnit::new(builder.finish())
     }
 
     fn direct_call_unit_with_identity(unit_id: u32, source: &str) -> CompiledUnit {
@@ -2699,6 +3489,129 @@ mod tests {
         (CompiledUnit::new(builder.finish()), callee)
     }
 
+    fn direct_reference_array_cow_unit() -> CompiledUnit {
+        let mut builder = IrBuilder::new(UnitId::new(9_942));
+        let file = builder.add_file("native-direct-reference-array-cow.php");
+        let span = IrSpan::new(file, 0, 32);
+        let zero = builder.intern_constant(IrConstant::Int(0));
+        let one = builder.intern_constant(IrConstant::Int(1));
+        let nine = builder.intern_constant(IrConstant::Int(9));
+
+        let entry = builder.start_function("main", FunctionFlags::default(), span);
+        let source = builder.intern_local(entry, "source");
+        let alias = builder.intern_local(entry, "alias");
+        let snapshot = builder.intern_local(entry, "snapshot");
+        let entry_block = builder.append_block(entry);
+        let initial = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::NewArray { dst: initial },
+            span,
+        );
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::StoreLocal {
+                local: source,
+                src: Operand::Register(initial),
+            },
+            span,
+        );
+        let copied = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::LoadLocal {
+                dst: copied,
+                local: source,
+            },
+            span,
+        );
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::StoreLocal {
+                local: snapshot,
+                src: Operand::Register(copied),
+            },
+            span,
+        );
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::BindReference {
+                target: alias,
+                source,
+            },
+            span,
+        );
+        let appended = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::AppendDim {
+                dst: appended,
+                local: alias,
+                dims: Vec::new(),
+                value: Operand::Constant(nine),
+            },
+            span,
+        );
+        let changed = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::LoadLocal {
+                dst: changed,
+                local: source,
+            },
+            span,
+        );
+        let unchanged = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::LoadLocal {
+                dst: unchanged,
+                local: snapshot,
+            },
+            span,
+        );
+        let result = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::NewArray { dst: result },
+            span,
+        );
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::ArrayInsert {
+                array: result,
+                key: Some(Operand::Constant(zero)),
+                value: Operand::Register(changed),
+                by_ref_local: None,
+            },
+            span,
+        );
+        builder.emit(
+            entry,
+            entry_block,
+            InstructionKind::ArrayInsert {
+                array: result,
+                key: Some(Operand::Constant(one)),
+                value: Operand::Register(unchanged),
+                by_ref_local: None,
+            },
+            span,
+        );
+        builder.terminate_return(entry, entry_block, Some(Operand::Register(result)), span);
+        builder.set_entry(entry);
+        CompiledUnit::new(builder.finish())
+    }
+
     fn optimizing_nested_callee_transition_unit() -> (CompiledUnit, php_ir::FunctionId) {
         let mut builder = IrBuilder::new(UnitId::new(9_938));
         let file = builder.add_file("native-nested-optimizing-transition.php");
@@ -2770,7 +3683,7 @@ mod tests {
 
     fn optimizing_nested_constant_key_array_transition_unit() -> (CompiledUnit, php_ir::FunctionId)
     {
-        let mut builder = IrBuilder::new(UnitId::new(9_938_1));
+        let mut builder = IrBuilder::new(UnitId::new(99_381));
         let file = builder.add_file("native-nested-constant-key-array-transition.php");
         let span = IrSpan::new(file, 0, 48);
         let first_key_constant = builder.intern_constant(IrConstant::String("path".to_owned()));
@@ -3587,8 +4500,10 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn optimizing_direct_call_keeps_baseline_continuation_and_upgrades_preferred_entry() {
         let unit = direct_call_unit_with_identity(9_936, "native-on-demand-optimizer-cell.php");
-        let mut tiering = crate::tiering::TieringOptions::default();
-        tiering.collect_stats = true;
+        let tiering = crate::tiering::TieringOptions {
+            collect_stats: true,
+            ..crate::tiering::TieringOptions::default()
+        };
         let worker = VmWorkerState::new(tiering.clone());
         let options = VmOptions {
             native_optimization: NativeOptimizationPolicy::Optimizing,
@@ -3617,15 +4532,6 @@ mod tests {
             0,
         );
         let manager = php_jit::global_code_manager().expect("global code manager");
-        let optimizing_address = manager
-            .published_function_exact(&optimizing_key)
-            .filter(|(_, handle)| {
-                handle.region_state_metadata().is_some_and(|metadata| {
-                    metadata.compiler_tier == php_jit::region_ir::NativeCompilerTier::Optimizing
-                })
-            })
-            .and_then(|(cell, _)| cell.resolve(optimizing_key.signature_hash, 0))
-            .expect("the reached callee must be optimized synchronously");
         let baseline_key = php_jit::native_function_key(
             unit.prepared_ir_fingerprint().to_owned(),
             callee.raw(),
@@ -3637,12 +4543,39 @@ mod tests {
         let baseline_address = manager
             .published_function_exact(&baseline_key)
             .and_then(|(_, handle)| handle.native_entry_address())
-            .expect("on-demand baseline callee publication");
+            .expect("publication-time baseline callee");
         let nested_address = unit.prepared_deployment_image().native_function_entries
             [callee.index()]
         .load(std::sync::atomic::Ordering::Acquire);
         assert_eq!(nested_address, baseline_address);
-        assert_ne!(nested_address, optimizing_address);
+        assert_eq!(
+            unit.prepared_deployment_image().preferred_function_entries[callee.index()]
+                .load(std::sync::atomic::Ordering::Acquire),
+            baseline_address,
+            "the direct callee baseline must be callable before the root optimizer is published"
+        );
+        assert_eq!(
+            result
+                .counters
+                .as_ref()
+                .expect("first diagnostic counters")
+                .native_transition_count,
+            0,
+            "the first direct call must not use an operation-local publication transition"
+        );
+        let optimizing_handle = worker
+            .resolve_native_function(&unit, callee, &options, &[])
+            .expect("explicit callee optimizer publication");
+        let optimizing_address = optimizing_handle
+            .native_entry_address()
+            .expect("callee optimizer address");
+        assert_ne!(baseline_address, optimizing_address);
+        assert_eq!(
+            manager
+                .published_function_exact(&optimizing_key)
+                .and_then(|(cell, _)| cell.resolve(optimizing_key.signature_hash, 0)),
+            Some(optimizing_address)
+        );
         assert_eq!(
             unit.prepared_deployment_image().preferred_function_entries[callee.index()]
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -3704,10 +4637,46 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
+    fn direct_reference_array_insert_preserves_cow_and_alias() {
+        let result = Vm::with_options(VmOptions {
+            native_optimization: NativeOptimizationPolicy::Optimizing,
+            native_cache: php_jit::NativeCacheMode::Off,
+            ..VmOptions::default()
+        })
+        .execute(direct_reference_array_cow_unit());
+
+        let Some(Value::Array(result_array)) = result.return_value else {
+            panic!("direct reference array mutation did not return evidence: {result:#?}");
+        };
+        let Some(Value::Array(changed)) = result_array.get(&php_runtime::api::ArrayKey::Int(0))
+        else {
+            panic!("aliased array result is missing: {result_array:?}");
+        };
+        assert!(
+            matches!(
+                changed.get(&php_runtime::api::ArrayKey::Int(0)),
+                Some(Value::Int(9))
+            ),
+            "mutation through the reference must update the referenced array"
+        );
+        let Some(Value::Array(snapshot)) = result_array.get(&php_runtime::api::ArrayKey::Int(1))
+        else {
+            panic!("array COW snapshot is missing: {result_array:?}");
+        };
+        assert!(
+            snapshot.get(&php_runtime::api::ArrayKey::Int(0)).is_none(),
+            "mutation through the reference must not modify a prior by-value copy"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
     fn optimizing_reference_call_preserves_alias_through_baseline_entry() {
         let (unit, callee) = optimizing_reference_call_to_baseline_unit();
-        let mut tiering = crate::tiering::TieringOptions::default();
-        tiering.enabled = false;
+        let tiering = crate::tiering::TieringOptions {
+            enabled: false,
+            ..crate::tiering::TieringOptions::default()
+        };
         let worker = VmWorkerState::new(tiering.clone());
         let baseline = VmOptions {
             native_optimization: NativeOptimizationPolicy::Baseline,
@@ -4095,8 +5064,10 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn reached_method_upgrades_the_preferred_entry_from_baseline() {
-        let mut tiering = crate::tiering::TieringOptions::default();
-        tiering.collect_stats = true;
+        let tiering = crate::tiering::TieringOptions {
+            collect_stats: true,
+            ..crate::tiering::TieringOptions::default()
+        };
         let worker = VmWorkerState::new(tiering.clone());
         let unit = polymorphic_method_pic_unit();
         let method = unit.unit().classes[0].methods[0].function;
@@ -4413,6 +5384,73 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
+    fn optimizing_cached_direct_call_restarts_with_prevalidated_preferred_cells() {
+        let directory = std::env::temp_dir().join(format!(
+            "phrust-vm-pna-optimizing-direct-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let unit =
+            direct_call_unit_with_identity(9_952, "native-cached-optimizing-direct-call.php");
+        let options = VmOptions {
+            native_optimization: NativeOptimizationPolicy::Optimizing,
+            native_cache: php_jit::NativeCacheMode::ReadWrite,
+            native_cache_dir: directory.clone(),
+            collect_counters: true,
+            ..VmOptions::default()
+        };
+        let first =
+            Vm::with_options_and_worker_state(options, VmWorkerState::isolated_for_restart_test())
+                .execute(unit.clone());
+        assert_eq!(first.return_value, Some(Value::Int(42)), "{first:#?}");
+        assert_eq!(first.counters.as_ref().unwrap().native_transition_count, 0);
+
+        let restarted = CompiledUnit::from(unit.unit().clone());
+        let restart_worker = VmWorkerState::isolated_for_restart_test();
+        let second = Vm::with_options_and_worker_state(
+            VmOptions {
+                native_optimization: NativeOptimizationPolicy::Optimizing,
+                native_cache: php_jit::NativeCacheMode::Read,
+                native_cache_dir: directory.clone(),
+                collect_counters: true,
+                ..VmOptions::default()
+            },
+            restart_worker.clone(),
+        )
+        .execute(restarted.clone());
+        assert_eq!(second.return_value, Some(Value::Int(42)), "{second:#?}");
+        assert_eq!(second.native_compile_nanos, 0);
+        assert_eq!(restart_worker.native_compile_cache_stats().misses, 0);
+        assert_eq!(
+            second.counters.as_ref().unwrap().native_transition_count,
+            0,
+            "the cached root must not execute before its direct callee cell is callable"
+        );
+
+        let callee = restarted
+            .unit()
+            .function_table
+            .iter()
+            .find_map(|entry| (entry.name == "callee").then_some(entry.function))
+            .expect("callee function id");
+        let deployment = restarted.prepared_deployment_image();
+        let callee_baseline = deployment.native_function_entries[callee.index()]
+            .load(std::sync::atomic::Ordering::Acquire);
+        let callee_preferred = deployment.preferred_function_entries[callee.index()]
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert_ne!(callee_baseline, 0);
+        assert_eq!(
+            callee_preferred, callee_baseline,
+            "restart publication must prepare the direct callee before invoking the optimizer"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
     fn worker_fast_entry_cache_reuses_loaded_artifact_without_identity_rebuild() {
         let directory = std::env::temp_dir().join(format!(
             "phrust-vm-loaded-unit-{}-{}",
@@ -4422,7 +5460,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let worker = VmWorkerState::new(crate::tiering::TieringOptions::default());
+        let worker = VmWorkerState::isolated_for_restart_test();
         let before = worker.loaded_native_unit_stats();
         let entry_hits_before = worker.resolved_native_entry_hits();
         let unit = direct_call_unit();

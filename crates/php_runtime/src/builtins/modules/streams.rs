@@ -235,9 +235,16 @@ pub(in crate::builtins::modules) fn builtin_fread(
     let Some(resource) = resource_arg(&args[0]) else {
         return Ok(Value::Bool(false));
     };
-    let length = int_arg("fread", &args[1])?.max(0) as usize;
+    let length = int_arg("fread", &args[1])?;
+    if length <= 0 {
+        return Err(argument_value_error(
+            "fread",
+            "#2 ($length)",
+            "must be greater than 0",
+        ));
+    }
     Ok(resource
-        .read_bytes(length)
+        .read_bytes(length as usize)
         .map_or(Value::Bool(false), Value::string))
 }
 pub(in crate::builtins::modules) fn builtin_fwrite(
@@ -286,10 +293,21 @@ pub(in crate::builtins::modules) fn builtin_fgets(
     let Some(resource) = resource_arg(&args[0]) else {
         return Ok(Value::Bool(false));
     };
-    let mut line = resource.read_line().unwrap_or_default();
-    if let Some(length) = args.get(1) {
-        line.truncate(int_arg("fgets", length)?.max(0) as usize);
-    }
+    let line = if let Some(length) = args.get(1) {
+        let length = int_arg("fgets", length)?;
+        if length <= 0 {
+            return Err(argument_value_error(
+                "fgets",
+                "#2 ($length)",
+                "must be greater than 0",
+            ));
+        }
+        resource
+            .read_line_bounded((length - 1) as usize)
+            .unwrap_or_default()
+    } else {
+        resource.read_line().unwrap_or_default()
+    };
     if line.is_empty() {
         Ok(Value::Bool(false))
     } else {
@@ -395,9 +413,10 @@ pub(in crate::builtins::modules) fn builtin_ftruncate(
     };
     let size = int_arg("ftruncate", &args[1])?;
     if size < 0 {
-        return Err(value_error(
+        return Err(argument_value_error(
             "ftruncate",
-            "size must be greater than or equal to 0",
+            "#2 ($size)",
+            "must be greater than or equal to 0",
         ));
     }
     Ok(Value::Bool(resource.truncate(size as usize).is_ok()))
@@ -578,6 +597,13 @@ pub(in crate::builtins::modules) fn builtin_stream_get_contents(
         .map(|value| int_arg("stream_get_contents", value))
         .transpose()?
     {
+        if length < -1 {
+            return Err(argument_value_error(
+                "stream_get_contents",
+                "#2 ($length)",
+                "must be greater than or equal to -1",
+            ));
+        }
         if length < 0 {
             resource.read_to_end()
         } else {

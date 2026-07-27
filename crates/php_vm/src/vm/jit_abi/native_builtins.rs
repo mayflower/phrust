@@ -1,6 +1,27 @@
 use super::*;
 use std::sync::Arc;
 
+/// Constructs the sole baseline builtin service adapter from the request's
+/// owned state. Keeping this expansion in one place prevents individual
+/// builtin families from inventing fallback request-state owners while still
+/// allowing Rust to borrow the disjoint context fields precisely at each
+/// cold invocation.
+macro_rules! borrow_native_builtin_context {
+    ($context:ident) => {
+        php_runtime::api::BuiltinContext::with_borrowed_runtime_request_state(
+            &mut $context.output,
+            &mut $context.cwd,
+            Arc::clone(&$context.include_path),
+            $context.options.runtime_context.filesystem.clone(),
+            Some(&mut $context.resources),
+            &mut $context.builtin_request_state,
+            &mut $context.ini_registry,
+            &mut $context.default_timezone,
+            Arc::clone(&$context.environment),
+        )
+    };
+}
+
 fn positional_native_call_argument() -> php_ir::instruction::IrCallArg {
     php_ir::instruction::IrCallArg {
         name: None,
@@ -672,15 +693,12 @@ fn emit_native_dimension_conversion_diagnostic_for_target(
     }
 }
 
-pub(super) fn emit_native_deprecated_call(
-    context: &mut NativeRequestColdState<'_>,
+fn native_deprecated_call_message(
+    unit: &php_ir::IrUnit,
     function: php_ir::FunctionId,
-    source: &php_ir::Instruction,
-) {
-    let Some(function) = context.unit.functions.get(function.index()) else {
-        return;
-    };
-    let Some(attribute) = function.attributes.iter().find(|attribute| {
+) -> Option<String> {
+    let function = unit.functions.get(function.index())?;
+    let attribute = function.attributes.iter().find(|attribute| {
         attribute
             .resolved_name
             .as_deref()
@@ -688,11 +706,9 @@ pub(super) fn emit_native_deprecated_call(
             .unwrap_or(&attribute.name)
             .trim_start_matches('\\')
             .eq_ignore_ascii_case("deprecated")
-    }) else {
-        return;
-    };
+    })?;
     let custom = attribute.arguments.iter().find_map(|constant| {
-        match context.unit.constants.get(constant.index())? {
+        match unit.constants.get(constant.index())? {
             php_ir::IrConstant::String(value) => Some(value.clone()),
             php_ir::IrConstant::StringBytes(value) => {
                 Some(String::from_utf8_lossy(value).into_owned())
@@ -710,6 +726,14 @@ pub(super) fn emit_native_deprecated_call(
         message.push_str(", ");
         message.push_str(&custom);
     }
+    Some(message)
+}
+
+fn emit_native_deprecated_message(
+    context: &mut NativeRequestColdState<'_>,
+    message: &str,
+    source: &php_ir::Instruction,
+) {
     let path = context
         .unit
         .files
@@ -719,6 +743,32 @@ pub(super) fn emit_native_deprecated_call(
     context.output.write_bytes(format!(
         "\nDeprecated: {message} in {path} on line {line}\n"
     ));
+}
+
+pub(super) fn emit_native_deprecated_call(
+    context: &mut NativeRequestColdState<'_>,
+    function: php_ir::FunctionId,
+    source: &php_ir::Instruction,
+) {
+    let Some(message) = native_deprecated_call_message(&context.unit, function) else {
+        return;
+    };
+    emit_native_deprecated_message(context, &message, source);
+}
+
+pub(super) fn emit_native_external_deprecated_call(
+    context: &mut NativeRequestColdState<'_>,
+    target: NativeDynamicFunction,
+    source: &php_ir::Instruction,
+) {
+    let message = context
+        .dynamic_units
+        .get(target.unit)
+        .and_then(|unit| native_deprecated_call_message(unit.compiled.unit(), target.function));
+    let Some(message) = message else {
+        return;
+    };
+    emit_native_deprecated_message(context, &message, source);
 }
 
 fn collect_native_compact_names(value: Value, names: &mut Vec<String>) -> Result<(), String> {
@@ -829,6 +879,16 @@ fn execute_baseline_callback_sort(
     let [target, callback] = arguments else {
         return Err("array callback sort expects exactly 2 arguments".to_owned());
     };
+    if let Some(result) = try_execute_direct_native_callback_sort(
+        context,
+        *target,
+        *callback,
+        source,
+        compare_keys,
+        preserve_keys,
+    ) {
+        return result;
+    }
     let Value::Reference(reference) = context.decode_baseline_value(*target)? else {
         return Err("array callback sort expects an array passed by reference".to_owned());
     };
@@ -889,6 +949,128 @@ fn execute_baseline_callback_sort(
     context.encode_baseline_value(Value::Bool(true))
 }
 
+fn try_execute_direct_native_callback_sort(
+    context: &mut NativeRequestColdState<'_>,
+    target: i64,
+    callback: i64,
+    source: &php_ir::Instruction,
+    compare_keys: bool,
+    preserve_keys: bool,
+) -> Option<Result<i64, String>> {
+    let array = context.direct_reference_payload(target)?;
+    let array = context.direct_array_encoding(array)?;
+    let (start, length) = context.direct_array_entry_range(array)?;
+    let mut entries = Vec::with_capacity(length);
+    let result = (|| {
+        for index in 0..length {
+            let entry = context.direct_array_entry_at(start, index);
+            let key = duplicate_native_callback_owner(context, entry.key)?;
+            let value = match duplicate_native_callback_owner(context, entry.value) {
+                Ok(value) => value,
+                Err(error) => {
+                    context.release_if_live(key)?;
+                    return Err(error);
+                }
+            };
+            entries.push(php_jit::JitNativeDirectArrayEntry { key, value });
+        }
+
+        for index in 1..entries.len() {
+            let mut cursor = index;
+            while cursor > 0 {
+                let left = if compare_keys {
+                    entries[cursor - 1].key
+                } else {
+                    entries[cursor - 1].value
+                };
+                let right = if compare_keys {
+                    entries[cursor].key
+                } else {
+                    entries[cursor].value
+                };
+                let result = invoke_native_array_callback_by_value(
+                    context,
+                    callback,
+                    &[left, right],
+                    source,
+                )?;
+                let ordering = consume_native_callback_ordering(context, result)?;
+                if ordering <= 0 {
+                    break;
+                }
+                entries.swap(cursor - 1, cursor);
+                cursor -= 1;
+            }
+        }
+
+        if !preserve_keys {
+            for (index, entry) in entries.iter_mut().enumerate() {
+                let index = i64::try_from(index)
+                    .map_err(|_| "callback sort index exceeds the PHP integer domain".to_owned())?;
+                let key = context.encode_native_int(index)?;
+                context.release_if_live(entry.key)?;
+                entry.key = key;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        return Some(match release_native_callback_entries(context, &entries) {
+            Ok(()) => Err(error),
+            Err(release_error) => Err(release_error),
+        });
+    }
+
+    let sorted = match context.publish_owned_direct_array_entries(entries) {
+        Ok(sorted) => sorted,
+        Err(error) => return Some(Err(error)),
+    };
+    match context.replace_direct_reference_payload_owned(target, sorted) {
+        Ok(true) => Some(Ok(php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE))),
+        Ok(false) => {
+            let release = context.release_if_live(sorted);
+            Some(match release {
+                Ok(()) => Err("callback sort target lost its native reference identity".to_owned()),
+                Err(error) => Err(error),
+            })
+        }
+        Err(error) => {
+            let _ = context.release_if_live(sorted);
+            Some(Err(error))
+        }
+    }
+}
+
+fn consume_native_callback_ordering(
+    context: &mut NativeRequestColdState<'_>,
+    encoded: i64,
+) -> Result<i64, String> {
+    let ordering = match context.native_encoded_value_kind(encoded) {
+        Some(NativeEncodedValueKind::Int) => context.native_encoded_int(encoded).unwrap_or(0),
+        Some(NativeEncodedValueKind::Float) => {
+            context.native_encoded_float(encoded).unwrap_or(0.0) as i64
+        }
+        Some(NativeEncodedValueKind::String) => context
+            .native_string_name_bytes(encoded)
+            .and_then(|bytes| std::str::from_utf8(&bytes).ok()?.parse::<i64>().ok())
+            .unwrap_or(0),
+        Some(NativeEncodedValueKind::Bool(value)) => i64::from(value),
+        Some(NativeEncodedValueKind::Null) => 0,
+        _ => {
+            let value = context.decode_baseline_value(encoded)?;
+            match value {
+                Value::Int(value) => value,
+                Value::Float(value) => value.to_f64() as i64,
+                Value::String(value) => value.to_string_lossy().parse::<i64>().unwrap_or(0),
+                Value::Bool(value) => i64::from(value),
+                _ => 0,
+            }
+        }
+    };
+    context.release_if_live(encoded)?;
+    Ok(ordering)
+}
+
 fn native_array_key_value(key: &php_runtime::api::ArrayKey) -> Value {
     match key {
         php_runtime::api::ArrayKey::Int(key) => Value::Int(*key),
@@ -896,39 +1078,181 @@ fn native_array_key_value(key: &php_runtime::api::ArrayKey) -> Value {
     }
 }
 
-/// Baseline implementation of the array-callback by-value contract.
+/// Invokes one callback from the by-value array family without constructing a
+/// parallel Rust `Value` argument plane.
 ///
-/// PHP's array_map/filter/reduce APIs never lend their element slots to a
-/// callback. A callback parameter declared by-reference therefore receives a
-/// warning and a temporary reference around a copied value. Reuse the same
-/// encoded binder used by call_user_func so closures, methods, and named
-/// functions all observe that rule without teaching the optimizing callback
-/// loop about cold warning dispatch.
+/// The shared call-user-func binder already implements PHP's by-reference
+/// warning/temporary semantics over native handles. Passing the authoritative
+/// element encodings straight through it gives map/filter/reduce/predicate
+/// callbacks the same semantics while keeping strings, arrays, objects, and
+/// references native across every iteration.
 fn invoke_native_array_callback_by_value(
     context: &mut NativeRequestColdState<'_>,
-    callback: Value,
-    arguments: &[Value],
+    callback: i64,
+    arguments: &[i64],
     source: &php_ir::Instruction,
 ) -> Result<i64, String> {
-    let mut encoded = Vec::with_capacity(arguments.len() + 1);
-    let result = (|| -> NativeCallResult {
-        encoded.push(context.encode_baseline_value(callback)?);
-        for argument in arguments {
-            encoded.push(context.encode_baseline_value(argument.clone())?);
-        }
-        execute_native_call_user_func_encoded(context, &encoded, source, None)
-    })();
+    let mut encoded = smallvec::SmallVec::<[i64; 8]>::with_capacity(arguments.len() + 1);
+    encoded.push(callback);
+    encoded.extend_from_slice(arguments);
+    execute_native_call_user_func_encoded(context, &encoded, source, None)
+        .map_err(NativeCallControl::into_baseline_error)
+}
+
+fn duplicate_native_callback_owner(
+    context: &mut NativeRequestColdState<'_>,
+    encoded: i64,
+) -> Result<i64, String> {
+    context
+        .duplicate_authoritative_native_value(encoded)?
+        .ok_or_else(|| {
+            "callback array value requires an explicit baseline representation".to_owned()
+        })
+}
+
+fn release_native_callback_entries(
+    context: &mut NativeRequestColdState<'_>,
+    entries: &[php_jit::JitNativeDirectArrayEntry],
+) -> Result<(), String> {
     let mut release_error = None;
-    for value in encoded {
-        if let Err(error) = context.release_if_live(value) {
-            release_error.get_or_insert(error);
+    for entry in entries.iter().rev() {
+        for encoded in [entry.value, entry.key] {
+            if let Err(error) = context.release_if_live(encoded) {
+                release_error.get_or_insert(error);
+            }
         }
     }
-    match (result, release_error) {
-        (Err(control), _) => Err(control.into_baseline_error()),
-        (Ok(_), Some(error)) => Err(error),
-        (Ok(value), None) => Ok(value),
+    release_error.map_or(Ok(()), Err)
+}
+
+fn finish_native_callback_entries(
+    context: &mut NativeRequestColdState<'_>,
+    entries: Vec<php_jit::JitNativeDirectArrayEntry>,
+    result: Result<(), String>,
+) -> Result<i64, String> {
+    match result {
+        Ok(()) => context.publish_owned_direct_array_entries(entries),
+        Err(error) => match release_native_callback_entries(context, &entries) {
+            Ok(()) => Err(error),
+            Err(release_error) => Err(release_error),
+        },
     }
+}
+
+fn push_native_callback_entry(
+    context: &mut NativeRequestColdState<'_>,
+    entries: &mut Vec<php_jit::JitNativeDirectArrayEntry>,
+    key: Result<i64, String>,
+    value: i64,
+) -> Result<(), String> {
+    let key = match key {
+        Ok(key) => key,
+        Err(error) => {
+            context.release_if_live(value)?;
+            return Err(error);
+        }
+    };
+    entries.push(php_jit::JitNativeDirectArrayEntry { key, value });
+    Ok(())
+}
+
+fn publish_native_packed_callback_values(
+    context: &mut NativeRequestColdState<'_>,
+    values: &[i64],
+) -> Result<i64, String> {
+    let mut entries = Vec::with_capacity(values.len());
+    let result = (|| {
+        for (index, value) in values.iter().copied().enumerate() {
+            let value = duplicate_native_callback_owner(context, value)?;
+            let index = i64::try_from(index)
+                .map_err(|_| "callback array index exceeds the PHP integer domain".to_owned())?;
+            let key = context.encode_native_int(index);
+            push_native_callback_entry(context, &mut entries, key, value)?;
+        }
+        Ok(())
+    })();
+    finish_native_callback_entries(context, entries, result)
+}
+
+fn consume_native_callback_truthiness(
+    context: &mut NativeRequestColdState<'_>,
+    encoded: i64,
+) -> Result<bool, String> {
+    let truthy = if let Some(truthy) = context.native_encoded_truthy(encoded) {
+        Ok(truthy)
+    } else {
+        // SimpleXML and already-materialized compatibility references are
+        // explicitly cold truthiness shapes. Materialize only this callback
+        // result once; ordinary scalar/string/array/object results stay native.
+        context
+            .decode_baseline_value(encoded)
+            .map(|value| native_property_truthy(&value))
+    };
+    let release = context.release_if_live(encoded);
+    match (truthy, release) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(truthy), Ok(())) => Ok(truthy),
+    }
+}
+
+fn try_execute_direct_native_array_map(
+    context: &mut NativeRequestColdState<'_>,
+    callback: i64,
+    arrays: &[i64],
+    source: &php_ir::Instruction,
+) -> Option<Result<i64, String>> {
+    let ranges = arrays
+        .iter()
+        .copied()
+        .map(|array| context.direct_array_entry_range(array))
+        .collect::<Option<Vec<_>>>()?;
+    let callback_is_null = matches!(
+        context.native_encoded_value_kind(callback),
+        Some(NativeEncodedValueKind::Null)
+    );
+    if callback_is_null && ranges.len() == 1 {
+        return Some(duplicate_native_callback_owner(context, arrays[0]));
+    }
+
+    let length = ranges.iter().map(|(_, length)| *length).max().unwrap_or(0);
+    let mut output = Vec::with_capacity(length);
+    let mut callback_arguments = Vec::with_capacity(ranges.len());
+    let result = (|| {
+        for index in 0..length {
+            callback_arguments.clear();
+            for (start, length) in ranges.iter().copied() {
+                callback_arguments.push(if index < length {
+                    context.direct_array_entry_at(start, index).value
+                } else {
+                    php_jit::jit_encode_constant(u32::MAX)
+                });
+            }
+            let value = if callback_is_null {
+                publish_native_packed_callback_values(context, &callback_arguments)?
+            } else {
+                invoke_native_array_callback_by_value(
+                    context,
+                    callback,
+                    &callback_arguments,
+                    source,
+                )?
+            };
+            let key = if ranges.len() == 1 {
+                duplicate_native_callback_owner(
+                    context,
+                    context.direct_array_entry_at(ranges[0].0, index).key,
+                )
+            } else {
+                i64::try_from(index)
+                    .map_err(|_| "array_map() result index exceeds PHP integer range".to_owned())
+                    .and_then(|index| context.encode_native_int(index))
+            };
+            push_native_callback_entry(context, &mut output, key, value)?;
+        }
+        Ok(())
+    })();
+    Some(finish_native_callback_entries(context, output, result))
 }
 
 fn execute_native_array_map(
@@ -942,7 +1266,21 @@ fn execute_native_array_map(
     if arrays.is_empty() {
         return Err("array_map() expects at least 2 arguments".to_owned());
     }
-    let callback = match context.decode_baseline_value(*callback)? {
+    if let Some(result) = try_execute_direct_native_array_map(context, *callback, arrays, source) {
+        return result;
+    }
+    execute_baseline_array_map(context, *callback, arrays, source)
+}
+
+/// Explicit cold compatibility for non-direct arrays/callbacks. Direct
+/// callback arrays are consumed above and never enter this Rust `Value` plane.
+fn execute_baseline_array_map(
+    context: &mut NativeRequestColdState<'_>,
+    callback: i64,
+    arrays: &[i64],
+    source: &php_ir::Instruction,
+) -> Result<i64, String> {
+    let callback = match context.decode_baseline_value(callback)? {
         Value::Reference(reference) => reference.get(),
         callback => callback,
     };
@@ -978,9 +1316,8 @@ fn execute_native_array_map(
         let value = if matches!(callback, Value::Null) {
             Value::Array(php_runtime::api::PhpArray::from_packed(values))
         } else {
-            let encoded =
-                invoke_native_array_callback_by_value(context, callback.clone(), &values, source)?;
-            context.decode_baseline_value(encoded)?
+            invoke_native_callable_value(context, callback.clone(), &values, source, None)
+                .and_then(|encoded| context.decode_baseline_value(encoded))?
         };
         if arrays.len() == 1 {
             let (key, _) = &entries[0][index];
@@ -1000,7 +1337,85 @@ fn execute_native_array_filter(
     let Some(array) = arguments.first() else {
         return Err("array_filter() expects at least 1 argument".to_owned());
     };
-    let array = match context.decode_baseline_value(*array)? {
+    if let Some(result) = try_execute_direct_native_array_filter(context, arguments, source) {
+        return result;
+    }
+    execute_baseline_array_filter(context, *array, &arguments[1..], source)
+}
+
+fn try_execute_direct_native_array_filter(
+    context: &mut NativeRequestColdState<'_>,
+    arguments: &[i64],
+    source: &php_ir::Instruction,
+) -> Option<Result<i64, String>> {
+    let (start, length) = context.direct_array_entry_range(arguments[0])?;
+    let callback = arguments.get(1).copied().filter(|callback| {
+        !matches!(
+            context.native_encoded_value_kind(*callback),
+            Some(NativeEncodedValueKind::Null)
+        )
+    });
+    let mode = arguments
+        .get(2)
+        .and_then(|mode| context.native_encoded_int(*mode))
+        .unwrap_or(0);
+
+    // Callback-free truthiness has no side effects, so determine native
+    // admission for the complete array before retaining any result owners.
+    if callback.is_none()
+        && (0..length).any(|index| {
+            context
+                .native_encoded_truthy(context.direct_array_entry_at(start, index).value)
+                .is_none()
+        })
+    {
+        return None;
+    }
+
+    let mut output = Vec::with_capacity(length);
+    let result = (|| {
+        for index in 0..length {
+            let entry = context.direct_array_entry_at(start, index);
+            let keep = if let Some(callback) = callback {
+                let mut callback_arguments = smallvec::SmallVec::<[i64; 2]>::new();
+                match mode {
+                    1 => callback_arguments.extend_from_slice(&[entry.value, entry.key]),
+                    2 => callback_arguments.push(entry.key),
+                    _ => callback_arguments.push(entry.value),
+                }
+                let result = invoke_native_array_callback_by_value(
+                    context,
+                    callback,
+                    &callback_arguments,
+                    source,
+                )?;
+                consume_native_callback_truthiness(context, result)?
+            } else {
+                context
+                    .native_encoded_truthy(entry.value)
+                    .expect("callback-free array_filter admission was preflighted")
+            };
+            if !keep {
+                continue;
+            }
+            let value = duplicate_native_callback_owner(context, entry.value)?;
+            let key = duplicate_native_callback_owner(context, entry.key);
+            push_native_callback_entry(context, &mut output, key, value)?;
+        }
+        Ok(())
+    })();
+    Some(finish_native_callback_entries(context, output, result))
+}
+
+/// Explicit cold compatibility for non-direct arrays and cold truthiness
+/// shapes. The ordinary callback loop above never constructs a `PhpArray`.
+fn execute_baseline_array_filter(
+    context: &mut NativeRequestColdState<'_>,
+    array: i64,
+    remaining: &[i64],
+    source: &php_ir::Instruction,
+) -> Result<i64, String> {
+    let array = match context.decode_baseline_value(array)? {
         Value::Reference(reference) => match reference.get() {
             Value::Array(array) => array,
             _ => return Err("array_filter(): argument #1 must be of type array".to_owned()),
@@ -1008,8 +1423,8 @@ fn execute_native_array_filter(
         Value::Array(array) => array,
         _ => return Err("array_filter(): argument #1 must be of type array".to_owned()),
     };
-    let callback = arguments
-        .get(1)
+    let callback = remaining
+        .first()
         .map(|callback| context.decode_baseline_value(*callback))
         .transpose()?
         .map(|callback| match callback {
@@ -1017,8 +1432,8 @@ fn execute_native_array_filter(
             callback => callback,
         })
         .filter(|callback| !matches!(callback, Value::Null));
-    let mode = arguments
-        .get(2)
+    let mode = remaining
+        .get(1)
         .map(|mode| context.decode_baseline_value(*mode))
         .transpose()?
         .map_or(0, |mode| match mode {
@@ -1034,11 +1449,12 @@ fn execute_native_array_filter(
                 2 => vec![key_value],
                 _ => vec![value.clone()],
             };
-            let encoded = invoke_native_array_callback_by_value(
+            let encoded = invoke_native_callable_value(
                 context,
                 callback.clone(),
                 &callback_arguments,
                 source,
+                None,
             )?;
             native_property_truthy(&context.decode_baseline_value(encoded)?)
         } else {
@@ -1077,6 +1493,55 @@ fn execute_native_array_reduce(
     if !(2..=3).contains(&arguments.len()) {
         return Err("array_reduce() expects 2 or 3 arguments".to_owned());
     }
+    if let Some(result) = try_execute_direct_native_array_reduce(context, arguments, source) {
+        return result;
+    }
+    execute_baseline_array_reduce(context, arguments, source)
+}
+
+fn try_execute_direct_native_array_reduce(
+    context: &mut NativeRequestColdState<'_>,
+    arguments: &[i64],
+    source: &php_ir::Instruction,
+) -> Option<Result<i64, String>> {
+    let (start, length) = context.direct_array_entry_range(arguments[0])?;
+    let mut carry = match arguments.get(2).copied() {
+        Some(initial) => match duplicate_native_callback_owner(context, initial) {
+            Ok(initial) => initial,
+            Err(error) => return Some(Err(error)),
+        },
+        None => php_jit::jit_encode_constant(u32::MAX),
+    };
+    for index in 0..length {
+        let value = context.direct_array_entry_at(start, index).value;
+        let next =
+            invoke_native_array_callback_by_value(context, arguments[1], &[carry, value], source);
+        match next {
+            Ok(next) => {
+                if let Err(error) = context.release_if_live(carry) {
+                    let _ = context.release_if_live(next);
+                    return Some(Err(error));
+                }
+                carry = next;
+            }
+            Err(error) => {
+                let release = context.release_if_live(carry);
+                return Some(match release {
+                    Ok(()) => Err(error),
+                    Err(release_error) => Err(release_error),
+                });
+            }
+        }
+    }
+    Some(Ok(carry))
+}
+
+/// Explicit cold compatibility for non-direct input arrays.
+fn execute_baseline_array_reduce(
+    context: &mut NativeRequestColdState<'_>,
+    arguments: &[i64],
+    source: &php_ir::Instruction,
+) -> Result<i64, String> {
     let array = native_array_argument(context, arguments[0], "array_reduce")?;
     let callback = match context.decode_baseline_value(arguments[1])? {
         Value::Reference(reference) => reference.get(),
@@ -1088,11 +1553,12 @@ fn execute_native_array_reduce(
         .transpose()?
         .unwrap_or(Value::Null);
     for (_, value) in array.iter() {
-        let encoded = invoke_native_array_callback_by_value(
+        let encoded = invoke_native_callable_value(
             context,
             callback.clone(),
             &[carry, value.clone()],
             source,
+            None,
         )?;
         carry = context.decode_baseline_value(encoded)?;
     }
@@ -1200,6 +1666,126 @@ fn walk_native_array_recursive(
     Ok(())
 }
 
+fn walk_direct_native_array_recursive(
+    context: &mut NativeRequestColdState<'_>,
+    array: i64,
+    callback: i64,
+    userdata: Option<i64>,
+    source: &php_ir::Instruction,
+    active: &mut std::collections::BTreeSet<i64>,
+) -> Result<(), String> {
+    if !active.insert(array) {
+        return Err("array_walk_recursive(): Recursion detected".to_owned());
+    }
+    let result = (|| {
+        let (start, length) = context
+            .direct_array_entry_range(array)
+            .ok_or_else(|| "array_walk_recursive() lost its native array".to_owned())?;
+        for index in 0..length {
+            let entry = context.direct_array_entry_at(start, index);
+            let key = context
+                .native_encoded_plain_array_key(entry.key)
+                .ok_or_else(|| "array_walk_recursive() found an invalid native key".to_owned())?;
+            if let Some(mut nested) = context.direct_array_encoding(entry.value) {
+                if context.direct_array_is_unique(nested) != Some(true) {
+                    let separated = context.clone_direct_array_handle(nested)?;
+                    let replaced = if context.php_handle_is_reference(entry.value) == Some(true) {
+                        context.replace_direct_reference_payload_owned(entry.value, separated)?
+                    } else {
+                        let inserted =
+                            context.direct_array_insert_encoded(array, Some(&key), separated);
+                        let release = context.release_if_live(separated);
+                        match (inserted, release) {
+                            (Err(error), _) | (Ok(()), Err(error)) => return Err(error),
+                            (Ok(()), Ok(())) => true,
+                        }
+                    };
+                    if !replaced {
+                        context.release_if_live(separated)?;
+                        return Err(
+                            "array_walk_recursive() could not separate a nested array".to_owned()
+                        );
+                    }
+                    nested =
+                        context
+                            .direct_array_encoding(
+                                context.direct_array_find_encoded(array, &key)?.ok_or_else(
+                                    || "array_walk_recursive() lost a separated child".to_owned(),
+                                )?,
+                            )
+                            .ok_or_else(|| {
+                                "array_walk_recursive() separated child is not an array".to_owned()
+                            })?;
+                }
+                walk_direct_native_array_recursive(
+                    context, nested, callback, userdata, source, active,
+                )?;
+                continue;
+            }
+
+            let reference = context
+                .bind_native_direct_array_element_reference(array, &key)?
+                .ok_or_else(|| {
+                    "array_walk_recursive() could not bind a native array element".to_owned()
+                })?;
+            let mut arguments = smallvec::SmallVec::<[i64; 3]>::new();
+            arguments.push(reference);
+            arguments.push(entry.key);
+            if let Some(userdata) = userdata {
+                arguments.push(userdata);
+            }
+            let invoked =
+                invoke_native_array_callback_by_value(context, callback, &arguments, source);
+            let release_reference = context.release_if_live(reference);
+            match (invoked, release_reference) {
+                (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
+                (Ok(result), Ok(())) => context.release_if_live(result)?,
+            }
+        }
+        Ok(())
+    })();
+    active.remove(&array);
+    result
+}
+
+fn try_execute_direct_native_array_walk_recursive(
+    context: &mut NativeRequestColdState<'_>,
+    arguments: &[i64],
+    source: &php_ir::Instruction,
+) -> Option<Result<i64, String>> {
+    let mut array = context.direct_reference_payload(arguments[0])?;
+    array = context.direct_array_encoding(array)?;
+    if context.direct_array_is_unique(array) != Some(true) {
+        let separated = match context.clone_direct_array_handle(array) {
+            Ok(separated) => separated,
+            Err(error) => return Some(Err(error)),
+        };
+        match context.replace_direct_reference_payload_owned(arguments[0], separated) {
+            Ok(true) => array = separated,
+            Ok(false) => {
+                let _ = context.release_if_live(separated);
+                return None;
+            }
+            Err(error) => {
+                let _ = context.release_if_live(separated);
+                return Some(Err(error));
+            }
+        }
+    }
+    let mut active = std::collections::BTreeSet::new();
+    Some(
+        walk_direct_native_array_recursive(
+            context,
+            array,
+            arguments[1],
+            arguments.get(2).copied(),
+            source,
+            &mut active,
+        )
+        .map(|()| php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE)),
+    )
+}
+
 fn execute_native_array_walk_recursive(
     context: &mut NativeRequestColdState<'_>,
     arguments: &[i64],
@@ -1207,6 +1793,10 @@ fn execute_native_array_walk_recursive(
 ) -> Result<i64, String> {
     if !(2..=3).contains(&arguments.len()) {
         return Err("array_walk_recursive() expects 2 or 3 arguments".to_owned());
+    }
+    if let Some(result) = try_execute_direct_native_array_walk_recursive(context, arguments, source)
+    {
+        return result;
     }
     let Value::Reference(root) = context.decode_baseline_value(arguments[0])? else {
         return Err(
@@ -1241,8 +1831,72 @@ fn execute_native_array_predicate(
     let [array, callback] = arguments else {
         return Err(format!("{name}() expects exactly 2 arguments"));
     };
-    let array = native_array_argument(context, *array, name)?;
-    let callback = match context.decode_baseline_value(*callback)? {
+    if let Some(result) =
+        try_execute_direct_native_array_predicate(context, name, *array, *callback, source)
+    {
+        return result;
+    }
+    execute_baseline_array_predicate(context, name, *array, *callback, source)
+}
+
+fn try_execute_direct_native_array_predicate(
+    context: &mut NativeRequestColdState<'_>,
+    name: &str,
+    array: i64,
+    callback: i64,
+    source: &php_ir::Instruction,
+) -> Option<Result<i64, String>> {
+    let (start, length) = context.direct_array_entry_range(array)?;
+    for index in 0..length {
+        let entry = context.direct_array_entry_at(start, index);
+        let result = match invoke_native_array_callback_by_value(
+            context,
+            callback,
+            &[entry.value, entry.key],
+            source,
+        ) {
+            Ok(result) => result,
+            Err(error) => return Some(Err(error)),
+        };
+        let truthy = match consume_native_callback_truthiness(context, result) {
+            Ok(truthy) => truthy,
+            Err(error) => return Some(Err(error)),
+        };
+        if truthy {
+            match name {
+                "array_any" => {
+                    return Some(Ok(php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE)));
+                }
+                "array_find" => {
+                    return Some(duplicate_native_callback_owner(context, entry.value));
+                }
+                "array_find_key" => {
+                    return Some(duplicate_native_callback_owner(context, entry.key));
+                }
+                "array_all" => continue,
+                _ => {}
+            }
+        } else if name == "array_all" {
+            return Some(Ok(php_jit::jit_encode_constant(php_jit::JIT_VALUE_FALSE)));
+        }
+    }
+    Some(Ok(php_jit::jit_encode_constant(match name {
+        "array_all" => php_jit::JIT_VALUE_TRUE,
+        "array_any" => php_jit::JIT_VALUE_FALSE,
+        _ => u32::MAX,
+    })))
+}
+
+/// Explicit cold compatibility for non-direct arrays.
+fn execute_baseline_array_predicate(
+    context: &mut NativeRequestColdState<'_>,
+    name: &str,
+    array: i64,
+    callback: i64,
+    source: &php_ir::Instruction,
+) -> Result<i64, String> {
+    let array = native_array_argument(context, array, name)?;
+    let callback = match context.decode_baseline_value(callback)? {
         Value::Reference(reference) => reference.get(),
         value => value,
     };
@@ -1553,6 +2207,39 @@ pub(super) fn native_builtin_class_lineage(
     lineage
 }
 
+fn native_builtin_is_subclass_of(
+    context: &NativeRequestColdState<'_>,
+    class_name: &str,
+    expected: &str,
+) -> bool {
+    let expected = normalize_class_name(expected);
+    let Some(class) = native_builtin_class(context, class_name) else {
+        return false;
+    };
+    let mut pending = class
+        .parent
+        .iter()
+        .chain(class.interfaces.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(candidate) = pending.pop() {
+        let normalized = normalize_class_name(&candidate);
+        if normalized == expected {
+            return true;
+        }
+        if !seen.insert(normalized.clone()) {
+            continue;
+        }
+        let Some(class) = native_builtin_class(context, &normalized) else {
+            continue;
+        };
+        pending.extend(class.parent.iter().cloned());
+        pending.extend(class.interfaces.iter().cloned());
+    }
+    false
+}
+
 fn native_builtin_caller_class(
     context: &NativeRequestColdState<'_>,
     caller_locals: Option<(u32, &[php_jit::JitAbiSlot])>,
@@ -1795,145 +2482,164 @@ fn native_ir_function_has_no_by_ref_parameters(function: &php_ir::IrFunction) ->
     Some(!function.params.iter().any(|parameter| parameter.by_ref))
 }
 
-fn native_ir_by_ref_parameter_at(function: &php_ir::IrFunction, index: usize) -> Option<String> {
-    function
-        .params
-        .get(index)
-        .or_else(|| {
+struct NativeCallableReferencePlan {
+    display_name: String,
+    by_ref_parameters: Vec<Option<String>>,
+    target: NativeCallablePlanTarget,
+}
+
+enum NativeCallablePlanTarget {
+    SameUnitFunction(php_ir::FunctionId),
+    ExternalFunction(NativeDynamicFunction),
+    Builtin(String),
+    BoundMethod {
+        target: php_runtime::api::CallableMethodTarget,
+        method: String,
+    },
+    PreparedClosure {
+        closure: php_runtime::api::ClosurePayload,
+        implicit_this: Option<i64>,
+        captures: smallvec::SmallVec<[i64; 8]>,
+    },
+}
+
+fn native_ir_reference_parameter_names(
+    function: &php_ir::IrFunction,
+    argument_count: usize,
+) -> Vec<Option<String>> {
+    (0..argument_count)
+        .map(|index| {
             function
                 .params
-                .last()
-                .filter(|parameter| parameter.variadic)
+                .get(index)
+                .or_else(|| {
+                    function
+                        .params
+                        .last()
+                        .filter(|parameter| parameter.variadic)
+                })
+                .filter(|parameter| parameter.by_ref)
+                .map(|parameter| parameter.name.clone())
         })
-        .filter(|parameter| parameter.by_ref)
-        .map(|parameter| parameter.name.clone())
+        .collect()
 }
 
-fn native_method_by_ref_parameter_at(
+fn native_method_reference_plan(
     context: &NativeRequestColdState<'_>,
-    class: &str,
+    target: php_runtime::api::CallableMethodTarget,
     method: &str,
-    index: usize,
-) -> Option<String> {
-    if let Some(function) = native_method_in_hierarchy(context, class, method) {
-        return context
-            .unit
-            .functions
-            .get(function.index())
-            .and_then(|function| native_ir_by_ref_parameter_at(function, index));
+    argument_count: usize,
+) -> Option<NativeCallableReferencePlan> {
+    let class = match &target {
+        php_runtime::api::CallableMethodTarget::Object(object) => object.class_name(),
+        php_runtime::api::CallableMethodTarget::Class(class) => class.clone(),
+    };
+    if let Some(function) = native_method_in_hierarchy(context, &class, method) {
+        let function = context.unit.functions.get(function.index())?;
+        return Some(NativeCallableReferencePlan {
+            display_name: function.name.clone(),
+            by_ref_parameters: native_ir_reference_parameter_names(function, argument_count),
+            target: NativeCallablePlanTarget::BoundMethod {
+                target,
+                method: method.to_owned(),
+            },
+        });
     }
-    if let Some((function, _)) = native_external_method(context, class, method) {
-        return context
-            .dynamic_units
-            .get(function.unit)
-            .and_then(|unit| {
-                unit.compiled
-                    .unit()
-                    .functions
-                    .get(function.function.index())
-            })
-            .and_then(|function| native_ir_by_ref_parameter_at(function, index));
+    if let Some((function, _)) = native_external_method(context, &class, method) {
+        let function = context.dynamic_units.get(function.unit).and_then(|unit| {
+            unit.compiled
+                .unit()
+                .functions
+                .get(function.function.index())
+        })?;
+        return Some(NativeCallableReferencePlan {
+            display_name: function.name.clone(),
+            by_ref_parameters: native_ir_reference_parameter_names(function, argument_count),
+            target: NativeCallablePlanTarget::BoundMethod {
+                target,
+                method: method.to_owned(),
+            },
+        });
     }
-    php_std::generated::arginfo::method_metadata_in_hierarchy(class, method).and_then(|method| {
-        method
-            .params
-            .get(index)
-            .or_else(|| method.params.last().filter(|parameter| parameter.variadic))
-            .filter(|parameter| parameter.by_ref)
-            .map(|parameter| parameter.name.to_owned())
+    php_std::generated::arginfo::method_metadata_in_hierarchy(&class, method).map(|metadata| {
+        NativeCallableReferencePlan {
+            display_name: format!("{}::{}", metadata.class_name, metadata.name),
+            by_ref_parameters: (0..argument_count)
+                .map(|index| {
+                    metadata
+                        .params
+                        .get(index)
+                        .or_else(|| {
+                            metadata
+                                .params
+                                .last()
+                                .filter(|parameter| parameter.variadic)
+                        })
+                        .filter(|parameter| parameter.by_ref)
+                        .map(|parameter| parameter.name.to_owned())
+                })
+                .collect(),
+            target: NativeCallablePlanTarget::BoundMethod {
+                target,
+                method: method.to_owned(),
+            },
+        }
     })
 }
 
-fn native_named_callable_by_ref_parameter_at(
+fn native_named_callable_reference_plan(
     context: &NativeRequestColdState<'_>,
     name: &str,
-    index: usize,
-) -> Option<String> {
+    argument_count: usize,
+) -> Option<NativeCallableReferencePlan> {
     if let Some((class, method)) = name.split_once("::") {
-        return native_method_by_ref_parameter_at(context, class, method, index);
+        return native_method_reference_plan(
+            context,
+            php_runtime::api::CallableMethodTarget::Class(class.to_owned()),
+            method,
+            argument_count,
+        );
     }
     if let Some(function) = context.function_id(name) {
-        return context
-            .unit
-            .functions
-            .get(function.index())
-            .and_then(|function| native_ir_by_ref_parameter_at(function, index));
+        let metadata = context.unit.functions.get(function.index())?;
+        return Some(NativeCallableReferencePlan {
+            display_name: metadata.name.clone(),
+            by_ref_parameters: native_ir_reference_parameter_names(metadata, argument_count),
+            target: NativeCallablePlanTarget::SameUnitFunction(function),
+        });
     }
     if let Some(function) = context.external_function(name) {
-        return context
-            .dynamic_units
-            .get(function.unit)
-            .and_then(|unit| {
-                unit.compiled
-                    .unit()
-                    .functions
-                    .get(function.function.index())
-            })
-            .and_then(|function| native_ir_by_ref_parameter_at(function, index));
+        let metadata = context.dynamic_units.get(function.unit).and_then(|unit| {
+            unit.compiled
+                .unit()
+                .functions
+                .get(function.function.index())
+        })?;
+        return Some(NativeCallableReferencePlan {
+            display_name: metadata.name.clone(),
+            by_ref_parameters: native_ir_reference_parameter_names(metadata, argument_count),
+            target: NativeCallablePlanTarget::ExternalFunction(function),
+        });
     }
-    php_std::arginfo::function_metadata_indexed(name).and_then(|function| {
-        function
-            .params
-            .get(index)
-            .or_else(|| {
+    php_std::arginfo::function_metadata_indexed(name).map(|function| NativeCallableReferencePlan {
+        display_name: function.name.to_owned(),
+        by_ref_parameters: (0..argument_count)
+            .map(|index| {
                 function
                     .params
-                    .last()
-                    .filter(|parameter| parameter.variadic)
+                    .get(index)
+                    .or_else(|| {
+                        function
+                            .params
+                            .last()
+                            .filter(|parameter| parameter.variadic)
+                    })
+                    .filter(|parameter| parameter.by_ref)
+                    .map(|parameter| parameter.name.to_owned())
             })
-            .filter(|parameter| parameter.by_ref)
-            .map(|parameter| parameter.name.to_owned())
+            .collect(),
+        target: NativeCallablePlanTarget::Builtin(name.to_owned()),
     })
-}
-
-fn native_method_callable_display_name(
-    context: &NativeRequestColdState<'_>,
-    class: &str,
-    method: &str,
-) -> String {
-    if let Some(function) = native_method_in_hierarchy(context, class, method)
-        && let Some(function) = context.unit.functions.get(function.index())
-    {
-        return function.name.clone();
-    }
-    if let Some((function, _)) = native_external_method(context, class, method)
-        && let Some(function) = context.dynamic_units.get(function.unit).and_then(|unit| {
-            unit.compiled
-                .unit()
-                .functions
-                .get(function.function.index())
-        })
-    {
-        return function.name.clone();
-    }
-
-    if let Some(method) = php_std::generated::arginfo::method_metadata_in_hierarchy(class, method) {
-        return format!("{}::{}", method.class_name, method.name);
-    }
-    format!("{class}::{method}")
-}
-
-fn native_named_callable_display_name(context: &NativeRequestColdState<'_>, name: &str) -> String {
-    if let Some((class, method)) = name.split_once("::") {
-        return native_method_callable_display_name(context, class, method);
-    }
-    if let Some(function) = context.function_id(name)
-        && let Some(function) = context.unit.functions.get(function.index())
-    {
-        return function.name.clone();
-    }
-    if let Some(function) = context.external_function(name)
-        && let Some(function) = context.dynamic_units.get(function.unit).and_then(|unit| {
-            unit.compiled
-                .unit()
-                .functions
-                .get(function.function.index())
-        })
-    {
-        return function.name.clone();
-    }
-    php_std::arginfo::function_metadata_indexed(name)
-        .map_or_else(|| name.to_owned(), |function| function.name.to_owned())
 }
 
 fn native_named_callable_has_no_by_ref_parameters(
@@ -1994,31 +2700,23 @@ fn native_method_has_no_by_ref_parameters(
         .map(|method| !method.params.iter().any(|parameter| parameter.by_ref))
 }
 
-fn native_encoded_callable_by_ref_parameter_at(
+fn native_encoded_callable_reference_plan(
     context: &NativeRequestColdState<'_>,
     encoded: i64,
-    index: usize,
-) -> Option<(String, String)> {
+    argument_count: usize,
+) -> Option<NativeCallableReferencePlan> {
     let encoded = context.dereference_direct_encoding(encoded);
     match context.native_encoded_value_kind(encoded)? {
         NativeEncodedValueKind::String => {
             let name = context.native_string_name_bytes(encoded)?;
             let name = String::from_utf8_lossy(&name).into_owned();
-            native_named_callable_by_ref_parameter_at(context, &name, index).map(|parameter| {
-                (
-                    native_named_callable_display_name(context, &name),
-                    parameter,
-                )
-            })
+            native_named_callable_reference_plan(context, &name, argument_count)
         }
         NativeEncodedValueKind::Object => {
-            let class = context.native_query_object(encoded)?.class_name();
-            native_method_by_ref_parameter_at(context, &class, "__invoke", index).map(|parameter| {
-                (
-                    native_method_callable_display_name(context, &class, "__invoke"),
-                    parameter,
-                )
-            })
+            let target = php_runtime::api::CallableMethodTarget::Object(
+                context.native_query_object(encoded)?,
+            );
+            native_method_reference_plan(context, target, "__invoke", argument_count)
         }
         NativeEncodedValueKind::Array => {
             if let Some(entries) = context.direct_array_entries_for(encoded) {
@@ -2038,27 +2736,24 @@ fn native_encoded_callable_by_ref_parameter_at(
                 let method = context.dereference_direct_encoding(method?);
                 let method = context.native_string_name_bytes(method)?;
                 let method = String::from_utf8_lossy(&method);
-                let class = if let Some(object) = context.native_query_object(target) {
-                    object.class_name()
+                let target = if let Some(object) = context.native_query_object(target) {
+                    php_runtime::api::CallableMethodTarget::Object(object)
                 } else {
                     let class = context.native_string_name_bytes(target)?;
-                    String::from_utf8_lossy(&class).into_owned()
+                    php_runtime::api::CallableMethodTarget::Class(
+                        String::from_utf8_lossy(&class).into_owned(),
+                    )
                 };
-                return native_method_by_ref_parameter_at(context, &class, &method, index).map(
-                    |parameter| {
-                        (
-                            native_method_callable_display_name(context, &class, &method),
-                            parameter,
-                        )
-                    },
-                );
+                return native_method_reference_plan(context, target, &method, argument_count);
             }
             None
         }
         NativeEncodedValueKind::Callable => {
-            if let Some(closure) = context.prepared_closure_payload(encoded) {
+            if let Some((closure, implicit_this, captures)) =
+                context.prepared_closure_invocation(encoded)
+            {
                 let function = php_ir::FunctionId::new(closure.function);
-                let function = closure
+                let function_metadata = closure
                     .context
                     .owner_unit
                     .and_then(|unit| context.dynamic_units.get(unit))
@@ -2066,36 +2761,30 @@ fn native_encoded_callable_by_ref_parameter_at(
                     .unwrap_or(&context.unit)
                     .functions
                     .get(function.index())?;
-                return native_ir_by_ref_parameter_at(function, index)
-                    .map(|parameter| ("{closure}".to_owned(), parameter));
+                let display_name = closure
+                    .debug
+                    .as_ref()
+                    .map_or_else(|| "{closure}".to_owned(), |debug| debug.name.clone());
+                return Some(NativeCallableReferencePlan {
+                    display_name,
+                    by_ref_parameters: native_ir_reference_parameter_names(
+                        function_metadata,
+                        argument_count,
+                    ),
+                    target: NativeCallablePlanTarget::PreparedClosure {
+                        closure,
+                        implicit_this,
+                        captures,
+                    },
+                });
             }
             if let Some(callable) = context.prepared_callable_dispatch(encoded) {
                 return match callable {
                     NativePreparedCallableDispatch::Named(name) => {
-                        native_named_callable_by_ref_parameter_at(context, &name, index).map(
-                            |parameter| {
-                                (
-                                    native_named_callable_display_name(context, &name),
-                                    parameter,
-                                )
-                            },
-                        )
+                        native_named_callable_reference_plan(context, &name, argument_count)
                     }
                     NativePreparedCallableDispatch::BoundMethod { target, method } => {
-                        let class = match target {
-                            php_runtime::api::CallableMethodTarget::Object(object) => {
-                                object.class_name()
-                            }
-                            php_runtime::api::CallableMethodTarget::Class(class) => class,
-                        };
-                        native_method_by_ref_parameter_at(context, &class, &method, index).map(
-                            |parameter| {
-                                (
-                                    native_method_callable_display_name(context, &class, &method),
-                                    parameter,
-                                )
-                            },
-                        )
+                        native_method_reference_plan(context, target, &method, argument_count)
                     }
                     NativePreparedCallableDispatch::Closure
                     | NativePreparedCallableDispatch::Invalid(_) => None,
@@ -2105,6 +2794,69 @@ fn native_encoded_callable_by_ref_parameter_at(
         }
         NativeEncodedValueKind::Reference => None,
         _ => None,
+    }
+}
+
+fn invoke_native_callable_reference_plan(
+    context: &mut NativeRequestColdState<'_>,
+    plan: &NativeCallableReferencePlan,
+    arguments: &[i64],
+    source: &php_ir::Instruction,
+    metadata: Option<&[php_ir::instruction::IrCallArg]>,
+    caller_function: Option<u32>,
+) -> NativeCallResult {
+    let strict = context.unit.strict_types_for_span(source.span);
+    match &plan.target {
+        NativeCallablePlanTarget::SameUnitFunction(function) => {
+            if native_function_is_generator(context, *function) {
+                create_baseline_bound_generator_with_metadata_strict(
+                    context, *function, arguments, metadata, strict,
+                )
+            } else {
+                invoke_baseline_bound_function_with_metadata_strict(
+                    context, *function, arguments, metadata, strict, false,
+                )
+            }
+        }
+        NativeCallablePlanTarget::ExternalFunction(function) => {
+            if external_function_is_generator(context, *function) {
+                create_native_external_generator_with_metadata(
+                    context, *function, arguments, metadata, None, strict,
+                )
+            } else {
+                invoke_native_external_function_with_metadata(
+                    context, *function, arguments, metadata, None, strict,
+                )
+            }
+        }
+        NativeCallablePlanTarget::Builtin(name) => {
+            let expanded = bind_native_builtin_arguments(context, name, arguments, metadata)?;
+            execute_baseline_native_builtin_control(context, name, &expanded, source, None, None)
+        }
+        NativeCallablePlanTarget::BoundMethod { target, method } => {
+            invoke_baseline_native_bound_method(
+                context,
+                target,
+                method,
+                arguments,
+                metadata,
+                strict,
+                caller_function,
+            )
+        }
+        NativeCallablePlanTarget::PreparedClosure {
+            closure,
+            implicit_this,
+            captures,
+        } => invoke_native_closure_payload(
+            context,
+            closure,
+            *implicit_this,
+            Some(captures),
+            arguments,
+            source,
+            metadata,
+        ),
     }
 }
 
@@ -2185,26 +2937,83 @@ pub(super) fn execute_native_call_user_func_encoded(
         return Err("call_user_func() expects a callback".into());
     };
     let callback = *callback;
+    let Some(reference_plan) =
+        native_encoded_callable_reference_plan(context, callback, call_arguments.len())
+    else {
+        let direct_callback = context.dereference_direct_encoding(callback);
+        if context.native_encoded_value_kind(direct_callback)
+            == Some(NativeEncodedValueKind::String)
+            && let Some(name) = context.native_string_name_bytes(direct_callback)
+        {
+            let name = String::from_utf8_lossy(&name);
+            let detail = if let Some((class, _)) = name.split_once("::") {
+                format!("class \"{class}\" not found")
+            } else {
+                format!("function \"{name}\" not found or invalid function name")
+            };
+            return Err(NativeCallControl::throw(
+                "TypeError",
+                format!(
+                    "call_user_func(): Argument #1 ($callback) must be a valid callback, {detail}"
+                ),
+            ));
+        }
+        // The dynamic callable dispatcher already consumes this exact native
+        // vector. Do not mirror it into request scratch merely to pass the
+        // same encodings onward unchanged.
+        return invoke_native_encoded_callable_value_from(
+            context,
+            arguments,
+            source,
+            None,
+            caller_function,
+        );
+    };
+    let needs_temporary_references =
+        call_arguments
+            .iter()
+            .copied()
+            .enumerate()
+            .any(|(index, value)| {
+                reference_plan
+                    .by_ref_parameters
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .is_some()
+                    && context.php_handle_is_reference(value) != Some(true)
+            });
+    if !needs_temporary_references {
+        return invoke_native_callable_reference_plan(
+            context,
+            &reference_plan,
+            call_arguments,
+            source,
+            None,
+            caller_function,
+        );
+    }
+
     let mut encoded = std::mem::take(&mut context.native_call_encoded_scratch);
     encoded.clear();
-    encoded.reserve(arguments.len());
-    encoded.extend_from_slice(arguments);
+    encoded.reserve(call_arguments.len());
+    encoded.extend_from_slice(call_arguments);
     let mut temporary_references = Vec::new();
     let result = (|| -> NativeCallResult {
         for (index, value) in call_arguments.iter().copied().enumerate() {
-            let Some((callable_name, parameter_name)) =
-                native_encoded_callable_by_ref_parameter_at(context, callback, index)
+            let Some(parameter_name) = reference_plan
+                .by_ref_parameters
+                .get(index)
+                .and_then(Option::as_ref)
+                .filter(|_| context.php_handle_is_reference(value) != Some(true))
             else {
                 continue;
             };
-            if context.php_handle_is_reference(value) == Some(true) {
-                continue;
-            }
             emit_native_php_warning(
                 context,
                 php_runtime::api::PHP_E_WARNING,
                 &format!(
-                    "{callable_name}(): Argument #{} (${}) must be passed by reference, value given",
+                    "{}(): Argument #{} (${}) must be passed by reference, value given",
+                    reference_plan.display_name,
                     index + 1,
                     parameter_name,
                 ),
@@ -2218,10 +3027,17 @@ pub(super) fn execute_native_call_user_func_encoded(
                     return Err(error.into());
                 }
             };
-            encoded[index + 1] = reference;
+            encoded[index] = reference;
             temporary_references.push(reference);
         }
-        invoke_native_encoded_callable_value_from(context, &encoded, source, None, caller_function)
+        invoke_native_callable_reference_plan(
+            context,
+            &reference_plan,
+            &encoded,
+            source,
+            None,
+            caller_function,
+        )
     })();
     let mut release_error = None;
     for reference in temporary_references {
@@ -2245,18 +3061,25 @@ pub(super) fn execute_native_call_user_func_array_direct(
     source: &php_ir::Instruction,
     caller_function: Option<u32>,
 ) -> Option<NativeCallResult> {
-    let entries = context.direct_array_entries_for(arguments)?.to_vec();
+    let (entry_start, entry_count) = context.direct_array_entry_range(arguments)?;
+    let reference_plan = native_encoded_callable_reference_plan(context, callback, entry_count);
     let mut encoded = std::mem::take(&mut context.native_call_encoded_scratch);
     encoded.clear();
-    encoded.reserve(entries.len() + 1);
+    encoded.reserve(entry_count + 1);
     encoded.push(callback);
     let mut temporary_references = Vec::new();
     let result = (|| -> NativeCallResult {
         let mut metadata: Option<Vec<php_ir::instruction::IrCallArg>> = None;
-        for (index, entry) in entries.into_iter().enumerate() {
+        for index in 0..entry_count {
+            let entry = context.direct_array_entry_at(entry_start, index);
             let mut encoded_value = entry.value;
             if let Some((callable_name, parameter_name)) =
-                native_encoded_callable_by_ref_parameter_at(context, callback, index)
+                reference_plan.as_ref().and_then(|plan| {
+                    plan.by_ref_parameters
+                        .get(index)
+                        .and_then(Option::as_ref)
+                        .map(|parameter| (&plan.display_name, parameter))
+                })
                 && context.php_handle_is_reference(encoded_value) != Some(true)
             {
                 emit_native_php_warning(
@@ -2313,13 +3136,24 @@ pub(super) fn execute_native_call_user_func_array_direct(
                 metadata.push(argument);
             }
         }
-        invoke_native_encoded_callable_value_from(
-            context,
-            &encoded,
-            source,
-            metadata,
-            caller_function,
-        )
+        if let Some(plan) = reference_plan.as_ref() {
+            invoke_native_callable_reference_plan(
+                context,
+                plan,
+                &encoded[1..],
+                source,
+                metadata.as_deref(),
+                caller_function,
+            )
+        } else {
+            invoke_native_encoded_callable_value_from(
+                context,
+                &encoded,
+                source,
+                metadata,
+                caller_function,
+            )
+        }
     })();
     let mut release_error = None;
     for reference in temporary_references {
@@ -2565,17 +3399,7 @@ pub(super) fn execute_baseline_prepared_runtime_builtin(
         context.materialize_native_session_state()?;
     }
     let (result, diagnostics) = if lightweight_handler {
-        let mut builtin = php_runtime::api::BuiltinContext::with_borrowed_runtime_request_state(
-            &mut context.output,
-            &mut context.cwd,
-            Arc::clone(&context.include_path),
-            context.options.runtime_context.filesystem.clone(),
-            Some(&mut context.resources),
-            &mut context.builtin_request_state,
-            &mut context.ini_registry,
-            &mut context.default_timezone,
-            Arc::clone(&context.environment),
-        );
+        let mut builtin = borrow_native_builtin_context!(context);
         builtin.set_diagnostic_display(php_runtime::api::PhpDiagnosticDisplayOptions {
             display_errors: false,
             error_reporting: context.error_reporting,
@@ -2585,17 +3409,7 @@ pub(super) fn execute_baseline_prepared_runtime_builtin(
         let diagnostics = builtin.take_diagnostics();
         (result, diagnostics)
     } else {
-        let mut builtin = php_runtime::api::BuiltinContext::with_borrowed_runtime_request_state(
-            &mut context.output,
-            &mut context.cwd,
-            Arc::clone(&context.include_path),
-            context.options.runtime_context.filesystem.clone(),
-            Some(&mut context.resources),
-            &mut context.builtin_request_state,
-            &mut context.ini_registry,
-            &mut context.default_timezone,
-            Arc::clone(&context.environment),
-        );
+        let mut builtin = borrow_native_builtin_context!(context);
         builtin.set_diagnostic_display(php_runtime::api::PhpDiagnosticDisplayOptions {
             display_errors: false,
             error_reporting: context.error_reporting,
@@ -3114,10 +3928,9 @@ pub(super) fn execute_baseline_native_builtin(
             context.encode_baseline_value(Value::Bool(true))
         }
         "ob_get_clean" => {
-            let bytes = context
-                .output
-                .pop_buffer_clean()
-                .ok_or_else(|| "ob_get_clean(): Failed to delete buffer".to_owned())?;
+            let Some(bytes) = context.output.pop_buffer_clean() else {
+                return context.encode_baseline_value(Value::Bool(false));
+            };
             context.encode_native_string_owner(PhpString::from_bytes(bytes))
         }
         "ob_get_contents" => {
@@ -3137,13 +3950,45 @@ pub(super) fn execute_baseline_native_builtin(
                 .current_buffer_len()
                 .map_or(Value::Bool(false), |length| Value::Int(length as i64)),
         ),
+        "ob_get_flush" => {
+            let Some(bytes) = context.output.current_buffer_bytes().map(<[u8]>::to_vec) else {
+                emit_native_php_diagnostic(
+                    context,
+                    php_runtime::api::PHP_E_NOTICE,
+                    "ob_get_flush(): Failed to delete and flush buffer. No buffer to delete or flush",
+                    source,
+                    true,
+                )?;
+                return context.encode_baseline_value(Value::Bool(false));
+            };
+            debug_assert!(context.output.pop_buffer_flush().is_some());
+            context.encode_native_string_owner(PhpString::from_bytes(bytes))
+        }
         "ob_end_flush" => {
-            let value = context.output.pop_buffer_flush().is_some();
-            context.encode_baseline_value(Value::Bool(value))
+            if context.output.pop_buffer_flush().is_none() {
+                emit_native_php_diagnostic(
+                    context,
+                    php_runtime::api::PHP_E_NOTICE,
+                    "ob_end_flush(): Failed to delete and flush buffer. No buffer to delete or flush",
+                    source,
+                    true,
+                )?;
+                return context.encode_baseline_value(Value::Bool(false));
+            }
+            context.encode_baseline_value(Value::Bool(true))
         }
         "ob_end_clean" => {
-            let value = context.output.pop_buffer_clean().is_some();
-            context.encode_baseline_value(Value::Bool(value))
+            if context.output.pop_buffer_clean().is_none() {
+                emit_native_php_diagnostic(
+                    context,
+                    php_runtime::api::PHP_E_NOTICE,
+                    "ob_end_clean(): Failed to delete buffer. No buffer to delete",
+                    source,
+                    true,
+                )?;
+                return context.encode_baseline_value(Value::Bool(false));
+            }
+            context.encode_baseline_value(Value::Bool(true))
         }
         "array_map" => execute_native_array_map(context, arguments, source),
         "array_filter" => execute_native_array_filter(context, arguments, source),
@@ -3202,9 +4047,21 @@ pub(super) fn execute_baseline_native_builtin(
             let mut result = php_runtime::api::PhpArray::new();
             for name in names {
                 let Some(index) = locals.iter().position(|local| local == &name) else {
+                    emit_native_php_warning(
+                        context,
+                        2,
+                        &format!("compact(): Undefined variable ${name}"),
+                        source,
+                    )?;
                     continue;
                 };
                 let Some(slot) = slots.get(index) else {
+                    emit_native_php_warning(
+                        context,
+                        2,
+                        &format!("compact(): Undefined variable ${name}"),
+                        source,
+                    )?;
                     continue;
                 };
                 // PHP's compact() copies the current value into the result. It
@@ -3214,6 +4071,15 @@ pub(super) fn execute_baseline_native_builtin(
                     Value::Reference(reference) => reference.get(),
                     value => value,
                 };
+                if matches!(value, Value::Uninitialized) {
+                    emit_native_php_warning(
+                        context,
+                        2,
+                        &format!("compact(): Undefined variable ${name}"),
+                        source,
+                    )?;
+                    continue;
+                }
                 result.insert(
                     php_runtime::api::ArrayKey::String(PhpString::from_bytes(
                         name.as_bytes().to_vec(),
@@ -3579,16 +4445,11 @@ pub(super) fn execute_baseline_native_builtin(
             let parent =
                 String::from_utf8_lossy(&native_string(context.decode_baseline_value(*parent)?)?)
                     .to_ascii_lowercase();
-            let mut current =
-                native_builtin_class(context, &class_name).and_then(|class| class.parent.clone());
-            while let Some(candidate) = current {
-                if normalize_class_name(&candidate) == parent {
-                    return context.encode_baseline_value(Value::Bool(true));
-                }
-                current = native_builtin_class(context, &candidate)
-                    .and_then(|class| class.parent.clone());
-            }
-            context.encode_baseline_value(Value::Bool(false))
+            context.encode_baseline_value(Value::Bool(native_builtin_is_subclass_of(
+                context,
+                &class_name,
+                &parent,
+            )))
         }
         "sys_get_temp_dir" => context.encode_native_string_owner(PhpString::from_bytes(
             std::env::temp_dir().to_string_lossy().as_bytes().to_vec(),
@@ -3950,15 +4811,6 @@ pub(super) fn execute_baseline_native_builtin(
                 return context.encode_baseline_value(Value::Bool(resource.close()));
             }
             Err("fclose() expects a stream resource".to_owned())
-        }
-        "file_get_contents" => {
-            let [path, ..] = arguments else {
-                return Err("file_get_contents() expects a path".to_owned());
-            };
-            let path = native_string(context.decode_baseline_value(*path)?)?;
-            let bytes = std::fs::read(String::from_utf8_lossy(&path).as_ref())
-                .map_err(|error| error.to_string())?;
-            context.encode_native_string_owner(PhpString::from_bytes(bytes))
         }
         "file_put_contents" => {
             use std::io::Write as _;
@@ -4523,7 +5375,8 @@ pub(super) fn execute_baseline_native_builtin(
                 .transpose()?
                 .is_some_and(|value| native_property_truthy(&value));
             let mut core = php_runtime::api::PhpArray::new();
-            for constant in php_std::ExtensionRegistry::standard_library().enabled_constants() {
+            let standard = php_std::ExtensionRegistry::standard_library().enabled_constants();
+            for constant in &standard {
                 if let Some(value) = constant.value() {
                     core.insert(
                         php_runtime::api::ArrayKey::String(PhpString::from_bytes(
@@ -4541,15 +5394,52 @@ pub(super) fn execute_baseline_native_builtin(
                 );
             }
             if categorized {
+                let mut groups = vec![("Core".to_owned(), php_runtime::api::PhpArray::new())];
+                for constant in standard {
+                    let Some(value) = constant.value() else {
+                        continue;
+                    };
+                    let category = php_constant_category(constant.extension());
+                    let index = groups
+                        .iter()
+                        .position(|(candidate, _)| candidate == category)
+                        .unwrap_or_else(|| {
+                            groups.push((category.to_owned(), php_runtime::api::PhpArray::new()));
+                            groups.len() - 1
+                        });
+                    groups[index].1.insert(
+                        php_runtime::api::ArrayKey::String(PhpString::from_bytes(
+                            constant.name().as_bytes().to_vec(),
+                        )),
+                        php_std::constants::constant_to_value(value),
+                    );
+                }
+                let mut defined = php_runtime::api::PhpArray::new();
+                for (key, value) in user.iter() {
+                    let php_runtime::api::ArrayKey::String(name) = &key else {
+                        continue;
+                    };
+                    if php_core_runtime_constant(&String::from_utf8_lossy(name.as_bytes())) {
+                        groups[0].1.insert(key, value.clone());
+                    } else {
+                        defined.insert(key, value.clone());
+                    }
+                }
+                if !defined.is_empty() {
+                    groups.push(("user".to_owned(), defined));
+                }
                 let mut result = php_runtime::api::PhpArray::new();
-                result.insert(
-                    php_runtime::api::ArrayKey::String(PhpString::from_bytes(b"Core".to_vec())),
-                    Value::Array(core),
-                );
-                result.insert(
-                    php_runtime::api::ArrayKey::String(PhpString::from_bytes(b"user".to_vec())),
-                    Value::Array(user),
-                );
+                for (category, values) in groups {
+                    if values.is_empty() {
+                        continue;
+                    }
+                    result.insert(
+                        php_runtime::api::ArrayKey::String(PhpString::from_bytes(
+                            category.into_bytes(),
+                        )),
+                        Value::Array(values),
+                    );
+                }
                 context.encode_native_array_owner(result)
             } else {
                 for (key, value) in user.iter() {
@@ -4571,11 +5461,23 @@ pub(super) fn execute_baseline_native_builtin(
             context.encode_baseline_value(Value::Bool(loaded))
         }
         "get_loaded_extensions" => {
-            let names = php_std::ExtensionRegistry::standard_library()
-                .enabled_extension_names()
-                .into_iter()
-                .map(|name| Value::String(PhpString::from_bytes(name.as_bytes().to_vec())))
-                .collect::<Vec<_>>();
+            if arguments.len() > 1 {
+                return Err("get_loaded_extensions() expects at most 1 argument".to_owned());
+            }
+            let zend_only = arguments
+                .first()
+                .map(|value| context.decode_baseline_value(*value))
+                .transpose()?
+                .is_some_and(|value| native_property_truthy(&value));
+            let names = if zend_only {
+                Vec::new()
+            } else {
+                php_std::ExtensionRegistry::standard_library()
+                    .enabled_extension_names()
+                    .into_iter()
+                    .map(|name| Value::String(PhpString::from_bytes(name.as_bytes().to_vec())))
+                    .collect::<Vec<_>>()
+            };
             context.encode_native_array_owner(php_runtime::api::PhpArray::from_packed(names))
         }
         "error_log" => {
@@ -4770,24 +5672,76 @@ pub(super) fn execute_baseline_native_builtin(
             let [target, type_name] = arguments else {
                 return Err("settype() expects exactly 2 arguments".to_owned());
             };
-            let Value::Reference(target) = context.decode_baseline_value(*target)? else {
+            if context.php_handle_is_reference(*target) != Some(true) {
                 return Err("settype(): Argument #1 ($var) must be passed by reference".to_owned());
+            }
+            let direct_target = context.direct_reference_payload(*target).is_some();
+            let materialized_target = if direct_target {
+                None
+            } else {
+                let Value::Reference(reference) = context.decode_baseline_value(*target)? else {
+                    return Err(
+                        "settype(): Argument #1 ($var) must be passed by reference".to_owned()
+                    );
+                };
+                Some(reference)
             };
             let type_name = String::from_utf8_lossy(&native_string(
                 context.decode_baseline_value(*type_name)?,
             )?)
             .to_ascii_lowercase();
-            let current = target.get();
+            let current = if direct_target {
+                context.decode_dereferenced_native_value(*target)?
+            } else {
+                materialized_target
+                    .as_ref()
+                    .expect("materialized settype target was prepared")
+                    .get()
+            };
             let replacement = match type_name.as_str() {
-                "null" => Value::Null,
-                "bool" | "boolean" => Value::Bool(native_property_truthy(&current)),
+                "null" => {
+                    if matches!(&current, Value::Float(value) if value.to_f64().is_nan()) {
+                        emit_native_php_warning(
+                            context,
+                            2,
+                            "unexpected NAN value was coerced to null",
+                            source,
+                        )?;
+                    }
+                    Value::Null
+                }
+                "bool" | "boolean" => {
+                    if matches!(&current, Value::Float(value) if value.to_f64().is_nan()) {
+                        emit_native_php_warning(
+                            context,
+                            2,
+                            "unexpected NAN value was coerced to bool",
+                            source,
+                        )?;
+                    }
+                    Value::Bool(native_property_truthy(&current))
+                }
                 "int" | "integer" => match current {
                     Value::String(value) => {
                         let classified =
                             php_runtime::experimental::numeric_string::classify_php_string(&value);
                         Value::Int(classified.value.map_or(0, |value| value.to_i64()))
                     }
-                    Value::Float(value) => Value::Int(value.to_f64() as i64),
+                    Value::Float(value) => {
+                        let value = value.to_f64();
+                        if !php_runtime::api::float_fits_int(value) {
+                            emit_native_php_warning(
+                                context,
+                                2,
+                                &format!(
+                                    "The float {} is not representable as an int, cast occurred",
+                                    native_php_float_label(value)
+                                ),
+                                source,
+                            )?;
+                        }
+                        Value::Int(php_runtime::api::php_float_to_int(value))
+                    }
                     Value::Bool(value) => Value::Int(i64::from(value)),
                     Value::Null | Value::Uninitialized => Value::Int(0),
                     Value::Int(value) => Value::Int(value),
@@ -4815,6 +5769,15 @@ pub(super) fn execute_baseline_native_builtin(
                     _ => Value::Float(php_runtime::api::FloatValue::from_f64(0.0)),
                 },
                 "string" => match current {
+                    Value::Float(value) if value.to_f64().is_nan() => {
+                        emit_native_php_warning(
+                            context,
+                            2,
+                            "unexpected NAN value was coerced to string",
+                            source,
+                        )?;
+                        Value::String(PhpString::from_bytes(b"NAN".to_vec()))
+                    }
                     Value::Array(_) => {
                         emit_native_php_warning(context, 2, "Array to string conversion", source)?;
                         Value::String(PhpString::from_bytes(b"Array".to_vec()))
@@ -4822,6 +5785,23 @@ pub(super) fn execute_baseline_native_builtin(
                     value => Value::String(PhpString::from_bytes(native_string(value)?)),
                 },
                 "array" => match current {
+                    Value::Float(value) if value.to_f64().is_nan() => {
+                        emit_native_php_warning(
+                            context,
+                            2,
+                            "unexpected NAN value was coerced to array",
+                            source,
+                        )?;
+                        let value = if direct_target {
+                            context.decode_dereferenced_native_value(*target)?
+                        } else {
+                            materialized_target
+                                .as_ref()
+                                .expect("materialized settype target was prepared")
+                                .get()
+                        };
+                        Value::Array(php_runtime::api::PhpArray::from_packed(vec![value]))
+                    }
                     Value::Array(array) => Value::Array(array),
                     Value::Null | Value::Uninitialized => {
                         Value::Array(php_runtime::api::PhpArray::new())
@@ -4829,6 +5809,25 @@ pub(super) fn execute_baseline_native_builtin(
                     value => Value::Array(php_runtime::api::PhpArray::from_packed(vec![value])),
                 },
                 "object" => match current {
+                    Value::Float(value) if value.to_f64().is_nan() => {
+                        emit_native_php_warning(
+                            context,
+                            2,
+                            "unexpected NAN value was coerced to object",
+                            source,
+                        )?;
+                        let object = native_metadata_object("stdClass", std::iter::empty());
+                        let value = if direct_target {
+                            context.decode_dereferenced_native_value(*target)?
+                        } else {
+                            materialized_target
+                                .as_ref()
+                                .expect("materialized settype target was prepared")
+                                .get()
+                        };
+                        object.set_property("scalar", value);
+                        Value::Object(object)
+                    }
                     Value::Object(object) => Value::Object(object),
                     Value::Array(array) => {
                         let object = native_metadata_object("stdClass", std::iter::empty());
@@ -4860,7 +5859,21 @@ pub(super) fn execute_baseline_native_builtin(
                     );
                 }
             };
-            context.set_native_reference_value(&target, replacement)?;
+            if direct_target {
+                let replacement = context.encode_baseline_call_value(replacement)?;
+                let stored = context.store_plain_native_reference_payload(*target, replacement)?;
+                context.release(replacement)?;
+                if !stored {
+                    return Err("settype() direct reference target became unavailable".to_owned());
+                }
+            } else {
+                context.set_native_reference_value(
+                    materialized_target
+                        .as_ref()
+                        .expect("materialized settype target was prepared"),
+                    replacement,
+                )?;
+            }
             context.encode_baseline_value(Value::Bool(true))
         }
         "set_time_limit" => {
@@ -4936,18 +5949,7 @@ pub(super) fn execute_baseline_native_builtin(
                 end: source.span.end,
             };
             let (result, diagnostics) = {
-                let mut builtin =
-                    php_runtime::api::BuiltinContext::with_borrowed_runtime_request_state(
-                        &mut context.output,
-                        &mut context.cwd,
-                        Arc::clone(&context.include_path),
-                        context.options.runtime_context.filesystem.clone(),
-                        Some(&mut context.resources),
-                        &mut context.builtin_request_state,
-                        &mut context.ini_registry,
-                        &mut context.default_timezone,
-                        Arc::clone(&context.environment),
-                    );
+                let mut builtin = borrow_native_builtin_context!(context);
                 builtin.set_diagnostic_display(php_runtime::api::PhpDiagnosticDisplayOptions {
                     // Diagnostics are synchronously routed below so native
                     // set_error_handler callbacks see builtin warnings/notices.

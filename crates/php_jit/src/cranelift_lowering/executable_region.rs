@@ -531,6 +531,32 @@ struct OptimizingCallScalarHelperNeeds {
     string_cast: bool,
 }
 
+fn direct_fixed_builtin_operand(call: &RegionNativeCall, index: usize) -> Option<RegionOperand> {
+    call.args
+        .get(index)
+        .filter(|argument| argument.name.is_none() && !argument.unpack)
+        .and_then(|_| {
+            call.operands
+                .get(call.argument_operand_offset.saturating_add(index))
+                .copied()
+                .flatten()
+        })
+}
+
+fn optimizing_strval_uses_float_handler(
+    call: &RegionNativeCall,
+    value_flow: &ExecutableValueFlow,
+    constants: &[IrConstant],
+) -> bool {
+    stable_builtin_scalar_consumer(&call.target) == Some(StableScalarConsumerBuiltin::StrVal)
+        && call.args.len() == 1
+        && direct_fixed_builtin_operand(call, 0).is_some_and(|operand| {
+            let fact = lowering_operand_fact(value_flow, constants, operand);
+            fact.certainty != crate::region_ir::SsaCertainty::Unknown
+                && fact.class == SsaValueClass::Float
+        })
+}
+
 fn optimizing_call_scalar_helper_needs(
     call: &RegionNativeCall,
     unit: &IrUnit,
@@ -720,45 +746,71 @@ pub(super) fn instruction_has_native_transition(
     )
 }
 
-fn optimizing_instruction_family_is_direct(kind: &RegionInstructionKind) -> bool {
-    match kind {
+fn optimizing_instruction_family_is_direct(instruction: &RegionInstruction) -> bool {
+    match &instruction.kind {
         RegionInstructionKind::AssignDim { keys, .. }
         | RegionInstructionKind::UnsetDim { keys, .. } => !keys.is_empty(),
         RegionInstructionKind::AppendDim { .. } => true,
         RegionInstructionKind::ArrayInsert {
             key, by_ref_local, ..
         } => key.is_none() && by_ref_local.is_none(),
+        RegionInstructionKind::BindReferenceIntoDim { append, keys, .. } => {
+            instruction.native_global_name.is_none() && (*append || !keys.is_empty())
+        }
+        RegionInstructionKind::BindReferenceDim { keys, .. }
+        | RegionInstructionKind::BindReferenceFromPropertyDim { keys, .. } => !keys.is_empty(),
+        RegionInstructionKind::BindReferenceIntoPropertyDim { append, keys, .. } => {
+            *append || !keys.is_empty()
+        }
+        RegionInstructionKind::NewObject { prepared, .. } => *prepared,
+        RegionInstructionKind::CloneObject { plain, .. } => *plain,
+        RegionInstructionKind::FetchDim { mode, .. } => {
+            *mode == php_ir::instruction::DimFetchMode::Read
+        }
         RegionInstructionKind::Nop
         | RegionInstructionKind::Move { .. }
         | RegionInstructionKind::LoadLocal { .. }
         | RegionInstructionKind::StoreLocal { .. }
         | RegionInstructionKind::AssignLocalResult { .. }
+        | RegionInstructionKind::BindReference { .. }
+        | RegionInstructionKind::BindReferenceProperty { .. }
+        | RegionInstructionKind::BindReferenceFromProperty { .. }
+        | RegionInstructionKind::BindReferenceDimFromProperty { .. }
+        | RegionInstructionKind::InitStaticLocal { .. }
         | RegionInstructionKind::Discard { .. }
         | RegionInstructionKind::Binary { .. }
         | RegionInstructionKind::Unary { .. }
         | RegionInstructionKind::Compare { .. }
         | RegionInstructionKind::Cast { .. }
+        | RegionInstructionKind::Echo { .. }
         | RegionInstructionKind::NewArray { .. }
-        | RegionInstructionKind::FetchDim {
-            mode: php_ir::instruction::DimFetchMode::Read,
-            ..
-        }
+        | RegionInstructionKind::FetchProperty { .. }
+        | RegionInstructionKind::FetchObjectClassName { .. }
+        | RegionInstructionKind::AssignProperty { .. }
+        | RegionInstructionKind::ArraySpread { .. }
+        | RegionInstructionKind::FetchConst { .. }
         | RegionInstructionKind::IssetDim { .. }
         | RegionInstructionKind::EmptyDim { .. }
         | RegionInstructionKind::IssetLocal { .. }
         | RegionInstructionKind::EmptyLocal { .. }
         | RegionInstructionKind::UnsetLocal { .. }
         | RegionInstructionKind::ForeachInit { .. }
+        | RegionInstructionKind::ForeachInitRef { .. }
         | RegionInstructionKind::ForeachNext { .. }
+        | RegionInstructionKind::ForeachNextRef { .. }
         | RegionInstructionKind::ForeachCleanup { .. }
-        | RegionInstructionKind::FetchProperty { .. }
         | RegionInstructionKind::ArrayCallback(_)
-        | RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::Include { .. })
         | RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::MakeClosure {
             ..
         })
+        | RegionInstructionKind::NativeSuspend(_)
         | RegionInstructionKind::NativeCall(_) => true,
-        _ => false,
+        RegionInstructionKind::FetchDynamicStaticProperty { .. }
+        | RegionInstructionKind::CloneWith { .. }
+        | RegionInstructionKind::NativeControl(_)
+        | RegionInstructionKind::NativeDynamicCode(_)
+        | RegionInstructionKind::RuntimeFatal { .. }
+        | RegionInstructionKind::CompileTimeFatal { .. } => false,
     }
 }
 
@@ -780,7 +832,7 @@ fn prepare_optimizing_baseline_islands(mut region: RegionGraph) -> RegionGraph {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, instruction)| {
-                    let direct = optimizing_instruction_family_is_direct(&instruction.kind);
+                    let direct = optimizing_instruction_family_is_direct(instruction);
                     let changed = previous.is_some_and(|previous| previous != direct);
                     previous = Some(direct);
                     (index != 0 && changed).then_some(index)
@@ -794,7 +846,7 @@ fn prepare_optimizing_baseline_islands(mut region: RegionGraph) -> RegionGraph {
         let direct = block
             .instructions
             .first()
-            .is_none_or(|instruction| optimizing_instruction_family_is_direct(&instruction.kind));
+            .is_none_or(optimizing_instruction_family_is_direct);
         for (index, instruction) in block.instructions.iter_mut().enumerate() {
             instruction.optimizer_transition_entry = if direct {
                 optimizing_direct_instruction_may_transition(&instruction.kind)
@@ -1215,11 +1267,7 @@ fn ir_function_requires_non_reference_trampoline(function: &php_ir::IrFunction) 
         block.instructions.iter().any(|instruction| {
             matches!(
                 instruction.kind,
-                php_ir::InstructionKind::EnterTry { .. }
-                    | php_ir::InstructionKind::LeaveTry
-                    | php_ir::InstructionKind::Throw { .. }
-                    | php_ir::InstructionKind::Yield { .. }
-                    | php_ir::InstructionKind::YieldFrom { .. }
+                php_ir::InstructionKind::Yield { .. } | php_ir::InstructionKind::YieldFrom { .. }
             )
         })
     }) || function.attributes.iter().any(|attribute| {
@@ -1492,12 +1540,27 @@ pub(super) fn compile_region_graph_native(
                 && call.direct_compiled_target().is_some_and(resolver_target)
         })
     });
+    let is_direct_linked_call = |call: &RegionNativeCall| {
+        direct_linked_signature(call, &request.external_function_signatures).is_some()
+    };
+    let is_direct_linked_variadic_call = |call: &RegionNativeCall| {
+        direct_linked_signature(call, &request.external_function_signatures)
+            .and_then(|signature| signature.native_params.last())
+            .is_some_and(|parameter| parameter.variadic)
+    };
     let needs_call_trampoline = regions.values().any(|region| {
-        region.has_native_trampoline_calls()
-            || region
-                .direct_callees()
-                .iter()
-                .any(|callee| !regions.contains_key(callee) && !resolver_target(*callee))
+        region_contains(region, |kind| {
+            matches!(
+                kind,
+                RegionInstructionKind::NativeCall(call)
+                    if call.direct_compiled_target().is_none()
+                        && !matches!(call.target, RegionCallTarget::Semantic { .. })
+                        && !is_direct_linked_call(call)
+            )
+        }) || region
+            .direct_callees()
+            .iter()
+            .any(|callee| !regions.contains_key(callee) && !resolver_target(*callee))
             || region_contains(region, |kind| {
                 matches!(
                     kind,
@@ -1636,6 +1699,108 @@ pub(super) fn compile_region_graph_native(
                     })
                 })
         });
+    let needs_exact_object_identity: [bool; StableObjectIdentityBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_object_identity(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_serialization: [bool; StableSerializationBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_serialization(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_object_vars: [bool; StableObjectVarsBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_object_vars(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_class_lineage: [bool; StableClassLineageBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_class_lineage(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_extension_query: [bool; StableExtensionQueryBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_extension_query(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_ini_query: [bool; StableIniQueryBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_ini_query(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_request_query: [bool; StableRequestQueryBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_request_query(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_declaration_inventory: [bool; StableDeclarationInventoryBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_declaration_inventory(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                    })
+                })
+        });
+    let needs_exact_constant_inventory = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_constant_inventory(&call.target))
+            })
+        });
+    let needs_exact_compact = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_compact(&call.target))
+            })
+        });
     let needs_exact_frame_introspection: [bool; StableFrameIntrospectionBuiltin::COUNT] =
         std::array::from_fn(|index| {
             !baseline_helper_imports
@@ -1690,6 +1855,18 @@ pub(super) fn compile_region_graph_native(
                 })
             })
     });
+    let needs_exact_output_buffer: [bool; StableOutputBufferBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_output_buffer(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index
+                                    && builtin.accepts_arity(call.args.len())))
+                    })
+                })
+        });
     let needs_exact_pure_math: [bool; StablePureMathBuiltin::COUNT] =
         std::array::from_fn(|index| {
             !baseline_helper_imports
@@ -1801,7 +1978,8 @@ pub(super) fn compile_region_graph_native(
             )
         })
     });
-    let needs_float_to_string = regions.values().any(|region| {
+    let needs_float_to_string = regions.iter().any(|(function, region)| {
+        let value_flow = &value_flows[function];
         region_contains(region, |kind| {
             matches!(
                 kind,
@@ -1811,7 +1989,12 @@ pub(super) fn compile_region_graph_native(
                 } | RegionInstructionKind::Echo { .. }
                     | RegionInstructionKind::Compare { .. }
             ) || matches!(kind, RegionInstructionKind::NativeCall(call)
-                    if stable_builtin_array_lookup(&call.target).is_some())
+            if stable_builtin_array_lookup(&call.target).is_some()
+                || optimizing_strval_uses_float_handler(
+                    call,
+                    value_flow,
+                    &unit.constants,
+                ))
         })
     });
     let call_scalar_helper_needs = regions.iter().fold(
@@ -1993,7 +2176,8 @@ pub(super) fn compile_region_graph_native(
         })
     });
     let needs_string_cast = call_scalar_helper_needs.string_cast
-        || regions.values().any(|region| {
+        || regions.iter().any(|(function, region)| {
+            let value_flow = &value_flows[function];
             region_contains(region, |kind| {
                 matches!(
                     kind,
@@ -2001,9 +2185,19 @@ pub(super) fn compile_region_graph_native(
                         op: RegionCastOp::String,
                         ..
                     }
-                ) || matches!(kind, RegionInstructionKind::NativeCall(call)
-                if stable_builtin_scalar_consumer(&call.target)
-                    == Some(StableScalarConsumerBuiltin::StrVal))
+                ) || matches!(
+                    kind,
+                    RegionInstructionKind::NativeCall(call)
+                        if stable_builtin_scalar_consumer(&call.target)
+                            == Some(StableScalarConsumerBuiltin::StrVal)
+                            && call.args.len() == 1
+                            && direct_fixed_builtin_operand(call, 0).is_some()
+                            && !optimizing_strval_uses_float_handler(
+                                call,
+                                value_flow,
+                                &unit.constants,
+                            )
+                )
             })
         });
     // Compare operands are dynamically typed at this boundary. Loose
@@ -2033,6 +2227,8 @@ pub(super) fn compile_region_graph_native(
             ) || matches!(kind, RegionInstructionKind::NativeCall(call)
                     if stable_builtin_scalar_consumer(&call.target)
                         == Some(StableScalarConsumerBuiltin::GetDebugType))
+                || matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_get_class(&call.target))
         })
     });
     let needs_echo = regions.values().any(|region| {
@@ -2132,7 +2328,8 @@ pub(super) fn compile_region_graph_native(
     let needs_array_new = regions.values().any(|region| {
         region_contains(region, |kind| {
             matches!(kind, RegionInstructionKind::NewArray { .. })
-                || matches!(kind, RegionInstructionKind::NativeCall(call) if call.variadic)
+                || matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if call.variadic || is_direct_linked_variadic_call(call))
         })
     });
     let needs_object_new = regions.values().any(|region| {
@@ -2238,7 +2435,8 @@ pub(super) fn compile_region_graph_native(
                     | RegionInstructionKind::BindReferenceIntoDim { .. }
                     | RegionInstructionKind::BindReferenceIntoPropertyDim { .. }
                     | RegionInstructionKind::BindReferenceDimFromProperty { .. }
-            ) || matches!(kind, RegionInstructionKind::NativeCall(call) if call.variadic)
+            ) || matches!(kind, RegionInstructionKind::NativeCall(call)
+                if call.variadic || is_direct_linked_variadic_call(call))
         })
     });
     let needs_array_fetch = regions.values().any(|region| {
@@ -2394,6 +2592,7 @@ pub(super) fn compile_region_graph_native(
     let needs_reference_bind = baseline_helper_imports && needs_reference_bind;
     let needs_argument_check = baseline_helper_imports && needs_argument_check;
     let needs_return_check = baseline_helper_imports && needs_return_check;
+    let needs_prepared_exception_new = !baseline_helper_imports && needs_exception_new;
     let needs_exception_new = baseline_helper_imports && needs_exception_new;
     let needs_array_new = baseline_helper_imports && needs_array_new;
     let needs_prepared_object_new = !baseline_helper_imports && needs_object_new;
@@ -2418,7 +2617,6 @@ pub(super) fn compile_region_graph_native(
     let needs_stable_length = baseline_helper_imports && needs_stable_length;
     let needs_string_predicate = baseline_helper_imports && needs_string_predicate;
     let needs_runtime_fatal = baseline_helper_imports && needs_runtime_fatal;
-    let needs_execution_poll = baseline_helper_imports && needs_execution_poll;
     let mut imports = vec![(
         "region-runtime-helper-abi".to_owned(),
         region.compile_metadata.helper_abi_hash as usize,
@@ -2667,6 +2865,158 @@ pub(super) fn compile_region_graph_native(
         }
         imports.push((builtin.symbol().to_owned(), address));
     }
+    for builtin in StableObjectIdentityBuiltin::all() {
+        if !needs_exact_object_identity[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_object_identity[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_OBJECT_IDENTITY",
+                format!(
+                    "prepared object-identity builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableSerializationBuiltin::all() {
+        if !needs_exact_serialization[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_serialization[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_SERIALIZATION",
+                format!(
+                    "prepared serialization builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableObjectVarsBuiltin::all() {
+        if !needs_exact_object_vars[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_object_vars[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_OBJECT_VARS",
+                format!(
+                    "prepared object-vars builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableClassLineageBuiltin::all() {
+        if !needs_exact_class_lineage[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_class_lineage[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_CLASS_LINEAGE",
+                format!(
+                    "prepared class-lineage builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableExtensionQueryBuiltin::all() {
+        if !needs_exact_extension_query[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_extension_query[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_EXTENSION_QUERY",
+                format!(
+                    "prepared extension-query builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableIniQueryBuiltin::all() {
+        if !needs_exact_ini_query[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_ini_query[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_INI_QUERY",
+                format!(
+                    "prepared INI-query builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableRequestQueryBuiltin::all() {
+        if !needs_exact_request_query[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_request_query[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_REQUEST_QUERY",
+                format!(
+                    "prepared request-query builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableDeclarationInventoryBuiltin::all() {
+        if !needs_exact_declaration_inventory[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_declaration_inventory[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_DECLARATION_INVENTORY",
+                format!(
+                    "prepared declaration-inventory builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    if needs_exact_constant_inventory {
+        if runtime_helpers.native_constant_inventory == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_CONSTANT_INVENTORY",
+                "prepared constant-inventory builtin requires exact handler phrust_native_get_defined_constants",
+            ));
+        }
+        imports.push((
+            "phrust_native_get_defined_constants".to_owned(),
+            runtime_helpers.native_constant_inventory,
+        ));
+    }
+    if needs_exact_compact {
+        if runtime_helpers.native_compact == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_COMPACT",
+                "prepared compact builtin requires exact handler phrust_native_compact",
+            ));
+        }
+        imports.push((
+            "phrust_native_compact".to_owned(),
+            runtime_helpers.native_compact,
+        ));
+    }
     for builtin in StableFrameIntrospectionBuiltin::all() {
         if !needs_exact_frame_introspection[builtin.index()] {
             continue;
@@ -2740,15 +3090,49 @@ pub(super) fn compile_region_graph_native(
             StablePathBuiltin::Dirname => runtime_helpers.native_dirname,
             StablePathBuiltin::Realpath => runtime_helpers.native_realpath,
             StablePathBuiltin::FileExists => runtime_helpers.native_file_exists,
+            StablePathBuiltin::IsFile => runtime_helpers.native_is_file,
+            StablePathBuiltin::IsDir => runtime_helpers.native_is_dir,
+            StablePathBuiltin::IsReadable => runtime_helpers.native_is_readable,
+            StablePathBuiltin::IsWritable => runtime_helpers.native_is_writable,
+            StablePathBuiltin::Filesize => runtime_helpers.native_filesize,
+            StablePathBuiltin::Filemtime => runtime_helpers.native_filemtime,
+            StablePathBuiltin::FileGetContents => runtime_helpers.native_file_get_contents,
             StablePathBuiltin::Fopen => runtime_helpers.native_fopen,
             StablePathBuiltin::Fwrite => runtime_helpers.native_fwrite,
             StablePathBuiltin::Fclose => runtime_helpers.native_fclose,
+            StablePathBuiltin::Fread => runtime_helpers.native_fread,
+            StablePathBuiltin::Fgets => runtime_helpers.native_fgets,
+            StablePathBuiltin::Fgetc => runtime_helpers.native_fgetc,
+            StablePathBuiltin::Feof => runtime_helpers.native_feof,
+            StablePathBuiltin::Fflush => runtime_helpers.native_fflush,
+            StablePathBuiltin::Fseek => runtime_helpers.native_fseek,
+            StablePathBuiltin::Ftell => runtime_helpers.native_ftell,
+            StablePathBuiltin::Ftruncate => runtime_helpers.native_ftruncate,
+            StablePathBuiltin::Rewind => runtime_helpers.native_rewind,
+            StablePathBuiltin::StreamGetContents => runtime_helpers.native_stream_get_contents,
+            StablePathBuiltin::StreamCopyToStream => runtime_helpers.native_stream_copy_to_stream,
         };
         if address == 0 {
             return Err(CraneliftLoweringError::new(
                 "JIT_CRANELIFT_REJECT_EXACT_PATH",
                 format!(
                     "prepared path builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
+    for builtin in StableOutputBufferBuiltin::all() {
+        if !needs_exact_output_buffer[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_output_buffer[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_OUTPUT_BUFFER",
+                format!(
+                    "prepared output-buffer builtin requires exact handler {}",
                     builtin.symbol()
                 ),
             ));
@@ -2983,7 +3367,7 @@ pub(super) fn compile_region_graph_native(
             "phrust_native_execution_poll",
         ),
     ] {
-        if baseline_helper_imports && needed {
+        if needed && (baseline_helper_imports || symbol == "phrust_native_execution_poll") {
             let address = if configured == 0 {
                 fallback
             } else {
@@ -3171,6 +3555,16 @@ pub(super) fn compile_region_graph_native(
                 test_native_prepared_object_new_fallback as *const () as usize
             } else {
                 runtime_helpers.native_prepared_object_new
+            },
+        ));
+    }
+    if needs_prepared_exception_new {
+        imports.push((
+            "phrust_native_prepared_exception_new".to_owned(),
+            if runtime_helpers.native_prepared_exception_new == 0 {
+                test_native_prepared_exception_new_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_prepared_exception_new
             },
         ));
     }
@@ -3505,6 +3899,193 @@ pub(super) fn compile_region_graph_native(
             }
             let mut exact_frame_introspection =
                 [None; StableFrameIntrospectionBuiltin::COUNT];
+            let mut exact_object_identity = [None; StableObjectIdentityBuiltin::COUNT];
+            for builtin in StableObjectIdentityBuiltin::all() {
+                if !needs_exact_object_identity[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_object_identity[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_serialization = [None; StableSerializationBuiltin::COUNT];
+            for builtin in StableSerializationBuiltin::all() {
+                if !needs_exact_serialization[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_serialization[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_object_vars = [None; StableObjectVarsBuiltin::COUNT];
+            for builtin in StableObjectVarsBuiltin::all() {
+                if !needs_exact_object_vars[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_object_vars[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_class_lineage = [None; StableClassLineageBuiltin::COUNT];
+            for builtin in StableClassLineageBuiltin::all() {
+                if !needs_exact_class_lineage[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_class_lineage[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_extension_query = [None; StableExtensionQueryBuiltin::COUNT];
+            for builtin in StableExtensionQueryBuiltin::all() {
+                if !needs_exact_extension_query[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_extension_query[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_ini_query = [None; StableIniQueryBuiltin::COUNT];
+            for builtin in StableIniQueryBuiltin::all() {
+                if !needs_exact_ini_query[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_ini_query[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_request_query = [None; StableRequestQueryBuiltin::COUNT];
+            for builtin in StableRequestQueryBuiltin::all() {
+                if !needs_exact_request_query[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_request_query[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_declaration_inventory =
+                [None; StableDeclarationInventoryBuiltin::COUNT];
+            for builtin in StableDeclarationInventoryBuiltin::all() {
+                if !needs_exact_declaration_inventory[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_declaration_inventory[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let exact_constant_inventory = if needs_exact_constant_inventory {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                Some(declare_native_helper(
+                    module,
+                    "phrust_native_get_defined_constants",
+                    &signature,
+                    helper_address("phrust_native_get_defined_constants"),
+                )?)
+            } else {
+                None
+            };
+            let exact_compact = if needs_exact_compact {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                Some(declare_native_helper(
+                    module,
+                    "phrust_native_compact",
+                    &signature,
+                    helper_address("phrust_native_compact"),
+                )?)
+            } else {
+                None
+            };
             for builtin in StableFrameIntrospectionBuiltin::all() {
                 if !needs_exact_frame_introspection[builtin.index()] {
                     continue;
@@ -3593,6 +4174,25 @@ pub(super) fn compile_region_graph_native(
                 signature.returns.push(AbiParam::new(types::I64));
                 signature.returns.push(AbiParam::new(types::I64));
                 exact_path[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
+            let mut exact_output_buffer = [None; StableOutputBufferBuiltin::COUNT];
+            for builtin in StableOutputBufferBuiltin::all() {
+                if !needs_exact_output_buffer[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                for _ in 0..6 {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_output_buffer[builtin.index()] = Some(declare_native_helper(
                     module,
                     builtin.symbol(),
                     &signature,
@@ -3802,6 +4402,21 @@ pub(super) fn compile_region_graph_native(
                     "phrust_native_prepared_object_new",
                     &signature,
                     helper_address("phrust_native_prepared_object_new"),
+                )?)
+            } else {
+                None
+            };
+            let prepared_exception_new = if needs_prepared_exception_new {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                Some(declare_native_helper(
+                    module,
+                    "phrust_native_prepared_exception_new",
+                    &signature,
+                    helper_address("phrust_native_prepared_exception_new"),
                 )?)
             } else {
                 None
@@ -4232,10 +4847,30 @@ pub(super) fn compile_region_graph_native(
             })?;
             let mut next_synthetic = synthetic_base;
             let tier_operations = if baseline_helper_imports {
+                let value_release_commit_symbol = FunctionId::new(next_synthetic);
+                next_synthetic = next_synthetic.checked_add(1).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_FRAGMENT_SYMBOL_LIMIT",
+                        "native baseline value-release symbol id overflowed",
+                    )
+                })?;
+                let symbol = format!("{name}.native.value_release_commit");
+                let signature = direct_value_release_signature(module);
+                let value_release_commit = module
+                    .declare_function(&symbol, Linkage::Local, &signature)
+                    .map_err(|error| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_DECLARE",
+                            format!("failed to declare {symbol}: {error}"),
+                        )
+                    })?;
+                functions.insert(value_release_commit_symbol, value_release_commit);
                 NativeTierOperations::Baseline {
                     call: native_call_helper,
                     dynamic_code: native_dynamic_code_helper,
                     operations: native_operations,
+                    value_release_commit,
+                    value_release_commit_symbol,
                 }
             } else {
                 let array_ensure_unique_symbol = FunctionId::new(next_synthetic);
@@ -4274,24 +4909,6 @@ pub(super) fn compile_region_graph_native(
                         )
                     })?;
                 functions.insert(array_child_entry_symbol, array_child_entry);
-                let array_insert_admitted_symbol = FunctionId::new(next_synthetic);
-                next_synthetic = next_synthetic.checked_add(1).ok_or_else(|| {
-                    CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_FRAGMENT_SYMBOL_LIMIT",
-                        "native prepared array-insert symbol id overflowed",
-                    )
-                })?;
-                let symbol = format!("{name}.native.array_insert_admitted");
-                let signature = direct_array_insert_admitted_signature(module);
-                let array_insert_admitted = module
-                    .declare_function(&symbol, Linkage::Local, &signature)
-                    .map_err(|error| {
-                        CraneliftLoweringError::new(
-                            "JIT_CRANELIFT_REJECT_DECLARE",
-                            format!("failed to declare {symbol}: {error}"),
-                        )
-                    })?;
-                functions.insert(array_insert_admitted_symbol, array_insert_admitted);
                 let value_release_validate_symbol = FunctionId::new(next_synthetic);
                 next_synthetic = next_synthetic.checked_add(1).ok_or_else(|| {
                     CraneliftLoweringError::new(
@@ -4330,6 +4947,7 @@ pub(super) fn compile_region_graph_native(
                 functions.insert(value_release_commit_symbol, value_release_commit);
                 NativeTierOperations::Optimizing {
                     operations: NativeOptimizingOperations {
+                        execution_poll: native_operations.execution_poll,
                         echo_bytes,
                         float_to_string,
                         numeric_string,
@@ -4349,6 +4967,7 @@ pub(super) fn compile_region_graph_native(
                         object_cast,
                         object_class_name,
                         prepared_object_new,
+                        prepared_exception_new,
                         prepared_closure_new,
                         plain_object_clone,
                         dynamic_property_slot,
@@ -4363,17 +4982,26 @@ pub(super) fn compile_region_graph_native(
                         exact_html_codec,
                         exact_url_query,
                         exact_array_preserving_sort,
+                        exact_object_identity,
+                        exact_serialization,
+                        exact_object_vars,
+                        exact_class_lineage,
+                        exact_extension_query,
+                        exact_ini_query,
+                        exact_request_query,
+                        exact_declaration_inventory,
+                        exact_constant_inventory,
+                        exact_compact,
                         exact_frame_introspection,
                         exact_base_conversion,
                         exact_network_address,
                         exact_compression_codec,
                         exact_path,
+                        exact_output_buffer,
                         array_ensure_unique,
                         array_ensure_unique_symbol,
                         array_child_entry,
                         array_child_entry_symbol,
-                        array_insert_admitted,
-                        array_insert_admitted_symbol,
                         value_release_validate,
                         value_release_validate_symbol,
                         value_release_commit,
@@ -4714,8 +5342,9 @@ pub(super) fn compile_region_graph_native(
                     )?;
                 }
             }
-            let referenced_internal_functions = std::cell::RefCell::new(BTreeSet::new());
-            let mut append_defined = |symbol: FunctionId,
+            {
+                let referenced_internal_functions = std::cell::RefCell::new(BTreeSet::new());
+                let mut append_defined = |symbol: FunctionId,
                                       arity: u8,
                                       local_count: u32,
                                       mut defined: DefinedRegionFunction|
@@ -4949,22 +5578,22 @@ pub(super) fn compile_region_graph_native(
                     function_code_metrics.insert(candidate.function, metrics);
                 }
             }
-            if let NativeTierOperations::Optimizing { operations } = tier_operations {
+            let referenced = referenced_internal_functions.borrow().clone();
+            match tier_operations {
+                NativeTierOperations::Optimizing { operations } => {
                 // Optimizing support functions are part of an artifact only
                 // when its emitted CLIF actually relocates to them. The old
                 // unconditional bundle compiled and published all five
                 // bodies even for pure scalar functions. Keep the exact
-                // native dependency closure for the admitted insert.
-                let referenced = referenced_internal_functions.borrow().clone();
-                let needs_insert = referenced.contains(&operations.array_insert_admitted_symbol);
+                // native dependency closure for the emitted direct paths.
                 let needs_ensure =
                     referenced.contains(&operations.array_ensure_unique_symbol);
                 let needs_child =
-                    needs_insert || referenced.contains(&operations.array_child_entry_symbol);
+                    referenced.contains(&operations.array_child_entry_symbol);
                 let needs_validate =
                     referenced.contains(&operations.value_release_validate_symbol);
                 let needs_commit =
-                    needs_insert || referenced.contains(&operations.value_release_commit_symbol);
+                    referenced.contains(&operations.value_release_commit_symbol);
 
                 if needs_ensure {
                     let defined = define_direct_array_ensure_unique_function(
@@ -5024,27 +5653,24 @@ pub(super) fn compile_region_graph_native(
                         defined,
                     )?;
                 }
-                if needs_insert {
-                    let defined = define_direct_array_insert_admitted_function(
+                },
+                NativeTierOperations::Baseline {
+                    value_release_commit,
+                    value_release_commit_symbol,
+                    ..
+                } if referenced.contains(&value_release_commit_symbol) => {
+                    let defined = define_direct_value_release_commit_function(
                         module,
                         codegen_context,
                         builder_context,
-                        operations.array_insert_admitted,
-                        operations.array_insert_admitted_symbol,
-                        operations.array_child_entry,
-                        operations.array_child_entry_symbol,
-                        operations.value_release_commit,
-                        operations.value_release_commit_symbol,
+                        value_release_commit,
+                        value_release_commit_symbol,
                     )?;
-                    let _ = append_defined(
-                        operations.array_insert_admitted_symbol,
-                        0,
-                        0,
-                        defined,
-                    )?;
-                }
+                    let _ = append_defined(value_release_commit_symbol, 0, 0, defined)?;
+                },
+                NativeTierOperations::Baseline { .. } => {},
             }
-            drop(append_defined);
+            }
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 module
                     .finalize_definitions()
@@ -5237,6 +5863,7 @@ pub(super) fn compile_region_graph_native(
                                     | "phrust_native_object_cast"
                                     | "phrust_native_object_class_name"
                                     | "phrust_native_prepared_object_new"
+                                    | "phrust_native_prepared_exception_new"
                                     | "phrust_native_prepared_closure_new"
                                     | "phrust_native_plain_object_clone"
                                     | "phrust_native_dynamic_property_slot"
@@ -5247,6 +5874,7 @@ pub(super) fn compile_region_graph_native(
                                     | "phrust_native_enum_exists"
                                     | "phrust_native_method_exists"
                                     | "phrust_native_property_exists"
+                                    | "phrust_native_execution_poll"
                             )
                                 || symbol.starts_with("phrust_native_preg_")
                                 || symbol.starts_with("phrust_native_json_")
@@ -5277,6 +5905,32 @@ pub(super) fn compile_region_graph_native(
                                 || StableArrayPreservingSortBuiltin::all()
                                     .iter()
                                     .any(|builtin| builtin.symbol() == symbol)
+                                || StableObjectIdentityBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || StableSerializationBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || StableObjectVarsBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || StableClassLineageBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || StableExtensionQueryBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || StableIniQueryBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || StableRequestQueryBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || StableDeclarationInventoryBuiltin::all()
+                                    .iter()
+                                    .any(|builtin| builtin.symbol() == symbol)
+                                || symbol == "phrust_native_get_defined_constants"
+                                || symbol == "phrust_native_compact"
                                 || StableFrameIntrospectionBuiltin::all()
                                     .iter()
                                     .any(|builtin| builtin.symbol() == symbol)
@@ -5311,9 +5965,35 @@ pub(super) fn compile_region_graph_native(
                                         | "phrust_native_dirname"
                                         | "phrust_native_realpath"
                                         | "phrust_native_file_exists"
+                                        | "phrust_native_is_file"
+                                        | "phrust_native_is_dir"
+                                        | "phrust_native_is_readable"
+                                        | "phrust_native_is_writable"
+                                        | "phrust_native_filesize"
+                                        | "phrust_native_filemtime"
+                                        | "phrust_native_file_get_contents"
                                         | "phrust_native_fopen"
                                         | "phrust_native_fwrite"
                                         | "phrust_native_fclose"
+                                        | "phrust_native_fread"
+                                        | "phrust_native_fgets"
+                                        | "phrust_native_fgetc"
+                                        | "phrust_native_feof"
+                                        | "phrust_native_fflush"
+                                        | "phrust_native_fseek"
+                                        | "phrust_native_ftell"
+                                        | "phrust_native_ftruncate"
+                                        | "phrust_native_rewind"
+                                        | "phrust_native_stream_get_contents"
+                                        | "phrust_native_stream_copy_to_stream"
+                                        | "phrust_native_ob_start"
+                                        | "phrust_native_ob_get_clean"
+                                        | "phrust_native_ob_get_contents"
+                                        | "phrust_native_ob_get_flush"
+                                        | "phrust_native_ob_get_length"
+                                        | "phrust_native_ob_get_level"
+                                        | "phrust_native_ob_end_flush"
+                                        | "phrust_native_ob_end_clean"
                                 ) =>
                         {
                             None
@@ -5647,6 +6327,11 @@ fn collect_bounded_inline_values(
         .values()
         .flat_map(RegionGraph::direct_callees)
         .filter(|callee| !roots.contains_key(callee))
+        .filter(|callee| {
+            unit.functions
+                .get(callee.index())
+                .is_some_and(|function| !ir_function_requires_trampoline(function))
+        })
         .filter_map(|callee| {
             crate::region_ir::build_baseline_region(unit, callee)
                 .ok()
@@ -5837,17 +6522,6 @@ fn direct_array_child_entry_signature(module: &JITModule) -> Signature {
     signature
 }
 
-fn direct_array_insert_admitted_signature(module: &JITModule) -> Signature {
-    let pointer_type = module.target_config().pointer_type();
-    let mut signature = module.make_signature();
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.params.push(AbiParam::new(types::I64));
-    signature.params.push(AbiParam::new(types::I64));
-    signature.params.push(AbiParam::new(types::I64));
-    signature.returns.push(AbiParam::new(types::I64));
-    signature
-}
-
 fn direct_value_release_signature(module: &JITModule) -> Signature {
     let pointer_type = module.target_config().pointer_type();
     let mut signature = module.make_signature();
@@ -5874,6 +6548,8 @@ fn region_fragment_signature(
     Ok(signature)
 }
 
+type DeclaredFragmentFunctions = (BTreeMap<u32, FuncId>, BTreeMap<u32, FunctionId>);
+
 #[allow(clippy::too_many_arguments)]
 fn declare_fragment_functions(
     module: &mut JITModule,
@@ -5883,7 +6559,7 @@ fn declare_fragment_functions(
     replan_attempt: usize,
     next_synthetic: &mut u32,
     functions: &mut BTreeMap<FunctionId, FuncId>,
-) -> Result<(BTreeMap<u32, FuncId>, BTreeMap<u32, FunctionId>), CraneliftLoweringError> {
+) -> Result<DeclaredFragmentFunctions, CraneliftLoweringError> {
     let mut fragment_functions = BTreeMap::new();
     let mut fragment_symbols = BTreeMap::new();
     let Some(layout) = layout else {
@@ -6640,6 +7316,9 @@ fn define_region_graph_function(
         builder.set_cold_block(terminal_exit);
         builder.append_block_param(terminal_exit, types::I32);
         builder.append_block_param(terminal_exit, types::I64);
+        let optimizing_baseline_resume =
+            matches!(tier_operations, NativeTierOperations::Optimizing { .. })
+                .then(|| builder.create_block());
         let normal_entry = blocks.values().next().copied().ok_or_else(|| {
             CraneliftLoweringError::new(
                 "JIT_CRANELIFT_REJECT_HELPER_CONTROL_FLOW",
@@ -6761,25 +7440,50 @@ fn define_region_graph_function(
         {
             lower_baseline_function_entry(&mut builder, deopt_out, region.function)?;
         }
-        let (native_call_helper, native_dynamic_code_helper, mut native_operations) =
-            match tier_operations {
-                NativeTierOperations::Baseline {
-                    call,
-                    dynamic_code,
-                    operations,
-                } => (
-                    call.map(|helper| helper.with_runtime(runtime)),
-                    dynamic_code.map(|helper| helper.with_runtime(runtime)),
-                    operations
-                        .with_runtime(runtime)
-                        .with_terminal_exit(NativeTerminalExit {
-                            block: terminal_exit,
-                        }),
-                ),
-                NativeTierOperations::Optimizing { .. } => {
-                    (None, None, NativeOperationFunctions::default())
-                }
-            };
+        let (
+            native_call_helper,
+            native_dynamic_code_helper,
+            mut native_operations,
+            baseline_value_release_commit,
+        ) = match tier_operations {
+            NativeTierOperations::Baseline {
+                call,
+                dynamic_code,
+                operations,
+                value_release_commit,
+                ..
+            } => (
+                call.map(|helper| helper.with_runtime(runtime)),
+                dynamic_code.map(|helper| helper.with_runtime(runtime)),
+                operations
+                    .with_runtime(runtime)
+                    .with_terminal_exit(NativeTerminalExit {
+                        block: terminal_exit,
+                    }),
+                Some(module.declare_func_in_func(value_release_commit, builder.func)),
+            ),
+            NativeTierOperations::Optimizing { .. } => {
+                let NativeTierOperations::Optimizing { operations } = tier_operations else {
+                    unreachable!("optimizing tier was matched above")
+                };
+                (
+                    None,
+                    None,
+                    NativeOperationFunctions {
+                        execution_poll: operations
+                            .execution_poll
+                            .map(|helper| helper.with_runtime(runtime))
+                            .map(|helper| {
+                                helper.with_terminal_exit(NativeTerminalExit {
+                                    block: terminal_exit,
+                                })
+                            }),
+                        ..NativeOperationFunctions::default()
+                    },
+                    None,
+                )
+            }
+        };
         // These guards read the request-owned runtime view directly and only
         // call Rust for reference, warning, destructor, or unsupported dynamic
         // cases. Baseline code needs the same fast paths: forcing every local,
@@ -7105,15 +7809,17 @@ fn define_region_graph_function(
             })
             .map(|continuation| (continuation, builder.create_block()))
             .collect::<BTreeMap<_, _>>();
-        let optimizing_block_resume_loaders = (region.compile_metadata.tier
-            == NativeCompilerTier::Optimizing)
-            .then(|| {
-                owned_blocks
-                    .iter()
-                    .map(|block| (block.id, builder.create_block()))
-                    .collect::<BTreeMap<_, _>>()
-            })
-            .unwrap_or_default();
+        let optimizing_block_resume_loaders =
+            if region.compile_metadata.tier == NativeCompilerTier::Optimizing {
+                {
+                    owned_blocks
+                        .iter()
+                        .map(|block| (block.id, builder.create_block()))
+                        .collect::<BTreeMap<_, _>>()
+                }
+            } else {
+                Default::default()
+            };
         let osr_entries = region
             .osr_entries()
             .into_iter()
@@ -7320,11 +8026,11 @@ fn define_region_graph_function(
                     builder
                         .ins()
                         .store(MemFlagsData::new(), empty, result_out, 0);
-                    let transition = builder.ins().iconst(
-                        types::I32,
-                        i64::from(crate::JitCallStatus::RECOMPILE_REQUESTED.0),
+                    builder.ins().jump(
+                        optimizing_baseline_resume
+                            .expect("optimizing catch transition requires baseline resume"),
+                        &[],
                     );
-                    builder.ins().return_(&[transition]);
                     let unreachable = builder.create_block();
                     builder.switch_to_block(unreachable);
                     builder.seal_block(unreachable);
@@ -7802,12 +8508,13 @@ fn define_region_graph_function(
                             &mut builder,
                             &register_variables,
                             &suspension_blocks,
+                            &blocks,
                             &locals,
                             &mut registers,
                             instruction,
                             transition_live_registers,
                             constants,
-                            &value_flow,
+                            value_flow,
                             inline_constants,
                             function_params,
                             external_function_signatures,
@@ -7822,6 +8529,8 @@ fn define_region_graph_function(
                             native_version,
                             unit_identity,
                             operations.with_runtime(runtime),
+                            optimizing_baseline_resume
+                                .expect("optimizing instruction requires baseline resume"),
                         )
                         .map(|emitted| {
                             production_lowering.push(crate::JitProductionLoweringMetadata {
@@ -7847,6 +8556,7 @@ fn define_region_graph_function(
                         native_call_helper,
                         native_dynamic_code_helper,
                         native_operations,
+                        baseline_value_release_commit,
                         &register_variables,
                         &blocks,
                         &suspension_blocks,
@@ -7856,7 +8566,7 @@ fn define_region_graph_function(
                         instruction,
                         transition_live_registers,
                         constants,
-                        &value_flow,
+                        value_flow,
                         streaming_call_exit,
                         result_out,
                         deopt_out,
@@ -7952,7 +8662,9 @@ fn define_region_graph_function(
                         region.return_type.as_ref(),
                         &region_block.terminator,
                         constants,
-                        &value_flow,
+                        value_flow,
+                        optimizing_baseline_resume
+                            .expect("optimizing terminator requires baseline resume"),
                     )
                     .map(|emitted| {
                         production_lowering.push(crate::JitProductionLoweringMetadata {
@@ -7983,7 +8695,7 @@ fn define_region_graph_function(
                     region.return_type.is_some(),
                     &region_block.terminator,
                     constants,
-                    &value_flow,
+                    value_flow,
                 ),
             }?;
         }
@@ -8141,6 +8853,91 @@ fn define_region_graph_function(
         if let (Some(dispatch), Some(resume_default)) = (resume_dispatch, resume_default) {
             builder.switch_to_block(dispatch);
             resume_switch.emit(&mut builder, resume_id, resume_default);
+        }
+        if let Some(baseline_resume) = optimizing_baseline_resume {
+            builder.switch_to_block(baseline_resume);
+            builder.set_cold_block(baseline_resume);
+            let runtime_view = lower_active_runtime_view(&mut builder, deopt_out);
+            let baseline_entries = builder.ins().load(
+                pointer_type,
+                MemFlagsData::new(),
+                runtime_view,
+                std::mem::offset_of!(crate::JitNativeRuntimeView, trusted_function_entries) as i32,
+            );
+            let rejected_function = builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                deopt_out,
+                std::mem::offset_of!(crate::JitDeoptState, function_id) as i32,
+            );
+            let rejected_function = builder.ins().uextend(pointer_type, rejected_function);
+            let rejected_offset = builder
+                .ins()
+                .imul_imm(rejected_function, i64::from(pointer_type.bytes()));
+            let rejected_entry = builder.ins().iadd(baseline_entries, rejected_offset);
+            let rejected_address =
+                builder
+                    .ins()
+                    .atomic_load(pointer_type, MemFlagsData::new(), rejected_entry);
+            let resume_published = builder.create_block();
+            let resume_unavailable = builder.create_block();
+            let published = builder.ins().icmp_imm(IntCC::NotEqual, rejected_address, 0);
+            builder
+                .ins()
+                .brif(published, resume_published, &[], resume_unavailable, &[]);
+
+            builder.switch_to_block(resume_unavailable);
+            let recompile = builder.ins().iconst(
+                types::I32,
+                i64::from(crate::JitCallStatus::RECOMPILE_REQUESTED.0),
+            );
+            builder.ins().return_(&[recompile]);
+
+            builder.switch_to_block(resume_published);
+            let rejected_continuation = builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                deopt_out,
+                std::mem::offset_of!(crate::JitDeoptState, continuation_id) as i32,
+            );
+            let transition_resume_id = builder.ins().bor_imm(
+                rejected_continuation,
+                i64::from(crate::JIT_NATIVE_TRANSITION_RESUME_TAG),
+            );
+            let handler_resume_id = builder.ins().bor_imm(
+                rejected_continuation,
+                i64::from(crate::JIT_NATIVE_HANDLER_RESUME_TAG),
+            );
+            let control_reserved = builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                deopt_out,
+                std::mem::offset_of!(crate::JitDeoptState, control_reserved) as i32,
+            );
+            let catch_bind = builder.ins().icmp_imm(
+                IntCC::Equal,
+                control_reserved,
+                i64::from(crate::JIT_NATIVE_CATCH_BIND_TRANSITION_DETAIL),
+            );
+            let rejected_resume_id =
+                builder
+                    .ins()
+                    .select(catch_bind, handler_resume_id, transition_resume_id);
+            let signature = builder.import_signature(native_php_entry_signature(module));
+            let resumed = builder.ins().call_indirect(
+                signature,
+                rejected_address,
+                &[
+                    runtime,
+                    arguments,
+                    result_out,
+                    deopt_out,
+                    rejected_resume_id,
+                    deopt_out,
+                ],
+            );
+            let resumed_status = builder.inst_results(resumed)[0];
+            builder.ins().return_(&[resumed_status]);
         }
         builder.switch_to_block(terminal_exit);
         let terminal_status = builder.block_params(terminal_exit)[0];
@@ -8400,188 +9197,6 @@ fn lower_direct_array_child_entry_body(builder: &mut FunctionBuilder<'_>) {
     let zero_value = builder.ins().iconst(types::I64, 0);
     let null_entry = builder.ins().iconst(pointer_type, 0);
     builder.ins().return_(&[zero_value, null_entry]);
-}
-
-fn lower_direct_array_insert_admitted_body(
-    module: &mut JITModule,
-    builder: &mut FunctionBuilder<'_>,
-    child_entry: FuncId,
-    value_release_commit: FuncId,
-) {
-    let entry = builder.create_block();
-    let inspect_replace = builder.create_block();
-    let replace = builder.create_block();
-    let append = builder.create_block();
-    let succeeded = builder.create_block();
-    builder.append_block_params_for_function_params(entry);
-    builder.append_block_param(inspect_replace, types::I64);
-    builder.append_block_param(inspect_replace, module.target_config().pointer_type());
-    builder.append_block_param(replace, types::I64);
-    builder.append_block_param(replace, module.target_config().pointer_type());
-
-    builder.switch_to_block(entry);
-    let deopt_out = builder.block_params(entry)[0];
-    let array = builder.block_params(entry)[1];
-    let key = builder.block_params(entry)[2];
-    let value = builder.block_params(entry)[3];
-    let pointer_type = builder.func.dfg.value_type(deopt_out);
-    let child_entry = module.declare_func_in_func(child_entry, builder.func);
-    let lookup = builder.ins().call(child_entry, &[deopt_out, array, key]);
-    let old = builder.inst_results(lookup)[0];
-    let found_entry = builder.inst_results(lookup)[1];
-    let found = builder.ins().icmp_imm(IntCC::NotEqual, found_entry, 0);
-    builder.ins().brif(
-        found,
-        inspect_replace,
-        &[old.into(), found_entry.into()],
-        append,
-        &[],
-    );
-
-    builder.switch_to_block(inspect_replace);
-    let old = builder.block_params(inspect_replace)[0];
-    let found_entry = builder.block_params(inspect_replace)[1];
-    let unchanged = builder.ins().icmp(IntCC::Equal, old, value);
-    builder.ins().brif(
-        unchanged,
-        succeeded,
-        &[],
-        replace,
-        &[old.into(), found_entry.into()],
-    );
-
-    builder.switch_to_block(replace);
-    let old = builder.block_params(replace)[0];
-    let found_entry = builder.block_params(replace)[1];
-    lower_optimizing_retain(builder, value, deopt_out);
-    builder.ins().store(
-        MemFlagsData::new(),
-        value,
-        found_entry,
-        std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
-    );
-    let commit = module.declare_func_in_func(value_release_commit, builder.func);
-    let _ = builder.ins().call(commit, &[deopt_out, old]);
-    builder.ins().jump(succeeded, &[]);
-
-    // The caller has already admitted a direct, unique array with room for
-    // one entry and an integer/string key. Repeating those engine-integrity
-    // checks here would recreate an operation-local fallback after the exact
-    // native boundary. This compiled function therefore commits the admitted
-    // mutation directly; PHP-visible COW/key semantics remain in the caller's
-    // single guard and continuation.
-    builder.switch_to_block(append);
-    let slot = lower_optimizing_slot_address(builder, array, deopt_out);
-    let length = builder.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
-    );
-    let (integer_key, integer_raw) = lower_optimizing_integer_candidate(builder, key, deopt_out);
-    let entries = builder.ins().load(
-        pointer_type,
-        MemFlagsData::new(),
-        slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, aux) as i32,
-    );
-    let entry_index = if pointer_type == types::I64 {
-        length
-    } else {
-        builder.ins().ireduce(pointer_type, length)
-    };
-    let entry_offset = builder.ins().ishl_imm(entry_index, 4);
-    let destination = builder.ins().iadd(entries, entry_offset);
-    lower_optimizing_retain(builder, key, deopt_out);
-    lower_optimizing_retain(builder, value, deopt_out);
-    builder
-        .ins()
-        .store(MemFlagsData::new(), key, destination, 0);
-    builder.ins().store(
-        MemFlagsData::new(),
-        value,
-        destination,
-        std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
-    );
-    let next_length = builder.ins().iadd_imm(length, 1);
-    builder.ins().store(
-        MemFlagsData::new(),
-        next_length,
-        slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
-    );
-
-    let state = lower_direct_array_state_address(builder, array, deopt_out);
-    let current_next = builder.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        state,
-        std::mem::offset_of!(crate::JitNativeDirectArrayState, next_append_key) as i32,
-    );
-    let has_current_next = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        state,
-        std::mem::offset_of!(crate::JitNativeDirectArrayState, has_next_append_key) as i32,
-    );
-    let maximum_key = builder.ins().icmp_imm(IntCC::Equal, integer_raw, i64::MAX);
-    let incremented_key = builder.ins().iadd_imm(integer_raw, 1);
-    let candidate_next = builder
-        .ins()
-        .select(maximum_key, integer_raw, incremented_key);
-    let advances = builder
-        .ins()
-        .icmp(IntCC::SignedGreaterThan, candidate_next, current_next);
-    let absent = builder.ins().icmp_imm(IntCC::Equal, has_current_next, 0);
-    let advances = builder.ins().bor(absent, advances);
-    let advances = builder.ins().band(integer_key, advances);
-    let next_append_key = builder.ins().select(advances, candidate_next, current_next);
-    builder.ins().store(
-        MemFlagsData::new(),
-        next_append_key,
-        state,
-        std::mem::offset_of!(crate::JitNativeDirectArrayState, next_append_key) as i32,
-    );
-    let has_integer_key = builder.ins().icmp_imm(IntCC::NotEqual, integer_key, 0);
-    let had_next = builder.ins().icmp_imm(IntCC::NotEqual, has_current_next, 0);
-    let has_next = builder.ins().bor(has_integer_key, had_next);
-    let has_next = builder.ins().uextend(types::I32, has_next);
-    builder.ins().store(
-        MemFlagsData::new(),
-        has_next,
-        state,
-        std::mem::offset_of!(crate::JitNativeDirectArrayState, has_next_append_key) as i32,
-    );
-
-    let flags = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
-    );
-    let cursor = builder
-        .ins()
-        .ushr_imm(flags, crate::JIT_NATIVE_DIRECT_ARRAY_CURSOR_SHIFT as i64);
-    let cursor_absent = builder.ins().icmp_imm(
-        IntCC::Equal,
-        cursor,
-        i64::from(crate::JIT_NATIVE_DIRECT_ARRAY_CURSOR_NONE),
-    );
-    let first = builder.ins().iconst(
-        types::I32,
-        i64::from(crate::JIT_NATIVE_DIRECT_ARRAY_ABI_VERSION),
-    );
-    let flags = builder.ins().select(cursor_absent, first, flags);
-    builder.ins().store(
-        MemFlagsData::new(),
-        flags,
-        slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
-    );
-    builder.ins().jump(succeeded, &[]);
-
-    builder.switch_to_block(succeeded);
-    builder.ins().return_(&[array]);
 }
 
 fn lower_direct_value_release_validate_body(
@@ -9707,108 +10322,6 @@ fn define_direct_array_child_entry_function(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn define_direct_array_insert_admitted_function(
-    module: &mut JITModule,
-    ctx: &mut cranelift_codegen::Context,
-    builder_context: &mut FunctionBuilderContext,
-    func_id: FuncId,
-    symbol: FunctionId,
-    child_entry: FuncId,
-    child_entry_symbol: FunctionId,
-    value_release_commit: FuncId,
-    value_release_commit_symbol: FunctionId,
-) -> Result<DefinedRegionFunction, CraneliftLoweringError> {
-    ctx.func.signature = direct_array_insert_admitted_signature(module);
-    ctx.func.name = UserFuncName::user(0, func_id.as_u32());
-    {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, builder_context);
-        lower_direct_array_insert_admitted_body(
-            module,
-            &mut builder,
-            child_entry,
-            value_release_commit,
-        );
-        builder.seal_all_blocks();
-        builder.finalize();
-    }
-    let verifier_flags = settings::Flags::new(settings::builder());
-    verify_function(&ctx.func, &verifier_flags).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_VERIFIER",
-            format!("prepared direct array insert verifier failure: {error}"),
-        )
-    })?;
-    let clif_blocks = ctx.func.layout.blocks().count();
-    let pre_regalloc = PreRegallocMetrics {
-        blocks: clif_blocks,
-        values: ctx.func.dfg.num_values(),
-        instructions: ctx
-            .func
-            .layout
-            .blocks()
-            .map(|block| ctx.func.layout.block_insts(block).count())
-            .sum(),
-        block_parameters: ctx
-            .func
-            .layout
-            .blocks()
-            .map(|block| ctx.func.dfg.block_params(block).len())
-            .sum(),
-        ..PreRegallocMetrics::default()
-    };
-    module.define_function(func_id, ctx).map_err(|error| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_DEFINE",
-            format!("failed to define prepared direct array insert: {error}"),
-        )
-    })?;
-    let compiled = ctx.compiled_code().ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_CACHE_CODE",
-            "Cranelift returned no prepared direct array insert code",
-        )
-    })?;
-    let native_stack_bytes = compiled
-        .buffer
-        .frame_layout()
-        .map_or(0, |layout| layout.frame_to_fp_offset);
-    let code = compiled.code_buffer().to_vec();
-    let alignment = u64::from(compiled.buffer.alignment)
-        .max(module.isa().function_alignment().minimum as u64)
-        .max(module.isa().symbol_alignment());
-    let relocation_functions = BTreeMap::from([
-        (symbol, func_id),
-        (child_entry_symbol, child_entry),
-        (value_release_commit_symbol, value_release_commit),
-    ]);
-    let relocations = compiled
-        .buffer
-        .relocs()
-        .iter()
-        .map(|relocation| {
-            capture_relocation(
-                module,
-                ModuleReloc::from_mach_reloc(relocation, &ctx.func, func_id),
-                &relocation_functions,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    module.clear_context(ctx);
-    Ok(DefinedRegionFunction {
-        lowered_function: None,
-        code,
-        clif_blocks,
-        alignment,
-        relocations,
-        native_pc_ranges: Vec::new(),
-        native_stack_bytes,
-        pre_regalloc,
-        maximum_temporary_cache_entries: 0,
-        production_lowering: Vec::new(),
-    })
-}
-
 fn define_direct_value_release_validate_function(
     module: &mut JITModule,
     ctx: &mut cranelift_codegen::Context,
@@ -9997,6 +10510,7 @@ fn define_direct_array_ensure_unique_function(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn region_graph_metadata<'a>(
     root: FunctionId,
     root_local_count: u32,
@@ -10428,6 +10942,45 @@ mod tests {
 
         let unit = builder.finish();
         let function = &unit.functions[factory.index()];
+        assert!(!ir_function_requires_non_reference_trampoline(function));
+        assert!(!ir_function_requires_trampoline(function));
+    }
+
+    #[test]
+    fn native_exception_control_does_not_require_a_trampoline() {
+        let mut builder = php_ir::IrBuilder::new(php_ir::UnitId::new(7_002));
+        let file = builder.add_file("direct-native-exception.php");
+        let span = php_ir::IrSpan::new(file, 0, 1);
+        let function = builder.start_function(
+            "direct_native_exception",
+            php_ir::FunctionFlags::default(),
+            span,
+        );
+        let block = builder.append_block(function);
+        let message = builder.intern_constant(php_ir::IrConstant::String("native".to_owned()));
+        let exception = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            php_ir::InstructionKind::MakeException {
+                dst: exception,
+                class_name: "runtimeexception".to_owned(),
+                message: php_ir::Operand::Constant(message),
+            },
+            span,
+        );
+        builder.emit(
+            function,
+            block,
+            php_ir::InstructionKind::Throw {
+                value: php_ir::Operand::Register(exception),
+            },
+            span,
+        );
+        builder.terminate_return(function, block, None, span);
+
+        let unit = builder.finish();
+        let function = &unit.functions[function.index()];
         assert!(!ir_function_requires_non_reference_trampoline(function));
         assert!(!ir_function_requires_trampoline(function));
     }

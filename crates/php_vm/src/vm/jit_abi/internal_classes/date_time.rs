@@ -17,30 +17,146 @@ fn object_from_value(value: Value) -> Result<php_runtime::api::ObjectRef, String
     }
 }
 
-fn timezone_from_value(value: &Value) -> Result<String, String> {
-    let object = object_argument("DateTimeZone", value)?;
+fn encoded_string_argument(
+    context: &mut NativeRequestColdState<'_>,
+    name: &str,
+    encoded: i64,
+) -> Result<String, String> {
+    let encoded = context.dereference_direct_encoding(encoded);
+    if let Some(bytes) = context.native_string_bytes(encoded) {
+        return Ok(String::from_utf8_lossy(bytes).into_owned());
+    }
+    let value = context.decode_baseline_value(encoded)?;
+    let value = match value {
+        Value::Reference(reference) => reference.get(),
+        value => value,
+    };
+    string_argument(name, value)
+}
+
+fn encoded_object(
+    context: &mut NativeRequestColdState<'_>,
+    name: &str,
+    encoded: i64,
+) -> Result<php_runtime::api::ObjectRef, String> {
+    if let Some(object) = context.native_query_object(encoded) {
+        return Ok(object);
+    }
+    let value = context.decode_baseline_value(encoded)?;
+    let value = match value {
+        Value::Reference(reference) => reference.get(),
+        value => value,
+    };
+    object_argument(name, &value)
+}
+
+fn object_timestamp(
+    context: &mut NativeRequestColdState<'_>,
+    encoded: i64,
+    object: &php_runtime::api::ObjectRef,
+) -> Option<i64> {
+    context
+        .native_object_property_value(encoded, "__timestamp")
+        .and_then(|value| context.native_encoded_int(value))
+        .or_else(|| php_runtime::api::datetime::object_timestamp(object))
+}
+
+fn object_timezone(
+    context: &mut NativeRequestColdState<'_>,
+    encoded: i64,
+    object: &php_runtime::api::ObjectRef,
+) -> Option<String> {
+    context
+        .native_object_property_value(encoded, "timezone")
+        .and_then(|value| context.native_string_name_bytes(value))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .or_else(|| php_runtime::api::datetime::object_timezone(object))
+}
+
+fn timezone_from_encoded(
+    context: &mut NativeRequestColdState<'_>,
+    encoded: i64,
+) -> Result<String, String> {
+    let object = encoded_object(context, "DateTimeZone", encoded)?;
     if normalize_class_name(&object.class_name()) != "datetimezone" {
         return Err(format!(
             "E_PHP_VM_DATETIMEZONE_ARG_TYPE: expected DateTimeZone, {} given",
             object.class_name()
         ));
     }
-    php_runtime::api::datetime::object_timezone(&object)
+    object_timezone(context, encoded, &object)
         .ok_or_else(|| "E_PHP_VM_DATETIMEZONE_INVALID: object has no timezone name".to_owned())
 }
 
-fn interval_seconds(value: &Value) -> Result<i64, String> {
-    let object = object_argument("DateInterval", value)?;
+fn interval_seconds(context: &mut NativeRequestColdState<'_>, encoded: i64) -> Result<i64, String> {
+    let object = encoded_object(context, "DateInterval", encoded)?;
     if normalize_class_name(&object.class_name()) != "dateinterval" {
         return Err(format!(
             "E_PHP_VM_DATEINTERVAL_ARG_TYPE: expected DateInterval, {} given",
             object.class_name()
         ));
     }
-    match object.get_property("__seconds") {
-        Some(Value::Int(seconds)) => Ok(seconds),
-        _ => Err("E_PHP_VM_DATEINTERVAL_INVALID: object has no seconds".to_owned()),
+    context
+        .native_object_property_value(encoded, "__seconds")
+        .and_then(|value| context.native_encoded_int(value))
+        .or_else(|| match object.get_property("__seconds") {
+            Some(Value::Int(seconds)) => Some(seconds),
+            _ => None,
+        })
+        .ok_or_else(|| "E_PHP_VM_DATEINTERVAL_INVALID: object has no seconds".to_owned())
+}
+
+fn encode_object_value(
+    context: &mut NativeRequestColdState<'_>,
+    value: Value,
+) -> Result<i64, String> {
+    let object = object_from_value(value)?;
+    context.encode_baseline_value(Value::Object(object))
+}
+
+fn encode_datetime(
+    context: &mut NativeRequestColdState<'_>,
+    immutable: bool,
+    timestamp: i64,
+    timezone: &str,
+) -> Result<i64, String> {
+    encode_object_value(
+        context,
+        if immutable {
+            php_runtime::api::datetime::datetime_immutable_object(timestamp, timezone)
+        } else {
+            php_runtime::api::datetime::datetime_object(timestamp, timezone)
+        },
+    )
+}
+
+fn encode_string(context: &mut NativeRequestColdState<'_>, value: String) -> Result<i64, String> {
+    context.encode_native_string_owner(PhpString::from_bytes(value.into_bytes()))
+}
+
+fn retain_receiver(
+    context: &mut NativeRequestColdState<'_>,
+    receiver: i64,
+    object: &php_runtime::api::ObjectRef,
+) -> Result<i64, String> {
+    if let Some(receiver) = context.duplicate_authoritative_native_value(receiver)? {
+        return Ok(receiver);
     }
+    context.encode_baseline_value(Value::Object(object.clone()))
+}
+
+fn replace_internal_property(
+    context: &mut NativeRequestColdState<'_>,
+    receiver: i64,
+    property: &str,
+    value: i64,
+) -> Result<(), String> {
+    if context.replace_native_object_property_owned(receiver, property, value)? {
+        return Ok(());
+    }
+    Err(format!(
+        "E_PHP_VM_DATETIME_NATIVE_STATE: {property} is not an authoritative native property"
+    ))
 }
 
 pub(in crate::vm::jit_abi) fn construct_native_date_time(
@@ -49,88 +165,89 @@ pub(in crate::vm::jit_abi) fn construct_native_date_time(
     arguments: &[i64],
 ) -> Option<Result<i64, String>> {
     let display_name = normalized_date_class(class_name)?;
-    let result = decode_arguments(context, arguments)
-        .and_then(
-            |arguments| match normalize_class_name(class_name).as_str() {
-                "datetime" | "datetimeimmutable" => {
-                    expect_arity(
-                        &format!("{display_name}::__construct"),
-                        arguments.len(),
-                        0,
-                        2,
-                    )?;
-                    let text = arguments
-                        .first()
-                        .cloned()
-                        .map(|value| string_argument(display_name, value))
-                        .transpose()?
-                        .unwrap_or_else(|| "now".to_owned());
-                    let timezone = arguments
-                        .get(1)
-                        .map(timezone_from_value)
-                        .transpose()?
-                        .unwrap_or_else(|| context.default_timezone.clone());
-                    let timestamp = php_runtime::api::datetime::parse_datetime_text_in_timezone(
-                        &text,
-                        php_runtime::api::datetime::current_timestamp(),
-                        &timezone,
-                    )
-                    .ok_or_else(|| {
-                        format!("E_PHP_VM_DATETIME_PARSE: could not parse DateTime text {text:?}")
-                    })?;
-                    object_from_value(if display_name == "DateTimeImmutable" {
-                        php_runtime::api::datetime::datetime_immutable_object(timestamp, &timezone)
-                    } else {
-                        php_runtime::api::datetime::datetime_object(timestamp, &timezone)
-                    })
-                }
-                "datetimezone" => {
-                    expect_arity("DateTimeZone::__construct", arguments.len(), 1, 1)?;
-                    let timezone =
-                        string_argument("DateTimeZone::__construct", arguments[0].clone())?;
-                    php_runtime::api::datetime::datetimezone_object(&timezone)
-                    .ok_or_else(|| {
-                        format!(
-                            "E_PHP_VM_DATETIMEZONE_INVALID: timezone {timezone:?} is unsupported"
-                        )
-                    })
-                    .and_then(object_from_value)
-                }
-                "dateinterval" => {
-                    expect_arity("DateInterval::__construct", arguments.len(), 1, 1)?;
-                    let spec = string_argument("DateInterval::__construct", arguments[0].clone())?;
-                    let seconds = php_runtime::api::datetime::parse_interval_spec(&spec)
-                        .ok_or_else(|| {
-                            format!(
-                                "E_PHP_VM_DATEINTERVAL_PARSE: interval spec {spec:?} is unsupported"
-                            )
-                        })?;
-                    object_from_value(php_runtime::api::datetime::dateinterval_object(seconds))
-                }
-                _ => unreachable!(),
-            },
-        )
-        .and_then(|object| context.encode_baseline_value(Value::Object(object)));
+    let result = (|| match normalize_class_name(class_name).as_str() {
+        "datetime" | "datetimeimmutable" => {
+            expect_arity(
+                &format!("{display_name}::__construct"),
+                arguments.len(),
+                0,
+                2,
+            )?;
+            let text = arguments
+                .first()
+                .copied()
+                .map(|value| encoded_string_argument(context, display_name, value))
+                .transpose()?
+                .unwrap_or_else(|| "now".to_owned());
+            let timezone = arguments
+                .get(1)
+                .copied()
+                .map(|value| timezone_from_encoded(context, value))
+                .transpose()?
+                .unwrap_or_else(|| context.default_timezone.clone());
+            let timestamp = php_runtime::api::datetime::parse_datetime_text_in_timezone(
+                &text,
+                php_runtime::api::datetime::current_timestamp(),
+                &timezone,
+            )
+            .ok_or_else(|| {
+                format!("E_PHP_VM_DATETIME_PARSE: could not parse DateTime text {text:?}")
+            })?;
+            encode_datetime(
+                context,
+                display_name == "DateTimeImmutable",
+                timestamp,
+                &timezone,
+            )
+        }
+        "datetimezone" => {
+            expect_arity("DateTimeZone::__construct", arguments.len(), 1, 1)?;
+            let timezone =
+                encoded_string_argument(context, "DateTimeZone::__construct", arguments[0])?;
+            let object =
+                php_runtime::api::datetime::datetimezone_object(&timezone).ok_or_else(|| {
+                    format!("E_PHP_VM_DATETIMEZONE_INVALID: timezone {timezone:?} is unsupported")
+                })?;
+            encode_object_value(context, object)
+        }
+        "dateinterval" => {
+            expect_arity("DateInterval::__construct", arguments.len(), 1, 1)?;
+            let spec = encoded_string_argument(context, "DateInterval::__construct", arguments[0])?;
+            let seconds =
+                php_runtime::api::datetime::parse_interval_spec(&spec).ok_or_else(|| {
+                    format!("E_PHP_VM_DATEINTERVAL_PARSE: interval spec {spec:?} is unsupported")
+                })?;
+            encode_object_value(
+                context,
+                php_runtime::api::datetime::dateinterval_object(seconds),
+            )
+        }
+        _ => unreachable!(),
+    })();
     Some(result)
 }
 
 fn call_date_time_method(
+    context: &mut NativeRequestColdState<'_>,
+    receiver: i64,
     object: &php_runtime::api::ObjectRef,
     method: &str,
-    arguments: Vec<Value>,
-) -> Result<Value, String> {
+    arguments: &[i64],
+) -> Result<i64, String> {
     let class_name = object.class_name();
     let immutable = normalize_class_name(&class_name) == "datetimeimmutable";
     match method.to_ascii_lowercase().as_str() {
         "format" => {
             expect_arity(&format!("{class_name}::format"), arguments.len(), 1, 1)?;
-            let format = string_argument(&format!("{class_name}::format"), arguments[0].clone())?;
-            let timestamp = php_runtime::api::datetime::object_timestamp(object).unwrap_or(0);
-            let timezone = php_runtime::api::datetime::object_timezone(object)
+            let format =
+                encoded_string_argument(context, &format!("{class_name}::format"), arguments[0])?;
+            let timestamp = object_timestamp(context, receiver, object).unwrap_or(0);
+            let timezone = object_timezone(context, receiver, object)
                 .unwrap_or_else(|| php_runtime::api::datetime::DEFAULT_TIMEZONE.to_owned());
-            Ok(Value::string(php_runtime::api::datetime::format_timestamp(
-                timestamp, &timezone, &format,
-            )))
+            encode_string(
+                context,
+                php_runtime::api::datetime::format_timestamp(timestamp, &timezone, &format),
+            )
         }
         "gettimestamp" => {
             expect_arity(
@@ -139,53 +256,82 @@ fn call_date_time_method(
                 0,
                 0,
             )?;
-            Ok(Value::Int(
-                php_runtime::api::datetime::object_timestamp(object).unwrap_or(0),
-            ))
+            let timestamp = object_timestamp(context, receiver, object).unwrap_or(0);
+            context.encode_native_int(timestamp)
         }
         "gettimezone" => {
             expect_arity(&format!("{class_name}::getTimezone"), arguments.len(), 0, 0)?;
-            let timezone = php_runtime::api::datetime::object_timezone(object)
+            let timezone = object_timezone(context, receiver, object)
                 .unwrap_or_else(|| php_runtime::api::datetime::DEFAULT_TIMEZONE.to_owned());
-            Ok(php_runtime::api::datetime::datetimezone_object(&timezone)
-                .unwrap_or(Value::Bool(false)))
+            match php_runtime::api::datetime::datetimezone_object(&timezone) {
+                Some(object) => encode_object_value(context, object),
+                None => context.encode_baseline_value(Value::Bool(false)),
+            }
         }
         "getoffset" => {
             expect_arity(&format!("{class_name}::getOffset"), arguments.len(), 0, 0)?;
-            let timezone = php_runtime::api::datetime::object_timezone(object)
+            let timezone = object_timezone(context, receiver, object)
                 .unwrap_or_else(|| php_runtime::api::datetime::DEFAULT_TIMEZONE.to_owned());
-            Ok(Value::Int(
-                php_runtime::api::datetime::timezone_offset_seconds(&timezone),
+            context.encode_native_int(php_runtime::api::datetime::timezone_offset_seconds(
+                &timezone,
             ))
         }
         "settimezone" => {
             expect_arity(&format!("{class_name}::setTimezone"), arguments.len(), 1, 1)?;
-            let timezone = timezone_from_value(&arguments[0])?;
-            php_runtime::api::datetime::with_timezone(object, &timezone, immutable).ok_or_else(
-                || format!("E_PHP_VM_DATETIMEZONE_INVALID: timezone {timezone:?} is unsupported"),
-            )
+            let timezone = timezone_from_encoded(context, arguments[0])?;
+            let timezone = php_runtime::api::datetime::normalize_timezone_identifier(&timezone)
+                .ok_or_else(|| {
+                    format!("E_PHP_VM_DATETIMEZONE_INVALID: timezone {timezone:?} is unsupported")
+                })?;
+            if immutable {
+                let timestamp = object_timestamp(context, receiver, object).unwrap_or(0);
+                return encode_datetime(context, true, timestamp, &timezone);
+            }
+            let timezone_value =
+                context.encode_native_string_owner(PhpString::from_bytes(timezone.into_bytes()))?;
+            replace_internal_property(context, receiver, "timezone", timezone_value)?;
+            retain_receiver(context, receiver, object)
         }
         "add" | "sub" => {
             expect_arity(&format!("{class_name}::{method}"), arguments.len(), 1, 1)?;
-            let mut seconds = interval_seconds(&arguments[0])?;
+            let mut seconds = interval_seconds(context, arguments[0])?;
             if method.eq_ignore_ascii_case("sub") {
                 seconds = seconds.saturating_neg();
             }
-            Ok(php_runtime::api::datetime::add_interval(
-                object, seconds, immutable,
-            ))
+            let timestamp = object_timestamp(context, receiver, object)
+                .unwrap_or(0)
+                .saturating_add(seconds);
+            if immutable {
+                let timezone = object_timezone(context, receiver, object)
+                    .unwrap_or_else(|| php_runtime::api::datetime::DEFAULT_TIMEZONE.to_owned());
+                return encode_datetime(context, true, timestamp, &timezone);
+            }
+            let timestamp_value = context.encode_native_int(timestamp)?;
+            replace_internal_property(context, receiver, "__timestamp", timestamp_value)?;
+            retain_receiver(context, receiver, object)
         }
         "modify" => {
             expect_arity(&format!("{class_name}::modify"), arguments.len(), 1, 1)?;
-            let modifier = string_argument(&format!("{class_name}::modify"), arguments[0].clone())?;
-            Ok(
-                php_runtime::api::datetime::modify_object(object, &modifier, immutable)
-                    .unwrap_or(Value::Bool(false)),
-            )
+            let modifier =
+                encoded_string_argument(context, &format!("{class_name}::modify"), arguments[0])?;
+            let Some(timestamp) = php_runtime::api::datetime::parse_datetime_text(
+                &modifier,
+                object_timestamp(context, receiver, object).unwrap_or(0),
+            ) else {
+                return context.encode_baseline_value(Value::Bool(false));
+            };
+            if immutable {
+                let timezone = object_timezone(context, receiver, object)
+                    .unwrap_or_else(|| php_runtime::api::datetime::DEFAULT_TIMEZONE.to_owned());
+                return encode_datetime(context, true, timestamp, &timezone);
+            }
+            let timestamp_value = context.encode_native_int(timestamp)?;
+            replace_internal_property(context, receiver, "__timestamp", timestamp_value)?;
+            retain_receiver(context, receiver, object)
         }
         "diff" => {
             expect_arity(&format!("{class_name}::diff"), arguments.len(), 1, 1)?;
-            let right = object_argument(&format!("{class_name}::diff"), &arguments[0])?;
+            let right = encoded_object(context, &format!("{class_name}::diff"), arguments[0])?;
             if !matches!(
                 normalize_class_name(&right.class_name()).as_str(),
                 "datetime" | "datetimeimmutable"
@@ -194,7 +340,13 @@ fn call_date_time_method(
                     "E_PHP_VM_DATETIME_ARG_TYPE: {class_name}::diff expects DateTimeInterface"
                 ));
             }
-            Ok(php_runtime::api::datetime::diff_objects(object, &right))
+            let seconds = object_timestamp(context, arguments[0], &right)
+                .unwrap_or(0)
+                .saturating_sub(object_timestamp(context, receiver, object).unwrap_or(0));
+            encode_object_value(
+                context,
+                php_runtime::api::datetime::dateinterval_object(seconds),
+            )
         }
         method => Err(format!(
             "E_PHP_VM_UNKNOWN_METHOD: method {class_name}::{method} is not implemented"
@@ -203,29 +355,33 @@ fn call_date_time_method(
 }
 
 fn call_timezone_method(
+    context: &mut NativeRequestColdState<'_>,
+    receiver: i64,
     object: &php_runtime::api::ObjectRef,
     method: &str,
-    arguments: Vec<Value>,
-) -> Result<Value, String> {
+    arguments: &[i64],
+) -> Result<i64, String> {
     match method.to_ascii_lowercase().as_str() {
         "getname" => {
             expect_arity("DateTimeZone::getName", arguments.len(), 0, 0)?;
-            Ok(php_runtime::api::datetime::object_timezone(object)
-                .map_or(Value::Bool(false), Value::string))
+            match object_timezone(context, receiver, object) {
+                Some(timezone) => encode_string(context, timezone),
+                None => context.encode_baseline_value(Value::Bool(false)),
+            }
         }
         "getoffset" => {
             expect_arity("DateTimeZone::getOffset", arguments.len(), 1, 1)?;
-            let datetime = object_argument("DateTimeZone::getOffset", &arguments[0])?;
+            let datetime = encoded_object(context, "DateTimeZone::getOffset", arguments[0])?;
             if !matches!(
                 normalize_class_name(&datetime.class_name()).as_str(),
                 "datetime" | "datetimeimmutable"
             ) {
                 return Err("E_PHP_VM_DATETIMEZONE_ARG_TYPE: expected DateTimeInterface".to_owned());
             }
-            let timezone = php_runtime::api::datetime::object_timezone(object)
+            let timezone = object_timezone(context, receiver, object)
                 .unwrap_or_else(|| php_runtime::api::datetime::DEFAULT_TIMEZONE.to_owned());
-            Ok(Value::Int(
-                php_runtime::api::datetime::timezone_offset_seconds(&timezone),
+            context.encode_native_int(php_runtime::api::datetime::timezone_offset_seconds(
+                &timezone,
             ))
         }
         method => Err(format!(
@@ -235,18 +391,26 @@ fn call_timezone_method(
 }
 
 fn call_interval_method(
+    context: &mut NativeRequestColdState<'_>,
+    receiver: i64,
     object: &php_runtime::api::ObjectRef,
     method: &str,
-    arguments: Vec<Value>,
-) -> Result<Value, String> {
+    arguments: &[i64],
+) -> Result<i64, String> {
     match method.to_ascii_lowercase().as_str() {
         "format" => {
             expect_arity("DateInterval::format", arguments.len(), 1, 1)?;
-            let format = string_argument("DateInterval::format", arguments[0].clone())?;
-            Ok(Value::string(php_runtime::api::datetime::format_interval(
-                interval_seconds(&Value::Object(object.clone()))?,
-                &format,
-            )))
+            let format = encoded_string_argument(context, "DateInterval::format", arguments[0])?;
+            let seconds = interval_seconds(context, receiver).or_else(|_| {
+                match object.get_property("__seconds") {
+                    Some(Value::Int(seconds)) => Ok(seconds),
+                    _ => Err("E_PHP_VM_DATEINTERVAL_INVALID: object has no seconds".to_owned()),
+                }
+            })?;
+            encode_string(
+                context,
+                php_runtime::api::datetime::format_interval(seconds, &format),
+            )
         }
         method => Err(format!(
             "E_PHP_VM_UNKNOWN_METHOD: method DateInterval::{method} is not implemented"
@@ -265,13 +429,18 @@ pub(in crate::vm::jit_abi) fn execute_native_date_time_instruction(
         } => construct_native_date_time(context, display_class_name, arguments),
         php_ir::InstructionKind::CallMethod { method, .. } => {
             let receiver = arguments.first().copied()?;
-            let receiver = match context.decode_baseline_value(receiver) {
-                Ok(Value::Reference(reference)) => reference.get(),
-                Ok(value) => value,
-                Err(error) => return Some(Err(error)),
-            };
-            let Value::Object(object) = receiver else {
-                return None;
+            let object = if let Some(object) = context.native_query_object(receiver) {
+                object
+            } else {
+                let receiver = match context.decode_baseline_value(receiver) {
+                    Ok(Value::Reference(reference)) => reference.get(),
+                    Ok(value) => value,
+                    Err(error) => return Some(Err(error)),
+                };
+                let Value::Object(object) = receiver else {
+                    return None;
+                };
+                object
             };
             let class = normalize_class_name(&object.class_name());
             if !matches!(
@@ -280,16 +449,18 @@ pub(in crate::vm::jit_abi) fn execute_native_date_time_instruction(
             ) {
                 return None;
             }
-            let result = decode_arguments(context, &arguments[1..])
-                .and_then(|arguments| match class.as_str() {
-                    "datetime" | "datetimeimmutable" => {
-                        call_date_time_method(&object, method, arguments)
-                    }
-                    "datetimezone" => call_timezone_method(&object, method, arguments),
-                    "dateinterval" => call_interval_method(&object, method, arguments),
-                    _ => unreachable!(),
-                })
-                .and_then(|value| context.encode_baseline_value(value));
+            let result = match class.as_str() {
+                "datetime" | "datetimeimmutable" => {
+                    call_date_time_method(context, receiver, &object, method, &arguments[1..])
+                }
+                "datetimezone" => {
+                    call_timezone_method(context, receiver, &object, method, &arguments[1..])
+                }
+                "dateinterval" => {
+                    call_interval_method(context, receiver, &object, method, &arguments[1..])
+                }
+                _ => unreachable!(),
+            };
             Some(result)
         }
         _ => None,

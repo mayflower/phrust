@@ -58,6 +58,28 @@ pub(super) fn execute_native_internal_class(
     instruction: &php_ir::Instruction,
     arguments: &[i64],
 ) -> Option<Result<i64, String>> {
+    if matches!(instruction.kind, php_ir::InstructionKind::CallMethod { .. })
+        && let Some(object) = arguments
+            .first()
+            .and_then(|receiver| context.native_query_object(*receiver))
+    {
+        let class = normalize_class_name(&object.class_name());
+        return match class.as_str() {
+            "domdocument" | "domnode" | "domelement" | "domattr" | "domtext" | "domcomment"
+            | "domcdatasection" | "domnodelist" | "domnamednodemap" | "domxpath" => {
+                execute_native_dom_instruction(context, instruction, arguments)
+            }
+            "datetime" | "datetimeimmutable" | "datetimezone" | "dateinterval" => {
+                execute_native_date_time_instruction(context, instruction, arguments)
+            }
+            "simplexmlelement" => {
+                execute_native_simple_xml_instruction(context, instruction, arguments)
+            }
+            "xmlreader" => execute_native_xml_reader_instruction(context, instruction, arguments),
+            "xmlwriter" => execute_native_xml_writer_instruction(context, instruction, arguments),
+            _ => None,
+        };
+    }
     execute_native_dom_instruction(context, instruction, arguments)
         .or_else(|| execute_native_date_time_instruction(context, instruction, arguments))
         .or_else(|| execute_native_mysqli_instruction(context, instruction, arguments))

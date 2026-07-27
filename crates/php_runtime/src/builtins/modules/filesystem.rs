@@ -304,8 +304,124 @@ pub fn native_file_exists(
     filesystem: &crate::FilesystemCapabilities,
     path: &[u8],
 ) -> Option<bool> {
+    native_local_metadata(cwd, filesystem, path, true).map(|metadata| metadata.is_some())
+}
+
+/// Exact native local-filesystem `is_file` query.
+///
+/// The outer `None` marks a registered/wrapper URI that requires the single
+/// baseline continuation. Local denial or metadata failure is the
+/// PHP-visible `false` result.
+pub fn native_is_file(
+    cwd: &Path,
+    filesystem: &crate::FilesystemCapabilities,
+    path: &[u8],
+) -> Option<bool> {
+    native_local_metadata(cwd, filesystem, path, true)
+        .map(|metadata| metadata.is_some_and(|metadata| metadata.is_file()))
+}
+
+/// Exact native local-filesystem `is_dir` query.
+pub fn native_is_dir(
+    cwd: &Path,
+    filesystem: &crate::FilesystemCapabilities,
+    path: &[u8],
+) -> Option<bool> {
+    native_local_metadata(cwd, filesystem, path, true)
+        .map(|metadata| metadata.is_some_and(|metadata| metadata.is_dir()))
+}
+
+/// Exact native local-filesystem `is_readable` query.
+///
+/// This deliberately preserves the runtime's established PHP-visible
+/// semantics: an allowed path with readable metadata is considered readable.
+pub fn native_is_readable(
+    cwd: &Path,
+    filesystem: &crate::FilesystemCapabilities,
+    path: &[u8],
+) -> Option<bool> {
+    native_local_metadata(cwd, filesystem, path, true).map(|metadata| metadata.is_some())
+}
+
+/// Exact native local-filesystem `is_writable` query.
+pub fn native_is_writable(
+    cwd: &Path,
+    filesystem: &crate::FilesystemCapabilities,
+    path: &[u8],
+) -> Option<bool> {
+    native_local_metadata(cwd, filesystem, path, true)
+        .map(|metadata| metadata.is_some_and(|metadata| !metadata.permissions().readonly()))
+}
+
+/// Exact native local-filesystem `filesize` query.
+///
+/// `Some(None)` is the PHP-visible `false` result; outer `None` requests the
+/// one baseline continuation for wrapper-backed paths.
+pub fn native_filesize(
+    cwd: &Path,
+    filesystem: &crate::FilesystemCapabilities,
+    path: &[u8],
+) -> Option<Option<i64>> {
+    native_local_metadata(cwd, filesystem, path, true)
+        .map(|metadata| metadata.map(|metadata| metadata.len() as i64))
+}
+
+/// Exact native local-filesystem `filemtime` query.
+pub fn native_filemtime(
+    cwd: &Path,
+    filesystem: &crate::FilesystemCapabilities,
+    path: &[u8],
+) -> Option<Option<i64>> {
+    native_local_metadata(cwd, filesystem, path, true)
+        .map(|metadata| metadata.map(|metadata| metadata_mtime(&metadata)))
+}
+
+/// Exact native local-file `file_get_contents` implementation.
+///
+/// Stream wrappers, denied capabilities, and I/O errors return `None` before
+/// publication so the caller can take its single baseline continuation and
+/// preserve wrapper coordination and PHP warnings. A successful local read
+/// returns only the final byte allocation.
+pub fn native_file_get_contents(
+    cwd: &Path,
+    filesystem: &crate::FilesystemCapabilities,
+    path: &[u8],
+    offset: i64,
+    length: Option<i64>,
+) -> Option<Vec<u8>> {
+    let resolved = native_local_path(cwd, filesystem, path)??;
+    let contents = fs::read(resolved).ok()?;
+    Some(file_get_contents_slice(&contents, offset, length))
+}
+
+fn native_local_metadata(
+    cwd: &Path,
+    filesystem: &crate::FilesystemCapabilities,
+    path: &[u8],
+    follow_links: bool,
+) -> Option<Option<fs::Metadata>> {
+    let Some(resolved) = native_local_path(cwd, filesystem, path)? else {
+        return Some(None);
+    };
+    let metadata = if follow_links {
+        fs::metadata(resolved)
+    } else {
+        fs::symlink_metadata(resolved)
+    };
+    Some(metadata.ok())
+}
+
+/// Resolves a local path without consulting runtime `Value` or builtin state.
+///
+/// Outer `None` is a wrapper URI, `Some(None)` is capability denial, and
+/// `Some(Some(path))` is an admitted local path.
+fn native_local_path(
+    cwd: &Path,
+    filesystem: &crate::FilesystemCapabilities,
+    path: &[u8],
+) -> Option<Option<PathBuf>> {
     let path = String::from_utf8_lossy(path);
-    if crate::phar::is_phar_uri(&path) {
+    if crate::phar::is_phar_uri(&path) || path.contains("://") {
         return None;
     }
     let raw = Path::new(path.as_ref());
@@ -315,7 +431,7 @@ pub fn native_file_exists(
         cwd.join(raw)
     };
     let resolved = normalize_runtime_path(&joined);
-    Some(filesystem.allows_path(&resolved) && fs::metadata(resolved).is_ok())
+    Some(filesystem.allows_path(&resolved).then_some(resolved))
 }
 
 pub(in crate::builtins::modules) fn builtin_is_file(

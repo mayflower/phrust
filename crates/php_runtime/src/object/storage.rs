@@ -49,6 +49,8 @@ impl NativeDynamicPropertyCell {
 /// `unset`, and later reinsertion.
 pub type NativeDynamicPropertySlots = HashMap<String, Box<NativeDynamicPropertyCell>>;
 
+type RustPropertySlots = (Vec<Option<Value>>, HashMap<String, Value>);
+
 /// Class-owned declared-property layout, shared across instances of the
 /// same class through a thread-local cache. The layout maps storage names
 /// (private names arrive pre-mangled as `private:Owner:prop`) to slot
@@ -724,12 +726,10 @@ impl ObjectRef {
         value: Value,
     ) -> Result<(), BorrowMutError> {
         let name = name.into();
-        let result = self
-            .cell
+        self.cell
             .storage
             .try_borrow_mut()
-            .map(|mut storage| storage.set(name, value));
-        result
+            .map(|mut storage| storage.set(name, value))
     }
 
     /// Runs `f` with a borrowed view of a property value, preferring
@@ -919,10 +919,7 @@ impl ObjectRef {
     /// Moves every declared and dynamic Rust property value out for
     /// request-native promotion. No Rust property value remains authoritative
     /// afterwards; dynamic names and their insertion order stay object-owned.
-    pub fn take_property_slots_for_native(
-        &self,
-        layout_id: u64,
-    ) -> Option<(Vec<Option<Value>>, HashMap<String, Value>)> {
+    pub fn take_property_slots_for_native(&self, layout_id: u64) -> Option<RustPropertySlots> {
         let mut storage = self.cell.storage.borrow_mut();
         if storage.layout.layout_id != layout_id
             || storage.native_declared_slots.is_some()
@@ -1066,9 +1063,7 @@ impl ObjectRef {
                 .native_dynamic_properties
                 .as_ref()?
                 .get(name)
-                .map(|cell| {
-                    (std::ptr::from_ref(&cell.slot) as *const NativeDeclaredPropertySlot).cast_mut()
-                }),
+                .map(|cell| std::ptr::from_ref(&cell.slot).cast_mut()),
         )
     }
 

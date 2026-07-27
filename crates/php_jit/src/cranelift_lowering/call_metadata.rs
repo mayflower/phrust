@@ -95,6 +95,8 @@ pub(super) fn stable_builtin_type_predicate(target: &RegionCallTarget) -> Option
         "is_object" => Some(6),
         "is_resource" => Some(7),
         "is_scalar" => Some(8),
+        "is_countable" => Some(9),
+        "is_iterable" => Some(10),
         _ => None,
     }
 }
@@ -1336,10 +1338,10 @@ pub(super) fn stable_builtin_string_rewrite(
 /// Exact stateless HTML entity codecs over authoritative native bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StableHtmlCodecBuiltin {
-    HtmlSpecialChars,
-    HtmlEntities,
-    HtmlEntityDecode,
-    HtmlSpecialCharsDecode,
+    SpecialChars,
+    Entities,
+    EntityDecode,
+    SpecialCharsDecode,
 }
 
 impl StableHtmlCodecBuiltin {
@@ -1347,36 +1349,36 @@ impl StableHtmlCodecBuiltin {
 
     pub(super) const fn index(self) -> usize {
         match self {
-            Self::HtmlSpecialChars => 0,
-            Self::HtmlEntities => 1,
-            Self::HtmlEntityDecode => 2,
-            Self::HtmlSpecialCharsDecode => 3,
+            Self::SpecialChars => 0,
+            Self::Entities => 1,
+            Self::EntityDecode => 2,
+            Self::SpecialCharsDecode => 3,
         }
     }
 
     pub(super) const fn symbol(self) -> &'static str {
         match self {
-            Self::HtmlSpecialChars => "phrust_native_htmlspecialchars",
-            Self::HtmlEntities => "phrust_native_htmlentities",
-            Self::HtmlEntityDecode => "phrust_native_html_entity_decode",
-            Self::HtmlSpecialCharsDecode => "phrust_native_htmlspecialchars_decode",
+            Self::SpecialChars => "phrust_native_htmlspecialchars",
+            Self::Entities => "phrust_native_htmlentities",
+            Self::EntityDecode => "phrust_native_html_entity_decode",
+            Self::SpecialCharsDecode => "phrust_native_htmlspecialchars_decode",
         }
     }
 
     pub(super) const fn accepts_arity(self, arity: usize) -> bool {
         match self {
-            Self::HtmlSpecialChars | Self::HtmlEntities => arity >= 1 && arity <= 4,
-            Self::HtmlEntityDecode => arity >= 1 && arity <= 3,
-            Self::HtmlSpecialCharsDecode => arity == 1 || arity == 2,
+            Self::SpecialChars | Self::Entities => arity >= 1 && arity <= 4,
+            Self::EntityDecode => arity >= 1 && arity <= 3,
+            Self::SpecialCharsDecode => arity == 1 || arity == 2,
         }
     }
 
     pub(super) const fn all() -> [Self; Self::COUNT] {
         [
-            Self::HtmlSpecialChars,
-            Self::HtmlEntities,
-            Self::HtmlEntityDecode,
-            Self::HtmlSpecialCharsDecode,
+            Self::SpecialChars,
+            Self::Entities,
+            Self::EntityDecode,
+            Self::SpecialCharsDecode,
         ]
     }
 }
@@ -1392,10 +1394,10 @@ pub(super) fn stable_builtin_html_codec(
         return None;
     }
     match normalized.to_ascii_lowercase().as_str() {
-        "htmlspecialchars" => Some(StableHtmlCodecBuiltin::HtmlSpecialChars),
-        "htmlentities" => Some(StableHtmlCodecBuiltin::HtmlEntities),
-        "html_entity_decode" => Some(StableHtmlCodecBuiltin::HtmlEntityDecode),
-        "htmlspecialchars_decode" => Some(StableHtmlCodecBuiltin::HtmlSpecialCharsDecode),
+        "htmlspecialchars" => Some(StableHtmlCodecBuiltin::SpecialChars),
+        "htmlentities" => Some(StableHtmlCodecBuiltin::Entities),
+        "html_entity_decode" => Some(StableHtmlCodecBuiltin::EntityDecode),
+        "htmlspecialchars_decode" => Some(StableHtmlCodecBuiltin::SpecialCharsDecode),
         _ => None,
     }
 }
@@ -1467,13 +1469,31 @@ pub(super) enum StablePathBuiltin {
     Dirname,
     Realpath,
     FileExists,
+    IsFile,
+    IsDir,
+    IsReadable,
+    IsWritable,
+    Filesize,
+    Filemtime,
+    FileGetContents,
     Fopen,
     Fwrite,
     Fclose,
+    Fread,
+    Fgets,
+    Fgetc,
+    Feof,
+    Fflush,
+    Fseek,
+    Ftell,
+    Ftruncate,
+    Rewind,
+    StreamGetContents,
+    StreamCopyToStream,
 }
 
 impl StablePathBuiltin {
-    pub(super) const COUNT: usize = 7;
+    pub(super) const COUNT: usize = 25;
 
     pub(super) const fn index(self) -> usize {
         match self {
@@ -1481,9 +1501,27 @@ impl StablePathBuiltin {
             Self::Dirname => 1,
             Self::Realpath => 2,
             Self::FileExists => 3,
-            Self::Fopen => 4,
-            Self::Fwrite => 5,
-            Self::Fclose => 6,
+            Self::IsFile => 4,
+            Self::IsDir => 5,
+            Self::IsReadable => 6,
+            Self::IsWritable => 7,
+            Self::Filesize => 8,
+            Self::Filemtime => 9,
+            Self::FileGetContents => 10,
+            Self::Fopen => 11,
+            Self::Fwrite => 12,
+            Self::Fclose => 13,
+            Self::Fread => 14,
+            Self::Fgets => 15,
+            Self::Fgetc => 16,
+            Self::Feof => 17,
+            Self::Fflush => 18,
+            Self::Fseek => 19,
+            Self::Ftell => 20,
+            Self::Ftruncate => 21,
+            Self::Rewind => 22,
+            Self::StreamGetContents => 23,
+            Self::StreamCopyToStream => 24,
         }
     }
 
@@ -1493,21 +1531,54 @@ impl StablePathBuiltin {
             Self::Dirname => "phrust_native_dirname",
             Self::Realpath => "phrust_native_realpath",
             Self::FileExists => "phrust_native_file_exists",
+            Self::IsFile => "phrust_native_is_file",
+            Self::IsDir => "phrust_native_is_dir",
+            Self::IsReadable => "phrust_native_is_readable",
+            Self::IsWritable => "phrust_native_is_writable",
+            Self::Filesize => "phrust_native_filesize",
+            Self::Filemtime => "phrust_native_filemtime",
+            Self::FileGetContents => "phrust_native_file_get_contents",
             Self::Fopen => "phrust_native_fopen",
             Self::Fwrite => "phrust_native_fwrite",
             Self::Fclose => "phrust_native_fclose",
+            Self::Fread => "phrust_native_fread",
+            Self::Fgets => "phrust_native_fgets",
+            Self::Fgetc => "phrust_native_fgetc",
+            Self::Feof => "phrust_native_feof",
+            Self::Fflush => "phrust_native_fflush",
+            Self::Fseek => "phrust_native_fseek",
+            Self::Ftell => "phrust_native_ftell",
+            Self::Ftruncate => "phrust_native_ftruncate",
+            Self::Rewind => "phrust_native_rewind",
+            Self::StreamGetContents => "phrust_native_stream_get_contents",
+            Self::StreamCopyToStream => "phrust_native_stream_copy_to_stream",
         }
     }
 
     pub(super) const fn accepts_arity(self, arity: usize) -> bool {
         match self {
             Self::Basename | Self::Dirname => arity == 1 || arity == 2,
-            Self::Realpath | Self::FileExists => arity == 1,
+            Self::Realpath
+            | Self::FileExists
+            | Self::IsFile
+            | Self::IsDir
+            | Self::IsReadable
+            | Self::IsWritable
+            | Self::Filesize
+            | Self::Filemtime => arity == 1,
+            Self::FileGetContents => arity >= 1 && arity <= 5,
             // Optional fopen include-path/context shapes retain their one
             // baseline continuation until those capabilities are published.
             Self::Fopen => arity == 2,
             Self::Fwrite => arity == 2 || arity == 3,
-            Self::Fclose => arity == 1,
+            Self::Fclose | Self::Fgetc | Self::Feof | Self::Fflush | Self::Ftell | Self::Rewind => {
+                arity == 1
+            }
+            Self::Fread | Self::Ftruncate => arity == 2,
+            Self::Fgets => arity == 1 || arity == 2,
+            Self::Fseek => arity == 2 || arity == 3,
+            Self::StreamGetContents => arity >= 1 && arity <= 3,
+            Self::StreamCopyToStream => arity >= 2 && arity <= 4,
         }
     }
 
@@ -1517,9 +1588,27 @@ impl StablePathBuiltin {
             Self::Dirname,
             Self::Realpath,
             Self::FileExists,
+            Self::IsFile,
+            Self::IsDir,
+            Self::IsReadable,
+            Self::IsWritable,
+            Self::Filesize,
+            Self::Filemtime,
+            Self::FileGetContents,
             Self::Fopen,
             Self::Fwrite,
             Self::Fclose,
+            Self::Fread,
+            Self::Fgets,
+            Self::Fgetc,
+            Self::Feof,
+            Self::Fflush,
+            Self::Fseek,
+            Self::Ftell,
+            Self::Ftruncate,
+            Self::Rewind,
+            Self::StreamGetContents,
+            Self::StreamCopyToStream,
         ]
     }
 }
@@ -1537,9 +1626,117 @@ pub(super) fn stable_builtin_path(target: &RegionCallTarget) -> Option<StablePat
         "dirname" => Some(StablePathBuiltin::Dirname),
         "realpath" => Some(StablePathBuiltin::Realpath),
         "file_exists" => Some(StablePathBuiltin::FileExists),
+        "is_file" => Some(StablePathBuiltin::IsFile),
+        "is_dir" => Some(StablePathBuiltin::IsDir),
+        "is_readable" => Some(StablePathBuiltin::IsReadable),
+        "is_writable" => Some(StablePathBuiltin::IsWritable),
+        "filesize" => Some(StablePathBuiltin::Filesize),
+        "filemtime" => Some(StablePathBuiltin::Filemtime),
+        "file_get_contents" => Some(StablePathBuiltin::FileGetContents),
         "fopen" => Some(StablePathBuiltin::Fopen),
         "fwrite" => Some(StablePathBuiltin::Fwrite),
         "fclose" => Some(StablePathBuiltin::Fclose),
+        "fread" => Some(StablePathBuiltin::Fread),
+        "fgets" => Some(StablePathBuiltin::Fgets),
+        "fgetc" => Some(StablePathBuiltin::Fgetc),
+        "feof" => Some(StablePathBuiltin::Feof),
+        "fflush" => Some(StablePathBuiltin::Fflush),
+        "fseek" => Some(StablePathBuiltin::Fseek),
+        "ftell" => Some(StablePathBuiltin::Ftell),
+        "ftruncate" => Some(StablePathBuiltin::Ftruncate),
+        "rewind" => Some(StablePathBuiltin::Rewind),
+        "stream_get_contents" => Some(StablePathBuiltin::StreamGetContents),
+        "stream_copy_to_stream" => Some(StablePathBuiltin::StreamCopyToStream),
+        _ => None,
+    }
+}
+
+/// Exact request-local output-buffer operations selected at compile time.
+///
+/// The default output-buffer operations consume only the authoritative
+/// request output stack and native string plane. `ob_start()` callback,
+/// chunk-size, and flags shapes retain their one baseline continuation until
+/// a native output-handler stack is published.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableOutputBufferBuiltin {
+    Start,
+    GetClean,
+    GetContents,
+    GetFlush,
+    GetLength,
+    GetLevel,
+    EndFlush,
+    EndClean,
+}
+
+impl StableOutputBufferBuiltin {
+    pub(super) const COUNT: usize = 8;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::Start => 0,
+            Self::GetClean => 1,
+            Self::GetContents => 2,
+            Self::GetFlush => 3,
+            Self::GetLength => 4,
+            Self::GetLevel => 5,
+            Self::EndFlush => 6,
+            Self::EndClean => 7,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::Start => "phrust_native_ob_start",
+            Self::GetClean => "phrust_native_ob_get_clean",
+            Self::GetContents => "phrust_native_ob_get_contents",
+            Self::GetFlush => "phrust_native_ob_get_flush",
+            Self::GetLength => "phrust_native_ob_get_length",
+            Self::GetLevel => "phrust_native_ob_get_level",
+            Self::EndFlush => "phrust_native_ob_end_flush",
+            Self::EndClean => "phrust_native_ob_end_clean",
+        }
+    }
+
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        // Optional ob_start arguments select output-handler semantics that are
+        // deliberately baseline-only until their state has a native record.
+        arity == 0
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [
+            Self::Start,
+            Self::GetClean,
+            Self::GetContents,
+            Self::GetFlush,
+            Self::GetLength,
+            Self::GetLevel,
+            Self::EndFlush,
+            Self::EndClean,
+        ]
+    }
+}
+
+pub(super) fn stable_builtin_output_buffer(
+    target: &RegionCallTarget,
+) -> Option<StableOutputBufferBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "ob_start" => Some(StableOutputBufferBuiltin::Start),
+        "ob_get_clean" => Some(StableOutputBufferBuiltin::GetClean),
+        "ob_get_contents" => Some(StableOutputBufferBuiltin::GetContents),
+        "ob_get_flush" => Some(StableOutputBufferBuiltin::GetFlush),
+        "ob_get_length" => Some(StableOutputBufferBuiltin::GetLength),
+        "ob_get_level" => Some(StableOutputBufferBuiltin::GetLevel),
+        "ob_end_flush" => Some(StableOutputBufferBuiltin::EndFlush),
+        "ob_end_clean" => Some(StableOutputBufferBuiltin::EndClean),
         _ => None,
     }
 }
@@ -1865,9 +2062,9 @@ pub(super) fn stable_builtin_array_preserving_sort(
 /// Rust `Value` trees.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StableFrameIntrospectionBuiltin {
-    FuncNumArgs,
-    FuncGetArg,
-    FuncGetArgs,
+    NumArgs,
+    GetArg,
+    GetArgs,
 }
 
 impl StableFrameIntrospectionBuiltin {
@@ -1875,29 +2072,29 @@ impl StableFrameIntrospectionBuiltin {
 
     pub(super) const fn index(self) -> usize {
         match self {
-            Self::FuncNumArgs => 0,
-            Self::FuncGetArg => 1,
-            Self::FuncGetArgs => 2,
+            Self::NumArgs => 0,
+            Self::GetArg => 1,
+            Self::GetArgs => 2,
         }
     }
 
     pub(super) const fn symbol(self) -> &'static str {
         match self {
-            Self::FuncNumArgs => "phrust_native_func_num_args",
-            Self::FuncGetArg => "phrust_native_func_get_arg",
-            Self::FuncGetArgs => "phrust_native_func_get_args",
+            Self::NumArgs => "phrust_native_func_num_args",
+            Self::GetArg => "phrust_native_func_get_arg",
+            Self::GetArgs => "phrust_native_func_get_args",
         }
     }
 
     pub(super) const fn accepts_arity(self, arity: usize) -> bool {
         match self {
-            Self::FuncGetArg => arity == 1,
-            Self::FuncNumArgs | Self::FuncGetArgs => arity == 0,
+            Self::GetArg => arity == 1,
+            Self::NumArgs | Self::GetArgs => arity == 0,
         }
     }
 
     pub(super) const fn all() -> [Self; Self::COUNT] {
-        [Self::FuncNumArgs, Self::FuncGetArg, Self::FuncGetArgs]
+        [Self::NumArgs, Self::GetArg, Self::GetArgs]
     }
 }
 
@@ -1912,11 +2109,493 @@ pub(super) fn stable_builtin_frame_introspection(
         return None;
     }
     match normalized.to_ascii_lowercase().as_str() {
-        "func_num_args" => Some(StableFrameIntrospectionBuiltin::FuncNumArgs),
-        "func_get_arg" => Some(StableFrameIntrospectionBuiltin::FuncGetArg),
-        "func_get_args" => Some(StableFrameIntrospectionBuiltin::FuncGetArgs),
+        "func_num_args" => Some(StableFrameIntrospectionBuiltin::NumArgs),
+        "func_get_arg" => Some(StableFrameIntrospectionBuiltin::GetArg),
+        "func_get_args" => Some(StableFrameIntrospectionBuiltin::GetArgs),
         _ => None,
     }
+}
+
+/// Stable object identity reads over authoritative direct object and closure
+/// owners. Hash and integer forms have separate fixed ABIs; neither operation
+/// enters generic SPL dispatch or materializes declared object properties.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableObjectIdentityBuiltin {
+    Hash,
+    Id,
+}
+
+impl StableObjectIdentityBuiltin {
+    pub(super) const COUNT: usize = 2;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::Hash => 0,
+            Self::Id => 1,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::Hash => "phrust_native_spl_object_hash",
+            Self::Id => "phrust_native_spl_object_id",
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [Self::Hash, Self::Id]
+    }
+}
+
+pub(super) fn stable_builtin_object_identity(
+    target: &RegionCallTarget,
+) -> Option<StableObjectIdentityBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "spl_object_hash" => Some(StableObjectIdentityBuiltin::Hash),
+        "spl_object_id" => Some(StableObjectIdentityBuiltin::Id),
+        _ => None,
+    }
+}
+
+/// PHP wire serialization over authoritative native scalar/array graphs.
+/// Object hooks, reference records, request-specific float precision, and
+/// malformed-input diagnostics retain one baseline continuation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableSerializationBuiltin {
+    Serialize,
+    Unserialize,
+}
+
+impl StableSerializationBuiltin {
+    pub(super) const COUNT: usize = 2;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::Serialize => 0,
+            Self::Unserialize => 1,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::Serialize => "phrust_native_serialize",
+            Self::Unserialize => "phrust_native_unserialize",
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [Self::Serialize, Self::Unserialize]
+    }
+}
+
+pub(super) fn stable_builtin_serialization(
+    target: &RegionCallTarget,
+) -> Option<StableSerializationBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "serialize" => Some(StableSerializationBuiltin::Serialize),
+        "unserialize" => Some(StableSerializationBuiltin::Unserialize),
+        _ => None,
+    }
+}
+
+/// Stable object-property projections over the authoritative native object
+/// layout. Visible and mangled forms have separate fixed ABIs so optimizing
+/// code never enters generic builtin dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableObjectVarsBuiltin {
+    Visible,
+    Mangled,
+}
+
+impl StableObjectVarsBuiltin {
+    pub(super) const COUNT: usize = 2;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::Visible => 0,
+            Self::Mangled => 1,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::Visible => "phrust_native_get_object_vars",
+            Self::Mangled => "phrust_native_get_mangled_object_vars",
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [Self::Visible, Self::Mangled]
+    }
+}
+
+pub(super) fn stable_builtin_object_vars(
+    target: &RegionCallTarget,
+) -> Option<StableObjectVarsBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "get_object_vars" => Some(StableObjectVarsBuiltin::Visible),
+        "get_mangled_object_vars" => Some(StableObjectVarsBuiltin::Mangled),
+        _ => None,
+    }
+}
+
+pub(super) fn stable_builtin_get_class(target: &RegionCallTarget) -> bool {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return false;
+    };
+    let normalized = name.trim_start_matches('\\');
+    !normalized.contains('\\') && normalized.eq_ignore_ascii_case("get_class")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableClassLineageBuiltin {
+    ParentClass,
+    IsSubclassOf,
+}
+
+impl StableClassLineageBuiltin {
+    pub(super) const COUNT: usize = 2;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::ParentClass => 0,
+            Self::IsSubclassOf => 1,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::ParentClass => "phrust_native_get_parent_class",
+            Self::IsSubclassOf => "phrust_native_is_subclass_of",
+        }
+    }
+
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::ParentClass => arity == 1,
+            Self::IsSubclassOf => arity == 2 || arity == 3,
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [Self::ParentClass, Self::IsSubclassOf]
+    }
+}
+
+pub(super) fn stable_builtin_class_lineage(
+    target: &RegionCallTarget,
+) -> Option<StableClassLineageBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "get_parent_class" => Some(StableClassLineageBuiltin::ParentClass),
+        "is_subclass_of" => Some(StableClassLineageBuiltin::IsSubclassOf),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableExtensionQueryBuiltin {
+    IsLoaded,
+    LoadedNames,
+}
+
+impl StableExtensionQueryBuiltin {
+    pub(super) const COUNT: usize = 2;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::IsLoaded => 0,
+            Self::LoadedNames => 1,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::IsLoaded => "phrust_native_extension_loaded",
+            Self::LoadedNames => "phrust_native_get_loaded_extensions",
+        }
+    }
+
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::IsLoaded => arity == 1,
+            Self::LoadedNames => arity <= 1,
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [Self::IsLoaded, Self::LoadedNames]
+    }
+}
+
+pub(super) fn stable_builtin_extension_query(
+    target: &RegionCallTarget,
+) -> Option<StableExtensionQueryBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "extension_loaded" => Some(StableExtensionQueryBuiltin::IsLoaded),
+        "get_loaded_extensions" => Some(StableExtensionQueryBuiltin::LoadedNames),
+        _ => None,
+    }
+}
+
+/// Stable reads from the request-published native INI registry. Mutating
+/// configuration remains a separate semantic family because it also updates
+/// execution-coordinator state such as include paths and diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableIniQueryBuiltin {
+    IniGet,
+    CfgVar,
+    IncludePath,
+}
+
+impl StableIniQueryBuiltin {
+    pub(super) const COUNT: usize = 3;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::IniGet => 0,
+            Self::CfgVar => 1,
+            Self::IncludePath => 2,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::IniGet => "phrust_native_ini_get",
+            Self::CfgVar => "phrust_native_get_cfg_var",
+            Self::IncludePath => "phrust_native_get_include_path",
+        }
+    }
+
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::IniGet | Self::CfgVar => arity == 1,
+            Self::IncludePath => arity == 0,
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [Self::IniGet, Self::CfgVar, Self::IncludePath]
+    }
+}
+
+pub(super) fn stable_builtin_ini_query(target: &RegionCallTarget) -> Option<StableIniQueryBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "ini_get" => Some(StableIniQueryBuiltin::IniGet),
+        "get_cfg_var" => Some(StableIniQueryBuiltin::CfgVar),
+        "get_include_path" => Some(StableIniQueryBuiltin::IncludePath),
+        _ => None,
+    }
+}
+
+/// Stable reads from request-published execution context.
+///
+/// Each variant lowers to its own exact ABI. The enum is compile-time
+/// metadata only: generated code never supplies an operation ID and the
+/// optimizing artifact cannot reach the generic builtin dispatcher.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableRequestQueryBuiltin {
+    TempDir,
+    CurrentDirectory,
+    Environment,
+    SapiName,
+    Uname,
+    CurrentUser,
+    IncludedFiles,
+}
+
+impl StableRequestQueryBuiltin {
+    pub(super) const COUNT: usize = 7;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::TempDir => 0,
+            Self::CurrentDirectory => 1,
+            Self::Environment => 2,
+            Self::SapiName => 3,
+            Self::Uname => 4,
+            Self::CurrentUser => 5,
+            Self::IncludedFiles => 6,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::TempDir => "phrust_native_sys_get_temp_dir",
+            Self::CurrentDirectory => "phrust_native_getcwd",
+            Self::Environment => "phrust_native_getenv",
+            Self::SapiName => "phrust_native_php_sapi_name",
+            Self::Uname => "phrust_native_php_uname",
+            Self::CurrentUser => "phrust_native_get_current_user",
+            Self::IncludedFiles => "phrust_native_get_included_files",
+        }
+    }
+
+    pub(super) const fn accepts_arity(self, arity: usize) -> bool {
+        match self {
+            Self::Environment | Self::Uname => arity <= 1,
+            Self::TempDir
+            | Self::CurrentDirectory
+            | Self::SapiName
+            | Self::CurrentUser
+            | Self::IncludedFiles => arity == 0,
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [
+            Self::TempDir,
+            Self::CurrentDirectory,
+            Self::Environment,
+            Self::SapiName,
+            Self::Uname,
+            Self::CurrentUser,
+            Self::IncludedFiles,
+        ]
+    }
+}
+
+pub(super) fn stable_builtin_request_query(
+    target: &RegionCallTarget,
+) -> Option<StableRequestQueryBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "sys_get_temp_dir" => Some(StableRequestQueryBuiltin::TempDir),
+        "getcwd" => Some(StableRequestQueryBuiltin::CurrentDirectory),
+        "getenv" => Some(StableRequestQueryBuiltin::Environment),
+        "php_sapi_name" => Some(StableRequestQueryBuiltin::SapiName),
+        "php_uname" => Some(StableRequestQueryBuiltin::Uname),
+        "get_current_user" => Some(StableRequestQueryBuiltin::CurrentUser),
+        "get_included_files" | "get_required_files" => {
+            Some(StableRequestQueryBuiltin::IncludedFiles)
+        }
+        _ => None,
+    }
+}
+
+/// Immutable declaration-name inventories published by the compiled unit.
+///
+/// Values are constructed directly as native arrays. Runtime-valued
+/// constants deliberately remain a separate storage family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StableDeclarationInventoryBuiltin {
+    Functions,
+    Classes,
+    Interfaces,
+    Traits,
+}
+
+impl StableDeclarationInventoryBuiltin {
+    pub(super) const COUNT: usize = 4;
+
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::Functions => 0,
+            Self::Classes => 1,
+            Self::Interfaces => 2,
+            Self::Traits => 3,
+        }
+    }
+
+    pub(super) const fn symbol(self) -> &'static str {
+        match self {
+            Self::Functions => "phrust_native_get_defined_functions",
+            Self::Classes => "phrust_native_get_declared_classes",
+            Self::Interfaces => "phrust_native_get_declared_interfaces",
+            Self::Traits => "phrust_native_get_declared_traits",
+        }
+    }
+
+    pub(super) const fn all() -> [Self; Self::COUNT] {
+        [
+            Self::Functions,
+            Self::Classes,
+            Self::Interfaces,
+            Self::Traits,
+        ]
+    }
+}
+
+pub(super) fn stable_builtin_declaration_inventory(
+    target: &RegionCallTarget,
+) -> Option<StableDeclarationInventoryBuiltin> {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return None;
+    };
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "get_defined_functions" => Some(StableDeclarationInventoryBuiltin::Functions),
+        "get_declared_classes" => Some(StableDeclarationInventoryBuiltin::Classes),
+        "get_declared_interfaces" => Some(StableDeclarationInventoryBuiltin::Interfaces),
+        "get_declared_traits" => Some(StableDeclarationInventoryBuiltin::Traits),
+        _ => None,
+    }
+}
+
+pub(super) fn stable_builtin_constant_inventory(target: &RegionCallTarget) -> bool {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return false;
+    };
+    let normalized = name.trim_start_matches('\\');
+    !normalized.contains('\\') && normalized.eq_ignore_ascii_case("get_defined_constants")
+}
+
+pub(super) fn stable_builtin_compact(target: &RegionCallTarget) -> bool {
+    let RegionCallTarget::Function { name, .. } = target else {
+        return false;
+    };
+    let normalized = name.trim_start_matches('\\');
+    !normalized.contains('\\') && normalized.eq_ignore_ascii_case("compact")
 }
 
 /// Non-callback array set and overlay operations over authoritative direct
@@ -2016,8 +2695,10 @@ pub(super) fn stable_builtin_array_pointer(target: &RegionCallTarget) -> Option<
     }
 }
 
-/// Exact local-mutating array stack operations. Zero pops one owner from the
-/// tail; one appends one or more prepared positional values.
+/// Exact local-mutating array deque operations over authoritative entries.
+/// Pop/shift move one element owner into the result; push/unshift retain the
+/// prepared positional values once for the array. Numeric-key reindexing for
+/// the front operations happens directly in the stable entry range.
 pub(super) fn stable_builtin_array_stack(target: &RegionCallTarget) -> Option<u32> {
     let RegionCallTarget::Function { name, .. } = target else {
         return None;
@@ -2029,6 +2710,8 @@ pub(super) fn stable_builtin_array_stack(target: &RegionCallTarget) -> Option<u3
     match normalized.to_ascii_lowercase().as_str() {
         "array_pop" => Some(0),
         "array_push" => Some(1),
+        "array_shift" => Some(2),
+        "array_unshift" => Some(3),
         _ => None,
     }
 }
@@ -2186,7 +2869,7 @@ pub(super) fn known_user_argument_requires_reference(
                     signature
                         .params
                         .iter()
-                        .find(|parameter| parameter.name.eq_ignore_ascii_case(name))
+                        .find(|parameter| parameter.name == name)
                         .or_else(|| {
                             signature
                                 .params
@@ -2281,7 +2964,7 @@ pub(super) fn known_user_argument_requires_reference(
                 |name| {
                     parameters
                         .iter()
-                        .find(|parameter| parameter.name.eq_ignore_ascii_case(name))
+                        .find(|parameter| parameter.name == name)
                         .or_else(|| parameters.last().filter(|parameter| parameter.variadic))
                 },
             )

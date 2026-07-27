@@ -370,7 +370,9 @@ mod tests {
         let stdout = String::from_utf8(stdout).expect("stdout utf8");
         assert!(
             stdout.contains(
-                "Fatal error: Uncaught Error: Call to undefined function missing_runtime_function()"
+                "Fatal error: Uncaught TypeError: call_user_func(): Argument #1 ($callback) must be \
+                 a valid callback, function \"missing_runtime_function\" not found or invalid \
+                 function name"
             ),
             "stdout={stdout} stderr={}",
             String::from_utf8_lossy(&stderr)

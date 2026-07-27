@@ -101,6 +101,9 @@ impl ExecutableValueFlow {
             RegionOperand::Constant(index) => constants
                 .get(index as usize)
                 .map_or_else(|| reserved_constant_fact(index), constant_fact),
+            RegionOperand::LinkedConstant { class, .. } => {
+                SsaValueFact::exact(class, SsaOwnership::Borrowed)
+            }
         }
     }
 
@@ -191,6 +194,7 @@ impl ExecutableValueFlow {
     /// last-use moves, and elided discards), rather than treating ownership as
     /// report-only metadata.
     pub fn verify_ownership(&self, region: &RegionGraph) -> Result<(), String> {
+        let reachability = block_reachability(region);
         let mut instruction_uses = BTreeMap::<RegId, Vec<(usize, usize, u32)>>::new();
         let mut terminator_uses = BTreeSet::new();
         for (block_index, block) in region.blocks.iter().enumerate() {
@@ -256,8 +260,13 @@ impl ExecutableValueFlow {
                         }
                         let invalid_use = instruction_uses.get(&src).into_iter().flatten().find(
                             |&&(use_block, use_index, continuation)| {
-                                (use_block, use_index) != (block_index, instruction_index)
-                                    && !self.elided_discards.contains(&continuation)
+                                use_may_follow(
+                                    &reachability,
+                                    block_index,
+                                    instruction_index,
+                                    use_block,
+                                    use_index,
+                                ) && !self.elided_discards.contains(&continuation)
                             },
                         );
                         if let Some(&(_, _, continuation)) = invalid_use {
@@ -280,8 +289,13 @@ impl ExecutableValueFlow {
                         }
                         let invalid_use = instruction_uses.get(&src).into_iter().flatten().find(
                             |&&(use_block, use_index, continuation)| {
-                                (use_block, use_index) != (block_index, instruction_index)
-                                    && !self.elided_discards.contains(&continuation)
+                                use_may_follow(
+                                    &reachability,
+                                    block_index,
+                                    instruction_index,
+                                    use_block,
+                                    use_index,
+                                ) && !self.elided_discards.contains(&continuation)
                             },
                         );
                         if let Some(&(_, _, continuation)) = invalid_use {
@@ -313,6 +327,74 @@ impl ExecutableValueFlow {
             }
         }
         Ok(())
+    }
+}
+
+fn block_reachability(region: &RegionGraph) -> Vec<BTreeSet<usize>> {
+    let block_indices = region
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.id, index))
+        .collect::<BTreeMap<_, _>>();
+    let successors = region
+        .blocks
+        .iter()
+        .map(|block| {
+            let targets = match block.terminator {
+                RegionTerminator::Jump { target } => vec![target],
+                RegionTerminator::JumpIfFalse {
+                    target,
+                    fallthrough,
+                    ..
+                }
+                | RegionTerminator::JumpIfTrue {
+                    target,
+                    fallthrough,
+                    ..
+                } => vec![target, fallthrough],
+                RegionTerminator::JumpIf {
+                    if_true, if_false, ..
+                } => vec![if_true, if_false],
+                RegionTerminator::Return { finally, .. }
+                | RegionTerminator::ReturnReference { finally, .. } => {
+                    finally.into_iter().collect()
+                }
+                RegionTerminator::Exit { finally, .. } => finally.into_iter().collect(),
+            };
+            targets
+                .into_iter()
+                .filter_map(|target| block_indices.get(&target).copied())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    (0..region.blocks.len())
+        .map(|start| {
+            let mut reachable = BTreeSet::new();
+            let mut pending = successors[start].clone();
+            while let Some(block) = pending.pop() {
+                if reachable.insert(block) {
+                    pending.extend(successors[block].iter().copied());
+                }
+            }
+            reachable
+        })
+        .collect()
+}
+
+fn use_may_follow(
+    reachability: &[BTreeSet<usize>],
+    block: usize,
+    instruction: usize,
+    use_block: usize,
+    use_instruction: usize,
+) -> bool {
+    if use_block == block {
+        use_instruction > instruction
+    } else {
+        reachability
+            .get(block)
+            .is_some_and(|reachable| reachable.contains(&use_block))
     }
 }
 
@@ -426,10 +508,11 @@ pub fn analyze_executable_value_flow(
             }
         }
     }
+    let reachability = block_reachability(region);
     let (moved_local_stores, mut elided_discards) =
-        find_moved_local_stores(region, &local_storage, &register_facts);
+        find_moved_local_stores(region, &local_storage, &register_facts, &reachability);
     let (moved_register_copies, moved_copy_discards) =
-        find_moved_register_copies(region, &register_facts);
+        find_moved_register_copies(region, &register_facts, &reachability);
     elided_discards.extend(moved_copy_discards);
     let (consumed_call_operands, call_operand_discards) =
         find_consumed_call_operands(region, &register_facts);
@@ -531,8 +614,9 @@ pub fn analyze_baseline_value_ownership(region: &RegionGraph) -> ExecutableValue
         }
     }
 
+    let reachability = block_reachability(region);
     let (moved_local_stores, moved_store_discards) =
-        find_moved_local_stores(region, &local_storage, &register_facts);
+        find_moved_local_stores(region, &local_storage, &register_facts, &reachability);
     let (consumed_call_operands, call_operand_discards) =
         find_consumed_call_operands(region, &register_facts);
     let mut elided_discards = moved_store_discards;
@@ -691,6 +775,7 @@ fn find_moved_local_stores(
     region: &RegionGraph,
     storage: &BTreeMap<LocalId, LocalStorageClass>,
     register_facts: &BTreeMap<RegId, SsaValueFact>,
+    reachability: &[BTreeSet<usize>],
 ) -> (BTreeSet<u32>, BTreeSet<u32>) {
     let mut uses = BTreeMap::<RegId, Vec<(usize, usize, bool, u32)>>::new();
     let mut terminator_uses = BTreeSet::new();
@@ -736,7 +821,13 @@ fn find_moved_local_stores(
                 .into_iter()
                 .flatten()
                 .filter(|&&(use_block, use_index, _, _)| {
-                    use_block != block_index || use_index != instruction_index
+                    use_may_follow(
+                        reachability,
+                        block_index,
+                        instruction_index,
+                        use_block,
+                        use_index,
+                    )
                 })
                 .copied()
                 .collect::<Vec<_>>();
@@ -760,6 +851,7 @@ fn find_moved_local_stores(
 fn find_moved_register_copies(
     region: &RegionGraph,
     register_facts: &BTreeMap<RegId, SsaValueFact>,
+    reachability: &[BTreeSet<usize>],
 ) -> (BTreeSet<u32>, BTreeSet<u32>) {
     let mut uses = BTreeMap::<RegId, Vec<(usize, usize, bool, u32)>>::new();
     let mut terminator_uses = BTreeSet::new();
@@ -800,7 +892,13 @@ fn find_moved_register_copies(
                 .into_iter()
                 .flatten()
                 .filter(|&&(use_block, use_index, _, _)| {
-                    (use_block, use_index) != (block_index, instruction_index)
+                    use_may_follow(
+                        reachability,
+                        block_index,
+                        instruction_index,
+                        use_block,
+                        use_index,
+                    )
                 })
                 .copied()
                 .collect::<Vec<_>>();
@@ -1118,6 +1216,15 @@ fn find_reference_dimension_loads(
 /// before the call and releasing it afterwards is redundant. Calls whose
 /// signature or binding shape is not fully known remain ownership barriers.
 fn native_call_preserves_borrowed_arguments(call: &super::RegionNativeCall) -> bool {
+    // A statically packed compiled call retains every ordinary operand before
+    // entering the callee and borrows prepared reference cells from their
+    // owning locals. A LoadLocal feeding such a call can therefore borrow its
+    // frame-local owner: classifying that register as an expiring standalone
+    // owner would add a last-owner validation and an unnecessary baseline
+    // continuation before every direct method receiver.
+    if call.direct_compiled_target().is_some() {
+        return true;
+    }
     let RegionCallTarget::Function {
         name,
         function: None,
@@ -1400,6 +1507,9 @@ fn operand_fact(
         RegionOperand::Constant(index) => constants
             .get(index as usize)
             .map_or_else(|| reserved_constant_fact(index), constant_fact),
+        RegionOperand::LinkedConstant { class, .. } => {
+            SsaValueFact::exact(class, SsaOwnership::Borrowed)
+        }
     }
 }
 
@@ -1848,6 +1958,68 @@ mod tests {
         assert!(baseline.elides_discard(discard_continuation));
         assert!(baseline.releases_local_at_frame_exit(local));
         assert_eq!(baseline.local_fact(local).ownership, SsaOwnership::Owned);
+    }
+
+    #[test]
+    fn final_store_moves_owner_after_prior_dominating_use() {
+        let mut builder = IrBuilder::new(UnitId::new(4_243));
+        let file = builder.add_file("prior-use-owner-move.php");
+        let span = IrSpan::new(file, 0, 1);
+        let function =
+            builder.start_function("prior_use_owner_move", FunctionFlags::default(), span);
+        let local = builder.intern_local(function, "value");
+        let producer = builder.append_block(function);
+        let consumer = builder.append_block(function);
+        let value = builder.alloc_register(function);
+        builder.emit(
+            function,
+            producer,
+            InstructionKind::NewArray { dst: value },
+            span,
+        );
+        builder.emit(
+            function,
+            producer,
+            InstructionKind::Echo {
+                src: Operand::Register(value),
+            },
+            span,
+        );
+        builder.terminate_jump(function, producer, consumer, span);
+        let store = builder.emit(
+            function,
+            consumer,
+            InstructionKind::StoreLocal {
+                local,
+                src: Operand::Register(value),
+            },
+            span,
+        );
+        let discard = builder.emit(
+            function,
+            consumer,
+            InstructionKind::Discard {
+                src: Operand::Register(value),
+            },
+            span,
+        );
+        builder.terminate_return(function, consumer, None, span);
+        let unit = builder.finish();
+        let region = build_baseline_region(&unit, function).expect("region");
+        let store_continuation =
+            region.blocks[consumer.index()].instructions[store.index()].continuation_id;
+        let discard_continuation =
+            region.blocks[consumer.index()].instructions[discard.index()].continuation_id;
+
+        for flow in [
+            analyze_baseline_value_ownership(&region),
+            analyze_executable_value_flow(&region, &unit.constants),
+        ] {
+            assert!(flow.moves_value_into_local(store_continuation));
+            assert!(flow.elides_discard(discard_continuation));
+            flow.verify_ownership(&region)
+                .expect("prior uses must not invalidate a final ownership move");
+        }
     }
 
     #[test]

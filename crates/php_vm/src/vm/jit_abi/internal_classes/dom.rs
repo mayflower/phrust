@@ -383,13 +383,18 @@ pub(in crate::vm::jit_abi) fn execute_native_dom_instruction(
         } => construct_native_dom_class(context, display_class_name, arguments),
         php_ir::InstructionKind::CallMethod { method, .. } => {
             let receiver = arguments.first().copied()?;
-            let receiver = match context.decode_baseline_value(receiver) {
-                Ok(Value::Reference(reference)) => reference.get(),
-                Ok(value) => value,
-                Err(error) => return Some(Err(error)),
-            };
-            let Value::Object(object) = receiver else {
-                return None;
+            let object = if let Some(object) = context.native_query_object(receiver) {
+                object
+            } else {
+                let receiver = match context.decode_baseline_value(receiver) {
+                    Ok(Value::Reference(reference)) => reference.get(),
+                    Ok(value) => value,
+                    Err(error) => return Some(Err(error)),
+                };
+                let Value::Object(object) = receiver else {
+                    return None;
+                };
+                object
             };
             if !is_dom_runtime_class(&object.class_name()) {
                 return None;

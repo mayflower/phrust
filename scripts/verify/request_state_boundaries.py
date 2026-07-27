@@ -114,7 +114,7 @@ def main() -> int:
         if symbol not in builtin_state:
             failures.append(f"builtin request owner is missing {symbol}")
 
-    native_execution_state = struct_body(vm_jit_abi, "NativeExecutionContext")
+    native_execution_state = struct_body(vm_jit_abi, "NativeRequestColdState")
     registered_extension_state = struct_body(
         vm_jit_abi, "NativeRegisteredExtensionRequestState"
     )
@@ -132,7 +132,7 @@ def main() -> int:
     ):
         if registered_extension_state.count(symbol) != 1:
             failures.append(f"native registered extension owner is missing {symbol}")
-    request_state_borrow = "BuiltinContext::with_runtime_request_state("
+    request_state_borrow = "BuiltinContext::with_borrowed_runtime_request_state("
     if request_state_borrow in vm:
         failures.append("VM facade must not construct builtin request-state services")
     if vm_native_builtins.count(request_state_borrow) != 1:

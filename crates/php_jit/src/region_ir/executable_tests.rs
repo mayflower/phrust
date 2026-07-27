@@ -805,6 +805,193 @@ fn exact_receiver_links_public_non_final_method() {
 }
 
 #[test]
+fn published_external_parent_prepares_local_object_family() {
+    let mut builder = IrBuilder::new(UnitId::new(9_602));
+    let file = builder.add_file("published-external-parent.php");
+    let span = IrSpan::new(file, 0, 40);
+    let caller = builder.start_function("main", FunctionFlags::default(), span);
+    let block = builder.append_block(caller);
+    let object = builder.alloc_register(caller);
+    builder.emit(
+        caller,
+        block,
+        InstructionKind::NewObject {
+            dst: object,
+            display_class_name: "LocalChild".to_owned(),
+            class_name: "localchild".to_owned(),
+            args: Vec::new(),
+        },
+        span,
+    );
+    let class_name = builder.alloc_register(caller);
+    builder.emit(
+        caller,
+        block,
+        InstructionKind::FetchObjectClassName {
+            dst: class_name,
+            object: Operand::Register(object),
+        },
+        span,
+    );
+    builder.terminate_return(caller, block, Some(Operand::Register(class_name)), span);
+    builder.push_class(ClassEntry {
+        id: ClassId::new(0),
+        name: "localchild".to_owned(),
+        display_name: "LocalChild".to_owned(),
+        parent: Some("externalbase".to_owned()),
+        parent_display_name: Some("ExternalBase".to_owned()),
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor: None,
+        flags: ClassFlags::default(),
+        span,
+    });
+    builder.set_entry(caller);
+    let unit = builder.finish();
+    let signature = crate::JitExternalFunctionSignature {
+        name: "ExternalBase::__construct".to_owned(),
+        link_index: 0,
+        published: true,
+        params: Vec::new(),
+        native_params: Vec::new(),
+        native_default_constant_indices: Vec::new(),
+        native_arity: 0,
+        requires_non_reference_trampoline: false,
+        returns_by_reference: false,
+    };
+    let metadata = CompileMetadata {
+        tier: NativeCompilerTier::Optimizing,
+        ..CompileMetadata::default()
+    };
+    let published = BaselineRegionBuilder::build_with_external_function_signatures(
+        &unit,
+        caller,
+        &metadata,
+        std::slice::from_ref(&signature),
+    )
+    .expect("published external parent region");
+    let mut inherited_constructor = signature;
+    inherited_constructor.native_arity = 1;
+    let constructor = BaselineRegionBuilder::build_with_external_function_signatures(
+        &unit,
+        caller,
+        &metadata,
+        &[inherited_constructor],
+    )
+    .expect("external parent constructor region");
+    let default_constructor = BaselineRegionBuilder::build_with_external_function_signatures(
+        &unit,
+        caller,
+        &metadata,
+        &[crate::JitExternalFunctionSignature {
+            name: "ExternalBase::__construct".to_owned(),
+            link_index: 7,
+            published: true,
+            params: vec![crate::JitExternalParameterSignature {
+                name: "count".to_owned(),
+                by_ref: false,
+                variadic: false,
+            }],
+            native_params: vec![IrParam {
+                name: "count".to_owned(),
+                local: LocalId::new(1),
+                required: false,
+                default: Some(IrConstant::Int(4)),
+                type_: Some(php_ir::IrReturnType::Int),
+                by_ref: false,
+                variadic: false,
+                attributes: Vec::new(),
+            }],
+            native_default_constant_indices: vec![Some(2)],
+            native_arity: 2,
+            requires_non_reference_trampoline: false,
+            returns_by_reference: false,
+        }],
+    )
+    .expect("external parent default constructor region");
+    let unresolved = BaselineRegionBuilder::build(&unit, caller, &metadata)
+        .expect("unresolved external parent region");
+
+    assert!(published.blocks[0].instructions.iter().any(|instruction| {
+        matches!(
+            instruction.kind,
+            RegionInstructionKind::NewObject {
+                prepared: true,
+                linked_class: None,
+                ..
+            }
+        )
+    }));
+    assert!(published.blocks[0].instructions.iter().any(|instruction| {
+        matches!(
+            instruction.kind,
+            RegionInstructionKind::FetchObjectClassName {
+                prepared_class: Some(0),
+                ..
+            }
+        )
+    }));
+    assert!(unresolved.blocks[0].instructions.iter().any(|instruction| {
+        matches!(
+            instruction.kind,
+            RegionInstructionKind::Discard {
+                src: RegionOperand::I64(0),
+            }
+        )
+    }));
+    assert!(unresolved.blocks[0].instructions.iter().any(|instruction| {
+        matches!(
+            instruction.kind,
+            RegionInstructionKind::NativeCall(RegionNativeCall {
+                target: RegionCallTarget::Constructor { .. },
+                ..
+            })
+        )
+    }));
+    assert!(
+        constructor.blocks[0]
+            .instructions
+            .iter()
+            .any(|instruction| {
+                matches!(
+                    instruction.kind,
+                    RegionInstructionKind::NewObject { prepared: true, .. }
+                )
+            })
+    );
+    assert!(
+        default_constructor.blocks[0]
+            .instructions
+            .iter()
+            .any(|instruction| {
+                matches!(
+                    &instruction.kind,
+                    RegionInstructionKind::NativeCall(RegionNativeCall {
+                        target: RegionCallTarget::Function { function: None, .. },
+                        operands,
+                        ..
+                    }) if matches!(
+                        operands.as_slice(),
+                        [
+                            Some(RegionOperand::Register(_)),
+                            Some(RegionOperand::LinkedConstant {
+                                link_index: 7,
+                                constant: 2,
+                                class: SsaValueClass::Int,
+                            }),
+                        ]
+                    )
+                )
+            })
+    );
+}
+
+#[test]
 fn property_assignment_borrows_implicit_method_receiver() {
     let mut builder = IrBuilder::new(UnitId::new(4_212));
     let file = builder.add_file("method-property-borrow.php");
@@ -1269,6 +1456,10 @@ fn native_argument_trace_plan_preserves_php_visible_shapes() {
     assert_eq!(plan.visible_fixed_count, 2);
     assert!(plan.visible_variadic_sources.is_empty());
     assert!(plan.extra_sources.is_empty());
+    assert!(
+        prepared_call_argument_plan(&[argument(0, Some("SECOND"))], &fixed).is_none(),
+        "PHP named parameter binding is case-sensitive"
+    );
 
     let variadic = [
         parameter("first", 0, false),
@@ -2054,6 +2245,109 @@ fn direct_closure_call_reads_the_authoritative_prepared_capture() {
 }
 
 #[test]
+fn named_closure_call_keeps_one_callable_baseline_boundary() {
+    let mut builder = IrBuilder::new(UnitId::new(103));
+    let file = builder.add_file("named-closure-call.php");
+    let span = IrSpan::new(file, 0, 20);
+    let closure = builder.start_function(
+        "{closure}",
+        FunctionFlags {
+            is_closure: true,
+            ..FunctionFlags::default()
+        },
+        span,
+    );
+    for (name, required, variadic) in [
+        ("first", true, false),
+        ("second", true, false),
+        ("rest", false, true),
+    ] {
+        let local = builder.intern_local(closure, name);
+        builder.push_param(
+            closure,
+            IrParam {
+                name: name.to_owned(),
+                local,
+                required,
+                default: None,
+                type_: None,
+                by_ref: false,
+                variadic,
+                attributes: Vec::new(),
+            },
+        );
+    }
+    let closure_block = builder.append_block(closure);
+    builder.terminate_return(closure, closure_block, None, span);
+
+    let main = builder.start_function("main", FunctionFlags::default(), span);
+    let block = builder.append_block(main);
+    let callable = builder.alloc_register(main);
+    builder.emit(
+        main,
+        block,
+        InstructionKind::MakeClosure {
+            dst: callable,
+            function: closure,
+            captures: Vec::new(),
+        },
+        span,
+    );
+    let one = builder.intern_constant(IrConstant::Int(1));
+    let two = builder.intern_constant(IrConstant::Int(2));
+    let three = builder.intern_constant(IrConstant::Int(3));
+    let result = builder.alloc_register(main);
+    let named_argument = |name: &str, value| IrCallArg {
+        name: Some(name.to_owned()),
+        value,
+        unpack: false,
+        value_kind: IrCallArgValueKind::Direct,
+        by_ref_local: None,
+        by_ref_dim: None,
+        by_ref_property: None,
+        by_ref_property_dim: None,
+    };
+    builder.emit(
+        main,
+        block,
+        InstructionKind::CallCallable {
+            dst: result,
+            callee: Operand::Register(callable),
+            args: vec![
+                named_argument("second", Operand::Constant(two)),
+                named_argument("first", Operand::Constant(one)),
+                named_argument("third", Operand::Constant(three)),
+            ],
+        },
+        span,
+    );
+    builder.terminate_return(main, block, Some(Operand::Register(result)), span);
+
+    let unit = builder.finish();
+    let region = build_baseline_region(&unit, main).expect("named closure region");
+    let call = region.blocks[0]
+        .instructions
+        .iter()
+        .find_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::NativeCall(call)
+                if matches!(
+                    call.target,
+                    RegionCallTarget::Closure { function: None, .. }
+                ) =>
+            {
+                Some(call)
+            }
+            _ => None,
+        })
+        .expect("named closure baseline boundary");
+    assert_eq!(call.argument_operand_offset, 1);
+    assert_eq!(
+        call.operands.first(),
+        Some(&Some(RegionOperand::Register(callable)))
+    );
+}
+
+#[test]
 fn optimizing_call_user_func_array_uses_prepared_closure_and_keeps_baseline_original() {
     let mut builder = IrBuilder::new(UnitId::new(102));
     let file = builder.add_file("closure-call-user-func-array.php");
@@ -2820,6 +3114,7 @@ fn published_external_static_method_stays_linked_across_callback_families() {
             variadic: false,
             attributes: Vec::new(),
         }],
+        native_default_constant_indices: Vec::new(),
         native_arity: 1,
         requires_non_reference_trampoline: false,
         returns_by_reference: false,
@@ -3082,6 +3377,7 @@ fn exact_external_instance_callback_carries_receiver_without_callable_array() {
             published: true,
             params: Vec::new(),
             native_params: Vec::new(),
+            native_default_constant_indices: Vec::new(),
             native_arity: 0,
             requires_non_reference_trampoline: false,
             returns_by_reference: false,
@@ -3105,6 +3401,7 @@ fn exact_external_instance_callback_carries_receiver_without_callable_array() {
                 variadic: false,
                 attributes: Vec::new(),
             }],
+            native_default_constant_indices: Vec::new(),
             native_arity: 2,
             requires_non_reference_trampoline: false,
             returns_by_reference: false,
@@ -3244,6 +3541,7 @@ fn optimizing_linked_reference_return_uses_published_native_signature() {
                 variadic: false,
                 attributes: Vec::new(),
             }],
+            native_default_constant_indices: Vec::new(),
             native_arity: 1,
             requires_non_reference_trampoline: false,
             returns_by_reference: true,
@@ -3277,4 +3575,365 @@ fn optimizing_linked_reference_return_uses_published_native_signature() {
     assert_eq!(call.operands, vec![Some(RegionOperand::I64(4))]);
     assert!(call.returns_by_reference);
     assert!(!call.variadic);
+}
+
+#[test]
+fn optimizing_same_unit_reference_method_uses_one_native_lvalue_plan() {
+    let mut builder = IrBuilder::new(UnitId::new(10_019));
+    let file = builder.add_file("same-unit-reference-method.php");
+    let span = IrSpan::new(file, 0, 40);
+
+    let method = builder.start_function(
+        "ReferenceBox::slot",
+        FunctionFlags {
+            is_method: true,
+            ..FunctionFlags::default()
+        },
+        span,
+    );
+    builder.set_returns_by_ref(method, true);
+    builder.intern_local(method, "this");
+    let parameter = builder.intern_local(method, "value");
+    builder.push_param(
+        method,
+        IrParam {
+            name: "value".to_owned(),
+            local: parameter,
+            required: true,
+            default: None,
+            type_: None,
+            by_ref: true,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let method_block = builder.append_block(method);
+    builder.terminate_return_ref(method, method_block, parameter, span);
+
+    let caller = builder.start_function("reference_method_caller", FunctionFlags::default(), span);
+    builder.set_entry(caller);
+    let array = builder.intern_local(caller, "array");
+    let result_reference = builder.intern_local(caller, "result");
+    let caller_block = builder.append_block(caller);
+    let object = builder.alloc_register(caller);
+    builder.emit(
+        caller,
+        caller_block,
+        InstructionKind::NewObject {
+            dst: object,
+            display_class_name: "ReferenceBox".to_owned(),
+            class_name: "referencebox".to_owned(),
+            args: Vec::new(),
+        },
+        span,
+    );
+    let zero = builder.intern_constant(IrConstant::Int(0));
+    let value = builder.alloc_register(caller);
+    builder.emit(
+        caller,
+        caller_block,
+        InstructionKind::FetchDim {
+            dst: value,
+            array: Operand::Local(array),
+            key: Operand::Constant(zero),
+            quiet: false,
+            mode: php_ir::instruction::DimFetchMode::Lvalue,
+        },
+        span,
+    );
+    builder.emit(
+        caller,
+        caller_block,
+        InstructionKind::BindReferenceFromMethodCall {
+            target: result_reference,
+            object: Operand::Register(object),
+            method: "slot".to_owned(),
+            args: vec![IrCallArg {
+                name: None,
+                value: Operand::Register(value),
+                unpack: false,
+                value_kind: IrCallArgValueKind::Direct,
+                by_ref_local: None,
+                by_ref_dim: Some(IrCallDimTarget {
+                    local: array,
+                    dims: vec![Operand::Constant(zero)],
+                }),
+                by_ref_property: None,
+                by_ref_property_dim: None,
+            }],
+        },
+        span,
+    );
+    builder.terminate_return(
+        caller,
+        caller_block,
+        Some(Operand::Local(result_reference)),
+        span,
+    );
+
+    builder.push_class(ClassEntry {
+        id: ClassId::new(0),
+        name: "referencebox".to_owned(),
+        display_name: "ReferenceBox".to_owned(),
+        parent: None,
+        parent_display_name: None,
+        interfaces: Vec::new(),
+        methods: vec![ClassMethodEntry {
+            name: "slot".to_owned(),
+            origin_class: "referencebox".to_owned(),
+            function: method,
+            flags: ClassMethodFlags {
+                has_body: true,
+                ..ClassMethodFlags::default()
+            },
+            attributes: Vec::new(),
+        }],
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor: None,
+        flags: ClassFlags {
+            is_final: true,
+            ..ClassFlags::default()
+        },
+        span,
+    });
+
+    let unit = builder.finish();
+    let region = BaselineRegionBuilder::build(
+        &unit,
+        caller,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+    )
+    .expect("optimizing same-unit reference method");
+    assert_eq!(
+        region.blocks[0]
+            .instructions
+            .iter()
+            .filter(|instruction| matches!(instruction.kind, RegionInstructionKind::Nop))
+            .count(),
+        1,
+        "the prepared reference binding must delete its superseded lvalue fetch"
+    );
+    let binding = region.blocks[0]
+        .instructions
+        .iter()
+        .find_map(|instruction| match instruction.kind {
+            RegionInstructionKind::BindReferenceDim { target, .. } => Some(target),
+            _ => None,
+        })
+        .expect("method argument lvalue binding");
+    let call = region.blocks[0]
+        .instructions
+        .iter()
+        .find_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::NativeCall(call)
+                if call.result == RegionCallResult::ReferenceLocal(result_reference) =>
+            {
+                Some(call)
+            }
+            _ => None,
+        })
+        .expect("direct reference-return method call");
+    assert_eq!(
+        call.target,
+        RegionCallTarget::Function {
+            name: "ReferenceBox::slot".to_owned(),
+            function: Some(method),
+        }
+    );
+    assert_eq!(call.argument_operand_offset, 1);
+    assert_eq!(call.direct_arity, Some(2));
+    assert_eq!(call.args[0].by_ref_local, Some(binding));
+    assert!(call.args[0].by_ref_dim.is_none());
+    assert_eq!(call.direct_compiled_target(), Some(method));
+    assert_eq!(region.direct_callees(), vec![method]);
+}
+
+#[test]
+fn static_method_closure_does_not_publish_a_null_implicit_receiver() {
+    let mut builder = IrBuilder::new(UnitId::new(10_021));
+    let file = builder.add_file("static-closure.php");
+    let span = IrSpan::new(file, 0, 40);
+    let closure = builder.start_function(
+        "{closure}",
+        FunctionFlags {
+            is_closure: true,
+            ..FunctionFlags::default()
+        },
+        span,
+    );
+    builder.intern_local(closure, "this");
+    let closure_block = builder.append_block(closure);
+    builder.terminate_return(closure, closure_block, None, span);
+
+    let caller = builder.start_function(
+        "Factory::make",
+        FunctionFlags {
+            is_method: true,
+            ..FunctionFlags::default()
+        },
+        span,
+    );
+    // Static methods retain the ordinary method IR shape, including a local
+    // named `this`, but publication must not treat that uninitialized slot as
+    // an object receiver.
+    builder.intern_local(caller, "this");
+    let caller_block = builder.append_block(caller);
+    let callable = builder.alloc_register(caller);
+    builder.emit(
+        caller,
+        caller_block,
+        InstructionKind::MakeClosure {
+            dst: callable,
+            function: closure,
+            captures: Vec::new(),
+        },
+        span,
+    );
+    builder.terminate_return(
+        caller,
+        caller_block,
+        Some(Operand::Register(callable)),
+        span,
+    );
+    builder.push_class(ClassEntry {
+        id: ClassId::new(0),
+        name: "factory".to_owned(),
+        display_name: "Factory".to_owned(),
+        parent: None,
+        parent_display_name: None,
+        interfaces: Vec::new(),
+        methods: vec![ClassMethodEntry {
+            name: "make".to_owned(),
+            origin_class: "factory".to_owned(),
+            function: caller,
+            flags: ClassMethodFlags {
+                is_static: true,
+                has_body: true,
+                ..ClassMethodFlags::default()
+            },
+            attributes: Vec::new(),
+        }],
+        properties: Vec::new(),
+        constants: Vec::new(),
+        enum_cases: Vec::new(),
+        attributes: Vec::new(),
+        enum_backing_type: None,
+        constructor: None,
+        flags: ClassFlags::default(),
+        span,
+    });
+    let unit = builder.finish();
+
+    assert_eq!(
+        native_closure_bound_this_local(&unit, caller, closure),
+        None
+    );
+    let region = BaselineRegionBuilder::build(
+        &unit,
+        caller,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+    )
+    .expect("static method closure region");
+    assert!(region.blocks[0].instructions.iter().any(|instruction| {
+        matches!(
+            instruction.kind,
+            RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::MakeClosure {
+                bound_this_local: None,
+                ..
+            })
+        )
+    }));
+}
+
+#[test]
+fn nested_closure_binds_the_resolved_receiver_local_after_captures() {
+    let mut builder = IrBuilder::new(UnitId::new(10_022));
+    let file = builder.add_file("nested-bound-closure.php");
+    let span = IrSpan::new(file, 0, 40);
+
+    let child = builder.start_function(
+        "{child}",
+        FunctionFlags {
+            is_closure: true,
+            ..FunctionFlags::default()
+        },
+        span,
+    );
+    builder.intern_local(child, "this");
+    let child_block = builder.append_block(child);
+    builder.terminate_return(child, child_block, None, span);
+
+    let parent = builder.start_function(
+        "{parent}",
+        FunctionFlags {
+            is_closure: true,
+            ..FunctionFlags::default()
+        },
+        span,
+    );
+    let captured = builder.intern_local(parent, "captured");
+    builder.push_capture(
+        parent,
+        IrCapture {
+            name: "captured".to_owned(),
+            local: captured,
+            by_ref: false,
+        },
+    );
+    let parent_this = builder.intern_local(parent, "this");
+    assert_ne!(parent_this, LocalId::new(0));
+    let parent_block = builder.append_block(parent);
+    let callable = builder.alloc_register(parent);
+    builder.emit(
+        parent,
+        parent_block,
+        InstructionKind::MakeClosure {
+            dst: callable,
+            function: child,
+            captures: Vec::new(),
+        },
+        span,
+    );
+    builder.terminate_return(
+        parent,
+        parent_block,
+        Some(Operand::Register(callable)),
+        span,
+    );
+    let unit = builder.finish();
+
+    assert_eq!(
+        native_closure_bound_this_local(&unit, parent, child),
+        Some(parent_this)
+    );
+    let region = BaselineRegionBuilder::build(
+        &unit,
+        parent,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+    )
+    .expect("nested closure region");
+    assert!(region.blocks[0].instructions.iter().any(|instruction| {
+        matches!(
+            instruction.kind,
+            RegionInstructionKind::NativeDynamicCode(
+                RegionNativeDynamicCode::MakeClosure {
+                    bound_this_local: Some(local),
+                    ..
+                }
+            ) if local == parent_this
+        )
+    }));
 }

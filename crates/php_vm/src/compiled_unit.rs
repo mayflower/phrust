@@ -1025,7 +1025,7 @@ impl CompiledUnit {
                                 php_jit::region_ir::RegionNativeDynamicCode::MakeClosure {
                                     function: closure_function,
                                     captures,
-                                    binds_this,
+                                    bound_this_local,
                                     ..
                                 },
                             ) = &instruction.kind
@@ -1073,7 +1073,7 @@ impl CompiledUnit {
                                                 .collect::<Vec<_>>(),
                                         ),
                                         debug,
-                                        binds_this: *binds_this,
+                                        binds_this: bound_this_local.is_some(),
                                     }));
                             }
                             if let php_jit::region_ir::RegionInstructionKind::NativeCall(call) =
@@ -1207,6 +1207,27 @@ impl CompiledUnit {
                 .iter()
                 .map(|class| class.name.trim_start_matches('\\').to_ascii_lowercase())
                 .collect::<std::collections::HashSet<_>>();
+            let external_parent_dependency = |class_name: &str| {
+                let mut current = class_name.trim_start_matches('\\').to_ascii_lowercase();
+                let mut visited = std::collections::HashSet::new();
+                loop {
+                    if !visited.insert(current.clone()) {
+                        return None;
+                    }
+                    let class = self.inner.unit.classes.iter().find(|class| {
+                        class
+                            .name
+                            .trim_start_matches('\\')
+                            .eq_ignore_ascii_case(&current)
+                    })?;
+                    let parent = class.parent.as_deref()?.trim_start_matches('\\');
+                    let normalized_parent = parent.to_ascii_lowercase();
+                    if !local_classes.contains(&normalized_parent) {
+                        return Some(parent.to_owned());
+                    }
+                    current = normalized_parent;
+                }
+            };
             let mut whole_unit = BTreeMap::<String, String>::new();
             let by_function = self
                 .inner
@@ -1234,7 +1255,21 @@ impl CompiledUnit {
                             } => {
                                 let normalized_class =
                                     class_name.trim_start_matches('\\').to_ascii_lowercase();
-                                if !local_classes.contains(&normalized_class) {
+                                if local_classes.contains(&normalized_class) {
+                                    if let Some(parent) = external_parent_dependency(class_name) {
+                                        // A local allocation inherits the
+                                        // external parent's published layout.
+                                        // Model that immutable class-plan
+                                        // dependency beside ordinary
+                                        // cross-unit constructor links so
+                                        // declaration-time publication can
+                                        // recompile the caller exactly once.
+                                        let source_name = format!("{parent}::__construct");
+                                        let normalized = source_name.to_ascii_lowercase();
+                                        calls.insert(normalized.clone(), source_name.clone());
+                                        whole_unit.insert(normalized, source_name);
+                                    }
+                                } else {
                                     external_object_registers.insert(
                                         *dst,
                                         class_name.trim_start_matches('\\').to_owned(),
@@ -2055,6 +2090,46 @@ mod tests {
             .prepared_continuation_instructions(dormant)
             .expect("dormant continuation index");
         assert_eq!(compiled.prepared_unit_stats().continuation_index_runs, 2);
+    }
+
+    #[test]
+    fn local_allocation_indexes_its_external_parent_class_plan() {
+        let mut builder = php_ir::IrBuilder::new(UnitId::new(2));
+        let file = builder.add_file("external-parent-plan.php");
+        let span = IrSpan::new(file, 0, 1);
+        let entry = builder.start_function("main", php_ir::FunctionFlags::default(), span);
+        let block = builder.append_block(entry);
+        let object = builder.alloc_register(entry);
+        builder.emit(
+            entry,
+            block,
+            php_ir::InstructionKind::NewObject {
+                dst: object,
+                display_class_name: "LocalChild".to_owned(),
+                class_name: "localchild".to_owned(),
+                args: Vec::new(),
+            },
+            span,
+        );
+        builder.terminate_return(entry, block, Some(php_ir::Operand::Register(object)), span);
+        let mut child = class_entry(0, "localchild", false);
+        child.display_name = "LocalChild".to_owned();
+        child.parent = Some("externalbase".to_owned());
+        child.parent_display_name = Some("ExternalBase".to_owned());
+        child.span = span;
+        builder.push_class(child);
+        builder.set_entry(entry);
+
+        let compiled = CompiledUnit::new(builder.finish());
+        let calls = compiled.prepared_external_function_calls(entry);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].normalized_name.as_ref(),
+            "externalbase::__construct"
+        );
+        assert_eq!(calls[0].source_name.as_ref(), "externalbase::__construct");
+        assert_eq!(calls[0].link_index, 0);
+        assert_eq!(compiled.prepared_unit_external_function_calls().len(), 1);
     }
 
     #[test]

@@ -1203,7 +1203,7 @@ impl<'a> BuiltinContext<'a> {
             .mb_internal_encoding_slot
             .as_deref()
             .map(String::as_str)
-            .or_else(|| self.extensions.mb_internal_encoding.as_deref())
+            .or(self.extensions.mb_internal_encoding.as_deref())
             .unwrap_or("UTF-8")
     }
 

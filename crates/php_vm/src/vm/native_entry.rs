@@ -1,9 +1,117 @@
 //! Shared native entry execution boundaries.
 
-use super::{NativeRequestOwner, Vm, VmResult, activate_native_context};
+use super::{
+    NativeOptimizationPolicy, NativeRequestOwner, Vm, VmResult, VmWorkerState,
+    activate_native_context, linked_external_function_signatures,
+};
 use crate::compiled_unit::CompiledUnit;
 use php_runtime::api::OutputBuffer;
 use std::sync::Arc;
+
+impl VmWorkerState {
+    fn prepare_native_direct_callees(
+        &self,
+        unit: &CompiledUnit,
+        handle: &php_jit::JitFunctionHandle,
+        options: &super::VmOptions,
+        external_signatures: &[php_jit::JitExternalFunctionSignature],
+    ) -> Result<(), String> {
+        let Some(metadata) = handle.region_state_metadata() else {
+            return Ok(());
+        };
+        for callee in metadata
+            .direct_callees
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            let callee_signatures =
+                linked_external_function_signatures(unit, callee, external_signatures);
+            self.prepare_native_baseline_entry(unit, callee, options, &callee_signatures)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn prepare_and_publish_optimizing_entry(
+        &self,
+        unit: &CompiledUnit,
+        function: php_ir::FunctionId,
+        options: &super::VmOptions,
+        external_signatures: &[php_jit::JitExternalFunctionSignature],
+        handle: &php_jit::JitFunctionHandle,
+        background: bool,
+    ) -> Result<(), String> {
+        if options.native_optimization != NativeOptimizationPolicy::Optimizing {
+            let address = handle.native_entry_address().ok_or_else(|| {
+                format!(
+                    "baseline function {} has no native entry address",
+                    function.raw()
+                )
+            })?;
+            let deployment = unit.prepared_deployment_image();
+            let baseline = deployment
+                .native_function_entries
+                .get(function.index())
+                .ok_or_else(|| {
+                    format!(
+                        "native function {} has no baseline publication cell",
+                        function.raw()
+                    )
+                })?;
+            let preferred = deployment
+                .preferred_function_entries
+                .get(function.index())
+                .ok_or_else(|| {
+                    format!(
+                        "native function {} has no preferred publication cell",
+                        function.raw()
+                    )
+                })?;
+            baseline.store(address, std::sync::atomic::Ordering::Release);
+            let _ = preferred.compare_exchange(
+                0,
+                address,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+            self.prepare_native_direct_callees(unit, handle, options, external_signatures)?;
+            return Ok(());
+        }
+        let root_signatures =
+            linked_external_function_signatures(unit, function, external_signatures);
+        self.prepare_native_baseline_entry(unit, function, options, &root_signatures)?;
+        if !handle.region_state_metadata().is_some_and(|metadata| {
+            metadata.compiler_tier == php_jit::region_ir::NativeCompilerTier::Optimizing
+        }) {
+            return Ok(());
+        }
+        self.prepare_native_direct_callees(unit, handle, options, external_signatures)?;
+        // Background compilation remains publication-neutral until the
+        // tiering coordinator validates and commits the exact returned
+        // optimizer handle.
+        if background {
+            return Ok(());
+        }
+        let address = handle.native_entry_address().ok_or_else(|| {
+            format!(
+                "optimizing function {} has no native entry address",
+                function.raw()
+            )
+        })?;
+        let preferred = unit
+            .prepared_deployment_image()
+            .preferred_function_entries
+            .get(function.index())
+            .ok_or_else(|| {
+                format!(
+                    "optimizing function {} has no preferred publication cell",
+                    function.raw()
+                )
+            })?;
+        preferred.store(address, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+}
 
 impl Vm {
     /// Execute a validated, zero-arity persistent native artifact through the
@@ -13,6 +121,7 @@ impl Vm {
         unit: &CompiledUnit,
         loaded: Arc<super::native_compile_cache::LoadedNativeUnit>,
         entry: php_ir::FunctionId,
+        external_signatures: &[php_jit::JitExternalFunctionSignature],
         output: OutputBuffer,
     ) -> VmResult {
         let native_entries = Arc::clone(loaded.native_entries());
@@ -25,6 +134,16 @@ impl Vm {
                 ),
             );
         };
+        if let Err(error) = self.worker_state.prepare_and_publish_optimizing_entry(
+            unit,
+            entry,
+            &self.options,
+            external_signatures,
+            &handle,
+            false,
+        ) {
+            return VmResult::compile_error(output, format!("E_NATIVE_CACHE_PUBLICATION: {error}"));
+        }
         let mut context = NativeRequestOwner::new(
             unit,
             unit.cache_identity(),

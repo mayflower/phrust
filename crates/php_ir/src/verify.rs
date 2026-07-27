@@ -1823,6 +1823,20 @@ fn terminator_targets(kind: &TerminatorKind, targets: &mut Vec<BlockId>) {
 fn call_args_register_uses(args: &[IrCallArg], uses: &mut Vec<RegId>) {
     for arg in args {
         operand_register_uses(&arg.value, uses);
+        if let Some(target) = &arg.by_ref_dim {
+            for dimension in &target.dims {
+                operand_register_uses(dimension, uses);
+            }
+        }
+        if let Some(target) = &arg.by_ref_property {
+            operand_register_uses(&target.object, uses);
+        }
+        if let Some(target) = &arg.by_ref_property_dim {
+            operand_register_uses(&target.object, uses);
+            for dimension in &target.dims {
+                operand_register_uses(dimension, uses);
+            }
+        }
     }
 }
 

@@ -178,7 +178,6 @@ impl ResolvedNativeEntryCache {
 
     pub(super) fn insert(&self, key: NativeCompileCacheKey, handle: php_jit::JitFunctionHandle) {
         let mut entries = write_unpoisoned(&self.entries);
-        entries.retain(|candidate, _| *candidate == key || !candidate.same_function_tier(key));
         if entries.len() < DEFAULT_RESOLVED_NATIVE_ENTRY_ENTRIES || entries.contains_key(&key) {
             entries.insert(key, handle);
         }
@@ -283,12 +282,6 @@ impl NativeCompileCacheKey {
             optimization_level,
             external_signatures_hash,
         }
-    }
-
-    const fn same_function_tier(self, other: Self) -> bool {
-        self.unit_cache_identity == other.unit_cache_identity
-            && self.function == other.function
-            && self.optimization_level == other.optimization_level
     }
 }
 
@@ -554,19 +547,12 @@ fn insert_primary(
     key: NativeCompileCacheKey,
     records: Arc<[JitUnitCompileRecord]>,
 ) {
-    let superseded = state
-        .primary_entries
-        .keys()
-        .copied()
-        .filter(|candidate| *candidate != key && candidate.same_function_tier(key))
-        .collect::<Vec<_>>();
-    for candidate in superseded {
-        if state.primary_entries.remove(&candidate).is_some() {
-            state.metrics.evictions = state.metrics.evictions.saturating_add(1);
-        }
-        state.permanent_failures.remove(&candidate);
-        remove_lru(&mut state.primary_lru, candidate);
-    }
+    // An external-call signature is an ABI specialization, not an
+    // invalidation generation. During a request, deterministic include order
+    // legitimately exposes both the pre-declaration and post-declaration
+    // variants of the same caller. Discarding one when the other is inserted
+    // makes every later request compile the same two variants again in
+    // alternation. Retain both under the existing process-wide LRU bound.
     state.primary_entries.insert(key, records);
     touch_lru(&mut state.primary_lru, key);
 }
@@ -753,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn newer_external_signature_specialization_replaces_same_function_tier() {
+    fn external_signature_specializations_coexist_under_the_lru_bound() {
         let cache = NativeCompileCache::new(8);
         let first = NativeCompileCacheKey::new(41, FunctionId::new(3), 2, 11);
         let second = NativeCompileCacheKey::new(41, FunctionId::new(3), 2, 19);
@@ -762,9 +748,11 @@ mod tests {
             .get_or_compile(second, || Ok(vec![record(3)]))
             .unwrap();
 
-        let (_, disposition) = cache.get_or_compile(first, || Ok(vec![record(3)])).unwrap();
-        assert_eq!(disposition, NativeCompileCacheDisposition::Miss);
-        assert_eq!(cache.stats().entries, 1);
-        assert_eq!(cache.stats().evictions, 2);
+        let (_, disposition) = cache
+            .get_or_compile(first, || panic!("valid ABI specialization recompiled"))
+            .unwrap();
+        assert_eq!(disposition, NativeCompileCacheDisposition::Hit);
+        assert_eq!(cache.stats().entries, 2);
+        assert_eq!(cache.stats().evictions, 0);
     }
 }

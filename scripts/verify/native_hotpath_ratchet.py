@@ -300,7 +300,7 @@ def run_generated_code_fixtures(failures: list[str]) -> None:
     )
     for test_name in (
         "optimizing_manifest_records_the_emitted_division_transition",
-        "optimizing_unknown_scalar_truthiness_uses_guarded_native_lanes",
+        "optimizing_unknown_scalar_truthiness_is_direct_for_authoritative_values",
         "optimizer_transitions_once_to_dynamic_baseline_without_repeating_effect",
     ):
         require(

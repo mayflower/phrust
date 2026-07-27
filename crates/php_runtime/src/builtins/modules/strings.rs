@@ -1429,12 +1429,12 @@ pub(in crate::builtins::modules) fn builtin_base64_decode(
         .map_err(|message| conversion_error("base64_decode", message))?
         .unwrap_or(false);
     match native_base64_decode(input.as_bytes(), strict) {
-        Ok(bytes) => Ok(Value::string(bytes)),
-        Err(_) => Ok(Value::Bool(false)),
+        Some(bytes) => Ok(Value::string(bytes)),
+        None => Ok(Value::Bool(false)),
     }
 }
 
-pub fn native_base64_decode(input: &[u8], strict: bool) -> Result<Vec<u8>, ()> {
+pub fn native_base64_decode(input: &[u8], strict: bool) -> Option<Vec<u8>> {
     let source = if strict {
         input.to_vec()
     } else {
@@ -1444,7 +1444,7 @@ pub fn native_base64_decode(input: &[u8], strict: bool) -> Result<Vec<u8>, ()> {
             .filter(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
             .collect()
     };
-    BASE64_STANDARD.decode(source).map_err(|_| ())
+    BASE64_STANDARD.decode(source).ok()
 }
 
 pub(in crate::builtins::modules) fn builtin_htmlspecialchars(

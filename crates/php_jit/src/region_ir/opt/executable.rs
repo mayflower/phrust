@@ -650,7 +650,9 @@ fn operand_class(
             Some(super::super::SsaValueClass::Bool)
         }
         RegionOperand::Register(register) => classes.get(&register).copied(),
-        RegionOperand::Local(_) | RegionOperand::Constant(_) => None,
+        RegionOperand::Local(_)
+        | RegionOperand::Constant(_)
+        | RegionOperand::LinkedConstant { .. } => None,
     }
 }
 

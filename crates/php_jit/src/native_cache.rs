@@ -1271,9 +1271,12 @@ impl NativeLoadedArtifact {
         }
         let address = self.entry_address(function_id)?;
         let mut out = 0_i64;
-        let mut state = crate::JitDeoptState::default();
+        let mut state = crate::prepare_native_deopt_out(std::ptr::null_mut());
+        let state = state.as_mut_ptr();
         // SAFETY: PNA validation proved the entry range and signature metadata;
-        // the mapping was writable only before its RX transition.
+        // the mapping was writable only before its RX transition. The sparse
+        // deopt record is prepared through the same runtime-view boundary as a
+        // production entry, so direct native loads never observe a null view.
         let status = unsafe {
             match function.abi {
                 NativeFunctionAbi::I64StatusOut => {
@@ -1283,7 +1286,7 @@ impl NativeLoadedArtifact {
                         i32,
                         *const crate::JitDeoptState,
                     ) -> i32 = std::mem::transmute(address);
-                    entry(&mut out, &mut state, -1, std::ptr::null())
+                    entry(&mut out, state, -1, std::ptr::null())
                 }
                 NativeFunctionAbi::PackedI64StatusOut => {
                     let entry: extern "C" fn(
@@ -1298,7 +1301,7 @@ impl NativeLoadedArtifact {
                         std::ptr::null_mut(),
                         std::ptr::NonNull::<i64>::dangling().as_ptr(),
                         &mut out,
-                        &mut state,
+                        state,
                         -1,
                         std::ptr::null(),
                     )

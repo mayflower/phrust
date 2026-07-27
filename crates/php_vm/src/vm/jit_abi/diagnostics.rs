@@ -156,6 +156,114 @@ pub(super) fn encode_native_throwable_at(
     encode_native_throwable_fields(context, class, message, Some(span), None)
 }
 
+pub(super) fn native_argument_count_message(
+    context: &NativeRequestColdState<'_>,
+    function: &str,
+    passed: usize,
+    required: usize,
+    callsite: php_ir::IrSpan,
+) -> String {
+    let path = context
+        .unit
+        .files
+        .get(callsite.file.index())
+        .or_else(|| context.unit.files.first())
+        .map_or("<unknown>", |file| file.path.as_str());
+    let line = native_source_line_for_span(context, callsite);
+    format!(
+        "Too few arguments to function {function}(), {passed} passed in {path} on line {line} and exactly {required} expected"
+    )
+}
+
+/// Immutable publication-time metadata for one optimizing `MakeException`
+/// site. Generated code forwards only the opaque pointer and the native
+/// message encoding to the exact allocator; class/source resolution never
+/// runs in the exception-construction path.
+pub(super) struct PreparedNativeThrowableSite {
+    pub runtime_class: php_runtime::api::ClassEntry,
+    pub display_name: String,
+    pub file: Box<[u8]>,
+    pub line: i64,
+}
+
+pub(super) fn prepare_native_throwable_site(
+    context: &NativeRequestColdState<'_>,
+    class: &str,
+    span: php_ir::IrSpan,
+) -> PreparedNativeThrowableSite {
+    let (runtime_class, display_name) = native_throwable_class(class);
+    let file = context
+        .unit
+        .files
+        .get(span.file.index())
+        .or_else(|| context.unit.files.first())
+        .map_or_else(
+            || Box::<[u8]>::from(b"<unknown>".as_slice()),
+            |file| Box::<[u8]>::from(file.path.as_bytes()),
+        );
+    let line = i64::try_from(native_source_line_for_span(context, span)).unwrap_or(i64::MAX);
+    PreparedNativeThrowableSite {
+        runtime_class,
+        display_name,
+        file,
+        line,
+    }
+}
+
+fn native_throwable_class(class: &str) -> (php_runtime::api::ClassEntry, String) {
+    let normalized = normalize_class_name(class);
+    let descriptor = php_std::ExtensionRegistry::standard_library().enabled_class(&normalized);
+    let display_name = descriptor.map_or_else(
+        || class.trim_start_matches('\\').to_owned(),
+        |descriptor| descriptor.name().to_owned(),
+    );
+    let source = descriptor.and_then(php_std::ClassDescriptor::source_metadata);
+    let parent = source
+        .and_then(|metadata| metadata.parent)
+        .map(ToOwned::to_owned)
+        .or_else(|| match normalized.as_str() {
+            "argumentcounterror" => Some("TypeError".to_owned()),
+            "typeerror"
+            | "valueerror"
+            | "arithmeticerror"
+            | "divisionbyzeroerror"
+            | "compileerror"
+            | "parseerror"
+            | "fibererror"
+            | "unhandledmatcherror" => Some("Error".to_owned()),
+            "errorexception" => Some("Exception".to_owned()),
+            _ if normalized.ends_with("exception") && normalized != "exception" => {
+                Some("Exception".to_owned())
+            }
+            _ => None,
+        });
+    let interfaces = source
+        .map(|metadata| {
+            metadata
+                .interfaces
+                .iter()
+                .map(|interface| (*interface).to_owned())
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["Throwable".to_owned()]);
+    (
+        php_runtime::api::ClassEntry {
+            name: Arc::from(normalized),
+            parent,
+            interfaces,
+            methods: Vec::new(),
+            properties: Vec::new(),
+            constants: Vec::new(),
+            enum_cases: Vec::new(),
+            attributes: Vec::new(),
+            enum_backing_type: None,
+            constructor_id: None,
+            flags: php_runtime::api::ClassFlags::default(),
+        },
+        display_name,
+    )
+}
+
 pub(super) fn initialize_native_throwable_parent(
     context: &mut NativeRequestColdState<'_>,
     class: &str,
@@ -222,54 +330,7 @@ fn encode_native_throwable_fields(
     span: Option<php_ir::IrSpan>,
     code: Option<i64>,
 ) -> Result<i64, String> {
-    let normalized = normalize_class_name(class);
-    let descriptor = php_std::ExtensionRegistry::standard_library().enabled_class(&normalized);
-    let display_name = descriptor.map_or_else(
-        || class.trim_start_matches('\\').to_owned(),
-        |descriptor| descriptor.name().to_owned(),
-    );
-    let source = descriptor.and_then(php_std::ClassDescriptor::source_metadata);
-    let parent = source
-        .and_then(|metadata| metadata.parent)
-        .map(ToOwned::to_owned)
-        .or_else(|| match normalized.as_str() {
-            "argumentcounterror" => Some("TypeError".to_owned()),
-            "typeerror"
-            | "valueerror"
-            | "arithmeticerror"
-            | "divisionbyzeroerror"
-            | "compileerror"
-            | "parseerror"
-            | "fibererror"
-            | "unhandledmatcherror" => Some("Error".to_owned()),
-            "errorexception" => Some("Exception".to_owned()),
-            _ if normalized.ends_with("exception") && normalized != "exception" => {
-                Some("Exception".to_owned())
-            }
-            _ => None,
-        });
-    let interfaces = source
-        .map(|metadata| {
-            metadata
-                .interfaces
-                .iter()
-                .map(|interface| (*interface).to_owned())
-                .collect()
-        })
-        .unwrap_or_else(|| vec!["Throwable".to_owned()]);
-    let runtime_class = php_runtime::api::ClassEntry {
-        name: Arc::from(normalized),
-        parent,
-        interfaces,
-        methods: Vec::new(),
-        properties: Vec::new(),
-        constants: Vec::new(),
-        enum_cases: Vec::new(),
-        attributes: Vec::new(),
-        enum_backing_type: None,
-        constructor_id: None,
-        flags: php_runtime::api::ClassFlags::default(),
-    };
+    let (runtime_class, display_name) = native_throwable_class(class);
     let exception =
         php_runtime::api::ObjectRef::new_with_display_name(&runtime_class, display_name);
     let file = span

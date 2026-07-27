@@ -475,11 +475,6 @@ struct ManagerState {
     cache: HashMap<CraneliftCodeKey, JitFunctionHandle>,
     function_cells: HashMap<NativeFunctionCellIdentity, Arc<NativeIndirectionCell>>,
     function_publications: HashMap<NativeFunctionKey, JitFunctionHandle>,
-    /// Latest machine-code specialization for each published PHP function
-    /// tier. Request contexts retain any older generation they are currently
-    /// executing; the process cache must not pin every superseded
-    /// external-signature variant indefinitely.
-    function_code_keys: HashMap<NativeFunctionKey, CraneliftCodeKey>,
     compiling: HashSet<CraneliftCodeKey>,
     compile_failures: HashMap<CraneliftCodeKey, String>,
 }
@@ -553,7 +548,6 @@ impl CraneliftCodeManager {
                 cache: HashMap::new(),
                 function_cells: HashMap::new(),
                 function_publications: HashMap::new(),
-                function_code_keys: HashMap::new(),
                 compiling: HashSet::new(),
                 compile_failures: HashMap::new(),
             }),
@@ -926,43 +920,16 @@ impl CraneliftCodeManager {
                         ));
                     }
                     let regalloc = regalloc_mode_for_admission(admission);
-                    let supersedes_published_specialization = function_key
-                        .as_ref()
-                        .and_then(|function_key| state.function_code_keys.get(function_key))
-                        .is_some_and(|published| published != &key);
-                    let generation = if supersedes_published_specialization {
-                        // The first publication may share a compact arena with
-                        // unrelated functions. Once this function acquires a
-                        // second external-signature specialization, keep that
-                        // replacement in its own reclaimable generation.
-                        // Otherwise one still-current neighbor pins every
-                        // superseded multi-megabyte variant in the shared
-                        // arena for the process lifetime.
-                        let id = state.next_generation;
-                        state.next_generation = state.next_generation.saturating_add(1);
-                        let generation = match Self::new_generation(
-                            id,
-                            &self.helpers,
-                            &self.metrics,
-                            regalloc,
-                        ) {
-                            Ok(generation) => generation,
-                            Err(error) => {
-                                if let Some(cell) = &function_cell {
-                                    cell.reset_declared();
-                                }
-                                state.compiling.remove(&key);
-                                self.state_changed.notify_all();
-                                return Err(ManagedCompileError::Manager(error));
-                            }
-                        };
-                        state.generations.push_back(Arc::clone(&generation));
-                        generation
-                    } else {
-                        match regalloc {
-                            NativeRegallocMode::Fast => Arc::clone(&state.active_fast),
-                            NativeRegallocMode::Quality => Arc::clone(&state.active_quality),
-                        }
+                    // External-call ABI variants are simultaneously valid:
+                    // deterministic include order needs both the
+                    // pre-declaration and post-declaration caller. They share
+                    // the bounded active generation like unrelated functions;
+                    // creating a dedicated 32 MiB JIT module for every variant
+                    // made application size, rather than live code bytes, set
+                    // process RSS.
+                    let generation = match regalloc {
+                        NativeRegallocMode::Fast => Arc::clone(&state.active_fast),
+                        NativeRegallocMode::Quality => Arc::clone(&state.active_quality),
                     };
                     break (generation, evictions_before, function_cell);
                 }
@@ -1050,15 +1017,6 @@ impl CraneliftCodeManager {
             ManagedCompileError::Manager(CraneliftCodeManagerError::Poisoned("state"))
         })?;
         self.publish_function_entries(&mut state, &key, function_key.as_ref(), &handle);
-        if let Some(function_key) = function_key
-            && let Some(previous) = state
-                .function_code_keys
-                .insert(function_key.clone(), key.clone())
-            && previous != key
-        {
-            state.cache.remove(&previous);
-            state.compile_failures.remove(&previous);
-        }
         state.cache.insert(key.clone(), handle.clone());
         state.compile_failures.remove(&key);
 
@@ -1123,10 +1081,6 @@ impl CraneliftCodeManager {
             state
                 .cache
                 .retain(|_, handle| handle.code_generation_id() != Some(retired_id));
-            let cached = state.cache.keys().cloned().collect::<HashSet<_>>();
-            state
-                .function_code_keys
-                .retain(|_, code_key| cached.contains(code_key));
             let retired_keys = state
                 .function_publications
                 .iter()
@@ -1559,8 +1513,8 @@ mod tests {
     }
 
     #[test]
-    fn newer_function_specialization_does_not_pin_old_process_cache_entry() {
-        let manager = CraneliftCodeManager::new(1024 * 1024, 1).unwrap();
+    fn valid_function_specializations_share_generation_and_remain_cached() {
+        let manager = CraneliftCodeManager::new(1024 * 1024, 1024 * 1024).unwrap();
         let function_key = crate::native_function_key("deployment".to_owned(), 0, 0, 0, false, 0);
         let first_key = key(81, 0);
         let mut second_key = first_key.clone();
@@ -1588,13 +1542,13 @@ mod tests {
             .unwrap();
         assert_eq!(second.disposition, CraneliftCodeCacheDisposition::Compiled);
         let second_generation = second.handle.code_generation_id();
-        assert_ne!(
+        assert_eq!(
             first_generation, second_generation,
-            "a replacement specialization must own a reclaimable generation"
+            "valid ABI specializations must not allocate one JIT module each"
         );
         drop(second);
 
-        let recompiled = manager
+        let reused = manager
             .compile_once_with_scratch(
                 first_key,
                 Some(function_key),
@@ -1602,10 +1556,8 @@ mod tests {
                 |module, _context, _builder_context, symbol| compile_constant(module, symbol, 10),
             )
             .unwrap();
-        assert_eq!(
-            recompiled.disposition,
-            CraneliftCodeCacheDisposition::Compiled
-        );
+        assert_eq!(reused.disposition, CraneliftCodeCacheDisposition::Hit);
+        assert_eq!(manager.stats().code_generations, 2);
     }
 
     #[test]

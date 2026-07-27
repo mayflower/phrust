@@ -331,6 +331,14 @@ pub(super) extern "C" fn test_native_prepared_object_new_fallback(
     crate::JitNativeControlResult::control(crate::JitCallStatus::RUNTIME_ERROR, 0, 0)
 }
 
+pub(super) extern "C" fn test_native_prepared_exception_new_fallback(
+    _runtime: *mut std::ffi::c_void,
+    _prepared: u64,
+    _message: i64,
+) -> crate::JitNativeControlResult {
+    crate::JitNativeControlResult::control(crate::JitCallStatus::RUNTIME_ERROR, 0, 0)
+}
+
 pub(super) extern "C" fn test_native_prepared_closure_new_fallback(
     _runtime: *mut std::ffi::c_void,
     _prepared: u64,

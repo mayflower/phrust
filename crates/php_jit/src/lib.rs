@@ -33,26 +33,27 @@ pub use abi::{
     JIT_NATIVE_DIRECT_ARRAY_CURSOR_SHIFT, JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY,
     JIT_NATIVE_DIRECT_ARRAY_FLAGS_VERSION_MASK, JIT_NATIVE_DIRECT_ARRAY_FREE_BUCKETS,
     JIT_NATIVE_DIRECT_ARRAY_FREE_NONE, JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY,
-    JIT_NATIVE_DIRECT_FIBER_ABI_VERSION, JIT_NATIVE_DIRECT_GENERATOR_ABI_VERSION,
-    JIT_NATIVE_DIRECT_INT_ABI_VERSION, JIT_NATIVE_DIRECT_RESOURCE_ABI_VERSION,
-    JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY, JIT_NATIVE_DIRECT_STRING_CAPACITY_SHIFT,
-    JIT_NATIVE_DIRECT_STRING_FREE_BUCKETS, JIT_NATIVE_DIRECT_STRING_MIN_CAPACITY,
-    JIT_NATIVE_DIRECT_VALUE_CAPACITY, JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
-    JIT_NATIVE_FIBER_SUSPENSION_CAPACITY, JIT_NATIVE_FOREACH_VIEW_ABI_VERSION,
-    JIT_NATIVE_INSTANCEOF_PLAN_PUBLISHED, JIT_NATIVE_NUMERIC_STRING_FLOAT,
-    JIT_NATIVE_NUMERIC_STRING_INT, JIT_NATIVE_NUMERIC_STRING_LEADING_FLOAT,
-    JIT_NATIVE_NUMERIC_STRING_LEADING_INT, JIT_NATIVE_NUMERIC_STRING_NON_NUMERIC,
-    JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_VERSION, JIT_NATIVE_PREPARED_CALLABLE_ABI_VERSION,
-    JIT_NATIVE_PREPARED_CLASS_ALLOCATABLE, JIT_NATIVE_PREPARED_CLASS_EMPTY,
-    JIT_NATIVE_PREPARED_CLOSURE_HAS_IMPLICIT_THIS, JIT_NATIVE_REFERENCE_ARRAY_KEY_INT,
-    JIT_NATIVE_REFERENCE_ARRAY_KEY_STRING, JIT_NATIVE_REFERENCE_ARRAY_VALUE_FALSE,
-    JIT_NATIVE_REFERENCE_ARRAY_VALUE_INT, JIT_NATIVE_REFERENCE_ARRAY_VALUE_NULL,
-    JIT_NATIVE_REFERENCE_ARRAY_VALUE_STRING, JIT_NATIVE_REFERENCE_ARRAY_VALUE_TRUE,
-    JIT_NATIVE_REFERENCE_ARRAY_VALUE_UNINITIALIZED, JIT_NATIVE_REFERENCE_ARRAY_VALUE_UNSUPPORTED,
-    JIT_NATIVE_REFERENCE_ARRAY_VIEW_ABI_VERSION, JIT_NATIVE_REFERENCE_ARRAY_VIEW_EMPTY,
-    JIT_NATIVE_REFERENCE_ARRAY_VIEW_PUBLISHED, JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION,
-    JIT_NATIVE_REFERENCE_SCALAR_VIEW_DIRTY_FALSE, JIT_NATIVE_REFERENCE_SCALAR_VIEW_DIRTY_INT,
-    JIT_NATIVE_REFERENCE_SCALAR_VIEW_DIRTY_NULL, JIT_NATIVE_REFERENCE_SCALAR_VIEW_DIRTY_TRUE,
+    JIT_NATIVE_DIRECT_FIBER_ABI_VERSION, JIT_NATIVE_DIRECT_FOREACH_LIVE_REFERENCE,
+    JIT_NATIVE_DIRECT_GENERATOR_ABI_VERSION, JIT_NATIVE_DIRECT_INT_ABI_VERSION,
+    JIT_NATIVE_DIRECT_RESOURCE_ABI_VERSION, JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY,
+    JIT_NATIVE_DIRECT_STRING_CAPACITY_SHIFT, JIT_NATIVE_DIRECT_STRING_FREE_BUCKETS,
+    JIT_NATIVE_DIRECT_STRING_MIN_CAPACITY, JIT_NATIVE_DIRECT_VALUE_CAPACITY,
+    JIT_NATIVE_DIRECT_VALUE_INDEX_BASE, JIT_NATIVE_FIBER_SUSPENSION_CAPACITY,
+    JIT_NATIVE_FOREACH_VIEW_ABI_VERSION, JIT_NATIVE_INSTANCEOF_PLAN_PUBLISHED,
+    JIT_NATIVE_NUMERIC_STRING_FLOAT, JIT_NATIVE_NUMERIC_STRING_INT,
+    JIT_NATIVE_NUMERIC_STRING_LEADING_FLOAT, JIT_NATIVE_NUMERIC_STRING_LEADING_INT,
+    JIT_NATIVE_NUMERIC_STRING_NON_NUMERIC, JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_VERSION,
+    JIT_NATIVE_PREPARED_CALLABLE_ABI_VERSION, JIT_NATIVE_PREPARED_CLASS_ALLOCATABLE,
+    JIT_NATIVE_PREPARED_CLASS_EMPTY, JIT_NATIVE_PREPARED_CLOSURE_HAS_IMPLICIT_THIS,
+    JIT_NATIVE_REFERENCE_ARRAY_KEY_INT, JIT_NATIVE_REFERENCE_ARRAY_KEY_STRING,
+    JIT_NATIVE_REFERENCE_ARRAY_VALUE_FALSE, JIT_NATIVE_REFERENCE_ARRAY_VALUE_INT,
+    JIT_NATIVE_REFERENCE_ARRAY_VALUE_NULL, JIT_NATIVE_REFERENCE_ARRAY_VALUE_STRING,
+    JIT_NATIVE_REFERENCE_ARRAY_VALUE_TRUE, JIT_NATIVE_REFERENCE_ARRAY_VALUE_UNINITIALIZED,
+    JIT_NATIVE_REFERENCE_ARRAY_VALUE_UNSUPPORTED, JIT_NATIVE_REFERENCE_ARRAY_VIEW_ABI_VERSION,
+    JIT_NATIVE_REFERENCE_ARRAY_VIEW_EMPTY, JIT_NATIVE_REFERENCE_ARRAY_VIEW_PUBLISHED,
+    JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION, JIT_NATIVE_REFERENCE_SCALAR_VIEW_DIRTY_FALSE,
+    JIT_NATIVE_REFERENCE_SCALAR_VIEW_DIRTY_INT, JIT_NATIVE_REFERENCE_SCALAR_VIEW_DIRTY_NULL,
+    JIT_NATIVE_REFERENCE_SCALAR_VIEW_DIRTY_TRUE,
     JIT_NATIVE_REFERENCE_SCALAR_VIEW_DIRTY_UNINITIALIZED, JIT_NATIVE_REFERENCE_SCALAR_VIEW_EMPTY,
     JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED, JIT_NATIVE_REFERENCE_TYPED_PROPERTY_GUARD,
     JIT_NATIVE_REQUEST_LOCAL_EMPTY, JIT_NATIVE_REQUEST_LOCAL_PUBLISHED,
@@ -247,9 +248,29 @@ pub struct JitRuntimeHelperAddresses {
     pub native_dirname: usize,
     pub native_realpath: usize,
     pub native_file_exists: usize,
+    pub native_is_file: usize,
+    pub native_is_dir: usize,
+    pub native_is_readable: usize,
+    pub native_is_writable: usize,
+    pub native_filesize: usize,
+    pub native_filemtime: usize,
+    pub native_file_get_contents: usize,
     pub native_fopen: usize,
     pub native_fwrite: usize,
     pub native_fclose: usize,
+    pub native_fread: usize,
+    pub native_fgets: usize,
+    pub native_fgetc: usize,
+    pub native_feof: usize,
+    pub native_fflush: usize,
+    pub native_fseek: usize,
+    pub native_ftell: usize,
+    pub native_ftruncate: usize,
+    pub native_rewind: usize,
+    pub native_stream_get_contents: usize,
+    pub native_stream_copy_to_stream: usize,
+    /// Exact request-local output-buffer state and native-string handlers.
+    pub native_output_buffer: [usize; 8],
     /// Direct typed PHP semantic operation over packed i64 operands.
     pub native_semantic_dispatch: usize,
     /// Resolves or compiles one statically known PHP callee without invoking it.
@@ -300,6 +321,27 @@ pub struct JitRuntimeHelperAddresses {
     pub native_url_query: [usize; 3],
     /// Exact key-preserving sorts over authoritative native array entries.
     pub native_array_preserving_sort: [usize; 6],
+    /// Exact stable identity reads over authoritative objects and closures.
+    pub native_object_identity: [usize; 2],
+    /// Exact PHP wire serialization over authoritative scalar/array graphs.
+    pub native_serialization: [usize; 2],
+    /// Exact visible/mangled projections of authoritative object properties.
+    pub native_object_vars: [usize; 2],
+    /// Exact parent/subclass reads from published native class metadata.
+    pub native_class_lineage: [usize; 2],
+    /// Exact extension registry membership and loaded-name publication.
+    pub native_extension_query: [usize; 2],
+    /// Exact reads from the request-published native INI registry.
+    pub native_ini_query: [usize; 3],
+    /// Exact execution-context reads over the request-published native
+    /// environment, cwd, SAPI, and included-file capabilities.
+    pub native_request_query: [usize; 7],
+    /// Exact immutable function/class/interface/trait name inventories.
+    pub native_declaration_inventory: [usize; 4],
+    /// Exact standard, compiled, and request-defined constant inventory.
+    pub native_constant_inventory: usize,
+    /// Exact frame-local projection for `compact()`.
+    pub native_compact: usize,
     /// Exact introspection over the active authoritative native call frame.
     pub native_frame_introspection: [usize; 3],
     /// Exact stateless textual/packed network-address conversions.
@@ -330,6 +372,9 @@ pub struct JitRuntimeHelperAddresses {
     pub native_object_class_name: usize,
     /// Exact allocation from a request-published immutable class plan.
     pub native_prepared_object_new: usize,
+    /// Exact internal throwable allocation from immutable continuation
+    /// metadata and one authoritative native message value.
+    pub native_prepared_exception_new: usize,
     /// Exact closure allocation from immutable callsite metadata and native
     /// capture owners.
     pub native_prepared_closure_new: usize,
@@ -528,6 +573,12 @@ pub struct JitExternalFunctionSignature {
     pub params: Vec<JitExternalParameterSignature>,
     /// Complete declaration metadata used to pack the callee's native frame.
     pub native_params: Vec<php_ir::IrParam>,
+    /// Target-unit literal-slot indices for omitted native parameters.
+    ///
+    /// Generated callers load these values from the linked callee runtime
+    /// view. They never reinterpret a target-unit constant index in the
+    /// caller's literal table.
+    pub native_default_constant_indices: Vec<Option<u32>>,
     /// Exact number of native entry arguments after prepared binding.
     pub native_arity: u32,
     /// True when ordinary execution requires semantic trampoline work beyond
@@ -1630,7 +1681,7 @@ impl JitFunctionHandle {
                 missing_register,
             });
         }
-        let mut remapped_state = state.clone();
+        let mut remapped_state = *state;
         remapped_state.initialized_register_mask =
             if transition.live_registers.len() >= u64::BITS as usize {
                 u64::MAX
@@ -1642,7 +1693,7 @@ impl JitFunctionHandle {
         for (target_slot, (register, source_slot)) in transition
             .live_registers
             .iter()
-            .zip(register_source_slots.into_iter())
+            .zip(register_source_slots)
             .enumerate()
         {
             let source_slot = source_slot.expect("transition completeness was checked");
@@ -1928,6 +1979,7 @@ impl JitFunctionHandle {
     }
 
     /// Resumes a suspension and generated unwind with direct request state.
+    #[allow(clippy::too_many_arguments)]
     pub fn invoke_i64_suspension_resume_with_native_unwind_runtime(
         &self,
         args: &[i64],
@@ -2175,7 +2227,7 @@ impl JitNativeEntry {
                 state.continuation_id,
             ));
         }
-        let mut resumed = state.clone();
+        let mut resumed = *state;
         resumed.control_status = if input == JitNativeResumeInputKind::THROW {
             JitCallStatus::THROW
         } else {
