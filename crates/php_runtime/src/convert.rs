@@ -6,8 +6,13 @@ use crate::{
 };
 use std::cell::Cell;
 use std::cmp::Ordering;
+use std::fmt::{self, Write};
 
 const DEFAULT_FLOAT_STRING_PRECISION: i32 = 14;
+
+/// Stack storage sufficient for every finite `f64` rendered with PHP's
+/// supported scalar-string precision, including fixed-point `precision=0`.
+pub const PHP_FLOAT_STRING_BUFFER_CAPACITY: usize = 384;
 
 thread_local! {
     static FLOAT_STRING_PRECISION: Cell<i32> = const { Cell::new(DEFAULT_FLOAT_STRING_PRECISION) };
@@ -112,32 +117,92 @@ pub fn to_string(value: &Value) -> Result<PhpString, String> {
 /// This is exposed separately from [`to_string`] so native callers that have
 /// already proven the scalar type do not need to construct a runtime `Value`.
 pub fn float_to_php_string(value: f64) -> String {
-    if value.is_nan() {
-        "NAN".to_owned()
-    } else if value.is_infinite() {
-        if value.is_sign_negative() {
-            "-INF".to_owned()
-        } else {
-            "INF".to_owned()
-        }
-    } else if FLOAT_STRING_PRECISION.with(Cell::get) == 0 {
-        format!("{value:.0}")
-    } else if FLOAT_STRING_PRECISION.with(Cell::get) == -1 {
-        value.to_string()
-    } else if value != 0.0 {
-        let abs = value.abs();
-        if !(1e-4..1e14).contains(&abs) {
-            return php_scientific_float_string(value);
-        }
-        php_decimal_float_string(value)
-    } else if value.is_sign_negative() {
-        "-0".to_owned()
-    } else {
-        "0".to_owned()
+    let mut buffer = [0_u8; PHP_FLOAT_STRING_BUFFER_CAPACITY];
+    let rendered = float_to_php_string_bytes(value, &mut buffer);
+    std::str::from_utf8(rendered)
+        .expect("PHP float rendering is ASCII")
+        .to_owned()
+}
+
+/// Formats one IEEE-754 value into caller-owned storage without allocating.
+///
+/// The returned range borrows `output` and contains the same bytes as
+/// [`float_to_php_string`]. The fixed capacity covers the longest finite
+/// fixed-point `f64`, including its sign.
+pub fn float_to_php_string_bytes<'a>(
+    value: f64,
+    output: &'a mut [u8; PHP_FLOAT_STRING_BUFFER_CAPACITY],
+) -> &'a [u8] {
+    let length =
+        render_float_to_php_bytes(value, output).expect("PHP float buffer capacity is sufficient");
+    &output[..length]
+}
+
+struct FixedFloatString<'a> {
+    bytes: &'a mut [u8],
+    length: usize,
+}
+
+impl FixedFloatString<'_> {
+    fn new(bytes: &mut [u8]) -> FixedFloatString<'_> {
+        FixedFloatString { bytes, length: 0 }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.length]
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> fmt::Result {
+        let end = self.length.checked_add(bytes.len()).ok_or(fmt::Error)?;
+        let target = self.bytes.get_mut(self.length..end).ok_or(fmt::Error)?;
+        target.copy_from_slice(bytes);
+        self.length = end;
+        Ok(())
+    }
+
+    fn truncate(&mut self, length: usize) {
+        self.length = self.length.min(length);
     }
 }
 
-fn php_decimal_float_string(value: f64) -> String {
+impl Write for FixedFloatString<'_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.push_bytes(value.as_bytes())
+    }
+}
+
+fn render_float_to_php_bytes(value: f64, bytes: &mut [u8]) -> Result<usize, fmt::Error> {
+    let mut output = FixedFloatString::new(bytes);
+    if value.is_nan() {
+        output.push_bytes(b"NAN")?;
+    } else if value.is_infinite() {
+        if value.is_sign_negative() {
+            output.push_bytes(b"-INF")?;
+        } else {
+            output.push_bytes(b"INF")?;
+        }
+    } else if FLOAT_STRING_PRECISION.with(Cell::get) == 0 {
+        write!(output, "{value:.0}")?;
+    } else if FLOAT_STRING_PRECISION.with(Cell::get) == -1 {
+        write!(output, "{value}")?;
+    } else if value != 0.0 {
+        let abs = value.abs();
+        if !(1e-4..1e14).contains(&abs) {
+            return render_php_scientific_float(value, output);
+        }
+        return render_php_decimal_float(value, output);
+    } else if value.is_sign_negative() {
+        output.push_bytes(b"-0")?;
+    } else {
+        output.push_bytes(b"0")?;
+    }
+    Ok(output.length)
+}
+
+fn render_php_decimal_float(
+    value: f64,
+    mut output: FixedFloatString<'_>,
+) -> Result<usize, fmt::Error> {
     let precision = FLOAT_STRING_PRECISION.with(Cell::get).clamp(1, 17) as usize;
     let abs = value.abs();
     let integer_digits = if abs >= 1.0 {
@@ -153,52 +218,63 @@ fn php_decimal_float_string(value: f64) -> String {
     let decimals = precision
         .saturating_sub(integer_digits)
         .saturating_add(leading_fractional_zeros);
-    let mut output = format!("{value:.decimals$}");
-    if output == "-0" {
-        return "0".to_owned();
+    write!(output, "{value:.decimals$}")?;
+    if output.as_bytes() == b"-0" {
+        output.bytes[0] = b'0';
+        output.truncate(1);
+        return Ok(output.length);
     }
-    if output.contains('.') {
-        while output.ends_with('0') {
-            output.pop();
+    if output.as_bytes().contains(&b'.') {
+        while output.as_bytes().ends_with(b"0") {
+            output.truncate(output.length - 1);
         }
-        if output.ends_with('.') {
-            output.pop();
+        if output.as_bytes().ends_with(b".") {
+            output.truncate(output.length - 1);
         }
     }
-    if output == "-0" {
-        "0".to_owned()
-    } else {
-        output
+    if output.as_bytes() == b"-0" {
+        output.bytes[0] = b'0';
+        output.truncate(1);
     }
+    Ok(output.length)
 }
 
-fn php_scientific_float_string(value: f64) -> String {
+fn render_php_scientific_float(
+    value: f64,
+    mut output: FixedFloatString<'_>,
+) -> Result<usize, fmt::Error> {
     let precision = FLOAT_STRING_PRECISION.with(Cell::get).clamp(1, 17) as usize;
     let decimals = precision.saturating_sub(1);
-    let mut output = format!("{value:.decimals$E}");
-    if let Some(exponent_index) = output.find('E') {
-        let mut mantissa = output[..exponent_index].to_owned();
-        let exponent = &output[exponent_index + 1..];
-        while mantissa.ends_with('0') {
-            mantissa.pop();
+    let mut scratch_bytes = [0_u8; PHP_FLOAT_STRING_BUFFER_CAPACITY];
+    let mut scratch = FixedFloatString::new(&mut scratch_bytes);
+    write!(scratch, "{value:.decimals$E}")?;
+    let rendered = scratch.as_bytes();
+    if let Some(exponent_index) = rendered.iter().position(|byte| *byte == b'E') {
+        let mut mantissa_end = exponent_index;
+        while rendered[..mantissa_end].ends_with(b"0") {
+            mantissa_end -= 1;
         }
-        if mantissa.ends_with('.') {
-            mantissa.push('0');
+        output.push_bytes(&rendered[..mantissa_end])?;
+        if rendered[..mantissa_end].ends_with(b".") {
+            output.push_bytes(b"0")?;
         }
-        let sign = exponent
-            .strip_prefix('+')
-            .map(|digits| ("+", digits))
-            .or_else(|| exponent.strip_prefix('-').map(|digits| ("-", digits)))
-            .unwrap_or(("+", exponent));
-        let digits = sign.1.trim_start_matches('0');
-        output = format!(
-            "{}E{}{}",
-            mantissa,
-            sign.0,
-            if digits.is_empty() { "0" } else { digits }
-        );
+        output.push_bytes(b"E")?;
+        let exponent = &rendered[exponent_index + 1..];
+        let (sign, digits) = match exponent.first() {
+            Some(b'+') => (b'+', &exponent[1..]),
+            Some(b'-') => (b'-', &exponent[1..]),
+            _ => (b'+', exponent),
+        };
+        output.push_bytes(&[sign])?;
+        let digits = digits
+            .iter()
+            .position(|digit| *digit != b'0')
+            .map_or(&digits[digits.len()..], |first| &digits[first..]);
+        output.push_bytes(if digits.is_empty() { b"0" } else { digits })?;
+    } else {
+        output.push_bytes(rendered)?;
     }
-    output
+    Ok(output.length)
 }
 
 /// Whether a float is exactly representable in the PHP int domain, mirroring
@@ -289,6 +365,30 @@ pub fn to_number(value: &Value) -> Result<NumericValue, String> {
         Value::Resource(resource) => Ok(NumericValue::Int(resource.id().get() as i64)),
         Value::Callable(_) => Err("callable to number conversion is not implemented".to_owned()),
         Value::Reference(cell) => to_number(&cell.borrow()),
+    }
+}
+
+/// Converts authoritative native string bytes to PHP's arithmetic number
+/// shape without constructing a `PhpString` or runtime `Value`.
+pub fn native_bytes_to_number(value: &[u8]) -> Result<NumericValue, String> {
+    let classified = crate::numeric_string::classify(value);
+    match (classified.kind, classified.value) {
+        (
+            NumericStringKind::IntString
+            | NumericStringKind::FloatString
+            | NumericStringKind::LeadingNumeric,
+            Some(NumericStringValue::Int(value)),
+        ) => Ok(NumericValue::Int(value)),
+        (
+            NumericStringKind::IntString
+            | NumericStringKind::FloatString
+            | NumericStringKind::LeadingNumeric,
+            Some(NumericStringValue::Float(value)),
+        ) => Ok(NumericValue::Float(value)),
+        _ => Err(
+            "E_PHP_RUNTIME_NON_NUMERIC_STRING: non-numeric string cannot be used as a number"
+                .to_owned(),
+        ),
     }
 }
 

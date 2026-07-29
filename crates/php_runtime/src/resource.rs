@@ -404,6 +404,9 @@ struct StreamFilterSpec {
 enum StreamFilterKind {
     ZlibDeflate,
     ZlibInflate,
+    StringRot13,
+    StringToUpper,
+    StringToLower,
 }
 
 impl StreamFilterKind {
@@ -411,6 +414,9 @@ impl StreamFilterKind {
         match name.to_ascii_lowercase().as_str() {
             "zlib.deflate" => Some(Self::ZlibDeflate),
             "zlib.inflate" => Some(Self::ZlibInflate),
+            "string.rot13" => Some(Self::StringRot13),
+            "string.toupper" => Some(Self::StringToUpper),
+            "string.tolower" => Some(Self::StringToLower),
             _ => None,
         }
     }
@@ -430,6 +436,7 @@ enum StreamData {
         path: PathBuf,
         buffer: Vec<u8>,
         cursor: usize,
+        delete_on_close: bool,
     },
     GzipFile {
         path: PathBuf,
@@ -448,7 +455,11 @@ enum StreamData {
         cursor: usize,
     },
     Context {
-        options: PhpArray,
+        /// Baseline-only compatibility snapshot. Optimizing execution keeps
+        /// the authoritative option graph in its request-owned native arena
+        /// and materializes this sidecar only for one explicit baseline
+        /// continuation.
+        baseline_options: Option<PhpArray>,
     },
     FileInfo {
         flags: i64,
@@ -562,6 +573,25 @@ impl ResourceRef {
     #[must_use]
     pub fn is_user_closable(&self) -> bool {
         self.0.borrow().user_closable
+    }
+
+    /// Marks a local plain-file stream as owning an anonymous temporary path.
+    ///
+    /// The path is removed by the authoritative stream close operation,
+    /// including request finalization. Other stream kinds cannot acquire this
+    /// ownership mode.
+    #[doc(hidden)]
+    pub fn mark_delete_on_close(&self) -> bool {
+        let mut state = self.0.borrow_mut();
+        match &mut state.data {
+            StreamData::File {
+                delete_on_close, ..
+            } => {
+                *delete_on_close = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Writes bytes into writable in-memory, temp, stdio, or file-backed buffers.
@@ -1053,6 +1083,35 @@ impl ResourceRef {
         }
     }
 
+    /// Captures the directory cursor before an exact native read.
+    #[must_use]
+    pub fn native_directory_cursor_checkpoint(&self) -> Option<usize> {
+        let state = self.0.borrow();
+        match &state.data {
+            StreamData::Directory { cursor, .. } if state.kind != ResourceKind::Closed => {
+                Some(*cursor)
+            }
+            _ => None,
+        }
+    }
+
+    /// Restores a directory cursor when native result publication fails.
+    pub fn restore_native_directory_cursor(&self, checkpoint: usize) -> bool {
+        let mut state = self.0.borrow_mut();
+        if state.kind == ResourceKind::Closed {
+            return false;
+        }
+        match &mut state.data {
+            StreamData::Directory {
+                entries, cursor, ..
+            } if checkpoint <= entries.len() => {
+                *cursor = checkpoint;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Rewinds a directory resource to the first entry.
     pub fn rewind_dir(&self) -> Result<(), StreamOpenError> {
         let mut state = self.0.borrow_mut();
@@ -1078,10 +1137,40 @@ impl ResourceRef {
     pub fn context_options(&self) -> Option<PhpArray> {
         let state = self.0.borrow();
         match &state.data {
-            StreamData::Context { options } if state.kind != ResourceKind::Closed => {
-                Some(options.clone())
+            StreamData::Context { baseline_options } if state.kind != ResourceKind::Closed => {
+                baseline_options.clone()
             }
             _ => None,
+        }
+    }
+
+    /// Publishes one baseline-only compatibility snapshot for this context.
+    ///
+    /// Native execution owns context options separately and uses this method
+    /// only while crossing its single baseline continuation.
+    pub fn replace_context_options(&self, options: PhpArray) -> Result<(), StreamOpenError> {
+        let mut state = self.0.borrow_mut();
+        if state.kind == ResourceKind::Closed {
+            return Err(StreamOpenError::new(
+                "E_PHP_RUNTIME_STREAM_CLOSED",
+                "cannot update a closed stream context",
+            ));
+        }
+        let StreamData::Context { baseline_options } = &mut state.data else {
+            return Err(StreamOpenError::new(
+                "E_PHP_RUNTIME_STREAM_NOT_CONTEXT",
+                "resource is not a stream context",
+            ));
+        };
+        *baseline_options = Some(options);
+        Ok(())
+    }
+
+    /// Drops the baseline compatibility snapshot after native republication.
+    pub fn clear_context_options(&self) {
+        let mut state = self.0.borrow_mut();
+        if let StreamData::Context { baseline_options } = &mut state.data {
+            *baseline_options = None;
         }
     }
 
@@ -1099,12 +1188,13 @@ impl ResourceRef {
                 "cannot update a closed stream context",
             ));
         }
-        let StreamData::Context { options } = &mut state.data else {
+        let StreamData::Context { baseline_options } = &mut state.data else {
             return Err(StreamOpenError::new(
                 "E_PHP_RUNTIME_STREAM_NOT_CONTEXT",
                 "resource is not a stream context",
             ));
         };
+        let options = baseline_options.get_or_insert_with(PhpArray::new);
         let wrapper = wrapper.into();
         let option = option.into();
         let wrapper_key = ArrayKey::String(PhpString::from_test_str(&wrapper));
@@ -1191,7 +1281,19 @@ impl ResourceRef {
             return false;
         }
         let _ = flush_file_data(&state.data);
+        let delete_path = match &state.data {
+            StreamData::File {
+                path,
+                delete_on_close: true,
+                ..
+            } => Some(path.clone()),
+            _ => None,
+        };
         state.kind = ResourceKind::Closed;
+        drop(state);
+        if let Some(path) = delete_path {
+            let _ = std::fs::remove_file(path);
+        }
         true
     }
 }
@@ -1338,6 +1440,16 @@ impl ResourceTable {
 
     /// Registers a stream context resource.
     pub fn register_stream_context(&mut self, options: PhpArray) -> ResourceRef {
+        self.register_stream_context_data(Some(options))
+    }
+
+    /// Registers a context whose authoritative options live in the native
+    /// request arena. No Rust `Value` or `PhpArray` is constructed.
+    pub fn register_native_stream_context(&mut self) -> ResourceRef {
+        self.register_stream_context_data(None)
+    }
+
+    fn register_stream_context_data(&mut self, baseline_options: Option<PhpArray>) -> ResourceRef {
         let id = ResourceId::new(self.next_id);
         self.next_id += 1;
         let resource = ResourceRef(Rc::new(RefCell::new(ResourceState {
@@ -1349,7 +1461,7 @@ impl ResourceTable {
             read_eof: false,
             read_filters: Vec::new(),
             write_filters: Vec::new(),
-            data: StreamData::Context { options },
+            data: StreamData::Context { baseline_options },
         })));
         self.resources.insert(id, resource.clone());
         resource
@@ -1656,6 +1768,7 @@ fn open_file_stream(
             path: normalized,
             buffer,
             cursor,
+            delete_on_close: false,
         },
     ))
 }
@@ -1774,6 +1887,24 @@ fn apply_stream_filters(
         bytes = match filter.kind {
             StreamFilterKind::ZlibDeflate => zlib_deflate_filter(&bytes, &filter.name)?,
             StreamFilterKind::ZlibInflate => zlib_inflate_filter(&bytes, &filter.name)?,
+            StreamFilterKind::StringRot13 => {
+                for byte in &mut bytes {
+                    *byte = match *byte {
+                        b'a'..=b'm' | b'A'..=b'M' => *byte + 13,
+                        b'n'..=b'z' | b'N'..=b'Z' => *byte - 13,
+                        byte => byte,
+                    };
+                }
+                bytes
+            }
+            StreamFilterKind::StringToUpper => {
+                bytes.make_ascii_uppercase();
+                bytes
+            }
+            StreamFilterKind::StringToLower => {
+                bytes.make_ascii_lowercase();
+                bytes
+            }
         };
     }
     Ok(bytes)

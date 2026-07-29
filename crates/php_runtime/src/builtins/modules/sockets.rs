@@ -7,6 +7,7 @@ use crate::{
     RuntimeSourceSpan, Value, normalize_class_name,
 };
 use std::convert::TryFrom;
+use std::fmt::Write as _;
 use std::io;
 
 const SOCKET_CLASS: &str = "Socket";
@@ -722,9 +723,7 @@ fn builtin_long2ip(
         return Err(arity_error("long2ip", "one argument"));
     }
     let address = int_arg("long2ip", &args[0])?;
-    Ok(Value::string(
-        String::from_utf8(native_long2ip(address)).expect("IPv4 text is ASCII"),
-    ))
+    Ok(Value::string(native_long2ip(address).as_bytes().to_vec()))
 }
 
 fn parse_php_ipv4(address: &str) -> Option<[u8; 4]> {
@@ -748,34 +747,79 @@ pub fn native_ip2long(address: &[u8]) -> Option<i64> {
     parse_php_ipv4(address).map(|octets| i64::from(u32::from_be_bytes(octets)))
 }
 
-pub fn native_long2ip(address: i64) -> Vec<u8> {
-    std::net::Ipv4Addr::from(address as u32)
-        .to_string()
-        .into_bytes()
+/// Fixed-size result for the native network-address family.
+///
+/// IPv6 text is at most 39 bytes and packed addresses are at most 16 bytes,
+/// so exact handlers carry the complete result on the native stack and copy
+/// it once into the authoritative request string arena.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeNetworkAddress {
+    bytes: [u8; 39],
+    length: usize,
 }
 
-pub fn native_inet_pton(address: &[u8]) -> Option<Vec<u8>> {
+impl NativeNetworkAddress {
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut result = Self {
+            bytes: [0; 39],
+            length: bytes.len(),
+        };
+        result.bytes.get_mut(..bytes.len())?.copy_from_slice(bytes);
+        Some(result)
+    }
+
+    fn from_display(address: impl std::fmt::Display) -> Option<Self> {
+        let mut result = Self {
+            bytes: [0; 39],
+            length: 0,
+        };
+        write!(result, "{address}").ok()?;
+        Some(result)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.length]
+    }
+}
+
+impl std::fmt::Write for NativeNetworkAddress {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        let end = self
+            .length
+            .checked_add(value.len())
+            .ok_or(std::fmt::Error)?;
+        let destination = self
+            .bytes
+            .get_mut(self.length..end)
+            .ok_or(std::fmt::Error)?;
+        destination.copy_from_slice(value.as_bytes());
+        self.length = end;
+        Ok(())
+    }
+}
+
+pub fn native_long2ip(address: i64) -> NativeNetworkAddress {
+    NativeNetworkAddress::from_display(std::net::Ipv4Addr::from(address as u32))
+        .expect("IPv4 text fits the fixed native network-address result")
+}
+
+pub fn native_inet_pton(address: &[u8]) -> Option<NativeNetworkAddress> {
     let address = std::str::from_utf8(address).ok()?;
-    address
-        .parse::<std::net::IpAddr>()
-        .ok()
-        .map(|address| match address {
-            std::net::IpAddr::V4(address) => address.octets().to_vec(),
-            std::net::IpAddr::V6(address) => address.octets().to_vec(),
-        })
+    match address.parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(address) => NativeNetworkAddress::from_bytes(&address.octets()),
+        std::net::IpAddr::V6(address) => NativeNetworkAddress::from_bytes(&address.octets()),
+    }
 }
 
-pub fn native_inet_ntop(packed: &[u8]) -> Option<Vec<u8>> {
+pub fn native_inet_ntop(packed: &[u8]) -> Option<NativeNetworkAddress> {
     match packed.len() {
-        4 => Some(
-            std::net::Ipv4Addr::new(packed[0], packed[1], packed[2], packed[3])
-                .to_string()
-                .into_bytes(),
-        ),
+        4 => NativeNetworkAddress::from_display(std::net::Ipv4Addr::new(
+            packed[0], packed[1], packed[2], packed[3],
+        )),
         16 => {
             let mut octets = [0; 16];
             octets.copy_from_slice(packed);
-            Some(std::net::Ipv6Addr::from(octets).to_string().into_bytes())
+            NativeNetworkAddress::from_display(std::net::Ipv6Addr::from(octets))
         }
         _ => None,
     }
@@ -790,7 +834,9 @@ fn builtin_inet_pton(
         return Err(arity_error("inet_pton", "one argument"));
     }
     let address = string_arg("inet_pton", &args[0])?;
-    Ok(native_inet_pton(address.as_bytes()).map_or(Value::Bool(false), Value::string))
+    Ok(native_inet_pton(address.as_bytes())
+        .map(|address| Value::string(address.as_bytes().to_vec()))
+        .unwrap_or(Value::Bool(false)))
 }
 
 fn builtin_inet_ntop(
@@ -802,7 +848,9 @@ fn builtin_inet_ntop(
         return Err(arity_error("inet_ntop", "one argument"));
     }
     let packed = string_arg("inet_ntop", &args[0])?;
-    Ok(native_inet_ntop(packed.as_bytes()).map_or(Value::Bool(false), Value::string))
+    Ok(native_inet_ntop(packed.as_bytes())
+        .map(|address| Value::string(address.as_bytes().to_vec()))
+        .unwrap_or(Value::Bool(false)))
 }
 
 fn socket_id_arg(name: &str, value: &Value) -> Result<i64, BuiltinError> {
@@ -914,10 +962,20 @@ mod tests {
     #[test]
     fn native_network_address_family_roundtrips_without_values() {
         assert_eq!(native_ip2long(b"127.0.0.1"), Some(2_130_706_433));
-        assert_eq!(native_long2ip(4_294_967_295), b"255.255.255.255");
-        assert_eq!(native_inet_pton(b"192.0.2.1"), Some(vec![192, 0, 2, 1]));
+        assert_eq!(native_long2ip(4_294_967_295).as_bytes(), b"255.255.255.255");
+        assert_eq!(
+            native_inet_pton(b"192.0.2.1")
+                .expect("valid IPv4")
+                .as_bytes(),
+            &[192, 0, 2, 1]
+        );
         let packed = native_inet_pton(b"2001:db8::1").expect("valid IPv6");
-        assert_eq!(native_inet_ntop(&packed), Some(b"2001:db8::1".to_vec()));
+        assert_eq!(
+            native_inet_ntop(packed.as_bytes())
+                .expect("valid packed IPv6")
+                .as_bytes(),
+            b"2001:db8::1"
+        );
         assert_eq!(native_ip2long(b"01.2.3.4"), None);
         assert_eq!(native_inet_ntop(b"short"), None);
     }

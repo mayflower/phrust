@@ -263,8 +263,14 @@ where
             .read_to_end(&mut stdin_bytes)
             .map_err(|error| format!("stdin: {error}"))?;
     }
+    let mut environment = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for (name, value) in options.env {
+        environment.insert(name, value);
+    }
     let runtime_context = RuntimeContext::controlled_cli(&options.path, options.script_args)
-        .with_env(options.env)
+        .with_env(environment.into_iter().collect())
         .with_cwd(cwd.clone())
         .with_stdin(stdin_bytes);
     let execute_started = Instant::now();

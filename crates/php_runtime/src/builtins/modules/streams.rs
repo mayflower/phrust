@@ -495,7 +495,11 @@ pub(in crate::builtins::modules) fn builtin_rewinddir(
     let Some(resource) = args.first().and_then(resource_arg) else {
         return Ok(Value::Bool(false));
     };
-    Ok(Value::Bool(resource.rewind_dir().is_ok()))
+    Ok(if resource.rewind_dir().is_ok() {
+        Value::Null
+    } else {
+        Value::Bool(false)
+    })
 }
 pub(in crate::builtins::modules) fn builtin_closedir(
     context: &mut BuiltinContext<'_>,
@@ -939,6 +943,66 @@ pub(in crate::builtins::modules) fn builtin_stream_resolve_include_path(
     }
     Ok(Value::Bool(false))
 }
+
+/// Resolves one local include-path candidate without constructing a runtime
+/// `Value`. Registered and remote wrappers retain their cold boundary.
+pub fn native_stream_resolve_include_path(
+    cwd: &Path,
+    filesystem: &crate::FilesystemCapabilities,
+    include_path: &[std::path::PathBuf],
+    file: &[u8],
+) -> Option<Option<Vec<u8>>> {
+    let file = String::from_utf8_lossy(file);
+    if is_remote_stream_uri(&file) || file.contains("://") {
+        return None;
+    }
+    let raw = Path::new(file.as_ref());
+    let candidates = if raw.is_absolute() {
+        vec![normalize_runtime_path(raw)]
+    } else {
+        include_path
+            .iter()
+            .map(|entry| {
+                let base = if entry.is_absolute() {
+                    entry.clone()
+                } else {
+                    cwd.join(entry)
+                };
+                normalize_runtime_path(&base.join(raw))
+            })
+            .collect()
+    };
+    Some(
+        candidates
+            .into_iter()
+            .find(|candidate| filesystem.allows_path(candidate) && candidate.exists())
+            .map(|candidate| candidate.to_string_lossy().into_owned().into_bytes()),
+    )
+}
+
+/// Classifies the string form accepted by `stream_is_local()` directly from
+/// request filesystem capabilities.
+pub fn native_stream_is_local(
+    cwd: &Path,
+    filesystem: &crate::FilesystemCapabilities,
+    path: &[u8],
+) -> bool {
+    let path = String::from_utf8_lossy(path);
+    if is_remote_stream_uri(&path) {
+        return false;
+    }
+    if path.starts_with("php://") {
+        return true;
+    }
+    let raw = Path::new(path.as_ref());
+    let resolved = if raw.is_absolute() {
+        normalize_runtime_path(raw)
+    } else {
+        normalize_runtime_path(&cwd.join(raw))
+    };
+    filesystem.allows_path(&resolved)
+}
+
 pub(in crate::builtins::modules) fn builtin_stream_is_local(
     context: &mut BuiltinContext<'_>,
     args: Vec<Value>,

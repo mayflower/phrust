@@ -24,9 +24,16 @@ pub(super) extern "C" fn test_native_unary_fallback(
     0
 }
 
+pub(super) extern "C" fn test_native_exact_unary_fallback(
+    _runtime: *mut std::ffi::c_void,
+    _source: i64,
+) -> crate::JitNativeControlResult {
+    crate::JitNativeControlResult::control(crate::JitCallStatus::RUNTIME_ERROR, 0, 0)
+}
+
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
-pub(super) extern "C" fn test_native_binary_fallback(
+pub(super) extern "C" fn test_baseline_binary_fallback(
     _runtime: *mut std::ffi::c_void,
     op: u32,
     lhs: i64,
@@ -52,6 +59,26 @@ pub(super) extern "C" fn test_native_binary_fallback(
     // SAFETY: Cranelift owns this synchronous stack output slot.
     unsafe { out.write(value) };
     0
+}
+
+pub(super) extern "C" fn test_native_exact_binary_fallback(
+    _runtime: *mut std::ffi::c_void,
+    _lhs: i64,
+    _rhs: i64,
+) -> crate::JitNativeControlResult {
+    crate::JitNativeControlResult::control(crate::JitCallStatus::RUNTIME_ERROR, 0, 0)
+}
+
+pub(super) extern "C" fn test_native_exact_compare_fallback(
+    _runtime: *mut u8,
+    _left: i64,
+    _right: i64,
+) -> crate::JitNativeControlResult {
+    crate::JitNativeControlResult::control(
+        crate::JitCallStatus::ABI_MISMATCH,
+        0,
+        crate::jit_encode_constant(u32::MAX),
+    )
 }
 
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
@@ -180,10 +207,6 @@ pub(super) extern "C" fn test_native_numeric_string_fallback(
     }
 }
 
-pub(super) extern "C" fn test_native_pow_f64_fallback(base: f64, exponent: f64) -> f64 {
-    base.powf(exponent)
-}
-
 pub(super) extern "C" fn test_native_fmod_f64_fallback(dividend: f64, divisor: f64) -> f64 {
     dividend % divisor
 }
@@ -268,18 +291,6 @@ pub(super) fn test_native_pure_math_fallback(builtin: super::StablePureMathBuilt
         StablePureMathBuiltin::Tan => test_native_tan_f64_fallback as *const () as usize,
         StablePureMathBuiltin::Tanh => test_native_tanh_f64_fallback as *const () as usize,
     }
-}
-
-pub(super) extern "C" fn test_native_array_comparison_fallback(
-    _runtime: *mut std::ffi::c_void,
-    _left: i64,
-    _right: i64,
-) -> crate::JitNativeControlResult {
-    crate::JitNativeControlResult::control(
-        crate::JitCallStatus::RECOMPILE_REQUESTED,
-        0,
-        crate::jit_encode_constant(u32::MAX),
-    )
 }
 
 pub(super) extern "C" fn test_native_object_class_name_fallback(

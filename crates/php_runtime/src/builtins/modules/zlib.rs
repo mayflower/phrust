@@ -12,7 +12,7 @@ use crate::{ClassEntry, ClassFlags, ObjectRef, PhpArray, Value, normalize_class_
 use flate2::Compression;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
-use std::io::{Cursor, Read, Write};
+use std::io::{self, Cursor, Read, Write};
 
 pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry::new(
@@ -510,7 +510,7 @@ fn builtin_gzencode(
     let input = string_arg("gzencode", &args[0])?;
     let level = compression_level_value("gzencode", args.get(1))?;
     Ok(
-        native_zlib_encode(input.as_bytes(), ZLIB_ENCODING_GZIP, level)
+        baseline_zlib_encode(input.as_bytes(), ZLIB_ENCODING_GZIP, level)
             .map_or(Value::Bool(false), Value::string),
     )
 }
@@ -526,7 +526,7 @@ fn builtin_gzcompress(
     let input = string_arg("gzcompress", &args[0])?;
     let level = compression_level_value("gzcompress", args.get(1))?;
     Ok(
-        native_zlib_encode(input.as_bytes(), ZLIB_ENCODING_DEFLATE, level)
+        baseline_zlib_encode(input.as_bytes(), ZLIB_ENCODING_DEFLATE, level)
             .map_or(Value::Bool(false), Value::string),
     )
 }
@@ -542,74 +542,102 @@ fn builtin_gzdeflate(
     let input = string_arg("gzdeflate", &args[0])?;
     let level = compression_level_value("gzdeflate", args.get(1))?;
     Ok(
-        native_zlib_encode(input.as_bytes(), ZLIB_ENCODING_RAW, level)
+        baseline_zlib_encode(input.as_bytes(), ZLIB_ENCODING_RAW, level)
             .map_or(Value::Bool(false), Value::string),
     )
 }
 
 fn builtin_gzdecode(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
-    _span: RuntimeSourceSpan,
+    span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if args.is_empty() || args.len() > 2 {
         return Err(arity_error("gzdecode", "one or two argument(s)"));
     }
     let input = string_arg("gzdecode", &args[0])?;
-    Ok(native_zlib_decode(
+    let decoded = baseline_zlib_decode(
         input.as_bytes(),
         ZLIB_ENCODING_GZIP,
         max_length("gzdecode", args.get(1))?,
-    )
-    .map_or(Value::Bool(false), Value::string))
+    );
+    if decoded.is_none() {
+        context.php_warning(
+            "E_PHP_RUNTIME_GZDECODE_DATA",
+            "gzdecode(): data error",
+            span,
+        );
+    }
+    Ok(decoded.map_or(Value::Bool(false), Value::string))
 }
 
 fn builtin_gzuncompress(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
-    _span: RuntimeSourceSpan,
+    span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if args.is_empty() || args.len() > 2 {
         return Err(arity_error("gzuncompress", "one or two argument(s)"));
     }
     let input = string_arg("gzuncompress", &args[0])?;
-    Ok(native_zlib_decode(
+    let decoded = baseline_zlib_decode(
         input.as_bytes(),
         ZLIB_ENCODING_DEFLATE,
         max_length("gzuncompress", args.get(1))?,
-    )
-    .map_or(Value::Bool(false), Value::string))
+    );
+    if decoded.is_none() {
+        context.php_warning(
+            "E_PHP_RUNTIME_GZUNCOMPRESS_DATA",
+            "gzuncompress(): data error",
+            span,
+        );
+    }
+    Ok(decoded.map_or(Value::Bool(false), Value::string))
 }
 
 fn builtin_gzinflate(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
-    _span: RuntimeSourceSpan,
+    span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if args.is_empty() || args.len() > 2 {
         return Err(arity_error("gzinflate", "one or two argument(s)"));
     }
     let input = string_arg("gzinflate", &args[0])?;
-    Ok(native_zlib_decode(
+    let decoded = baseline_zlib_decode(
         input.as_bytes(),
         ZLIB_ENCODING_RAW,
         max_length("gzinflate", args.get(1))?,
-    )
-    .map_or(Value::Bool(false), Value::string))
+    );
+    if decoded.is_none() {
+        context.php_warning(
+            "E_PHP_RUNTIME_GZINFLATE_DATA",
+            "gzinflate(): data error",
+            span,
+        );
+    }
+    Ok(decoded.map_or(Value::Bool(false), Value::string))
 }
 
 fn builtin_zlib_decode(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
-    _span: RuntimeSourceSpan,
+    span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if args.is_empty() || args.len() > 2 {
         return Err(arity_error("zlib_decode", "one or two argument(s)"));
     }
     let input = string_arg("zlib_decode", &args[0])?;
     let max_length = max_length("zlib_decode", args.get(1))?;
-    Ok(native_zlib_decode_auto(input.as_bytes(), max_length)
-        .map_or(Value::Bool(false), Value::string))
+    let decoded = baseline_zlib_decode_auto(input.as_bytes(), max_length);
+    if decoded.is_none() {
+        context.php_warning(
+            "E_PHP_RUNTIME_ZLIB_DECODE_DATA",
+            "zlib_decode(): data error",
+            span,
+        );
+    }
+    Ok(decoded.map_or(Value::Bool(false), Value::string))
 }
 
 fn builtin_zlib_encode(
@@ -623,7 +651,7 @@ fn builtin_zlib_encode(
     let input = string_arg("zlib_encode", &args[0])?;
     let encoding = int_arg("zlib_encode", &args[1])?;
     let level = compression_level_value("zlib_encode", args.get(2))?;
-    Ok(native_zlib_encode(input.as_bytes(), encoding, level)
+    Ok(baseline_zlib_encode(input.as_bytes(), encoding, level)
         .map_or(Value::Bool(false), Value::string))
 }
 
@@ -635,7 +663,172 @@ fn native_compression_level(level: i64) -> Compression {
     }
 }
 
-pub fn native_zlib_encode(input: &[u8], encoding: i64, level: i64) -> Option<Vec<u8>> {
+struct NativeZlibSliceWriter<'a> {
+    output: &'a mut [u8],
+    length: usize,
+}
+
+impl<'a> NativeZlibSliceWriter<'a> {
+    fn new(output: &'a mut [u8]) -> Self {
+        Self { output, length: 0 }
+    }
+}
+
+impl Write for NativeZlibSliceWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let remaining = self.output.len().saturating_sub(self.length);
+        if remaining == 0 && !bytes.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "native zlib output reservation is full",
+            ));
+        }
+        let written = remaining.min(bytes.len());
+        self.output[self.length..self.length + written].copy_from_slice(&bytes[..written]);
+        self.length += written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Conservative zlib-family output reservation. This is the zlib
+/// `compressBound` formula plus wrapper/headroom bytes for gzip and the
+/// backend's final flush.
+pub fn native_zlib_encode_output_capacity(input_length: usize, encoding: i64) -> Option<usize> {
+    zlib_encoding_is_supported(encoding).then_some(())?;
+    input_length
+        .checked_add(input_length >> 12)?
+        .checked_add(input_length >> 14)?
+        .checked_add(input_length >> 25)?
+        .checked_add(128)
+}
+
+/// Compresses directly into a caller-owned native string reservation and
+/// returns the initialized prefix length.
+pub fn native_zlib_encode_into(
+    input: &[u8],
+    encoding: i64,
+    level: i64,
+    output: &mut [u8],
+) -> Option<usize> {
+    let level = native_compression_level(level);
+    match encoding {
+        ZLIB_ENCODING_RAW => {
+            let mut encoder = DeflateEncoder::new(NativeZlibSliceWriter::new(output), level);
+            encoder.write_all(input).ok()?;
+            Some(encoder.finish().ok()?.length)
+        }
+        ZLIB_ENCODING_GZIP => {
+            let mut encoder = GzEncoder::new(NativeZlibSliceWriter::new(output), level);
+            encoder.write_all(input).ok()?;
+            Some(encoder.finish().ok()?.length)
+        }
+        ZLIB_ENCODING_DEFLATE => {
+            let mut encoder = ZlibEncoder::new(NativeZlibSliceWriter::new(output), level);
+            encoder.write_all(input).ok()?;
+            Some(encoder.finish().ok()?.length)
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeZlibDecodePlan {
+    encoding: i64,
+    output_length: usize,
+}
+
+impl NativeZlibDecodePlan {
+    pub fn output_length(self) -> usize {
+        self.output_length
+    }
+
+    pub fn write_into(self, input: &[u8], output: &mut [u8]) -> bool {
+        if output.len() != self.output_length {
+            return false;
+        }
+        match self.encoding {
+            ZLIB_ENCODING_RAW => native_decode_into_with(DeflateDecoder::new(input), output),
+            ZLIB_ENCODING_GZIP => native_decode_into_with(GzDecoder::new(input), output),
+            ZLIB_ENCODING_DEFLATE => native_decode_into_with(ZlibDecoder::new(input), output),
+            _ => false,
+        }
+    }
+}
+
+fn native_decode_output_length_with(
+    mut decoder: impl Read,
+    max_length: Option<usize>,
+) -> Option<usize> {
+    let mut scratch = [0_u8; 8192];
+    let mut length = 0_usize;
+    loop {
+        let read = decoder.read(&mut scratch).ok()?;
+        if read == 0 {
+            return Some(length);
+        }
+        length = length.checked_add(read)?;
+        if max_length.is_some_and(|maximum| length > maximum) {
+            return None;
+        }
+    }
+}
+
+fn native_decode_into_with(mut decoder: impl Read, output: &mut [u8]) -> bool {
+    let mut length = 0_usize;
+    while length < output.len() {
+        let Ok(read) = decoder.read(&mut output[length..]) else {
+            return false;
+        };
+        if read == 0 {
+            break;
+        }
+        length += read;
+    }
+    if length != output.len() {
+        return false;
+    }
+    let mut extra = [0_u8; 1];
+    decoder.read(&mut extra).is_ok_and(|read| read == 0)
+}
+
+/// Validates and sizes one exact decompression before the native string
+/// reservation is made. Rendering then performs the second stream pass
+/// directly into the authoritative arena.
+pub fn native_zlib_decode(
+    input: &[u8],
+    encoding: i64,
+    max_length: Option<usize>,
+) -> Option<NativeZlibDecodePlan> {
+    let output_length = match encoding {
+        ZLIB_ENCODING_RAW => {
+            native_decode_output_length_with(DeflateDecoder::new(input), max_length)
+        }
+        ZLIB_ENCODING_GZIP => native_decode_output_length_with(GzDecoder::new(input), max_length),
+        ZLIB_ENCODING_DEFLATE => {
+            native_decode_output_length_with(ZlibDecoder::new(input), max_length)
+        }
+        _ => None,
+    }?;
+    Some(NativeZlibDecodePlan {
+        encoding,
+        output_length,
+    })
+}
+
+pub fn native_zlib_decode_auto(
+    input: &[u8],
+    max_length: Option<usize>,
+) -> Option<NativeZlibDecodePlan> {
+    native_zlib_decode(input, ZLIB_ENCODING_GZIP, max_length)
+        .or_else(|| native_zlib_decode(input, ZLIB_ENCODING_DEFLATE, max_length))
+        .or_else(|| native_zlib_decode(input, ZLIB_ENCODING_RAW, max_length))
+}
+
+fn baseline_zlib_encode(input: &[u8], encoding: i64, level: i64) -> Option<Vec<u8>> {
     let level = native_compression_level(level);
     match encoding {
         ZLIB_ENCODING_RAW => {
@@ -657,11 +850,7 @@ pub fn native_zlib_encode(input: &[u8], encoding: i64, level: i64) -> Option<Vec
     }
 }
 
-pub fn native_zlib_decode(
-    input: &[u8],
-    encoding: i64,
-    max_length: Option<usize>,
-) -> Option<Vec<u8>> {
+fn baseline_zlib_decode(input: &[u8], encoding: i64, max_length: Option<usize>) -> Option<Vec<u8>> {
     match encoding {
         ZLIB_ENCODING_RAW => native_decode_with(DeflateDecoder::new(input), max_length),
         ZLIB_ENCODING_GZIP => native_decode_with(GzDecoder::new(input), max_length),
@@ -670,10 +859,10 @@ pub fn native_zlib_decode(
     }
 }
 
-pub fn native_zlib_decode_auto(input: &[u8], max_length: Option<usize>) -> Option<Vec<u8>> {
-    native_zlib_decode(input, ZLIB_ENCODING_GZIP, max_length)
-        .or_else(|| native_zlib_decode(input, ZLIB_ENCODING_DEFLATE, max_length))
-        .or_else(|| native_zlib_decode(input, ZLIB_ENCODING_RAW, max_length))
+fn baseline_zlib_decode_auto(input: &[u8], max_length: Option<usize>) -> Option<Vec<u8>> {
+    baseline_zlib_decode(input, ZLIB_ENCODING_GZIP, max_length)
+        .or_else(|| baseline_zlib_decode(input, ZLIB_ENCODING_DEFLATE, max_length))
+        .or_else(|| baseline_zlib_decode(input, ZLIB_ENCODING_RAW, max_length))
 }
 
 fn native_decode_with(mut decoder: impl Read, max_length: Option<usize>) -> Option<Vec<u8>> {
@@ -968,23 +1157,30 @@ mod tests {
     #[test]
     fn native_stateless_codec_family_roundtrips_without_values() {
         for encoding in [ZLIB_ENCODING_RAW, ZLIB_ENCODING_GZIP, ZLIB_ENCODING_DEFLATE] {
-            let encoded =
-                native_zlib_encode(b"native zlib payload", encoding, 6).expect("encode succeeds");
-            assert_eq!(
-                native_zlib_decode(&encoded, encoding, None),
-                Some(b"native zlib payload".to_vec())
-            );
-            assert_eq!(native_zlib_decode(&encoded, encoding, Some(4)), None);
-            assert_eq!(
-                native_zlib_decode_auto(&encoded, None),
-                Some(b"native zlib payload".to_vec())
-            );
+            let capacity =
+                native_zlib_encode_output_capacity(b"native zlib payload".len(), encoding)
+                    .expect("supported encoding");
+            let mut encoded = vec![0; capacity];
+            let encoded_length =
+                native_zlib_encode_into(b"native zlib payload", encoding, 6, &mut encoded)
+                    .expect("encode succeeds");
+            encoded.truncate(encoded_length);
+
+            let decoded =
+                native_zlib_decode(&encoded, encoding, None).expect("decode plan succeeds");
+            let mut output = vec![0; decoded.output_length()];
+            assert!(decoded.write_into(&encoded, &mut output));
+            assert_eq!(output, b"native zlib payload");
+            assert!(native_zlib_decode(&encoded, encoding, Some(4)).is_none());
+
+            let automatic =
+                native_zlib_decode_auto(&encoded, None).expect("automatic decode succeeds");
+            let mut output = vec![0; automatic.output_length()];
+            assert!(automatic.write_into(&encoded, &mut output));
+            assert_eq!(output, b"native zlib payload");
         }
-        assert_eq!(native_zlib_encode(b"payload", 999, -1), None);
-        assert_eq!(
-            native_zlib_decode(b"invalid", ZLIB_ENCODING_GZIP, None),
-            None
-        );
+        assert!(native_zlib_encode_output_capacity(b"payload".len(), 999).is_none());
+        assert!(native_zlib_decode(b"invalid", ZLIB_ENCODING_GZIP, None).is_none());
     }
 
     #[test]

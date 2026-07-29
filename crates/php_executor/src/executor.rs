@@ -275,6 +275,13 @@ mod tests {
     use php_ir::{FunctionFlags, IrConstant, IrReturnType, IrSpan, UnitId};
     use php_ir::{InstructionKind, Operand};
 
+    fn background_tiering_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn replacing_borrowed_variadic_parameter_preserves_call_boundary_owner() {
         let output = PhpExecutor::default().execute_source(PhpExecutionInput {
@@ -529,6 +536,7 @@ echo $classAvailable && (new ReflectionClass($class))->hasProperty($member) ? "p
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn hot_function_from_cached_include_enters_optimizing_tier_next_request() {
+        let _guard = background_tiering_test_guard();
         let root = std::env::temp_dir().join(format!(
             "phrust-executor-dynamic-tier-{}-{}",
             std::process::id(),
@@ -606,6 +614,7 @@ echo $classAvailable && (new ReflectionClass($class))->hasProperty($member) ? "p
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn optimizing_cached_include_dereferences_global_method_receiver() {
+        let _guard = background_tiering_test_guard();
         let root = std::env::temp_dir().join(format!(
             "phrust-executor-global-method-receiver-{}-{}",
             std::process::id(),
@@ -617,19 +626,25 @@ echo $classAvailable && (new ReflectionClass($class))->hasProperty($member) ? "p
         std::fs::create_dir_all(&root).expect("create fixture");
         let entry = root.join("index.php");
         let include = root.join("callee.php");
-        let source = "<?php require __DIR__ . '/callee.php'; $GLOBALS['box'] = new NativeReceiverBox(); $sum = 0; for ($i = 0; $i < 32; $i++) { $found = false; $sum += through_global_receiver($i, $found); if (!$found) { echo \"missing\\n\"; } } echo $sum, \"\\n\";";
+        let class = root.join("receiver.php");
+        let source = "<?php require __DIR__ . '/callee.php'; initialize_global_receiver(); $sum = 0; for ($i = 0; $i < 32; $i++) { $found = false; $sum += through_global_receiver($i, $found); if (!$found) { echo \"missing\\n\"; } } echo $sum, \"\\n\";";
         std::fs::write(&entry, source).expect("write entry");
         std::fs::write(
             &include,
-            "<?php class NativeReceiverBox { public function get($value, &$found) { $found = true; return $value; } } function through_global_receiver($value, &$found) { global $box; return $box->get($value, $found); }",
+            "<?php require_once __DIR__ . '/receiver.php'; function initialize_global_receiver() { $GLOBALS['box'] = new NativeReceiverBox(); } function through_global_receiver($value, &$found) { global $box; return $box->get($value, $found); }",
         )
         .expect("write include");
+        std::fs::write(
+            &class,
+            "<?php class NativeReceiverBox { public function get($value, &$found) { $found = true; return $value; } }",
+        )
+        .expect("write receiver class");
 
         let mut options = PhpExecutorOptions::default_native_runtime();
         options.vm_options.collect_counters = true;
         options.vm_options.tiering.collect_stats = true;
         options.vm_options.tiering.function_entry_threshold = 1;
-        options.vm_options.tiering.native_max_functions = 8;
+        options.vm_options.tiering.native_max_functions = 16;
         let include_cache =
             std::sync::Arc::new(php_vm::api::IncludeCache::new_with_revalidation_interval(
                 1,
@@ -662,13 +677,13 @@ echo $classAvailable && (new ReflectionClass($class))->hasProperty($member) ? "p
         assert_eq!(first.status, PhpExecutionStatus::Success, "{first:#?}");
         assert_eq!(first.stdout, b"496\n");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while worker.tiering_stats().native_compiled_functions < 5
+        while worker.tiering_stats().native_compiled_functions < 7
             && std::time::Instant::now() < deadline
         {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
-            worker.tiering_stats().native_compiled_functions >= 5,
+            worker.tiering_stats().native_compiled_functions >= 7,
             "the completed request did not finish its optimizing batch"
         );
 

@@ -2,11 +2,14 @@ use super::{
     ClassEntry, ClassEnumBackingType, ObjectIdGuard, debug::property_debug_label, next_object_id,
 };
 use crate::Value;
-use std::cell::{BorrowError, BorrowMutError, Cell, RefCell};
+use std::cell::{BorrowError, BorrowMutError, RefCell};
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex, MutexGuard, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 /// One authoritative declared-property cell while an object is admitted to
 /// native execution. `initialized == 0` represents an absent/unset slot;
@@ -51,13 +54,12 @@ pub type NativeDynamicPropertySlots = HashMap<String, Box<NativeDynamicPropertyC
 
 type RustPropertySlots = (Vec<Option<Value>>, HashMap<String, Value>);
 
-/// Class-owned declared-property layout, shared across instances of the
-/// same class through a thread-local cache. The layout maps storage names
-/// (private names arrive pre-mangled as `private:Owner:prop`) to slot
-/// indices and carries the per-class debug labels; per-object state is a
-/// plain slot vector plus a side map for dynamic properties.
+/// Class-owned declared-property layout, shared across instances of the same
+/// class through a thread-local data cache. Its numeric identity is interned
+/// process-wide so native code and worker-owned compile records see one stable
+/// ABI shape regardless of which server worker materialized the class.
 struct PropertyLayout {
-    /// Process-thread-unique identity used as the slot-access guard.
+    /// Process-wide identity used as the slot-access and method-PIC guard.
     layout_id: u64,
     /// Declared storage names in declaration order, slot-index aligned.
     slot_names: Vec<String>,
@@ -71,18 +73,41 @@ struct PropertyLayout {
     debug_labels: HashMap<String, String>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PropertyLayoutIdentity {
+    class_name: String,
+    slot_names: Vec<String>,
+    array_cast_names: Vec<String>,
+    debug_labels: Vec<(String, String)>,
+}
+
 thread_local! {
     static LAYOUT_CACHE: RefCell<HashMap<String, Vec<Rc<PropertyLayout>>>> =
         RefCell::new(HashMap::new());
-    static NEXT_LAYOUT_ID: Cell<u64> = const { Cell::new(1) };
 }
 
-fn next_layout_id() -> u64 {
-    NEXT_LAYOUT_ID.with(|next| {
-        let id = next.get();
-        next.set(id.wrapping_add(1));
-        id
-    })
+fn lock_layout_identities(
+    identities: &Mutex<HashMap<PropertyLayoutIdentity, u64>>,
+) -> MutexGuard<'_, HashMap<PropertyLayoutIdentity, u64>> {
+    identities
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn intern_layout_id(identity: PropertyLayoutIdentity) -> u64 {
+    static IDENTITIES: OnceLock<Mutex<HashMap<PropertyLayoutIdentity, u64>>> = OnceLock::new();
+    static NEXT_LAYOUT_ID: AtomicU64 = AtomicU64::new(1);
+
+    let mut identities = lock_layout_identities(IDENTITIES.get_or_init(Mutex::default));
+    if let Some(id) = identities.get(&identity) {
+        return *id;
+    }
+    let id = NEXT_LAYOUT_ID.fetch_add(1, Ordering::Relaxed);
+    if id == 0 {
+        std::process::abort();
+    }
+    identities.insert(identity, id);
+    id
 }
 
 /// Returns true when a property entry occupies backed instance storage.
@@ -171,8 +196,19 @@ fn class_layout(class: &ClassEntry, display_name: &str) -> Rc<PropertyLayout> {
             .enumerate()
             .map(|(index, name)| (name.clone(), index as u32))
             .collect();
+        let mut identity_debug_labels = debug_labels
+            .iter()
+            .map(|(name, label)| (name.clone(), label.clone()))
+            .collect::<Vec<_>>();
+        identity_debug_labels.sort_unstable();
+        let layout_id = intern_layout_id(PropertyLayoutIdentity {
+            class_name: class.name.to_string(),
+            slot_names: slot_names.clone(),
+            array_cast_names: array_cast_names.clone(),
+            debug_labels: identity_debug_labels,
+        });
         let layout = Rc::new(PropertyLayout {
-            layout_id: next_layout_id(),
+            layout_id,
             slot_names,
             slot_by_name,
             array_cast_names,
@@ -189,6 +225,12 @@ struct ObjectStorage {
     display_name: Arc<str>,
     is_enum: bool,
     enum_backing_type: Option<ClassEnumBackingType>,
+    /// Exact class-shape knowledge for non-mutating dynamic property tests.
+    /// `None` is reserved for formatter/synthetic views without a complete
+    /// runtime method table.
+    native_magic_isset: Option<bool>,
+    native_countable: bool,
+    native_traversable: bool,
     id_guard: Option<ObjectIdGuard>,
     layout: Rc<PropertyLayout>,
     /// Declared property slots; `None` means unset (absent), which is
@@ -500,6 +542,23 @@ impl ObjectRef {
                     display_name: Arc::from(display_name),
                     is_enum: class.flags.is_enum,
                     enum_backing_type: class.enum_backing_type,
+                    native_magic_isset: class
+                        .methods
+                        .iter()
+                        .any(|method| method.name.eq_ignore_ascii_case("__isset"))
+                        .then_some(true)
+                        .or_else(|| class.flags.has_complete_method_table.then_some(false)),
+                    native_countable: class.flags.implements_countable
+                        || class
+                            .interfaces
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case("countable")),
+                    native_traversable: class.flags.implements_traversable
+                        || class.interfaces.iter().any(|name| {
+                            name.eq_ignore_ascii_case("traversable")
+                                || name.eq_ignore_ascii_case("iterator")
+                                || name.eq_ignore_ascii_case("iteratoraggregate")
+                        }),
                     id_guard: Some(ObjectIdGuard::new(id)),
                     layout,
                     declared_slots,
@@ -550,6 +609,9 @@ impl ObjectRef {
                     display_name: source.display_name_handle(),
                     is_enum: false,
                     enum_backing_type: None,
+                    native_magic_isset: None,
+                    native_countable: source.is_native_countable(),
+                    native_traversable: source.is_native_traversable(),
                     id_guard: None,
                     layout: empty_layout,
                     declared_slots: Vec::new(),
@@ -611,6 +673,20 @@ impl ObjectRef {
         Arc::clone(&self.cell.storage.borrow().display_name)
     }
 
+    /// Returns publication-time `Countable` classification without consulting
+    /// a request class table.
+    #[must_use]
+    pub fn is_native_countable(&self) -> bool {
+        self.cell.storage.borrow().native_countable
+    }
+
+    /// Returns publication-time `Traversable` classification without
+    /// consulting a request class table.
+    #[must_use]
+    pub fn is_native_traversable(&self) -> bool {
+        self.cell.storage.borrow().native_traversable
+    }
+
     /// Returns whether this object represents an enum case.
     #[must_use]
     pub fn is_enum(&self) -> bool {
@@ -652,6 +728,9 @@ impl ObjectRef {
                     display_name: storage.display_name.clone(),
                     is_enum: storage.is_enum,
                     enum_backing_type: storage.enum_backing_type,
+                    native_magic_isset: storage.native_magic_isset,
+                    native_countable: storage.native_countable,
+                    native_traversable: storage.native_traversable,
                     id_guard: Some(ObjectIdGuard::new(id)),
                     layout: Rc::clone(&storage.layout),
                     declared_slots: storage.declared_slots.clone(),
@@ -1065,6 +1144,28 @@ impl ObjectRef {
                 .get(name)
                 .map(|cell| std::ptr::from_ref(&cell.slot).cast_mut()),
         )
+    }
+
+    /// Returns whether a property name belongs to the immutable declared
+    /// layout while verifying that native property storage is authoritative.
+    #[must_use]
+    pub fn native_property_name_is_declared(&self, layout_id: u64, name: &str) -> Option<bool> {
+        let storage = self.cell.storage.borrow();
+        if storage.layout.layout_id != layout_id
+            || storage.native_declared_slots.is_none()
+            || !storage.declared_slots.is_empty()
+            || !storage.dynamic_properties.is_empty()
+        {
+            return None;
+        }
+        Some(storage.layout.slot_by_name.contains_key(name))
+    }
+
+    /// Returns exact class metadata for `__isset`, when this is a real runtime
+    /// object rather than a synthetic formatter view.
+    #[must_use]
+    pub fn native_has_magic_isset(&self) -> Option<bool> {
+        self.cell.storage.borrow().native_magic_isset
     }
 
     /// Resolves a stable dynamic-property cell, reserving an uninitialized

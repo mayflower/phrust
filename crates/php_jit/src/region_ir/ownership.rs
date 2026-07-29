@@ -28,6 +28,8 @@ const CONSUME_1: &[HelperInputOwnership] = &[HelperInputOwnership::Consume];
 const BORROW_1: &[HelperInputOwnership] = &[HelperInputOwnership::Borrow];
 const BORROW_2: &[HelperInputOwnership] =
     &[HelperInputOwnership::Borrow, HelperInputOwnership::Borrow];
+const CONSUME_BORROW_1: &[HelperInputOwnership] =
+    &[HelperInputOwnership::Consume, HelperInputOwnership::Borrow];
 const BORROW_3: &[HelperInputOwnership] = &[
     HelperInputOwnership::Borrow,
     HelperInputOwnership::Borrow,
@@ -66,12 +68,16 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         may_alias_input: false,
     };
     match name {
+        "phrust_native_array_merge_recursive" | "phrust_native_array_replace_recursive" => {
+            Some(owned(CONSUME_BORROW_1, false))
+        }
         name if name.starts_with("phrust_native_preg_")
             || name.starts_with("phrust_native_json_")
             || matches!(
                 name,
                 "phrust_native_define"
                     | "phrust_native_defined"
+                    | "phrust_native_constant"
                     | "phrust_native_function_exists"
                     | "phrust_native_class_exists"
                     | "phrust_native_interface_exists"
@@ -83,6 +89,7 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
                     | "phrust_native_printf"
                     | "phrust_native_vsprintf"
                     | "phrust_native_vprintf"
+                    | "phrust_native_number_format"
                     | "phrust_native_md5"
                     | "phrust_native_sha1"
                     | "phrust_native_crc32"
@@ -104,6 +111,8 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
                     | "phrust_native_stripcslashes"
                     | "phrust_native_stripslashes"
                     | "phrust_native_quotemeta"
+                    | "phrust_native_pack"
+                    | "phrust_native_unpack"
                     | "phrust_native_strstr"
                     | "phrust_native_stristr"
                     | "phrust_native_strrchr"
@@ -116,6 +125,8 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
                     | "phrust_native_strtr"
                     | "phrust_native_strip_tags"
                     | "phrust_native_substr_replace"
+                    | "phrust_native_str_split"
+                    | "phrust_native_version_compare"
                     | "phrust_native_htmlspecialchars"
                     | "phrust_native_htmlentities"
                     | "phrust_native_html_entity_decode"
@@ -123,12 +134,24 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
                     | "phrust_native_parse_url"
                     | "phrust_native_parse_str"
                     | "phrust_native_http_build_query"
+                    | "phrust_native_array_sum"
                     | "phrust_native_asort"
                     | "phrust_native_arsort"
                     | "phrust_native_ksort"
                     | "phrust_native_krsort"
                     | "phrust_native_natsort"
                     | "phrust_native_natcasesort"
+                    | "phrust_native_sort"
+                    | "phrust_native_rsort"
+                    | "phrust_native_array_multisort"
+                    | "phrust_native_random_bytes"
+                    | "phrust_native_random_int"
+                    | "phrust_native_rand"
+                    | "phrust_native_mt_rand"
+                    | "phrust_native_getrandmax"
+                    | "phrust_native_mt_getrandmax"
+                    | "phrust_native_array_rand"
+                    | "phrust_native_shuffle"
                     | "phrust_native_spl_object_hash"
                     | "phrust_native_spl_object_id"
                     | "phrust_native_serialize"
@@ -140,6 +163,7 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
                     | "phrust_native_extension_loaded"
                     | "phrust_native_get_loaded_extensions"
                     | "phrust_native_ini_get"
+                    | "phrust_native_ini_get_all"
                     | "phrust_native_get_cfg_var"
                     | "phrust_native_get_include_path"
                     | "phrust_native_func_num_args"
@@ -182,16 +206,16 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         {
             Some(owned(BORROW_6, false))
         }
-        "phrust_jit_native_call_dispatch"
+        "phrust_baseline_native_call_dispatch"
         | "phrust_baseline_native_builtin_dispatch"
-        | "phrust_jit_native_semantic_dispatch"
+        | "phrust_baseline_native_semantic_dispatch"
         | "phrust_jit_native_dynamic_code" => Some(owned(NONE, false)),
         "phrust_jit_native_function_resolve"
         | "phrust_native_frame_alloc"
         | "phrust_native_frame_release"
         | "phrust_native_numeric_string" => Some(none(NONE)),
-        "phrust_native_unary"
-        | "phrust_native_cast"
+        "phrust_baseline_native_unary"
+        | "phrust_baseline_native_cast"
         | "phrust_native_type_predicate"
         | "phrust_native_stable_length"
         | "phrust_native_local_fetch"
@@ -204,14 +228,16 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         | "phrust_native_string_cast"
         | "phrust_native_foreach_init"
         | "phrust_native_constant_fetch" => Some(owned(BORROW_1, true)),
-        "phrust_native_binary"
-        | "phrust_native_compare"
+        "phrust_baseline_native_binary"
+        | "phrust_baseline_native_compare"
         | "phrust_native_array_fetch"
         | "phrust_native_array_unset"
         | "phrust_native_array_spread"
         | "phrust_native_object_clone_with" => Some(owned(BORROW_2, true)),
         "phrust_native_string_predicate" => Some(owned(BORROW_2, false)),
-        "phrust_native_dynamic_property_slot" => Some(borrowed(BORROW_2)),
+        "phrust_native_dynamic_property_slot" | "phrust_native_dynamic_property_test_slot" => {
+            Some(borrowed(BORROW_2))
+        }
         "phrust_native_local_store"
         | "phrust_native_reference_bind"
         | "phrust_native_property_fetch"

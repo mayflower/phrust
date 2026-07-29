@@ -7,8 +7,8 @@ use php_ir::{IrConstant, IrReturnType, LocalId, RegId};
 use super::{
     RegionBinaryOp, RegionCallResult, RegionCallTarget, RegionCastOp, RegionGraph,
     RegionInstructionKind, RegionNativeControl, RegionNativeDynamicCode, RegionNativeSuspend,
-    RegionOperand, RegionTerminator, RegionUnaryOp, SsaOwnership, SsaValueClass, SsaValueFact,
-    ssa::ExecutableSsaGraph,
+    RegionOperand, RegionSemanticOp, RegionTerminator, RegionUnaryOp, SsaOwnership, SsaValueClass,
+    SsaValueFact, ssa::ExecutableSsaGraph,
 };
 
 /// Storage selected for a PHP local before Cranelift lowering.
@@ -508,6 +508,40 @@ pub fn analyze_executable_value_flow(
             }
         }
     }
+    // Borrow classification is intentionally decided after the main value
+    // fixed point because it depends on complete use ranges. Propagate that
+    // final ownership through instructions whose result is the same SSA
+    // owner as an input. Without this pass, a borrowed local used as the
+    // right-hand side of a property assignment became an `Owned` assignment
+    // result, and the trailing expression `Discard` released the local's
+    // frame owner even though the property store had only retained its own
+    // independent owner.
+    for _ in 0..iteration_limit {
+        let previous_registers = register_facts.clone();
+        for block in &region.blocks {
+            for instruction in &block.instructions {
+                let alias = match instruction.kind {
+                    RegionInstructionKind::Move { dst, src }
+                    | RegionInstructionKind::AssignLocalResult {
+                        dst, value: src, ..
+                    }
+                    | RegionInstructionKind::AssignProperty {
+                        dst, value: src, ..
+                    } => Some((dst, src)),
+                    _ => None,
+                };
+                if let Some((dst, src)) = alias {
+                    register_facts.insert(
+                        dst,
+                        operand_fact(constants, &local_facts, &register_facts, src),
+                    );
+                }
+            }
+        }
+        if register_facts == previous_registers {
+            break;
+        }
+    }
     let reachability = block_reachability(region);
     let (moved_local_stores, mut elided_discards) =
         find_moved_local_stores(region, &local_storage, &register_facts, &reachability);
@@ -698,12 +732,19 @@ fn find_owned_entry_parameters(
         .collect()
 }
 
+/// Finds native frame slots that retain an owner until the frame exits.
+///
+/// Passing a value or reference to a call does not transfer this owner. A
+/// direct compiled call retains ordinary values and borrows prepared
+/// references; a baseline continuation receives its own published state.
+/// Removing a local merely because one of its loads reaches a call therefore
+/// leaks the authoritative frame owner after an ordinary native return.
 fn find_frame_cleanup_locals(
     region: &RegionGraph,
     moved_stores: &BTreeSet<u32>,
     storage: &BTreeMap<LocalId, LocalStorageClass>,
 ) -> BTreeSet<LocalId> {
-    let mut candidates = region
+    region
         .blocks
         .iter()
         .flat_map(|block| &block.instructions)
@@ -715,10 +756,13 @@ fn find_frame_cleanup_locals(
                 vec![local]
             }
             RegionInstructionKind::BindReference { target, source } => vec![target, source],
-            RegionInstructionKind::BindReferenceProperty { source, .. }
-            | RegionInstructionKind::BindReferenceIntoPropertyDim { source, .. } => vec![source],
-            RegionInstructionKind::BindReferenceFromProperty { target, .. }
+            RegionInstructionKind::BindReferenceDim { target, .. }
+            | RegionInstructionKind::BindReferenceFromProperty { target, .. }
             | RegionInstructionKind::BindReferenceFromPropertyDim { target, .. } => vec![target],
+            RegionInstructionKind::BindReferenceIntoDim { source, .. }
+            | RegionInstructionKind::BindReferenceProperty { source, .. }
+            | RegionInstructionKind::BindReferenceIntoPropertyDim { source, .. } => vec![source],
+            RegionInstructionKind::BindReferenceDimFromProperty { array, .. } => vec![array],
             _ => Vec::new(),
         })
         .filter(|local| {
@@ -726,49 +770,7 @@ fn find_frame_cleanup_locals(
                 .get(local)
                 .is_some_and(|class| class.is_native_frame_local())
         })
-        .collect::<BTreeSet<_>>();
-
-    for local in candidates.clone() {
-        let loaded = region
-            .blocks
-            .iter()
-            .flat_map(|block| &block.instructions)
-            .filter_map(|instruction| match instruction.kind {
-                RegionInstructionKind::LoadLocal {
-                    dst, local: loaded, ..
-                } if loaded == local => Some(dst),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        let escapes_call = region
-            .blocks
-            .iter()
-            .flat_map(|block| &block.instructions)
-            .any(|instruction| match &instruction.kind {
-                RegionInstructionKind::NativeCall(call) => {
-                    call.args
-                        .iter()
-                        .any(|argument| argument.by_ref_local == Some(local))
-                        || instruction
-                            .register_uses()
-                            .into_iter()
-                            .any(|register| loaded.contains(&register))
-                }
-                RegionInstructionKind::ArrayCallback(_) => instruction
-                    .register_uses()
-                    .into_iter()
-                    .any(|register| loaded.contains(&register)),
-                RegionInstructionKind::NativeDynamicCode(_)
-                | RegionInstructionKind::NativeSuspend(_) => {
-                    instruction.live_locals.contains(&local)
-                }
-                _ => false,
-            });
-        if escapes_call {
-            candidates.remove(&local);
-        }
-    }
-    candidates
+        .collect()
 }
 
 fn find_moved_local_stores(
@@ -956,6 +958,8 @@ fn find_consumed_call_operands(
             };
             if !matches!(call.target, RegionCallTarget::Semantic { .. })
                 && call.direct_compiled_target().is_none()
+                && call.direct_compiled_unpack_target().is_none()
+                && !native_call_uses_prepared_dynamic_callable(call)
             {
                 continue;
             }
@@ -1028,7 +1032,8 @@ fn find_borrowed_local_loads(
                 RegionInstructionKind::NativeCall(call) => {
                     !native_call_preserves_borrowed_arguments(call)
                 }
-                RegionInstructionKind::ArrayCallback(_) => true,
+                RegionInstructionKind::ArrayCallback(_)
+                | RegionInstructionKind::PregCallbackArray(_) => true,
                 RegionInstructionKind::NativeDynamicCode(_)
                 | RegionInstructionKind::NativeSuspend(_) => true,
                 _ => false,
@@ -1215,6 +1220,32 @@ fn find_reference_dimension_loads(
 /// promoted local remains the owning root, so retaining a second arena handle
 /// before the call and releasing it afterwards is redundant. Calls whose
 /// signature or binding shape is not fully known remain ownership barriers.
+fn native_call_uses_prepared_dynamic_callable(call: &super::RegionNativeCall) -> bool {
+    if !matches!(
+        call.target,
+        RegionCallTarget::Callable { .. }
+            | RegionCallTarget::Closure { function: None, .. }
+            | RegionCallTarget::Pipe { .. }
+    ) || call.returns_by_reference
+        || matches!(call.result, super::RegionCallResult::ReferenceLocal(_))
+        || call.argument_operand_offset != 1
+        || !call.operands.iter().all(Option::is_some)
+    {
+        return false;
+    }
+    let fixed = call.operands.len() == call.args.len().saturating_add(1)
+        && call
+            .args
+            .iter()
+            .all(|argument| argument.name.is_none() && !argument.unpack);
+    let unpack = matches!(
+        call.target,
+        RegionCallTarget::Callable { .. } | RegionCallTarget::Closure { function: None, .. }
+    ) && call.operands.len() == 2
+        && call.trailing_unpack_argument() == Some(0);
+    fixed || unpack
+}
+
 fn native_call_preserves_borrowed_arguments(call: &super::RegionNativeCall) -> bool {
     // A statically packed compiled call retains every ordinary operand before
     // entering the callee and borrows prepared reference cells from their
@@ -1223,6 +1254,14 @@ fn native_call_preserves_borrowed_arguments(call: &super::RegionNativeCall) -> b
     // owner would add a last-owner validation and an unnecessary baseline
     // continuation before every direct method receiver.
     if call.direct_compiled_target().is_some() {
+        return true;
+    }
+    if native_call_uses_prepared_dynamic_callable(call) {
+        // The optimizing callable boundary admits only a published same-unit
+        // by-value binding and retains every fixed or unpacked visible
+        // argument across the compiled native call. Unsupported callable
+        // shapes leave through one baseline continuation before invocation,
+        // so a promoted local remains the authoritative owner on both paths.
         return true;
     }
     let RegionCallTarget::Function {
@@ -1311,6 +1350,12 @@ fn instruction_mutated_locals(kind: &RegionInstructionKind) -> Vec<LocalId> {
                     }),
             );
         }
+        RegionInstructionKind::ArrayCallback(call) => {
+            locals.extend(call.mutable_local);
+        }
+        RegionInstructionKind::PregCallbackArray(call) => {
+            locals.extend(call.count_local);
+        }
         RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::MakeClosure {
             captures,
             ..
@@ -1344,6 +1389,7 @@ fn classify_locals(region: &RegionGraph) -> BTreeMap<LocalId, LocalStorageClass>
                 .map(|capture| capture.local),
         )
         .collect::<BTreeSet<_>>();
+    let mut request_globals = BTreeSet::new();
     let mut suspension = BTreeSet::new();
     for block in &region.blocks {
         for instruction in &block.instructions {
@@ -1374,6 +1420,13 @@ fn classify_locals(region: &RegionGraph) -> BTreeMap<LocalId, LocalStorageClass>
                     references.insert(*local);
                 }
                 RegionInstructionKind::NativeCall(call) => {
+                    if let RegionCallTarget::Semantic {
+                        operation: RegionSemanticOp::BindGlobal { local, .. },
+                        ..
+                    } = &call.target
+                    {
+                        request_globals.insert(*local);
+                    }
                     if let RegionCallResult::ReferenceLocal(local) = call.result {
                         references.insert(local);
                     }
@@ -1415,12 +1468,20 @@ fn classify_locals(region: &RegionGraph) -> BTreeMap<LocalId, LocalStorageClass>
                 LocalStorageClass::Globals
             } else if name.is_some_and(|name| SUPERGLOBALS.contains(&name)) {
                 LocalStorageClass::Superglobal
+            } else if request_globals.contains(&local) {
+                LocalStorageClass::RequestGlobal
             } else if region.flags.is_top_level && !compiler_generated {
                 LocalStorageClass::RequestGlobal
             } else if references.contains(&local) {
                 LocalStorageClass::MemoryReference
             } else if suspension.contains(&local) {
                 LocalStorageClass::SuspensionPersistent
+            } else if region.parameter_locals.contains(&local) {
+                // By-value parameters are initialized by the native frame
+                // binder before entry. Their last load need not keep the
+                // local live afterwards, so post-instruction liveness cannot
+                // be used as an initialization test.
+                LocalStorageClass::SsaPlain
             } else if region.blocks.iter().all(|block| {
                 block.instructions.iter().all(|instruction| {
                     !matches!(
@@ -1524,6 +1585,9 @@ fn instruction_result_fact(
         RegionInstructionKind::Move { dst, src }
         | RegionInstructionKind::AssignLocalResult {
             dst, value: src, ..
+        }
+        | RegionInstructionKind::AssignProperty {
+            dst, value: src, ..
         } => Some((*dst, fact(*src))),
         RegionInstructionKind::LoadLocal { dst, local, quiet } => {
             let mut fact = locals.get(local).copied().unwrap_or(SsaValueFact::UNKNOWN);
@@ -1535,11 +1599,26 @@ fn instruction_result_fact(
         RegionInstructionKind::Binary { dst, op, lhs, rhs } => {
             let lhs = fact(*lhs);
             let rhs = fact(*rhs);
+            // Every binary producer publishes one independent result owner.
+            // Its runtime class can remain dynamic (for example integer
+            // overflow becoming a float), but its ownership cannot: no
+            // binary operation aliases either input.  Leaving these results
+            // at SsaOwnership::Unknown prevents last-use moves and keeps the
+            // superseded generic lifecycle path alive.
+            let owned_dynamic = SsaValueFact {
+                class: SsaValueClass::MixedHandle,
+                certainty: super::SsaCertainty::Unknown,
+                ownership: SsaOwnership::Owned,
+            };
+            let both_arrays =
+                lhs.class == SsaValueClass::ArrayHandle && rhs.class == SsaValueClass::ArrayHandle;
             let both_integer = lhs.class == SsaValueClass::Int && rhs.class == SsaValueClass::Int;
             let both_numeric = matches!(lhs.class, SsaValueClass::Int | SsaValueClass::Float)
                 && matches!(rhs.class, SsaValueClass::Int | SsaValueClass::Float);
             let has_float = lhs.class == SsaValueClass::Float || rhs.class == SsaValueClass::Float;
-            let output = if both_numeric {
+            let output = if both_arrays && *op == RegionBinaryOp::Add {
+                SsaValueFact::known(SsaValueClass::ArrayHandle, SsaOwnership::Owned)
+            } else if both_numeric {
                 match op {
                     RegionBinaryOp::Mod
                     | RegionBinaryOp::BitAnd
@@ -1559,7 +1638,7 @@ fn instruction_result_fact(
                     RegionBinaryOp::Add | RegionBinaryOp::Sub | RegionBinaryOp::Mul
                         if both_integer =>
                     {
-                        SsaValueFact::UNKNOWN
+                        owned_dynamic
                     }
                     RegionBinaryOp::Div => {
                         SsaValueFact::known(SsaValueClass::Float, SsaOwnership::Owned)
@@ -1576,10 +1655,10 @@ fn instruction_result_fact(
                     | RegionBinaryOp::ShiftRight
                     | RegionBinaryOp::Add
                     | RegionBinaryOp::Sub
-                    | RegionBinaryOp::Mul => SsaValueFact::UNKNOWN,
+                    | RegionBinaryOp::Mul => owned_dynamic,
                 }
             } else {
-                SsaValueFact::UNKNOWN
+                owned_dynamic
             };
             Some((*dst, output))
         }
@@ -1699,13 +1778,25 @@ fn instruction_result_fact(
                     SsaValueFact::known(SsaValueClass::ArrayHandle, SsaOwnership::Owned)
                 }
                 super::RegionArrayCallbackOperation::All
-                | super::RegionArrayCallbackOperation::Any => {
+                | super::RegionArrayCallbackOperation::Any
+                | super::RegionArrayCallbackOperation::Usort
+                | super::RegionArrayCallbackOperation::Uasort
+                | super::RegionArrayCallbackOperation::Uksort
+                | super::RegionArrayCallbackOperation::Walk
+                | super::RegionArrayCallbackOperation::WalkRecursive => {
                     SsaValueFact::known(SsaValueClass::Bool, SsaOwnership::Owned)
+                }
+                super::RegionArrayCallbackOperation::PregReplace => {
+                    SsaValueFact::known(SsaValueClass::StringHandle, SsaOwnership::Owned)
                 }
                 super::RegionArrayCallbackOperation::Reduce
                 | super::RegionArrayCallbackOperation::Find
                 | super::RegionArrayCallbackOperation::FindKey => SsaValueFact::UNKNOWN,
             },
+        )),
+        RegionInstructionKind::PregCallbackArray(call) => Some((
+            call.result,
+            SsaValueFact::known(SsaValueClass::StringHandle, SsaOwnership::Owned),
         )),
         _ => None,
     }
@@ -1779,13 +1870,276 @@ fn join_facts(left: SsaValueFact, right: SsaValueFact) -> SsaValueFact {
 
 #[cfg(test)]
 mod tests {
-    use php_ir::instruction::{IrCallArg, IrCallArgValueKind};
+    use php_ir::instruction::{IrCallArg, IrCallArgValueKind, IrCallDimTarget};
     use php_ir::{
-        FunctionFlags, InstructionKind, IrBuilder, IrParam, IrReturnType, IrSpan, Operand, UnitId,
+        BinaryOp, FunctionFlags, InstructionKind, IrBuilder, IrParam, IrReturnType, IrSpan,
+        Operand, UnitId,
     };
 
     use super::*;
     use crate::region_ir::{RegionNativeCall, build_baseline_region};
+
+    #[test]
+    fn prepared_dynamic_callable_consumes_an_owned_argument_at_its_last_use() {
+        let mut builder = IrBuilder::new(UnitId::new(4_239));
+        let file = builder.add_file("dynamic-call-owner.php");
+        let span = IrSpan::new(file, 0, 1);
+        let function = builder.start_function("dynamic_call_owner", FunctionFlags::default(), span);
+        let callable = builder.intern_local(function, "callback");
+        builder.push_param(
+            function,
+            IrParam {
+                name: "callback".to_owned(),
+                local: callable,
+                required: true,
+                default: None,
+                type_: Some(IrReturnType::Callable),
+                by_ref: false,
+                variadic: false,
+                attributes: Vec::new(),
+            },
+        );
+        let block = builder.append_block(function);
+        let source = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::NewArray { dst: source },
+            span,
+        );
+        let result = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::CallCallable {
+                dst: result,
+                callee: Operand::Local(callable),
+                args: vec![IrCallArg {
+                    name: None,
+                    value: Operand::Register(source),
+                    unpack: false,
+                    value_kind: IrCallArgValueKind::Direct,
+                    by_ref_local: None,
+                    by_ref_dim: None,
+                    by_ref_property: None,
+                    by_ref_property_dim: None,
+                }],
+            },
+            span,
+        );
+        builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+        let unit = builder.finish();
+        let region = build_baseline_region(&unit, function).expect("region");
+        let flow = analyze_executable_value_flow(&region, &unit.constants);
+        let call = region.blocks[0]
+            .instructions
+            .iter()
+            .find(|instruction| {
+                matches!(
+                    instruction.kind,
+                    RegionInstructionKind::NativeCall(RegionNativeCall {
+                        target: RegionCallTarget::Callable { .. },
+                        ..
+                    })
+                )
+            })
+            .expect("prepared dynamic callable");
+        assert!(flow.consumes_call_operand(call.continuation_id, source));
+        flow.verify_ownership(&region)
+            .expect("last-use dynamic-call ownership should verify");
+    }
+
+    #[test]
+    fn prepared_runtime_closure_consumes_an_owned_argument_at_its_last_use() {
+        let mut builder = IrBuilder::new(UnitId::new(4_236));
+        let file = builder.add_file("runtime-closure-owner.php");
+        let span = IrSpan::new(file, 0, 1);
+        let function =
+            builder.start_function("runtime_closure_owner", FunctionFlags::default(), span);
+        let closure = builder.intern_local(function, "closure");
+        builder.push_param(
+            function,
+            IrParam {
+                name: "closure".to_owned(),
+                local: closure,
+                required: true,
+                default: None,
+                type_: Some(IrReturnType::Callable),
+                by_ref: false,
+                variadic: false,
+                attributes: Vec::new(),
+            },
+        );
+        let block = builder.append_block(function);
+        let source = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::NewArray { dst: source },
+            span,
+        );
+        let result = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::CallClosure {
+                dst: result,
+                callee: Operand::Local(closure),
+                args: vec![IrCallArg {
+                    name: None,
+                    value: Operand::Register(source),
+                    unpack: false,
+                    value_kind: IrCallArgValueKind::Direct,
+                    by_ref_local: None,
+                    by_ref_dim: None,
+                    by_ref_property: None,
+                    by_ref_property_dim: None,
+                }],
+            },
+            span,
+        );
+        builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+        let unit = builder.finish();
+        let region = build_baseline_region(&unit, function).expect("region");
+        let flow = analyze_executable_value_flow(&region, &unit.constants);
+        let call = region.blocks[0]
+            .instructions
+            .iter()
+            .find(|instruction| {
+                matches!(
+                    instruction.kind,
+                    RegionInstructionKind::NativeCall(RegionNativeCall {
+                        target: RegionCallTarget::Closure { function: None, .. },
+                        ..
+                    })
+                )
+            })
+            .expect("prepared runtime closure");
+        assert!(flow.consumes_call_operand(call.continuation_id, source));
+        flow.verify_ownership(&region)
+            .expect("last-use runtime-closure ownership should verify");
+    }
+
+    #[test]
+    fn prepared_pipe_consumes_an_owned_input_at_its_last_use() {
+        let mut builder = IrBuilder::new(UnitId::new(4_237));
+        let file = builder.add_file("pipe-owner.php");
+        let span = IrSpan::new(file, 0, 1);
+        let function = builder.start_function("pipe_owner", FunctionFlags::default(), span);
+        let callable = builder.intern_local(function, "callback");
+        builder.push_param(
+            function,
+            IrParam {
+                name: "callback".to_owned(),
+                local: callable,
+                required: true,
+                default: None,
+                type_: Some(IrReturnType::Callable),
+                by_ref: false,
+                variadic: false,
+                attributes: Vec::new(),
+            },
+        );
+        let block = builder.append_block(function);
+        let source = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::NewArray { dst: source },
+            span,
+        );
+        let result = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::Pipe {
+                dst: result,
+                input: Operand::Register(source),
+                callable: Operand::Local(callable),
+            },
+            span,
+        );
+        builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+        let unit = builder.finish();
+        let region = build_baseline_region(&unit, function).expect("region");
+        let flow = analyze_executable_value_flow(&region, &unit.constants);
+        let call = region.blocks[0]
+            .instructions
+            .iter()
+            .find(|instruction| {
+                matches!(
+                    instruction.kind,
+                    RegionInstructionKind::NativeCall(RegionNativeCall {
+                        target: RegionCallTarget::Pipe { .. },
+                        ..
+                    })
+                )
+            })
+            .expect("prepared pipe");
+        assert!(flow.consumes_call_operand(call.continuation_id, source));
+        flow.verify_ownership(&region)
+            .expect("last-use pipe ownership should verify");
+    }
+
+    #[test]
+    fn direct_compiled_unpack_consumes_its_owned_source_array() {
+        let mut builder = IrBuilder::new(UnitId::new(4_238));
+        let file = builder.add_file("direct-unpack-owner.php");
+        let span = IrSpan::new(file, 0, 1);
+        let callee = builder.start_function("unpack_target", FunctionFlags::default(), span);
+        let callee_block = builder.append_block(callee);
+        builder.terminate_return(callee, callee_block, None, span);
+        builder.register_function_name("unpack_target", callee);
+
+        let caller = builder.start_function("direct_unpack_owner", FunctionFlags::default(), span);
+        let block = builder.append_block(caller);
+        let source = builder.alloc_register(caller);
+        builder.emit(
+            caller,
+            block,
+            InstructionKind::NewArray { dst: source },
+            span,
+        );
+        let result = builder.alloc_register(caller);
+        builder.emit(
+            caller,
+            block,
+            InstructionKind::CallFunction {
+                dst: result,
+                name: "unpack_target".to_owned(),
+                args: vec![IrCallArg {
+                    name: None,
+                    value: Operand::Register(source),
+                    unpack: true,
+                    value_kind: IrCallArgValueKind::Direct,
+                    by_ref_local: None,
+                    by_ref_dim: None,
+                    by_ref_property: None,
+                    by_ref_property_dim: None,
+                }],
+            },
+            span,
+        );
+        builder.terminate_return(caller, block, Some(Operand::Register(result)), span);
+        let unit = builder.finish();
+        let region = build_baseline_region(&unit, caller).expect("region");
+        let flow = analyze_executable_value_flow(&region, &unit.constants);
+        let call = region.blocks[0]
+            .instructions
+            .iter()
+            .find_map(|instruction| match &instruction.kind {
+                RegionInstructionKind::NativeCall(call)
+                    if call.direct_compiled_unpack_target() == Some(callee) =>
+                {
+                    Some(instruction)
+                }
+                _ => None,
+            })
+            .expect("direct compiled unpack call");
+        assert!(flow.consumes_call_operand(call.continuation_id, source));
+        flow.verify_ownership(&region)
+            .expect("last-use direct-unpack ownership should verify");
+    }
 
     #[test]
     fn semantic_call_consumes_only_a_registers_final_owner_use() {
@@ -1961,6 +2315,121 @@ mod tests {
     }
 
     #[test]
+    fn prepared_reference_argument_keeps_its_frame_cleanup_owner() {
+        let mut builder = IrBuilder::new(UnitId::new(4_246));
+        let file = builder.add_file("reference-call-frame-owner.php");
+        let span = IrSpan::new(file, 0, 1);
+
+        let callee = builder.start_function("borrow_reference", FunctionFlags::default(), span);
+        let callee_local = builder.intern_local(callee, "value");
+        builder.push_param(
+            callee,
+            IrParam {
+                name: "value".to_owned(),
+                local: callee_local,
+                required: true,
+                default: None,
+                type_: None,
+                by_ref: true,
+                variadic: false,
+                attributes: Vec::new(),
+            },
+        );
+        let callee_block = builder.append_block(callee);
+        builder.terminate_return(callee, callee_block, None, span);
+        builder.register_function_name("borrow_reference", callee);
+
+        let caller =
+            builder.start_function("reference_call_frame_owner", FunctionFlags::default(), span);
+        let array = builder.intern_local(caller, "array");
+        builder.push_param(
+            caller,
+            IrParam {
+                name: "array".to_owned(),
+                local: array,
+                required: true,
+                default: None,
+                type_: Some(IrReturnType::Array),
+                by_ref: false,
+                variadic: false,
+                attributes: Vec::new(),
+            },
+        );
+        let block = builder.append_block(caller);
+        let zero = builder.intern_constant(IrConstant::Int(0));
+        let argument = builder.alloc_register(caller);
+        builder.emit(
+            caller,
+            block,
+            InstructionKind::FetchDim {
+                dst: argument,
+                array: Operand::Local(array),
+                key: Operand::Constant(zero),
+                quiet: false,
+                mode: php_ir::instruction::DimFetchMode::Lvalue,
+            },
+            span,
+        );
+        let result = builder.alloc_register(caller);
+        builder.emit(
+            caller,
+            block,
+            InstructionKind::CallFunction {
+                dst: result,
+                name: "borrow_reference".to_owned(),
+                args: vec![IrCallArg {
+                    name: None,
+                    value: Operand::Register(argument),
+                    unpack: false,
+                    value_kind: IrCallArgValueKind::Direct,
+                    by_ref_local: None,
+                    by_ref_dim: Some(IrCallDimTarget {
+                        local: array,
+                        dims: vec![Operand::Constant(zero)],
+                    }),
+                    by_ref_property: None,
+                    by_ref_property_dim: None,
+                }],
+            },
+            span,
+        );
+        builder.terminate_return(caller, block, None, span);
+        let unit = builder.finish();
+        let region = build_baseline_region(&unit, caller).expect("reference call region");
+        let reference_local = region.blocks[0]
+            .instructions
+            .iter()
+            .find_map(|instruction| match instruction.kind {
+                RegionInstructionKind::BindReferenceDim { target, .. } => Some(target),
+                _ => None,
+            })
+            .expect("prepared reference local");
+        let call = region.blocks[0]
+            .instructions
+            .iter()
+            .find_map(|instruction| match &instruction.kind {
+                RegionInstructionKind::NativeCall(call) => Some(call),
+                _ => None,
+            })
+            .expect("prepared native call");
+        assert_eq!(call.args[0].by_ref_local, Some(reference_local));
+
+        for flow in [
+            analyze_executable_value_flow(&region, &unit.constants),
+            analyze_baseline_value_ownership(&region),
+        ] {
+            assert!(
+                flow.releases_local_at_frame_exit(reference_local),
+                "the call borrows the prepared reference; its frame owner must be released"
+            );
+            assert_eq!(
+                flow.local_storage(reference_local),
+                LocalStorageClass::MemoryReference
+            );
+        }
+    }
+
+    #[test]
     fn final_store_moves_owner_after_prior_dominating_use() {
         let mut builder = IrBuilder::new(UnitId::new(4_243));
         let file = builder.add_file("prior-use-owner-move.php");
@@ -2073,6 +2542,119 @@ mod tests {
             assert!(flow.releases_local_at_frame_exit(local));
             assert_eq!(flow.register_fact(loaded).ownership, SsaOwnership::Borrowed);
         }
+    }
+
+    #[test]
+    fn property_assignment_result_preserves_borrowed_input_ownership() {
+        let mut builder = IrBuilder::new(UnitId::new(4_245));
+        let file = builder.add_file("borrowed-property-assignment.php");
+        let span = IrSpan::new(file, 0, 1);
+        let function = builder.start_function(
+            "borrowed_property_assignment",
+            FunctionFlags::default(),
+            span,
+        );
+        let object_local = builder.intern_local(function, "object");
+        builder.push_param(
+            function,
+            IrParam {
+                name: "object".to_owned(),
+                local: object_local,
+                required: true,
+                default: None,
+                type_: Some(IrReturnType::Mixed),
+                by_ref: false,
+                variadic: false,
+                attributes: Vec::new(),
+            },
+        );
+        let value_local = builder.intern_local(function, "value");
+        let block = builder.append_block(function);
+        let value = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::NewArray { dst: value },
+            span,
+        );
+        builder.emit(
+            function,
+            block,
+            InstructionKind::StoreLocal {
+                local: value_local,
+                src: Operand::Register(value),
+            },
+            span,
+        );
+        builder.emit(
+            function,
+            block,
+            InstructionKind::Discard {
+                src: Operand::Register(value),
+            },
+            span,
+        );
+        let object = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::LoadLocal {
+                dst: object,
+                local: object_local,
+            },
+            span,
+        );
+        let borrowed = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::LoadLocal {
+                dst: borrowed,
+                local: value_local,
+            },
+            span,
+        );
+        let assigned = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::AssignProperty {
+                dst: assigned,
+                object: Operand::Register(object),
+                property: "output".to_owned(),
+                value: Operand::Register(borrowed),
+            },
+            span,
+        );
+        let discarded = builder.emit(
+            function,
+            block,
+            InstructionKind::Discard {
+                src: Operand::Register(assigned),
+            },
+            span,
+        );
+        builder.terminate_return(function, block, None, span);
+        let unit = builder.finish();
+        let region = build_baseline_region(&unit, function).expect("region");
+        let flow = analyze_executable_value_flow(&region, &unit.constants);
+
+        assert_eq!(
+            flow.register_fact(borrowed).ownership,
+            SsaOwnership::Borrowed
+        );
+        assert_eq!(
+            flow.register_fact(assigned).ownership,
+            SsaOwnership::Borrowed
+        );
+        assert!(
+            !flow.elides_discard(region.blocks[0].instructions[discarded.index()].continuation_id)
+        );
+        assert!(!crate::region_ir::value_release_required(
+            flow.register_fact(assigned)
+        ));
+        flow.verify_ownership(&region)
+            .expect("borrowed property assignment result should verify");
     }
 
     #[test]
@@ -2200,6 +2782,46 @@ mod tests {
         assert_eq!(
             flow.local_storage(visible),
             LocalStorageClass::RequestGlobal
+        );
+    }
+
+    #[test]
+    fn classifies_function_global_binding_as_request_global_storage() {
+        let mut builder = IrBuilder::new(UnitId::new(4_203));
+        let file = builder.add_file("function-global-reference.php");
+        let span = IrSpan::new(file, 0, 1);
+        let function =
+            builder.start_function("function_global_reference", FunctionFlags::default(), span);
+        let source = builder.intern_local(function, "source");
+        let global = builder.intern_local(function, "shared");
+        let block = builder.append_block(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::BindGlobal {
+                local: global,
+                name: "shared".to_owned(),
+            },
+            span,
+        );
+        builder.emit(
+            function,
+            block,
+            InstructionKind::BindReference {
+                target: global,
+                source,
+            },
+            span,
+        );
+        builder.terminate_return(function, block, None, span);
+        let unit = builder.finish();
+        let region = build_baseline_region(&unit, function).expect("region");
+        let flow = analyze_executable_value_flow(&region, &unit.constants);
+
+        assert_eq!(flow.local_storage(global), LocalStorageClass::RequestGlobal);
+        assert_eq!(
+            flow.local_storage(source),
+            LocalStorageClass::MemoryReference
         );
     }
 
@@ -2586,6 +3208,67 @@ mod tests {
         );
         flow.verify_ownership(&region)
             .expect("last-use register move should verify");
+    }
+
+    #[test]
+    fn dynamic_binary_result_is_one_owned_value_and_moves_at_last_use() {
+        let mut builder = IrBuilder::new(UnitId::new(4_214));
+        let file = builder.add_file("binary-result-owner.php");
+        let span = IrSpan::new(file, 0, 1);
+        let function =
+            builder.start_function("binary_result_owner", FunctionFlags::default(), span);
+        let local = builder.intern_local(function, "result");
+        let block = builder.append_block(function);
+        let left = builder.intern_constant(IrConstant::Int(i64::MAX));
+        let right = builder.intern_constant(IrConstant::Int(1));
+        let result = builder.alloc_register(function);
+        builder.emit(
+            function,
+            block,
+            InstructionKind::Binary {
+                dst: result,
+                op: BinaryOp::Add,
+                lhs: Operand::Constant(left),
+                rhs: Operand::Constant(right),
+            },
+            span,
+        );
+        let stored = builder.emit(
+            function,
+            block,
+            InstructionKind::StoreLocal {
+                local,
+                src: Operand::Register(result),
+            },
+            span,
+        );
+        let discarded = builder.emit(
+            function,
+            block,
+            InstructionKind::Discard {
+                src: Operand::Register(result),
+            },
+            span,
+        );
+        builder.terminate_return(function, block, None, span);
+        let unit = builder.finish();
+        let region = build_baseline_region(&unit, function).expect("region");
+        let flow = analyze_executable_value_flow(&region, &unit.constants);
+
+        let result_fact = flow.register_fact(result);
+        assert_eq!(result_fact.class, SsaValueClass::MixedHandle);
+        assert_eq!(result_fact.certainty, super::super::SsaCertainty::Unknown);
+        assert_eq!(result_fact.ownership, SsaOwnership::Owned);
+        assert!(
+            flow.moves_value_into_local(
+                region.blocks[0].instructions[stored.index()].continuation_id
+            )
+        );
+        assert!(
+            flow.elides_discard(region.blocks[0].instructions[discarded.index()].continuation_id)
+        );
+        flow.verify_ownership(&region)
+            .expect("binary last-use owner move should verify");
     }
 
     #[test]

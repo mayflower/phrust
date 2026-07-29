@@ -265,6 +265,7 @@ const fn instruction_is_motion_barrier(kind: &RegionInstructionKind) -> bool {
     matches!(
         kind,
         RegionInstructionKind::ArrayCallback(_)
+            | RegionInstructionKind::PregCallbackArray(_)
             | RegionInstructionKind::NativeCall(_)
             | RegionInstructionKind::NativeControl(_)
             | RegionInstructionKind::NativeSuspend(_)
@@ -786,16 +787,23 @@ mod tests {
             RegionInstructionKind::ArrayCallback(crate::region_ir::RegionArrayCallbackCall {
                 result: RegId::new(1),
                 operation: crate::region_ir::RegionArrayCallbackOperation::Map,
-                callback: crate::region_ir::RegionStableCallback {
-                    name: "callback".to_owned(),
-                    function: Some(FunctionId::new(1)),
-                    receiver: None,
-                    closure: None,
-                    bound_object_count: 0,
-                    capture_count: 0,
-                },
+                callback: crate::region_ir::RegionArrayCallbackTarget::Stable(
+                    crate::region_ir::RegionStableCallback {
+                        name: "callback".to_owned(),
+                        function: Some(FunctionId::new(1)),
+                        receiver: None,
+                        closure: None,
+                        bound_object_count: 0,
+                        capture_count: 0,
+                        returns_int: false,
+                        returns_string: false,
+                        returns_releasable_scalar: false,
+                    },
+                ),
                 arrays: vec![RegionOperand::Register(RegId::new(0))],
                 initial: None,
+                mutable_local: None,
+                caller_strict_types: false,
             });
         assert!(instruction_is_motion_barrier(&callback));
     }

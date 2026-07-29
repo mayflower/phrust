@@ -1109,14 +1109,56 @@ pub fn input_pairs_array(pairs: &[(String, String)], ini: &RuntimeIniOptions) ->
 }
 
 #[cfg(feature = "full-runtime")]
-pub(crate) fn native_input_pairs_value(
-    pairs: &[(String, String)],
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeInputKey {
+    Int(i64),
+    String(Vec<u8>),
+}
+
+#[cfg(feature = "full-runtime")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeInputSegment {
+    Key(NativeInputKey),
+    Append,
+}
+
+#[cfg(feature = "full-runtime")]
+pub(crate) fn native_input_bytes_into<E>(
+    input: &[u8],
     ini: &RuntimeIniOptions,
-) -> crate::builtins::NativeDecodedValue {
+    mut insert: impl FnMut(&[NativeInputSegment], &[u8]) -> Result<(), E>,
+) -> Result<(), E> {
     let mut builder = InputArrayBuilder::new(ini);
-    let mut entries = Vec::new();
-    builder.insert_native_pairs(&mut entries, pairs);
-    crate::builtins::NativeDecodedValue::KeyedArray(entries)
+    let separators = input_separator_bytes(&ini.arg_separator_input);
+    for part in input
+        .split(|byte| separators.contains(byte))
+        .filter(|part| !part.is_empty())
+    {
+        if !builder.consume_var() {
+            break;
+        }
+        let (name, value) = split_bytes_once(part, b'=').unwrap_or((part, &[]));
+        let Some(name) = decode_component(name) else {
+            continue;
+        };
+        let Some(value) = decode_component(value) else {
+            continue;
+        };
+        let Some(segments) = parse_input_key_segments(&name, builder.max_input_nesting_level)
+        else {
+            continue;
+        };
+        let segments = segments
+            .iter()
+            .map(|segment| match segment {
+                InputKeySegment::Key(key) => NativeInputSegment::Key(native_input_key(key)),
+                InputKeySegment::Append => NativeInputSegment::Append,
+            })
+            .collect::<Vec<_>>();
+        let value = builder.filter_value_bytes(&value);
+        insert(&segments, &value)?;
+    }
+    Ok(())
 }
 
 fn raw_input_pairs_array(pairs: &[(String, String)], ini: &RuntimeIniOptions) -> PhpArray {
@@ -1192,26 +1234,6 @@ impl InputArrayBuilder {
         }
     }
 
-    #[cfg(feature = "full-runtime")]
-    fn insert_native_pairs(
-        &mut self,
-        array: &mut Vec<(
-            crate::builtins::NativeDecodedArrayKey,
-            crate::builtins::NativeDecodedValue,
-        )>,
-        pairs: &[(String, String)],
-    ) {
-        for (key, value) in pairs {
-            if !self.consume_var() {
-                break;
-            }
-            let Some(segments) = parse_input_key_segments(key, self.max_input_nesting_level) else {
-                continue;
-            };
-            insert_native_input_at(array, &segments, self.filter_value_bytes(value));
-        }
-    }
-
     fn consume_var(&mut self) -> bool {
         if self.remaining_vars == 0 {
             return false;
@@ -1240,72 +1262,11 @@ impl InputArrayBuilder {
 }
 
 #[cfg(feature = "full-runtime")]
-fn native_decoded_array_key(key: &ArrayKey) -> crate::builtins::NativeDecodedArrayKey {
+fn native_input_key(key: &ArrayKey) -> NativeInputKey {
     match key {
-        ArrayKey::Int(value) => crate::builtins::NativeDecodedArrayKey::Int(*value),
-        ArrayKey::String(value) => {
-            crate::builtins::NativeDecodedArrayKey::String(value.as_bytes().to_vec())
-        }
+        ArrayKey::Int(value) => NativeInputKey::Int(*value),
+        ArrayKey::String(value) => NativeInputKey::String(value.as_bytes().to_vec()),
     }
-}
-
-#[cfg(feature = "full-runtime")]
-fn insert_native_input_at(
-    array: &mut Vec<(
-        crate::builtins::NativeDecodedArrayKey,
-        crate::builtins::NativeDecodedValue,
-    )>,
-    segments: &[InputKeySegment],
-    value: Vec<u8>,
-) {
-    let Some((head, tail)) = segments.split_first() else {
-        return;
-    };
-    let key = match head {
-        InputKeySegment::Key(key) => native_decoded_array_key(key),
-        InputKeySegment::Append => {
-            let next = array
-                .iter()
-                .filter_map(|(key, _)| match key {
-                    crate::builtins::NativeDecodedArrayKey::Int(value) => {
-                        Some(value.saturating_add(1))
-                    }
-                    crate::builtins::NativeDecodedArrayKey::String(_) => None,
-                })
-                .max()
-                .unwrap_or(0);
-            crate::builtins::NativeDecodedArrayKey::Int(next)
-        }
-    };
-    if tail.is_empty() {
-        let value = crate::builtins::NativeDecodedValue::String(value);
-        if let Some((_, current)) = array.iter_mut().find(|(candidate, _)| *candidate == key) {
-            *current = value;
-        } else {
-            array.push((key, value));
-        }
-        return;
-    }
-    let index = array
-        .iter()
-        .position(|(candidate, _)| *candidate == key)
-        .unwrap_or_else(|| {
-            array.push((
-                key,
-                crate::builtins::NativeDecodedValue::KeyedArray(Vec::new()),
-            ));
-            array.len() - 1
-        });
-    if !matches!(
-        array[index].1,
-        crate::builtins::NativeDecodedValue::KeyedArray(_)
-    ) {
-        array[index].1 = crate::builtins::NativeDecodedValue::KeyedArray(Vec::new());
-    }
-    let crate::builtins::NativeDecodedValue::KeyedArray(child) = &mut array[index].1 else {
-        unreachable!("native input child was initialized as an array");
-    };
-    insert_native_input_at(child, tail, value);
 }
 
 const FILTER_FLAG_STRIP_LOW: i64 = 4;

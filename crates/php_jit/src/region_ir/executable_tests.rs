@@ -124,6 +124,18 @@ fn namespaced_builtin_reference_requirements_fall_back_to_global_metadata() {
 }
 
 #[test]
+fn namespaced_builtin_publication_uses_the_fixed_global_identity() {
+    assert_eq!(
+        resolved_internal_builtin_name("WpOrg\\Requests\\ksort"),
+        Some("ksort")
+    );
+    let parameters = internal_builtin_binding_parameters("WpOrg\\Requests\\ksort")
+        .expect("global ksort arginfo");
+    assert!(parameters[0].by_ref);
+    assert!(!parameters[1].by_ref);
+}
+
+#[test]
 fn namespaced_builtin_reference_argument_load_is_quiet() {
     let mut builder = IrBuilder::new(UnitId::new(97));
     let file = builder.add_file("namespaced-reference.php");
@@ -863,6 +875,7 @@ fn published_external_parent_prepares_local_object_family() {
         native_arity: 0,
         requires_non_reference_trampoline: false,
         returns_by_reference: false,
+        exception_routes: None,
     };
     let metadata = CompileMetadata {
         tier: NativeCompilerTier::Optimizing,
@@ -911,6 +924,7 @@ fn published_external_parent_prepares_local_object_family() {
             native_arity: 2,
             requires_non_reference_trampoline: false,
             returns_by_reference: false,
+            exception_routes: None,
         }],
     )
     .expect("external parent default constructor region");
@@ -1165,7 +1179,7 @@ fn this_receiver_keeps_virtual_method_dispatch_in_non_final_class() {
         span,
     );
     let result = builder.alloc_register(run);
-    builder.emit(
+    let call_instruction = builder.emit(
         run,
         run_block,
         InstructionKind::CallMethod {
@@ -1231,6 +1245,40 @@ fn this_receiver_keeps_virtual_method_dispatch_in_non_final_class() {
         RegionCallTarget::Method { ref method, .. } if method == "item"
     ));
     assert_eq!(call.direct_compiled_target(), None);
+
+    let specialized = BaselineRegionBuilder::build_with_runtime_specializations(
+        &unit,
+        run,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+        &[],
+        &[crate::JitMethodSpecialization {
+            instruction_id: call_instruction.raw(),
+            receiver_layout_id: 0x5a17,
+            target: crate::JitMethodSpecializationTarget::Local(item),
+        }],
+    )
+    .expect("profile-specialized method region");
+    let call = specialized.blocks[0]
+        .instructions
+        .iter()
+        .find_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::NativeCall(call) => Some(call),
+            _ => None,
+        })
+        .expect("specialized native method call");
+    assert!(matches!(
+        call.target,
+        RegionCallTarget::Method {
+            function: Some(target),
+            linked_function: None,
+            receiver_layout_id: Some(0x5a17),
+            ..
+        } if target == item
+    ));
+    assert_eq!(call.direct_compiled_target(), Some(item));
 }
 
 #[test]
@@ -2505,6 +2553,735 @@ fn optimizing_call_user_func_array_uses_prepared_closure_and_keeps_baseline_orig
 }
 
 #[test]
+fn optimizing_runtime_callable_array_preserves_one_native_unpack_boundary() {
+    let mut builder = IrBuilder::new(UnitId::new(103));
+    let file = builder.add_file("runtime-callable-array.php");
+    let span = IrSpan::new(file, 0, 20);
+    let function = builder.start_function("runtime_callable_array", FunctionFlags::default(), span);
+    let callable = builder.intern_local(function, "callback");
+    builder.push_param(
+        function,
+        IrParam {
+            name: "callback".to_owned(),
+            local: callable,
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Callable),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let values = builder.intern_local(function, "values");
+    builder.push_param(
+        function,
+        IrParam {
+            name: "values".to_owned(),
+            local: values,
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Array),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let block = builder.append_block(function);
+    let result = builder.alloc_register(function);
+    let argument = |value| IrCallArg {
+        name: None,
+        value,
+        unpack: false,
+        value_kind: IrCallArgValueKind::Direct,
+        by_ref_local: None,
+        by_ref_dim: None,
+        by_ref_property: None,
+        by_ref_property_dim: None,
+    };
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: result,
+            name: "call_user_func_array".to_owned(),
+            args: vec![
+                argument(Operand::Local(callable)),
+                argument(Operand::Local(values)),
+            ],
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+    let unit = builder.finish();
+
+    let optimizing = BaselineRegionBuilder::build(
+        &unit,
+        function,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+    )
+    .expect("optimizing runtime callable array region");
+    let unpack = optimizing.blocks[0]
+        .instructions
+        .iter()
+        .find_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::NativeCall(call)
+                if matches!(call.target, RegionCallTarget::Callable { .. }) =>
+            {
+                Some(call)
+            }
+            _ => None,
+        })
+        .expect("runtime callable must retain a native callable target");
+    assert_eq!(unpack.argument_operand_offset, 1);
+    assert_eq!(unpack.operands.len(), 2);
+    assert_eq!(unpack.trailing_unpack_argument(), Some(0));
+
+    let baseline = BaselineRegionBuilder::build(&unit, function, &CompileMetadata::default())
+        .expect("baseline runtime callable array region");
+    assert!(baseline.blocks[0].instructions.iter().any(|instruction| {
+        matches!(
+            &instruction.kind,
+            RegionInstructionKind::NativeCall(RegionNativeCall {
+                target: RegionCallTarget::Function { name, function: None },
+                ..
+            }) if name.eq_ignore_ascii_case("call_user_func_array")
+        )
+    }));
+}
+
+#[test]
+fn optimizing_array_map_preserves_runtime_callable_for_one_native_loop() {
+    let mut builder = IrBuilder::new(UnitId::new(103));
+    let file = builder.add_file("runtime-array-callback.php");
+    let span = IrSpan::new(file, 0, 20);
+    let function = builder.start_function("runtime_array_callback", FunctionFlags::default(), span);
+    let callable = builder.intern_local(function, "callback");
+    builder.push_param(
+        function,
+        IrParam {
+            name: "callback".to_owned(),
+            local: callable,
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Callable),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let values = builder.intern_local(function, "values");
+    builder.push_param(
+        function,
+        IrParam {
+            name: "values".to_owned(),
+            local: values,
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Array),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let block = builder.append_block(function);
+    let result = builder.alloc_register(function);
+    let argument = |value| IrCallArg {
+        name: None,
+        value,
+        unpack: false,
+        value_kind: IrCallArgValueKind::Direct,
+        by_ref_local: None,
+        by_ref_dim: None,
+        by_ref_property: None,
+        by_ref_property_dim: None,
+    };
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: result,
+            name: "array_map".to_owned(),
+            args: vec![
+                argument(Operand::Local(callable)),
+                argument(Operand::Local(values)),
+            ],
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+    let unit = builder.finish();
+
+    let optimizing = BaselineRegionBuilder::build(
+        &unit,
+        function,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+    )
+    .expect("optimizing runtime array callback region");
+    let callback = optimizing.blocks[0]
+        .instructions
+        .iter()
+        .find_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::ArrayCallback(call) => Some(call),
+            _ => None,
+        })
+        .expect("runtime callback must use the native array loop");
+    assert_eq!(
+        callback.callback,
+        RegionArrayCallbackTarget::Runtime(RegionOperand::Local(callable))
+    );
+    assert_eq!(callback.operation, RegionArrayCallbackOperation::Map);
+    assert!(
+        !optimizing.blocks[0].instructions.iter().any(|instruction| {
+            matches!(
+                &instruction.kind,
+                RegionInstructionKind::NativeCall(RegionNativeCall {
+                    target: RegionCallTarget::Function { name, .. },
+                    ..
+                }) if name.eq_ignore_ascii_case("array_map")
+            )
+        })
+    );
+}
+
+#[test]
+fn optimizing_preg_replace_callback_uses_native_match_plan_for_string_callback() {
+    let mut builder = IrBuilder::new(UnitId::new(109));
+    let file = builder.add_file("preg-replace-callback-native.php");
+    let span = IrSpan::new(file, 0, 20);
+
+    let callback = builder.start_function("replace_match", FunctionFlags::default(), span);
+    builder.register_function_name("replace_match", callback);
+    builder.set_return_type(callback, Some(IrReturnType::String));
+    let matches = builder.intern_local(callback, "matches");
+    builder.push_param(
+        callback,
+        IrParam {
+            name: "matches".to_owned(),
+            local: matches,
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Array),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let replacement = builder.intern_constant(IrConstant::String("x".to_owned()));
+    let callback_block = builder.append_block(callback);
+    builder.terminate_return(
+        callback,
+        callback_block,
+        Some(Operand::Constant(replacement)),
+        span,
+    );
+
+    let function = builder.start_function("replace_subject", FunctionFlags::default(), span);
+    let pattern = builder.intern_local(function, "pattern");
+    let subject = builder.intern_local(function, "subject");
+    for (name, local) in [("pattern", pattern), ("subject", subject)] {
+        builder.push_param(
+            function,
+            IrParam {
+                name: name.to_owned(),
+                local,
+                required: true,
+                default: None,
+                type_: Some(IrReturnType::String),
+                by_ref: false,
+                variadic: false,
+                attributes: Vec::new(),
+            },
+        );
+    }
+    let callback_name = builder.intern_constant(IrConstant::String("replace_match".to_owned()));
+    let block = builder.append_block(function);
+    let result = builder.alloc_register(function);
+    let argument = |value| IrCallArg {
+        name: None,
+        value,
+        unpack: false,
+        value_kind: IrCallArgValueKind::Direct,
+        by_ref_local: None,
+        by_ref_dim: None,
+        by_ref_property: None,
+        by_ref_property_dim: None,
+    };
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: result,
+            name: "preg_replace_callback".to_owned(),
+            args: vec![
+                argument(Operand::Local(pattern)),
+                argument(Operand::Constant(callback_name)),
+                argument(Operand::Local(subject)),
+            ],
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+    let unit = builder.finish();
+
+    let region = BaselineRegionBuilder::build(
+        &unit,
+        function,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+    )
+    .expect("optimizing preg_replace_callback region");
+    let call = region.blocks[0]
+        .instructions
+        .iter()
+        .find_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::ArrayCallback(call)
+                if call.operation == RegionArrayCallbackOperation::PregReplace =>
+            {
+                Some(call)
+            }
+            _ => None,
+        })
+        .expect("native PCRE callback plan");
+    assert_eq!(
+        call.arrays,
+        vec![
+            RegionOperand::Local(pattern),
+            RegionOperand::Local(subject),
+            RegionOperand::I64(-1),
+            RegionOperand::I64(0),
+        ]
+    );
+    let callback_plan = call.callback.stable().expect("stable callback");
+    assert_eq!(callback_plan.function, Some(callback));
+    assert!(callback_plan.returns_string);
+    assert_eq!(region.direct_callees(), vec![callback]);
+}
+
+#[test]
+fn optimizing_preg_replace_callback_preserves_one_runtime_callable_boundary() {
+    let mut builder = IrBuilder::new(UnitId::new(110));
+    let file = builder.add_file("preg-replace-runtime-callback-native.php");
+    let span = IrSpan::new(file, 0, 20);
+    let function =
+        builder.start_function("replace_runtime_subject", FunctionFlags::default(), span);
+    let callback = builder.intern_local(function, "callback");
+    let pattern = builder.intern_local(function, "pattern");
+    let subject = builder.intern_local(function, "subject");
+    for (name, local, type_) in [
+        ("callback", callback, IrReturnType::Callable),
+        ("pattern", pattern, IrReturnType::String),
+        ("subject", subject, IrReturnType::String),
+    ] {
+        builder.push_param(
+            function,
+            IrParam {
+                name: name.to_owned(),
+                local,
+                required: true,
+                default: None,
+                type_: Some(type_),
+                by_ref: false,
+                variadic: false,
+                attributes: Vec::new(),
+            },
+        );
+    }
+    let argument = |value| IrCallArg {
+        name: None,
+        value,
+        unpack: false,
+        value_kind: IrCallArgValueKind::Direct,
+        by_ref_local: None,
+        by_ref_dim: None,
+        by_ref_property: None,
+        by_ref_property_dim: None,
+    };
+    let block = builder.append_block(function);
+    let result = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: result,
+            name: "preg_replace_callback".to_owned(),
+            args: vec![
+                argument(Operand::Local(pattern)),
+                argument(Operand::Local(callback)),
+                argument(Operand::Local(subject)),
+            ],
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+    let unit = builder.finish();
+
+    let region = BaselineRegionBuilder::build(
+        &unit,
+        function,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+    )
+    .expect("optimizing runtime preg_replace_callback region");
+    let call = region.blocks[0]
+        .instructions
+        .iter()
+        .find_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::ArrayCallback(call)
+                if call.operation == RegionArrayCallbackOperation::PregReplace =>
+            {
+                Some(call)
+            }
+            _ => None,
+        })
+        .expect("runtime native PCRE callback plan");
+    assert_eq!(
+        call.callback,
+        RegionArrayCallbackTarget::Runtime(RegionOperand::Local(callback))
+    );
+    assert_eq!(
+        call.arrays,
+        vec![
+            RegionOperand::Local(pattern),
+            RegionOperand::Local(subject),
+            RegionOperand::I64(-1),
+            RegionOperand::I64(0),
+        ]
+    );
+}
+
+#[test]
+fn optimizing_preg_replace_callback_array_preserves_ordered_native_entries() {
+    let mut builder = IrBuilder::new(UnitId::new(111));
+    let file = builder.add_file("preg-replace-callback-array-native.php");
+    let span = IrSpan::new(file, 0, 20);
+
+    let callback = builder.start_function("replace_array_match", FunctionFlags::default(), span);
+    let callback_matches = builder.intern_local(callback, "matches");
+    builder.push_param(
+        callback,
+        IrParam {
+            name: "matches".to_owned(),
+            local: callback_matches,
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Array),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    builder.set_return_type(callback, Some(IrReturnType::String));
+    let replacement = builder.intern_constant(IrConstant::String("X".to_owned()));
+    let callback_block = builder.append_block(callback);
+    builder.terminate_return(
+        callback,
+        callback_block,
+        Some(Operand::Constant(replacement)),
+        span,
+    );
+    builder.register_function_name("replace_array_match", callback);
+
+    let function = builder.start_function("replace_array_subject", FunctionFlags::default(), span);
+    let subject = builder.intern_local(function, "subject");
+    let count = builder.intern_local(function, "count");
+    builder.push_param(
+        function,
+        IrParam {
+            name: "subject".to_owned(),
+            local: subject,
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::String),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    let pattern = builder.intern_constant(IrConstant::String("/a+/".to_owned()));
+    let callback_name =
+        builder.intern_constant(IrConstant::String("replace_array_match".to_owned()));
+    let limit = builder.intern_constant(IrConstant::Int(2));
+    let missing = builder.intern_constant(IrConstant::Null);
+    let block = builder.append_block(function);
+    let callback_map = builder.alloc_register(function);
+    let pattern_register = builder.alloc_register(function);
+    let callback_register = builder.alloc_register(function);
+    let result = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::NewArray { dst: callback_map },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::LoadConst {
+            dst: pattern_register,
+            constant: pattern,
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::LoadConst {
+            dst: callback_register,
+            constant: callback_name,
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::ArrayInsert {
+            array: callback_map,
+            key: Some(Operand::Register(pattern_register)),
+            value: Operand::Register(callback_register),
+            by_ref_local: None,
+        },
+        span,
+    );
+    for register in [pattern_register, callback_register] {
+        builder.emit(
+            function,
+            block,
+            InstructionKind::Discard {
+                src: Operand::Register(register),
+            },
+            span,
+        );
+    }
+    let argument = |value| IrCallArg {
+        name: None,
+        value,
+        unpack: false,
+        value_kind: IrCallArgValueKind::Direct,
+        by_ref_local: None,
+        by_ref_dim: None,
+        by_ref_property: None,
+        by_ref_property_dim: None,
+    };
+    let mut count_argument = argument(Operand::Constant(missing));
+    count_argument.by_ref_local = Some(count);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: result,
+            name: "preg_replace_callback_array".to_owned(),
+            args: vec![
+                argument(Operand::Register(callback_map)),
+                argument(Operand::Local(subject)),
+                argument(Operand::Constant(limit)),
+                count_argument,
+            ],
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::Discard {
+            src: Operand::Register(callback_map),
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+    let unit = builder.finish();
+
+    let region = BaselineRegionBuilder::build(
+        &unit,
+        function,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+    )
+    .expect("optimizing preg_replace_callback_array region");
+    let call = region.blocks[0]
+        .instructions
+        .iter()
+        .find_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::PregCallbackArray(call) => Some(call),
+            _ => None,
+        })
+        .expect("ordered native PCRE callback map");
+    assert_eq!(call.entries.len(), 1);
+    assert_eq!(
+        call.entries[0].pattern,
+        RegionOperand::Register(pattern_register)
+    );
+    assert_eq!(call.subject, RegionOperand::Local(subject));
+    assert_eq!(call.count_local, Some(count));
+    assert_eq!(
+        call.entries[0]
+            .callback
+            .stable()
+            .and_then(|callback| callback.function),
+        Some(callback)
+    );
+    assert!(region.blocks[0].instructions.iter().all(|instruction| {
+        !matches!(
+            instruction.kind,
+            RegionInstructionKind::NewArray { dst, .. }
+                | RegionInstructionKind::ArrayInsert { array: dst, .. }
+                if dst == callback_map
+        )
+    }));
+    assert_eq!(region.direct_callees(), vec![callback]);
+}
+
+#[test]
+fn optimizing_preg_replace_callback_array_reads_runtime_callable_from_map() {
+    let mut builder = IrBuilder::new(UnitId::new(112));
+    let file = builder.add_file("preg-replace-runtime-callback-array-native.php");
+    let span = IrSpan::new(file, 0, 20);
+    let function = builder.start_function(
+        "replace_runtime_array_subject",
+        FunctionFlags::default(),
+        span,
+    );
+    let callback = builder.intern_local(function, "callback");
+    let subject = builder.intern_local(function, "subject");
+    for (name, local, type_) in [
+        ("callback", callback, IrReturnType::Callable),
+        ("subject", subject, IrReturnType::String),
+    ] {
+        builder.push_param(
+            function,
+            IrParam {
+                name: name.to_owned(),
+                local,
+                required: true,
+                default: None,
+                type_: Some(type_),
+                by_ref: false,
+                variadic: false,
+                attributes: Vec::new(),
+            },
+        );
+    }
+    let pattern = builder.intern_constant(IrConstant::String("/a+/".to_owned()));
+    let block = builder.append_block(function);
+    let callback_map = builder.alloc_register(function);
+    let pattern_register = builder.alloc_register(function);
+    let result = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::NewArray { dst: callback_map },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::LoadConst {
+            dst: pattern_register,
+            constant: pattern,
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::ArrayInsert {
+            array: callback_map,
+            key: Some(Operand::Register(pattern_register)),
+            value: Operand::Local(callback),
+            by_ref_local: None,
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::Discard {
+            src: Operand::Register(pattern_register),
+        },
+        span,
+    );
+    let argument = |value| IrCallArg {
+        name: None,
+        value,
+        unpack: false,
+        value_kind: IrCallArgValueKind::Direct,
+        by_ref_local: None,
+        by_ref_dim: None,
+        by_ref_property: None,
+        by_ref_property_dim: None,
+    };
+    builder.emit(
+        function,
+        block,
+        InstructionKind::CallFunction {
+            dst: result,
+            name: "preg_replace_callback_array".to_owned(),
+            args: vec![
+                argument(Operand::Register(callback_map)),
+                argument(Operand::Local(subject)),
+            ],
+        },
+        span,
+    );
+    builder.emit(
+        function,
+        block,
+        InstructionKind::Discard {
+            src: Operand::Register(callback_map),
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(result)), span);
+    let unit = builder.finish();
+
+    let region = BaselineRegionBuilder::build(
+        &unit,
+        function,
+        &CompileMetadata {
+            tier: NativeCompilerTier::Optimizing,
+            ..CompileMetadata::default()
+        },
+    )
+    .expect("optimizing runtime preg_replace_callback_array region");
+    let call = region.blocks[0]
+        .instructions
+        .iter()
+        .find_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::PregCallbackArray(call) => Some(call),
+            _ => None,
+        })
+        .expect("runtime native PCRE callback map");
+    assert_eq!(call.entries.len(), 1);
+    assert_eq!(
+        call.entries[0].callback,
+        RegionArrayCallbackTarget::Runtime(RegionOperand::Register(callback_map))
+    );
+    assert!(region.blocks[0].instructions.iter().any(|instruction| {
+        matches!(
+            instruction.kind,
+            RegionInstructionKind::NewArray { dst, .. } if dst == callback_map
+        )
+    }));
+    assert!(region.blocks[0].instructions.iter().any(|instruction| {
+        matches!(
+            instruction.kind,
+            RegionInstructionKind::ArrayInsert { array, .. } if array == callback_map
+        )
+    }));
+}
+
+#[test]
 fn known_closure_bind_preserves_the_runtime_closure_value() {
     let mut builder = IrBuilder::new(UnitId::new(96));
     let file = builder.add_file("closure-bind.php");
@@ -2723,13 +3500,14 @@ fn optimizing_array_callback_carries_exact_prepared_closure_plan() {
     let RegionInstructionKind::ArrayCallback(call) = &instruction.kind else {
         unreachable!("filtered above");
     };
-    assert_eq!(call.callback.function, Some(closure));
+    let callback_plan = call.callback.stable().expect("stable closure callback");
+    assert_eq!(callback_plan.function, Some(closure));
     assert_eq!(
-        call.callback.closure,
+        callback_plan.closure,
         Some(RegionOperand::Register(callable))
     );
-    assert_eq!(call.callback.bound_object_count, 0);
-    assert_eq!(call.callback.capture_count, 1);
+    assert_eq!(callback_plan.bound_object_count, 0);
+    assert_eq!(callback_plan.capture_count, 1);
     assert!(instruction.register_uses().contains(&callable));
     assert_eq!(region.direct_callees(), vec![closure]);
 }
@@ -2884,13 +3662,14 @@ fn optimizing_array_callback_uses_closure_returned_by_native_factory() {
     let RegionInstructionKind::ArrayCallback(call) = &instruction.kind else {
         unreachable!("filtered above");
     };
-    assert_eq!(call.callback.function, Some(closure));
+    let callback_plan = call.callback.stable().expect("stable factory callback");
+    assert_eq!(callback_plan.function, Some(closure));
     assert_eq!(
-        call.callback.closure,
+        callback_plan.closure,
         Some(RegionOperand::Register(callable))
     );
-    assert_eq!(call.callback.bound_object_count, 0);
-    assert_eq!(call.callback.capture_count, 1);
+    assert_eq!(callback_plan.bound_object_count, 0);
+    assert_eq!(callback_plan.capture_count, 1);
     assert!(instruction.register_uses().contains(&callable));
     assert!(region.direct_callees().contains(&factory));
     assert!(region.direct_callees().contains(&closure));
@@ -3118,6 +3897,7 @@ fn published_external_static_method_stays_linked_across_callback_families() {
         native_arity: 1,
         requires_non_reference_trampoline: false,
         returns_by_reference: false,
+        exception_routes: None,
     };
     let region = BaselineRegionBuilder::build_with_external_function_signatures(
         &unit,
@@ -3140,8 +3920,9 @@ fn published_external_static_method_stays_linked_across_callback_families() {
         .collect::<Vec<_>>();
     assert_eq!(callbacks.len(), 2);
     let callback = callbacks[0];
-    assert_eq!(callback.callback.name, "ExternalCallbacks::map");
-    assert_eq!(callback.callback.function, None);
+    let callback_plan = callback.callback.stable().expect("stable linked callback");
+    assert_eq!(callback_plan.name, "ExternalCallbacks::map");
+    assert_eq!(callback_plan.function, None);
 
     let linked_calls = region.blocks[0]
         .instructions
@@ -3381,6 +4162,7 @@ fn exact_external_instance_callback_carries_receiver_without_callable_array() {
             native_arity: 0,
             requires_non_reference_trampoline: false,
             returns_by_reference: false,
+            exception_routes: None,
         },
         crate::JitExternalFunctionSignature {
             name: "ExternalCallbacks::map".to_owned(),
@@ -3405,6 +4187,7 @@ fn exact_external_instance_callback_carries_receiver_without_callable_array() {
             native_arity: 2,
             requires_non_reference_trampoline: false,
             returns_by_reference: false,
+            exception_routes: None,
         },
     ];
     let region = BaselineRegionBuilder::build_with_external_function_signatures(
@@ -3426,14 +4209,18 @@ fn exact_external_instance_callback_carries_receiver_without_callable_array() {
     let RegionInstructionKind::ArrayCallback(call) = &instruction.kind else {
         unreachable!("filtered above");
     };
-    assert_eq!(call.callback.name, "ExternalCallbacks::map");
-    assert_eq!(call.callback.function, None);
+    let callback_plan = call
+        .callback
+        .stable()
+        .expect("stable linked instance callback");
+    assert_eq!(callback_plan.name, "ExternalCallbacks::map");
+    assert_eq!(callback_plan.function, None);
     assert_eq!(
-        call.callback.receiver,
+        callback_plan.receiver,
         Some(RegionOperand::Register(object))
     );
-    assert_eq!(call.callback.bound_object_count, 1);
-    assert_eq!(call.callback.capture_count, 0);
+    assert_eq!(callback_plan.bound_object_count, 1);
+    assert_eq!(callback_plan.capture_count, 0);
     assert!(instruction.register_uses().contains(&object));
     assert!(!instruction.register_uses().contains(&callable));
     let linked_calls = region.blocks[0]
@@ -3545,6 +4332,7 @@ fn optimizing_linked_reference_return_uses_published_native_signature() {
             native_arity: 1,
             requires_non_reference_trampoline: false,
             returns_by_reference: true,
+            exception_routes: None,
         }],
     )
     .expect("optimizing linked reference-return region");

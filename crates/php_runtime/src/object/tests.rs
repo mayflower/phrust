@@ -4,6 +4,58 @@ use crate::Value;
 mod identity_storage {
     use super::*;
 
+    fn layout_class(name: &str) -> ClassEntry {
+        ClassEntry {
+            name: name.to_owned().into(),
+            parent: None,
+            interfaces: Vec::new(),
+            methods: Vec::new(),
+            properties: vec![ClassPropertyEntry {
+                name: "value".to_owned(),
+                default: Value::Null,
+                type_: None,
+                flags: ClassPropertyFlags::default(),
+                hooks: ClassPropertyHooks::default(),
+                attributes: Vec::new(),
+            }],
+            constants: Vec::new(),
+            enum_cases: Vec::new(),
+            attributes: Vec::new(),
+            enum_backing_type: None,
+            constructor_id: None,
+            flags: ClassFlags::default(),
+        }
+    }
+
+    #[test]
+    fn class_layout_identity_is_stable_across_worker_threads() {
+        let first = std::thread::spawn(|| {
+            let _ = ObjectRef::prepared_layout_id(
+                &layout_class("native_layout_thread_noise"),
+                "native_layout_thread_noise",
+            );
+            ObjectRef::prepared_layout_id(
+                &layout_class("native_layout_thread_stable"),
+                "native_layout_thread_stable",
+            )
+        })
+        .join()
+        .expect("first layout worker");
+        let second = std::thread::spawn(|| {
+            ObjectRef::prepared_layout_id(
+                &layout_class("native_layout_thread_stable"),
+                "native_layout_thread_stable",
+            )
+        })
+        .join()
+        .expect("second layout worker");
+
+        assert_eq!(
+            first, second,
+            "native class ABI identity must not depend on the server worker"
+        );
+    }
+
     #[test]
     fn object_refs_preserve_identity_and_independent_properties() {
         let class = ClassEntry {
@@ -56,6 +108,11 @@ mod identity_storage {
                 .expect("checked property visit")
         );
         assert_eq!(one.class_name(), "box");
+        assert_eq!(
+            one.native_has_magic_isset(),
+            None,
+            "an incomplete method table must not prove magic-method absence"
+        );
     }
 
     #[test]
@@ -1082,6 +1139,8 @@ mod magic_metadata {
 
         assert_eq!(object.class_name(), "overloaded");
         assert!(object.id() > 0);
+        assert_eq!(object.native_has_magic_isset(), Some(true));
+        assert_eq!(object.clone_shallow().native_has_magic_isset(), Some(true));
         assert_eq!(
             class
                 .methods

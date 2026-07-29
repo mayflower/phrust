@@ -1,8 +1,8 @@
 //! Math builtin registry slice.
 
 use super::core::{
-    argument_type_error, argument_value_error, arity_error, conversion_error, deref_value,
-    expect_arity, group_decimal_integer, int_arg, min_max_builtin, numeric_f64_arg,
+    NativePrintfScalar, argument_type_error, argument_value_error, arity_error, conversion_error,
+    deref_value, expect_arity, group_decimal_integer, int_arg, min_max_builtin, numeric_f64_arg,
     php_float_debug_string, string_arg,
 };
 use crate::builtins::{
@@ -110,14 +110,18 @@ fn parse_native_base_number(input: &[u8], base: u32) -> Option<ParsedBaseNumber>
         if digit >= base {
             return None;
         }
-        float_value = (float_value * f64::from(base)) + f64::from(digit);
-        if !overflowed {
-            match int_value
-                .checked_mul(u128::from(base))
-                .and_then(|value| value.checked_add(u128::from(digit)))
-            {
-                Some(value) => int_value = value,
-                None => overflowed = true,
+        if overflowed {
+            float_value = (float_value * f64::from(base)) + f64::from(digit);
+            continue;
+        }
+        let next = int_value
+            .checked_mul(u128::from(base))
+            .and_then(|value| value.checked_add(u128::from(digit)));
+        match next {
+            Some(value) if value <= i64::MAX as u128 => int_value = value,
+            _ => {
+                float_value = (int_value as f64 * f64::from(base)) + f64::from(digit);
+                overflowed = true;
             }
         }
     }
@@ -139,26 +143,84 @@ pub fn native_parse_base_digits(input: &[u8], base: u32) -> Option<NativeParsedB
     }
 }
 
-/// Converts a native byte string between validated bases. Invalid digits
-/// return `None` so PHP-visible diagnostics remain on the exact baseline
-/// continuation.
-pub fn native_base_convert(input: &[u8], from_base: u32, to_base: u32) -> Option<Vec<u8>> {
+#[derive(Clone, Copy, Debug)]
+enum NativeBaseConversionValue {
+    Integer(u128),
+    Float(f64),
+}
+
+/// Prepared allocation-free rendering state for the optimizing native
+/// base-conversion family.
+///
+/// Parsing and PHP-compatible overflow classification happen once. The exact
+/// handler then reserves the authoritative native string at the known length
+/// and renders directly into that range.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeBaseConversion {
+    value: NativeBaseConversionValue,
+    base: u32,
+    output_length: usize,
+}
+
+impl NativeBaseConversion {
+    pub fn output_length(self) -> usize {
+        self.output_length
+    }
+
+    pub fn write_into(self, output: &mut [u8]) -> bool {
+        if output.len() != self.output_length {
+            return false;
+        }
+        match self.value {
+            NativeBaseConversionValue::Integer(value) => {
+                write_u128_base_into(value, self.base, output)
+            }
+            NativeBaseConversionValue::Float(value) => {
+                write_f64_base_into(value, self.base, output)
+            }
+        }
+    }
+}
+
+/// Prepares a native byte string for direct conversion between validated
+/// bases. Invalid digits return `None` so PHP-visible diagnostics remain on
+/// the exact baseline continuation.
+pub fn native_base_conversion(
+    input: &[u8],
+    from_base: u32,
+    to_base: u32,
+) -> Option<NativeBaseConversion> {
     if !(2..=36).contains(&to_base) {
         return None;
     }
     let parsed = parse_native_base_number(input, from_base)?;
-    let output = if parsed.overflowed {
-        format_f64_base(parsed.float_value, to_base)
+    let value = if parsed.overflowed {
+        NativeBaseConversionValue::Float(parsed.float_value)
     } else {
-        format_u128_base(parsed.int_value, to_base)
+        NativeBaseConversionValue::Integer(parsed.int_value)
     };
-    Some(output.into_bytes())
+    Some(NativeBaseConversion {
+        value,
+        base: to_base,
+        output_length: match value {
+            NativeBaseConversionValue::Integer(value) => u128_base_output_length(value, to_base),
+            NativeBaseConversionValue::Float(value) => f64_base_output_length(value, to_base),
+        },
+    })
 }
 
-/// Formats an already validated native integer using PHP's unsigned
+/// Prepares an already validated native integer using PHP's unsigned
 /// two's-complement behavior for decimal-to-base builtins.
-pub fn native_decimal_to_base(value: i64, base: u32) -> Option<Vec<u8>> {
-    (matches!(base, 2 | 8 | 16)).then(|| format_u128_base(value as u64 as u128, base).into_bytes())
+pub fn native_decimal_base_conversion(value: i64, base: u32) -> Option<NativeBaseConversion> {
+    if !matches!(base, 2 | 8 | 16) {
+        return None;
+    }
+    let value = value as u64 as u128;
+    Some(NativeBaseConversion {
+        value: NativeBaseConversionValue::Integer(value),
+        base,
+        output_length: u128_base_output_length(value, base),
+    })
 }
 
 fn unary_float_builtin(
@@ -288,14 +350,18 @@ fn parse_base_number(
             ignored_invalid_characters = true;
             continue;
         }
-        float_value = (float_value * f64::from(base)) + f64::from(digit);
-        if !overflowed {
-            match int_value
-                .checked_mul(u128::from(base))
-                .and_then(|value| value.checked_add(u128::from(digit)))
-            {
-                Some(value) => int_value = value,
-                None => overflowed = true,
+        if overflowed {
+            float_value = (float_value * f64::from(base)) + f64::from(digit);
+            continue;
+        }
+        let next = int_value
+            .checked_mul(u128::from(base))
+            .and_then(|value| value.checked_add(u128::from(digit)));
+        match next {
+            Some(value) if value <= i64::MAX as u128 => int_value = value,
+            _ => {
+                float_value = (int_value as f64 * f64::from(base)) + f64::from(digit);
+                overflowed = true;
             }
         }
     }
@@ -349,20 +415,86 @@ fn format_u128_base(mut value: u128, base: u32) -> String {
     String::from_utf8(output).expect("base digits are ascii")
 }
 
-fn format_f64_base(mut value: f64, base: u32) -> String {
-    if !value.is_finite() || value <= 0.0 {
+fn u128_base_output_length(mut value: u128, base: u32) -> usize {
+    if value == 0 {
+        return 1;
+    }
+    let mut length = 0;
+    while value > 0 {
+        length += 1;
+        value /= u128::from(base);
+    }
+    length
+}
+
+fn write_u128_base_into(mut value: u128, base: u32, output: &mut [u8]) -> bool {
+    if output.len() != u128_base_output_length(value, base) {
+        return false;
+    }
+    if value == 0 {
+        output[0] = b'0';
+        return true;
+    }
+    for slot in output.iter_mut().rev() {
+        let digit = (value % u128::from(base)) as usize;
+        *slot = DIGITS[digit];
+        value /= u128::from(base);
+    }
+    value == 0
+}
+
+fn format_f64_base(value: f64, base: u32) -> String {
+    if !value.is_finite() {
         return "0".to_owned();
     }
+    let mut value = value.floor();
     let base_f64 = f64::from(base);
     let mut output = Vec::new();
-    while value >= 1.0 && output.len() < 4096 {
-        let next = (value / base_f64).floor();
-        let digit = (value - (next * base_f64)).round().clamp(0.0, 35.0) as usize;
+    loop {
+        let digit = (value % base_f64) as usize;
         output.push(DIGITS[digit]);
-        value = next;
+        value /= base_f64;
+        if output.len() == 64 || value.abs() < 1.0 {
+            break;
+        }
     }
     output.reverse();
     String::from_utf8(output).expect("base digits are ascii")
+}
+
+fn f64_base_output_length(value: f64, base: u32) -> usize {
+    if !value.is_finite() {
+        return 1;
+    }
+    let mut value = value.floor();
+    let base_f64 = f64::from(base);
+    let mut length = 0_usize;
+    loop {
+        length += 1;
+        value /= base_f64;
+        if length == 64 || value.abs() < 1.0 {
+            break;
+        }
+    }
+    length
+}
+
+fn write_f64_base_into(value: f64, base: u32, output: &mut [u8]) -> bool {
+    if output.len() != f64_base_output_length(value, base) {
+        return false;
+    }
+    if !value.is_finite() {
+        output[0] = b'0';
+        return true;
+    }
+    let mut value = value.floor();
+    let base_f64 = f64::from(base);
+    for slot in output.iter_mut().rev() {
+        let digit = (value % base_f64) as usize;
+        *slot = DIGITS[digit];
+        value /= base_f64;
+    }
+    output.len() == 64 || value.abs() < 1.0
 }
 
 fn parsed_base_as_value(parsed: ParsedBaseNumber) -> Value {
@@ -747,40 +879,134 @@ fn number_format_float_units(value: f64, decimals: usize) -> Option<u128> {
     Some(rounded as u128)
 }
 
-fn number_format_rounded_integer_digits(
-    value: &Value,
+fn native_number_format_rounded_integer_digits(
+    value: &NativePrintfScalar<'_>,
     decimals: i64,
-) -> Result<String, BuiltinError> {
+) -> Option<String> {
     let places = decimals.unsigned_abs() as usize;
     let Some(scale) = pow10_u128(places) else {
-        return Ok("0".to_owned());
+        return Some("0".to_owned());
     };
-    match deref_value(value) {
-        Value::Int(int) => {
-            let absolute = i128::from(int).unsigned_abs();
-            Ok((((absolute + (scale / 2)) / scale) * scale).to_string())
+    match value {
+        NativePrintfScalar::Int(value) => {
+            let absolute = i128::from(*value).unsigned_abs();
+            Some((((absolute + (scale / 2)) / scale) * scale).to_string())
         }
-        other => {
-            let raw_number = numeric_f64_arg("number_format", &other)?;
+        NativePrintfScalar::Float(raw_number) => {
             let number = raw_number.abs();
             if !number.is_finite() {
-                return Ok("0".to_owned());
+                return Some("0".to_owned());
             }
             if (raw_number.is_sign_negative() || number < 9_223_372_036_854_775_808.0)
                 && number.fract() == 0.0
                 && (0.0..=(u128::MAX as f64)).contains(&number)
             {
                 let absolute = number as u128;
-                return Ok((((absolute + (scale / 2)) / scale) * scale).to_string());
+                return Some((((absolute + (scale / 2)) / scale) * scale).to_string());
             }
             let scale_f64 = scale as f64;
             let rounded = ((number / scale_f64) + 0.5).floor() * scale_f64;
             if !rounded.is_finite() || rounded == 0.0 {
-                return Ok("0".to_owned());
+                return Some("0".to_owned());
             }
-            Ok(format!("{rounded:.0}"))
+            Some(format!("{rounded:.0}"))
+        }
+        NativePrintfScalar::Null | NativePrintfScalar::Bool(_) | NativePrintfScalar::String(_) => {
+            None
         }
     }
+}
+
+/// Formats one already-coerced native numeric scalar without constructing a
+/// runtime `Value`. Separators remain byte strings until this PHP-compatible
+/// formatting boundary applies the same lossy conversion as the baseline
+/// implementation.
+#[doc(hidden)]
+pub fn native_number_format(
+    value: NativePrintfScalar<'_>,
+    decimals: i64,
+    decimal_separator: &[u8],
+    thousands_separator: &[u8],
+) -> Option<Vec<u8>> {
+    let decimal_separator = String::from_utf8_lossy(decimal_separator);
+    let thousands_separator = String::from_utf8_lossy(thousands_separator);
+    let sign_negative = match value {
+        NativePrintfScalar::Int(value) => value < 0,
+        NativePrintfScalar::Float(value) => value.is_sign_negative(),
+        NativePrintfScalar::Null | NativePrintfScalar::Bool(_) | NativePrintfScalar::String(_) => {
+            return None;
+        }
+    };
+    let mut grouped = if decimals < 0 {
+        let digits = native_number_format_rounded_integer_digits(&value, decimals)?;
+        group_decimal_integer(&digits, &thousands_separator)
+    } else {
+        let decimals = decimals as usize;
+        match value {
+            NativePrintfScalar::Int(value) => {
+                if let Some(scale) = pow10_u128(decimals)
+                    && let Some(units) = i128::from(value).unsigned_abs().checked_mul(scale)
+                {
+                    format_number_format_parts(
+                        units,
+                        decimals,
+                        &decimal_separator,
+                        &thousands_separator,
+                    )
+                } else {
+                    let rounded = format!("{:.*}", decimals, (value as f64).abs());
+                    let (integer, fraction) = rounded.split_once('.').unwrap_or((&rounded, ""));
+                    let mut grouped = group_decimal_integer(integer, &thousands_separator);
+                    if decimals > 0 {
+                        grouped.push_str(&decimal_separator);
+                        grouped.push_str(fraction);
+                    }
+                    grouped
+                }
+            }
+            NativePrintfScalar::Float(value) if decimals <= 18 => {
+                match number_format_float_units(value, decimals) {
+                    Some(units) => format_number_format_parts(
+                        units,
+                        decimals,
+                        &decimal_separator,
+                        &thousands_separator,
+                    ),
+                    None => {
+                        let rounded = format!("{:.*}", decimals, value.abs());
+                        let (integer, fraction) = rounded.split_once('.').unwrap_or((&rounded, ""));
+                        let mut grouped = group_decimal_integer(integer, &thousands_separator);
+                        if decimals > 0 {
+                            grouped.push_str(&decimal_separator);
+                            grouped.push_str(fraction);
+                        }
+                        grouped
+                    }
+                }
+            }
+            NativePrintfScalar::Float(value) => {
+                let rounded = format!("{:.*}", decimals, value.abs());
+                let (integer, fraction) = rounded.split_once('.').unwrap_or((&rounded, ""));
+                let mut grouped = group_decimal_integer(integer, &thousands_separator);
+                if decimals > 0 {
+                    grouped.push_str(&decimal_separator);
+                    grouped.push_str(fraction);
+                }
+                grouped
+            }
+            NativePrintfScalar::Null
+            | NativePrintfScalar::Bool(_)
+            | NativePrintfScalar::String(_) => return None,
+        }
+    };
+    if sign_negative
+        && grouped
+            .bytes()
+            .any(|byte| byte.is_ascii_digit() && byte != b'0')
+    {
+        grouped.insert(0, '-');
+    }
+    Some(grouped.into_bytes())
 }
 
 pub(in crate::builtins::modules) fn builtin_abs(
@@ -1301,109 +1527,45 @@ pub(in crate::builtins::modules) fn builtin_number_format(
         .unwrap_or(0);
     let decimal_separator = number_format_separator(args.get(2), ".")?;
     let thousands_separator = number_format_separator(args.get(3), ",")?;
-    let decimal_separator = decimal_separator.to_string_lossy();
-    let thousands_separator = thousands_separator.to_string_lossy();
-    let sign_negative = match deref_value(&args[0]) {
-        Value::Int(value) => value < 0,
-        Value::Float(value) => value.to_f64().is_sign_negative(),
-        other => numeric_f64_arg("number_format", &other)?.is_sign_negative(),
+    let number = match deref_value(&args[0]) {
+        Value::Int(value) => NativePrintfScalar::Int(value),
+        Value::Float(value) => NativePrintfScalar::Float(value.to_f64()),
+        other => NativePrintfScalar::Float(numeric_f64_arg("number_format", &other)?),
     };
-
-    let mut grouped = if decimals < 0 {
-        let digits = number_format_rounded_integer_digits(&args[0], decimals)?;
-        group_decimal_integer(&digits, &thousands_separator)
-    } else {
-        let decimals = decimals as usize;
-        match deref_value(&args[0]) {
-            Value::Int(value) => {
-                if let Some(scale) = pow10_u128(decimals)
-                    && let Some(units) = i128::from(value).unsigned_abs().checked_mul(scale)
-                {
-                    format_number_format_parts(
-                        units,
-                        decimals,
-                        &decimal_separator,
-                        &thousands_separator,
-                    )
-                } else {
-                    let rounded = format!("{:.*}", decimals, (value as f64).abs());
-                    let (integer, fraction) = rounded.split_once('.').unwrap_or((&rounded, ""));
-                    let mut grouped = group_decimal_integer(integer, &thousands_separator);
-                    if decimals > 0 {
-                        grouped.push_str(&decimal_separator);
-                        grouped.push_str(fraction);
-                    }
-                    grouped
-                }
-            }
-            other if decimals <= 18 => {
-                let value = numeric_f64_arg("number_format", &other)?;
-                match number_format_float_units(value, decimals) {
-                    Some(units) => format_number_format_parts(
-                        units,
-                        decimals,
-                        &decimal_separator,
-                        &thousands_separator,
-                    ),
-                    None => {
-                        let rounded = format!("{:.*}", decimals, value.abs());
-                        let (integer, fraction) = rounded.split_once('.').unwrap_or((&rounded, ""));
-                        let mut grouped = group_decimal_integer(integer, &thousands_separator);
-                        if decimals > 0 {
-                            grouped.push_str(&decimal_separator);
-                            grouped.push_str(fraction);
-                        }
-                        grouped
-                    }
-                }
-            }
-            other => {
-                let value = numeric_f64_arg("number_format", &other)?;
-                let rounded = format!("{:.*}", decimals, value.abs());
-                let (integer, fraction) = rounded.split_once('.').unwrap_or((&rounded, ""));
-                let mut grouped = group_decimal_integer(integer, &thousands_separator);
-                if decimals > 0 {
-                    grouped.push_str(&decimal_separator);
-                    grouped.push_str(fraction);
-                }
-                grouped
-            }
-        }
-    };
-    if sign_negative
-        && grouped
-            .bytes()
-            .any(|byte| byte.is_ascii_digit() && byte != b'0')
-    {
-        grouped.insert(0, '-');
-    }
-    Ok(Value::string(grouped))
+    let formatted = native_number_format(
+        number,
+        decimals,
+        decimal_separator.as_bytes(),
+        thousands_separator.as_bytes(),
+    )
+    .expect("baseline number_format coerced its numeric scalar");
+    Ok(Value::string(formatted))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeParsedBaseNumber, native_base_convert, native_decimal_to_base,
-        native_parse_base_digits, native_round_f64, number_format_rounded_integer_digits,
+        NativeParsedBaseNumber, native_base_conversion, native_decimal_base_conversion,
+        native_number_format_rounded_integer_digits, native_parse_base_digits, native_round_f64,
     };
-    use crate::Value;
+    use crate::builtins::modules::core::NativePrintfScalar;
 
     #[test]
     fn native_base_conversion_family_preserves_php_numeric_shapes() {
-        assert_eq!(
-            native_base_convert(b"ff", 16, 2),
-            Some(b"11111111".to_vec())
-        );
+        let binary = native_base_conversion(b"ff", 16, 2).expect("valid conversion");
+        let mut binary_output = vec![0; binary.output_length()];
+        assert!(binary.write_into(&mut binary_output));
+        assert_eq!(binary_output, b"11111111");
         assert_eq!(
             native_parse_base_digits(b"101010", 2),
             Some(NativeParsedBaseNumber::Int(42))
         );
-        assert_eq!(
-            native_decimal_to_base(-1, 16),
-            Some(b"ffffffffffffffff".to_vec())
-        );
+        let hexadecimal = native_decimal_base_conversion(-1, 16).expect("valid decimal conversion");
+        let mut hexadecimal_output = vec![0; hexadecimal.output_length()];
+        assert!(hexadecimal.write_into(&mut hexadecimal_output));
+        assert_eq!(hexadecimal_output, b"ffffffffffffffff");
         assert_eq!(native_parse_base_digits(b"10x1", 2), None);
-        assert_eq!(native_base_convert(b"10", 1, 10), None);
+        assert!(native_base_conversion(b"10", 1, 10).is_none());
     }
 
     #[test]
@@ -1431,28 +1593,43 @@ mod tests {
     #[test]
     fn number_format_negative_precision_matches_large_negative_float_quirk() {
         assert_eq!(
-            number_format_rounded_integer_digits(&Value::float(9_223_372_036_854_775_808.0), -5)
-                .unwrap(),
+            native_number_format_rounded_integer_digits(
+                &NativePrintfScalar::Float(9_223_372_036_854_775_808.0),
+                -5,
+            )
+            .unwrap(),
             "9223372036854800384"
         );
         assert_eq!(
-            number_format_rounded_integer_digits(&Value::float(9_223_372_036_854_774_784.0), -5)
-                .unwrap(),
+            native_number_format_rounded_integer_digits(
+                &NativePrintfScalar::Float(9_223_372_036_854_774_784.0),
+                -5,
+            )
+            .unwrap(),
             "9223372036854800000"
         );
         assert_eq!(
-            number_format_rounded_integer_digits(&Value::float(9_223_372_036_854_774_784.0), -1)
-                .unwrap(),
+            native_number_format_rounded_integer_digits(
+                &NativePrintfScalar::Float(9_223_372_036_854_774_784.0),
+                -1,
+            )
+            .unwrap(),
             "9223372036854774780"
         );
         assert_eq!(
-            number_format_rounded_integer_digits(&Value::float(-9_223_372_036_854_775_808.0), -5)
-                .unwrap(),
+            native_number_format_rounded_integer_digits(
+                &NativePrintfScalar::Float(-9_223_372_036_854_775_808.0),
+                -5,
+            )
+            .unwrap(),
             "9223372036854800000"
         );
         assert_eq!(
-            number_format_rounded_integer_digits(&Value::float(-9_223_372_036_854_775_808.0), -1)
-                .unwrap(),
+            native_number_format_rounded_integer_digits(
+                &NativePrintfScalar::Float(-9_223_372_036_854_775_808.0),
+                -1,
+            )
+            .unwrap(),
             "9223372036854775810"
         );
     }

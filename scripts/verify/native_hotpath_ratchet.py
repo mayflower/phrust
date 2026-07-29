@@ -264,7 +264,7 @@ def run_generated_code_fixtures(failures: list[str]) -> None:
         ROOT / "crates/php_jit/src/abi.rs",
         ROOT / "crates/php_jit/src/cranelift_lowering.rs",
         ROOT / "crates/php_vm/src/vm/jit_abi.rs",
-        ROOT / "crates/php_vm/src/vm/jit_abi/runtime_ops.rs",
+        ROOT / "crates/php_vm/src/vm/jit_abi/exact_runtime_ops.rs",
     )
     combined = "\n".join(path.read_text(encoding="utf-8") for path in sources)
     for symbol in deleted_warm_cache_symbols:
@@ -323,8 +323,8 @@ def run_generated_code_fixtures(failures: list[str]) -> None:
         ROOT / "crates/php_jit/src/cranelift_lowering.rs",
         ROOT / "crates/php_jit/src/cranelift_lowering/executable_region.rs",
         ROOT / "crates/php_vm/src/vm/jit_abi.rs",
-        ROOT / "crates/php_vm/src/vm/jit_abi/call_dispatch.rs",
-        ROOT / "crates/php_vm/src/vm/jit_abi/native_builtins.rs",
+        ROOT / "crates/php_vm/src/vm/jit_abi/exact_call_dispatch.rs",
+        ROOT / "crates/php_vm/src/vm/jit_abi/exact_runtime_ops.rs",
     )
     production = "\n".join(
         path.read_text(encoding="utf-8") for path in production_sources

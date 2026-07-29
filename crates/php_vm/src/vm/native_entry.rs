@@ -68,12 +68,17 @@ impl VmWorkerState {
                     )
                 })?;
             baseline.store(address, std::sync::atomic::Ordering::Release);
-            let _ = preferred.compare_exchange(
-                0,
-                address,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            );
+            if preferred
+                .compare_exchange(
+                    0,
+                    address,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                unit.publish_preferred_function_metadata(function, handle);
+            }
             self.prepare_native_direct_callees(unit, handle, options, external_signatures)?;
             return Ok(());
         }
@@ -108,6 +113,7 @@ impl VmWorkerState {
                     function.raw()
                 )
             })?;
+        unit.publish_preferred_function_metadata(function, handle);
         preferred.store(address, std::sync::atomic::Ordering::Release);
         Ok(())
     }
@@ -164,7 +170,7 @@ impl Vm {
             runtime,
             |types, value| {
                 let class = context
-                    .decode_result(value)
+                    .materialize_outer_result(value)
                     .ok()
                     .and_then(super::native_exception_fields)
                     .map(|(class, _, _)| class);
@@ -180,7 +186,8 @@ impl Vm {
                 })
             },
         );
-        let outcome = super::jit_abi::resume_native_optimizing_exit(&mut context, outcome);
+        let outcome =
+            super::jit_abi::resume_native_optimizing_exit(&mut context, handle.clone(), outcome);
         let (exception_handled, exception_handler_error) = match &outcome {
             Ok(php_jit::JitI64InvokeOutcome::SideExit { status, value, .. })
                 if *status == php_jit::JitCallStatus::THROW.0 as i32 =>
@@ -245,7 +252,7 @@ impl Vm {
         } else {
             match outcome {
                 Ok(php_jit::JitI64InvokeOutcome::Returned(encoded)) => {
-                    match context.decode_result(encoded) {
+                    match context.materialize_outer_result(encoded) {
                         Ok(value) => {
                             let mut result =
                                 VmResult::success(std::mem::take(&mut context.output), Some(value));
@@ -262,7 +269,7 @@ impl Vm {
                 Ok(php_jit::JitI64InvokeOutcome::SideExit { status, value, .. })
                     if status == php_jit::JitCallStatus::EXIT.0 as i32 =>
                 {
-                    let exit_code = match context.decode_result(value) {
+                    let exit_code = match context.materialize_outer_result(value) {
                         Ok(php_runtime::api::Value::String(value)) => {
                             context.output.write_bytes(value.as_bytes());
                             0
@@ -278,7 +285,7 @@ impl Vm {
                 Ok(php_jit::JitI64InvokeOutcome::SideExit { status, value, .. })
                     if status == php_jit::JitCallStatus::THROW.0 as i32 =>
                 {
-                    let throwable = context.decode_result(value).ok();
+                    let throwable = context.materialize_outer_result(value).ok();
                     super::native_uncaught_throwable_result(
                         std::mem::take(&mut context.output),
                         throwable,

@@ -8,7 +8,7 @@
 ///
 /// Increment this whenever serialized cache identity or lowering semantics can
 /// no longer be shared with code produced from an earlier Region IR shape.
-pub const REGION_IR_SCHEMA_VERSION: u32 = 22;
+pub const REGION_IR_SCHEMA_VERSION: u32 = 25;
 
 mod bind;
 mod builder;
@@ -44,14 +44,14 @@ pub use dump::dump_region_graph;
 pub(crate) use executable::native_function_parameter_locals;
 pub use executable::{
     BaselineRegionBuilder, CompileMetadata, NativeCompileError, NativeCompilerTier,
-    RegionArrayCallbackCall, RegionArrayCallbackOperation, RegionBinaryOp, RegionBlock,
-    RegionCallResult, RegionCallTarget, RegionCastOp, RegionCompareOpCode,
-    RegionDeclarationMetadata, RegionExceptionRegion, RegionGraph, RegionInstruction,
-    RegionInstructionKind, RegionMethodIdentity, RegionNativeCall, RegionNativeClosureCapture,
-    RegionNativeControl, RegionNativeDynamicCode, RegionNativeSuspend, RegionOperand,
-    RegionOsrEntryPoint, RegionStableCallback, RegionTerminator, RegionUnaryOp,
-    build_baseline_region, native_closure_bound_this_local,
-    native_continuation_capacity_upper_bound,
+    RegionArrayCallbackCall, RegionArrayCallbackOperation, RegionArrayCallbackTarget,
+    RegionBinaryOp, RegionBlock, RegionCallResult, RegionCallTarget, RegionCastOp,
+    RegionCompareOpCode, RegionDeclarationMetadata, RegionExceptionRegion, RegionGraph,
+    RegionInstruction, RegionInstructionKind, RegionMethodIdentity, RegionNativeCall,
+    RegionNativeClosureCapture, RegionNativeControl, RegionNativeDynamicCode, RegionNativeSuspend,
+    RegionOperand, RegionOsrEntryPoint, RegionPregCallbackArrayCall, RegionPregCallbackArrayEntry,
+    RegionStableCallback, RegionTerminator, RegionUnaryOp, build_baseline_region,
+    native_closure_bound_this_local, native_continuation_capacity_upper_bound,
 };
 pub use ids::{ConstId, EntryId, ExitId, NodeId, RegionId, SnapshotId, VmSlotId};
 pub use node::{

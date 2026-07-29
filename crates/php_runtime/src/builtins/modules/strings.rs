@@ -580,7 +580,7 @@ pub(in crate::builtins::modules) fn builtin_strtr(
             replacements.push((key, string_arg("strtr", value)?.into_bytes()));
         }
         replacements.sort_by_key(|(key, _)| std::cmp::Reverse(key.len()));
-        subject = replace_map(&subject, &replacements);
+        subject = native_strtr_map(&subject, &replacements);
         return Ok(Value::string(subject));
     }
     expect_arity("strtr", &args, 3)?;
@@ -593,25 +593,43 @@ pub(in crate::builtins::modules) fn builtin_strtr(
         span.clone(),
     )?;
     let to = strtr_string_arg(context, &args[2], "#3 ($to)", "string", span)?;
-    Ok(Value::string(native_strtr(
+    Ok(Value::string(baseline_strtr(
         subject.as_bytes(),
         from.as_bytes(),
         to.as_bytes(),
     )))
 }
 
-/// Applies PHP's three-string `strtr` byte translation without `Value`
-/// materialization.
-pub fn native_strtr(subject: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
-    let mut subject = subject.to_vec();
-    for byte in &mut subject {
-        if let Some(index) = from.iter().take(to.len()).rposition(|from| from == byte)
+pub fn native_strtr_into(subject: &[u8], from: &[u8], to: &[u8], output: &mut [u8]) -> bool {
+    if output.len() != subject.len() {
+        return false;
+    }
+    for (byte, output) in subject.iter().copied().zip(output.iter_mut()) {
+        *output = if let Some(index) = from.iter().take(to.len()).rposition(|from| *from == byte)
             && let Some(replacement) = to.get(index)
         {
-            *byte = *replacement;
-        }
+            *replacement
+        } else {
+            byte
+        };
     }
-    subject
+    true
+}
+
+fn baseline_strtr(subject: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let mut output = vec![0; subject.len()];
+    debug_assert!(native_strtr_into(subject, from, to, &mut output));
+    output
+}
+
+/// Applies PHP's longest-key-first replacement-map form of `strtr` to
+/// authoritative native byte pairs.
+pub fn native_strtr_map<K, V>(subject: &[u8], replacements: &[(K, V)]) -> Vec<u8>
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+{
+    replace_map(subject, replacements)
 }
 
 pub(in crate::builtins::modules) fn builtin_strip_tags(
@@ -624,7 +642,7 @@ pub(in crate::builtins::modules) fn builtin_strip_tags(
     }
     let input = string_arg("strip_tags", &args[0])?;
     let allowed = args.get(1).map(allowed_strip_tags_arg).transpose()?;
-    Ok(Value::string(native_strip_tags(
+    Ok(Value::string(baseline_strip_tags(
         input.as_bytes(),
         allowed.as_deref(),
     )))
@@ -632,7 +650,7 @@ pub(in crate::builtins::modules) fn builtin_strip_tags(
 
 /// Removes PHP/HTML tags from native bytes. Allowed-tag syntax is normalized
 /// to ASCII lowercase before the shared scanner consumes it.
-pub fn native_strip_tags(input: &[u8], allowed: Option<&[u8]>) -> Vec<u8> {
+fn baseline_strip_tags(input: &[u8], allowed: Option<&[u8]>) -> Vec<u8> {
     let allowed = allowed.map(lower_ascii_bytes);
     strip_tags_bytes(input, allowed.as_deref())
 }
@@ -724,26 +742,36 @@ pub(in crate::builtins::modules) fn builtin_ucwords(
         .get(1)
         .map(|value| string_arg("ucwords", value))
         .transpose()?;
-    Ok(Value::string(native_ucwords(
+    Ok(Value::string(baseline_ucwords(
         input.as_bytes(),
         delimiters.as_ref().map(crate::PhpString::as_bytes),
     )))
 }
 
-/// Uppercases word-initial ASCII bytes using PHP's byte delimiter rules.
-pub fn native_ucwords(input: &[u8], delimiters: Option<&[u8]>) -> Vec<u8> {
-    let mut bytes = input.to_vec();
+pub fn native_ucwords_into(input: &[u8], delimiters: Option<&[u8]>, output: &mut [u8]) -> bool {
+    if output.len() != input.len() {
+        return false;
+    }
     let delimiters = delimiters.unwrap_or(b" \t\r\n\x0c\x0b");
     let mut at_word_start = true;
-    for byte in &mut bytes {
-        if delimiters.contains(byte) {
+    for (byte, output) in input.iter().copied().zip(output.iter_mut()) {
+        if delimiters.contains(&byte) {
+            *output = byte;
             at_word_start = true;
         } else if at_word_start {
-            *byte = byte.to_ascii_uppercase();
+            *output = byte.to_ascii_uppercase();
             at_word_start = false;
+        } else {
+            *output = byte;
         }
     }
-    bytes
+    true
+}
+
+fn baseline_ucwords(input: &[u8], delimiters: Option<&[u8]>) -> Vec<u8> {
+    let mut output = vec![0; input.len()];
+    debug_assert!(native_ucwords_into(input, delimiters, &mut output));
+    output
 }
 
 pub(in crate::builtins::modules) fn builtin_str_repeat(
@@ -825,7 +853,7 @@ pub(in crate::builtins::modules) fn builtin_str_pad(
         .map(|value| int_arg("str_pad", value))
         .transpose()?
         .unwrap_or(1);
-    Ok(Value::string(native_str_pad(
+    Ok(Value::string(baseline_str_pad(
         input.as_bytes(),
         length as usize,
         pad.as_bytes(),
@@ -833,10 +861,26 @@ pub(in crate::builtins::modules) fn builtin_str_pad(
     )))
 }
 
-/// Pads one native byte string to the requested PHP byte length.
-pub fn native_str_pad(input: &[u8], target: usize, pad: &[u8], pad_type: i64) -> Vec<u8> {
+pub fn native_str_pad_output_length(input: &[u8], target: usize, pad: &[u8]) -> Option<usize> {
+    if pad.is_empty() {
+        return None;
+    }
+    Some(input.len().max(target))
+}
+
+pub fn native_str_pad_into(
+    input: &[u8],
+    target: usize,
+    pad: &[u8],
+    pad_type: i64,
+    output: &mut [u8],
+) -> bool {
+    if native_str_pad_output_length(input, target, pad) != Some(output.len()) {
+        return false;
+    }
     if input.len() >= target {
-        return input.to_vec();
+        output.copy_from_slice(input);
+        return true;
     }
     let needed = target - input.len();
     let (left, right) = match pad_type {
@@ -844,9 +888,31 @@ pub fn native_str_pad(input: &[u8], target: usize, pad: &[u8], pad_type: i64) ->
         2 => (needed / 2, needed - (needed / 2)),
         _ => (0, needed),
     };
-    let mut output = repeat_pad(pad, left);
-    output.extend_from_slice(input);
-    output.extend_from_slice(&repeat_pad(pad, right));
+    for (index, slot) in output[..left].iter_mut().enumerate() {
+        *slot = pad[index % pad.len()];
+    }
+    output[left..left + input.len()].copy_from_slice(input);
+    for (index, slot) in output[left + input.len()..left + input.len() + right]
+        .iter_mut()
+        .enumerate()
+    {
+        *slot = pad[index % pad.len()];
+    }
+    true
+}
+
+fn baseline_str_pad(input: &[u8], target: usize, pad: &[u8], pad_type: i64) -> Vec<u8> {
+    let Some(length) = native_str_pad_output_length(input, target, pad) else {
+        return Vec::new();
+    };
+    let mut output = vec![0; length];
+    debug_assert!(native_str_pad_into(
+        input,
+        target,
+        pad,
+        pad_type,
+        &mut output
+    ));
     output
 }
 
@@ -868,25 +934,50 @@ pub(in crate::builtins::modules) fn builtin_quotemeta(
 ) -> BuiltinResult {
     expect_arity("quotemeta", &args, 1)?;
     let input = string_arg("quotemeta", &args[0])?;
-    Ok(Value::string(native_quotemeta(input.as_bytes())))
+    Ok(Value::string(baseline_quotemeta(input.as_bytes())))
 }
 
-/// Escapes the byte metacharacters recognized by PHP's `quotemeta`.
-///
-/// This pure byte-oriented entry is shared by the baseline builtin and the
-/// exact optimizing handler so the latter never constructs a Rust `Value`.
-pub fn native_quotemeta(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    for &byte in input {
-        if matches!(
-            byte,
-            b'.' | b'\\' | b'+' | b'*' | b'?' | b'[' | b'^' | b']' | b'$' | b'(' | b')'
-        ) {
-            out.push(b'\\');
-        }
-        out.push(byte);
+fn is_quotemeta_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'.' | b'\\' | b'+' | b'*' | b'?' | b'[' | b'^' | b']' | b'$' | b'(' | b')'
+    )
+}
+
+/// Exact output length for a `quotemeta()` native string.
+pub fn native_quotemeta_output_length(input: &[u8]) -> Option<usize> {
+    input.len().checked_add(
+        input
+            .iter()
+            .filter(|byte| is_quotemeta_byte(**byte))
+            .count(),
+    )
+}
+
+/// Writes `quotemeta()` bytes directly into an already reserved native range.
+pub fn native_quotemeta_into(input: &[u8], output: &mut [u8]) -> bool {
+    if native_quotemeta_output_length(input) != Some(output.len()) {
+        return false;
     }
-    out
+    let mut cursor = 0;
+    for &byte in input {
+        if is_quotemeta_byte(byte) {
+            output[cursor] = b'\\';
+            cursor += 1;
+        }
+        output[cursor] = byte;
+        cursor += 1;
+    }
+    true
+}
+
+fn baseline_quotemeta(input: &[u8]) -> Vec<u8> {
+    let Some(length) = native_quotemeta_output_length(input) else {
+        return Vec::new();
+    };
+    let mut output = vec![0; length];
+    debug_assert!(native_quotemeta_into(input, &mut output));
+    output
 }
 
 pub(in crate::builtins::modules) fn builtin_bin2hex(
@@ -895,13 +986,36 @@ pub(in crate::builtins::modules) fn builtin_bin2hex(
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("bin2hex", &args, 1)?;
-    Ok(Value::string(native_bin2hex(
+    Ok(Value::string(baseline_bin2hex(
         string_arg("bin2hex", &args[0])?.as_bytes(),
     )))
 }
 
-pub fn native_bin2hex(input: &[u8]) -> Vec<u8> {
-    hex_encode(input)
+/// Exact output length for hexadecimal encoding.
+pub fn native_bin2hex_output_length(input: &[u8]) -> Option<usize> {
+    input.len().checked_mul(2)
+}
+
+/// Writes lower-case hexadecimal bytes directly into a native string range.
+pub fn native_bin2hex_into(input: &[u8], output: &mut [u8]) -> bool {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    if native_bin2hex_output_length(input) != Some(output.len()) {
+        return false;
+    }
+    for (byte, pair) in input.iter().zip(output.chunks_exact_mut(2)) {
+        pair[0] = HEX[(byte >> 4) as usize];
+        pair[1] = HEX[(byte & 0x0f) as usize];
+    }
+    true
+}
+
+fn baseline_bin2hex(input: &[u8]) -> Vec<u8> {
+    let Some(length) = native_bin2hex_output_length(input) else {
+        return Vec::new();
+    };
+    let mut output = vec![0; length];
+    debug_assert!(native_bin2hex_into(input, &mut output));
+    output
 }
 
 pub(in crate::builtins::modules) fn builtin_hex2bin(
@@ -931,15 +1045,36 @@ pub(in crate::builtins::modules) fn builtin_hex2bin(
         );
         return Ok(Value::Bool(false));
     }
-    native_hex2bin(input.as_bytes())
+    baseline_hex2bin(input.as_bytes())
         .map_or(Ok(Value::Bool(false)), |bytes| Ok(Value::string(bytes)))
 }
 
-pub fn native_hex2bin(input: &[u8]) -> Option<Vec<u8>> {
+/// Validates hexadecimal input and returns its exact decoded length.
+pub fn native_hex2bin_output_length(input: &[u8]) -> Option<usize> {
     if !input.len().is_multiple_of(2) || input.iter().any(|byte| hex_nibble(*byte).is_none()) {
         return None;
     }
-    hex_decode(input)
+    Some(input.len() / 2)
+}
+
+/// Decodes validated hexadecimal input directly into a native string range.
+pub fn native_hex2bin_into(input: &[u8], output: &mut [u8]) -> bool {
+    if native_hex2bin_output_length(input) != Some(output.len()) {
+        return false;
+    }
+    for (pair, byte) in input.chunks_exact(2).zip(output) {
+        let (Some(high), Some(low)) = (hex_nibble(pair[0]), hex_nibble(pair[1])) else {
+            return false;
+        };
+        *byte = (high << 4) | low;
+    }
+    true
+}
+
+fn baseline_hex2bin(input: &[u8]) -> Option<Vec<u8>> {
+    let length = native_hex2bin_output_length(input)?;
+    let mut output = vec![0; length];
+    native_hex2bin_into(input, &mut output).then_some(output)
 }
 
 pub(in crate::builtins::modules) fn builtin_quoted_printable_decode(
@@ -949,13 +1084,13 @@ pub(in crate::builtins::modules) fn builtin_quoted_printable_decode(
 ) -> BuiltinResult {
     expect_arity("quoted_printable_decode", &args, 1)?;
     let input = string_arg("quoted_printable_decode", &args[0])?;
-    Ok(Value::string(native_quoted_printable_decode(
+    Ok(Value::string(baseline_quoted_printable_decode(
         input.as_bytes(),
     )))
 }
 
-pub fn native_quoted_printable_decode(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
+fn visit_quoted_printable_decoded(bytes: &[u8], mut emit: impl FnMut(u8)) -> usize {
+    let mut length = 0;
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'=' {
@@ -971,15 +1106,41 @@ pub fn native_quoted_printable_decode(bytes: &[u8]) -> Vec<u8> {
                 && let (Some(high), Some(low)) =
                     (hex_nibble(bytes[index + 1]), hex_nibble(bytes[index + 2]))
             {
-                out.push((high << 4) | low);
+                emit((high << 4) | low);
+                length += 1;
                 index += 3;
                 continue;
             }
         }
-        out.push(bytes[index]);
+        emit(bytes[index]);
+        length += 1;
         index += 1;
     }
-    out
+    length
+}
+
+/// Exact decoded length for `quoted_printable_decode()`.
+pub fn native_quoted_printable_decode_output_length(bytes: &[u8]) -> usize {
+    visit_quoted_printable_decoded(bytes, |_| {})
+}
+
+/// Decodes quoted-printable bytes directly into a native string range.
+pub fn native_quoted_printable_decode_into(bytes: &[u8], output: &mut [u8]) -> bool {
+    if native_quoted_printable_decode_output_length(bytes) != output.len() {
+        return false;
+    }
+    let mut cursor = 0;
+    let length = visit_quoted_printable_decoded(bytes, |byte| {
+        output[cursor] = byte;
+        cursor += 1;
+    });
+    length == output.len()
+}
+
+fn baseline_quoted_printable_decode(bytes: &[u8]) -> Vec<u8> {
+    let mut output = vec![0; native_quoted_printable_decode_output_length(bytes)];
+    debug_assert!(native_quoted_printable_decode_into(bytes, &mut output));
+    output
 }
 
 pub(in crate::builtins::modules) fn builtin_ord(
@@ -1005,6 +1166,250 @@ pub(in crate::builtins::modules) fn builtin_chr(
     expect_arity("chr", &args, 1)?;
     let value = int_arg("chr", &args[0])?.rem_euclid(256) as u8;
     Ok(Value::string(vec![value]))
+}
+
+/// Scalar payload requested by the exact native `pack()` format visitor.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NativePackArgument<'a> {
+    Int(i64),
+    String(&'a [u8]),
+}
+
+/// Visits one fully validated `pack()` result without constructing a runtime
+/// `Value` or an aggregate output vector. Callers run a validation/count pass
+/// before reserving visible storage, then a second pass that writes directly.
+#[doc(hidden)]
+pub fn visit_native_pack<'a>(
+    format: &[u8],
+    argument_count: usize,
+    mut argument: impl FnMut(usize) -> Option<NativePackArgument<'a>>,
+    mut emit: impl FnMut(&[u8]) -> Option<()>,
+) -> Option<usize> {
+    let specs = parse_pack_format(format, false).ok()?;
+    let mut argument_index = 0usize;
+    let mut output_length = 0usize;
+    for spec in specs {
+        match spec.code {
+            b'n' | b'v' => {
+                let count = if spec.count_all {
+                    argument_count.checked_sub(argument_index)?
+                } else {
+                    spec.count.unwrap_or(1)
+                };
+                for _ in 0..count {
+                    let NativePackArgument::Int(value) = argument(argument_index)? else {
+                        return None;
+                    };
+                    argument_index = argument_index.checked_add(1)?;
+                    let bytes = pack_u16_bytes(spec.code, value);
+                    emit(&bytes)?;
+                    output_length = output_length.checked_add(bytes.len())?;
+                }
+            }
+            b'l' | b'I' | b'V' => {
+                let count = if spec.count_all {
+                    argument_count.checked_sub(argument_index)?
+                } else {
+                    spec.count.unwrap_or(1)
+                };
+                for _ in 0..count {
+                    let NativePackArgument::Int(value) = argument(argument_index)? else {
+                        return None;
+                    };
+                    argument_index = argument_index.checked_add(1)?;
+                    let bytes = pack_u32_bytes(spec.code, value);
+                    emit(&bytes)?;
+                    output_length = output_length.checked_add(bytes.len())?;
+                }
+            }
+            b'h' | b'H' => {
+                let NativePackArgument::String(input) = argument(argument_index)? else {
+                    return None;
+                };
+                argument_index = argument_index.checked_add(1)?;
+                let count = if spec.count_all {
+                    input.len()
+                } else {
+                    spec.count.unwrap_or(1)
+                };
+                for index in (0..count).step_by(2) {
+                    let first = input.get(index).map_or(0, |byte| hex_pack_nibble(*byte));
+                    let second = if index + 1 < count {
+                        input
+                            .get(index + 1)
+                            .map_or(0, |byte| hex_pack_nibble(*byte))
+                    } else {
+                        0
+                    };
+                    let byte = if spec.code == b'H' {
+                        (first << 4) | second
+                    } else {
+                        (second << 4) | first
+                    };
+                    emit(std::slice::from_ref(&byte))?;
+                    output_length = output_length.checked_add(1)?;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(output_length)
+}
+
+/// Key description emitted by the exact native `unpack()` visitor.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeUnpackKey<'a> {
+    Int(i64),
+    String(&'a [u8]),
+    IndexedString(&'a [u8], usize),
+}
+
+/// Value description emitted by the exact native `unpack()` visitor.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeUnpackValue<'a> {
+    Int(i64),
+    Hex {
+        code: u8,
+        input: &'a [u8],
+        count: usize,
+    },
+}
+
+fn native_unpack_key<'a>(
+    spec: &'a PackFormatSpec,
+    index: usize,
+    next_numeric_key: &mut i64,
+    hex: bool,
+) -> Option<NativeUnpackKey<'a>> {
+    match spec.label.as_deref() {
+        Some(label) if !label.is_empty() && (hex || spec.count.unwrap_or(1) == 1) => {
+            Some(NativeUnpackKey::String(label))
+        }
+        Some(label) if !label.is_empty() => {
+            Some(NativeUnpackKey::IndexedString(label, index.checked_add(1)?))
+        }
+        _ => {
+            let key = *next_numeric_key;
+            *next_numeric_key = next_numeric_key.checked_add(1)?;
+            Some(NativeUnpackKey::Int(key))
+        }
+    }
+}
+
+/// Visits a validated `unpack()` result as native key/value descriptions.
+/// No result array, string `Value`, or compatibility identity is created.
+#[doc(hidden)]
+pub fn visit_native_unpack<'a>(
+    format: &[u8],
+    data: &'a [u8],
+    offset: usize,
+    mut emit: impl FnMut(NativeUnpackKey<'_>, NativeUnpackValue<'a>) -> Option<()>,
+) -> Option<usize> {
+    if offset > data.len() {
+        return None;
+    }
+    let specs = parse_pack_format(format, true).ok()?;
+    let base = offset;
+    let mut cursor = base;
+    let mut next_numeric_key = 1_i64;
+    let mut entry_count = 0usize;
+    for spec in &specs {
+        match spec.code {
+            b'n' | b'v' => {
+                let count = if spec.count_all {
+                    data.len().saturating_sub(cursor) / 2
+                } else {
+                    spec.count.unwrap_or(1)
+                };
+                for index in 0..count {
+                    let end = cursor.checked_add(2)?;
+                    let bytes = data.get(cursor..end)?;
+                    cursor = end;
+                    emit(
+                        native_unpack_key(spec, index, &mut next_numeric_key, false)?,
+                        NativeUnpackValue::Int(unpack_u16_value(spec.code, bytes)),
+                    )?;
+                    entry_count = entry_count.checked_add(1)?;
+                }
+            }
+            b'l' | b'I' | b'V' => {
+                let count = if spec.count_all {
+                    data.len().saturating_sub(cursor) / 4
+                } else {
+                    spec.count.unwrap_or(1)
+                };
+                for index in 0..count {
+                    let end = cursor.checked_add(4)?;
+                    let bytes = data.get(cursor..end)?;
+                    cursor = end;
+                    emit(
+                        native_unpack_key(spec, index, &mut next_numeric_key, false)?,
+                        NativeUnpackValue::Int(unpack_u32_value(spec.code, bytes)),
+                    )?;
+                    entry_count = entry_count.checked_add(1)?;
+                }
+            }
+            b'h' | b'H' => {
+                let count = if spec.count_all {
+                    data.len().saturating_sub(cursor).checked_mul(2)?
+                } else {
+                    spec.count.unwrap_or(1)
+                };
+                let width = count.div_ceil(2);
+                let end = cursor.checked_add(width)?;
+                let input = data.get(cursor..end)?;
+                cursor = end;
+                emit(
+                    native_unpack_key(spec, 0, &mut next_numeric_key, true)?,
+                    NativeUnpackValue::Hex {
+                        code: spec.code,
+                        input,
+                        count,
+                    },
+                )?;
+                entry_count = entry_count.checked_add(1)?;
+            }
+            b'@' => {
+                cursor = base.checked_add(spec.count.unwrap_or(0))?;
+                if cursor > data.len() {
+                    return None;
+                }
+            }
+            b'X' => {
+                cursor = cursor.checked_sub(spec.count.unwrap_or(1))?;
+            }
+            _ => return None,
+        }
+    }
+    Some(entry_count)
+}
+
+/// Writes one hexadecimal `unpack()` result into an exact native string.
+#[doc(hidden)]
+pub fn native_unpack_hex_into(code: u8, input: &[u8], count: usize, output: &mut [u8]) -> bool {
+    if !matches!(code, b'h' | b'H') || output.len() != count || input.len() < count.div_ceil(2) {
+        return false;
+    }
+    let mut cursor = 0usize;
+    for byte in input {
+        let high = byte >> 4;
+        let low = byte & 0x0f;
+        for nibble in if code == b'H' {
+            [high, low]
+        } else {
+            [low, high]
+        } {
+            if cursor == count {
+                return true;
+            }
+            output[cursor] = hex_digit(nibble);
+            cursor += 1;
+        }
+    }
+    cursor == count
 }
 
 pub(in crate::builtins::modules) fn builtin_pack(
@@ -1265,18 +1670,30 @@ pub(in crate::builtins::modules) fn builtin_md5(
         .transpose()
         .map_err(|message| conversion_error("md5", message))?
         .unwrap_or(false);
-    Ok(Value::string(native_md5(input.as_bytes(), raw)))
+    Ok(Value::string(baseline_md5(input.as_bytes(), raw)))
 }
 
-/// Exact native digest used by prepared optimizing calls. The input and
-/// result stay byte strings; no runtime `Value` is constructed.
-pub fn native_md5(input: &[u8], raw: bool) -> Vec<u8> {
+pub fn native_md5_output_length(raw: bool) -> usize {
+    if raw { 16 } else { 32 }
+}
+
+pub fn native_md5_into(input: &[u8], raw: bool, output: &mut [u8]) -> bool {
+    if output.len() != native_md5_output_length(raw) {
+        return false;
+    }
     let digest = Md5::digest(input);
     if raw {
-        digest.to_vec()
+        output.copy_from_slice(&digest);
     } else {
-        hex_encode(&digest)
+        write_hex_into(&digest, output);
     }
+    true
+}
+
+fn baseline_md5(input: &[u8], raw: bool) -> Vec<u8> {
+    let mut output = vec![0; native_md5_output_length(raw)];
+    debug_assert!(native_md5_into(input, raw, &mut output));
+    output
 }
 
 pub(in crate::builtins::modules) fn builtin_sha1(
@@ -1297,16 +1714,38 @@ pub(in crate::builtins::modules) fn builtin_sha1(
         .transpose()
         .map_err(|message| conversion_error("sha1", message))?
         .unwrap_or(false);
-    Ok(Value::string(native_sha1(input.as_bytes(), raw)))
+    Ok(Value::string(baseline_sha1(input.as_bytes(), raw)))
 }
 
-/// Exact native SHA-1 digest over the authoritative string bytes.
-pub fn native_sha1(input: &[u8], raw: bool) -> Vec<u8> {
+pub fn native_sha1_output_length(raw: bool) -> usize {
+    if raw { 20 } else { 40 }
+}
+
+pub fn native_sha1_into(input: &[u8], raw: bool, output: &mut [u8]) -> bool {
+    if output.len() != native_sha1_output_length(raw) {
+        return false;
+    }
     let digest = Sha1::digest(input);
     if raw {
-        digest.to_vec()
+        output.copy_from_slice(&digest);
     } else {
-        hex_encode(&digest)
+        write_hex_into(&digest, output);
+    }
+    true
+}
+
+fn baseline_sha1(input: &[u8], raw: bool) -> Vec<u8> {
+    let mut output = vec![0; native_sha1_output_length(raw)];
+    debug_assert!(native_sha1_into(input, raw, &mut output));
+    output
+}
+
+fn write_hex_into(input: &[u8], output: &mut [u8]) {
+    debug_assert_eq!(output.len(), input.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (byte, pair) in input.iter().zip(output.chunks_exact_mut(2)) {
+        pair[0] = HEX[(byte >> 4) as usize];
+        pair[1] = HEX[(byte & 0x0f) as usize];
     }
 }
 
@@ -1325,24 +1764,26 @@ pub fn native_crc32(input: &[u8]) -> i64 {
     i64::from(crc32fast::hash(input))
 }
 
-/// Exact stateless hash operation for the ordinary no-options call shape.
-/// Unsupported algorithms remain on the caller's one baseline continuation.
-pub fn native_hash(algorithm: &[u8], input: &[u8], binary: bool) -> Option<Vec<u8>> {
-    let algorithm = String::from_utf8_lossy(algorithm);
-    let digest = hash_digest_bytes("hash", &algorithm, input).ok()?;
-    Some(if binary { digest } else { hex_encode(&digest) })
+pub fn native_hash_output_length(algorithm: &[u8], binary: bool) -> Option<usize> {
+    direct_hash_output_length(algorithm, binary)
 }
 
-/// Exact stateless HMAC operation over native byte strings.
-pub fn native_hash_hmac(
+pub fn native_hash_into(algorithm: &[u8], input: &[u8], binary: bool, output: &mut [u8]) -> bool {
+    direct_hash_into(algorithm, input, binary, output)
+}
+
+pub fn native_hash_hmac_output_length(algorithm: &[u8], binary: bool) -> Option<usize> {
+    direct_hash_hmac_output_length(algorithm, binary)
+}
+
+pub fn native_hash_hmac_into(
     algorithm: &[u8],
     input: &[u8],
     key: &[u8],
     binary: bool,
-) -> Option<Vec<u8>> {
-    let algorithm = String::from_utf8_lossy(algorithm);
-    let digest = hmac_digest_bytes("hash_hmac", &algorithm, key, input).ok()?;
-    Some(if binary { digest } else { hex_encode(&digest) })
+    output: &mut [u8],
+) -> bool {
+    direct_hash_hmac_into(algorithm, input, key, binary, output)
 }
 
 pub(in crate::builtins::modules) fn builtin_hash(
@@ -1401,13 +1842,30 @@ pub(in crate::builtins::modules) fn builtin_base64_encode(
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("base64_encode", &args, 1)?;
-    Ok(Value::string(native_base64_encode(
-        string_arg("base64_encode", &args[0])?.as_bytes(),
-    )))
+    let input = string_arg("base64_encode", &args[0])?;
+    Ok(Value::string(baseline_base64_encode(input.as_bytes())))
 }
 
-pub fn native_base64_encode(input: &[u8]) -> Vec<u8> {
-    BASE64_STANDARD.encode(input).into_bytes()
+/// Exact output length for canonical padded Base64.
+pub fn native_base64_encode_output_length(input: &[u8]) -> Option<usize> {
+    base64::encoded_len(input.len(), true)
+}
+
+/// Encodes directly into one authoritative native string range.
+pub fn native_base64_encode_into(input: &[u8], output: &mut [u8]) -> bool {
+    native_base64_encode_output_length(input) == Some(output.len())
+        && BASE64_STANDARD
+            .encode_slice(input, output)
+            .is_ok_and(|written| written == output.len())
+}
+
+fn baseline_base64_encode(input: &[u8]) -> Vec<u8> {
+    let Some(length) = native_base64_encode_output_length(input) else {
+        return Vec::new();
+    };
+    let mut output = vec![0; length];
+    debug_assert!(native_base64_encode_into(input, &mut output));
+    output
 }
 
 pub(in crate::builtins::modules) fn builtin_base64_decode(
@@ -1428,23 +1886,100 @@ pub(in crate::builtins::modules) fn builtin_base64_decode(
         .transpose()
         .map_err(|message| conversion_error("base64_decode", message))?
         .unwrap_or(false);
-    match native_base64_decode(input.as_bytes(), strict) {
+    match baseline_base64_decode(input.as_bytes(), strict) {
         Some(bytes) => Ok(Value::string(bytes)),
         None => Ok(Value::Bool(false)),
     }
 }
 
-pub fn native_base64_decode(input: &[u8], strict: bool) -> Option<Vec<u8>> {
-    let source = if strict {
-        input.to_vec()
-    } else {
-        input
-            .iter()
-            .copied()
-            .filter(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
-            .collect()
+fn base64_sextet(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn is_php_base64_whitespace(byte: u8) -> bool {
+    matches!(byte, b'\t' | b'\n' | b'\r' | b' ')
+}
+
+fn base64_decode_shape(input: &[u8], strict: bool) -> Option<(usize, usize)> {
+    let mut symbol_count = 0_usize;
+    let mut padding = 0_usize;
+    for byte in input.iter().copied() {
+        if base64_sextet(byte).is_some() {
+            if strict && padding != 0 {
+                return None;
+            }
+            symbol_count += 1;
+        } else if byte == b'=' {
+            padding += 1;
+        } else if strict && !is_php_base64_whitespace(byte) {
+            return None;
+        }
+    }
+
+    if strict && symbol_count % 4 == 1 {
+        return None;
+    }
+    if strict && padding != 0 && (padding > 2 || !(symbol_count + padding).is_multiple_of(4)) {
+        return None;
+    }
+    let output_length = symbol_count.checked_mul(3)?.checked_div(4)?;
+    Some((symbol_count, output_length))
+}
+
+/// Validates Base64 and returns its exact decoded native-string length.
+pub fn native_base64_decode_output_length(input: &[u8], strict: bool) -> Option<usize> {
+    base64_decode_shape(input, strict).map(|(_, output_length)| output_length)
+}
+
+/// Decodes Base64 directly into one authoritative native string range.
+pub fn native_base64_decode_into(input: &[u8], strict: bool, output: &mut [u8]) -> bool {
+    let Some((_, output_length)) = base64_decode_shape(input, strict) else {
+        return false;
     };
-    BASE64_STANDARD.decode(source).ok()
+    if output_length != output.len() {
+        return false;
+    }
+
+    let mut quartet = [0_u8; 4];
+    let mut quartet_length = 0_usize;
+    let mut cursor = 0;
+    for byte in input.iter().copied() {
+        let Some(sextet) = base64_sextet(byte) else {
+            continue;
+        };
+        quartet[quartet_length] = sextet;
+        quartet_length += 1;
+        if quartet_length != 4 {
+            continue;
+        }
+        output[cursor] = (quartet[0] << 2) | (quartet[1] >> 4);
+        output[cursor + 1] = (quartet[1] << 4) | (quartet[2] >> 2);
+        output[cursor + 2] = (quartet[2] << 6) | quartet[3];
+        cursor += 3;
+        quartet_length = 0;
+    }
+    if quartet_length >= 2 {
+        output[cursor] = (quartet[0] << 2) | (quartet[1] >> 4);
+        cursor += 1;
+    }
+    if quartet_length == 3 {
+        output[cursor] = (quartet[1] << 4) | (quartet[2] >> 2);
+        cursor += 1;
+    }
+    cursor == output.len()
+}
+
+fn baseline_base64_decode(input: &[u8], strict: bool) -> Option<Vec<u8>> {
+    let length = native_base64_decode_output_length(input, strict)?;
+    let mut output = vec![0; length];
+    native_base64_decode_into(input, strict, &mut output).then_some(output)
 }
 
 pub(in crate::builtins::modules) fn builtin_htmlspecialchars(
@@ -1468,10 +2003,11 @@ pub(in crate::builtins::modules) fn builtin_htmlspecialchars(
         )
     })?;
     let input = string_arg("htmlspecialchars", &args[0])?;
-    Ok(Value::string(native_htmlspecialchars(
+    Ok(Value::string(baseline_html_escape(
         input.as_bytes(),
         flags,
         double_encode,
+        false,
     )))
 }
 
@@ -1479,8 +2015,36 @@ pub const NATIVE_HTML_ESCAPE_DEFAULT_FLAGS: i64 = HTML_ESCAPE_DEFAULT_FLAGS;
 
 /// Escapes one authoritative native byte string with PHP's HTML-special-char
 /// flag semantics.
-pub fn native_htmlspecialchars(input: &[u8], flags: i64, double_encode: bool) -> Vec<u8> {
-    html_escape_with_options(input, flags, double_encode)
+pub fn native_html_escape_output_length(
+    input: &[u8],
+    flags: i64,
+    double_encode: bool,
+    all_entities: bool,
+) -> Option<usize> {
+    direct_html_escape_output_length(input, flags, double_encode, all_entities)
+}
+
+pub fn native_html_escape_into(
+    input: &[u8],
+    flags: i64,
+    double_encode: bool,
+    all_entities: bool,
+    output: &mut [u8],
+) -> bool {
+    direct_html_escape_into(input, flags, double_encode, all_entities, output)
+}
+
+fn baseline_html_escape(
+    input: &[u8],
+    flags: i64,
+    double_encode: bool,
+    all_entities: bool,
+) -> Vec<u8> {
+    if all_entities {
+        htmlentities_escape_with_options(input, flags, double_encode)
+    } else {
+        html_escape_with_options(input, flags, double_encode)
+    }
 }
 
 pub(in crate::builtins::modules) fn builtin_htmlentities(
@@ -1504,16 +2068,12 @@ pub(in crate::builtins::modules) fn builtin_htmlentities(
         )
     })?;
     let input = string_arg("htmlentities", &args[0])?;
-    Ok(Value::string(native_htmlentities(
+    Ok(Value::string(baseline_html_escape(
         input.as_bytes(),
         flags,
         double_encode,
+        true,
     )))
-}
-
-/// Escapes all supported HTML entities from authoritative native bytes.
-pub fn native_htmlentities(input: &[u8], flags: i64, double_encode: bool) -> Vec<u8> {
-    htmlentities_escape_with_options(input, flags, double_encode)
 }
 
 pub(in crate::builtins::modules) fn builtin_html_entity_decode(
@@ -1531,15 +2091,37 @@ pub(in crate::builtins::modules) fn builtin_html_entity_decode(
         int_arg("html_entity_decode", value)
     })?;
     let input = string_arg("html_entity_decode", &args[0])?;
-    Ok(Value::string(native_html_entity_decode(
+    Ok(Value::string(baseline_html_entity_decode(
         input.as_bytes(),
         flags,
+        false,
     )))
 }
 
-/// Decodes supported HTML entities without constructing a runtime `Value`.
-pub fn native_html_entity_decode(input: &[u8], flags: i64) -> Vec<u8> {
-    html_entity_decode_with_flags(&String::from_utf8_lossy(input), flags)
+pub fn native_html_entity_decode_output_length(
+    input: &[u8],
+    flags: i64,
+    special_only: bool,
+) -> Option<usize> {
+    direct_html_entity_decode_output_length(input, flags, special_only)
+}
+
+pub fn native_html_entity_decode_into(
+    input: &[u8],
+    flags: i64,
+    special_only: bool,
+    output: &mut [u8],
+) -> bool {
+    direct_html_entity_decode_into(input, flags, special_only, output)
+}
+
+fn baseline_html_entity_decode(input: &[u8], flags: i64, special_only: bool) -> Vec<u8> {
+    let input = String::from_utf8_lossy(input);
+    if special_only {
+        htmlspecialchars_decode_with_flags(&input, flags)
+    } else {
+        html_entity_decode_with_flags(&input, flags)
+    }
 }
 
 pub(in crate::builtins::modules) fn builtin_get_html_translation_table(
@@ -1585,15 +2167,11 @@ pub(in crate::builtins::modules) fn builtin_htmlspecialchars_decode(
         int_arg("htmlspecialchars_decode", value)
     })?;
     let input = string_arg("htmlspecialchars_decode", &args[0])?;
-    Ok(Value::string(native_htmlspecialchars_decode(
+    Ok(Value::string(baseline_html_entity_decode(
         input.as_bytes(),
         flags,
+        true,
     )))
-}
-
-/// Decodes PHP's special-character entity subset from native bytes.
-pub fn native_htmlspecialchars_decode(input: &[u8], flags: i64) -> Vec<u8> {
-    htmlspecialchars_decode_with_flags(&String::from_utf8_lossy(input), flags)
 }
 
 pub(in crate::builtins::modules) fn builtin_urlencode(
@@ -1602,13 +2180,10 @@ pub(in crate::builtins::modules) fn builtin_urlencode(
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("urlencode", &args, 1)?;
-    Ok(Value::string(native_urlencode(
+    Ok(Value::string(baseline_url_encode(
         string_arg("urlencode", &args[0])?.as_bytes(),
+        false,
     )))
-}
-
-pub fn native_urlencode(input: &[u8]) -> Vec<u8> {
-    url_encode(input, false)
 }
 
 pub(in crate::builtins::modules) fn builtin_rawurlencode(
@@ -1617,13 +2192,59 @@ pub(in crate::builtins::modules) fn builtin_rawurlencode(
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("rawurlencode", &args, 1)?;
-    Ok(Value::string(native_rawurlencode(
+    Ok(Value::string(baseline_url_encode(
         string_arg("rawurlencode", &args[0])?.as_bytes(),
+        true,
     )))
 }
 
-pub fn native_rawurlencode(input: &[u8]) -> Vec<u8> {
-    url_encode(input, true)
+fn url_byte_is_unescaped(byte: u8, raw: bool) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(byte, b'-' | b'_')
+        || (!raw && byte == b'.')
+        || (raw && matches!(byte, b'.' | b'~'))
+}
+
+/// Exact output length for PHP URL encoding.
+pub fn native_url_encode_output_length(input: &[u8], raw: bool) -> Option<usize> {
+    let escaped = input
+        .iter()
+        .filter(|byte| !url_byte_is_unescaped(**byte, raw) && (raw || **byte != b' '))
+        .count();
+    input.len().checked_add(escaped.checked_mul(2)?)
+}
+
+/// URL-encodes bytes directly into a native string range.
+pub fn native_url_encode_into(input: &[u8], raw: bool, output: &mut [u8]) -> bool {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    if native_url_encode_output_length(input, raw) != Some(output.len()) {
+        return false;
+    }
+    let mut cursor = 0;
+    for &byte in input {
+        if url_byte_is_unescaped(byte, raw) {
+            output[cursor] = byte;
+            cursor += 1;
+        } else if !raw && byte == b' ' {
+            output[cursor] = b'+';
+            cursor += 1;
+        } else {
+            output[cursor] = b'%';
+            output[cursor + 1] = HEX[(byte >> 4) as usize];
+            output[cursor + 2] = HEX[(byte & 0x0f) as usize];
+            cursor += 3;
+        }
+    }
+    true
+}
+
+fn baseline_url_encode(input: &[u8], raw: bool) -> Vec<u8> {
+    let Some(length) = native_url_encode_output_length(input, raw) else {
+        return Vec::new();
+    };
+    let mut output = vec![0; length];
+    debug_assert!(native_url_encode_into(input, raw, &mut output));
+    output
 }
 
 pub(in crate::builtins::modules) fn builtin_urldecode(
@@ -1632,13 +2253,10 @@ pub(in crate::builtins::modules) fn builtin_urldecode(
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("urldecode", &args, 1)?;
-    Ok(Value::string(native_urldecode(
+    Ok(Value::string(baseline_url_decode(
         string_arg("urldecode", &args[0])?.as_bytes(),
+        false,
     )))
-}
-
-pub fn native_urldecode(input: &[u8]) -> Vec<u8> {
-    url_decode(input, false)
 }
 
 pub(in crate::builtins::modules) fn builtin_rawurldecode(
@@ -1647,13 +2265,58 @@ pub(in crate::builtins::modules) fn builtin_rawurldecode(
     _span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     expect_arity("rawurldecode", &args, 1)?;
-    Ok(Value::string(native_rawurldecode(
+    Ok(Value::string(baseline_url_decode(
         string_arg("rawurldecode", &args[0])?.as_bytes(),
+        true,
     )))
 }
 
-pub fn native_rawurldecode(input: &[u8]) -> Vec<u8> {
-    url_decode(input, true)
+fn visit_url_decoded(input: &[u8], raw: bool, mut emit: impl FnMut(u8)) -> usize {
+    let mut index = 0;
+    let mut length = 0;
+    while index < input.len() {
+        if input[index] == b'%'
+            && index + 2 < input.len()
+            && let (Some(high), Some(low)) =
+                (hex_nibble(input[index + 1]), hex_nibble(input[index + 2]))
+        {
+            emit((high << 4) | low);
+            index += 3;
+        } else {
+            emit(if !raw && input[index] == b'+' {
+                b' '
+            } else {
+                input[index]
+            });
+            index += 1;
+        }
+        length += 1;
+    }
+    length
+}
+
+/// Exact output length for PHP URL decoding.
+pub fn native_url_decode_output_length(input: &[u8], raw: bool) -> usize {
+    visit_url_decoded(input, raw, |_| {})
+}
+
+/// URL-decodes bytes directly into a native string range.
+pub fn native_url_decode_into(input: &[u8], raw: bool, output: &mut [u8]) -> bool {
+    if native_url_decode_output_length(input, raw) != output.len() {
+        return false;
+    }
+    let mut cursor = 0;
+    let length = visit_url_decoded(input, raw, |byte| {
+        output[cursor] = byte;
+        cursor += 1;
+    });
+    length == output.len()
+}
+
+fn baseline_url_decode(input: &[u8], raw: bool) -> Vec<u8> {
+    let mut output = vec![0; native_url_decode_output_length(input, raw)];
+    debug_assert!(native_url_decode_into(input, raw, &mut output));
+    output
 }
 
 pub(in crate::builtins::modules) fn builtin_parse_url(
@@ -1693,72 +2356,91 @@ pub(in crate::builtins::modules) fn builtin_parse_url(
     Ok(Value::Array(array))
 }
 
-/// Parses a URL into the temporary typed tree consumed directly by the native
-/// slot publisher. `None` is PHP's `false` parse result; `Err(component)` is
-/// the rare invalid-component ValueError path.
-pub fn native_parse_url(
+/// Parses a URL and publishes its exact scalar/array result directly into the
+/// supplied authoritative native sink.
+///
+/// The returned pair is `(parsed, value)`: an unparsed URL is PHP `false`,
+/// while `parsed && value.is_none()` means native publication capacity was
+/// unavailable and the exact handler must take its baseline continuation.
+pub fn native_parse_url_into<P: super::json::NativeStructuredValuePublisher>(
     input: &[u8],
     component: Option<i64>,
-) -> Result<Option<super::json::NativeDecodedValue>, i64> {
+    publisher: &mut P,
+) -> Result<(bool, Option<P::Output>), i64> {
     let Some(parsed) = parse_php_url(input) else {
-        return Ok(None);
+        return Ok((false, None));
     };
     if let Some(component) = component
         && component >= 0
     {
+        fn optional_string<P: super::json::NativeStructuredValuePublisher>(
+            publisher: &mut P,
+            value: Option<Vec<u8>>,
+        ) -> Option<P::Output> {
+            match value {
+                Some(value) => publisher.publish_string(&value),
+                None => publisher.publish_null(),
+            }
+        }
         let value = match component {
-            0 => parsed.scheme.map(super::json::NativeDecodedValue::String),
-            1 => parsed.host.map(super::json::NativeDecodedValue::String),
-            2 => parsed.port.map(super::json::NativeDecodedValue::Int),
-            3 => parsed.user.map(super::json::NativeDecodedValue::String),
-            4 => parsed.pass.map(super::json::NativeDecodedValue::String),
-            5 => parsed.path.map(super::json::NativeDecodedValue::String),
-            6 => parsed.query.map(super::json::NativeDecodedValue::String),
-            7 => parsed.fragment.map(super::json::NativeDecodedValue::String),
+            0 => optional_string(publisher, parsed.scheme),
+            1 => optional_string(publisher, parsed.host),
+            2 => match parsed.port {
+                Some(value) => publisher.publish_int(value),
+                None => publisher.publish_null(),
+            },
+            3 => optional_string(publisher, parsed.user),
+            4 => optional_string(publisher, parsed.pass),
+            5 => optional_string(publisher, parsed.path),
+            6 => optional_string(publisher, parsed.query),
+            7 => optional_string(publisher, parsed.fragment),
             other => return Err(other),
         };
-        return Ok(Some(value.unwrap_or(super::json::NativeDecodedValue::Null)));
+        return Ok((true, value));
     }
 
-    let mut values = Vec::new();
-    let mut insert = |key: &'static [u8], value| {
-        if let Some(value) = value {
-            values.push((key.to_vec(), value));
+    enum NativeParsedUrlField {
+        String(Vec<u8>),
+        Int(i64),
+    }
+    let fields = [
+        parsed
+            .scheme
+            .map(|value| (b"scheme".as_slice(), NativeParsedUrlField::String(value))),
+        parsed
+            .host
+            .map(|value| (b"host".as_slice(), NativeParsedUrlField::String(value))),
+        parsed
+            .port
+            .map(|value| (b"port".as_slice(), NativeParsedUrlField::Int(value))),
+        parsed
+            .user
+            .map(|value| (b"user".as_slice(), NativeParsedUrlField::String(value))),
+        parsed
+            .pass
+            .map(|value| (b"pass".as_slice(), NativeParsedUrlField::String(value))),
+        parsed
+            .path
+            .map(|value| (b"path".as_slice(), NativeParsedUrlField::String(value))),
+        parsed
+            .query
+            .map(|value| (b"query".as_slice(), NativeParsedUrlField::String(value))),
+        parsed
+            .fragment
+            .map(|value| (b"fragment".as_slice(), NativeParsedUrlField::String(value))),
+    ];
+    let published = publisher.publish_object_stream::<()>(|publisher, push| {
+        for (key, value) in fields.into_iter().flatten() {
+            let value = match value {
+                NativeParsedUrlField::String(value) => publisher.publish_string(&value),
+                NativeParsedUrlField::Int(value) => publisher.publish_int(value),
+            }
+            .ok_or(())?;
+            push(publisher, key, value).ok_or(())?;
         }
-    };
-    insert(
-        b"scheme",
-        parsed.scheme.map(super::json::NativeDecodedValue::String),
-    );
-    insert(
-        b"host",
-        parsed.host.map(super::json::NativeDecodedValue::String),
-    );
-    insert(
-        b"port",
-        parsed.port.map(super::json::NativeDecodedValue::Int),
-    );
-    insert(
-        b"user",
-        parsed.user.map(super::json::NativeDecodedValue::String),
-    );
-    insert(
-        b"pass",
-        parsed.pass.map(super::json::NativeDecodedValue::String),
-    );
-    insert(
-        b"path",
-        parsed.path.map(super::json::NativeDecodedValue::String),
-    );
-    insert(
-        b"query",
-        parsed.query.map(super::json::NativeDecodedValue::String),
-    );
-    insert(
-        b"fragment",
-        parsed.fragment.map(super::json::NativeDecodedValue::String),
-    );
-    Ok(Some(super::json::NativeDecodedValue::Object(values)))
+        Ok(())
+    });
+    Ok((true, published.unwrap_or(None)))
 }
 
 pub(in crate::builtins::modules) fn builtin_parse_str(
@@ -1775,12 +2457,15 @@ pub(in crate::builtins::modules) fn builtin_parse_str(
     Ok(Value::Null)
 }
 
-/// Parses one query string directly into a temporary typed native tree,
-/// preserving PHP array-key, nesting, filtering, and input-limit semantics.
-pub fn native_parse_str(input: &[u8], ini: &RuntimeIniOptions) -> super::json::NativeDecodedValue {
-    let query = String::from_utf8_lossy(input);
-    let pairs = crate::parse_query_string_with_separators(&query, &ini.arg_separator_input);
-    crate::context::native_input_pairs_value(&pairs, ini)
+/// Streams one query string into an exact native sink while preserving PHP
+/// array-key, nesting, filtering, and input-limit semantics. No aggregate
+/// parsed-value tree is constructed.
+pub fn native_parse_str_into<E>(
+    input: &[u8],
+    ini: &RuntimeIniOptions,
+    insert: impl FnMut(&[crate::context::NativeInputSegment], &[u8]) -> Result<(), E>,
+) -> Result<(), E> {
+    crate::context::native_input_bytes_into(input, ini, insert)
 }
 
 fn input_ini_options(context: &BuiltinContext<'_>) -> RuntimeIniOptions {
@@ -1855,25 +2540,6 @@ pub(in crate::builtins::modules) fn builtin_http_build_query(
 
 pub const NATIVE_PHP_QUERY_RFC3986: i64 = PHP_QUERY_RFC3986;
 
-/// Converts one already-classified native scalar to the bytes used by
-/// `http_build_query`. `None` means PHP omits the value.
-pub fn native_http_build_query_scalar(value: NativePrintfScalar<'_>) -> Option<Vec<u8>> {
-    match value {
-        NativePrintfScalar::Null => None,
-        NativePrintfScalar::Bool(value) => Some(if value { b"1".to_vec() } else { b"0".to_vec() }),
-        NativePrintfScalar::Int(value) => Some(value.to_string().into_bytes()),
-        NativePrintfScalar::Float(value) => {
-            Some(crate::convert::float_to_php_string(value).into_bytes())
-        }
-        NativePrintfScalar::String(value) => Some(value.to_vec()),
-    }
-}
-
-/// Percent-encodes one query key or value with PHP's RFC1738/RFC3986 rules.
-pub fn native_http_build_query_component(input: &[u8], raw_encoding: bool) -> Vec<u8> {
-    url_encode(input, raw_encoding)
-}
-
 pub(in crate::builtins::modules) fn builtin_substr(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -1946,16 +2612,16 @@ pub(in crate::builtins::modules) fn builtin_strrchr(
         .unwrap_or(false);
     let needle = needle.as_bytes().first().copied().unwrap_or(0);
     Ok(native_strrchr(haystack.as_bytes(), needle, before_needle)
-        .map_or(Value::Bool(false), Value::string))
+        .map_or(Value::Bool(false), |bytes| Value::string(bytes.to_vec())))
 }
 
 /// Returns the byte slice selected by PHP's `strrchr`, if the byte exists.
-pub fn native_strrchr(haystack: &[u8], needle: u8, before_needle: bool) -> Option<Vec<u8>> {
+pub fn native_strrchr(haystack: &[u8], needle: u8, before_needle: bool) -> Option<&[u8]> {
     let index = find_last_byte(haystack, needle)?;
     Some(if before_needle {
-        haystack[..index].to_vec()
+        &haystack[..index]
     } else {
-        haystack[index..].to_vec()
+        &haystack[index..]
     })
 }
 
@@ -1976,24 +2642,24 @@ pub(in crate::builtins::modules) fn builtin_stristr(
 }
 
 /// Selects the prefix or suffix around the first native byte-string match.
-pub fn native_string_search_slice(
-    haystack: &[u8],
+pub fn native_string_search_slice<'a>(
+    haystack: &'a [u8],
     needle: &[u8],
     case_insensitive: bool,
     before_needle: bool,
-) -> Option<Vec<u8>> {
+) -> Option<&'a [u8]> {
     if needle.is_empty() {
         return Some(if before_needle {
-            Vec::new()
+            &haystack[..0]
         } else {
-            haystack.to_vec()
+            haystack
         });
     }
     let index = find_bytes_from(haystack, needle, 0, case_insensitive)?;
     Some(if before_needle {
-        haystack[..index].to_vec()
+        &haystack[..index]
     } else {
-        haystack[index..].to_vec()
+        &haystack[index..]
     })
 }
 
@@ -2013,16 +2679,16 @@ pub(in crate::builtins::modules) fn builtin_strpbrk(
         ));
     }
     Ok(native_strpbrk(haystack.as_bytes(), chars.as_bytes())
-        .map_or(Value::Bool(false), Value::string))
+        .map_or(Value::Bool(false), |bytes| Value::string(bytes.to_vec())))
 }
 
 /// Returns the suffix beginning with the first byte from `characters`.
 ///
 /// Empty character sets are rejected by the PHP-facing caller before this
 /// byte-only operation is entered.
-pub fn native_strpbrk(haystack: &[u8], characters: &[u8]) -> Option<Vec<u8>> {
+pub fn native_strpbrk<'a>(haystack: &'a [u8], characters: &[u8]) -> Option<&'a [u8]> {
     let index = find_first_of(haystack, 0, characters);
-    (index != haystack.len()).then(|| haystack[index..].to_vec())
+    (index != haystack.len()).then(|| &haystack[index..])
 }
 
 pub(in crate::builtins::modules) fn builtin_strspn(
@@ -2167,16 +2833,16 @@ pub fn native_substr_compare(
     let compare_len = length
         .unwrap_or_else(|| main.len().saturating_sub(start))
         .min(main.len().saturating_sub(start));
-    let mut left = main[start..start + compare_len].to_vec();
-    let mut right = other.to_vec();
-    if let Some(length) = length {
-        right.truncate(length);
-    }
-    if case_insensitive {
-        php_source::byte_kernel::ascii_lowercase_in_place(&mut left);
-        php_source::byte_kernel::ascii_lowercase_in_place(&mut right);
-    }
-    Some(ordering_to_i64(left.cmp(&right)))
+    let left = &main[start..start + compare_len];
+    let right = &other[..length.map_or(other.len(), |length| length.min(other.len()))];
+    let ordering = if case_insensitive {
+        left.iter()
+            .map(|byte| byte.to_ascii_lowercase())
+            .cmp(right.iter().map(|byte| byte.to_ascii_lowercase()))
+    } else {
+        left.cmp(right)
+    };
+    Some(ordering_to_i64(ordering))
 }
 
 pub(in crate::builtins::modules) fn substr_compare_offset(
@@ -2330,26 +2996,78 @@ pub(in crate::builtins::modules) fn builtin_addcslashes(
     expect_arity("addcslashes", &args, 2)?;
     let input = string_arg("addcslashes", &args[0])?;
     let charlist = string_arg("addcslashes", &args[1])?;
-    Ok(Value::string(native_addcslashes(
+    Ok(Value::string(baseline_addcslashes(
         input.as_bytes(),
         charlist.as_bytes(),
     )))
 }
 
-/// Applies PHP's byte-oriented `addcslashes` character-list escaping.
-///
-/// Both inputs and the result stay in the native string representation at the
-/// optimizing boundary.
-pub fn native_addcslashes(input: &[u8], charlist: &[u8]) -> Vec<u8> {
+pub fn native_addcslashes_output_length(input: &[u8], charlist: &[u8]) -> Option<usize> {
     let escaped = addcslashes_charlist(charlist);
-    let mut output = Vec::with_capacity(input.len());
+    let mut length = 0_usize;
     for byte in input {
-        if escaped[usize::from(*byte)] {
-            push_addcslashes_escape(&mut output, *byte);
+        let escaped_length = if !escaped[usize::from(*byte)] {
+            1
+        } else if matches!(
+            *byte,
+            b'\n' | b'\r' | b'\t' | 0x0b | 0x0c | 0x07 | 0x08 | 0x20..=0x7e
+        ) {
+            2
         } else {
-            output.push(*byte);
-        }
+            4
+        };
+        length = length.checked_add(escaped_length)?;
     }
+    Some(length)
+}
+
+pub fn native_addcslashes_into(input: &[u8], charlist: &[u8], output: &mut [u8]) -> bool {
+    if native_addcslashes_output_length(input, charlist) != Some(output.len()) {
+        return false;
+    }
+    let escaped = addcslashes_charlist(charlist);
+    let mut cursor = 0;
+    for byte in input.iter().copied() {
+        if !escaped[usize::from(byte)] {
+            output[cursor] = byte;
+            cursor += 1;
+            continue;
+        }
+        let encoded: &[u8] = match byte {
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            b'\t' => b"\\t",
+            0x0b => b"\\v",
+            0x0c => b"\\f",
+            0x07 => b"\\a",
+            0x08 => b"\\b",
+            0x20..=0x7e => {
+                output[cursor] = b'\\';
+                output[cursor + 1] = byte;
+                cursor += 2;
+                continue;
+            }
+            _ => {
+                output[cursor] = b'\\';
+                output[cursor + 1] = b'0' + ((byte >> 6) & 0x07);
+                output[cursor + 2] = b'0' + ((byte >> 3) & 0x07);
+                output[cursor + 3] = b'0' + (byte & 0x07);
+                cursor += 4;
+                continue;
+            }
+        };
+        output[cursor..cursor + 2].copy_from_slice(encoded);
+        cursor += 2;
+    }
+    cursor == output.len()
+}
+
+fn baseline_addcslashes(input: &[u8], charlist: &[u8]) -> Vec<u8> {
+    let Some(length) = native_addcslashes_output_length(input, charlist) else {
+        return Vec::new();
+    };
+    let mut output = vec![0; length];
+    debug_assert!(native_addcslashes_into(input, charlist, &mut output));
     output
 }
 
@@ -2412,28 +3130,6 @@ fn addcslashes_charlist_atom(input: &[u8]) -> Option<(u8, usize)> {
     }
 }
 
-fn push_addcslashes_escape(output: &mut Vec<u8>, byte: u8) {
-    match byte {
-        b'\n' => output.extend_from_slice(b"\\n"),
-        b'\r' => output.extend_from_slice(b"\\r"),
-        b'\t' => output.extend_from_slice(b"\\t"),
-        0x0b => output.extend_from_slice(b"\\v"),
-        0x0c => output.extend_from_slice(b"\\f"),
-        0x07 => output.extend_from_slice(b"\\a"),
-        0x08 => output.extend_from_slice(b"\\b"),
-        0x20..=0x7e => {
-            output.push(b'\\');
-            output.push(byte);
-        }
-        byte => {
-            output.push(b'\\');
-            output.push(b'0' + ((byte >> 6) & 0x07));
-            output.push(b'0' + ((byte >> 3) & 0x07));
-            output.push(b'0' + (byte & 0x07));
-        }
-    }
-}
-
 pub(in crate::builtins::modules) fn builtin_stripslashes(
     _context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
@@ -2441,12 +3137,50 @@ pub(in crate::builtins::modules) fn builtin_stripslashes(
 ) -> BuiltinResult {
     expect_arity("stripslashes", &args, 1)?;
     let input = string_arg("stripslashes", &args[0])?;
-    Ok(Value::string(native_stripslashes(input.as_bytes())))
+    Ok(Value::string(baseline_stripslashes(input.as_bytes())))
 }
 
-/// Removes PHP addslashes-style byte escapes without materializing `Value`.
-pub fn native_stripslashes(input: &[u8]) -> Vec<u8> {
-    stripslashes_bytes(input)
+fn visit_stripslashes(input: &[u8], mut emit: impl FnMut(u8)) -> usize {
+    let mut index = 0;
+    let mut length = 0;
+    while index < input.len() {
+        if input[index] != b'\\' {
+            emit(input[index]);
+            index += 1;
+        } else if let Some(next) = input.get(index + 1).copied() {
+            emit(if next == b'0' { b'\0' } else { next });
+            index += 2;
+        } else {
+            index += 1;
+            continue;
+        }
+        length += 1;
+    }
+    length
+}
+
+/// Exact output length for `stripslashes()`.
+pub fn native_stripslashes_output_length(input: &[u8]) -> usize {
+    visit_stripslashes(input, |_| {})
+}
+
+/// Removes addslashes-style escapes directly into a native string range.
+pub fn native_stripslashes_into(input: &[u8], output: &mut [u8]) -> bool {
+    if native_stripslashes_output_length(input) != output.len() {
+        return false;
+    }
+    let mut cursor = 0;
+    let length = visit_stripslashes(input, |byte| {
+        output[cursor] = byte;
+        cursor += 1;
+    });
+    length == output.len()
+}
+
+fn baseline_stripslashes(input: &[u8]) -> Vec<u8> {
+    let mut output = vec![0; native_stripslashes_output_length(input)];
+    debug_assert!(native_stripslashes_into(input, &mut output));
+    output
 }
 
 pub(in crate::builtins::modules) fn builtin_stripcslashes(
@@ -2456,12 +3190,78 @@ pub(in crate::builtins::modules) fn builtin_stripcslashes(
 ) -> BuiltinResult {
     expect_arity("stripcslashes", &args, 1)?;
     let input = string_arg("stripcslashes", &args[0])?;
-    Ok(Value::string(native_stripcslashes(input.as_bytes())))
+    Ok(Value::string(baseline_stripcslashes(input.as_bytes())))
 }
 
-/// Decodes PHP C-style byte escapes without materializing `Value`.
-pub fn native_stripcslashes(input: &[u8]) -> Vec<u8> {
-    stripcslashes_bytes(input)
+fn visit_stripcslashes(input: &[u8], mut emit: impl FnMut(u8)) -> usize {
+    let mut index = 0;
+    let mut length = 0;
+    while index < input.len() {
+        if input[index] != b'\\' {
+            emit(input[index]);
+            index += 1;
+            length += 1;
+            continue;
+        }
+        index += 1;
+        let Some(next) = input.get(index).copied() else {
+            emit(b'\\');
+            length += 1;
+            break;
+        };
+        match next {
+            b'n' => emit(b'\n'),
+            b'r' => emit(b'\r'),
+            b't' => emit(b'\t'),
+            b'v' => emit(0x0b),
+            b'f' => emit(0x0c),
+            b'a' => emit(0x07),
+            b'b' => emit(0x08),
+            b'\\' | b'\'' | b'"' => emit(next),
+            b'x' | b'X' => {
+                let (decoded, consumed) = decode_c_hex_escape(&input[index + 1..]);
+                if consumed == 0 {
+                    emit(next);
+                } else {
+                    emit(decoded);
+                    index += consumed;
+                }
+            }
+            b'0'..=b'7' => {
+                let (decoded, consumed) = decode_c_octal_escape(&input[index..]);
+                emit(decoded);
+                index += consumed.saturating_sub(1);
+            }
+            byte => emit(byte),
+        }
+        index += 1;
+        length += 1;
+    }
+    length
+}
+
+/// Exact output length for `stripcslashes()`.
+pub fn native_stripcslashes_output_length(input: &[u8]) -> usize {
+    visit_stripcslashes(input, |_| {})
+}
+
+/// Decodes C-style escapes directly into a native string range.
+pub fn native_stripcslashes_into(input: &[u8], output: &mut [u8]) -> bool {
+    if native_stripcslashes_output_length(input) != output.len() {
+        return false;
+    }
+    let mut cursor = 0;
+    let length = visit_stripcslashes(input, |byte| {
+        output[cursor] = byte;
+        cursor += 1;
+    });
+    length == output.len()
+}
+
+fn baseline_stripcslashes(input: &[u8]) -> Vec<u8> {
+    let mut output = vec![0; native_stripcslashes_output_length(input)];
+    debug_assert!(native_stripcslashes_into(input, &mut output));
+    output
 }
 
 pub(in crate::builtins::modules) fn builtin_strnatcmp(
@@ -2620,25 +3420,54 @@ pub(in crate::builtins::modules) fn builtin_substr_replace(
 
 /// Replaces one normalized native byte substring. `None` preserves the
 /// PHP-visible negative-length range error at the baseline continuation.
-pub fn native_substr_replace(
+pub fn native_substr_replace_output_length(
+    subject: &[u8],
+    replacement: &[u8],
+    offset: i64,
+    length: Option<i64>,
+) -> Option<usize> {
+    let start = normalize_offset(subject.len(), offset);
+    let replace_len = byte_substring_length("substr_replace", subject.len(), start, length).ok()?;
+    subject
+        .len()
+        .checked_sub(replace_len)?
+        .checked_add(replacement.len())
+}
+
+pub fn native_substr_replace_into(
+    subject: &[u8],
+    replacement: &[u8],
+    offset: i64,
+    length: Option<i64>,
+    output: &mut [u8],
+) -> bool {
+    if native_substr_replace_output_length(subject, replacement, offset, length)
+        != Some(output.len())
+    {
+        return false;
+    }
+    let start = normalize_offset(subject.len(), offset);
+    let Ok(replace_len) = byte_substring_length("substr_replace", subject.len(), start, length)
+    else {
+        return false;
+    };
+    let end = start + replace_len;
+    let replacement_end = start + replacement.len();
+    output[..start].copy_from_slice(&subject[..start]);
+    output[start..replacement_end].copy_from_slice(replacement);
+    output[replacement_end..].copy_from_slice(&subject[end..]);
+    true
+}
+
+pub(in crate::builtins::modules) fn baseline_substr_replace(
     subject: &[u8],
     replacement: &[u8],
     offset: i64,
     length: Option<i64>,
 ) -> Option<Vec<u8>> {
-    let start = normalize_offset(subject.len(), offset);
-    let replace_len = byte_substring_length("substr_replace", subject.len(), start, length).ok()?;
-    let end = start + replace_len;
-    let mut output = Vec::with_capacity(
-        subject
-            .len()
-            .saturating_sub(replace_len)
-            .saturating_add(replacement.len()),
-    );
-    output.extend_from_slice(&subject[..start]);
-    output.extend_from_slice(replacement);
-    output.extend_from_slice(&subject[end..]);
-    Some(output)
+    let output_length = native_substr_replace_output_length(subject, replacement, offset, length)?;
+    let mut output = vec![0; output_length];
+    native_substr_replace_into(subject, replacement, offset, length, &mut output).then_some(output)
 }
 
 pub(in crate::builtins::modules) fn builtin_convert_uuencode(
@@ -2648,11 +3477,58 @@ pub(in crate::builtins::modules) fn builtin_convert_uuencode(
 ) -> BuiltinResult {
     expect_arity("convert_uuencode", &args, 1)?;
     let input = string_arg("convert_uuencode", &args[0])?;
-    Ok(Value::string(native_convert_uuencode(input.as_bytes())))
+    Ok(Value::string(baseline_convert_uuencode(input.as_bytes())))
 }
 
-pub fn native_convert_uuencode(input: &[u8]) -> Vec<u8> {
-    uuencode_bytes(input)
+fn uuencode_sixbit(value: u8) -> u8 {
+    let encoded = (value & 0x3f) + 0x20;
+    if encoded == 0x20 { b'`' } else { encoded }
+}
+
+/// Exact output length for `convert_uuencode()`.
+pub fn native_convert_uuencode_output_length(input: &[u8]) -> Option<usize> {
+    let mut length = 2_usize;
+    for chunk in input.chunks(45) {
+        length = length
+            .checked_add(2)?
+            .checked_add(chunk.len().div_ceil(3).checked_mul(4)?)?;
+    }
+    Some(length)
+}
+
+/// Encodes uuencoded data directly into one authoritative native string range.
+pub fn native_convert_uuencode_into(input: &[u8], output: &mut [u8]) -> bool {
+    if native_convert_uuencode_output_length(input) != Some(output.len()) {
+        return false;
+    }
+    let mut cursor = 0;
+    for chunk in input.chunks(45) {
+        output[cursor] = uuencode_sixbit(chunk.len() as u8);
+        cursor += 1;
+        for triple in chunk.chunks(3) {
+            let a = triple.first().copied().unwrap_or(0);
+            let b = triple.get(1).copied().unwrap_or(0);
+            let c = triple.get(2).copied().unwrap_or(0);
+            output[cursor] = uuencode_sixbit(a >> 2);
+            output[cursor + 1] = uuencode_sixbit(((a << 4) | (b >> 4)) & 0x3f);
+            output[cursor + 2] = uuencode_sixbit(((b << 2) | (c >> 6)) & 0x3f);
+            output[cursor + 3] = uuencode_sixbit(c & 0x3f);
+            cursor += 4;
+        }
+        output[cursor] = b'\n';
+        cursor += 1;
+    }
+    output[cursor..].copy_from_slice(b"`\n");
+    cursor + 2 == output.len()
+}
+
+fn baseline_convert_uuencode(input: &[u8]) -> Vec<u8> {
+    let Some(length) = native_convert_uuencode_output_length(input) else {
+        return Vec::new();
+    };
+    let mut output = vec![0; length];
+    debug_assert!(native_convert_uuencode_into(input, &mut output));
+    output
 }
 
 pub(in crate::builtins::modules) fn builtin_convert_uudecode(
@@ -2662,7 +3538,7 @@ pub(in crate::builtins::modules) fn builtin_convert_uudecode(
 ) -> BuiltinResult {
     expect_arity("convert_uudecode", &args, 1)?;
     let input = string_arg("convert_uudecode", &args[0])?;
-    Ok(native_convert_uudecode(input.as_bytes()).map_or_else(
+    Ok(baseline_convert_uudecode(input.as_bytes()).map_or_else(
         || {
             context.php_warning(
                 "E_PHP_RUNTIME_INVALID_UUENCODED_STRING",
@@ -2675,8 +3551,76 @@ pub(in crate::builtins::modules) fn builtin_convert_uudecode(
     ))
 }
 
-pub fn native_convert_uudecode(input: &[u8]) -> Option<Vec<u8>> {
-    uudecode_bytes(input)
+fn uudecode_sixbit(value: u8) -> u8 {
+    if value == b'`' {
+        0
+    } else {
+        value.wrapping_sub(0x20) & 0x3f
+    }
+}
+
+/// Validates uuencoded data and returns its exact decoded native-string length.
+pub fn native_convert_uudecode_output_length(input: &[u8]) -> Option<usize> {
+    if input.is_empty() {
+        return None;
+    }
+    let mut output_length = 0_usize;
+    for raw_line in input.split(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if line.is_empty() {
+            continue;
+        }
+        let length = uudecode_sixbit(*line.first()?) as usize;
+        if length == 0 {
+            return Some(output_length);
+        }
+        let encoded_length = length.div_ceil(3).checked_mul(4)?;
+        if line.len().saturating_sub(1) < encoded_length {
+            return None;
+        }
+        output_length = output_length.checked_add(length)?;
+    }
+    Some(output_length)
+}
+
+/// Decodes uuencoded data directly into one authoritative native string range.
+pub fn native_convert_uudecode_into(input: &[u8], output: &mut [u8]) -> bool {
+    if native_convert_uudecode_output_length(input) != Some(output.len()) {
+        return false;
+    }
+    let mut cursor = 0;
+    for raw_line in input.split(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if line.is_empty() {
+            continue;
+        }
+        let length = uudecode_sixbit(line[0]) as usize;
+        if length == 0 {
+            return cursor == output.len();
+        }
+        let encoded_length = length.div_ceil(3) * 4;
+        let line_output_end = cursor + length;
+        for group in line[1..1 + encoded_length].chunks(4) {
+            let a = uudecode_sixbit(group[0]);
+            let b = uudecode_sixbit(group[1]);
+            let c = uudecode_sixbit(group[2]);
+            let d = uudecode_sixbit(group[3]);
+            for byte in [(a << 2) | (b >> 4), (b << 4) | (c >> 2), (c << 6) | d] {
+                if cursor == line_output_end {
+                    break;
+                }
+                output[cursor] = byte;
+                cursor += 1;
+            }
+        }
+    }
+    cursor == output.len()
+}
+
+fn baseline_convert_uudecode(input: &[u8]) -> Option<Vec<u8>> {
+    let length = native_convert_uudecode_output_length(input)?;
+    let mut output = vec![0; length];
+    native_convert_uudecode_into(input, &mut output).then_some(output)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2696,6 +3640,19 @@ fn compare_versions(left: &str, right: &str) -> i64 {
         }
     }
     0
+}
+
+/// Compares two PHP version byte strings without constructing runtime values.
+///
+/// `version_compare()` historically coerces its string arguments through
+/// lossy UTF-8 display before tokenization; the exact native builtin retains
+/// that behavior while keeping the authoritative inputs in native storage.
+#[must_use]
+pub fn native_version_compare(left: &[u8], right: &[u8]) -> i64 {
+    compare_versions(
+        String::from_utf8_lossy(left).as_ref(),
+        String::from_utf8_lossy(right).as_ref(),
+    )
 }
 
 fn version_parts(version: &str) -> Vec<VersionPart> {
@@ -2799,6 +3756,23 @@ pub(in crate::builtins::modules) fn version_operator_matches(
             "E_PHP_RUNTIME_BUILTIN_VALUE",
             format!("builtin version_compare received unsupported operator {operator}"),
         )),
+    }
+}
+
+/// Applies a validated `version_compare()` operator to an already computed
+/// three-way comparison. `None` denotes the PHP value-error shape, which the
+/// exact handler sends to its single baseline continuation for diagnostics.
+#[must_use]
+pub fn native_version_operator_matches(operator: &[u8], comparison: i64) -> Option<bool> {
+    let operator = String::from_utf8_lossy(operator);
+    match operator.to_ascii_lowercase().as_str() {
+        "<" | "lt" => Some(comparison < 0),
+        "<=" | "le" => Some(comparison <= 0),
+        ">" | "gt" => Some(comparison > 0),
+        ">=" | "ge" => Some(comparison >= 0),
+        "==" | "=" | "eq" => Some(comparison == 0),
+        "!=" | "<>" | "ne" => Some(comparison != 0),
+        _ => None,
     }
 }
 

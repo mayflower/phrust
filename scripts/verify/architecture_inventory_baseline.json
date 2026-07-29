@@ -9,7 +9,7 @@
       "reason": "explicit baseline-only exit conversion in NativeCallControl::from_baseline_error; optimizing exact handlers carry the encoded exit value directly"
     },
     {
-      "id": "crates/php_vm/src/vm/jit_abi/runtime_ops.rs:diagnostic_code_prefix_parse:aeb86ceeb4fd:1",
+      "id": "crates/php_vm/src/vm/jit_abi/baseline_runtime_ops.rs:diagnostic_code_prefix_parse:aeb86ceeb4fd:1",
       "reason": "baseline local-operation continuation translates the legacy cold semantic throw envelope at its ABI boundary; optimizing operations use typed control"
     }
   ],
@@ -173,7 +173,7 @@
       "max_bytes": 237378,
       "max_lines": 5838
     },
-    "crates/php_vm/src/vm/jit_abi/runtime_ops.rs": {
+    "crates/php_vm/src/vm/jit_abi/baseline_runtime_ops.rs": {
       "max_bytes": 278575,
       "max_lines": 6653
     },

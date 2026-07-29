@@ -100,7 +100,14 @@ impl SsaValueFact {
     pub const fn has_runtime_lifecycle(self) -> bool {
         matches!(
             self.class,
-            SsaValueClass::StringHandle
+            // Most integers stay untagged machine values, but namespace-
+            // colliding integers use authoritative direct-int slots. Floats
+            // likewise live in direct slots. Their SSA class therefore owns
+            // a conditional native lifecycle even though both remain exact
+            // PHP scalars; retain/release lower to no-ops for immediates.
+            SsaValueClass::Int
+                | SsaValueClass::Float
+                | SsaValueClass::StringHandle
                 | SsaValueClass::ArrayHandle
                 | SsaValueClass::ObjectHandle
                 | SsaValueClass::ReferenceHandle

@@ -289,9 +289,9 @@ pub(in crate::builtins) const ENTRIES: &[BuiltinEntry] = &[
 ];
 
 pub(in crate::builtins::modules) fn builtin_count(
-    _context: &mut BuiltinContext<'_>,
+    context: &mut BuiltinContext<'_>,
     args: Vec<Value>,
-    _span: RuntimeSourceSpan,
+    span: RuntimeSourceSpan,
 ) -> BuiltinResult {
     if !(1..=2).contains(&args.len()) {
         return Err(arity_error("count", "one or two argument(s)"));
@@ -301,8 +301,17 @@ pub(in crate::builtins::modules) fn builtin_count(
         .map(|value| int_arg("count", value))
         .transpose()?
         .unwrap_or(0);
+    let root_reference = match &args[0] {
+        Value::Reference(reference) => Some(reference.gc_debug_id()),
+        _ => None,
+    };
+    let mut recursion_warnings = 0_usize;
     let count = match deref_value(&args[0]) {
-        Value::Array(array) if mode == 1 => count_recursive(&array),
+        Value::Array(array) if mode == 1 => {
+            let (count, warnings) = count_recursive(&array, root_reference);
+            recursion_warnings = warnings;
+            count
+        }
         Value::Array(array) => array.len(),
         Value::Object(object) => {
             if let Some(Value::Int(count)) =
@@ -328,6 +337,13 @@ pub(in crate::builtins::modules) fn builtin_count(
         }
         _ => return Err(type_error("count", "array or Countable", &args[0])),
     };
+    for _ in 0..recursion_warnings {
+        context.php_warning(
+            "E_PHP_RUNTIME_COUNT_RECURSION",
+            "count(): Recursion detected",
+            span.clone(),
+        );
+    }
     Ok(Value::Int(count as i64))
 }
 
@@ -1259,19 +1275,25 @@ pub(in crate::builtins::modules) fn builtin_array_splice(
         .iter()
         .map(|(key, value)| (key.clone(), materialize_array_builtin_value(value)))
         .collect::<Vec<_>>();
-    let mut result_values = Vec::new();
-    result_values.extend(
+    let mut result_entries = Vec::new();
+    result_entries.extend(
         entries[..start]
             .iter()
-            .map(|(_, value)| materialize_array_builtin_value(value)),
+            .map(|(key, value)| (key.clone(), materialize_array_builtin_value(value))),
     );
-    result_values.extend(replacement);
-    result_values.extend(
+    result_entries.extend(
+        replacement
+            .into_iter()
+            .map(|value| (ArrayKey::Int(0), value)),
+    );
+    result_entries.extend(
         entries[start + delete_len..]
             .iter()
-            .map(|(_, value)| materialize_array_builtin_value(value)),
+            .map(|(key, value)| (key.clone(), materialize_array_builtin_value(value))),
     );
-    cell.set(Value::packed_array(result_values));
+    cell.set(Value::Array(array_from_entries_reindex_ints(
+        result_entries,
+    )));
     Ok(Value::Array(array_from_entries_reindex_ints(removed)))
 }
 

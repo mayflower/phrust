@@ -43,7 +43,9 @@ def main() -> int:
     views = read("crates/php_runtime/src/builtins/context/service_views.rs")
     vm = read("crates/php_vm/src/vm/mod.rs")
     vm_jit_abi = read_rust_module(ROOT / "crates/php_vm/src/vm/jit_abi.rs")
-    vm_native_builtins = read("crates/php_vm/src/vm/jit_abi/native_builtins.rs")
+    vm_native_builtins = read_rust_module(
+        ROOT / "crates/php_vm/src/vm/jit_abi/baseline_native_builtins.rs"
+    )
     extensions = read("crates/php_extensions/src/lib.rs")
     apcu = read("crates/php_extensions/src/apcu.rs")
     migration = read("docs/runtime/request-state-slots.md")
