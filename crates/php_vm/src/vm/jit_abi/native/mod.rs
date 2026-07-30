@@ -10,10 +10,13 @@ use crate::vm::jit_abi::{
     NativeDynamicFunction, NativeDynamicUnit, NativeExecutionScope, NativeFrameArena,
     NativeFunctionNameScope, NativeLastError, NativePreparedCallableOwner, NativePreparedClosure,
     PreparedNativeRuntimeClass, PreparedNativeThrowableSite, native_comparison_truthy,
-    native_comparison_values_order, native_fixed_callable_plan, native_reference_state,
+    native_comparison_values_order, native_reference_state,
 };
 use std::rc::Rc;
 use std::sync::Arc;
+
+mod capability_impl;
+pub(crate) use capability_impl::native_fixed_callable_plan;
 
 pub(super) static NATIVE_TEMPNAM_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);

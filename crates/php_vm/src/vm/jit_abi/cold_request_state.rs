@@ -6,6 +6,133 @@
 
 use super::*;
 
+/// Cold request-lifetime owner. Publication wires the separately boxed native
+/// fast state exactly once before any optimizing entry becomes reachable.
+pub(in crate::vm) struct NativeRequestOwner<'a> {
+    cold: Box<NativeRequestColdState<'a>>,
+    _fast: Box<NativeRequestFastState>,
+}
+
+impl<'a> NativeRequestOwner<'a> {
+    pub(in crate::vm) fn new(
+        compiled: &'a crate::compiled_unit::CompiledUnit,
+        unit_identity: u64,
+        options: &'a crate::vm::VmOptions,
+        worker_state: &'a crate::vm::VmWorkerState,
+        output: php_runtime::api::OutputBuffer,
+        native_entries: std::sync::Arc<
+            std::collections::BTreeMap<php_ir::FunctionId, php_jit::JitFunctionHandle>,
+        >,
+    ) -> Self {
+        let mut cold = Box::new(NativeRequestColdState::new(
+            compiled,
+            unit_identity,
+            options,
+            worker_state,
+            output,
+            native_entries,
+        ));
+        cold.promote_cold_dynamic_constants()
+            .expect("request constants must fit the authoritative native arena");
+        cold.promote_pending_registered_callbacks()
+            .expect("registered callbacks must fit the authoritative native arena");
+        let mut fast = Box::<NativeRequestFastState>::default();
+        let fast_ptr = std::ptr::from_mut(fast.as_mut());
+        cold.fast_state = fast_ptr;
+        fast.output = std::ptr::from_mut(&mut cold.output);
+        fast.json_state = std::ptr::from_mut(cold.builtin_request_state.json_mut());
+        fast.pcre_state = std::ptr::from_mut(cold.builtin_request_state.pcre_mut());
+        fast.gc_state = std::ptr::from_mut(cold.builtin_request_state.gc_mut());
+        fast.cwd = std::ptr::from_mut(&mut cold.cwd);
+        fast.filesystem_capabilities = std::ptr::from_ref(&cold.options.runtime_context.filesystem);
+        fast.filesystem_state = cold.registered_extensions.filesystem_ptr();
+        let default_stream_context = cold
+            .publish_owned_direct_array_entries(Vec::new())
+            .expect("default stream context must fit the native array arena");
+        cold.native_stream_context.default_options = default_stream_context;
+        fast.stream_context = std::ptr::from_mut(&mut cold.native_stream_context);
+        fast.stdin = std::ptr::from_ref(&cold.options.runtime_context.stdin);
+        fast.resources = std::ptr::from_mut(&mut cold.resources);
+        fast.upload_registry = std::ptr::from_mut(&mut cold.upload_registry);
+        fast.last_error = std::ptr::from_mut(&mut cold.last_error);
+        fast.direct_resource_handles = std::ptr::from_mut(&mut cold.direct_resource_handles);
+        fast.direct_closure_handles = std::ptr::from_mut(&mut cold.direct_closure_handles);
+        fast.callback_handlers = std::ptr::from_mut(&mut cold.registered_callbacks);
+        fast.callback_transient_export = u8::from(cold.include_child);
+        fast.symbol_query = publish_native_symbol_query(cold.as_ref());
+        fast.configuration = publish_native_configuration(cold.as_ref());
+        fast.http_response = publish_native_http_response(cold.as_ref());
+        fast.request_query = publish_native_request_query(cold.as_ref());
+        fast.mbstring = NativeMbstringCapability {
+            internal_encoding: cold.registered_extensions.mb_internal_encoding_ptr(),
+            substitute_character: cold.registered_extensions.mb_substitute_character_ptr(),
+        };
+        fast.bcmath = NativeBcmathCapability {
+            scale: cold.registered_extensions.bcmath_scale_ptr(),
+        };
+        fast.random = NativeRandomCapability {
+            fill: Some(php_runtime::api::native_random_fill),
+        };
+        let (filter_roots, filter_present) = cold
+            .publish_native_filter_input_roots()
+            .expect("request filter inputs must fit the native value arena");
+        fast.filter = NativeFilterCapability {
+            roots: filter_roots,
+            present: filter_present,
+        };
+        fast.frame_arena = publish_native_frame_arena(cold.as_mut());
+        cold.trusted_globals_proxy = cold
+            .encode_globals_proxy()
+            .expect("request globals proxy must fit the native value arena");
+        cold.prepare_trusted_literal_slots();
+        cold.prepare_trusted_closure_plans();
+        cold.prepare_trusted_exception_plans();
+        cold.prepare_trusted_constant_fetches();
+        cold.prepare_trusted_request_locals();
+        cold.prepare_trusted_global_references()
+            .expect("trusted global references must publish before native entry");
+        let session_reference = cold
+            .native_global_reference_handle("_SESSION")
+            .expect("session global must publish in the native plane")
+            .expect("session global must have one canonical reference");
+        let committed = cold
+            .encode_native_array_owner(cold.session.committed_data())
+            .expect("committed session payload must fit the native arena");
+        fast.session = NativeSessionCapability {
+            control: std::ptr::from_mut(cold.session.native_control_mut()),
+            global_reference: session_reference,
+            committed,
+            has_loader: u8::from(cold.options.runtime_context.session_loader.is_some()),
+            has_id_generator: u8::from(cold.options.runtime_context.session_id_generator.is_some()),
+        };
+        cold.prepare_trusted_static_locals();
+        cold.prepare_trusted_static_properties();
+        cold.prepare_trusted_class_plans();
+        cold.prepare_trusted_declared_properties();
+        cold.prepare_trusted_instanceof_plans();
+        cold.prepare_trusted_exception_routes();
+        if cold.include_child {
+            cold.republish_transferred_dynamic_units()
+                .expect("transferred native units must publish before include execution");
+        }
+        Self { cold, _fast: fast }
+    }
+}
+
+impl<'a> std::ops::Deref for NativeRequestOwner<'a> {
+    type Target = NativeRequestColdState<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        self.cold.as_ref()
+    }
+}
+
+impl<'a> std::ops::DerefMut for NativeRequestOwner<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.cold.as_mut()
+    }
+}
+
 pub(in crate::vm) struct NativeRequestColdState<'a> {
     pub(super) compiled: crate::compiled_unit::CompiledUnit,
     pub(super) unit: ActiveNativeUnit,

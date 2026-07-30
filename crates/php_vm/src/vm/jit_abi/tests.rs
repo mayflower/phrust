@@ -48,7 +48,7 @@ fn fixed_callable_plan_publishes_walk_reference_and_return_contract() {
     builder.register_function_name("walk_callback", callback);
 
     let compiled = crate::compiled_unit::CompiledUnit::new(builder.finish());
-    let plan = super::native_fixed_callable_plan(&compiled, callback, false)
+    let plan = crate::native_exact::native_fixed_callable_plan(&compiled, callback, false)
         .expect("walk callback has one fixed native contract");
     assert_eq!(plan.visible_arity, 3);
     assert!(plan.first_parameter_by_reference);
@@ -3958,6 +3958,10 @@ fn exact_native_tree_has_a_compiler_enforced_cold_state_firewall() {
             include_str!("native/fast_state_impl.rs"),
         ),
         (
+            "native/capability_impl.rs",
+            include_str!("native/capability_impl.rs"),
+        ),
+        (
             "native/exact_call_dispatch.rs",
             include_str!("native/exact_call_dispatch.rs"),
         ),
@@ -4006,7 +4010,12 @@ fn cold_request_state_is_physically_outside_the_common_native_abi_source() {
     let common = include_str!("../jit_abi.rs");
     let cold = include_str!("cold_request_state.rs");
     assert!(!common.contains("struct NativeRequestColdState"));
+    assert!(!common.contains("struct NativeRequestOwner"));
+    assert!(!common.contains("impl<'a> NativeRequestOwner"));
+    assert!(!common.contains("fn published("));
     assert!(cold.contains("struct NativeRequestColdState"));
+    assert!(cold.contains("struct NativeRequestOwner"));
+    assert!(cold.contains("impl<'a> NativeRequestOwner"));
     assert!(!cold.contains("php_runtime::api::Value"));
     assert!(!cold.contains("decode_baseline_value"));
     assert!(!cold.contains("encode_baseline_value"));

@@ -45,7 +45,7 @@ impl NativeFunctionNameScope {
         }
     }
 
-    pub(super) fn contains(&self, name: &str) -> bool {
+    pub(crate) fn contains(&self, name: &str) -> bool {
         let mut scope = Some(self);
         while let Some(current) = scope {
             if current.names.contains(name) {

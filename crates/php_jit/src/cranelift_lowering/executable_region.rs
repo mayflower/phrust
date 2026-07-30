@@ -949,14 +949,28 @@ fn publish_total_fixed_builtin_plan(
         operand_ownership.push(ownership);
     }
 
-    // Every exact call receives a fixed result owner, a bounded small-array
-    // envelope, and a native string block before entry. Input-dependent
-    // string/array requirements added by the family classifier extend these
-    // fixed minima below; allocation failure inside an admitted handler is
-    // therefore an ABI contract violation rather than a runtime fallback.
-    const FIXED_RESULT_VALUES: usize = 8;
-    const FIXED_RESULT_ENTRIES: usize = 16;
-    const FIXED_RESULT_STRING_BYTES: usize = 4096;
+    // Publication reserves only the representation resources that the
+    // selected family can actually produce. Direct predicates return an
+    // immediate encoded boolean and therefore must not acquire an allocator
+    // dependency merely because they are also members of the exact-builtin
+    // catalogue.
+    const EXACT_RESULT_VALUES: usize = 8;
+    const EXACT_RESULT_ENTRIES: usize = 16;
+    const EXACT_RESULT_STRING_BYTES: usize = 4096;
+    let direct_immediate_result = stable_builtin_type_predicate(&call.target).is_some()
+        || stable_builtin_string_predicate(&call.target).is_some()
+        || stable_builtin_array_key_exists(&call.target)
+        || stable_builtin_array_is_list(&call.target);
+    let (reserved_value_slots, reserved_array_entries, reserved_string_bytes) =
+        if direct_immediate_result {
+            (0, 0, 0)
+        } else {
+            (
+                EXACT_RESULT_VALUES,
+                EXACT_RESULT_ENTRIES,
+                EXACT_RESULT_STRING_BYTES,
+            )
+        };
     let provided_arity = call.args.len();
     let native_arity = if call.variadic {
         provided_arity
@@ -1012,13 +1026,13 @@ fn publish_total_fixed_builtin_plan(
         .collect();
     admission.fixed_value_allocations = admission
         .fixed_value_allocations
-        .saturating_add(FIXED_RESULT_VALUES);
+        .saturating_add(reserved_value_slots);
     admission.fixed_array_entries = admission
         .fixed_array_entries
-        .saturating_add(FIXED_RESULT_ENTRIES);
+        .saturating_add(reserved_array_entries);
     admission.fixed_string_bytes = admission
         .fixed_string_bytes
-        .saturating_add(FIXED_RESULT_STRING_BYTES);
+        .saturating_add(reserved_string_bytes);
     admission.fixed_builtin_plans.insert(
         continuation_id,
         NativeFixedBuiltinPublicationPlan {
@@ -1036,9 +1050,9 @@ fn publish_total_fixed_builtin_plan(
             frame,
             callback,
             semantic_outcomes: NATIVE_EXACT_TOTAL_OUTCOMES,
-            reserved_value_slots: FIXED_RESULT_VALUES,
-            reserved_array_entries: FIXED_RESULT_ENTRIES,
-            reserved_string_bytes: FIXED_RESULT_STRING_BYTES,
+            reserved_value_slots,
+            reserved_array_entries,
+            reserved_string_bytes,
         },
     );
     Ok(())
@@ -1054,19 +1068,11 @@ fn optimizing_admission_for_region(
     if region.compile_metadata.tier != NativeCompilerTier::Optimizing {
         return Ok(NativeOptimizingAdmission::default());
     }
-    // Scalar result encodings are bounded by the static instruction graph.
-    // Reserve a conservative fixed number of direct descriptors per
-    // instruction before entering the region; array/callback loops add their
-    // separate length-dependent budgets below.
-    let instruction_count = region
-        .blocks
-        .iter()
-        .map(|block| block.instructions.len())
-        .sum::<usize>();
-    let mut admission = NativeOptimizingAdmission {
-        fixed_value_allocations: instruction_count.saturating_mul(4),
-        ..NativeOptimizingAdmission::default()
-    };
+    // Every allocation is charged by the family classifier that publishes
+    // its total output plan below. A graph-wide per-instruction allowance
+    // made immediate-only regions depend on allocator state and concealed
+    // missing family plans behind an arbitrary warm-path budget.
+    let mut admission = NativeOptimizingAdmission::default();
     if region
         .exception_regions
         .iter()
@@ -8945,13 +8951,6 @@ pub(super) fn compile_region_graph_native(
                 )
             })
     });
-    let needs_baseline_builtin_dispatch = baseline_helper_imports
-        && regions.values().any(|region| {
-            region_contains(region, |kind| {
-                matches!(kind, RegionInstructionKind::NativeCall(call)
-                    if baseline_builtin_helper_id(&call.target).is_some())
-            })
-        });
     let needs_exact_symbol_query: [bool; StableSymbolQueryBuiltin::COUNT] =
         std::array::from_fn(|index| {
             !baseline_helper_imports
@@ -9574,15 +9573,6 @@ pub(super) fn compile_region_graph_native(
         ));
     }
     if baseline_helper_imports
-        && needs_baseline_builtin_dispatch
-        && runtime_helpers.baseline_builtin_dispatch == 0
-    {
-        return Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_NATIVE_BUILTIN_DISPATCH",
-            "direct builtin call requires the stable-ID native builtin dispatcher",
-        ));
-    }
-    if baseline_helper_imports
         && needs_semantic_dispatch
         && runtime_helpers.baseline_semantic_dispatch == 0
     {
@@ -9599,7 +9589,6 @@ pub(super) fn compile_region_graph_native(
         ));
     }
     let baseline_call_symbol = BASELINE_NATIVE_CALL_DISPATCH_SYMBOL.to_owned();
-    let native_builtin_dispatch_symbol = BASELINE_NATIVE_BUILTIN_DISPATCH_SYMBOL.to_owned();
     let baseline_semantic_dispatch_symbol = BASELINE_NATIVE_SEMANTIC_DISPATCH_SYMBOL.to_owned();
     let native_function_resolve_symbol = NATIVE_FUNCTION_RESOLVE_SYMBOL.to_owned();
     let native_dynamic_code_symbol = NATIVE_DYNAMIC_CODE_SYMBOL.to_owned();
@@ -10284,12 +10273,6 @@ pub(super) fn compile_region_graph_native(
             ) || matches!(kind, RegionInstructionKind::NativeCall(call) if stable_builtin_length(&call.target).is_some())
         })
     });
-    let needs_string_predicate = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(kind, RegionInstructionKind::NativeCall(call)
-                if stable_builtin_string_predicate(&call.target).is_some())
-        })
-    });
     let needs_runtime_fatal = regions.values().any(|region| {
         region_contains(region, |kind| {
             matches!(kind, RegionInstructionKind::RuntimeFatal { .. })
@@ -10358,7 +10341,6 @@ pub(super) fn compile_region_graph_native(
     let needs_truthy = baseline_helper_imports && needs_truthy;
     let needs_type_predicate = baseline_helper_imports && needs_type_predicate;
     let needs_stable_length = baseline_helper_imports && needs_stable_length;
-    let needs_string_predicate = baseline_helper_imports && needs_string_predicate;
     let needs_runtime_fatal = baseline_helper_imports && needs_runtime_fatal;
     let mut imports = vec![(
         "region-runtime-helper-abi".to_owned(),
@@ -10368,12 +10350,6 @@ pub(super) fn compile_region_graph_native(
         imports.push((
             baseline_call_symbol.clone(),
             runtime_helpers.baseline_call_dispatch,
-        ));
-    }
-    if needs_baseline_builtin_dispatch {
-        imports.push((
-            native_builtin_dispatch_symbol.clone(),
-            runtime_helpers.baseline_builtin_dispatch,
         ));
     }
     for builtin in StableSymbolQueryBuiltin::all() {
@@ -11537,12 +11513,6 @@ pub(super) fn compile_region_graph_native(
             runtime_helpers.native_stable_length,
             test_native_stable_length_fallback as *const () as usize,
             "phrust_native_stable_length",
-        ),
-        (
-            needs_string_predicate,
-            runtime_helpers.native_string_predicate,
-            test_native_string_predicate_fallback as *const () as usize,
-            "phrust_native_string_predicate",
         ),
         (
             needs_runtime_fatal,
@@ -13455,27 +13425,6 @@ pub(super) fn compile_region_graph_native(
                 2,
                 || helper_address("phrust_native_dynamic_property_test_slot"),
             )?;
-            if needs_baseline_builtin_dispatch {
-                let mut signature = module.make_signature();
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(pointer_type));
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(pointer_type));
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(pointer_type));
-                signature.params.push(AbiParam::new(pointer_type));
-                signature.returns.push(AbiParam::new(types::I32));
-                native_operations.builtin_dispatch = Some(declare_native_helper(
-                    module,
-                    &native_builtin_dispatch_symbol,
-                    &signature,
-                    helper_address(&native_builtin_dispatch_symbol),
-                )?);
-            }
             if needs_semantic_dispatch {
                 let mut signature = module.make_signature();
                 signature.params.push(AbiParam::new(types::I64));
@@ -13786,14 +13735,6 @@ pub(super) fn compile_region_graph_native(
                     "phrust_native_stable_length",
                     3,
                     helper_address("phrust_native_stable_length"),
-                )?);
-            }
-            if needs_string_predicate {
-                native_operations.string_predicate = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_string_predicate",
-                    2,
-                    helper_address("phrust_native_string_predicate"),
                 )?);
             }
             if needs_runtime_fatal {
@@ -19615,9 +19556,6 @@ fn define_region_graph_function(
                 .map(NativeHelper::with_inline_runtime_view);
             native_operations.foreach_next = native_operations
                 .foreach_next
-                .map(NativeHelper::with_inline_runtime_view);
-            native_operations.string_predicate = native_operations
-                .string_predicate
                 .map(NativeHelper::with_inline_runtime_view);
         }
         let (arguments, resume_id) = if region.compile_metadata.tier == NativeCompilerTier::Baseline

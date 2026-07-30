@@ -1862,6 +1862,19 @@ fn fixed_function_result_fact(name: &str) -> Option<SsaValueFact> {
             .with_integer_range(SsaIntegerRange { minimum, maximum })
     };
     match name.as_str() {
+        // These fixed builtins have a publication-total boolean ABI. Recording
+        // the result class at the producer lets a following branch remain in
+        // the optimizing region without a generic truthiness classifier.
+        "array_key_exists" | "key_exists" | "str_contains" | "str_starts_with"
+        | "str_ends_with" | "is_null" | "is_bool" | "is_int" | "is_integer" | "is_long"
+        | "is_float" | "is_double" | "is_real" | "is_string" | "is_array" | "is_object"
+        | "is_resource" | "is_scalar" | "is_numeric" | "is_countable" | "is_iterable"
+        | "ctype_alnum" | "ctype_alpha" | "ctype_cntrl" | "ctype_digit" | "ctype_graph"
+        | "ctype_lower" | "ctype_print" | "ctype_punct" | "ctype_space" | "ctype_upper"
+        | "ctype_xdigit" => Some(SsaValueFact::known(
+            SsaValueClass::Bool,
+            SsaOwnership::Owned,
+        )),
         // The byte-compare ABIs return a C-compatible signed comparison
         // result. Keeping the complete i32 range remains conservative while
         // proving that short reduction trees cannot overflow a PHP integer.

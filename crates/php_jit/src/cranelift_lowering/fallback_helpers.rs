@@ -681,16 +681,6 @@ pub(super) extern "C" fn test_native_stable_length_fallback(
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
 }
 
-pub(super) extern "C" fn test_native_string_predicate_fallback(
-    _runtime: *mut std::ffi::c_void,
-    _op: u32,
-    _haystack: i64,
-    _needle: i64,
-    _out: *mut i64,
-) -> i32 {
-    crate::JitCallStatus::ABI_MISMATCH.0 as i32
-}
-
 pub(super) extern "C" fn test_native_runtime_fatal_fallback(
     _runtime: *mut std::ffi::c_void,
     _function: u32,

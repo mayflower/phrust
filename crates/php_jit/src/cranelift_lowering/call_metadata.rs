@@ -73,23 +73,6 @@ pub(super) fn baseline_builtin_helper_id(target: &RegionCallTarget) -> Option<u3
         .filter(|helper_id| *helper_id != 0)
 }
 
-/// Baseline-only dense identity consumed by the compatibility dispatcher.
-///
-/// Keeping this name explicitly baseline-scoped prevents a future exact
-/// optimizer family from accidentally selecting the generic executor.
-pub(super) fn baseline_builtin_dense_id(target: &RegionCallTarget) -> Option<u32> {
-    let RegionCallTarget::Function { name, .. } = target else {
-        return None;
-    };
-    let normalized = name.trim_start_matches('\\').to_ascii_lowercase();
-    if normalized.contains('\\') {
-        return None;
-    }
-    php_runtime::api::BuiltinRegistry::new()
-        .get(&normalized)
-        .map(php_runtime::api::BuiltinEntry::dense_id)
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StableTypePredicateBuiltin {
     Null,
@@ -2754,12 +2737,6 @@ pub(super) enum StableStringPredicateBuiltin {
     Contains,
     StartsWith,
     EndsWith,
-}
-
-impl StableStringPredicateBuiltin {
-    pub(super) const fn baseline_opcode(self) -> u32 {
-        self as u32
-    }
 }
 
 pub(super) fn stable_builtin_string_predicate(

@@ -4,6 +4,77 @@
 //! before generated code executes. Per-invocation validation is forbidden.
 
 use super::*;
+
+pub(super) fn publish_native_symbol_query(
+    context: &NativeRequestColdState<'_>,
+) -> NativeSymbolQueryCapability {
+    NativeSymbolQueryCapability {
+        active_compiled: std::ptr::from_ref(&context.compiled),
+        current_dynamic_unit: std::ptr::from_ref(&context.current_dynamic_unit),
+        dynamic_units: std::ptr::from_ref(&context.dynamic_units),
+        dynamic_functions: std::ptr::from_ref(&context.dynamic_functions),
+        external_functions: std::ptr::from_ref(&context.external_functions),
+        external_class_units: std::ptr::from_ref(&context.external_class_units),
+        deployment_functions: std::ptr::from_ref(&context.deployment_functions),
+        deployment_classes: std::ptr::from_ref(&context.deployment_classes),
+        visible_function_names: std::ptr::from_ref(&context.visible_function_names),
+        native_dynamic_constants: std::ptr::from_ref(&context.native_dynamic_constants)
+            as *mut std::collections::BTreeMap<String, i64>,
+        trusted_dynamic_constant_sites: std::ptr::from_ref(&context.trusted_dynamic_constant_sites),
+        dynamic_classes: std::ptr::from_ref(&context.dynamic_classes),
+        class_aliases: std::ptr::from_ref(&context.class_aliases),
+    }
+}
+
+pub(super) fn publish_native_request_query(
+    context: &NativeRequestColdState<'_>,
+) -> NativeRequestQueryCapability {
+    NativeRequestQueryCapability {
+        environment: std::ptr::from_ref(&context.environment),
+        included_files: std::ptr::from_ref(&context.included_files),
+        sapi_name: std::ptr::from_ref(&context.options.runtime_context.sapi_name),
+    }
+}
+
+pub(super) fn publish_native_configuration(
+    context: &NativeRequestColdState<'_>,
+) -> NativeConfigurationCapability {
+    NativeConfigurationCapability {
+        ini_registry: std::ptr::from_ref(&context.ini_registry)
+            as *mut php_runtime::api::IniRegistry,
+        include_path: std::ptr::from_ref(&context.include_path)
+            as *mut Arc<Vec<std::path::PathBuf>>,
+        display_errors: std::ptr::from_ref(&context.display_errors) as *mut bool,
+        default_timezone: std::ptr::from_ref(&context.default_timezone) as *mut String,
+    }
+}
+
+pub(super) fn publish_native_http_response(
+    context: &NativeRequestColdState<'_>,
+) -> NativeHttpResponseCapability {
+    NativeHttpResponseCapability {
+        response: std::ptr::from_ref(&context.http_response)
+            as *mut php_runtime::api::RuntimeHttpResponseState,
+    }
+}
+
+pub(super) fn publish_native_execution_deadline(
+    context: &mut NativeRequestColdState<'_>,
+) -> NativeExecutionDeadlineCapability {
+    NativeExecutionDeadlineCapability {
+        deadline: std::ptr::from_ref(&context.execution_deadline_at),
+        diagnostic: std::ptr::from_mut(&mut context.diagnostic),
+    }
+}
+
+pub(super) fn publish_native_frame_arena(
+    context: &mut NativeRequestColdState<'_>,
+) -> NativeFrameArenaCapability {
+    NativeFrameArenaCapability {
+        arena: std::ptr::from_mut(&mut context.native_frame_arena),
+        diagnostic: std::ptr::from_mut(&mut context.diagnostic),
+    }
+}
 use php_runtime::api::PhpString;
 use php_runtime::api::Value;
 

@@ -16,12 +16,11 @@ use super::{
     StableResourceQueryBuiltin, StableSerializationBuiltin, StableSessionBuiltin,
     StableStringRewriteBuiltin, StableStringSearchCompareBuiltin, StableSymbolQueryBuiltin,
     StableTokenizerBuiltin, StableTypePredicateBuiltin, StableUrlQueryBuiltin,
-    baseline_builtin_dense_id, build_trivial_add_clif_smoke, native_dim_operation,
-    native_local_store_operation, ordinary_local_fast_path, runtime_helper_abi_hash,
-    stable_builtin_array_aggregate, stable_builtin_array_constructor, stable_builtin_array_set,
-    stable_builtin_array_shape, stable_builtin_length, stable_builtin_request_query,
-    stable_builtin_symbol_query, stable_builtin_type_predicate,
-    test_native_execution_poll_fallback,
+    build_trivial_add_clif_smoke, native_dim_operation, native_local_store_operation,
+    ordinary_local_fast_path, runtime_helper_abi_hash, stable_builtin_array_aggregate,
+    stable_builtin_array_constructor, stable_builtin_array_set, stable_builtin_array_shape,
+    stable_builtin_length, stable_builtin_request_query, stable_builtin_symbol_query,
+    stable_builtin_type_predicate, test_native_execution_poll_fallback,
 };
 use crate::region_ir::{
     BaselineRegionBuilder, CompileMetadata, NativeCompilerTier, RegionCallTarget,
@@ -369,15 +368,11 @@ fn stable_builtin_identity_survives_symbolic_function_metadata() {
         stable_builtin_type_predicate(&predicate),
         Some(StableTypePredicateBuiltin::String)
     );
-    assert!(baseline_builtin_dense_id(&predicate).is_some());
-
     let namespaced = RegionCallTarget::Function {
         name: "Vendor\\is_string".to_owned(),
         function: Some(FunctionId::new(18)),
     };
     assert_eq!(stable_builtin_type_predicate(&namespaced), None);
-    assert_eq!(baseline_builtin_dense_id(&namespaced), None);
-
     let define = RegionCallTarget::Function {
         name: "define".to_owned(),
         function: Some(FunctionId::new(19)),
@@ -1260,7 +1255,27 @@ fn optimizing_fixed_arity_exact_calls_have_no_shared_control_adapter() {
             "optimizing lowering retained deleted fixed-arity adapter {deleted}"
         );
     }
-    assert!(source.contains("macro_rules! emit_total_exact_native_value"));
+    for deleted in [
+        "macro_rules! emit_total_exact_native_value",
+        "macro_rules! emit_total_exact_native_value_with_cleanup",
+    ] {
+        assert!(
+            !source.contains(deleted),
+            "optimizing lowering retained generic exact-control adapter {deleted}"
+        );
+    }
+    for family in [
+        "macro_rules! emit_total_exact_builtin_value",
+        "macro_rules! emit_total_exact_scalar_value",
+        "macro_rules! emit_total_exact_runtime_value",
+        "emit_exact_throw",
+        "emit_exact_runtime_error",
+    ] {
+        assert!(
+            source.contains(family),
+            "optimizing lowering omitted total family outcome path {family}"
+        );
+    }
     assert!(source.contains("JitCallStatus::ABI_MISMATCH"));
     assert!(source.contains("fn lower_optimizing_exact_argument_slice("));
     let publication = include_str!("executable_region.rs");

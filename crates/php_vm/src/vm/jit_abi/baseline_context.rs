@@ -267,8 +267,8 @@ pub(in crate::vm) fn activate_native_context(
             std::ptr::from_mut(context.builtin_request_state.json_mut());
         (*context.fast_state).pcre_state =
             std::ptr::from_mut(context.builtin_request_state.pcre_mut());
-        (*context.fast_state).configuration = NativeConfigurationCapability::published(context);
-        (*context.fast_state).http_response = NativeHttpResponseCapability::published(context);
+        (*context.fast_state).configuration = publish_native_configuration(context);
+        (*context.fast_state).http_response = publish_native_http_response(context);
         (*context.fast_state).cwd = std::ptr::from_mut(&mut context.cwd);
         (*context.fast_state).filesystem_capabilities =
             std::ptr::from_ref(&context.options.runtime_context.filesystem);
@@ -280,10 +280,9 @@ pub(in crate::vm) fn activate_native_context(
         (*context.fast_state).direct_closure_handles =
             std::ptr::from_mut(&mut context.direct_closure_handles);
         (*context.fast_state).execution_scope = execution_scope;
-        (*context.fast_state).request_query = NativeRequestQueryCapability::published(context);
-        (*context.fast_state).execution_deadline =
-            NativeExecutionDeadlineCapability::published(context);
-        (*context.fast_state).frame_arena = NativeFrameArenaCapability::published(context);
+        (*context.fast_state).request_query = publish_native_request_query(context);
+        (*context.fast_state).execution_deadline = publish_native_execution_deadline(context);
+        (*context.fast_state).frame_arena = publish_native_frame_arena(context);
     }
     let runtime_view = php_jit::activate_native_runtime_view(view);
     let baseline_context = ActiveBaselineContext {

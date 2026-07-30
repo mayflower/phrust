@@ -11,7 +11,7 @@ pub use options::{NativeBlacklistMode, NativeOptimizationPolicy, VmOptions};
 pub use result::VmResult;
 
 use crate::compiled_unit::CompiledUnit;
-pub(crate) use jit_abi::native_fixed_callable_plan;
+pub(crate) use crate::native_exact::native_fixed_callable_plan;
 use jit_abi::{
     NativeRequestOwner, activate_native_context, jit_baseline_native_binary_abi,
     jit_baseline_native_builtin_dispatch_abi, jit_baseline_native_builtin_dispatch_diagnostic_abi,
