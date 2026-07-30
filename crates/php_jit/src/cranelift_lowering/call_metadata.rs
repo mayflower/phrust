@@ -4761,6 +4761,118 @@ pub(super) fn stable_builtin_get_defined_vars(target: &RegionCallTarget) -> bool
     !normalized.contains('\\') && normalized.eq_ignore_ascii_case("get_defined_vars")
 }
 
+/// Compile-time family identity for every fixed builtin whose implementation
+/// lives behind the exact native control ABI.
+///
+/// This value never enters generated code. Publication uses it to require one
+/// complete operand/resource/ownership plan before optimizing lowering is
+/// allowed to declare the family's fixed symbol.
+pub(super) fn stable_exact_control_builtin_family(
+    target: &RegionCallTarget,
+) -> Option<&'static str> {
+    if stable_builtin_symbol_query(target).is_some() {
+        Some("symbol-query")
+    } else if stable_builtin_pcre(target).is_some() {
+        Some("pcre")
+    } else if stable_builtin_json(target).is_some() {
+        Some("json")
+    } else if stable_builtin_format(target).is_some() {
+        Some("format")
+    } else if stable_builtin_hash(target).is_some() {
+        Some("hash")
+    } else if stable_builtin_byte_codec(target).is_some() {
+        Some("byte-codec")
+    } else if stable_builtin_string_search_compare(target).is_some() {
+        Some("string-search-compare")
+    } else if stable_builtin_string_rewrite(target).is_some() {
+        Some("string-rewrite")
+    } else if stable_builtin_html_codec(target).is_some() {
+        Some("html-codec")
+    } else if stable_builtin_url_query(target).is_some() {
+        Some("url-query")
+    } else if stable_builtin_array_aggregate(target).is_some() {
+        Some("array-aggregate")
+    } else if stable_builtin_recursive_array(target).is_some() {
+        Some("recursive-array")
+    } else if stable_builtin_array_sort(target).is_some() || stable_builtin_array_multisort(target)
+    {
+        Some("array-sort")
+    } else if stable_builtin_object_identity(target).is_some() {
+        Some("object-identity")
+    } else if stable_builtin_callable_query(target).is_some() {
+        Some("callable-query")
+    } else if stable_builtin_callback_handler(target).is_some()
+        || stable_builtin_autoload_callback(target).is_some()
+        || stable_builtin_shutdown_callback(target)
+    {
+        Some("callback-control")
+    } else if stable_builtin_serialization(target).is_some() {
+        Some("serialization")
+    } else if stable_builtin_tokenizer(target).is_some() {
+        Some("tokenizer")
+    } else if stable_builtin_mbstring(target).is_some() {
+        Some("mbstring")
+    } else if stable_builtin_bcmath(target).is_some() {
+        Some("bcmath")
+    } else if stable_builtin_filter(target).is_some() {
+        Some("filter")
+    } else if stable_builtin_session(target).is_some() {
+        Some("session")
+    } else if stable_builtin_object_vars(target).is_some() {
+        Some("object-vars")
+    } else if stable_builtin_class_metadata(target).is_some() {
+        Some("class-metadata")
+    } else if stable_builtin_class_lineage(target).is_some() {
+        Some("class-lineage")
+    } else if stable_builtin_extension_query(target).is_some() {
+        Some("extension-query")
+    } else if stable_builtin_memory_query(target).is_some() {
+        Some("memory-query")
+    } else if stable_builtin_gc(target).is_some() {
+        Some("gc")
+    } else if stable_builtin_resource_query(target).is_some() {
+        Some("resource-query")
+    } else if stable_builtin_error_state(target).is_some() {
+        Some("error-state")
+    } else if stable_builtin_settype(target) {
+        Some("settype")
+    } else if stable_builtin_configuration(target).is_some() {
+        Some("configuration")
+    } else if stable_builtin_http_response(target).is_some() {
+        Some("http-response")
+    } else if stable_builtin_cookie(target).is_some() {
+        Some("cookie")
+    } else if stable_builtin_clock(target).is_some() {
+        Some("clock")
+    } else if stable_builtin_date(target).is_some() {
+        Some("date")
+    } else if stable_builtin_random(target).is_some() {
+        Some("random")
+    } else if stable_builtin_request_query(target).is_some() {
+        Some("request-query")
+    } else if stable_builtin_declaration_inventory(target).is_some()
+        || stable_builtin_constant_inventory(target)
+    {
+        Some("declaration-inventory")
+    } else if stable_builtin_compact(target) || stable_builtin_get_defined_vars(target) {
+        Some("frame-values")
+    } else if stable_builtin_frame_introspection(target).is_some() {
+        Some("frame-introspection")
+    } else if stable_builtin_base_conversion(target).is_some() {
+        Some("base-conversion")
+    } else if stable_builtin_network_address(target).is_some() {
+        Some("network-address")
+    } else if stable_builtin_compression_codec(target).is_some() {
+        Some("compression-codec")
+    } else if stable_builtin_path(target).is_some() {
+        Some("path")
+    } else if stable_builtin_output_buffer(target).is_some() {
+        Some("output-buffer")
+    } else {
+        None
+    }
+}
+
 /// Non-callback array set and overlay operations over authoritative direct
 /// entries. Callback comparators and recursive overlays remain distinct
 /// baseline semantics instead of being smuggled through this fixed family.

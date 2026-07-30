@@ -474,7 +474,7 @@ fn optimizing_loop_imports_only_exact_execution_deadline_poll() {
 }
 
 #[test]
-fn optimizing_stream_family_imports_only_exact_resource_handlers() {
+fn optimizing_stream_chain_rejects_unproved_resource_result_before_entry() {
     let mut builder = IrBuilder::new(UnitId::new(4_243));
     let file = builder.add_file("optimizing-exact-resource-stream.php");
     let span = IrSpan::new(file, 0, 1);
@@ -554,28 +554,15 @@ fn optimizing_stream_family_imports_only_exact_resource_handlers() {
             ..crate::JitRuntimeHelperAddresses::default()
         },
     });
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("optimizing exact resource handle");
-    assert_optimizing_artifact(&handle);
-    let helpers = handle
-        .relocatable_code()
-        .expect("optimizer relocatable artifact")
-        .relocations
-        .iter()
-        .filter_map(|relocation| match &relocation.target {
-            crate::JitRelocatableTarget::Helper(symbol) => Some(symbol.as_str()),
-            crate::JitRelocatableTarget::InternalFunction(_) => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        helpers,
-        vec![
-            "phrust_native_fopen",
-            "phrust_native_fwrite",
-            "phrust_native_fclose",
-        ]
+    assert!(
+        matches!(
+            &outcome.status,
+            JitCompileStatus::Rejected { reason }
+                if reason == "JIT_CRANELIFT_REJECT_FIXED_BUILTIN_VALUE_PLAN"
+        ),
+        "{outcome:?}"
     );
-    assert!(!helpers.contains(&"phrust_baseline_native_builtin_dispatch"));
+    assert!(outcome.handle.is_none());
 }
 
 #[test]
@@ -666,7 +653,7 @@ fn optimizing_output_buffer_family_imports_only_distinct_fixed_handlers() {
 }
 
 #[test]
-fn optimizing_complete_stream_io_family_imports_only_distinct_fixed_handlers() {
+fn optimizing_complete_stream_chain_rejects_unproved_resource_result_before_entry() {
     let mut builder = IrBuilder::new(UnitId::new(42_432));
     let file = builder.add_file("optimizing-exact-complete-stream-io.php");
     let span = IrSpan::new(file, 0, 1);
@@ -795,39 +782,15 @@ fn optimizing_complete_stream_io_family_imports_only_distinct_fixed_handlers() {
             ..crate::JitRuntimeHelperAddresses::default()
         },
     });
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("optimizing exact stream I/O handle");
-    assert_optimizing_artifact(&handle);
-    let helpers = handle
-        .relocatable_code()
-        .expect("optimizer relocatable artifact")
-        .relocations
-        .iter()
-        .filter_map(|relocation| match &relocation.target {
-            crate::JitRelocatableTarget::Helper(symbol) => Some(symbol.as_str()),
-            crate::JitRelocatableTarget::InternalFunction(_) => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        helpers,
-        vec![
-            "phrust_native_fopen",
-            "phrust_native_fwrite",
-            "phrust_native_fread",
-            "phrust_native_fgets",
-            "phrust_native_fgetc",
-            "phrust_native_feof",
-            "phrust_native_fflush",
-            "phrust_native_fseek",
-            "phrust_native_ftell",
-            "phrust_native_ftruncate",
-            "phrust_native_rewind",
-            "phrust_native_stream_get_contents",
-            "phrust_native_stream_copy_to_stream",
-            "phrust_native_fclose",
-        ]
+    assert!(
+        matches!(
+            &outcome.status,
+            JitCompileStatus::Rejected { reason }
+                if reason == "JIT_CRANELIFT_REJECT_FIXED_BUILTIN_VALUE_PLAN"
+        ),
+        "{outcome:?}"
     );
-    assert!(!helpers.contains(&"phrust_baseline_native_builtin_dispatch"));
+    assert!(outcome.handle.is_none());
 }
 
 #[test]
@@ -1271,6 +1234,50 @@ fn optimizing_format_family_imports_exact_handlers_without_adapter_cutoff() {
         vec!["phrust_native_sprintf", "phrust_native_number_format"]
     );
     assert!(!helpers.contains(&"phrust_baseline_native_builtin_dispatch"));
+}
+
+#[test]
+fn optimizing_fixed_arity_exact_calls_have_no_shared_control_adapter() {
+    let source = include_str!("../cranelift_lowering.rs");
+    for deleted in [
+        "fn lower_optimizing_exact_zero_runtime_builtin",
+        "fn lower_optimizing_exact_unary_runtime_builtin",
+        "fn lower_optimizing_exact_ternary_runtime_builtin",
+        "fn lower_optimizing_exact_quaternary_runtime_builtin",
+        "fn lower_optimizing_exact_compact_runtime_builtin",
+        "fn lower_optimizing_exact_five_runtime_builtin",
+        "fn lower_optimizing_exact_six_runtime_builtin",
+        "fn lower_optimizing_exact_seven_runtime_builtin",
+        "fn lower_optimizing_exact_nine_runtime_builtin",
+        "fn lower_optimizing_exact_argument_slice_builtin",
+        "fn lower_optimizing_exact_shutdown_callback_builtin",
+        "fn lower_optimizing_exact_frame_introspection",
+        "macro_rules! emit_exact_native_control_value",
+        "macro_rules! emit_exact_native_control_value_with_cleanup",
+    ] {
+        assert!(
+            !source.contains(deleted),
+            "optimizing lowering retained deleted fixed-arity adapter {deleted}"
+        );
+    }
+    assert!(source.contains("macro_rules! emit_total_exact_native_value"));
+    assert!(source.contains("JitCallStatus::ABI_MISMATCH"));
+    assert!(source.contains("fn lower_optimizing_exact_argument_slice("));
+    let publication = include_str!("executable_region.rs");
+    for contract in [
+        "NativeExactCallFramePlan",
+        "VariadicSlice",
+        "ShutdownCallback",
+        "FrameIntrospection",
+        "cleanup_owned_arguments",
+        "NativeExactSemanticOutcome::RuntimeError",
+        "NativeExactSemanticOutcome::AbiMismatch",
+    ] {
+        assert!(
+            publication.contains(contract),
+            "publication omitted exact call contract {contract}"
+        );
+    }
 }
 
 #[test]
@@ -3853,9 +3860,9 @@ fn optimizing_callable_query_family_imports_only_fixed_native_handler() {
         FunctionFlags::default(),
         span,
     );
-    let callable = untyped_param(&mut builder, function, "callable");
-    let syntax_only = untyped_param(&mut builder, function, "syntax_only");
-    let callable_name = untyped_param(&mut builder, function, "callable_name");
+    let callable = typed_callable_param(&mut builder, function, "callable");
+    let syntax_only = typed_bool_param(&mut builder, function, "syntax_only");
+    let callable_name = typed_string_reference_param(&mut builder, function, "callable_name");
     let block = builder.append_block(function);
     let mut arguments = Vec::new();
     for (local, by_ref_local) in [
@@ -3935,7 +3942,7 @@ fn optimizing_callback_handler_family_imports_only_dedicated_native_handlers() {
             FunctionFlags::default(),
             span,
         );
-        let callback = untyped_param(&mut builder, function, "callback");
+        let callback = typed_callable_param(&mut builder, function, "callback");
         let block = builder.append_block(function);
         let mut arguments = Vec::new();
         if matches!(
@@ -4024,7 +4031,7 @@ fn optimizing_autoload_callback_family_imports_only_dedicated_native_handlers() 
             FunctionFlags::default(),
             span,
         );
-        let callback = untyped_param(&mut builder, function, "callback");
+        let callback = typed_callable_param(&mut builder, function, "callback");
         let block = builder.append_block(function);
         let mut arguments = Vec::new();
         if !matches!(builtin, StableAutoloadCallbackBuiltin::Functions) {
@@ -4109,8 +4116,8 @@ fn optimizing_shutdown_callback_imports_only_dedicated_native_slice_handler() {
         FunctionFlags::default(),
         span,
     );
-    let callback = untyped_param(&mut builder, function, "callback");
-    let argument = untyped_param(&mut builder, function, "argument");
+    let callback = typed_callable_param(&mut builder, function, "callback");
+    let argument = typed_int_param(&mut builder, function, "argument");
     let block = builder.append_block(function);
     let mut arguments = Vec::new();
     for local in [callback, argument] {
@@ -4658,7 +4665,7 @@ fn optimizing_bcmath_family_imports_only_fixed_native_handlers() {
 }
 
 #[test]
-fn optimizing_filter_family_imports_only_fixed_native_handlers() {
+fn optimizing_filter_family_admits_only_published_argument_shapes() {
     for (ordinal, builtin) in StableFilterBuiltin::all().into_iter().enumerate() {
         let name = builtin.symbol().trim_start_matches("phrust_native_");
         let mut builder = IrBuilder::new(UnitId::new(4_330 + ordinal as u32));
@@ -4733,6 +4740,18 @@ fn optimizing_filter_family_imports_only_fixed_native_handlers() {
                 ..crate::JitRuntimeHelperAddresses::default()
             },
         });
+        if arity != 0 {
+            assert!(
+                matches!(
+                    &outcome.status,
+                    JitCompileStatus::Rejected { reason }
+                        if reason == "JIT_CRANELIFT_REJECT_FIXED_BUILTIN_VALUE_PLAN"
+                ),
+                "{outcome:?}"
+            );
+            assert!(outcome.handle.is_none());
+            continue;
+        }
         assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
         let handle = outcome
             .handle
@@ -4754,7 +4773,7 @@ fn optimizing_filter_family_imports_only_fixed_native_handlers() {
 }
 
 #[test]
-fn optimizing_session_family_imports_only_fixed_native_handlers() {
+fn optimizing_session_family_admits_only_published_argument_shapes() {
     for (ordinal, builtin) in StableSessionBuiltin::all().into_iter().enumerate() {
         let name = builtin.symbol().trim_start_matches("phrust_native_");
         let mut builder = IrBuilder::new(UnitId::new(4_350 + ordinal as u32));
@@ -4845,6 +4864,18 @@ fn optimizing_session_family_imports_only_fixed_native_handlers() {
                 ..crate::JitRuntimeHelperAddresses::default()
             },
         });
+        if arity != 0 {
+            assert!(
+                matches!(
+                    &outcome.status,
+                    JitCompileStatus::Rejected { reason }
+                        if reason == "JIT_CRANELIFT_REJECT_FIXED_BUILTIN_VALUE_PLAN"
+                ),
+                "{outcome:?}"
+            );
+            assert!(outcome.handle.is_none());
+            continue;
+        }
         assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
         let handle = outcome
             .handle
@@ -6065,15 +6096,6 @@ fn optimizing_filesystem_capability_family_imports_only_fixed_native_handlers() 
             .handle
             .expect("optimizing exact native filesystem-capability handle");
         assert_optimizing_artifact(&handle);
-        assert!(
-            handle
-                .region_state_metadata()
-                .expect("optimizer production lowering metadata")
-                .production_lowering
-                .iter()
-                .all(|row| row.operation != "LoadLocal"),
-            "{name} retained a last-use parameter fallback"
-        );
         let helpers = handle
             .relocatable_code()
             .expect("optimizer relocatable artifact")
@@ -17646,6 +17668,64 @@ fn typed_string_param(builder: &mut IrBuilder, function: FunctionId, name: &str)
     local
 }
 
+fn typed_bool_param(builder: &mut IrBuilder, function: FunctionId, name: &str) -> LocalId {
+    let local = builder.intern_local(function, name);
+    builder.push_param(
+        function,
+        IrParam {
+            name: name.to_owned(),
+            local,
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Bool),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    local
+}
+
+fn typed_callable_param(builder: &mut IrBuilder, function: FunctionId, name: &str) -> LocalId {
+    let local = builder.intern_local(function, name);
+    builder.push_param(
+        function,
+        IrParam {
+            name: name.to_owned(),
+            local,
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::Callable),
+            by_ref: false,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    local
+}
+
+fn typed_string_reference_param(
+    builder: &mut IrBuilder,
+    function: FunctionId,
+    name: &str,
+) -> LocalId {
+    let local = builder.intern_local(function, name);
+    builder.push_param(
+        function,
+        IrParam {
+            name: name.to_owned(),
+            local,
+            required: true,
+            default: None,
+            type_: Some(IrReturnType::String),
+            by_ref: true,
+            variadic: false,
+            attributes: Vec::new(),
+        },
+    );
+    local
+}
+
 fn typed_array_param(builder: &mut IrBuilder, function: FunctionId, name: &str) -> LocalId {
     let local = builder.intern_local(function, name);
     builder.push_param(
@@ -17799,8 +17879,7 @@ fn optimizing_known_integer_condition_consumes_immediate_and_direct_payload() {
 }
 
 #[test]
-fn optimizing_unknown_scalar_truthiness_is_direct_for_authoritative_values() {
-    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
+fn optimizing_unknown_scalar_truthiness_is_rejected_before_entry() {
     let mut builder = IrBuilder::new(UnitId::new(4_210));
     let file = builder.add_file("optimizing-guarded-truthiness.php");
     let span = IrSpan::new(file, 0, 1);
@@ -17824,95 +17903,20 @@ fn optimizing_unknown_scalar_truthiness_is_direct_for_authoritative_values() {
         compile: &JitCompileRequest::new("cl.optimizing.guarded-truthiness").with_opt_level(2),
         unit: Some(&unit),
         function: Some(function),
-        runtime_helpers: crate::JitRuntimeHelperAddresses {
-            native_truthy: forbidden_truthy as *const () as usize,
-            ..crate::JitRuntimeHelperAddresses::default()
-        },
+        runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
     });
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("guarded truthiness handle");
-    assert_optimizing_artifact(&handle);
-    let metadata = handle.region_state_metadata().expect("native metadata");
-    let conditional = metadata
-        .production_lowering
-        .iter()
-        .find(|entry| entry.operation == "JumpIf")
-        .expect("conditional lowering row");
-    assert_eq!(
-        conditional.class,
-        crate::JitProductionLoweringClass::DirectClif
+    assert!(
+        matches!(
+            &outcome.status,
+            JitCompileStatus::Rejected { reason }
+                if reason.contains("TRUTHINESS_PUBLICATION")
+        ),
+        "{outcome:?}"
     );
-    for (value, expected) in [
-        (0, 0),
-        (-17, 1),
-        (crate::jit_encode_constant(u32::MAX), 0),
-        (crate::jit_encode_constant(crate::JIT_VALUE_FALSE), 0),
-        (crate::jit_encode_constant(crate::JIT_VALUE_TRUE), 1),
-    ] {
-        assert_eq!(
-            handle
-                .invoke_i64(&[value], JIT_RUNTIME_ABI_HASH)
-                .expect("guarded truthiness execution"),
-            expected
-        );
-    }
-    let mut direct_slots = vec![crate::JitNativeValueSlot::default(); 11];
-    direct_slots[7] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_ARRAY,
-        flags: crate::JIT_NATIVE_ARRAY_VIEW_ABI_VERSION,
-        payload: 0,
-        ..crate::JitNativeValueSlot::default()
-    };
-    direct_slots[8] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_STRING,
-        flags: crate::JIT_NATIVE_STRING_VIEW_ABI_VERSION,
-        reserved: crate::JIT_NATIVE_STRING_VALUE_ZERO,
-        payload: 1,
-        ..crate::JitNativeValueSlot::default()
-    };
-    direct_slots[9] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_STRING,
-        flags: crate::JIT_NATIVE_STRING_VIEW_ABI_VERSION,
-        payload: 4,
-        ..crate::JitNativeValueSlot::default()
-    };
-    direct_slots[10] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_ARRAY,
-        flags: crate::JIT_NATIVE_ARRAY_VIEW_ABI_VERSION,
-        payload: 3,
-        ..crate::JitNativeValueSlot::default()
-    };
-    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
-        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
-        ..crate::JitNativeRuntimeView::default()
-    });
-    for (index, tag, expected) in [
-        (7, crate::JIT_VALUE_RUNTIME_ARRAY_TAG, 0),
-        (8, crate::JIT_VALUE_RUNTIME_STRING_TAG, 0),
-        (9, crate::JIT_VALUE_RUNTIME_STRING_TAG, 1),
-        (10, crate::JIT_VALUE_RUNTIME_ARRAY_TAG, 1),
-    ] {
-        let value = crate::jit_encode_typed_runtime_value(
-            crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + index,
-            tag,
-        );
-        assert_eq!(
-            handle
-                .invoke_i64(&[value], JIT_RUNTIME_ABI_HASH)
-                .expect("guarded runtime truthiness execution"),
-            expected
-        );
-    }
-    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 
 #[test]
-fn optimizing_reference_condition_reads_authoritative_payload_without_validation_block() {
+fn optimizing_reference_truthiness_is_rejected_before_entry() {
     let mut builder = IrBuilder::new(UnitId::new(42_100));
     let file = builder.add_file("optimizing-reference-truthiness.php");
     let span = IrSpan::new(file, 0, 1);
@@ -17931,102 +17935,21 @@ fn optimizing_reference_condition_reads_authoritative_payload_without_validation
     builder.terminate_return(function, truthy, Some(Operand::Constant(one)), span);
     builder.terminate_return(function, falsey, Some(Operand::Constant(zero)), span);
     let unit = builder.finish();
-
     let mut backend = CraneliftNativeCompiler;
     let outcome = backend.compile_region(&NativeCompileRequest {
         compile: &JitCompileRequest::new("cl.optimizing.reference-truthiness").with_opt_level(2),
         unit: Some(&unit),
         function: Some(function),
-        runtime_helpers: crate::JitRuntimeHelperAddresses {
-            native_truthy: forbidden_truthy as *const () as usize,
-            ..crate::JitRuntimeHelperAddresses::default()
-        },
+        runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
     });
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("reference truthiness handle");
-    assert_optimizing_artifact(&handle);
-    let condition = handle
-        .region_state_metadata()
-        .expect("reference truthiness metadata")
-        .production_lowering
-        .iter()
-        .find(|entry| entry.operation == "JumpIf")
-        .expect("reference condition lowering row");
-    assert_eq!(
-        condition.class,
-        crate::JitProductionLoweringClass::DirectClif
-    );
-    let helper_imports = handle
-        .relocatable_code()
-        .expect("reference truthiness relocations")
-        .relocations
-        .iter()
-        .filter_map(|relocation| match &relocation.target {
-            crate::JitRelocatableTarget::Helper(symbol) => Some(symbol.as_str()),
-            crate::JitRelocatableTarget::InternalFunction(_) => None,
-        })
-        .collect::<Vec<_>>();
     assert!(
-        helper_imports.is_empty(),
-        "authoritative reference truthiness imported helpers: {helper_imports:?}"
+        matches!(
+            &outcome.status,
+            JitCompileStatus::Rejected { reason }
+                if reason.contains("TRUTHINESS_PUBLICATION")
+        ),
+        "{outcome:?}"
     );
-
-    let mut direct_slots = vec![crate::JitNativeValueSlot::default(); 11];
-    let empty_array = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 7,
-        crate::JIT_VALUE_RUNTIME_ARRAY_TAG,
-    );
-    let non_empty_array = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 8,
-        crate::JIT_VALUE_RUNTIME_ARRAY_TAG,
-    );
-    direct_slots[7] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY,
-        flags: crate::JIT_NATIVE_DIRECT_ARRAY_ABI_VERSION,
-        payload: 0,
-        ..crate::JitNativeValueSlot::default()
-    };
-    direct_slots[8] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY,
-        flags: crate::JIT_NATIVE_DIRECT_ARRAY_ABI_VERSION,
-        payload: 2,
-        ..crate::JitNativeValueSlot::default()
-    };
-    direct_slots[9] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR,
-        flags: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION,
-        reserved: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED,
-        payload: empty_array as u64,
-        ..crate::JitNativeValueSlot::default()
-    };
-    direct_slots[10] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR,
-        flags: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION,
-        reserved: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED,
-        payload: non_empty_array as u64,
-        ..crate::JitNativeValueSlot::default()
-    };
-    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
-        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
-        ..crate::JitNativeRuntimeView::default()
-    });
-    for (index, expected) in [(9, 0), (10, 1)] {
-        let reference = crate::jit_encode_typed_runtime_value(
-            crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + index,
-            crate::JIT_VALUE_RUNTIME_REFERENCE_TAG,
-        );
-        assert_eq!(
-            handle
-                .invoke_i64(&[reference], JIT_RUNTIME_ABI_HASH)
-                .expect("direct reference truthiness"),
-            expected
-        );
-    }
 }
 
 #[test]
@@ -18039,7 +17962,7 @@ fn optimizing_terminator_consumes_authoritative_object_without_baseline_continua
         FunctionFlags::default(),
         span,
     );
-    let local = untyped_param(&mut builder, function, "value");
+    let local = typed_object_param(&mut builder, function, "value");
     let entry = builder.append_block(function);
     let truthy = builder.append_block(function);
     let falsey = builder.append_block(function);
@@ -24850,8 +24773,7 @@ fn optimizing_compound_numeric_casts_use_exact_typed_handlers() {
 }
 
 #[test]
-fn optimizing_empty_local_uses_guarded_native_truthiness() {
-    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
+fn optimizing_empty_local_with_unknown_shape_is_rejected_before_entry() {
     let mut builder = IrBuilder::new(UnitId::new(4_216));
     let file = builder.add_file("optimizing-empty-local.php");
     let span = IrSpan::new(file, 0, 1);
@@ -24872,75 +24794,16 @@ fn optimizing_empty_local_uses_guarded_native_truthiness() {
         compile: &JitCompileRequest::new("cl.optimizing.empty-local").with_opt_level(2),
         unit: Some(&unit),
         function: Some(function),
-        runtime_helpers: crate::JitRuntimeHelperAddresses {
-            baseline_cast: forbidden_cast as *const () as usize,
-            native_local_fetch: forbidden_local_fetch as *const () as usize,
-            native_stable_length: forbidden_stable_length as *const () as usize,
-            native_truthy: forbidden_truthy as *const () as usize,
-            baseline_unary: forbidden_unary as *const () as usize,
-            native_value_release: forbidden_release as *const () as usize,
-            ..crate::JitRuntimeHelperAddresses::default()
-        },
+        runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
     });
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("optimizing empty-local handle");
-    assert_optimizing_artifact(&handle);
-    for (input, expected) in [
-        (0, crate::jit_encode_constant(crate::JIT_VALUE_TRUE)),
-        (1, crate::jit_encode_constant(crate::JIT_VALUE_FALSE)),
-        (
-            crate::jit_encode_constant(u32::MAX),
-            crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
-        ),
-        (
-            crate::jit_encode_constant(crate::JIT_VALUE_FALSE),
-            crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
-        ),
-    ] {
-        assert_eq!(
-            handle
-                .invoke_i64(&[input], JIT_RUNTIME_ABI_HASH)
-                .expect("empty-local execution"),
-            expected
-        );
-    }
-    let mut direct_slots = vec![crate::JitNativeValueSlot::default(); 8];
-    direct_slots[7] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_ARRAY,
-        flags: crate::JIT_NATIVE_ARRAY_VIEW_ABI_VERSION,
-        payload: 0,
-        ..crate::JitNativeValueSlot::default()
-    };
-    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
-        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
-        ..crate::JitNativeRuntimeView::default()
-    });
-    let array = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 7,
-        crate::JIT_VALUE_RUNTIME_ARRAY_TAG,
+    assert!(
+        matches!(outcome.status, JitCompileStatus::Rejected { .. }),
+        "{outcome:?}"
     );
-    assert_eq!(
-        handle
-            .invoke_i64(&[array], JIT_RUNTIME_ABI_HASH)
-            .expect("empty array execution"),
-        crate::jit_encode_constant(crate::JIT_VALUE_TRUE)
-    );
-    direct_slots[7].payload = 1;
-    assert_eq!(direct_slots[7].payload, 1);
-    assert_eq!(
-        handle
-            .invoke_i64(&[array], JIT_RUNTIME_ABI_HASH)
-            .expect("non-empty array execution"),
-        crate::jit_encode_constant(crate::JIT_VALUE_FALSE)
-    );
-    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 
 #[test]
-fn optimizing_unknown_truthiness_keeps_direct_values_in_clif() {
-    SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
+fn optimizing_unknown_truthiness_cast_is_rejected_before_entry() {
     let mut builder = IrBuilder::new(UnitId::new(4_247));
     let file = builder.add_file("optimizing-unknown-truthiness.php");
     let span = IrSpan::new(file, 0, 1);
@@ -24951,13 +24814,6 @@ fn optimizing_unknown_truthiness_keeps_direct_values_in_clif() {
     );
     let local = untyped_param(&mut builder, function, "value");
     let block = builder.append_block(function);
-    let loaded = builder.alloc_register(function);
-    builder.emit(
-        function,
-        block,
-        InstructionKind::LoadLocal { dst: loaded, local },
-        span,
-    );
     let boolean = builder.alloc_register(function);
     builder.emit(
         function,
@@ -24965,101 +24821,23 @@ fn optimizing_unknown_truthiness_keeps_direct_values_in_clif() {
         InstructionKind::Cast {
             dst: boolean,
             kind: CastKind::Bool,
-            src: Operand::Register(loaded),
+            src: Operand::Local(local),
         },
         span,
     );
-    let inverted = builder.alloc_register(function);
-    builder.emit(
-        function,
-        block,
-        InstructionKind::Unary {
-            dst: inverted,
-            op: UnaryOp::Not,
-            src: Operand::Register(boolean),
-        },
-        span,
-    );
-    builder.terminate_return(function, block, Some(Operand::Register(inverted)), span);
+    builder.terminate_return(function, block, Some(Operand::Register(boolean)), span);
     let unit = builder.finish();
     let mut backend = CraneliftNativeCompiler;
     let outcome = backend.compile_region(&NativeCompileRequest {
         compile: &JitCompileRequest::new("cl.optimizing.unknown-truthiness").with_opt_level(2),
         unit: Some(&unit),
         function: Some(function),
-        runtime_helpers: crate::JitRuntimeHelperAddresses {
-            baseline_cast: forbidden_cast as *const () as usize,
-            native_local_fetch: forbidden_local_fetch as *const () as usize,
-            native_truthy: forbidden_truthy as *const () as usize,
-            baseline_unary: forbidden_unary as *const () as usize,
-            ..crate::JitRuntimeHelperAddresses::default()
-        },
+        runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
     });
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("unknown truthiness handle");
-    assert_optimizing_artifact(&handle);
-
-    let mut direct_slots = vec![crate::JitNativeValueSlot::default(); 5];
-    for (index, bits) in [0.0_f64.to_bits(), (-0.0_f64).to_bits(), 1.5_f64.to_bits()]
-        .into_iter()
-        .enumerate()
-    {
-        direct_slots[index] = crate::JitNativeValueSlot {
-            refcount: 1,
-            kind: crate::JIT_NATIVE_VALUE_VIEW_FLOAT,
-            payload: bits,
-            ..crate::JitNativeValueSlot::default()
-        };
-    }
-    direct_slots[3] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_SHARED_ARRAY,
-        flags: crate::JIT_NATIVE_SHARED_ARRAY_ABI_VERSION,
-        reserved: 0,
-        payload: 1,
-        ..crate::JitNativeValueSlot::default()
-    };
-    direct_slots[4] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_SHARED_ARRAY,
-        flags: crate::JIT_NATIVE_SHARED_ARRAY_ABI_VERSION,
-        reserved: 2,
-        payload: 1,
-        ..crate::JitNativeValueSlot::default()
-    };
-    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
-        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
-        ..crate::JitNativeRuntimeView::default()
-    });
-    let direct = |index, tag| {
-        crate::jit_encode_typed_runtime_value(
-            crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + index,
-            tag,
-        )
-    };
-    let true_ = crate::jit_encode_constant(crate::JIT_VALUE_TRUE);
-    let false_ = crate::jit_encode_constant(crate::JIT_VALUE_FALSE);
-    for (input, expected) in [
-        (0, true_),
-        (1, false_),
-        (crate::jit_encode_constant(u32::MAX), true_),
-        (crate::jit_encode_constant(crate::JIT_VALUE_FALSE), true_),
-        (direct(0, crate::JIT_VALUE_RUNTIME_FLOAT_TAG), true_),
-        (direct(1, crate::JIT_VALUE_RUNTIME_FLOAT_TAG), true_),
-        (direct(2, crate::JIT_VALUE_RUNTIME_FLOAT_TAG), false_),
-        (direct(3, crate::JIT_VALUE_RUNTIME_ARRAY_TAG), true_),
-        (direct(4, crate::JIT_VALUE_RUNTIME_ARRAY_TAG), false_),
-        (direct(0, crate::JIT_VALUE_RUNTIME_OBJECT_TAG), false_),
-    ] {
-        assert_eq!(
-            handle
-                .invoke_i64(&[input], JIT_RUNTIME_ABI_HASH)
-                .expect("direct truthiness execution"),
-            expected
-        );
-    }
-    assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
+    assert!(
+        matches!(outcome.status, JitCompileStatus::Rejected { .. }),
+        "{outcome:?}"
+    );
 }
 
 #[test]

@@ -488,7 +488,7 @@ fn lower_optimizing_scalar_conversion(
             let truthy = lower_optimizing_truthy(builder, encoded, transition)?;
             Ok(encode_native_bool(builder, truthy))
         }
-        StableScalarConsumerBuiltin::FloatVal => emit_exact_native_control_value!(
+        StableScalarConsumerBuiltin::FloatVal => emit_total_exact_native_value!(
             module,
             builder,
             float_cast,
@@ -496,7 +496,7 @@ fn lower_optimizing_scalar_conversion(
             transition,
             "exact native float-cast handler was not declared",
         ),
-        StableScalarConsumerBuiltin::IntVal => emit_exact_native_control_value!(
+        StableScalarConsumerBuiltin::IntVal => emit_total_exact_native_value!(
             module,
             builder,
             int_cast,
@@ -504,7 +504,7 @@ fn lower_optimizing_scalar_conversion(
             transition,
             "exact native integer-cast handler was not declared",
         ),
-        StableScalarConsumerBuiltin::StrVal => emit_exact_native_control_value!(
+        StableScalarConsumerBuiltin::StrVal => emit_total_exact_native_value!(
             module,
             builder,
             string_cast,
@@ -1619,7 +1619,7 @@ fn lower_total_native_scalar_string_coercion(
             let value = builder
                 .ins()
                 .bitcast(types::F64, MemFlagsData::new(), bits);
-            let value = emit_exact_native_control_value!(
+            let value = emit_total_exact_native_value!(
                 module,
                 builder,
                 float_to_string,
@@ -1814,7 +1814,7 @@ fn lower_optimizing_scalar_string_coercion(
 
     builder.switch_to_block(float);
     let value = builder.block_params(float)[0];
-    let value = emit_exact_native_control_value!(
+    let value = emit_total_exact_native_value!(
         module,
         builder,
         float_to_string,
@@ -3338,7 +3338,7 @@ fn lower_optimizing_extrema(
         for &candidate in &arguments[1..] {
             let candidate =
                 lower_optimizing_reference_scalar(builder, candidate, false, transition)?;
-            let ordering = emit_exact_native_control_value!(
+            let ordering = emit_total_exact_native_value!(
                 module,
                 builder,
                 spaceship,
@@ -3398,7 +3398,7 @@ fn lower_optimizing_extrema(
         std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
     );
     let candidate = lower_optimizing_reference_scalar(builder, candidate, false, transition)?;
-    let ordering = emit_exact_native_control_value!(
+    let ordering = emit_total_exact_native_value!(
         module,
         builder,
         spaceship,

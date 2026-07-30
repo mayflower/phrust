@@ -6551,11 +6551,11 @@ fn lower_optimizing_error_reporting(
     Ok(current)
 }
 
-// Expand an exact typed native ABI call directly into each family lowering.
-// This is intentionally a macro rather than a shared call adapter: emitted
-// artifacts call the published family handler itself and carry its typed
-// control result directly into the caller's PHP-visible control edge.
-macro_rules! emit_exact_native_control_value {
+// Fixed builtin publication admits only handlers with three possible
+// outcomes: a native value, a PHP-visible throw/runtime diagnostic, or an ABI
+// contract violation. Unknown statuses are converted to ABI_MISMATCH locally;
+// they never enter the generic continuation adapter.
+macro_rules! emit_total_exact_native_value {
     ($module:expr, $builder:expr, $helper:expr, $arguments:expr, $transition:expr, $missing:expr $(,)?) => {{
         let helper = ($helper).ok_or_else(|| {
             CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_NATIVE_OPERATION", $missing)
@@ -6567,7 +6567,9 @@ macro_rules! emit_exact_native_control_value {
         let detail = $builder.ins().ushr_imm(control, 32);
         let detail = $builder.ins().ireduce(types::I32, detail);
         let returned = $builder.create_block();
-        let control_exit = $builder.create_block();
+        let classify_control = $builder.create_block();
+        let semantic_control = $builder.create_block();
+        let contract_violation = $builder.create_block();
         let is_return = $builder.ins().icmp_imm(
             IntCC::Equal,
             status,
@@ -6575,15 +6577,43 @@ macro_rules! emit_exact_native_control_value {
         );
         $builder
             .ins()
-            .brif(is_return, returned, &[], control_exit, &[]);
-        $builder.switch_to_block(control_exit);
+            .brif(is_return, returned, &[], classify_control, &[]);
+
+        $builder.switch_to_block(classify_control);
+        let is_throw = $builder.ins().icmp_imm(
+            IntCC::Equal,
+            status,
+            i64::from(crate::JitCallStatus::THROW.0),
+        );
+        let is_runtime_error = $builder.ins().icmp_imm(
+            IntCC::Equal,
+            status,
+            i64::from(crate::JitCallStatus::RUNTIME_ERROR.0),
+        );
+        let is_semantic_control = $builder.ins().bor(is_throw, is_runtime_error);
+        $builder.ins().brif(
+            is_semantic_control,
+            semantic_control,
+            &[],
+            contract_violation,
+            &[],
+        );
+
+        $builder.switch_to_block(semantic_control);
         $transition.emit_control($builder, status, detail, value)?;
+
+        $builder.switch_to_block(contract_violation);
+        let abi_mismatch = $builder
+            .ins()
+            .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
+        $builder.ins().return_(&[abi_mismatch]);
+
         $builder.switch_to_block(returned);
         Ok::<ir::Value, CraneliftLoweringError>(value)
     }};
 }
 
-macro_rules! emit_exact_native_control_value_with_cleanup {
+macro_rules! emit_total_exact_native_value_with_cleanup {
     (
         $module:expr,
         $builder:expr,
@@ -6604,7 +6634,9 @@ macro_rules! emit_exact_native_control_value_with_cleanup {
         let detail = $builder.ins().ushr_imm(control, 32);
         let detail = $builder.ins().ireduce(types::I32, detail);
         let returned = $builder.create_block();
-        let control_exit = $builder.create_block();
+        let classify_control = $builder.create_block();
+        let semantic_control = $builder.create_block();
+        let contract_violation = $builder.create_block();
         let is_return = $builder.ins().icmp_imm(
             IntCC::Equal,
             status,
@@ -6612,12 +6644,40 @@ macro_rules! emit_exact_native_control_value_with_cleanup {
         );
         $builder
             .ins()
-            .brif(is_return, returned, &[], control_exit, &[]);
-        $builder.switch_to_block(control_exit);
+            .brif(is_return, returned, &[], classify_control, &[]);
+
+        $builder.switch_to_block(classify_control);
+        let is_throw = $builder.ins().icmp_imm(
+            IntCC::Equal,
+            status,
+            i64::from(crate::JitCallStatus::THROW.0),
+        );
+        let is_runtime_error = $builder.ins().icmp_imm(
+            IntCC::Equal,
+            status,
+            i64::from(crate::JitCallStatus::RUNTIME_ERROR.0),
+        );
+        let is_semantic_control = $builder.ins().bor(is_throw, is_runtime_error);
+        $builder.ins().brif(
+            is_semantic_control,
+            semantic_control,
+            &[],
+            contract_violation,
+            &[],
+        );
+
+        $builder.switch_to_block(semantic_control);
         for cleanup in $cleanup_values {
             lower_optimizing_commit_owned_value($builder, *cleanup, $transition);
         }
         $transition.emit_control($builder, status, detail, value)?;
+
+        $builder.switch_to_block(contract_violation);
+        let abi_mismatch = $builder
+            .ins()
+            .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
+        $builder.ins().return_(&[abi_mismatch]);
+
         $builder.switch_to_block(returned);
         Ok::<ir::Value, CraneliftLoweringError>(value)
     }};
@@ -6796,90 +6856,36 @@ fn lower_optimizing_prepared_exception_pointer(
     builder.ins().load(types::I64, MemFlagsData::new(), plan, 0)
 }
 
-/// Calls one fixed zero-argument native target.
-///
-/// No dynamic call-frame shape is carried across this boundary: the selected
-/// symbol completely determines the operation and its empty parameter list.
-fn lower_optimizing_exact_zero_runtime_builtin(
-    module: &mut JITModule,
-    builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
-    transition: NativeOptimizingTransition<'_>,
-) -> Result<ir::Value, CraneliftLoweringError> {
-    let helper = helper.ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_EXACT_ZERO_BUILTIN",
-            "prepared zero-argument runtime builtin has no fixed native handler",
+// Total fixed-builtin calls are expanded at their family callsites. Publication
+// proves argument shape and resources before entry, and every admitted exact
+// handler returns either a native value or ABI_MISMATCH for a broken contract.
+// There is no shared fixed-arity control-flow adapter or local fallback CFG.
+macro_rules! emit_total_exact_zero {
+    ($module:expr, $builder:expr, $helper:expr, $transition:expr $(,)?) => {
+        emit_total_exact_native_value!(
+            $module,
+            $builder,
+            $helper,
+            &[],
+            $transition,
+            "total zero-argument builtin has no fixed native handler",
         )
-    })?;
-    let call = call_native_helper(module, builder, helper, &[]);
-    let control = builder.inst_results(call)[0];
-    let value = builder.inst_results(call)[1];
-    let status = builder.ins().ireduce(types::I32, control);
-    let detail = builder.ins().ushr_imm(control, 32);
-    let detail = builder.ins().ireduce(types::I32, detail);
-    let returned = builder.create_block();
-    let control_exit = builder.create_block();
-    let is_return = builder.ins().icmp_imm(
-        IntCC::Equal,
-        status,
-        i64::from(crate::JitCallStatus::RETURN.0),
-    );
-    builder
-        .ins()
-        .brif(is_return, returned, &[], control_exit, &[]);
-
-    builder.switch_to_block(control_exit);
-    transition.emit_control(builder, status, detail, value)?;
-
-    builder.switch_to_block(returned);
-    Ok(value)
+    };
 }
 
-/// Calls one fixed unary native target.
-///
-/// The operation and arity are properties of the declared import. Generated
-/// code therefore passes only the authoritative native operand.
-fn lower_optimizing_exact_unary_runtime_builtin(
-    module: &mut JITModule,
-    builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
-    argument: ir::Value,
-    transition: NativeOptimizingTransition<'_>,
-) -> Result<ir::Value, CraneliftLoweringError> {
-    let helper = helper.ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_EXACT_UNARY_BUILTIN",
-            "prepared unary runtime builtin has no fixed native handler",
+macro_rules! emit_total_exact_unary {
+    ($module:expr, $builder:expr, $helper:expr, $argument:expr, $transition:expr $(,)?) => {
+        emit_total_exact_native_value!(
+            $module,
+            $builder,
+            $helper,
+            &[$argument],
+            $transition,
+            "total unary builtin has no fixed native handler",
         )
-    })?;
-    let call = call_native_helper(module, builder, helper, &[argument]);
-    let control = builder.inst_results(call)[0];
-    let value = builder.inst_results(call)[1];
-    let status = builder.ins().ireduce(types::I32, control);
-    let detail = builder.ins().ushr_imm(control, 32);
-    let detail = builder.ins().ireduce(types::I32, detail);
-    let returned = builder.create_block();
-    let control_exit = builder.create_block();
-    let is_return = builder.ins().icmp_imm(
-        IntCC::Equal,
-        status,
-        i64::from(crate::JitCallStatus::RETURN.0),
-    );
-    builder
-        .ins()
-        .brif(is_return, returned, &[], control_exit, &[]);
-
-    builder.switch_to_block(control_exit);
-    transition.emit_control(builder, status, detail, value)?;
-
-    builder.switch_to_block(returned);
-    Ok(value)
+    };
 }
 
-// Expand each fixed two-argument target at its family callsite. This keeps the
-// declared target direct while avoiding a shared binary control adapter in
-// optimizing source and emitted artifacts.
 macro_rules! emit_fixed_two_argument_control {
     (
         $module:expr,
@@ -6890,230 +6896,104 @@ macro_rules! emit_fixed_two_argument_control {
         $transition:expr
         $(,)?
     ) => {
-        emit_exact_native_control_value!(
+        emit_total_exact_native_value!(
             $module,
             $builder,
             $helper,
             &[$left, $right],
             $transition,
-            "prepared two-argument runtime builtin has no fixed native handler",
+            "total binary builtin has no fixed native handler",
         )
     };
 }
 
-/// Calls one fixed ternary native target without a count word or padded tail.
-fn lower_optimizing_exact_ternary_runtime_builtin(
-    module: &mut JITModule,
-    builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
-    first: ir::Value,
-    second: ir::Value,
-    third: ir::Value,
-    transition: NativeOptimizingTransition<'_>,
-) -> Result<ir::Value, CraneliftLoweringError> {
-    let helper = helper.ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_EXACT_TERNARY_BUILTIN",
-            "prepared ternary runtime builtin has no fixed native handler",
+macro_rules! emit_total_exact_ternary {
+    (
+        $module:expr,
+        $builder:expr,
+        $helper:expr,
+        $first:expr,
+        $second:expr,
+        $third:expr,
+        $transition:expr
+        $(,)?
+    ) => {
+        emit_total_exact_native_value!(
+            $module,
+            $builder,
+            $helper,
+            &[$first, $second, $third],
+            $transition,
+            "total ternary builtin has no fixed native handler",
         )
-    })?;
-    let call = call_native_helper(module, builder, helper, &[first, second, third]);
-    let control = builder.inst_results(call)[0];
-    let value = builder.inst_results(call)[1];
-    let status = builder.ins().ireduce(types::I32, control);
-    let detail = builder.ins().ushr_imm(control, 32);
-    let detail = builder.ins().ireduce(types::I32, detail);
-    let returned = builder.create_block();
-    let control_exit = builder.create_block();
-    let is_return = builder.ins().icmp_imm(
-        IntCC::Equal,
-        status,
-        i64::from(crate::JitCallStatus::RETURN.0),
-    );
-    builder
-        .ins()
-        .brif(is_return, returned, &[], control_exit, &[]);
-
-    builder.switch_to_block(control_exit);
-    transition.emit_control(builder, status, detail, value)?;
-
-    builder.switch_to_block(returned);
-    Ok(value)
+    };
 }
 
-/// Calls one fixed four-operand native target.
-fn lower_optimizing_exact_quaternary_runtime_builtin(
-    module: &mut JITModule,
-    builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
-    arguments: [ir::Value; 4],
-    transition: NativeOptimizingTransition<'_>,
-) -> Result<ir::Value, CraneliftLoweringError> {
-    let helper = helper.ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_EXACT_QUATERNARY_BUILTIN",
-            "prepared four-operand runtime builtin has no fixed native handler",
+macro_rules! emit_total_exact_quaternary {
+    ($module:expr, $builder:expr, $helper:expr, $arguments:expr, $transition:expr $(,)?) => {{
+        let arguments: [ir::Value; 4] = $arguments;
+        emit_total_exact_native_value!(
+            $module,
+            $builder,
+            $helper,
+            &arguments,
+            $transition,
+            "total quaternary builtin has no fixed native handler",
         )
-    })?;
-    let call = call_native_helper(module, builder, helper, &arguments);
-    let control = builder.inst_results(call)[0];
-    let value = builder.inst_results(call)[1];
-    let status = builder.ins().ireduce(types::I32, control);
-    let detail = builder.ins().ushr_imm(control, 32);
-    let detail = builder.ins().ireduce(types::I32, detail);
-    let returned = builder.create_block();
-    let control_exit = builder.create_block();
-    let is_return = builder.ins().icmp_imm(
-        IntCC::Equal,
-        status,
-        i64::from(crate::JitCallStatus::RETURN.0),
-    );
-    builder
-        .ins()
-        .brif(is_return, returned, &[], control_exit, &[]);
-
-    builder.switch_to_block(control_exit);
-    transition.emit_control(builder, status, detail, value)?;
-
-    builder.switch_to_block(returned);
-    Ok(value)
+    }};
 }
 
-/// Calls the one fixed native `compact` boundary.
-///
-/// These five words are compiler-owned metadata/slices, not a PHP call-frame
-/// adapter, so their shape is invariant for every generated invocation.
-fn lower_optimizing_exact_compact(
-    module: &mut JITModule,
-    builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
-    arguments: [ir::Value; 5],
-    transition: NativeOptimizingTransition<'_>,
-) -> Result<ir::Value, CraneliftLoweringError> {
-    let helper = helper.ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_EXACT_COMPACT",
-            "prepared compact operation has no fixed native handler",
+macro_rules! emit_total_exact_compact {
+    ($module:expr, $builder:expr, $helper:expr, $arguments:expr, $transition:expr $(,)?) => {{
+        let arguments: [ir::Value; 5] = $arguments;
+        emit_total_exact_native_value!(
+            $module,
+            $builder,
+            $helper,
+            &arguments,
+            $transition,
+            "total compact builtin has no fixed native handler",
         )
-    })?;
-    let call = call_native_helper(module, builder, helper, &arguments);
-    let control = builder.inst_results(call)[0];
-    let value = builder.inst_results(call)[1];
-    let status = builder.ins().ireduce(types::I32, control);
-    let detail = builder.ins().ushr_imm(control, 32);
-    let detail = builder.ins().ireduce(types::I32, detail);
-    let returned = builder.create_block();
-    let control_exit = builder.create_block();
-    let is_return = builder.ins().icmp_imm(
-        IntCC::Equal,
-        status,
-        i64::from(crate::JitCallStatus::RETURN.0),
-    );
-    builder
-        .ins()
-        .brif(is_return, returned, &[], control_exit, &[]);
-
-    builder.switch_to_block(control_exit);
-    transition.emit_control(builder, status, detail, value)?;
-
-    builder.switch_to_block(returned);
-    Ok(value)
+    }};
 }
 
-/// Calls one fixed five-operand native target.
-fn lower_optimizing_exact_five_runtime_builtin(
-    module: &mut JITModule,
-    builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
-    arguments: [ir::Value; 5],
-    transition: NativeOptimizingTransition<'_>,
-) -> Result<ir::Value, CraneliftLoweringError> {
-    let helper = helper.ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_EXACT_FIVE_BUILTIN",
-            "prepared five-operand runtime builtin has no fixed native handler",
+macro_rules! emit_total_exact_five {
+    ($module:expr, $builder:expr, $helper:expr, $arguments:expr, $transition:expr $(,)?) => {{
+        let arguments: [ir::Value; 5] = $arguments;
+        emit_total_exact_native_value!(
+            $module,
+            $builder,
+            $helper,
+            &arguments,
+            $transition,
+            "total five-argument builtin has no fixed native handler",
         )
-    })?;
-    let call = call_native_helper(module, builder, helper, &arguments);
-    let control = builder.inst_results(call)[0];
-    let value = builder.inst_results(call)[1];
-    let status = builder.ins().ireduce(types::I32, control);
-    let detail = builder.ins().ushr_imm(control, 32);
-    let detail = builder.ins().ireduce(types::I32, detail);
-    let returned = builder.create_block();
-    let control_exit = builder.create_block();
-    let is_return = builder.ins().icmp_imm(
-        IntCC::Equal,
-        status,
-        i64::from(crate::JitCallStatus::RETURN.0),
-    );
-    builder
-        .ins()
-        .brif(is_return, returned, &[], control_exit, &[]);
-
-    builder.switch_to_block(control_exit);
-    transition.emit_control(builder, status, detail, value)?;
-
-    builder.switch_to_block(returned);
-    Ok(value)
+    }};
 }
 
-/// Calls one fixed six-operand native target.
-fn lower_optimizing_exact_six_runtime_builtin(
-    module: &mut JITModule,
-    builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
-    arguments: [ir::Value; 6],
-    transition: NativeOptimizingTransition<'_>,
-) -> Result<ir::Value, CraneliftLoweringError> {
-    let helper = helper.ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_EXACT_SIX_BUILTIN",
-            "prepared six-operand runtime builtin has no fixed native handler",
+macro_rules! emit_total_exact_six {
+    ($module:expr, $builder:expr, $helper:expr, $arguments:expr, $transition:expr $(,)?) => {{
+        let arguments: [ir::Value; 6] = $arguments;
+        emit_total_exact_native_value!(
+            $module,
+            $builder,
+            $helper,
+            &arguments,
+            $transition,
+            "total six-argument builtin has no fixed native handler",
         )
-    })?;
-    let call = call_native_helper(module, builder, helper, &arguments);
-    let control = builder.inst_results(call)[0];
-    let value = builder.inst_results(call)[1];
-    let status = builder.ins().ireduce(types::I32, control);
-    let detail = builder.ins().ushr_imm(control, 32);
-    let detail = builder.ins().ireduce(types::I32, detail);
-    let returned = builder.create_block();
-    let control_exit = builder.create_block();
-    let is_return = builder.ins().icmp_imm(
-        IntCC::Equal,
-        status,
-        i64::from(crate::JitCallStatus::RETURN.0),
-    );
-    builder
-        .ins()
-        .brif(is_return, returned, &[], control_exit, &[]);
-
-    builder.switch_to_block(control_exit);
-    transition.emit_control(builder, status, detail, value)?;
-
-    builder.switch_to_block(returned);
-    Ok(value)
+    }};
 }
 
-/// Calls one fixed exact handler with a synchronous slice of authoritative
-/// native encodings. This is the fixed-target variadic ABI used by operations
-/// such as `array_multisort`, `sprintf`, and `printf`; the slice lives in
-/// generated stack storage and is neither a value out-pointer nor a generic
-/// builtin-dispatch frame.
-fn lower_optimizing_exact_argument_slice_builtin(
+/// Materializes the publication-fixed positional frame for one direct
+/// variadic callsite. Status classification remains expanded at the family
+/// callsite; this routine only creates stack storage and returns the native
+/// `(length, pointer)` operands.
+fn lower_optimizing_exact_argument_slice(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
     arguments: &[ir::Value],
-    transition: NativeOptimizingTransition<'_>,
-) -> Result<ir::Value, CraneliftLoweringError> {
-    let helper = helper.ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_EXACT_BUILTIN",
-            "prepared variadic runtime builtin has no exact native slice handler",
-        )
-    })?;
+) -> Result<[ir::Value; 2], CraneliftLoweringError> {
     let byte_count = arguments
         .len()
         .checked_mul(std::mem::size_of::<i64>())
@@ -7143,236 +7023,35 @@ fn lower_optimizing_exact_argument_slice_builtin(
         types::I32,
         i64::try_from(arguments.len()).unwrap_or(i64::MAX),
     );
-    let call = call_native_helper(
-        module,
-        builder,
-        helper,
-        &[argument_count, arguments_pointer],
-    );
-    let control = builder.inst_results(call)[0];
-    let value = builder.inst_results(call)[1];
-    let status = builder.ins().ireduce(types::I32, control);
-    let detail = builder.ins().ushr_imm(control, 32);
-    let detail = builder.ins().ireduce(types::I32, detail);
-    let returned = builder.create_block();
-    let control_exit = builder.create_block();
-    let is_return = builder.ins().icmp_imm(
-        IntCC::Equal,
-        status,
-        i64::from(crate::JitCallStatus::RETURN.0),
-    );
-    builder
-        .ins()
-        .brif(is_return, returned, &[], control_exit, &[]);
-    builder.switch_to_block(control_exit);
-    transition.emit_control(builder, status, detail, value)?;
-    builder.switch_to_block(returned);
-    Ok(value)
+    Ok([argument_count, arguments_pointer])
 }
 
-/// Dedicated variadic registration ABI. Besides the synchronous native
-/// argument slice it publishes the immutable callsite identity used later to
-/// recover one cold source instruction when shutdown actually invokes the
-/// callback.
-fn lower_optimizing_exact_shutdown_callback_builtin(
-    module: &mut JITModule,
-    builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
-    arguments: &[ir::Value],
-    transition: NativeOptimizingTransition<'_>,
-) -> Result<ir::Value, CraneliftLoweringError> {
-    let helper = helper.ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_EXACT_SHUTDOWN_CALLBACK",
-            "register_shutdown_function has no exact native slice handler",
+macro_rules! emit_total_exact_seven {
+    ($module:expr, $builder:expr, $helper:expr, $arguments:expr, $transition:expr $(,)?) => {{
+        let arguments: [ir::Value; 7] = $arguments;
+        emit_total_exact_native_value!(
+            $module,
+            $builder,
+            $helper,
+            &arguments,
+            $transition,
+            "total seven-argument builtin has no fixed native handler",
         )
-    })?;
-    let byte_count = arguments
-        .len()
-        .checked_mul(std::mem::size_of::<i64>())
-        .and_then(|bytes| u32::try_from(bytes).ok())
-        .ok_or_else(|| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_EXACT_SHUTDOWN_CALLBACK",
-                "shutdown callback argument slice is too large",
-            )
-        })?;
-    let slot = builder.create_sized_stack_slot(StackSlotData::new(
-        StackSlotKind::ExplicitSlot,
-        byte_count.max(8),
-        3,
-    ));
-    let pointer_type = module.target_config().pointer_type();
-    let arguments_pointer = builder.ins().stack_addr(pointer_type, slot, 0);
-    for (index, argument) in arguments.iter().enumerate() {
-        builder.ins().store(
-            MemFlagsData::new(),
-            *argument,
-            arguments_pointer,
-            i32::try_from(index.saturating_mul(8)).unwrap_or(i32::MAX),
-        );
-    }
-    let argument_count = builder.ins().iconst(
-        types::I32,
-        i64::try_from(arguments.len()).unwrap_or(i64::MAX),
-    );
-    let function = builder
-        .ins()
-        .iconst(types::I32, i64::from(transition.function.raw()));
-    let continuation = builder
-        .ins()
-        .iconst(types::I32, i64::from(transition.continuation_id));
-    let call = call_native_helper(
-        module,
-        builder,
-        helper,
-        &[argument_count, arguments_pointer, function, continuation],
-    );
-    let control = builder.inst_results(call)[0];
-    let value = builder.inst_results(call)[1];
-    let status = builder.ins().ireduce(types::I32, control);
-    let detail = builder.ins().ushr_imm(control, 32);
-    let detail = builder.ins().ireduce(types::I32, detail);
-    let returned = builder.create_block();
-    let control_exit = builder.create_block();
-    let is_return = builder.ins().icmp_imm(
-        IntCC::Equal,
-        status,
-        i64::from(crate::JitCallStatus::RETURN.0),
-    );
-    builder
-        .ins()
-        .brif(is_return, returned, &[], control_exit, &[]);
-    builder.switch_to_block(control_exit);
-    transition.emit_control(builder, status, detail, value)?;
-    builder.switch_to_block(returned);
-    Ok(value)
+    }};
 }
 
-fn lower_optimizing_exact_seven_runtime_builtin(
-    module: &mut JITModule,
-    builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
-    arguments: [ir::Value; 7],
-    transition: NativeOptimizingTransition<'_>,
-) -> Result<ir::Value, CraneliftLoweringError> {
-    let helper = helper.ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_EXACT_SEVEN_BUILTIN",
-            "prepared seven-argument runtime builtin has no fixed native handler",
+macro_rules! emit_total_exact_nine {
+    ($module:expr, $builder:expr, $helper:expr, $arguments:expr, $transition:expr $(,)?) => {{
+        let arguments: [ir::Value; 9] = $arguments;
+        emit_total_exact_native_value!(
+            $module,
+            $builder,
+            $helper,
+            &arguments,
+            $transition,
+            "total nine-argument builtin has no fixed native handler",
         )
-    })?;
-    let call = call_native_helper(module, builder, helper, &arguments);
-    let control = builder.inst_results(call)[0];
-    let value = builder.inst_results(call)[1];
-    let status = builder.ins().ireduce(types::I32, control);
-    let detail = builder.ins().ushr_imm(control, 32);
-    let detail = builder.ins().ireduce(types::I32, detail);
-    let returned = builder.create_block();
-    let control_exit = builder.create_block();
-    let is_return = builder.ins().icmp_imm(
-        IntCC::Equal,
-        status,
-        i64::from(crate::JitCallStatus::RETURN.0),
-    );
-    builder
-        .ins()
-        .brif(is_return, returned, &[], control_exit, &[]);
-    builder.switch_to_block(control_exit);
-    transition.emit_control(builder, status, detail, value)?;
-    builder.switch_to_block(returned);
-    Ok(value)
-}
-
-/// Calls one fixed nine-operand native target.
-fn lower_optimizing_exact_nine_runtime_builtin(
-    module: &mut JITModule,
-    builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
-    arguments: [ir::Value; 9],
-    transition: NativeOptimizingTransition<'_>,
-) -> Result<ir::Value, CraneliftLoweringError> {
-    let helper = helper.ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_EXACT_NINE_BUILTIN",
-            "prepared nine-argument runtime builtin has no fixed native handler",
-        )
-    })?;
-    let call = call_native_helper(module, builder, helper, &arguments);
-    let control = builder.inst_results(call)[0];
-    let value = builder.inst_results(call)[1];
-    let status = builder.ins().ireduce(types::I32, control);
-    let detail = builder.ins().ushr_imm(control, 32);
-    let detail = builder.ins().ireduce(types::I32, detail);
-    let returned = builder.create_block();
-    let control_exit = builder.create_block();
-    let is_return = builder.ins().icmp_imm(
-        IntCC::Equal,
-        status,
-        i64::from(crate::JitCallStatus::RETURN.0),
-    );
-    builder
-        .ins()
-        .brif(is_return, returned, &[], control_exit, &[]);
-    builder.switch_to_block(control_exit);
-    transition.emit_control(builder, status, detail, value)?;
-    builder.switch_to_block(returned);
-    Ok(value)
-}
-
-fn lower_optimizing_exact_frame_introspection(
-    module: &mut JITModule,
-    builder: &mut FunctionBuilder<'_>,
-    builtin: StableFrameIntrospectionBuiltin,
-    helper: Option<NativeHelper>,
-    arguments: &[ir::Value],
-    transition: NativeOptimizingTransition<'_>,
-    restore: (ir::Value, ir::Value),
-) -> Result<ir::Value, CraneliftLoweringError> {
-    let helper = helper.ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_FRAME_INTROSPECTION",
-            "prepared frame-introspection builtin has no fixed native handler",
-        )
-    })?;
-    let call = match builtin {
-        StableFrameIntrospectionBuiltin::NumArgs | StableFrameIntrospectionBuiltin::GetArgs => {
-            debug_assert!(arguments.is_empty());
-            call_native_helper(module, builder, helper, &[])
-        }
-        StableFrameIntrospectionBuiltin::GetArg => {
-            debug_assert_eq!(arguments.len(), 1);
-            call_native_helper(module, builder, helper, &[arguments[0]])
-        }
-    };
-    let control = builder.inst_results(call)[0];
-    let value = builder.inst_results(call)[1];
-    let status = builder.ins().ireduce(types::I32, control);
-    let detail = builder.ins().ushr_imm(control, 32);
-    let detail = builder.ins().ireduce(types::I32, detail);
-    let returned = builder.create_block();
-    let control_exit = builder.create_block();
-    let is_return = builder.ins().icmp_imm(
-        IntCC::Equal,
-        status,
-        i64::from(crate::JitCallStatus::RETURN.0),
-    );
-    builder
-        .ins()
-        .brif(is_return, returned, &[], control_exit, &[]);
-
-    let (address, previous) = restore;
-    builder.switch_to_block(control_exit);
-    builder
-        .ins()
-        .store(MemFlagsData::new(), previous, address, 0);
-    transition.emit_control(builder, status, detail, value)?;
-
-    builder.switch_to_block(returned);
-    builder
-        .ins()
-        .store(MemFlagsData::new(), previous, address, 0);
-    Ok(value)
+    }};
 }
 
 fn lower_optimizing_reference_scalar(
@@ -12474,7 +12153,7 @@ fn lower_optimizing_preg_replace_callback_step(
     let effects_committed = builder
         .ins()
         .iconst(types::I64, i64::from(effects_committed));
-    let plan = emit_exact_native_control_value_with_cleanup!(
+    let plan = emit_total_exact_native_value_with_cleanup!(
         module,
         builder,
         operations.preg_callback_plan,
@@ -12602,7 +12281,7 @@ fn lower_optimizing_preg_replace_callback_step(
             coercion_cleanup.push(owner);
         }
         coercion_cleanup.push(callback_result);
-        let coerced = emit_exact_native_control_value_with_cleanup!(
+        let coerced = emit_total_exact_native_value_with_cleanup!(
             module,
             builder,
             operations.callback_return_string,
@@ -12641,7 +12320,7 @@ fn lower_optimizing_preg_replace_callback_step(
     if let Some(owner) = callback.owner() {
         assembly_cleanup.push(owner);
     }
-    let result = emit_exact_native_control_value_with_cleanup!(
+    let result = emit_total_exact_native_value_with_cleanup!(
         module,
         builder,
         operations.preg_callback_assemble,
@@ -18453,7 +18132,7 @@ fn lower_guarded_empty_condition(
     builder.ins().jump(merge, &[array_truthy.into()]);
 
     builder.switch_to_block(generic);
-    let generic_truthy = terminators::lower_guarded_unknown_condition(
+    let generic_truthy = terminators::lower_baseline_unknown_condition(
         module,
         builder,
         truthy.ok_or_else(|| {
@@ -20550,7 +20229,7 @@ fn lower_optimizing_prepare_array_callback<'a>(
             requires_releasable_scalar_return,
             allow_first_parameter_by_reference,
         } => {
-            let owner = emit_exact_native_control_value_with_cleanup!(
+            let owner = emit_total_exact_native_value_with_cleanup!(
                 module,
                 builder,
                 acquire,
@@ -21376,7 +21055,7 @@ fn lower_optimizing_region_instruction(
             } else {
                 lower_optimizing_prepared_class_pointer(builder, *class, transition)
             };
-            let object = emit_exact_native_control_value!(
+            let object = emit_total_exact_native_value!(
                 module,
                 builder,
                 optimizing_operations.prepared_object_new,
@@ -21402,7 +21081,7 @@ fn lower_optimizing_region_instruction(
             emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
             let object = lower_region_operand(builder, locals, registers, *object)?;
             let object = lower_optimizing_reference_scalar(builder, object, false, transition)?;
-            let clone = emit_exact_native_control_value!(
+            let clone = emit_total_exact_native_value!(
                 module,
                 builder,
                 optimizing_operations.plain_object_clone,
@@ -22104,26 +21783,14 @@ fn lower_optimizing_region_instruction(
                         "total representation-heavy binary target was not declared",
                     )
                 })?;
-                let call = call_native_helper(module, builder, helper, &[lhs, rhs]);
-                let control = builder.inst_results(call)[0];
-                let value = builder.inst_results(call)[1];
-                let status = builder.ins().ireduce(types::I32, control);
-                let detail = builder.ins().ushr_imm(control, 32);
-                let detail = builder.ins().ireduce(types::I32, detail);
-                let returned = builder.create_block();
-                let control_exit = builder.create_block();
-                let is_return = builder.ins().icmp_imm(
-                    IntCC::Equal,
-                    status,
-                    i64::from(crate::JitCallStatus::RETURN.0),
-                );
-                builder
-                    .ins()
-                    .brif(is_return, returned, &[], control_exit, &[]);
-                builder.switch_to_block(control_exit);
-                transition.emit_control(builder, status, detail, value)?;
-                builder.switch_to_block(returned);
-                value
+                emit_total_exact_native_value!(
+                    module,
+                    builder,
+                    Some(helper),
+                    &[lhs, rhs],
+                    transition,
+                    "publication-total representation-heavy binary target was not declared",
+                )?
             };
             define_region_register(builder, register_variables, registers, *dst, value)?;
         }
@@ -22143,7 +21810,7 @@ fn lower_optimizing_region_instruction(
                 }
                 exact => {
                     emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
-                    emit_exact_native_control_value!(
+                    emit_total_exact_native_value!(
                         module,
                         builder,
                         optimizing_operations.exact_unary[native_exact_unary_index(*exact)],
@@ -22167,7 +21834,7 @@ fn lower_optimizing_region_instruction(
                 builder, locals, registers, constants, *rhs, transition,
             )?;
             emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
-            let value = emit_exact_native_control_value!(
+            let value = emit_total_exact_native_value!(
                 module,
                 builder,
                 optimizing_operations.exact_compare[native_exact_compare_index(*op)],
@@ -22194,7 +21861,7 @@ fn lower_optimizing_region_instruction(
                     || optimizing_fact_is_compound_numeric_cast(fact))
             {
                 emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
-                emit_exact_native_control_value!(
+                emit_total_exact_native_value!(
                     module,
                     builder,
                     optimizing_operations.float_cast,
@@ -22218,7 +21885,7 @@ fn lower_optimizing_region_instruction(
                     .expect("direct integer cast contract was checked")
             } else if *op == RegionCastOp::Int {
                 emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
-                emit_exact_native_control_value!(
+                emit_total_exact_native_value!(
                     module,
                     builder,
                     optimizing_operations.int_cast,
@@ -22228,7 +21895,7 @@ fn lower_optimizing_region_instruction(
                 )?
             } else if *op == RegionCastOp::Array {
                 emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
-                emit_exact_native_control_value!(
+                emit_total_exact_native_value!(
                     module,
                     builder,
                     optimizing_operations.array_cast,
@@ -22238,7 +21905,7 @@ fn lower_optimizing_region_instruction(
                 )?
             } else if *op == RegionCastOp::Object {
                 emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
-                emit_exact_native_control_value!(
+                emit_total_exact_native_value!(
                     module,
                     builder,
                     optimizing_operations.object_cast,
@@ -22248,7 +21915,7 @@ fn lower_optimizing_region_instruction(
                 )?
             } else if *op == RegionCastOp::String {
                 emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
-                emit_exact_native_control_value!(
+                emit_total_exact_native_value!(
                     module,
                     builder,
                     optimizing_operations.string_cast,
@@ -22330,7 +21997,7 @@ fn lower_optimizing_region_instruction(
                     let object = lower_region_operand(builder, locals, registers, *object)?;
                     let object =
                         lower_optimizing_reference_scalar(builder, object, false, transition)?;
-                    emit_exact_native_control_value!(
+                    emit_total_exact_native_value!(
                         module,
                         builder,
                         optimizing_operations.object_class_name,
@@ -23099,7 +22766,7 @@ fn lower_optimizing_region_instruction(
                 instruction.continuation_id,
                 deopt_out,
             );
-            let closure = emit_exact_native_control_value!(
+            let closure = emit_total_exact_native_value!(
                 module,
                 builder,
                 optimizing_operations.prepared_closure_new,
@@ -23210,7 +22877,7 @@ fn lower_optimizing_region_instruction(
                     instruction.continuation_id,
                     deopt_out,
                 );
-                let value = emit_exact_native_control_value!(
+                let value = emit_total_exact_native_value!(
                     module,
                     builder,
                     optimizing_operations.prepared_exception_new,
@@ -23721,7 +23388,7 @@ fn lower_optimizing_region_instruction(
                 }
                 let callable = runtime_callables[entry_index]
                     .expect("runtime PCRE map entry retains its native callable value");
-                let owner = emit_exact_native_control_value_with_cleanup!(
+                let owner = emit_total_exact_native_value_with_cleanup!(
                     module,
                     builder,
                     optimizing_operations.acquire_callable,
@@ -23848,6 +23515,16 @@ fn lower_optimizing_region_instruction(
         }
         RegionInstructionKind::NativeCall(call) => {
             emitted_class = crate::JitProductionLoweringClass::DirectClif;
+            if let Some(family) = stable_exact_control_builtin_family(&call.target)
+                && !total_native_array_call
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FIXED_BUILTIN_PUBLICATION",
+                    format!(
+                        "{family} builtin reached optimizing lowering without a total publication plan",
+                    ),
+                ));
+            }
             // The Region builder appends immutable scalar defaults to a
             // statically resolved call's operand vector. Those operands are
             // already the complete prepared binder plan; requiring one source
@@ -25457,7 +25134,7 @@ fn lower_optimizing_region_instruction(
                 emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
                 let object = lower_region_operand(builder, locals, registers, *bound_object)?;
                 let object = lower_optimizing_reference_scalar(builder, object, false, transition)?;
-                let value = emit_exact_native_control_value!(
+                let value = emit_total_exact_native_value!(
                     module,
                     builder,
                     optimizing_operations.object_class_name,
@@ -25478,7 +25155,7 @@ fn lower_optimizing_region_instruction(
             {
                 emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
                 let value = lower_region_operand(builder, locals, registers, *value)?;
-                let callable = emit_exact_native_control_value!(
+                let callable = emit_total_exact_native_value!(
                     module,
                     builder,
                     optimizing_operations.acquire_callable,
@@ -25554,7 +25231,7 @@ fn lower_optimizing_region_instruction(
                     })?,
                 );
                 let flags = builder.ins().iconst(types::I64, i64::from(flags));
-                let callable = emit_exact_native_control_value!(
+                let callable = emit_total_exact_native_value!(
                     module,
                     builder,
                     optimizing_operations.resolve_callable,
@@ -25872,7 +25549,7 @@ fn lower_optimizing_region_instruction(
                 } else {
                     optimizing_operations.dynamic_property_slot
                 };
-                let property_slot = emit_exact_native_control_value!(
+                let property_slot = emit_total_exact_native_value!(
                     module,
                     builder,
                     property_slot_handler,
@@ -26498,9 +26175,7 @@ fn lower_optimizing_region_instruction(
                 );
                 let result = match builtin {
                     StablePcreBuiltin::LastError | StablePcreBuiltin::LastErrorMessage => {
-                        lower_optimizing_exact_zero_runtime_builtin(
-                            module, builder, helper, transition,
-                        )?
+                        emit_total_exact_zero!(module, builder, helper, transition,)?
                     }
                     StablePcreBuiltin::Quote => emit_fixed_two_argument_control!(
                         module,
@@ -26510,7 +26185,7 @@ fn lower_optimizing_region_instruction(
                         arguments.get(1).copied().unwrap_or(missing),
                         transition,
                     )?,
-                    StablePcreBuiltin::Grep => lower_optimizing_exact_ternary_runtime_builtin(
+                    StablePcreBuiltin::Grep => emit_total_exact_ternary!(
                         module,
                         builder,
                         helper,
@@ -26519,7 +26194,7 @@ fn lower_optimizing_region_instruction(
                         arguments.get(2).copied().unwrap_or(missing),
                         transition,
                     )?,
-                    StablePcreBuiltin::Split => lower_optimizing_exact_quaternary_runtime_builtin(
+                    StablePcreBuiltin::Split => emit_total_exact_quaternary!(
                         module,
                         builder,
                         helper,
@@ -26531,7 +26206,7 @@ fn lower_optimizing_region_instruction(
                     StablePcreBuiltin::Match
                     | StablePcreBuiltin::MatchAll
                     | StablePcreBuiltin::Replace
-                    | StablePcreBuiltin::Filter => lower_optimizing_exact_five_runtime_builtin(
+                    | StablePcreBuiltin::Filter => emit_total_exact_five!(
                         module,
                         builder,
                         helper,
@@ -26567,12 +26242,10 @@ fn lower_optimizing_region_instruction(
                 );
                 let result = match builtin {
                     StableJsonBuiltin::LastError | StableJsonBuiltin::LastErrorMessage => {
-                        lower_optimizing_exact_zero_runtime_builtin(
-                            module, builder, helper, transition,
-                        )?
+                        emit_total_exact_zero!(module, builder, helper, transition,)?
                     }
                     StableJsonBuiltin::Encode | StableJsonBuiltin::Validate => {
-                        lower_optimizing_exact_ternary_runtime_builtin(
+                        emit_total_exact_ternary!(
                             module,
                             builder,
                             helper,
@@ -26582,7 +26255,7 @@ fn lower_optimizing_region_instruction(
                             transition,
                         )?
                     }
-                    StableJsonBuiltin::Decode => lower_optimizing_exact_quaternary_runtime_builtin(
+                    StableJsonBuiltin::Decode => emit_total_exact_quaternary!(
                         module,
                         builder,
                         helper,
@@ -26614,8 +26287,15 @@ fn lower_optimizing_region_instruction(
                 let helper = optimizing_operations.exact_format[builtin.index()];
                 let result = match builtin {
                     StableFormatBuiltin::Sprintf | StableFormatBuiltin::Printf => {
-                        lower_optimizing_exact_argument_slice_builtin(
-                            module, builder, helper, &arguments, transition,
+                        let frame =
+                            lower_optimizing_exact_argument_slice(module, builder, &arguments)?;
+                        emit_total_exact_native_value!(
+                            module,
+                            builder,
+                            helper,
+                            &frame,
+                            transition,
+                            "published formatting callsite has no exact variadic handler",
                         )?
                     }
                     StableFormatBuiltin::Vsprintf | StableFormatBuiltin::Vprintf => {
@@ -26633,7 +26313,7 @@ fn lower_optimizing_region_instruction(
                             types::I64,
                             crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                         );
-                        lower_optimizing_exact_quaternary_runtime_builtin(
+                        emit_total_exact_quaternary!(
                             module,
                             builder,
                             helper,
@@ -26669,13 +26349,9 @@ fn lower_optimizing_region_instruction(
                     crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                 );
                 let result = match builtin {
-                    StableHashBuiltin::Crc32 => lower_optimizing_exact_unary_runtime_builtin(
-                        module,
-                        builder,
-                        helper,
-                        arguments[0],
-                        transition,
-                    )?,
+                    StableHashBuiltin::Crc32 => {
+                        emit_total_exact_unary!(module, builder, helper, arguments[0], transition,)?
+                    }
                     StableHashBuiltin::HashEquals => emit_fixed_two_argument_control!(
                         module,
                         builder,
@@ -26695,7 +26371,7 @@ fn lower_optimizing_region_instruction(
                         )?
                     }
                     StableHashBuiltin::Hash | StableHashBuiltin::HashHmac => {
-                        lower_optimizing_exact_quaternary_runtime_builtin(
+                        emit_total_exact_quaternary!(
                             module,
                             builder,
                             helper,
@@ -26727,15 +26403,24 @@ fn lower_optimizing_region_instruction(
                     .collect::<Result<Vec<_>, CraneliftLoweringError>>()?;
                 let helper = optimizing_operations.exact_byte_codec[builtin.index()];
                 let result = match builtin {
-                    StableByteCodecBuiltin::Pack => lower_optimizing_exact_argument_slice_builtin(
-                        module, builder, helper, &arguments, transition,
-                    )?,
+                    StableByteCodecBuiltin::Pack => {
+                        let frame =
+                            lower_optimizing_exact_argument_slice(module, builder, &arguments)?;
+                        emit_total_exact_native_value!(
+                            module,
+                            builder,
+                            helper,
+                            &frame,
+                            transition,
+                            "published pack callsite has no exact variadic handler",
+                        )?
+                    }
                     StableByteCodecBuiltin::Unpack => {
                         let missing = builder.ins().iconst(
                             types::I64,
                             crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                         );
-                        lower_optimizing_exact_ternary_runtime_builtin(
+                        emit_total_exact_ternary!(
                             module,
                             builder,
                             helper,
@@ -26780,13 +26465,7 @@ fn lower_optimizing_region_instruction(
                     | StableByteCodecBuiltin::StripCSlashes
                     | StableByteCodecBuiltin::StripSlashes
                     | StableByteCodecBuiltin::QuoteMeta => {
-                        lower_optimizing_exact_unary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            transition,
-                        )?
+                        emit_total_exact_unary!(module, builder, helper, arguments[0], transition,)?
                     }
                 };
                 define_optimizing_call_result(
@@ -26828,28 +26507,24 @@ fn lower_optimizing_region_instruction(
                     }
                     StableStringSearchCompareBuiltin::StrStr
                     | StableStringSearchCompareBuiltin::StrIStr
-                    | StableStringSearchCompareBuiltin::StrRChr => {
-                        lower_optimizing_exact_ternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments[1],
-                            arguments.get(2).copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
-                    StableStringSearchCompareBuiltin::SubstrCompare => {
-                        lower_optimizing_exact_five_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            std::array::from_fn(|index| {
-                                arguments.get(index).copied().unwrap_or(missing)
-                            }),
-                            transition,
-                        )?
-                    }
+                    | StableStringSearchCompareBuiltin::StrRChr => emit_total_exact_ternary!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments[1],
+                        arguments.get(2).copied().unwrap_or(missing),
+                        transition,
+                    )?,
+                    StableStringSearchCompareBuiltin::SubstrCompare => emit_total_exact_five!(
+                        module,
+                        builder,
+                        helper,
+                        std::array::from_fn(|index| {
+                            arguments.get(index).copied().unwrap_or(missing)
+                        }),
+                        transition,
+                    )?,
                 };
                 define_optimizing_call_result(
                     builder,
@@ -26887,29 +26562,25 @@ fn lower_optimizing_region_instruction(
                         transition,
                     )?,
                     StableStringRewriteBuiltin::StrTr
-                    | StableStringRewriteBuiltin::VersionCompare => {
-                        lower_optimizing_exact_ternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments[1],
-                            arguments.get(2).copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
+                    | StableStringRewriteBuiltin::VersionCompare => emit_total_exact_ternary!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments[1],
+                        arguments.get(2).copied().unwrap_or(missing),
+                        transition,
+                    )?,
                     StableStringRewriteBuiltin::StrPad
-                    | StableStringRewriteBuiltin::SubstrReplace => {
-                        lower_optimizing_exact_quaternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            std::array::from_fn(|index| {
-                                arguments.get(index).copied().unwrap_or(missing)
-                            }),
-                            transition,
-                        )?
-                    }
+                    | StableStringRewriteBuiltin::SubstrReplace => emit_total_exact_quaternary!(
+                        module,
+                        builder,
+                        helper,
+                        std::array::from_fn(|index| {
+                            arguments.get(index).copied().unwrap_or(missing)
+                        }),
+                        transition,
+                    )?,
                 };
                 define_optimizing_call_result(
                     builder,
@@ -26937,7 +26608,7 @@ fn lower_optimizing_region_instruction(
                 );
                 let result = match builtin {
                     StableHtmlCodecBuiltin::SpecialChars | StableHtmlCodecBuiltin::Entities => {
-                        lower_optimizing_exact_quaternary_runtime_builtin(
+                        emit_total_exact_quaternary!(
                             module,
                             builder,
                             helper,
@@ -26947,17 +26618,15 @@ fn lower_optimizing_region_instruction(
                             transition,
                         )?
                     }
-                    StableHtmlCodecBuiltin::EntityDecode => {
-                        lower_optimizing_exact_ternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments.get(1).copied().unwrap_or(missing),
-                            arguments.get(2).copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
+                    StableHtmlCodecBuiltin::EntityDecode => emit_total_exact_ternary!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments.get(1).copied().unwrap_or(missing),
+                        arguments.get(2).copied().unwrap_or(missing),
+                        transition,
+                    )?,
                     StableHtmlCodecBuiltin::SpecialCharsDecode => emit_fixed_two_argument_control!(
                         module,
                         builder,
@@ -27022,17 +26691,15 @@ fn lower_optimizing_region_instruction(
                         arguments[1],
                         transition,
                     )?,
-                    StableUrlQueryBuiltin::HttpBuildQuery => {
-                        lower_optimizing_exact_quaternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            std::array::from_fn(|index| {
-                                arguments.get(index).copied().unwrap_or(missing)
-                            }),
-                            transition,
-                        )?
-                    }
+                    StableUrlQueryBuiltin::HttpBuildQuery => emit_total_exact_quaternary!(
+                        module,
+                        builder,
+                        helper,
+                        std::array::from_fn(|index| {
+                            arguments.get(index).copied().unwrap_or(missing)
+                        }),
+                        transition,
+                    )?,
                 };
                 define_optimizing_call_result(
                     builder,
@@ -27099,13 +26766,7 @@ fn lower_optimizing_region_instruction(
                 let helper = optimizing_operations.exact_array_aggregate[builtin.index()];
                 let result = match builtin {
                     StableArrayAggregateBuiltin::Sum => {
-                        lower_optimizing_exact_unary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            transition,
-                        )?
+                        emit_total_exact_unary!(module, builder, helper, arguments[0], transition,)?
                     }
                     StableArrayAggregateBuiltin::Count | StableArrayAggregateBuiltin::SizeOf => {
                         let missing = builder.ins().iconst(
@@ -27150,12 +26811,14 @@ fn lower_optimizing_region_instruction(
                         arguments.push(lower_region_operand(builder, locals, registers, operand)?);
                     }
                 }
-                let result = lower_optimizing_exact_argument_slice_builtin(
+                let frame = lower_optimizing_exact_argument_slice(module, builder, &arguments)?;
+                let result = emit_total_exact_native_value!(
                     module,
                     builder,
                     optimizing_operations.exact_array_multisort,
-                    &arguments,
+                    &frame,
                     transition,
+                    "published array_multisort callsite has no exact variadic handler",
                 )?;
                 define_optimizing_call_result(
                     builder,
@@ -27212,7 +26875,7 @@ fn lower_optimizing_region_instruction(
                 let argument_owner = lower_region_operand(builder, locals, registers, operand)?;
                 let argument =
                     lower_optimizing_reference_scalar(builder, argument_owner, false, transition)?;
-                let result = lower_optimizing_exact_unary_runtime_builtin(
+                let result = emit_total_exact_unary!(
                     module,
                     builder,
                     optimizing_operations.exact_object_identity[builtin.index()],
@@ -27268,7 +26931,7 @@ fn lower_optimizing_region_instruction(
                     types::I64,
                     crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                 );
-                let result = lower_optimizing_exact_ternary_runtime_builtin(
+                let result = emit_total_exact_ternary!(
                     module,
                     builder,
                     optimizing_operations.exact_callable_query[builtin.index()],
@@ -27335,7 +26998,7 @@ fn lower_optimizing_region_instruction(
                     types::I64,
                     crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                 );
-                let result = lower_optimizing_exact_ternary_runtime_builtin(
+                let result = emit_total_exact_ternary!(
                     module,
                     builder,
                     optimizing_operations.exact_autoload_callback[builtin.index()],
@@ -27364,12 +27027,21 @@ fn lower_optimizing_region_instruction(
                         lower_optimizing_reference_scalar(builder, argument, false, transition)
                     })
                     .collect::<Result<Vec<_>, CraneliftLoweringError>>()?;
-                let result = lower_optimizing_exact_shutdown_callback_builtin(
+                let frame = lower_optimizing_exact_argument_slice(module, builder, &arguments)?;
+                let function = builder
+                    .ins()
+                    .iconst(types::I32, i64::from(transition.function.raw()));
+                let continuation = builder
+                    .ins()
+                    .iconst(types::I32, i64::from(transition.continuation_id));
+                let native_arguments = [frame[0], frame[1], function, continuation];
+                let result = emit_total_exact_native_value!(
                     module,
                     builder,
                     optimizing_operations.exact_shutdown_callback,
-                    &arguments,
+                    &native_arguments,
                     transition,
+                    "published shutdown callback has no exact variadic handler",
                 )?;
                 define_optimizing_call_result(
                     builder,
@@ -27388,7 +27060,7 @@ fn lower_optimizing_region_instruction(
                 let argument = lower_region_operand(builder, locals, registers, operand)?;
                 let argument =
                     lower_optimizing_reference_scalar(builder, argument, false, transition)?;
-                let result = lower_optimizing_exact_unary_runtime_builtin(
+                let result = emit_total_exact_unary!(
                     module,
                     builder,
                     optimizing_operations.exact_serialization[builtin.index()],
@@ -27432,13 +27104,9 @@ fn lower_optimizing_region_instruction(
                             transition,
                         )?
                     }
-                    StableTokenizerBuiltin::Name => lower_optimizing_exact_unary_runtime_builtin(
-                        module,
-                        builder,
-                        helper,
-                        arguments[0],
-                        transition,
-                    )?,
+                    StableTokenizerBuiltin::Name => {
+                        emit_total_exact_unary!(module, builder, helper, arguments[0], transition,)?
+                    }
                 };
                 define_optimizing_call_result(
                     builder,
@@ -27481,21 +27149,17 @@ fn lower_optimizing_region_instruction(
                 );
                 let result = match builtin {
                     StableMbstringBuiltin::ListEncodings => {
-                        lower_optimizing_exact_zero_runtime_builtin(
-                            module, builder, helper, transition,
-                        )?
+                        emit_total_exact_zero!(module, builder, helper, transition,)?
                     }
                     StableMbstringBuiltin::InternalEncoding
                     | StableMbstringBuiltin::EncodingAliases
-                    | StableMbstringBuiltin::SubstituteCharacter => {
-                        lower_optimizing_exact_unary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments.first().copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
+                    | StableMbstringBuiltin::SubstituteCharacter => emit_total_exact_unary!(
+                        module,
+                        builder,
+                        helper,
+                        arguments.first().copied().unwrap_or(missing),
+                        transition,
+                    )?,
                     StableMbstringBuiltin::CheckEncoding
                     | StableMbstringBuiltin::Strlen
                     | StableMbstringBuiltin::Strtolower
@@ -27516,44 +27180,38 @@ fn lower_optimizing_region_instruction(
                     StableMbstringBuiltin::DetectEncoding
                     | StableMbstringBuiltin::ConvertEncoding
                     | StableMbstringBuiltin::SubstrCount
-                    | StableMbstringBuiltin::ConvertCase => {
-                        lower_optimizing_exact_ternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments.get(1).copied().unwrap_or(missing),
-                            arguments.get(2).copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
+                    | StableMbstringBuiltin::ConvertCase => emit_total_exact_ternary!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments.get(1).copied().unwrap_or(missing),
+                        arguments.get(2).copied().unwrap_or(missing),
+                        transition,
+                    )?,
                     StableMbstringBuiltin::Stripos
                     | StableMbstringBuiltin::Strpos
                     | StableMbstringBuiltin::Strripos
                     | StableMbstringBuiltin::Strrpos
                     | StableMbstringBuiltin::Substr
-                    | StableMbstringBuiltin::Strcut => {
-                        lower_optimizing_exact_quaternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            std::array::from_fn(|index| {
-                                arguments.get(index).copied().unwrap_or(missing)
-                            }),
-                            transition,
-                        )?
-                    }
-                    StableMbstringBuiltin::Strimwidth => {
-                        lower_optimizing_exact_five_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            std::array::from_fn(|index| {
-                                arguments.get(index).copied().unwrap_or(missing)
-                            }),
-                            transition,
-                        )?
-                    }
+                    | StableMbstringBuiltin::Strcut => emit_total_exact_quaternary!(
+                        module,
+                        builder,
+                        helper,
+                        std::array::from_fn(|index| {
+                            arguments.get(index).copied().unwrap_or(missing)
+                        }),
+                        transition,
+                    )?,
+                    StableMbstringBuiltin::Strimwidth => emit_total_exact_five!(
+                        module,
+                        builder,
+                        helper,
+                        std::array::from_fn(|index| {
+                            arguments.get(index).copied().unwrap_or(missing)
+                        }),
+                        transition,
+                    )?,
                 };
                 define_optimizing_call_result(
                     builder,
@@ -27581,7 +27239,7 @@ fn lower_optimizing_region_instruction(
                     crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                 );
                 let result = match builtin {
-                    StableBcmathBuiltin::Scale => lower_optimizing_exact_unary_runtime_builtin(
+                    StableBcmathBuiltin::Scale => emit_total_exact_unary!(
                         module,
                         builder,
                         helper,
@@ -27596,24 +27254,22 @@ fn lower_optimizing_region_instruction(
                         arguments.get(1).copied().unwrap_or(missing),
                         transition,
                     )?,
-                    StableBcmathBuiltin::PowMod => {
-                        lower_optimizing_exact_quaternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            std::array::from_fn(|index| {
-                                arguments.get(index).copied().unwrap_or(missing)
-                            }),
-                            transition,
-                        )?
-                    }
+                    StableBcmathBuiltin::PowMod => emit_total_exact_quaternary!(
+                        module,
+                        builder,
+                        helper,
+                        std::array::from_fn(|index| {
+                            arguments.get(index).copied().unwrap_or(missing)
+                        }),
+                        transition,
+                    )?,
                     StableBcmathBuiltin::Add
                     | StableBcmathBuiltin::Comp
                     | StableBcmathBuiltin::Div
                     | StableBcmathBuiltin::Mod
                     | StableBcmathBuiltin::Mul
                     | StableBcmathBuiltin::Pow
-                    | StableBcmathBuiltin::Sub => lower_optimizing_exact_ternary_runtime_builtin(
+                    | StableBcmathBuiltin::Sub => emit_total_exact_ternary!(
                         module,
                         builder,
                         helper,
@@ -27649,20 +27305,18 @@ fn lower_optimizing_region_instruction(
                     crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                 );
                 let result = match builtin {
-                    StableFilterBuiltin::Input => {
-                        lower_optimizing_exact_quaternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            [
-                                arguments[0],
-                                arguments[1],
-                                arguments.get(2).copied().unwrap_or(missing),
-                                arguments.get(3).copied().unwrap_or(missing),
-                            ],
-                            transition,
-                        )?
-                    }
+                    StableFilterBuiltin::Input => emit_total_exact_quaternary!(
+                        module,
+                        builder,
+                        helper,
+                        [
+                            arguments[0],
+                            arguments[1],
+                            arguments.get(2).copied().unwrap_or(missing),
+                            arguments.get(3).copied().unwrap_or(missing),
+                        ],
+                        transition,
+                    )?,
                     StableFilterBuiltin::HasVar => emit_fixed_two_argument_control!(
                         module,
                         builder,
@@ -27672,7 +27326,7 @@ fn lower_optimizing_region_instruction(
                         transition,
                     )?,
                     StableFilterBuiltin::InputArray | StableFilterBuiltin::VarArray => {
-                        lower_optimizing_exact_ternary_runtime_builtin(
+                        emit_total_exact_ternary!(
                             module,
                             builder,
                             helper,
@@ -27682,17 +27336,13 @@ fn lower_optimizing_region_instruction(
                             transition,
                         )?
                     }
-                    StableFilterBuiltin::List => lower_optimizing_exact_zero_runtime_builtin(
-                        module, builder, helper, transition,
-                    )?,
-                    StableFilterBuiltin::Id => lower_optimizing_exact_unary_runtime_builtin(
-                        module,
-                        builder,
-                        helper,
-                        arguments[0],
-                        transition,
-                    )?,
-                    StableFilterBuiltin::Var => lower_optimizing_exact_ternary_runtime_builtin(
+                    StableFilterBuiltin::List => {
+                        emit_total_exact_zero!(module, builder, helper, transition,)?
+                    }
+                    StableFilterBuiltin::Id => {
+                        emit_total_exact_unary!(module, builder, helper, arguments[0], transition,)?
+                    }
+                    StableFilterBuiltin::Var => emit_total_exact_ternary!(
                         module,
                         builder,
                         helper,
@@ -27737,54 +27387,42 @@ fn lower_optimizing_region_instruction(
                     | StableSessionBuiltin::Name
                     | StableSessionBuiltin::RegenerateId
                     | StableSessionBuiltin::SavePath
-                    | StableSessionBuiltin::Start => lower_optimizing_exact_unary_runtime_builtin(
+                    | StableSessionBuiltin::Start => {
+                        emit_total_exact_unary!(module, builder, helper, argument(0), transition,)?
+                    }
+                    StableSessionBuiltin::Decode => {
+                        emit_total_exact_unary!(module, builder, helper, arguments[0], transition,)?
+                    }
+                    StableSessionBuiltin::SetCookieParams => emit_total_exact_five!(
                         module,
                         builder,
                         helper,
-                        argument(0),
+                        [
+                            arguments[0],
+                            argument(1),
+                            argument(2),
+                            argument(3),
+                            argument(4),
+                        ],
                         transition,
                     )?,
-                    StableSessionBuiltin::Decode => lower_optimizing_exact_unary_runtime_builtin(
+                    StableSessionBuiltin::SetSaveHandler => emit_total_exact_nine!(
                         module,
                         builder,
                         helper,
-                        arguments[0],
+                        [
+                            arguments[0],
+                            argument(1),
+                            argument(2),
+                            argument(3),
+                            argument(4),
+                            argument(5),
+                            argument(6),
+                            argument(7),
+                            argument(8),
+                        ],
                         transition,
                     )?,
-                    StableSessionBuiltin::SetCookieParams => {
-                        lower_optimizing_exact_five_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            [
-                                arguments[0],
-                                argument(1),
-                                argument(2),
-                                argument(3),
-                                argument(4),
-                            ],
-                            transition,
-                        )?
-                    }
-                    StableSessionBuiltin::SetSaveHandler => {
-                        lower_optimizing_exact_nine_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            [
-                                arguments[0],
-                                argument(1),
-                                argument(2),
-                                argument(3),
-                                argument(4),
-                                argument(5),
-                                argument(6),
-                                argument(7),
-                                argument(8),
-                            ],
-                            transition,
-                        )?
-                    }
                     StableSessionBuiltin::Abort
                     | StableSessionBuiltin::Commit
                     | StableSessionBuiltin::Destroy
@@ -27796,9 +27434,7 @@ fn lower_optimizing_region_instruction(
                     | StableSessionBuiltin::Status
                     | StableSessionBuiltin::Unset
                     | StableSessionBuiltin::WriteClose => {
-                        lower_optimizing_exact_zero_runtime_builtin(
-                            module, builder, helper, transition,
-                        )?
+                        emit_total_exact_zero!(module, builder, helper, transition,)?
                     }
                 };
                 define_optimizing_call_result(
@@ -27818,7 +27454,7 @@ fn lower_optimizing_region_instruction(
                 let argument = lower_region_operand(builder, locals, registers, operand)?;
                 let argument =
                     lower_optimizing_reference_scalar(builder, argument, false, transition)?;
-                let result = lower_optimizing_exact_unary_runtime_builtin(
+                let result = emit_total_exact_unary!(
                     module,
                     builder,
                     optimizing_operations.exact_object_vars[builtin.index()],
@@ -27841,7 +27477,7 @@ fn lower_optimizing_region_instruction(
                     .expect("fixed native get_class argument has an operand");
                 let object = lower_region_operand(builder, locals, registers, operand)?;
                 let object = lower_optimizing_reference_scalar(builder, object, false, transition)?;
-                let result = emit_exact_native_control_value!(
+                let result = emit_total_exact_native_value!(
                     module,
                     builder,
                     optimizing_operations.object_class_name,
@@ -27902,13 +27538,7 @@ fn lower_optimizing_region_instruction(
                 );
                 let result = match builtin {
                     StableClassLineageBuiltin::ParentClass => {
-                        lower_optimizing_exact_unary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            transition,
-                        )?
+                        emit_total_exact_unary!(module, builder, helper, arguments[0], transition,)?
                     }
                     StableClassLineageBuiltin::Implements => emit_fixed_two_argument_control!(
                         module,
@@ -27919,7 +27549,7 @@ fn lower_optimizing_region_instruction(
                         transition,
                     )?,
                     StableClassLineageBuiltin::IsSubclassOf | StableClassLineageBuiltin::IsA => {
-                        lower_optimizing_exact_ternary_runtime_builtin(
+                        emit_total_exact_ternary!(
                             module,
                             builder,
                             helper,
@@ -27955,7 +27585,7 @@ fn lower_optimizing_region_instruction(
                     types::I64,
                     crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                 );
-                let result = lower_optimizing_exact_unary_runtime_builtin(
+                let result = emit_total_exact_unary!(
                     module,
                     builder,
                     optimizing_operations.exact_extension_query[builtin.index()],
@@ -27987,7 +27617,7 @@ fn lower_optimizing_region_instruction(
                 } else {
                     missing
                 };
-                let result = lower_optimizing_exact_unary_runtime_builtin(
+                let result = emit_total_exact_unary!(
                     module,
                     builder,
                     optimizing_operations.exact_memory_query[builtin.index()],
@@ -28005,7 +27635,7 @@ fn lower_optimizing_region_instruction(
                 && call.args.is_empty()
             {
                 emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
-                let result = lower_optimizing_exact_zero_runtime_builtin(
+                let result = emit_total_exact_zero!(
                     module,
                     builder,
                     optimizing_operations.exact_gc[builtin.index()],
@@ -28033,7 +27663,7 @@ fn lower_optimizing_region_instruction(
                 } else {
                     missing
                 };
-                let result = lower_optimizing_exact_unary_runtime_builtin(
+                let result = emit_total_exact_unary!(
                     module,
                     builder,
                     optimizing_operations.exact_resource_query[builtin.index()],
@@ -28051,7 +27681,7 @@ fn lower_optimizing_region_instruction(
                 && call.args.is_empty()
             {
                 emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
-                let result = lower_optimizing_exact_zero_runtime_builtin(
+                let result = emit_total_exact_zero!(
                     module,
                     builder,
                     optimizing_operations.exact_error_state[builtin.index()],
@@ -28121,21 +27751,13 @@ fn lower_optimizing_region_instruction(
                 let result = match builtin {
                     StableConfigurationBuiltin::IncludePath
                     | StableConfigurationBuiltin::TimezoneGet => {
-                        lower_optimizing_exact_zero_runtime_builtin(
-                            module, builder, helper, transition,
-                        )?
+                        emit_total_exact_zero!(module, builder, helper, transition,)?
                     }
                     StableConfigurationBuiltin::IniGet
                     | StableConfigurationBuiltin::CfgVar
                     | StableConfigurationBuiltin::SetIncludePath
                     | StableConfigurationBuiltin::TimezoneSet => {
-                        lower_optimizing_exact_unary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            transition,
-                        )?
+                        emit_total_exact_unary!(module, builder, helper, arguments[0], transition,)?
                     }
                     StableConfigurationBuiltin::IniSet => emit_fixed_two_argument_control!(
                         module,
@@ -28183,31 +27805,25 @@ fn lower_optimizing_region_instruction(
                 let result = match builtin {
                     StableHttpResponseBuiltin::HeadersList
                     | StableHttpResponseBuiltin::HeadersSent => {
-                        lower_optimizing_exact_zero_runtime_builtin(
-                            module, builder, helper, transition,
-                        )?
+                        emit_total_exact_zero!(module, builder, helper, transition,)?
                     }
                     StableHttpResponseBuiltin::HeaderRemove
-                    | StableHttpResponseBuiltin::ResponseCode => {
-                        lower_optimizing_exact_unary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments.first().copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
-                    StableHttpResponseBuiltin::Header => {
-                        lower_optimizing_exact_ternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments.get(1).copied().unwrap_or(missing),
-                            arguments.get(2).copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
+                    | StableHttpResponseBuiltin::ResponseCode => emit_total_exact_unary!(
+                        module,
+                        builder,
+                        helper,
+                        arguments.first().copied().unwrap_or(missing),
+                        transition,
+                    )?,
+                    StableHttpResponseBuiltin::Header => emit_total_exact_ternary!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments.get(1).copied().unwrap_or(missing),
+                        arguments.get(2).copied().unwrap_or(missing),
+                        transition,
+                    )?,
                 };
                 define_optimizing_call_result(
                     builder,
@@ -28234,7 +27850,7 @@ fn lower_optimizing_region_instruction(
                     types::I64,
                     crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                 );
-                let result = lower_optimizing_exact_seven_runtime_builtin(
+                let result = emit_total_exact_seven!(
                     module,
                     builder,
                     optimizing_operations.exact_cookie[builtin.index()],
@@ -28264,15 +27880,15 @@ fn lower_optimizing_region_instruction(
                 }
                 let helper = optimizing_operations.exact_clock[builtin.index()];
                 let result = match builtin {
-                    StableClockBuiltin::Time => lower_optimizing_exact_zero_runtime_builtin(
-                        module, builder, helper, transition,
-                    )?,
+                    StableClockBuiltin::Time => {
+                        emit_total_exact_zero!(module, builder, helper, transition,)?
+                    }
                     StableClockBuiltin::Microtime | StableClockBuiltin::Hrtime => {
                         let missing = builder.ins().iconst(
                             types::I64,
                             crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                         );
-                        lower_optimizing_exact_unary_runtime_builtin(
+                        emit_total_exact_unary!(
                             module,
                             builder,
                             helper,
@@ -28309,9 +27925,7 @@ fn lower_optimizing_region_instruction(
                 );
                 let result = match builtin {
                     StableDateBuiltin::TimezoneIdentifiers => {
-                        lower_optimizing_exact_zero_runtime_builtin(
-                            module, builder, helper, transition,
-                        )?
+                        emit_total_exact_zero!(module, builder, helper, transition,)?
                     }
                     StableDateBuiltin::Date
                     | StableDateBuiltin::Gmdate
@@ -28323,7 +27937,7 @@ fn lower_optimizing_region_instruction(
                         arguments.get(1).copied().unwrap_or(missing),
                         transition,
                     )?,
-                    StableDateBuiltin::Checkdate => lower_optimizing_exact_ternary_runtime_builtin(
+                    StableDateBuiltin::Checkdate => emit_total_exact_ternary!(
                         module,
                         builder,
                         helper,
@@ -28333,7 +27947,7 @@ fn lower_optimizing_region_instruction(
                         transition,
                     )?,
                     StableDateBuiltin::Mktime | StableDateBuiltin::Gmmktime => {
-                        lower_optimizing_exact_six_runtime_builtin(
+                        emit_total_exact_six!(
                             module,
                             builder,
                             helper,
@@ -28384,18 +27998,10 @@ fn lower_optimizing_region_instruction(
                 );
                 let result = match builtin {
                     StableRandomBuiltin::GetRandMax | StableRandomBuiltin::MtGetRandMax => {
-                        lower_optimizing_exact_zero_runtime_builtin(
-                            module, builder, helper, transition,
-                        )?
+                        emit_total_exact_zero!(module, builder, helper, transition,)?
                     }
                     StableRandomBuiltin::RandomBytes | StableRandomBuiltin::Shuffle => {
-                        lower_optimizing_exact_unary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            transition,
-                        )?
+                        emit_total_exact_unary!(module, builder, helper, arguments[0], transition,)?
                     }
                     StableRandomBuiltin::RandomInt => emit_fixed_two_argument_control!(
                         module,
@@ -28454,7 +28060,7 @@ fn lower_optimizing_region_instruction(
                             types::I64,
                             crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                         );
-                        lower_optimizing_exact_unary_runtime_builtin(
+                        emit_total_exact_unary!(
                             module,
                             builder,
                             helper,
@@ -28463,13 +28069,7 @@ fn lower_optimizing_region_instruction(
                         )?
                     }
                     StableRequestQueryBuiltin::ChangeDirectory => {
-                        lower_optimizing_exact_unary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            transition,
-                        )?
+                        emit_total_exact_unary!(module, builder, helper, arguments[0], transition,)?
                     }
                     StableRequestQueryBuiltin::ClearStatCache => {
                         let missing = builder.ins().iconst(
@@ -28490,9 +28090,7 @@ fn lower_optimizing_region_instruction(
                     | StableRequestQueryBuiltin::SapiName
                     | StableRequestQueryBuiltin::CurrentUser
                     | StableRequestQueryBuiltin::IncludedFiles => {
-                        lower_optimizing_exact_zero_runtime_builtin(
-                            module, builder, helper, transition,
-                        )?
+                        emit_total_exact_zero!(module, builder, helper, transition,)?
                     }
                 };
                 define_optimizing_call_result(
@@ -28506,7 +28104,7 @@ fn lower_optimizing_region_instruction(
                 && call.args.is_empty()
             {
                 emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
-                let result = lower_optimizing_exact_zero_runtime_builtin(
+                let result = emit_total_exact_zero!(
                     module,
                     builder,
                     optimizing_operations.exact_declaration_inventory[builtin.index()],
@@ -28537,7 +28135,7 @@ fn lower_optimizing_region_instruction(
                     types::I64,
                     crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                 );
-                let result = lower_optimizing_exact_unary_runtime_builtin(
+                let result = emit_total_exact_unary!(
                     module,
                     builder,
                     optimizing_operations.exact_constant_inventory,
@@ -28626,7 +28224,7 @@ fn lower_optimizing_region_instruction(
                         i64::try_from(call.args.len()).unwrap_or(i64::MAX)
                     },
                 );
-                let result = lower_optimizing_exact_compact(
+                let result = emit_total_exact_compact!(
                     module,
                     builder,
                     optimizing_operations.exact_compact,
@@ -28712,15 +28310,71 @@ fn lower_optimizing_region_instruction(
                         lower_region_operand(builder, locals, registers, operand)
                     })
                     .collect::<Result<Vec<_>, CraneliftLoweringError>>()?;
-                let result = lower_optimizing_exact_frame_introspection(
-                    module,
-                    builder,
-                    builtin,
-                    optimizing_operations.exact_frame_introspection[builtin.index()],
-                    &arguments,
-                    transition,
-                    (fixed_arguments_field, previous_fixed_arguments),
-                )?;
+                let helper = optimizing_operations.exact_frame_introspection[builtin.index()]
+                    .ok_or_else(|| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_FRAME_INTROSPECTION",
+                            "published frame-introspection callsite has no exact handler",
+                        )
+                    })?;
+                let native_arguments = match builtin {
+                    StableFrameIntrospectionBuiltin::NumArgs
+                    | StableFrameIntrospectionBuiltin::GetArgs => {
+                        debug_assert!(arguments.is_empty());
+                        &[][..]
+                    }
+                    StableFrameIntrospectionBuiltin::GetArg => {
+                        debug_assert_eq!(arguments.len(), 1);
+                        &arguments[..]
+                    }
+                };
+                let native_call = call_native_helper(module, builder, helper, native_arguments);
+                let control = builder.inst_results(native_call)[0];
+                let result = builder.inst_results(native_call)[1];
+                builder.ins().store(
+                    MemFlagsData::new(),
+                    previous_fixed_arguments,
+                    fixed_arguments_field,
+                    0,
+                );
+                let status = builder.ins().ireduce(types::I32, control);
+                let detail = builder.ins().ushr_imm(control, 32);
+                let detail = builder.ins().ireduce(types::I32, detail);
+                let returned = builder.create_block();
+                let classify_control = builder.create_block();
+                let semantic_control = builder.create_block();
+                let contract_violation = builder.create_block();
+                let is_return = builder.ins().icmp_imm(
+                    IntCC::Equal,
+                    status,
+                    i64::from(crate::JitCallStatus::RETURN.0),
+                );
+                builder
+                    .ins()
+                    .brif(is_return, returned, &[], classify_control, &[]);
+                builder.switch_to_block(classify_control);
+                let is_throw = builder.ins().icmp_imm(
+                    IntCC::Equal,
+                    status,
+                    i64::from(crate::JitCallStatus::THROW.0),
+                );
+                let is_runtime_error = builder.ins().icmp_imm(
+                    IntCC::Equal,
+                    status,
+                    i64::from(crate::JitCallStatus::RUNTIME_ERROR.0),
+                );
+                let semantic = builder.ins().bor(is_throw, is_runtime_error);
+                builder
+                    .ins()
+                    .brif(semantic, semantic_control, &[], contract_violation, &[]);
+                builder.switch_to_block(semantic_control);
+                transition.emit_control(builder, status, detail, result)?;
+                builder.switch_to_block(contract_violation);
+                let abi_mismatch = builder
+                    .ins()
+                    .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
+                builder.ins().return_(&[abi_mismatch]);
+                builder.switch_to_block(returned);
                 define_optimizing_call_result(
                     builder,
                     register_variables,
@@ -28742,30 +28396,22 @@ fn lower_optimizing_region_instruction(
                     .collect::<Result<Vec<_>, CraneliftLoweringError>>()?;
                 let helper = optimizing_operations.exact_base_conversion[builtin.index()];
                 let result = match builtin {
-                    StableBaseConversionBuiltin::BaseConvert => {
-                        lower_optimizing_exact_ternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments[1],
-                            arguments[2],
-                            transition,
-                        )?
-                    }
+                    StableBaseConversionBuiltin::BaseConvert => emit_total_exact_ternary!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments[1],
+                        arguments[2],
+                        transition,
+                    )?,
                     StableBaseConversionBuiltin::BinDec
                     | StableBaseConversionBuiltin::DecBin
                     | StableBaseConversionBuiltin::DecHex
                     | StableBaseConversionBuiltin::DecOct
                     | StableBaseConversionBuiltin::HexDec
                     | StableBaseConversionBuiltin::OctDec => {
-                        lower_optimizing_exact_unary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            transition,
-                        )?
+                        emit_total_exact_unary!(module, builder, helper, arguments[0], transition,)?
                     }
                 };
                 define_optimizing_call_result(
@@ -28783,7 +28429,7 @@ fn lower_optimizing_region_instruction(
                 let operand =
                     direct_builtin_argument(0).expect("fixed network-address argument has operand");
                 let argument = lower_region_operand(builder, locals, registers, operand)?;
-                let result = lower_optimizing_exact_unary_runtime_builtin(
+                let result = emit_total_exact_unary!(
                     module,
                     builder,
                     optimizing_operations.exact_network_address[builtin.index()],
@@ -28831,17 +28477,15 @@ fn lower_optimizing_region_instruction(
                     StableCompressionCodecBuiltin::GzEncode
                     | StableCompressionCodecBuiltin::GzCompress
                     | StableCompressionCodecBuiltin::GzDeflate
-                    | StableCompressionCodecBuiltin::ZlibEncode => {
-                        lower_optimizing_exact_ternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments.get(1).copied().unwrap_or(missing),
-                            arguments.get(2).copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
+                    | StableCompressionCodecBuiltin::ZlibEncode => emit_total_exact_ternary!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments.get(1).copied().unwrap_or(missing),
+                        arguments.get(2).copied().unwrap_or(missing),
+                        transition,
+                    )?,
                 };
                 define_optimizing_call_result(
                     builder,
@@ -28869,9 +28513,7 @@ fn lower_optimizing_region_instruction(
                 );
                 let result = match builtin {
                     StablePathBuiltin::StreamGetWrappers | StablePathBuiltin::Tmpfile => {
-                        lower_optimizing_exact_zero_runtime_builtin(
-                            module, builder, helper, transition,
-                        )?
+                        emit_total_exact_zero!(module, builder, helper, transition,)?
                     }
                     StablePathBuiltin::Realpath
                     | StablePathBuiltin::FileExists
@@ -28913,24 +28555,16 @@ fn lower_optimizing_region_instruction(
                     | StablePathBuiltin::StreamIsAtty
                     | StablePathBuiltin::Readfile
                     | StablePathBuiltin::IsUploadedFile => {
-                        lower_optimizing_exact_unary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            transition,
-                        )?
+                        emit_total_exact_unary!(module, builder, helper, arguments[0], transition,)?
                     }
                     StablePathBuiltin::StreamContextCreate
-                    | StablePathBuiltin::StreamContextGetDefault => {
-                        lower_optimizing_exact_unary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments.first().copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
+                    | StablePathBuiltin::StreamContextGetDefault => emit_total_exact_unary!(
+                        module,
+                        builder,
+                        helper,
+                        arguments.first().copied().unwrap_or(missing),
+                        transition,
+                    )?,
                     StablePathBuiltin::Basename
                     | StablePathBuiltin::Dirname
                     | StablePathBuiltin::Pathinfo
@@ -28956,73 +28590,61 @@ fn lower_optimizing_region_instruction(
                     | StablePathBuiltin::Fseek
                     | StablePathBuiltin::File
                     | StablePathBuiltin::StreamGetContents
-                    | StablePathBuiltin::StreamSetTimeout => {
-                        lower_optimizing_exact_ternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments.get(1).copied().unwrap_or(missing),
-                            arguments.get(2).copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
-                    StablePathBuiltin::StreamCopyToStream => {
-                        lower_optimizing_exact_quaternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            std::array::from_fn(|index| {
-                                arguments.get(index).copied().unwrap_or(missing)
-                            }),
-                            transition,
-                        )?
-                    }
-                    StablePathBuiltin::StreamContextSetOption => {
-                        lower_optimizing_exact_quaternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            std::array::from_fn(|index| {
-                                arguments.get(index).copied().unwrap_or(missing)
-                            }),
-                            transition,
-                        )?
-                    }
+                    | StablePathBuiltin::StreamSetTimeout => emit_total_exact_ternary!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments.get(1).copied().unwrap_or(missing),
+                        arguments.get(2).copied().unwrap_or(missing),
+                        transition,
+                    )?,
+                    StablePathBuiltin::StreamCopyToStream => emit_total_exact_quaternary!(
+                        module,
+                        builder,
+                        helper,
+                        std::array::from_fn(|index| {
+                            arguments.get(index).copied().unwrap_or(missing)
+                        }),
+                        transition,
+                    )?,
+                    StablePathBuiltin::StreamContextSetOption => emit_total_exact_quaternary!(
+                        module,
+                        builder,
+                        helper,
+                        std::array::from_fn(|index| {
+                            arguments.get(index).copied().unwrap_or(missing)
+                        }),
+                        transition,
+                    )?,
                     StablePathBuiltin::StreamFilterAppend
-                    | StablePathBuiltin::StreamFilterPrepend => {
-                        lower_optimizing_exact_quaternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            std::array::from_fn(|index| {
-                                arguments.get(index).copied().unwrap_or(missing)
-                            }),
-                            transition,
-                        )?
-                    }
-                    StablePathBuiltin::FileGetContents => {
-                        lower_optimizing_exact_five_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            std::array::from_fn(|index| {
-                                arguments.get(index).copied().unwrap_or(missing)
-                            }),
-                            transition,
-                        )?
-                    }
-                    StablePathBuiltin::FilePutContents => {
-                        lower_optimizing_exact_quaternary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            std::array::from_fn(|index| {
-                                arguments.get(index).copied().unwrap_or(missing)
-                            }),
-                            transition,
-                        )?
-                    }
+                    | StablePathBuiltin::StreamFilterPrepend => emit_total_exact_quaternary!(
+                        module,
+                        builder,
+                        helper,
+                        std::array::from_fn(|index| {
+                            arguments.get(index).copied().unwrap_or(missing)
+                        }),
+                        transition,
+                    )?,
+                    StablePathBuiltin::FileGetContents => emit_total_exact_five!(
+                        module,
+                        builder,
+                        helper,
+                        std::array::from_fn(|index| {
+                            arguments.get(index).copied().unwrap_or(missing)
+                        }),
+                        transition,
+                    )?,
+                    StablePathBuiltin::FilePutContents => emit_total_exact_quaternary!(
+                        module,
+                        builder,
+                        helper,
+                        std::array::from_fn(|index| {
+                            arguments.get(index).copied().unwrap_or(missing)
+                        }),
+                        transition,
+                    )?,
                 };
                 define_optimizing_call_result(
                     builder,
@@ -29035,7 +28657,7 @@ fn lower_optimizing_region_instruction(
                 && builtin.accepts_arity(call.args.len())
             {
                 emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
-                let result = lower_optimizing_exact_zero_runtime_builtin(
+                let result = emit_total_exact_zero!(
                     module,
                     builder,
                     optimizing_operations.exact_output_buffer[builtin.index()],
@@ -31611,7 +31233,7 @@ fn lower_baseline_region_instruction(
             let value = if let Some(value) = direct {
                 value
             } else if *op == RegionUnaryOp::Not {
-                let truthy = terminators::lower_guarded_unknown_condition(
+                let truthy = terminators::lower_baseline_unknown_condition(
                     module,
                     builder,
                     native_operations.truthy.ok_or_else(|| {

@@ -202,8 +202,13 @@ fn lower_optimizing_condition(
         value
     };
     let fact = value_flow.operand_fact(constants, condition);
-    if fact.certainty != crate::region_ir::SsaCertainty::Unknown && fact.class == SsaValueClass::Int
-    {
+    if fact.certainty == crate::region_ir::SsaCertainty::Unknown {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_TRUTHINESS_CONTRACT",
+            "optimizing branch entered without a publication-fixed value class",
+        ));
+    }
+    if fact.class == SsaValueClass::Int {
         if let RegionOperand::Constant(index) = condition
             && let Some(IrConstant::Int(value)) = constants.get(index as usize)
         {
@@ -212,15 +217,88 @@ fn lower_optimizing_condition(
         let integer = lower_optimizing_authoritative_integer(builder, value, deopt_out);
         return Ok(builder.ins().icmp_imm(IntCC::NotEqual, integer, 0));
     }
-    if let Some(truthy) = scalar_truthy(builder, value, fact.class)
-        && fact.certainty != crate::region_ir::SsaCertainty::Unknown
-    {
+    if let Some(truthy) = scalar_truthy(builder, value, fact.class) {
         return Ok(truthy);
     }
-
-    Ok(lower_optimizing_authoritative_truthy(
-        builder, value, deopt_out,
-    ))
+    match fact.class {
+        SsaValueClass::Float => {
+            let slot = lower_optimizing_slot_address(builder, value, deopt_out);
+            let bits = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                slot,
+                std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+            );
+            let magnitude = builder.ins().band_imm(bits, i64::MAX);
+            Ok(builder.ins().icmp_imm(IntCC::NotEqual, magnitude, 0))
+        }
+        SsaValueClass::StringHandle => {
+            let (_, length, bytes) = lower_native_string_key_descriptor(builder, value, deopt_out);
+            let non_empty = builder.ins().icmp_imm(IntCC::NotEqual, length, 0);
+            let single = builder.ins().icmp_imm(IntCC::Equal, length, 1);
+            let inspect_byte = builder.create_block();
+            let merge = builder.create_block();
+            builder.append_block_param(merge, types::I8);
+            builder
+                .ins()
+                .brif(single, inspect_byte, &[], merge, &[non_empty.into()]);
+            builder.switch_to_block(inspect_byte);
+            let byte = builder.ins().load(types::I8, MemFlagsData::new(), bytes, 0);
+            let not_zero = builder.ins().icmp_imm(IntCC::NotEqual, byte, b'0' as i64);
+            builder.ins().jump(merge, &[not_zero.into()]);
+            builder.switch_to_block(merge);
+            Ok(builder.block_params(merge)[0])
+        }
+        SsaValueClass::ArrayHandle => {
+            let slot = lower_optimizing_slot_address(builder, value, deopt_out);
+            let kind = builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                slot,
+                std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+            );
+            let direct_length = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                slot,
+                std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+            );
+            let shared_length = builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                slot,
+                std::mem::offset_of!(crate::JitNativeValueSlot, reserved) as i32,
+            );
+            let shared_length = builder.ins().uextend(types::I64, shared_length);
+            let shared = builder.ins().icmp_imm(
+                IntCC::Equal,
+                kind,
+                i64::from(crate::JIT_NATIVE_VALUE_VIEW_SHARED_ARRAY),
+            );
+            let borrowed = builder.ins().icmp_imm(
+                IntCC::Equal,
+                kind,
+                i64::from(crate::JIT_NATIVE_VALUE_VIEW_BORROWED_REFERENCE_ARRAY),
+            );
+            let shared = builder.ins().bor(shared, borrowed);
+            let length = builder.ins().select(shared, shared_length, direct_length);
+            Ok(builder.ins().icmp_imm(IntCC::NotEqual, length, 0))
+        }
+        SsaValueClass::ObjectHandle
+        | SsaValueClass::CallableHandle
+        | SsaValueClass::ResourceHandle
+        | SsaValueClass::GeneratorHandle
+        | SsaValueClass::FiberHandle => Ok(builder.ins().iconst(types::I8, 1)),
+        SsaValueClass::Uninitialized
+        | SsaValueClass::ReferenceHandle
+        | SsaValueClass::MixedHandle => Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_TRUTHINESS_CONTRACT",
+            "optimizing branch entered with an unclassified truthiness shape",
+        )),
+        SsaValueClass::Null | SsaValueClass::Bool | SsaValueClass::Int => {
+            unreachable!("direct scalar truthiness returned above")
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -254,7 +332,7 @@ fn lower_region_condition(
         _ => {}
     }
     if let Some(helper) = native_operations.truthy {
-        lower_guarded_unknown_condition(module, builder, helper, value, deopt_out)
+        lower_baseline_unknown_condition(module, builder, helper, value, deopt_out)
     } else if builder.func.dfg.value_type(value) == types::I64 {
         Ok(builder.ins().icmp_imm(IntCC::NotEqual, value, 0))
     } else {
@@ -265,7 +343,7 @@ fn lower_region_condition(
 /// Resolve the stable null/bool/int lanes without crossing the runtime ABI.
 /// Runtime handles and opaque constant-pool handles retain the typed helper
 /// slow path.
-pub(super) fn lower_guarded_unknown_condition(
+pub(super) fn lower_baseline_unknown_condition(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     helper: NativeHelper,

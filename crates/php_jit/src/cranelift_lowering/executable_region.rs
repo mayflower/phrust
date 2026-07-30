@@ -174,10 +174,128 @@ impl NativeEntryArrayMutationRequirement {
     }
 }
 
+/// Complete compile/publication contract for one admitted exact fixed
+/// builtin. The optimizer receives only the existence of this plan; every
+/// field is consumed while constructing entry guards and resource budgets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeExactCallFramePlan {
+    Fixed {
+        native_arity: usize,
+    },
+    VariadicSlice {
+        length: usize,
+    },
+    ShutdownCallback {
+        length: usize,
+    },
+    FrameIntrospection {
+        supplied_arguments: usize,
+        fixed_parameters: usize,
+    },
+}
+
+impl NativeExactCallFramePlan {
+    const fn supplied_arguments(self) -> usize {
+        match self {
+            Self::Fixed { native_arity } => native_arity,
+            Self::VariadicSlice { length } | Self::ShutdownCallback { length } => length,
+            Self::FrameIntrospection {
+                supplied_arguments, ..
+            } => supplied_arguments,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeExactCallbackPlan {
+    None,
+    CallableValue,
+    CallbackAndArgumentArray,
+    ShutdownCallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeExactSemanticOutcome {
+    Return,
+    Throw,
+    RuntimeError,
+    AbiMismatch,
+}
+
+const NATIVE_EXACT_TOTAL_OUTCOMES: [NativeExactSemanticOutcome; 4] = [
+    NativeExactSemanticOutcome::Return,
+    NativeExactSemanticOutcome::Throw,
+    NativeExactSemanticOutcome::RuntimeError,
+    NativeExactSemanticOutcome::AbiMismatch,
+];
+
+#[derive(Clone, Debug)]
+struct NativeFixedBuiltinPublicationPlan {
+    capability_family: &'static str,
+    provided_arity: usize,
+    native_arity: usize,
+    defaulted_argument_count: usize,
+    variadic: bool,
+    defaults_published: bool,
+    operand_classes: Vec<SsaValueClass>,
+    operand_ownership: Vec<SsaOwnership>,
+    mode_operands: Vec<usize>,
+    mutation_locals: Vec<LocalId>,
+    cleanup_owned_arguments: Vec<usize>,
+    frame: NativeExactCallFramePlan,
+    callback: NativeExactCallbackPlan,
+    semantic_outcomes: [NativeExactSemanticOutcome; 4],
+    reserved_value_slots: usize,
+    reserved_array_entries: usize,
+    reserved_string_bytes: usize,
+}
+
+impl NativeFixedBuiltinPublicationPlan {
+    fn is_total(&self) -> bool {
+        !self.capability_family.is_empty()
+            && self.defaults_published
+            && self.native_arity >= self.provided_arity
+            && self.defaulted_argument_count
+                == self.native_arity.saturating_sub(self.provided_arity)
+            && (!self.variadic || self.defaulted_argument_count == 0)
+            && self.operand_classes.len() == self.provided_arity
+            && self.operand_ownership.len() == self.provided_arity
+            && self
+                .mode_operands
+                .iter()
+                .all(|index| *index < self.provided_arity)
+            && self
+                .mutation_locals
+                .iter()
+                .all(|local| local.raw() < u32::MAX)
+            && self
+                .cleanup_owned_arguments
+                .iter()
+                .all(|index| *index < self.provided_arity)
+            && self.frame.supplied_arguments() >= self.provided_arity
+            && match self.callback {
+                NativeExactCallbackPlan::None => true,
+                NativeExactCallbackPlan::CallableValue => self.provided_arity >= 1,
+                NativeExactCallbackPlan::CallbackAndArgumentArray => self.provided_arity >= 2,
+                NativeExactCallbackPlan::ShutdownCallback => {
+                    matches!(
+                        self.frame,
+                        NativeExactCallFramePlan::ShutdownCallback { .. }
+                    ) && self.provided_arity >= 1
+                }
+            }
+            && self.semantic_outcomes == NATIVE_EXACT_TOTAL_OUTCOMES
+            && self.reserved_value_slots != 0
+            && self.reserved_array_entries != 0
+            && self.reserved_string_bytes != 0
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct NativeOptimizingAdmission {
     total_array_calls: BTreeSet<u32>,
     total_fixed_builtin_calls: BTreeSet<u32>,
+    fixed_builtin_plans: BTreeMap<u32, NativeFixedBuiltinPublicationPlan>,
     total_array_instructions: BTreeSet<u32>,
     total_binary_instructions: BTreeSet<u32>,
     total_scalar_control_instructions: BTreeSet<u32>,
@@ -225,7 +343,10 @@ impl NativeOptimizingAdmission {
     }
 
     fn fixed_builtin_call_is_total(&self, continuation_id: u32) -> bool {
-        self.total_fixed_builtin_calls.contains(&continuation_id)
+        self.fixed_builtin_plans
+            .get(&continuation_id)
+            .is_some_and(NativeFixedBuiltinPublicationPlan::is_total)
+            || self.total_fixed_builtin_calls.contains(&continuation_id)
     }
 
     fn array_instruction_is_total(&self, continuation_id: u32) -> bool {
@@ -730,6 +851,197 @@ fn publication_native_array_key(
         | RegionOperand::I64(_)
         | RegionOperand::LinkedConstant { .. } => None,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_total_fixed_builtin_plan(
+    admission: &mut NativeOptimizingAdmission,
+    call: &RegionNativeCall,
+    continuation_id: u32,
+    family: &'static str,
+    value_flow: &ExecutableValueFlow,
+    constants: &[IrConstant],
+    definitions: &BTreeMap<RegId, RegionOperand>,
+    parameter_indices: &BTreeMap<LocalId, usize>,
+    fixed_parameter_count: usize,
+) -> Result<(), CraneliftLoweringError> {
+    if call.args.iter().any(|argument| {
+        argument.name.is_some()
+            || argument.unpack
+            || argument.by_ref_dim.is_some()
+            || argument.by_ref_property.is_some()
+            || argument.by_ref_property_dim.is_some()
+    }) {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_FIXED_BUILTIN_ARGUMENT_PLAN",
+            format!(
+                "{family} builtin at continuation {continuation_id} has no total positional native argument plan",
+            ),
+        ));
+    }
+
+    let mut operand_classes = Vec::with_capacity(call.args.len());
+    let mut operand_ownership = Vec::with_capacity(call.args.len());
+    let mut mode_operands = Vec::new();
+    let mut mutation_locals = Vec::new();
+    for (index, argument) in call.args.iter().enumerate() {
+        let operand = direct_fixed_builtin_operand(call, index)
+            .or_else(|| argument.by_ref_local.map(RegionOperand::Local))
+            .ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FIXED_BUILTIN_OPERAND_PLAN",
+                    format!(
+                        "{family} builtin argument {index} at continuation {continuation_id} has no published native operand",
+                    ),
+                )
+            })?;
+        let fact = lowering_operand_fact(value_flow, constants, operand);
+        let entry_parameter = publication_entry_parameter(operand, definitions, parameter_indices);
+        let published_entry_class = entry_parameter.and_then(|parameter_index| {
+            admission
+                .value_class_requirements
+                .iter()
+                .rev()
+                .find(|requirement| requirement.parameter_index == parameter_index)
+                .map(|requirement| requirement.class)
+        });
+        let (class, ownership) = if argument.by_ref_local.is_some() {
+            (
+                SsaValueClass::ReferenceHandle,
+                SsaOwnership::AliasedReference,
+            )
+        } else if fact.certainty != crate::region_ir::SsaCertainty::Unknown
+            && fact.ownership != SsaOwnership::Unknown
+            && !matches!(
+                fact.class,
+                SsaValueClass::ReferenceHandle | SsaValueClass::MixedHandle
+            )
+        {
+            (fact.class, fact.ownership)
+        } else if let Some(class) = published_entry_class {
+            (class, SsaOwnership::Borrowed)
+        } else {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_FIXED_BUILTIN_VALUE_PLAN",
+                format!(
+                    "{family} builtin argument {index} at continuation {continuation_id} has no total class/ownership plan",
+                ),
+            ));
+        };
+
+        // Exact known SSA facts already form part of the function-entry
+        // contract. Adding a second value-class guard here would pin an
+        // otherwise plain last-use parameter in local storage.
+        if class == SsaValueClass::ArrayHandle
+            && let Some(source) = entry_array_source(operand, definitions, parameter_indices)
+        {
+            let requirement = admission.array_requirements.entry(source).or_default();
+            requirement.require_supported_keys = true;
+            requirement.require_plain_values = true;
+        }
+        if matches!(class, SsaValueClass::Int | SsaValueClass::Bool) {
+            mode_operands.push(index);
+        }
+        if let Some(local) = argument.by_ref_local {
+            mutation_locals.push(local);
+        }
+        operand_classes.push(class);
+        operand_ownership.push(ownership);
+    }
+
+    // Every exact call receives a fixed result owner, a bounded small-array
+    // envelope, and a native string block before entry. Input-dependent
+    // string/array requirements added by the family classifier extend these
+    // fixed minima below; allocation failure inside an admitted handler is
+    // therefore an ABI contract violation rather than a runtime fallback.
+    const FIXED_RESULT_VALUES: usize = 8;
+    const FIXED_RESULT_ENTRIES: usize = 16;
+    const FIXED_RESULT_STRING_BYTES: usize = 4096;
+    let provided_arity = call.args.len();
+    let native_arity = if call.variadic {
+        provided_arity
+    } else {
+        call.direct_arity
+            .and_then(|arity| usize::try_from(arity).ok())
+            .and_then(|arity| arity.checked_sub(call.argument_operand_offset))
+            .unwrap_or(provided_arity)
+            .max(provided_arity)
+    };
+    let defaulted_argument_count = native_arity.saturating_sub(provided_arity);
+    let frame = if stable_builtin_shutdown_callback(&call.target) {
+        NativeExactCallFramePlan::ShutdownCallback {
+            length: provided_arity,
+        }
+    } else if stable_builtin_array_multisort(&call.target)
+        || matches!(
+            stable_builtin_format(&call.target),
+            Some(StableFormatBuiltin::Sprintf | StableFormatBuiltin::Printf)
+        )
+        || matches!(
+            stable_builtin_byte_codec(&call.target),
+            Some(StableByteCodecBuiltin::Pack)
+        )
+    {
+        NativeExactCallFramePlan::VariadicSlice {
+            length: provided_arity,
+        }
+    } else if stable_builtin_frame_introspection(&call.target).is_some() {
+        NativeExactCallFramePlan::FrameIntrospection {
+            supplied_arguments: provided_arity,
+            fixed_parameters: fixed_parameter_count,
+        }
+    } else {
+        NativeExactCallFramePlan::Fixed { native_arity }
+    };
+    let callback = if stable_builtin_shutdown_callback(&call.target) {
+        NativeExactCallbackPlan::ShutdownCallback
+    } else if stable_builtin_callback_neutral_array(&call.target).is_some() {
+        NativeExactCallbackPlan::CallbackAndArgumentArray
+    } else if stable_builtin_callable_query(&call.target).is_some()
+        || stable_builtin_callback_handler(&call.target).is_some()
+        || stable_builtin_autoload_callback(&call.target).is_some()
+    {
+        NativeExactCallbackPlan::CallableValue
+    } else {
+        NativeExactCallbackPlan::None
+    };
+    let cleanup_owned_arguments = operand_ownership
+        .iter()
+        .enumerate()
+        .filter_map(|(index, ownership)| (*ownership == SsaOwnership::Owned).then_some(index))
+        .collect();
+    admission.fixed_value_allocations = admission
+        .fixed_value_allocations
+        .saturating_add(FIXED_RESULT_VALUES);
+    admission.fixed_array_entries = admission
+        .fixed_array_entries
+        .saturating_add(FIXED_RESULT_ENTRIES);
+    admission.fixed_string_bytes = admission
+        .fixed_string_bytes
+        .saturating_add(FIXED_RESULT_STRING_BYTES);
+    admission.fixed_builtin_plans.insert(
+        continuation_id,
+        NativeFixedBuiltinPublicationPlan {
+            capability_family: family,
+            provided_arity,
+            native_arity,
+            defaulted_argument_count,
+            variadic: call.variadic,
+            defaults_published: true,
+            operand_classes,
+            operand_ownership,
+            mode_operands,
+            mutation_locals,
+            cleanup_owned_arguments,
+            frame,
+            callback,
+            semantic_outcomes: NATIVE_EXACT_TOTAL_OUTCOMES,
+            reserved_value_slots: FIXED_RESULT_VALUES,
+            reserved_array_entries: FIXED_RESULT_ENTRIES,
+            reserved_string_bytes: FIXED_RESULT_STRING_BYTES,
+        },
+    );
+    Ok(())
 }
 
 fn optimizing_admission_for_region(
@@ -1587,6 +1899,41 @@ fn optimizing_admission_for_region(
                     .insert(instruction.continuation_id);
             }
             _ => {}
+        }
+        if let RegionInstructionKind::EmptyLocal { local, .. } = instruction.kind {
+            let operand = RegionOperand::Local(local);
+            let fact = lowering_operand_fact(value_flow, constants, operand);
+            if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                || matches!(
+                    fact.class,
+                    SsaValueClass::Uninitialized
+                        | SsaValueClass::ReferenceHandle
+                        | SsaValueClass::MixedHandle
+                )
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_TRUTHINESS_PUBLICATION",
+                    format!(
+                        "empty-local at continuation {} has no exact truthiness shape",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let guarded = admit_publication_scalar_class(
+                &mut admission,
+                value_flow,
+                constants,
+                &definitions,
+                &parameter_indices,
+                operand,
+                fact.class,
+                instruction.continuation_id,
+                "empty-local truthiness",
+            )?;
+            entry_dependent_continuations.extend(guarded.map(|_| instruction.continuation_id));
+            admission
+                .total_scalar_control_instructions
+                .insert(instruction.continuation_id);
         }
         if let RegionInstructionKind::UnsetLocal { local } = instruction.kind {
             let storage = value_flow.local_storage(local);
@@ -6826,13 +7173,14 @@ fn optimizing_admission_for_region(
                 .insert(block.terminator_continuation_id);
         }
     }
+    let cleanup_total_reference_locals = admission.total_reference_locals.clone();
     let cleanup_local_is_total = |local: LocalId| {
         if !value_flow.releases_local_at_frame_exit(local) {
             return true;
         }
         let storage = value_flow.local_storage(local);
         let fact = value_flow.local_fact(local);
-        admission.total_reference_locals.contains(&local)
+        cleanup_total_reference_locals.contains(&local)
             || by_ref_parameters.contains(&local)
             || storage == crate::region_ir::LocalStorageClass::SsaPlain
                 && fact.certainty != crate::region_ir::SsaCertainty::Unknown
@@ -6970,11 +7318,49 @@ fn optimizing_admission_for_region(
             .iter()
             .copied()
             .all(&cleanup_local_is_total);
+        let branch_condition_total = match block.terminator {
+            RegionTerminator::JumpIfFalse { condition, .. }
+            | RegionTerminator::JumpIfTrue { condition, .. }
+            | RegionTerminator::JumpIf { condition, .. } => {
+                let fact = lowering_operand_fact(value_flow, constants, condition);
+                if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                    || matches!(
+                        fact.class,
+                        SsaValueClass::Uninitialized
+                            | SsaValueClass::ReferenceHandle
+                            | SsaValueClass::MixedHandle
+                    )
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_TRUTHINESS_PUBLICATION",
+                        format!(
+                            "branch at continuation {} has no exact truthiness shape",
+                            block.terminator_continuation_id,
+                        ),
+                    ));
+                }
+                let guarded = admit_publication_scalar_class(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    condition,
+                    fact.class,
+                    block.terminator_continuation_id,
+                    "branch truthiness",
+                )?;
+                entry_dependent_continuations
+                    .extend(guarded.map(|_| block.terminator_continuation_id));
+                true
+            }
+            _ => true,
+        };
         let total = match block.terminator {
-            RegionTerminator::Jump { .. }
-            | RegionTerminator::JumpIfFalse { .. }
+            RegionTerminator::Jump { .. } => true,
+            RegionTerminator::JumpIfFalse { .. }
             | RegionTerminator::JumpIfTrue { .. }
-            | RegionTerminator::JumpIf { .. } => true,
+            | RegionTerminator::JumpIf { .. } => branch_condition_total,
             RegionTerminator::Return {
                 value,
                 finally: None,
@@ -7068,6 +7454,41 @@ fn optimizing_admission_for_region(
         admission
             .total_terminators
             .insert(block.terminator_continuation_id);
+    }
+    if let Some(continuation_id) = entry_dependent_continuations
+        .intersection(&unstable_before)
+        .next()
+        .copied()
+    {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_STALE_TRUTHINESS_PLAN",
+            format!(
+                "truthiness at continuation {continuation_id} depends on entry data after an external effect or control-flow join",
+            ),
+        ));
+    }
+    for instruction in region.blocks.iter().flat_map(|block| &block.instructions) {
+        let RegionInstructionKind::NativeCall(call) = &instruction.kind else {
+            continue;
+        };
+        let Some(family) = stable_exact_control_builtin_family(&call.target) else {
+            continue;
+        };
+        publish_total_fixed_builtin_plan(
+            &mut admission,
+            call,
+            instruction.continuation_id,
+            family,
+            value_flow,
+            constants,
+            &definitions,
+            &parameter_indices,
+            region
+                .params
+                .iter()
+                .take_while(|parameter| !parameter.variadic)
+                .count(),
+        )?;
     }
     admission.fixed_lvalue_insertions = admission
         .array_requirements

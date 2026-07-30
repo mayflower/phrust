@@ -1,8 +1,9 @@
 //! Exact native builtin handlers over authoritative native values.
 //!
 //! Its explicit imports expose only fast-state capabilities and native
-//! comparison/reference primitives. Unsupported semantic shapes return one
-//! typed baseline continuation request.
+//! comparison/reference primitives. Publication rejects unsupported semantic
+//! shapes before optimizer entry; a mismatch here is therefore an ABI
+//! contract violation rather than a request to recompile.
 
 use super::{
     NativeComparisonValue, NativeDirectStringPublishError, NativeRequestFastState,
@@ -11,6 +12,14 @@ use super::{
 };
 use php_ir::module::normalize_class_name;
 use std::sync::Arc;
+
+fn exact_query_contract_violation() -> php_jit::JitNativeControlResult {
+    php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::ABI_MISMATCH, 0, 0)
+}
+
+fn exact_query_runtime_error() -> php_jit::JitNativeControlResult {
+    php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::RUNTIME_ERROR, 0, 0)
+}
 
 include!("exact_call_dispatch/scalar_and_filter_families.rs");
 include!("exact_call_dispatch/recursive_array_family.rs");
@@ -23,11 +32,11 @@ fn native_object_vars_result(
 ) -> php_jit::JitNativeControlResult {
     let Some(entries) = super::exact_runtime_ops::native_object_vars_entries(fast, object, mangled)
     else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     match super::exact_runtime_ops::publish_native_array_cast_entries(fast, entries) {
         Ok(value) => php_jit::JitNativeControlResult::returning(value),
-        Err(_) => exact_query_baseline(),
+        Err(_) => exact_query_contract_violation(),
     }
 }
 
@@ -148,10 +157,10 @@ pub(in crate::vm) extern "C" fn jit_native_get_class_methods_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(target) = native_class_target(fast, argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(lineage) = exact_class_lineage(&fast.symbol_query, &target.name) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let caller_class = fast.symbol_query.caller_class(caller_function as u32);
     let mut seen = std::collections::BTreeSet::new();
@@ -171,7 +180,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_class_methods_abi(
         }
     }
     publish_exact_string_list(fast, methods.len(), methods).map_or_else(
-        exact_query_baseline,
+        exact_query_contract_violation,
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -190,10 +199,10 @@ pub(in crate::vm) extern "C" fn jit_native_get_class_vars_abi(
     let fast = unsafe { &mut *runtime };
     let Some(target) = native_class_target(fast, argument_0).filter(|target| !target.is_object)
     else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(lineage) = exact_class_lineage(&fast.symbol_query, &target.name) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let caller_class = fast.symbol_query.caller_class(caller_function as u32);
     let mut seen = std::collections::BTreeSet::new();
@@ -234,7 +243,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_class_vars_abi(
                     .is_none_or(|value| !exact_ir_constant_is_direct(value))
             })
     }) {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     fast.publish_owned_direct_array_with(properties.len(), |fast, index| {
         let projection = properties
@@ -258,7 +267,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_class_vars_abi(
         Ok(php_jit::JitNativeDirectArrayEntry { key, value })
     })
     .map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -277,22 +286,22 @@ pub(in crate::vm) extern "C" fn jit_native_is_callable_abi(
         false
     } else {
         let Some(syntax_only) = exact_native_boolean_flag(fast, argument_1) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         syntax_only
     };
     let Some(callable) = fast.direct_callable_is_valid(argument_0, syntax_only) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     if argument_2 != missing {
         let Some(name) = fast.direct_callable_name_bytes(argument_0) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         let Ok(name) = fast.publish_direct_string_bytes(&name) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         if !fast.replace_direct_reference(argument_2, name) {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         }
     }
     native_bool_result(callable)
@@ -307,7 +316,7 @@ pub(in crate::vm) extern "C" fn jit_native_set_error_handler_abi(
     let fast = unsafe { &mut *runtime };
     fast.exact_set_error_handler(argument_0, argument_1)
         .map_or_else(
-            exact_query_baseline,
+            exact_query_contract_violation,
             php_jit::JitNativeControlResult::returning,
         )
 }
@@ -320,7 +329,7 @@ pub(in crate::vm) extern "C" fn jit_native_restore_error_handler_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     fast.exact_restore_error_handler().map_or_else(
-        exact_query_baseline,
+        exact_query_contract_violation,
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -333,7 +342,7 @@ pub(in crate::vm) extern "C" fn jit_native_set_exception_handler_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     fast.exact_set_exception_handler(argument_0).map_or_else(
-        exact_query_baseline,
+        exact_query_contract_violation,
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -346,7 +355,7 @@ pub(in crate::vm) extern "C" fn jit_native_restore_exception_handler_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     fast.exact_restore_exception_handler().map_or_else(
-        exact_query_baseline,
+        exact_query_contract_violation,
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -359,7 +368,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_exception_handler_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     fast.exact_get_exception_handler().map_or_else(
-        exact_query_baseline,
+        exact_query_contract_violation,
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -374,19 +383,19 @@ pub(in crate::vm) extern "C" fn jit_native_spl_autoload_register_abi(
     let fast = unsafe { &mut *runtime };
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
     if argument_1 != missing && exact_native_boolean_flag(fast, argument_1).is_none() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let prepend = if argument_2 == missing {
         false
     } else {
         let Some(prepend) = exact_native_boolean_flag(fast, argument_2) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         prepend
     };
     fast.exact_register_autoload_callback(argument_0, prepend)
         .map_or_else(
-            exact_query_baseline,
+            exact_query_contract_violation,
             php_jit::JitNativeControlResult::returning,
         )
 }
@@ -401,7 +410,7 @@ pub(in crate::vm) extern "C" fn jit_native_spl_autoload_unregister_abi(
     let fast = unsafe { &mut *runtime };
     fast.exact_unregister_autoload_callback(argument_0)
         .map_or_else(
-            exact_query_baseline,
+            exact_query_contract_violation,
             php_jit::JitNativeControlResult::returning,
         )
 }
@@ -415,7 +424,7 @@ pub(in crate::vm) extern "C" fn jit_native_spl_autoload_functions_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     fast.exact_autoload_functions().map_or_else(
-        exact_query_baseline,
+        exact_query_contract_violation,
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -428,10 +437,10 @@ pub(in crate::vm) extern "C" fn jit_native_register_shutdown_function_abi(
     continuation: u32,
 ) -> php_jit::JitNativeControlResult {
     let Ok(argument_count) = usize::try_from(argument_count) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     if argument_count == 0 || arguments.is_null() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     #[allow(unsafe_code)]
     let arguments = unsafe { std::slice::from_raw_parts(arguments, argument_count) };
@@ -439,7 +448,7 @@ pub(in crate::vm) extern "C" fn jit_native_register_shutdown_function_abi(
     let fast = unsafe { &mut *runtime };
     fast.exact_register_shutdown_callback(arguments, function, continuation)
         .map_or_else(
-            exact_query_baseline,
+            exact_query_contract_violation,
             php_jit::JitNativeControlResult::returning,
         )
 }
@@ -452,7 +461,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_parent_class_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(target) = native_class_target(fast, argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(class) = fast.symbol_query.class_handle(&target.name) else {
         return native_false_result();
@@ -466,7 +475,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_parent_class_abi(
         .map_or_else(|| parent.to_owned(), |class| class.display_name.clone());
     match fast.publish_direct_string_bytes(display.as_bytes()) {
         Ok(value) => php_jit::JitNativeControlResult::returning(value),
-        Err(_) => exact_query_baseline(),
+        Err(_) => exact_query_contract_violation(),
     }
 }
 
@@ -503,11 +512,11 @@ pub(in crate::vm) extern "C" fn jit_native_is_subclass_of_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(target) = native_class_target(fast, argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(parent) = native_class_target(fast, argument_1).filter(|target| !target.is_object)
     else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let allow_string =
         if argument_2 == php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING) {
@@ -517,7 +526,7 @@ pub(in crate::vm) extern "C" fn jit_native_is_subclass_of_abi(
                 .native_comparison_value(argument_2)
                 .map(native_comparison_truthy)
             else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             value
         };
@@ -541,11 +550,11 @@ pub(in crate::vm) extern "C" fn jit_native_is_a_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(target) = native_class_target(fast, argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(expected) = native_class_target(fast, argument_1).filter(|target| !target.is_object)
     else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let allow_string =
         if argument_2 == php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING) {
@@ -555,7 +564,7 @@ pub(in crate::vm) extern "C" fn jit_native_is_a_abi(
                 .native_comparison_value(argument_2)
                 .map(native_comparison_truthy)
             else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             value
         };
@@ -618,7 +627,7 @@ pub(in crate::vm) extern "C" fn jit_native_class_implements_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(target) = native_class_target(fast, argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let autoload =
         if argument_1 == php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING) {
@@ -628,13 +637,13 @@ pub(in crate::vm) extern "C" fn jit_native_class_implements_abi(
                 .native_comparison_value(argument_1)
                 .map(native_comparison_truthy)
             else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             value
         };
     if fast.symbol_query.class_handle(&target.name).is_none() {
         return if !target.is_object && autoload {
-            exact_query_baseline()
+            exact_query_contract_violation()
         } else {
             native_false_result()
         };
@@ -643,7 +652,7 @@ pub(in crate::vm) extern "C" fn jit_native_class_implements_abi(
         .begin_owned_direct_array(4, php_jit::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY)
         .ok()
     else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let fast_ptr = fast as *mut NativeRequestFastState;
     let symbols = &fast.symbol_query;
@@ -678,13 +687,13 @@ pub(in crate::vm) extern "C" fn jit_native_class_implements_abi(
     if exact_visit_class_interfaces(symbols, &target.name, 0, &mut publish).is_none() {
         drop(publish);
         unsafe { &mut *fast_ptr }.abort_owned_direct_array(writer);
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     drop(publish);
     unsafe { &mut *fast_ptr }
         .finish_owned_direct_array(writer)
         .map_or_else(
-            |_| exact_query_baseline(),
+            |_| exact_query_contract_violation(),
             php_jit::JitNativeControlResult::returning,
         )
 }
@@ -697,7 +706,7 @@ pub(in crate::vm) extern "C" fn jit_native_extension_loaded_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &*runtime };
     let Some(name) = fast.native_string_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let name = String::from_utf8_lossy(name);
     native_bool_result(php_std::introspection::extension_loaded(
@@ -761,7 +770,7 @@ pub(in crate::vm) extern "C" fn jit_native_gc_collect_cycles_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     fast.publish_direct_int(0).map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -772,7 +781,7 @@ pub(in crate::vm) extern "C" fn jit_native_gc_disable_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(state) = native_gc_state_mut(fast) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     state.set_enabled(false);
     php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(u32::MAX))
@@ -784,7 +793,7 @@ pub(in crate::vm) extern "C" fn jit_native_gc_enable_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(state) = native_gc_state_mut(fast) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     state.set_enabled(true);
     php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(u32::MAX))
@@ -796,7 +805,7 @@ pub(in crate::vm) extern "C" fn jit_native_gc_enabled_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(state) = native_gc_state_mut(fast) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     native_bool_result(state.enabled())
 }
@@ -807,7 +816,7 @@ pub(in crate::vm) extern "C" fn jit_native_gc_mem_caches_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     fast.publish_direct_int(0).map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -865,7 +874,7 @@ pub(in crate::vm) extern "C" fn jit_native_gc_status_abi(
         Ok(php_jit::JitNativeDirectArrayEntry { key, value })
     })
     .map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -920,7 +929,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_resources_abi(
         None
     } else {
         let Some(value) = exact_native_scalar_string(fast, argument_0) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         Some(value.into_lossy_owned())
     };
@@ -936,7 +945,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_resources_abi(
             .any(|resource| resource.resource_type() == resource_type);
         let can_be_empty = matches!(resource_type, "stream" | "stream-context" | "Unknown");
         if !has_matching_resource && !can_be_empty {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         }
     }
     let selected = resources
@@ -965,7 +974,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_resources_abi(
         Ok(php_jit::JitNativeDirectArrayEntry { key, value })
     })
     .map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -979,7 +988,7 @@ pub(in crate::vm) extern "C" fn jit_native_settype_abi(
         #[allow(unsafe_code)]
         let fast = unsafe { &mut *runtime };
         let Some((_, slot)) = fast.direct_slot(reference) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         if slot.kind != php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR
             || slot.flags != php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION
@@ -987,10 +996,10 @@ pub(in crate::vm) extern "C" fn jit_native_settype_abi(
                 == php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_EMPTY
             || slot.reserved & php_jit::JIT_NATIVE_REFERENCE_TYPED_PROPERTY_GUARD != 0
         {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         }
         let Some(type_name) = exact_native_scalar_string(fast, type_name) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         (
             slot.payload as i64,
@@ -1006,7 +1015,7 @@ pub(in crate::vm) extern "C" fn jit_native_settype_abi(
                 .native_comparison_value(current)
                 .map(native_comparison_truthy)
             else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(if value {
                 php_jit::JIT_VALUE_TRUE
@@ -1022,7 +1031,7 @@ pub(in crate::vm) extern "C" fn jit_native_settype_abi(
         "null" => {
             php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(u32::MAX))
         }
-        _ => return exact_query_baseline(),
+        _ => return exact_query_contract_violation(),
     };
     if cast.status != php_jit::JitCallStatus::RETURN {
         return cast;
@@ -1030,7 +1039,7 @@ pub(in crate::vm) extern "C" fn jit_native_settype_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     if !fast.replace_direct_reference(reference, cast.value) {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     native_bool_result(true)
 }
@@ -1512,13 +1521,13 @@ pub(in crate::vm) extern "C" fn jit_native_get_loaded_extensions_abi(
                 .native_comparison_value(argument_0)
                 .map(native_comparison_truthy)
             else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             value
         };
     if zend_only {
         return publish_exact_string_list(fast, 0, std::iter::empty::<&[u8]>()).map_or_else(
-            exact_query_baseline,
+            exact_query_contract_violation,
             php_jit::JitNativeControlResult::returning,
         );
     }
@@ -1526,7 +1535,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_loaded_extensions_abi(
     let length = names.len();
     match publish_exact_string_list(fast, length, names.iter().map(|name| name.as_bytes())) {
         Some(value) => php_jit::JitNativeControlResult::returning(value),
-        None => exact_query_baseline(),
+        None => exact_query_contract_violation(),
     }
 }
 
@@ -1547,7 +1556,7 @@ fn native_configuration_result(
         NativeConfigurationQuery::IncludePath => registry.get("include_path"),
         NativeConfigurationQuery::Current | NativeConfigurationQuery::Configured => {
             let Some(name) = fast.native_string_view(name) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             let name = String::from_utf8_lossy(name);
             match query {
@@ -1571,7 +1580,7 @@ fn native_configuration_result(
     let bytes = unsafe { std::slice::from_raw_parts(bytes.0, bytes.1) };
     match fast.publish_direct_string_bytes(bytes) {
         Ok(value) => php_jit::JitNativeControlResult::returning(value),
-        Err(_) => exact_query_baseline(),
+        Err(_) => exact_query_contract_violation(),
     }
 }
 
@@ -1601,11 +1610,11 @@ pub(in crate::vm) extern "C" fn jit_native_ini_get_all_abi(
             Some(php_runtime::api::NativePrintfScalar::Null) => None,
             Some(_) => {
                 let Some(extension) = exact_native_scalar_string(fast, argument_0) else {
-                    return exact_query_baseline();
+                    return exact_query_contract_violation();
                 };
                 Some(extension.into_lossy_owned())
             }
-            None => return exact_query_baseline(),
+            None => return exact_query_contract_violation(),
         }
     };
     let details = if argument_1 == missing {
@@ -1615,10 +1624,10 @@ pub(in crate::vm) extern "C" fn jit_native_ini_get_all_abi(
             fast.native_printf_scalar(argument_1),
             Some(php_runtime::api::NativePrintfScalar::Null)
         ) {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         }
         let Some(details) = exact_native_boolean_flag(fast, argument_1) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         details
     };
@@ -1684,7 +1693,7 @@ pub(in crate::vm) extern "C" fn jit_native_ini_get_all_abi(
         Ok(php_jit::JitNativeDirectArrayEntry { key, value })
     });
     result.map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -1735,7 +1744,7 @@ fn exact_native_configuration_set(
     };
     fast.publish_direct_string_bytes(previous.as_bytes())
         .map_or_else(
-            |_| exact_query_baseline(),
+            |_| exact_query_contract_violation(),
             php_jit::JitNativeControlResult::returning,
         )
 }
@@ -1752,7 +1761,7 @@ pub(in crate::vm) extern "C" fn jit_native_ini_set_abi(
         exact_native_scalar_string(fast, argument_0),
         exact_native_scalar_string(fast, argument_1),
     ) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     exact_native_configuration_set(fast, name.into_lossy_owned(), value.into_lossy_owned())
 }
@@ -1765,7 +1774,7 @@ pub(in crate::vm) extern "C" fn jit_native_set_include_path_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(value) = exact_native_scalar_string(fast, argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     exact_native_configuration_set(fast, "include_path".to_owned(), value.into_lossy_owned())
 }
@@ -1789,7 +1798,7 @@ pub(in crate::vm) extern "C" fn jit_native_date_default_timezone_get_abi(
         Ok::<(), &'static str>(())
     })
     .map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -1802,7 +1811,7 @@ pub(in crate::vm) extern "C" fn jit_native_date_default_timezone_set_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(identifier) = exact_native_scalar_string(fast, argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let identifier = identifier.into_lossy_owned();
     let Some(identifier) = php_runtime::api::normalize_timezone_identifier(&identifier) else {
@@ -1828,7 +1837,7 @@ fn exact_session_publish_string(
 ) -> php_jit::JitNativeControlResult {
     fast.publish_direct_string_bytes(value.as_bytes())
         .map_or_else(
-            |_| exact_query_baseline(),
+            |_| exact_query_contract_violation(),
             php_jit::JitNativeControlResult::returning,
         )
 }
@@ -1850,7 +1859,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_status_abi(
     let fast = unsafe { &mut *runtime };
     fast.publish_direct_int(fast.session.control().status())
         .map_or_else(
-            |_| exact_query_baseline(),
+            |_| exact_query_contract_violation(),
             php_jit::JitNativeControlResult::returning,
         )
 }
@@ -1870,14 +1879,14 @@ pub(in crate::vm) extern "C" fn jit_native_session_cache_expire_abi(
         .unwrap_or(180);
     if !exact_session_argument_missing(argument_0) {
         let Some(is_null) = exact_session_null_argument(fast, argument_0) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         if !is_null {
             if fast.session.control().status() == php_runtime::api::PHP_SESSION_ACTIVE {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             }
             let Some(value) = exact_native_integer(fast, argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             fast.session.control_mut().replace_cache_expire(value);
             let _ = fast
@@ -1887,7 +1896,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_cache_expire_abi(
         }
     }
     fast.publish_direct_int(previous).map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -1907,14 +1916,14 @@ pub(in crate::vm) extern "C" fn jit_native_session_cache_limiter_abi(
         .to_owned();
     if !exact_session_argument_missing(argument_0) {
         let Some(is_null) = exact_session_null_argument(fast, argument_0) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         if !is_null {
             if fast.session.control().status() == php_runtime::api::PHP_SESSION_ACTIVE {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             }
             let Some(value) = exact_native_scalar_string(fast, argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             let value = value.into_lossy_owned();
             fast.session
@@ -1939,16 +1948,16 @@ pub(in crate::vm) extern "C" fn jit_native_session_id_abi(
     let previous = fast.session.control().id().to_owned();
     if !exact_session_argument_missing(argument_0) {
         let Some(is_null) = exact_session_null_argument(fast, argument_0) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         if !is_null {
             if fast.session.control().status() == php_runtime::api::PHP_SESSION_ACTIVE
                 || !fast.session.control().id_replacement_is_value_free()
             {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             }
             let Some(value) = exact_native_scalar_string(fast, argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             let value = value.into_lossy_owned();
             if fast
@@ -1957,7 +1966,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_id_abi(
                 .replace_id_value_free(value)
                 .is_none()
             {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             }
         }
     }
@@ -1974,17 +1983,17 @@ pub(in crate::vm) extern "C" fn jit_native_session_module_name_abi(
     let previous = fast.session.control().module_name().to_owned();
     if !exact_session_argument_missing(argument_0) {
         let Some(is_null) = exact_session_null_argument(fast, argument_0) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         if !is_null {
             if fast.session.control().status() == php_runtime::api::PHP_SESSION_ACTIVE {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             }
             let Some(value) = exact_native_scalar_string(fast, argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             if value.as_bytes() != b"files" {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             }
             fast.session.control_mut().replace_module_name("files");
             let _ = fast
@@ -2015,18 +2024,18 @@ pub(in crate::vm) extern "C" fn jit_native_session_name_abi(
     let previous = fast.session.control().name().to_owned();
     if !exact_session_argument_missing(argument_0) {
         let Some(is_null) = exact_session_null_argument(fast, argument_0) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         if !is_null {
             if fast.session.control().status() == php_runtime::api::PHP_SESSION_ACTIVE {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             }
             let Some(value) = exact_native_scalar_string(fast, argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             let value = value.into_lossy_owned();
             if !php_runtime::api::native_session_name_is_valid(&value) {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             }
             fast.session.control_mut().replace_name(value.clone());
             let _ = fast
@@ -2053,14 +2062,14 @@ pub(in crate::vm) extern "C" fn jit_native_session_save_path_abi(
         .unwrap_or_else(|| fast.session.control().save_path().to_owned());
     if !exact_session_argument_missing(argument_0) {
         let Some(is_null) = exact_session_null_argument(fast, argument_0) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         if !is_null {
             if fast.session.control().status() == php_runtime::api::PHP_SESSION_ACTIVE {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             }
             let Some(value) = exact_native_scalar_string(fast, argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             let value = value.into_lossy_owned();
             fast.session.control_mut().replace_save_path(value.clone());
@@ -2130,7 +2139,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_get_cookie_params_abi(
         Ok(php_jit::JitNativeDirectArrayEntry { key, value })
     });
     result.map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -2147,10 +2156,10 @@ pub(in crate::vm) extern "C" fn jit_native_session_set_cookie_params_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     if fast.session.control().status() == php_runtime::api::PHP_SESSION_ACTIVE {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let Some(lifetime) = exact_native_integer(fast, argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let mut updates = vec![("session.cookie_lifetime", lifetime.to_string())];
     for (index, name, boolean) in [
@@ -2164,19 +2173,19 @@ pub(in crate::vm) extern "C" fn jit_native_session_set_cookie_params_abi(
             continue;
         }
         let Some(is_null) = exact_session_null_argument(fast, encoded) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         if is_null {
             continue;
         }
         let value = if boolean {
             let Some(value) = exact_native_boolean_flag(fast, encoded) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             if value { "1" } else { "0" }.to_owned()
         } else {
             let Some(value) = exact_native_scalar_string(fast, encoded) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             value.into_lossy_owned()
         };
@@ -2195,7 +2204,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_gc_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     if fast.session.control().status() != php_runtime::api::PHP_SESSION_ACTIVE {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     php_jit::JitNativeControlResult::returning(0)
 }
@@ -2229,7 +2238,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_abort_abi(
         return exact_session_lifecycle_result(false);
     }
     if !fast.restore_native_session_payload() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     exact_session_lifecycle_result(fast.session.control_mut().close_value_free())
 }
@@ -2244,7 +2253,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_commit_abi(
         return exact_session_lifecycle_result(false);
     }
     if !fast.commit_native_session_payload() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     exact_session_lifecycle_result(fast.session.control_mut().close_value_free())
 }
@@ -2257,10 +2266,10 @@ pub(in crate::vm) extern "C" fn jit_native_session_destroy_abi(
     let fast = unsafe { &mut *runtime };
     if !fast.session.control().payload_operation_is_active() {
         // PHP emits a warning for this state.
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     if !fast.clear_native_session_payload_and_commit() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     exact_session_lifecycle_result(fast.session.control_mut().destroy_value_free())
 }
@@ -2275,7 +2284,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_decode_abi(
     if fast.native_session_decode(argument_0).is_none() {
         // Type errors, inactive sessions, malformed input, and unsupported
         // object/reference records require PHP diagnostics or cold semantics.
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     exact_session_lifecycle_result(true)
 }
@@ -2287,7 +2296,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_encode_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(output_length) = fast.native_session_encode_output_length() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(output_length) = output_length else {
         return exact_session_lifecycle_result(false);
@@ -2303,7 +2312,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_encode_abi(
             .ok_or("native session serialization changed after its length pass")
     })
     .map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -2316,19 +2325,19 @@ pub(in crate::vm) extern "C" fn jit_native_session_create_id_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     if fast.session.has_id_generator() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let prefix = if exact_session_argument_missing(argument_0) {
         NativeScalarBytes::Empty
     } else {
         let Some(is_null) = exact_session_null_argument(fast, argument_0) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         if is_null {
             NativeScalarBytes::Empty
         } else {
             let Some(prefix) = exact_native_scalar_string(fast, argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             prefix
         }
@@ -2340,7 +2349,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_create_id_abi(
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b','))
     {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let prefix = prefix.into_lossy_owned();
     let id_length = exact_session_sid_length(fast);
@@ -2361,10 +2370,10 @@ pub(in crate::vm) extern "C" fn jit_native_session_regenerate_id_abi(
     if !exact_session_argument_missing(argument_0)
         && exact_native_boolean_flag(fast, argument_0).is_none()
     {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     if !fast.session.control().payload_operation_is_active() || fast.session.has_id_generator() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let id_length = exact_session_sid_length(fast);
     exact_session_lifecycle_result(
@@ -2384,7 +2393,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_reset_abi(
         return exact_session_lifecycle_result(false);
     }
     if !fast.restore_native_session_payload() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     exact_session_lifecycle_result(true)
 }
@@ -2415,7 +2424,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_set_save_handler_abi(
         // Callback lists require callable validation and a deprecation; the
         // object form is representation-complete and has no retained payload
         // in the current PHP session implementation.
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let _ = fast
         .configuration
@@ -2436,7 +2445,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_start_abi(
         || fast.session.control().payload_operation_is_active()
     {
         // Options and duplicate starts can emit diagnostics.
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let ini = fast.configuration.ini_registry();
     if !matches!(ini.get("session.save_handler").unwrap_or("files"), "files")
@@ -2452,12 +2461,12 @@ pub(in crate::vm) extern "C" fn jit_native_session_start_abi(
             .is_some_and(|paths| !paths.trim().is_empty())
         || (fast.session.control().needs_lazy_load() && fast.session.has_loader())
     {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let strict_mode = exact_session_ini_bool(ini.get("session.use_strict_mode"));
     let generate = fast.session.control().id().is_empty() || strict_mode;
     if generate && fast.session.has_id_generator() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let payload_ready = if generate {
         fast.clear_native_session_payload_and_commit()
@@ -2465,7 +2474,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_start_abi(
         fast.restore_native_session_payload()
     };
     if !payload_ready {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let id_length = exact_session_sid_length(fast);
     fast.session
@@ -2484,7 +2493,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_unset_abi(
         return exact_session_lifecycle_result(false);
     }
     if !fast.clear_native_session_payload() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     exact_session_lifecycle_result(true)
 }
@@ -2505,12 +2514,12 @@ pub(in crate::vm) extern "C" fn jit_native_header_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(line) = exact_native_scalar_string(fast, argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
     let replace = if argument_1 != missing {
         let Some(replace) = exact_native_boolean_flag(fast, argument_1) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         replace
     } else {
@@ -2521,16 +2530,16 @@ pub(in crate::vm) extern "C" fn jit_native_header_abi(
             None
         } else {
             let Some(code) = exact_native_integer(fast, argument_2) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             if code == 0 {
                 None
             } else {
                 let Ok(code) = u16::try_from(code) else {
-                    return exact_query_baseline();
+                    return exact_query_contract_violation();
                 };
                 if !(100..=599).contains(&code) {
-                    return exact_query_baseline();
+                    return exact_query_contract_violation();
                 }
                 Some(code)
             }
@@ -2542,7 +2551,7 @@ pub(in crate::vm) extern "C" fn jit_native_header_abi(
         .add_header_line(line.as_ref(), replace, response_code)
         .is_err()
     {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(u32::MAX))
 }
@@ -2560,7 +2569,7 @@ pub(in crate::vm) extern "C" fn jit_native_header_remove_abi(
         None
     } else {
         let Some(name) = exact_native_scalar_string(fast, argument_0) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         Some(name.into_lossy_owned())
     };
@@ -2570,7 +2579,7 @@ pub(in crate::vm) extern "C" fn jit_native_header_remove_abi(
         .remove_header(name.as_deref())
         .is_err()
     {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(u32::MAX))
 }
@@ -2595,7 +2604,7 @@ pub(in crate::vm) extern "C" fn jit_native_headers_list_abi(
         })
     });
     result.map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -2623,7 +2632,7 @@ pub(in crate::vm) extern "C" fn jit_native_http_response_code_abi(
         return php_jit::JitNativeControlResult::returning(previous);
     }
     let Some(code) = exact_native_integer(fast, argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Ok(code) = u16::try_from(code) else {
         return exact_query_return_bool(false);
@@ -2729,12 +2738,12 @@ fn exact_native_cookie<const RAW: bool>(
             .or_else(|| (arguments[1] == missing).then(String::new)),
         exact_native_cookie_options(fast, &arguments),
     ) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(header_value) =
         php_runtime::api::build_native_cookie_header_value(&name, &value, &options, RAW)
     else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let line = format!("Set-Cookie: {header_value}");
     if fast
@@ -2743,7 +2752,7 @@ fn exact_native_cookie<const RAW: bool>(
         .add_header_line(&line, false, None)
         .is_err()
     {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     exact_query_return_bool(true)
 }
@@ -2798,7 +2807,7 @@ pub(in crate::vm) extern "C" fn jit_native_time_abi(
     let fast = unsafe { &mut *runtime };
     fast.publish_direct_int(php_runtime::api::datetime::current_timestamp())
         .map_or_else(
-            |_| exact_query_baseline(),
+            |_| exact_query_contract_violation(),
             php_jit::JitNativeControlResult::returning,
         )
 }
@@ -2815,12 +2824,12 @@ pub(in crate::vm) extern "C" fn jit_native_microtime_abi(
             false
         } else {
             let Some(as_float) = exact_native_boolean_flag(fast, argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             as_float
         };
     let Some(elapsed) = exact_native_clock_elapsed() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let seconds = elapsed.as_secs();
     let micros = elapsed.subsec_micros();
@@ -2828,14 +2837,14 @@ pub(in crate::vm) extern "C" fn jit_native_microtime_abi(
         return fast
             .publish_direct_float(seconds as f64 + f64::from(micros) / 1_000_000.0)
             .map_or_else(
-                |_| exact_query_baseline(),
+                |_| exact_query_contract_violation(),
                 php_jit::JitNativeControlResult::returning,
             );
     }
     let value = format!("0.{micros:06} {seconds}");
     fast.publish_direct_string_bytes(value.as_bytes())
         .map_or_else(
-            |_| exact_query_baseline(),
+            |_| exact_query_contract_violation(),
             php_jit::JitNativeControlResult::returning,
         )
 }
@@ -2852,15 +2861,15 @@ pub(in crate::vm) extern "C" fn jit_native_hrtime_abi(
             false
         } else {
             let Some(as_number) = exact_native_boolean_flag(fast, argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             as_number
         };
     let Some(elapsed) = exact_native_clock_elapsed() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Ok(seconds) = i64::try_from(elapsed.as_secs()) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let nanos = i64::from(elapsed.subsec_nanos());
     if as_number {
@@ -2868,19 +2877,19 @@ pub(in crate::vm) extern "C" fn jit_native_hrtime_abi(
             .checked_mul(1_000_000_000)
             .and_then(|value| value.checked_add(nanos))
         else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         return fast.publish_direct_int(total).map_or_else(
-            |_| exact_query_baseline(),
+            |_| exact_query_contract_violation(),
             php_jit::JitNativeControlResult::returning,
         );
     }
     let Ok(seconds) = fast.publish_direct_int(seconds) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Ok(nanos) = fast.publish_direct_int(nanos) else {
         let _ = fast.discard_owned_direct_value(seconds);
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     fast.publish_owned_direct_array_from_iter(
         [
@@ -2896,7 +2905,7 @@ pub(in crate::vm) extern "C" fn jit_native_hrtime_abi(
         .into_iter(),
     )
     .map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -2931,7 +2940,7 @@ fn exact_native_publish_date_string(
 ) -> php_jit::JitNativeControlResult {
     fast.publish_direct_string_bytes(value.as_bytes())
         .map_or_else(
-            |_| exact_query_baseline(),
+            |_| exact_query_contract_violation(),
             php_jit::JitNativeControlResult::returning,
         )
 }
@@ -2942,12 +2951,12 @@ fn exact_native_format_date<const UTC: bool>(
     timestamp: i64,
 ) -> php_jit::JitNativeControlResult {
     let Some(format) = exact_native_date_string(fast, format) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let timestamp =
         if timestamp != php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING) {
             let Some(timestamp) = exact_native_date_integer(fast, timestamp) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             timestamp
         } else {
@@ -2978,7 +2987,7 @@ pub(in crate::vm) extern "C" fn jit_native_checkdate_abi(
         exact_native_date_integer(fast, argument_1),
         exact_native_date_integer(fast, argument_2),
     ) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     exact_query_return_bool(php_runtime::api::datetime::is_valid_gregorian_date(
         month, day, year,
@@ -3016,11 +3025,11 @@ pub(in crate::vm) extern "C" fn jit_native_strtotime_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(text) = exact_native_date_string(fast, argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let base = if argument_1 != php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING) {
         let Some(base) = exact_native_date_integer(fast, argument_1) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         base
     } else {
@@ -3029,7 +3038,7 @@ pub(in crate::vm) extern "C" fn jit_native_strtotime_abi(
     let timezone = fast.configuration.default_timezone().to_owned();
     match php_runtime::api::datetime::parse_datetime_text_in_timezone(&text, base, &timezone) {
         Some(timestamp) => fast.publish_direct_int(timestamp).map_or_else(
-            |_| exact_query_baseline(),
+            |_| exact_query_contract_violation(),
             php_jit::JitNativeControlResult::returning,
         ),
         None => exact_query_return_bool(false),
@@ -3054,7 +3063,7 @@ fn exact_native_mktime<const UTC: bool>(
     .map(str::parse::<i64>)
     .collect::<Result<Vec<_>, _>>();
     let Ok(defaults) = defaults else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
     let component = |index: usize, default: i64| -> Option<i64> {
@@ -3077,13 +3086,13 @@ fn exact_native_mktime<const UTC: bool>(
         component(4, defaults[2]),
         component(5, defaults[0]),
     ) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     match php_runtime::api::datetime::timestamp_from_components(
         year, month, day, hour, minute, second, &timezone,
     ) {
         Some(timestamp) => fast.publish_direct_int(timestamp).map_or_else(
-            |_| exact_query_baseline(),
+            |_| exact_query_contract_violation(),
             php_jit::JitNativeControlResult::returning,
         ),
         None => exact_query_return_bool(false),
@@ -3144,7 +3153,7 @@ pub(in crate::vm) extern "C" fn jit_native_timezone_identifiers_list_abi(
             .map(|identifier| identifier.as_bytes()),
     ) {
         Some(value) => php_jit::JitNativeControlResult::returning(value),
-        None => exact_query_baseline(),
+        None => exact_query_contract_violation(),
     }
 }
 
@@ -3157,7 +3166,7 @@ pub(in crate::vm) extern "C" fn jit_native_sys_get_temp_dir_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     fast.publish_direct_string_bytes(&bytes).map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -3169,7 +3178,7 @@ pub(in crate::vm) extern "C" fn jit_native_getcwd_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(cwd) = fast.native_current_directory() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let bytes = cwd.as_os_str().as_encoded_bytes();
     let bytes = (bytes.as_ptr(), bytes.len());
@@ -3178,7 +3187,7 @@ pub(in crate::vm) extern "C" fn jit_native_getcwd_abi(
     #[allow(unsafe_code)]
     let bytes = unsafe { std::slice::from_raw_parts(bytes.0, bytes.1) };
     fast.publish_direct_string_bytes(bytes).map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -3190,10 +3199,10 @@ pub(in crate::vm) extern "C" fn jit_native_chdir_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some((path, path_length)) = fast.stable_native_string_range(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some((cwd, filesystem)) = fast.native_chdir_capability() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     // SAFETY: the encoded argument owner remains live for this synchronous
     // call, and replacing the disjoint cwd slot cannot relocate its bytes.
@@ -3201,9 +3210,9 @@ pub(in crate::vm) extern "C" fn jit_native_chdir_abi(
     let path = unsafe { std::slice::from_raw_parts(path, path_length) };
     let Some(Some(target)) = php_runtime::api::native_chdir_target(cwd.as_path(), filesystem, path)
     else {
-        // Validation failed before mutation. The one baseline continuation
-        // owns PHP warning construction and the visible `false` result.
-        return exact_query_baseline();
+        // Publication must exclude warning-producing targets before mutation.
+        // Reaching this state violates that immutable call contract.
+        return exact_query_contract_violation();
     };
     *cwd = target;
     exact_query_return_bool(true)
@@ -3220,19 +3229,19 @@ pub(in crate::vm) extern "C" fn jit_native_umask_abi(
         None
     } else {
         let Some(value) = exact_native_integer(fast, argument_0) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         Some(value)
     };
     let Some(previous) = fast.native_filesystem_state().map(|state| state.umask()) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Ok(encoded_previous) = fast.publish_direct_int(previous) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     if let Some(next) = next {
         let Some(state) = fast.native_filesystem_state() else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         state.set_umask(next);
     }
@@ -3250,7 +3259,7 @@ pub(in crate::vm) extern "C" fn jit_native_clearstatcache_abi(
         // Optional argument coercion and validation remain one cold boundary;
         // the common zero-argument operation has no cache work in this
         // runtime and returns `null` directly.
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(u32::MAX))
 }
@@ -3263,7 +3272,7 @@ pub(in crate::vm) extern "C" fn jit_native_getenv_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(environment) = fast.request_query.environment() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let environment = environment as *const [(String, String)];
     // SAFETY: the request environment is immutable and stable for the active
@@ -3276,7 +3285,7 @@ pub(in crate::vm) extern "C" fn jit_native_getenv_abi(
         match fast.native_printf_scalar(argument_0) {
             Some(php_runtime::api::NativePrintfScalar::Null) => None,
             Some(php_runtime::api::NativePrintfScalar::String(name)) => Some(name),
-            _ => return exact_query_baseline(),
+            _ => return exact_query_contract_violation(),
         }
     };
     if let Some(name) = name {
@@ -3289,7 +3298,7 @@ pub(in crate::vm) extern "C" fn jit_native_getenv_abi(
         return fast
             .publish_direct_string_bytes(value.as_bytes())
             .map_or_else(
-                |_| exact_query_baseline(),
+                |_| exact_query_contract_violation(),
                 php_jit::JitNativeControlResult::returning,
             );
     }
@@ -3301,7 +3310,7 @@ pub(in crate::vm) extern "C" fn jit_native_getenv_abi(
             .map(|(name, value)| (name.as_bytes(), value.as_bytes())),
     )
     .map_or_else(
-        exact_query_baseline,
+        exact_query_contract_violation,
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -3313,7 +3322,7 @@ pub(in crate::vm) extern "C" fn jit_native_php_sapi_name_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(sapi_name) = fast.request_query.sapi_name() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let bytes = sapi_name.as_bytes();
     let bytes = (bytes.as_ptr(), bytes.len());
@@ -3321,7 +3330,7 @@ pub(in crate::vm) extern "C" fn jit_native_php_sapi_name_abi(
     #[allow(unsafe_code)]
     let bytes = unsafe { std::slice::from_raw_parts(bytes.0, bytes.1) };
     fast.publish_direct_string_bytes(bytes).map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -3340,7 +3349,7 @@ pub(in crate::vm) extern "C" fn jit_native_php_uname_abi(
             Some(php_runtime::api::NativePrintfScalar::String(mode)) => {
                 mode.first().copied().unwrap_or(b'a').to_ascii_lowercase()
             }
-            _ => return exact_query_baseline(),
+            _ => return exact_query_contract_violation(),
         }
     };
     let version = php_source::reference_php_version();
@@ -3353,7 +3362,7 @@ pub(in crate::vm) extern "C" fn jit_native_php_uname_abi(
         _ => format!("Phrust localhost {version} Stdlib generic").into_bytes(),
     };
     fast.publish_direct_string_bytes(&value).map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -3365,7 +3374,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_current_user_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     fast.publish_direct_string_bytes(b"phrust").map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -3377,7 +3386,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_included_files_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(included_files) = fast.request_query.included_files() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let included_files = included_files as *const std::collections::BTreeSet<std::path::PathBuf>;
     // SAFETY: request publication owns this included-file set for the complete
@@ -3392,7 +3401,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_included_files_abi(
             .map(|path| path.as_os_str().as_encoded_bytes()),
     )
     .map_or_else(
-        exact_query_baseline,
+        exact_query_contract_violation,
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -3404,7 +3413,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_defined_functions_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(compiled) = fast.symbol_query.active_compiled() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let compiled = compiled as *const crate::compiled_unit::CompiledUnit;
     // SAFETY: the active compiled unit is request-stable and native result
@@ -3418,7 +3427,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_defined_functions_abi(
         internal_entries.len(),
         internal_entries.iter().map(|entry| entry.name().as_bytes()),
     ) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let user_entries = &compiled.unit().function_table;
     let Some(user) = publish_exact_string_list(
@@ -3427,7 +3436,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_defined_functions_abi(
         user_entries.iter().map(|entry| entry.name.as_bytes()),
     ) else {
         let _ = fast.discard_owned_direct_value(internal);
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     publish_exact_named_owned_values(
         fast,
@@ -3437,7 +3446,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_defined_functions_abi(
         ],
     )
     .map_or_else(
-        exact_query_baseline,
+        exact_query_contract_violation,
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -3449,7 +3458,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_declared_classes_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(compiled) = fast.symbol_query.active_compiled() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let compiled = compiled as *const crate::compiled_unit::CompiledUnit;
     // SAFETY: the active compiled unit is request-stable for this call.
@@ -3469,7 +3478,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_declared_classes_abi(
             .map(|class| class.display_name.as_bytes()),
     )
     .map_or_else(
-        exact_query_baseline,
+        exact_query_contract_violation,
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -3481,7 +3490,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_declared_interfaces_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(compiled) = fast.symbol_query.active_compiled() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let compiled = compiled as *const crate::compiled_unit::CompiledUnit;
     // SAFETY: the active compiled unit is request-stable for this call.
@@ -3501,7 +3510,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_declared_interfaces_abi(
             .map(|class| class.display_name.as_bytes()),
     )
     .map_or_else(
-        exact_query_baseline,
+        exact_query_contract_violation,
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -3513,7 +3522,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_declared_traits_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(compiled) = fast.symbol_query.active_compiled() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let compiled = compiled as *const crate::compiled_unit::CompiledUnit;
     // SAFETY: the active compiled unit is request-stable for this call.
@@ -3530,7 +3539,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_declared_traits_abi(
             .map(|class| class.display_name.as_bytes()),
     )
     .map_or_else(
-        exact_query_baseline,
+        exact_query_contract_violation,
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -4083,12 +4092,12 @@ pub(in crate::vm) extern "C" fn jit_native_get_defined_constants_abi(
             false
         } else {
             let Some(value) = exact_native_boolean_flag(fast, argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             value
         };
     if fast.symbol_query.active_compiled().is_none() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let state = std::ptr::from_ref(fast);
     let result = if categorized {
@@ -4109,7 +4118,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_defined_constants_abi(
             .checked_add(standard_category_count)
             .and_then(|count| count.checked_add(usize::from(user_length != 0)));
         let Some(category_count) = category_count else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         fast.publish_owned_direct_array_with(category_count, |fast, index| {
             let (name, category) = if core_length != 0 && index == 0 {
@@ -4140,7 +4149,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_defined_constants_abi(
         publish_exact_uncategorized_constants(fast, state)
     };
     result.ok().map_or_else(
-        exact_query_baseline,
+        exact_query_contract_violation,
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -4199,10 +4208,10 @@ pub(in crate::vm) extern "C" fn jit_native_compact_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Ok(function_id) = usize::try_from(function_id) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Ok(local_count) = usize::try_from(local_count) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     // `-1` is the published frame-projection mode for get_defined_vars().
     // It reuses this one numeric ABI instead of adding a wrapper ABI around
@@ -4212,18 +4221,18 @@ pub(in crate::vm) extern "C" fn jit_native_compact_abi(
         0
     } else {
         let Ok(count) = usize::try_from(compact_argument_count) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         count
     };
     let Some(compiled) = fast.symbol_query.active_compiled() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(function) = compiled.unit().functions.get(function_id) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     if function.locals.len() != local_count {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let local_names = function.locals.as_ptr();
     let local_values = if local_count == 0 {
@@ -4231,7 +4240,7 @@ pub(in crate::vm) extern "C" fn jit_native_compact_abi(
     } else {
         let values = local_values as usize as *const i64;
         if values.is_null() {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         }
         // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
         #[allow(unsafe_code)]
@@ -4244,7 +4253,7 @@ pub(in crate::vm) extern "C" fn jit_native_compact_abi(
     } else {
         let arguments = compact_arguments as usize as *const i64;
         if arguments.is_null() {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         }
         // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
         #[allow(unsafe_code)]
@@ -4256,7 +4265,7 @@ pub(in crate::vm) extern "C" fn jit_native_compact_abi(
         .begin_owned_direct_array(4, php_jit::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY)
         .ok()
     else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let fast = fast as *mut NativeRequestFastState;
     let mut publish_name = |fast: *mut NativeRequestFastState, name: &[u8]| {
@@ -4313,7 +4322,7 @@ pub(in crate::vm) extern "C" fn jit_native_compact_abi(
             if publish_name(fast, name.as_bytes()).is_none() {
                 drop(publish_name);
                 unsafe { &mut *fast }.abort_owned_direct_array(writer);
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             }
         }
     } else {
@@ -4325,7 +4334,7 @@ pub(in crate::vm) extern "C" fn jit_native_compact_abi(
                 drop(publish_compact_name);
                 drop(publish_name);
                 unsafe { &mut *fast }.abort_owned_direct_array(writer);
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             }
         }
         drop(publish_compact_name);
@@ -4334,7 +4343,7 @@ pub(in crate::vm) extern "C" fn jit_native_compact_abi(
     unsafe { &mut *fast }
         .finish_owned_direct_array(writer)
         .map_or_else(
-            |_| exact_query_baseline(),
+            |_| exact_query_contract_violation(),
             php_jit::JitNativeControlResult::returning,
         )
 }
@@ -4346,7 +4355,7 @@ pub(in crate::vm) extern "C" fn jit_native_func_num_args_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     fast.native_func_num_args().map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -4365,11 +4374,11 @@ pub(in crate::vm) extern "C" fn jit_native_func_get_arg_abi(
             _ => None,
         })
     else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     match fast.native_func_get_arg(index) {
         Ok(Some(value)) => php_jit::JitNativeControlResult::returning(value),
-        Ok(None) | Err(_) => exact_query_baseline(),
+        Ok(None) | Err(_) => exact_query_contract_violation(),
     }
 }
 
@@ -4380,7 +4389,7 @@ pub(in crate::vm) extern "C" fn jit_native_func_get_args_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     fast.native_func_get_args().map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -4394,12 +4403,12 @@ pub(in crate::vm) extern "C" fn jit_native_base64_decode_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(input) = fast.native_string_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let strict = if argument_1 != php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING)
     {
         let Some(strict) = exact_native_boolean_flag(fast, argument_1) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         strict
     } else {
@@ -4415,7 +4424,7 @@ pub(in crate::vm) extern "C" fn jit_native_base64_decode_abi(
         |input, output| php_runtime::api::native_base64_decode_into(input, strict, output),
     )
     .map_or_else(
-        exact_query_baseline,
+        exact_query_contract_violation,
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -4429,7 +4438,7 @@ fn exact_native_parsed_base_result(
         php_runtime::api::NativeParsedBaseNumber::Float(value) => fast.publish_direct_float(value),
     };
     encoded.map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -4444,10 +4453,10 @@ macro_rules! exact_native_parse_base_abi {
             #[allow(unsafe_code)]
             let fast = unsafe { &mut *runtime };
             let Some(input) = fast.native_string_view(argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             let Some(parsed) = php_runtime::api::native_parse_base_digits(input, $base) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             exact_native_parsed_base_result(fast, parsed)
         }
@@ -4468,11 +4477,11 @@ macro_rules! exact_native_decimal_to_base_abi {
             #[allow(unsafe_code)]
             let fast = unsafe { &mut *runtime };
             let Some(value) = exact_native_integer(fast, argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             let Some(conversion) = php_runtime::api::native_decimal_base_conversion(value, $base)
             else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             fast.try_publish_direct_string_with(conversion.output_length(), |output| {
                 conversion
@@ -4481,7 +4490,7 @@ macro_rules! exact_native_decimal_to_base_abi {
                     .ok_or("native decimal base conversion length mismatch")
             })
             .map_or_else(
-                |_| exact_query_baseline(),
+                |_| exact_query_contract_violation(),
                 php_jit::JitNativeControlResult::returning,
             )
         }
@@ -4505,14 +4514,14 @@ pub(in crate::vm) extern "C" fn jit_native_base_convert_abi(
         exact_native_integer(fast, argument_1).and_then(|base| u32::try_from(base).ok()),
         exact_native_integer(fast, argument_2).and_then(|base| u32::try_from(base).ok()),
     ) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(input) = fast.native_string_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(conversion) = php_runtime::api::native_base_conversion(input, from_base, to_base)
     else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     fast.try_publish_direct_string_with(conversion.output_length(), |output| {
         conversion
@@ -4521,7 +4530,7 @@ pub(in crate::vm) extern "C" fn jit_native_base_convert_abi(
             .ok_or("native base conversion length mismatch")
     })
     .map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -4534,13 +4543,13 @@ pub(in crate::vm) extern "C" fn jit_native_ip2long_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(address) = fast.native_string_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(value) = php_runtime::api::native_ip2long(address) else {
         return exact_query_return_bool(false);
     };
     fast.publish_direct_int(value).map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -4553,12 +4562,12 @@ pub(in crate::vm) extern "C" fn jit_native_long2ip_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(address) = exact_native_integer(fast, argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let output = php_runtime::api::native_long2ip(address);
     fast.publish_direct_string_bytes(output.as_bytes())
         .map_or_else(
-            |_| exact_query_baseline(),
+            |_| exact_query_contract_violation(),
             php_jit::JitNativeControlResult::returning,
         )
 }
@@ -4573,14 +4582,14 @@ macro_rules! exact_native_network_string_abi {
             #[allow(unsafe_code)]
             let fast = unsafe { &mut *runtime };
             let Some(input) = fast.native_string_view(argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             let Some(output) = $operation(input) else {
                 return exact_query_return_bool(false);
             };
             fast.publish_direct_string_bytes(output.as_bytes())
                 .map_or_else(
-                    |_| exact_query_baseline(),
+                    |_| exact_query_contract_violation(),
                     php_jit::JitNativeControlResult::returning,
                 )
         }
@@ -4613,14 +4622,14 @@ macro_rules! exact_native_compression_encode_abi {
                 != php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING)
             {
                 let Some(level) = exact_native_integer(fast, argument_1) else {
-                    return exact_query_baseline();
+                    return exact_query_contract_violation();
                 };
                 level
             } else {
                 -1
             };
             let Some((input, input_length)) = fast.stable_native_string_range(argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             let Some(output_capacity) =
                 php_runtime::api::native_zlib_encode_output_capacity(input_length, $encoding)
@@ -4636,7 +4645,7 @@ macro_rules! exact_native_compression_encode_abi {
             }) {
                 Ok(encoded) => php_jit::JitNativeControlResult::returning(encoded),
                 Err(NativeDirectStringPublishError::Fill(())) => exact_query_return_bool(false),
-                Err(NativeDirectStringPublishError::Arena(_)) => exact_query_baseline(),
+                Err(NativeDirectStringPublishError::Arena(_)) => exact_query_contract_violation(),
             }
         }
     };
@@ -4666,10 +4675,10 @@ macro_rules! exact_native_compression_decode_abi {
             #[allow(unsafe_code)]
             let fast = unsafe { &mut *runtime };
             let Some(max_length) = exact_native_max_length(fast, argument_1) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             let Some((input, input_length)) = fast.stable_native_string_range(argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             // SAFETY: validation borrows the stable source only until the
             // immutable decode plan has been produced.
@@ -4678,7 +4687,7 @@ macro_rules! exact_native_compression_decode_abi {
             let Some(plan) =
                 php_runtime::api::native_zlib_decode(input_bytes, $encoding, max_length)
             else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             fast.try_publish_direct_string_with(plan.output_length(), |output| {
                 // SAFETY: direct string publication cannot relocate the
@@ -4690,7 +4699,7 @@ macro_rules! exact_native_compression_decode_abi {
                     .ok_or("native zlib decode changed after validation")
             })
             .map_or_else(
-                |_| exact_query_baseline(),
+                |_| exact_query_contract_violation(),
                 php_jit::JitNativeControlResult::returning,
             )
         }
@@ -4719,17 +4728,17 @@ pub(in crate::vm) extern "C" fn jit_native_zlib_decode_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(max_length) = exact_native_max_length(fast, argument_1) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some((input, input_length)) = fast.stable_native_string_range(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     // SAFETY: validation borrows the stable source only until the immutable
     // decode plan has been produced.
     #[allow(unsafe_code)]
     let input_bytes = unsafe { std::slice::from_raw_parts(input, input_length) };
     let Some(plan) = php_runtime::api::native_zlib_decode_auto(input_bytes, max_length) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     fast.try_publish_direct_string_with(plan.output_length(), |output| {
         // SAFETY: direct string publication cannot relocate the source range
@@ -4741,7 +4750,7 @@ pub(in crate::vm) extern "C" fn jit_native_zlib_decode_abi(
             .ok_or("native zlib auto-decode changed after validation")
     })
     .map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -4763,10 +4772,10 @@ pub(in crate::vm) extern "C" fn jit_native_zlib_encode_abi(
             Some(-1)
         },
     ) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some((input, input_length)) = fast.stable_native_string_range(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(output_capacity) =
         php_runtime::api::native_zlib_encode_output_capacity(input_length, encoding)
@@ -4782,7 +4791,7 @@ pub(in crate::vm) extern "C" fn jit_native_zlib_encode_abi(
     }) {
         Ok(encoded) => php_jit::JitNativeControlResult::returning(encoded),
         Err(NativeDirectStringPublishError::Fill(())) => exact_query_return_bool(false),
-        Err(NativeDirectStringPublishError::Arena(_)) => exact_query_baseline(),
+        Err(NativeDirectStringPublishError::Arena(_)) => exact_query_contract_violation(),
     }
 }
 
@@ -4797,14 +4806,14 @@ pub(in crate::vm) extern "C" fn jit_native_basename_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some((path, path_length)) = fast.stable_native_string_range(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
     let suffix = if argument_1 == missing {
         None
     } else {
         let Some((suffix, suffix_length)) = fast.stable_native_string_range(argument_1) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         // SAFETY: exact-call string owners remain stable for this synchronous
         // byte-range calculation.
@@ -4827,7 +4836,7 @@ pub(in crate::vm) extern "C" fn jit_native_basename_abi(
             .ok_or("native basename plan no longer matches its source")
     })
     .map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -4841,14 +4850,14 @@ pub(in crate::vm) extern "C" fn jit_native_dirname_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some((path, path_length)) = fast.stable_native_string_range(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
     let levels = if argument_1 != missing {
         let Some(php_runtime::api::NativePrintfScalar::Int(levels)) =
             fast.native_printf_scalar(argument_1)
         else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         levels
     } else {
@@ -4870,7 +4879,7 @@ pub(in crate::vm) extern "C" fn jit_native_dirname_abi(
             .ok_or("native dirname plan no longer matches its source")
     })
     .map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -4884,14 +4893,14 @@ pub(in crate::vm) extern "C" fn jit_native_pathinfo_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some((path, path_length)) = fast.stable_native_string_range(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
     let flags = if argument_1 == missing {
         None
     } else {
         let Some(flags) = exact_native_integer(fast, argument_1) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         Some(flags)
     };
@@ -4900,7 +4909,7 @@ pub(in crate::vm) extern "C" fn jit_native_pathinfo_abi(
     #[allow(unsafe_code)]
     let path = unsafe { std::slice::from_raw_parts(path, path_length) };
     php_runtime::api::native_pathinfo_into(path, flags, fast).map_or_else(
-        exact_query_baseline,
+        exact_query_contract_violation,
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -4971,18 +4980,18 @@ macro_rules! exact_native_stat_abi {
             #[allow(unsafe_code)]
             let fast = unsafe { &mut *runtime };
             let Some(path) = fast.native_string_view(argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             let Some((cwd, filesystem)) = fast.native_filesystem_capability() else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             match php_runtime::api::native_stat(cwd, filesystem, path, $follow_links) {
                 Some(Some(record)) => publish_exact_stat_record(fast, record).map_or_else(
-                    exact_query_baseline,
+                    exact_query_contract_violation,
                     php_jit::JitNativeControlResult::returning,
                 ),
                 Some(None) => exact_query_return_bool(false),
-                None => exact_query_baseline(),
+                None => exact_query_contract_violation(),
             }
         }
     };
@@ -5005,7 +5014,7 @@ pub(in crate::vm) extern "C" fn jit_native_file_abi(
         0
     } else {
         let Some(flags) = exact_native_integer(fast, argument_1) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         flags
     };
@@ -5015,10 +5024,10 @@ pub(in crate::vm) extern "C" fn jit_native_file_abi(
             Some(php_runtime::api::NativePrintfScalar::Null)
         )
     {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let Some(lines) = fast.native_file_lines_direct(argument_0, flags) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     php_jit::JitNativeControlResult::returning(lines)
 }
@@ -5033,14 +5042,14 @@ pub(in crate::vm) extern "C" fn jit_native_glob_abi(
     let fast = unsafe { &mut *runtime };
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
     if argument_1 != missing && exact_native_integer(fast, argument_1) != Some(0) {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     match fast.native_glob_direct(argument_0) {
         Some(php_runtime::api::NativeGlobPublished::Matches(paths)) => {
             php_jit::JitNativeControlResult::returning(paths)
         }
         Some(php_runtime::api::NativeGlobPublished::False) => exact_query_return_bool(false),
-        None => exact_query_baseline(),
+        None => exact_query_contract_violation(),
     }
 }
 
@@ -5051,11 +5060,11 @@ pub(in crate::vm) extern "C" fn jit_native_opendir_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(path) = fast.native_string_view(argument_0).map(<[u8]>::to_vec) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let resource = {
         let Some((resources, cwd, filesystem)) = fast.native_directory_capability() else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         match php_runtime::api::native_directory_entries(cwd, filesystem, &path) {
             Some(Some((resolved, entries))) => {
@@ -5063,14 +5072,14 @@ pub(in crate::vm) extern "C" fn jit_native_opendir_abi(
                 resources.register_directory(resolved, entries, uri)
             }
             Some(None) => return exact_query_return_bool(false),
-            None => return exact_query_baseline(),
+            None => return exact_query_contract_violation(),
         }
     };
     match fast.publish_direct_resource(resource.clone()) {
         Ok(encoded) => php_jit::JitNativeControlResult::returning(encoded),
         Err(_) => {
             resource.close();
-            exact_query_baseline()
+            exact_query_contract_violation()
         }
     }
 }
@@ -5082,16 +5091,16 @@ pub(in crate::vm) extern "C" fn jit_native_readdir_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(checkpoint) = resource.native_directory_cursor_checkpoint() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     match resource.read_dir_entry() {
         Ok(Some(entry)) => match fast.publish_direct_string_bytes(entry.as_bytes()) {
             Ok(encoded) => php_jit::JitNativeControlResult::returning(encoded),
             Err(_) if resource.restore_native_directory_cursor(checkpoint) => {
-                exact_query_baseline()
+                exact_query_contract_violation()
             }
             Err(_) => {
                 debug_assert!(false, "native directory cursor rollback failed");
@@ -5099,7 +5108,7 @@ pub(in crate::vm) extern "C" fn jit_native_readdir_abi(
             }
         },
         Ok(None) => exact_query_return_bool(false),
-        Err(_) => exact_query_baseline(),
+        Err(_) => exact_query_contract_violation(),
     }
 }
 
@@ -5110,13 +5119,13 @@ pub(in crate::vm) extern "C" fn jit_native_rewinddir_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     match resource.rewind_dir() {
         Ok(()) => {
             php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(u32::MAX))
         }
-        Err(_) => exact_query_baseline(),
+        Err(_) => exact_query_contract_violation(),
     }
 }
 
@@ -5127,10 +5136,10 @@ pub(in crate::vm) extern "C" fn jit_native_closedir_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     if !resource.is_user_closable() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     resource.close();
     php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(u32::MAX))
@@ -5148,19 +5157,19 @@ pub(in crate::vm) extern "C" fn jit_native_scandir_abi(
         0
     } else {
         let Some(order) = exact_native_integer(fast, argument_1) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         order
     };
     if !matches!(order, 0 | 1) {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     match fast.native_scandir_direct(argument_0, order == 1) {
         Some(php_runtime::api::NativeGlobPublished::Matches(entries)) => {
             php_jit::JitNativeControlResult::returning(entries)
         }
         Some(php_runtime::api::NativeGlobPublished::False) => exact_query_return_bool(false),
-        None => exact_query_baseline(),
+        None => exact_query_contract_violation(),
     }
 }
 
@@ -5170,7 +5179,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_get_wrappers_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     publish_exact_string_list(fast, 2, [b"file".as_slice(), b"php".as_slice()]).map_or_else(
-        exact_query_baseline,
+        exact_query_contract_violation,
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -5182,7 +5191,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_get_meta_data_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let metadata = resource.metadata();
     let flags = resource.flags();
@@ -5231,7 +5240,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_get_meta_data_abi(
         Ok(php_jit::JitNativeDirectArrayEntry { key, value })
     })
     .map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -5249,10 +5258,10 @@ pub(in crate::vm) extern "C" fn jit_native_stream_is_local_abi(
         ));
     }
     let Some((path, path_length)) = fast.stable_native_string_range(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some((cwd, filesystem)) = fast.native_filesystem_capability() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     #[allow(unsafe_code)]
     let path = unsafe { std::slice::from_raw_parts(path, path_length) };
@@ -5268,10 +5277,10 @@ pub(in crate::vm) extern "C" fn jit_native_stream_resolve_include_path_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some((path, path_length)) = fast.stable_native_string_range(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some((cwd, filesystem)) = fast.native_filesystem_capability() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let include_path = Arc::clone(fast.configuration.include_path());
     #[allow(unsafe_code)]
@@ -5283,11 +5292,11 @@ pub(in crate::vm) extern "C" fn jit_native_stream_resolve_include_path_abi(
         path,
     ) {
         Some(Some(resolved)) => fast.publish_direct_string_bytes(&resolved).map_or_else(
-            |_| exact_query_baseline(),
+            |_| exact_query_contract_violation(),
             php_jit::JitNativeControlResult::returning,
         ),
         Some(None) => exact_query_return_bool(false),
-        None => exact_query_baseline(),
+        None => exact_query_contract_violation(),
     }
 }
 
@@ -5331,10 +5340,10 @@ pub(in crate::vm) extern "C" fn jit_native_stream_context_create_abi(
         fast.duplicate_native_stream_context_array(argument_0)
     };
     let Ok(options) = options else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     publish_native_stream_context(fast, options).map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -5350,29 +5359,29 @@ pub(in crate::vm) extern "C" fn jit_native_stream_context_get_default_abi(
     let default_owner = if let Some(requested) = requested {
         match fast.duplicate_native_stream_context_array(requested) {
             Ok(options) => options,
-            Err(_) => return exact_query_baseline(),
+            Err(_) => return exact_query_contract_violation(),
         }
     } else {
         let Some(default) = fast.native_stream_context_default_options() else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         match fast.duplicate_native_stream_context_array(default) {
             Ok(options) => options,
-            Err(_) => return exact_query_baseline(),
+            Err(_) => return exact_query_contract_violation(),
         }
     };
     let resource_owner = match fast.duplicate_native_stream_context_array(default_owner) {
         Ok(options) => options,
         Err(_) => {
             let _ = fast.discard_owned_direct_value(default_owner);
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         }
     };
     let resource = match publish_native_stream_context(fast, resource_owner) {
         Ok(resource) => resource,
         Err(_) => {
             let _ = fast.discard_owned_direct_value(default_owner);
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         }
     };
     if requested.is_some()
@@ -5395,14 +5404,14 @@ pub(in crate::vm) extern "C" fn jit_native_stream_context_get_options_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(options) = fast.native_stream_context_resource_options(&resource) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     fast.duplicate_native_stream_context_array(options)
         .map_or_else(
-            |_| exact_query_baseline(),
+            |_| exact_query_contract_violation(),
             php_jit::JitNativeControlResult::returning,
         )
 }
@@ -5434,14 +5443,14 @@ pub(in crate::vm) extern "C" fn jit_native_stream_context_set_options_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     if fast.native_stream_context_array(argument_1).is_none() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     match merge_native_stream_context_resource(fast, &resource, argument_1) {
         Ok(()) => exact_query_return_bool(true),
-        Err(_) => exact_query_baseline(),
+        Err(_) => exact_query_contract_violation(),
     }
 }
 
@@ -5455,30 +5464,30 @@ pub(in crate::vm) extern "C" fn jit_native_stream_context_set_option_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
     if argument_2 == missing && argument_3 == missing {
         if fast.native_stream_context_array(argument_1).is_none() {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         }
         return match merge_native_stream_context_resource(fast, &resource, argument_1) {
             Ok(()) => exact_query_return_bool(true),
-            Err(_) => exact_query_baseline(),
+            Err(_) => exact_query_contract_violation(),
         };
     }
     let Some((wrapper, wrapper_length)) = fast.stable_native_string_range(argument_1) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some((option, option_length)) = fast.stable_native_string_range(argument_2) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Ok(value) = fast.duplicate_native_stream_context_value(argument_3) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(current) = fast.native_stream_context_resource_options(&resource) else {
         let _ = fast.discard_owned_direct_value(value);
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     #[allow(unsafe_code)]
     let wrapper = unsafe { std::slice::from_raw_parts(wrapper, wrapper_length) };
@@ -5487,7 +5496,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_context_set_option_abi(
     let updated = fast.native_stream_context_set_named_option(current, wrapper, option, value);
     let _ = fast.discard_owned_direct_value(value);
     let Ok(updated) = updated else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     match fast.insert_native_stream_context_resource_owned(&resource, updated) {
         Ok(()) => exact_query_return_bool(true),
@@ -5503,10 +5512,10 @@ fn attach_native_stream_filter(
     prepend: bool,
 ) -> php_jit::JitNativeControlResult {
     let Some(stream) = fast.native_resource_view(stream).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(filter_name) = fast.native_string_view(filter_name) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let filter_name = String::from_utf8_lossy(filter_name).into_owned();
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
@@ -5514,12 +5523,12 @@ fn attach_native_stream_filter(
         0
     } else {
         let Some(mode) = exact_native_integer(fast, mode) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         mode
     };
     let Some(mode) = php_runtime::api::StreamFilterMode::from_php(mode) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let filter = match fast
         .native_stream_context_resources()
@@ -5529,13 +5538,13 @@ fn attach_native_stream_filter(
                 .ok()
         }) {
         Some(Some(filter)) => filter,
-        Some(None) | None => return exact_query_baseline(),
+        Some(None) | None => return exact_query_contract_violation(),
     };
     match fast.publish_direct_resource(filter.clone()) {
         Ok(encoded) => php_jit::JitNativeControlResult::returning(encoded),
         Err(_) => {
             filter.remove_stream_filter_resource();
-            exact_query_baseline()
+            exact_query_contract_violation()
         }
     }
 }
@@ -5571,7 +5580,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_filter_remove_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(filter) = fast.native_resource_view(argument_0).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     exact_query_return_bool(filter.remove_stream_filter_resource())
 }
@@ -5583,7 +5592,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_isatty_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     if fast.native_resource_view(argument_0).is_none() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     exact_query_return_bool(false)
 }
@@ -5597,17 +5606,17 @@ pub(in crate::vm) extern "C" fn jit_native_stream_set_timeout_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     if fast.native_resource_view(argument_0).is_none() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let Some(seconds) = exact_native_integer(fast, argument_1) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
     let microseconds = if argument_2 == missing {
         0
     } else {
         let Some(microseconds) = exact_native_integer(fast, argument_2) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         microseconds
     };
@@ -5625,16 +5634,16 @@ pub(in crate::vm) extern "C" fn jit_native_realpath_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(path) = fast.native_string_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some((cwd, filesystem)) = fast.native_filesystem_capability() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(bytes) = php_runtime::api::native_realpath(cwd, filesystem, path) else {
         return exact_query_return_bool(false);
     };
     fast.publish_direct_string_bytes(&bytes).map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -5649,14 +5658,14 @@ macro_rules! exact_native_boolean_path_abi {
             #[allow(unsafe_code)]
             let fast = unsafe { &mut *runtime };
             let Some(path) = fast.native_string_view(argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             let Some((cwd, filesystem)) = fast.native_filesystem_capability() else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             match $native(cwd, filesystem, path) {
                 Some(value) => exact_query_return_bool(value),
-                None => exact_query_baseline(),
+                None => exact_query_contract_violation(),
             }
         }
     };
@@ -5688,18 +5697,18 @@ macro_rules! exact_native_integer_path_abi {
             #[allow(unsafe_code)]
             let fast = unsafe { &mut *runtime };
             let Some(path) = fast.native_string_view(argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             let Some((cwd, filesystem)) = fast.native_filesystem_capability() else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             match $native(cwd, filesystem, path) {
                 Some(Some(value)) => fast.publish_direct_int(value).map_or_else(
-                    |_| exact_query_baseline(),
+                    |_| exact_query_contract_violation(),
                     php_jit::JitNativeControlResult::returning,
                 ),
                 Some(None) => exact_query_return_bool(false),
-                None => exact_query_baseline(),
+                None => exact_query_contract_violation(),
             }
         }
     };
@@ -5719,18 +5728,18 @@ pub(in crate::vm) extern "C" fn jit_native_filetype_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(path) = fast.native_string_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some((cwd, filesystem)) = fast.native_filesystem_capability() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     match php_runtime::api::native_filetype(cwd, filesystem, path) {
         Some(Some(bytes)) => fast.publish_direct_string_bytes(bytes).map_or_else(
-            |_| exact_query_baseline(),
+            |_| exact_query_contract_violation(),
             php_jit::JitNativeControlResult::returning,
         ),
         Some(None) => exact_query_return_bool(false),
-        None => exact_query_baseline(),
+        None => exact_query_contract_violation(),
     }
 }
 
@@ -5744,18 +5753,18 @@ macro_rules! exact_native_disk_space_abi {
             #[allow(unsafe_code)]
             let fast = unsafe { &mut *runtime };
             let Some(path) = fast.native_string_view(argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             let Some((cwd, filesystem)) = fast.native_filesystem_capability() else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             match php_runtime::api::native_disk_space(cwd, filesystem, path) {
                 Some(Some(value)) => fast.publish_direct_float(value).map_or_else(
-                    |_| exact_query_baseline(),
+                    |_| exact_query_contract_violation(),
                     php_jit::JitNativeControlResult::returning,
                 ),
                 Some(None) => exact_query_return_bool(false),
-                None => exact_query_baseline(),
+                None => exact_query_contract_violation(),
             }
         }
     };
@@ -5776,7 +5785,7 @@ pub(in crate::vm) extern "C" fn jit_native_file_get_contents_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(path) = fast.native_string_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
     if argument_1 != missing
@@ -5785,7 +5794,7 @@ pub(in crate::vm) extern "C" fn jit_native_file_get_contents_abi(
             Some(php_runtime::api::NativePrintfScalar::Bool(_))
         )
     {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     if argument_2 != missing
         && !matches!(
@@ -5794,13 +5803,13 @@ pub(in crate::vm) extern "C" fn jit_native_file_get_contents_abi(
         )
     {
         // Non-null stream contexts can change wrapper/read semantics.
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let offset = if argument_3 != missing {
         let Some(php_runtime::api::NativePrintfScalar::Int(offset)) =
             fast.native_printf_scalar(argument_3)
         else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         offset
     } else {
@@ -5810,21 +5819,21 @@ pub(in crate::vm) extern "C" fn jit_native_file_get_contents_abi(
         match fast.native_printf_scalar(argument_4) {
             Some(php_runtime::api::NativePrintfScalar::Null) => None,
             Some(php_runtime::api::NativePrintfScalar::Int(length)) if length >= 0 => Some(length),
-            _ => return exact_query_baseline(),
+            _ => return exact_query_contract_violation(),
         }
     } else {
         None
     };
     let Some((cwd, filesystem)) = fast.native_filesystem_capability() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(bytes) =
         php_runtime::api::native_file_get_contents(cwd, filesystem, path, offset, length)
     else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     fast.publish_direct_string_bytes(&bytes).map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -5846,7 +5855,7 @@ pub(in crate::vm) extern "C" fn jit_native_file_put_contents_abi(
         let Some(php_runtime::api::NativePrintfScalar::Int(flags)) =
             fast.native_printf_scalar(argument_2)
         else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         flags
     };
@@ -5856,18 +5865,17 @@ pub(in crate::vm) extern "C" fn jit_native_file_put_contents_abi(
             Some(php_runtime::api::NativePrintfScalar::Null)
         )
     {
-        // A real stream context changes the I/O capability and stays at the
-        // one baseline continuation.
-        return exact_query_baseline();
+        // Publication admits only the null/default stream-context capability.
+        return exact_query_contract_violation();
     }
     let Some(path) = fast.native_string_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(bytes) = fast.native_string_view(argument_1) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some((cwd, filesystem)) = fast.native_filesystem_capability() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     match php_runtime::api::native_file_put_contents(cwd, filesystem, path, bytes, flags) {
         Some(Some(written)) => fast.publish_direct_int(written).map_or_else(
@@ -5875,7 +5883,7 @@ pub(in crate::vm) extern "C" fn jit_native_file_put_contents_abi(
             php_jit::JitNativeControlResult::returning,
         ),
         Some(None) => exact_query_return_bool(false),
-        None => exact_query_baseline(),
+        None => exact_query_contract_violation(),
     }
 }
 
@@ -5888,17 +5896,17 @@ pub(in crate::vm) extern "C" fn jit_native_rename_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(from) = fast.native_string_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(to) = fast.native_string_view(argument_1) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some((cwd, filesystem)) = fast.native_filesystem_capability() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     match php_runtime::api::native_rename(cwd, filesystem, from, to) {
         Some(result) => exact_query_return_bool(result),
-        None => exact_query_baseline(),
+        None => exact_query_contract_violation(),
     }
 }
 
@@ -5912,14 +5920,14 @@ macro_rules! exact_native_unary_path_mutation_abi {
             #[allow(unsafe_code)]
             let fast = unsafe { &mut *runtime };
             let Some(path) = fast.native_string_view(argument_0) else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             let Some((cwd, filesystem)) = fast.native_filesystem_capability() else {
-                return exact_query_baseline();
+                return exact_query_contract_violation();
             };
             match $native(cwd, filesystem, path) {
                 Some(result) => exact_query_return_bool(result),
-                None => exact_query_baseline(),
+                None => exact_query_contract_violation(),
             }
         }
     };
@@ -5938,17 +5946,17 @@ pub(in crate::vm) extern "C" fn jit_native_chmod_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(path) = fast.native_string_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(mode) = exact_native_integer(fast, argument_1) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some((cwd, filesystem)) = fast.native_filesystem_capability() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     match php_runtime::api::native_chmod(cwd, filesystem, path, mode) {
         Some(result) => exact_query_return_bool(result),
-        None => exact_query_baseline(),
+        None => exact_query_contract_violation(),
     }
 }
 
@@ -5960,17 +5968,17 @@ pub(in crate::vm) extern "C" fn jit_native_symlink_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(target) = fast.native_string_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(link) = fast.native_string_view(argument_1) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some((cwd, filesystem)) = fast.native_filesystem_capability() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     match php_runtime::api::native_symlink(cwd, filesystem, target, link) {
         Some(result) => exact_query_return_bool(result),
-        None => exact_query_baseline(),
+        None => exact_query_contract_violation(),
     }
 }
 
@@ -5981,16 +5989,16 @@ pub(in crate::vm) extern "C" fn jit_native_readfile_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(path) = fast.native_string_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some((cwd, filesystem)) = fast.native_filesystem_capability() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(bytes) = php_runtime::api::native_file_get_contents(cwd, filesystem, path, 0, None)
     else {
         // Read failures need the source-aware PHP warning, and no output has
         // been written yet.
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let length = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
     match fast.write_output_slice(&bytes) {
@@ -6006,11 +6014,11 @@ pub(in crate::vm) extern "C" fn jit_native_is_uploaded_file_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(path) = fast.native_string_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let path = String::from_utf8_lossy(path);
     let Some(registry) = fast.native_upload_registry() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     exact_query_return_bool(registry.is_active_upload(&path))
 }
@@ -6023,16 +6031,16 @@ pub(in crate::vm) extern "C" fn jit_native_tempnam_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(directory) = fast.native_string_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(prefix) = fast.native_string_view(argument_1) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some((cwd, filesystem)) = fast.native_filesystem_capability() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(path) = php_runtime::api::native_tempnam(cwd, filesystem, directory, prefix) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(path) = path else {
         return exact_query_return_bool(false);
@@ -6042,7 +6050,7 @@ pub(in crate::vm) extern "C" fn jit_native_tempnam_abi(
         Ok(value) => php_jit::JitNativeControlResult::returning(value),
         Err(_) => {
             let _ = std::fs::remove_file(path);
-            exact_query_baseline()
+            exact_query_contract_violation()
         }
     }
 }
@@ -6053,7 +6061,7 @@ pub(in crate::vm) extern "C" fn jit_native_tmpfile_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some((resources, cwd, filesystem, stdin)) = fast.native_stream_open_capability() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(resource) = php_runtime::api::native_tmpfile(resources, cwd, filesystem, stdin) else {
         return exact_query_return_bool(false);
@@ -6062,7 +6070,7 @@ pub(in crate::vm) extern "C" fn jit_native_tmpfile_abi(
         Ok(value) => php_jit::JitNativeControlResult::returning(value),
         Err(_) => {
             resource.close();
-            exact_query_baseline()
+            exact_query_contract_violation()
         }
     }
 }
@@ -6076,15 +6084,15 @@ pub(in crate::vm) extern "C" fn jit_native_fopen_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(path) = fast.native_string_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(mode) = fast.native_string_view(argument_1) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let path = String::from_utf8_lossy(path).into_owned();
     let mode = String::from_utf8_lossy(mode).into_owned();
     let Some((resources, cwd, filesystem, stdin)) = fast.native_stream_open_capability() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     match php_runtime::api::StreamWrapperRegistry::new()
         .open(resources, &path, &mode, cwd, filesystem, stdin)
@@ -6093,10 +6101,10 @@ pub(in crate::vm) extern "C" fn jit_native_fopen_abi(
             Ok(encoded) => php_jit::JitNativeControlResult::returning(encoded),
             Err(_) => {
                 resource.close();
-                exact_query_baseline()
+                exact_query_contract_violation()
             }
         },
-        Err(_) => exact_query_baseline(),
+        Err(_) => exact_query_contract_violation(),
     }
 }
 
@@ -6110,17 +6118,17 @@ pub(in crate::vm) extern "C" fn jit_native_fwrite_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(data) = fast.native_string_view(argument_1) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
     let length = if argument_2 != missing {
         let Some(php_runtime::api::NativePrintfScalar::Int(length)) =
             fast.native_printf_scalar(argument_2)
         else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         usize::try_from(length.max(0)).unwrap_or(usize::MAX)
     } else {
@@ -6161,10 +6169,10 @@ pub(in crate::vm) extern "C" fn jit_native_fclose_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     if !resource.is_user_closable() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     exact_query_return_bool(resource.close())
 }
@@ -6184,7 +6192,9 @@ fn exact_stream_publish_read(
 ) -> php_jit::JitNativeControlResult {
     match fast.publish_direct_string_bytes(bytes) {
         Ok(encoded) => php_jit::JitNativeControlResult::returning(encoded),
-        Err(_) if resource.restore_native_read_cursor(checkpoint) => exact_query_baseline(),
+        Err(_) if resource.restore_native_read_cursor(checkpoint) => {
+            exact_query_contract_violation()
+        }
         Err(_) => {
             debug_assert!(false, "native stream cursor rollback failed");
             exact_query_return_bool(false)
@@ -6201,16 +6211,16 @@ pub(in crate::vm) extern "C" fn jit_native_fread_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(length) = exact_stream_integer(fast, argument_1) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     if length <= 0 {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let Some(checkpoint) = resource.native_read_cursor_checkpoint() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let length = usize::try_from(length).unwrap_or(usize::MAX);
     match resource.read_bytes(length) {
@@ -6228,22 +6238,22 @@ pub(in crate::vm) extern "C" fn jit_native_fgets_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
     let length = if argument_1 != missing {
         let Some(length) = exact_stream_integer(fast, argument_1) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         if length <= 0 {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         }
         Some(usize::try_from(length - 1).unwrap_or(usize::MAX))
     } else {
         None
     };
     let Some(checkpoint) = resource.native_read_cursor_checkpoint() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let bytes = match length {
         Some(length) => resource.read_line_bounded(length),
@@ -6268,10 +6278,10 @@ pub(in crate::vm) extern "C" fn jit_native_fgetc_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(checkpoint) = resource.native_read_cursor_checkpoint() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     match resource.read_bytes(1) {
         Ok(bytes) if bytes.is_empty() => exact_query_return_bool(false),
@@ -6288,7 +6298,7 @@ pub(in crate::vm) extern "C" fn jit_native_feof_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     exact_query_return_bool(resource.eof().unwrap_or(true))
 }
@@ -6301,7 +6311,7 @@ pub(in crate::vm) extern "C" fn jit_native_fflush_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     exact_query_return_bool(resource.flush().is_ok())
 }
@@ -6316,15 +6326,15 @@ pub(in crate::vm) extern "C" fn jit_native_fseek_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(offset) = exact_stream_integer(fast, argument_1) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
     let whence = if argument_2 != missing {
         let Some(whence) = exact_stream_integer(fast, argument_2) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         whence
     } else {
@@ -6351,7 +6361,7 @@ pub(in crate::vm) extern "C" fn jit_native_ftell_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     if !resource.flags().seekable {
         return exact_query_return_bool(false);
@@ -6371,13 +6381,13 @@ pub(in crate::vm) extern "C" fn jit_native_ftruncate_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(size) = exact_stream_integer(fast, argument_1) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     if size < 0 {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     exact_query_return_bool(resource.truncate(size as usize).is_ok())
 }
@@ -6390,7 +6400,7 @@ pub(in crate::vm) extern "C" fn jit_native_rewind_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     exact_query_return_bool(resource.rewind().is_ok())
 }
@@ -6405,15 +6415,15 @@ pub(in crate::vm) extern "C" fn jit_native_stream_get_contents_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
     let length = if argument_1 != missing {
         let Some(length) = exact_stream_integer(fast, argument_1) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         if length < -1 {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         }
         Some(length)
     } else {
@@ -6421,14 +6431,14 @@ pub(in crate::vm) extern "C" fn jit_native_stream_get_contents_abi(
     };
     let offset = if argument_2 != missing {
         let Some(offset) = exact_stream_integer(fast, argument_2) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         Some(offset)
     } else {
         None
     };
     let Some(checkpoint) = resource.native_read_cursor_checkpoint() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     if let Some(offset) = offset
         && offset >= 0
@@ -6457,15 +6467,15 @@ pub(in crate::vm) extern "C" fn jit_native_stream_copy_to_stream_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(source) = fast.native_resource_view(argument_0).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(destination) = fast.native_resource_view(argument_1).cloned() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
     let length = if argument_2 != missing {
         let Some(length) = exact_stream_integer(fast, argument_2) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         Some(length)
     } else {
@@ -6473,7 +6483,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_copy_to_stream_abi(
     };
     let offset = if argument_3 != missing {
         let Some(offset) = exact_stream_integer(fast, argument_3) else {
-            return exact_query_baseline();
+            return exact_query_contract_violation();
         };
         Some(offset)
     } else {
@@ -6505,7 +6515,7 @@ pub(in crate::vm) extern "C" fn jit_native_ob_start_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(output) = fast.native_output_buffer() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     output.start_buffer();
     exact_query_return_bool(true)
@@ -6520,10 +6530,10 @@ pub(in crate::vm) extern "C" fn jit_native_ob_get_clean_abi(
     let encoded = match fast.publish_current_output_buffer() {
         Ok(Some(encoded)) => encoded,
         Ok(None) => return exact_query_return_bool(false),
-        Err(_) => return exact_query_baseline(),
+        Err(_) => return exact_query_contract_violation(),
     };
     let Some(output) = fast.native_output_buffer() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     debug_assert!(output.pop_buffer_clean().is_some());
     php_jit::JitNativeControlResult::returning(encoded)
@@ -6538,7 +6548,7 @@ pub(in crate::vm) extern "C" fn jit_native_ob_get_contents_abi(
     match fast.publish_current_output_buffer() {
         Ok(Some(encoded)) => php_jit::JitNativeControlResult::returning(encoded),
         Ok(None) => exact_query_return_bool(false),
-        Err(_) => exact_query_baseline(),
+        Err(_) => exact_query_contract_violation(),
     }
 }
 
@@ -6551,14 +6561,14 @@ pub(in crate::vm) extern "C" fn jit_native_ob_get_flush_abi(
     let encoded = match fast.publish_current_output_buffer() {
         Ok(Some(encoded)) => encoded,
         Ok(None) => {
-            // The baseline continuation emits PHP's required notice before
-            // returning false. No output-stack effect has happened yet.
-            return exact_query_baseline();
+            // Publication excludes the empty-stack notice case before entry.
+            // No output-stack effect has happened yet.
+            return exact_query_contract_violation();
         }
-        Err(_) => return exact_query_baseline(),
+        Err(_) => return exact_query_contract_violation(),
     };
     let Some(output) = fast.native_output_buffer() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     debug_assert!(output.pop_buffer_flush().is_some());
     php_jit::JitNativeControlResult::returning(encoded)
@@ -6586,7 +6596,7 @@ pub(in crate::vm) extern "C" fn jit_native_ob_get_level_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(output) = fast.native_output_buffer() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     php_jit::JitNativeControlResult::returning(
         i64::try_from(output.buffer_level()).unwrap_or(i64::MAX),
@@ -6600,10 +6610,10 @@ pub(in crate::vm) extern "C" fn jit_native_ob_end_flush_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(output) = fast.native_output_buffer() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     if output.buffer_level() == 0 {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     debug_assert!(output.pop_buffer_flush().is_some());
     exact_query_return_bool(true)
@@ -6616,10 +6626,10 @@ pub(in crate::vm) extern "C" fn jit_native_ob_end_clean_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(output) = fast.native_output_buffer() else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     if output.buffer_level() == 0 {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     debug_assert!(output.pop_buffer_clean().is_some());
     exact_query_return_bool(true)

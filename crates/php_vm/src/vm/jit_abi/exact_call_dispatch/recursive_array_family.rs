@@ -38,10 +38,6 @@ enum ExactNativeArrayKey {
     String,
 }
 
-fn exact_recursive_array_baseline() -> php_jit::JitNativeControlResult {
-    exact_query_baseline()
-}
-
 fn exact_direct_dereference(fast: &NativeRequestFastState, mut encoded: i64) -> Option<i64> {
     for _ in 0..EXACT_RECURSIVE_ARRAY_DEPTH_LIMIT {
         let Some((_, slot)) = fast.direct_slot(encoded) else {
@@ -576,7 +572,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_merge_recursive_abi(
     let fast = unsafe { &mut *runtime };
     let mut active = ExactRecursiveArrayPath::new();
     exact_merge_recursive_owned(fast, left_owned, right, 0, &mut active).map_or_else(
-        |_| exact_recursive_array_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -593,7 +589,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_replace_recursive_abi(
     let fast = unsafe { &mut *runtime };
     let mut active = ExactRecursiveArrayPath::new();
     exact_replace_recursive_owned(fast, left_owned, right, 0, &mut active).map_or_else(
-        |_| exact_recursive_array_baseline(),
+        |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
 }

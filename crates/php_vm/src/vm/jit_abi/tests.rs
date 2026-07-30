@@ -3824,56 +3824,45 @@ fn common_and_exact_native_sources_cannot_import_the_rust_value_plane() {
         );
     }
 
-    let exact_calls = include_str!("exact_call_dispatch.rs");
-    for (function, next_function) in [
+    for (name, source) in [
         (
-            "fn native_memory_usage_result",
-            "pub(in crate::vm) extern \"C\" fn jit_native_memory_get_usage_abi",
+            "exact_call_dispatch.rs",
+            include_str!("exact_call_dispatch.rs"),
         ),
         (
-            "fn jit_native_get_resource_id_abi",
-            "pub(in crate::vm) extern \"C\" fn jit_native_get_resource_type_abi",
+            "exact_call_dispatch/array_multisort.rs",
+            include_str!("exact_call_dispatch/array_multisort.rs"),
         ),
         (
-            "fn jit_native_get_resource_type_abi",
-            "pub(in crate::vm) extern \"C\" fn jit_native_get_resources_abi",
+            "exact_call_dispatch/recursive_array_family.rs",
+            include_str!("exact_call_dispatch/recursive_array_family.rs"),
+        ),
+        (
+            "exact_call_dispatch/scalar_and_filter_families.rs",
+            include_str!("exact_call_dispatch/scalar_and_filter_families.rs"),
         ),
     ] {
-        let body = exact_calls
-            .split_once(function)
-            .and_then(|(_, suffix)| suffix.split_once(next_function))
-            .map(|(body, _)| body)
-            .expect("selected exact fixed-builtin family remains in source");
         assert!(
-            !body.contains("exact_query_baseline"),
-            "{function} retained an exact-query warm fallback"
+            !source.contains("exact_query_baseline"),
+            "{name} retained the deleted exact-query warm fallback"
+        );
+        assert!(
+            !source.contains("RECOMPILE_REQUESTED"),
+            "{name} retained a runtime retry result"
         );
     }
+}
 
-    let scalar_families = include_str!("exact_call_dispatch/scalar_and_filter_families.rs");
-    for (family, next_family) in [
-        ("fn exact_class_kind_exists", "fn exact_member_exists"),
-        (
-            "fn exact_member_exists",
-            "macro_rules! exact_symbol_query_abi",
-        ),
-        (
-            "exact_symbol_query_abi!(jit_native_defined_abi",
-            "pub(in crate::vm) extern \"C\" fn jit_native_constant_abi",
-        ),
-        (
-            "exact_symbol_query_abi!(jit_native_function_exists_abi",
-            "exact_symbol_query_abi!(jit_native_class_exists_abi",
-        ),
-    ] {
-        let body = scalar_families
-            .split_once(family)
-            .and_then(|(_, suffix)| suffix.split_once(next_family))
-            .map(|(body, _)| body)
-            .expect("selected symbol-capability family remains in source");
-        assert!(
-            !body.contains("exact_query_baseline"),
-            "{family} retained an exact-query warm fallback"
-        );
-    }
+#[test]
+fn cold_request_state_is_physically_outside_the_common_native_abi_source() {
+    let common = include_str!("../jit_abi.rs");
+    let cold = include_str!("cold_request_state.rs");
+    assert!(!common.contains("struct NativeRequestColdState"));
+    assert!(cold.contains("struct NativeRequestColdState"));
+    assert!(!cold.contains("php_runtime::api::Value"));
+    assert!(!cold.contains("decode_baseline_value"));
+    assert!(!cold.contains("encode_baseline_value"));
+    let value_plane = include_str!("baseline_value_plane.rs");
+    assert!(value_plane.contains("fn decode_baseline_value"));
+    assert!(value_plane.contains("fn encode_baseline_value"));
 }

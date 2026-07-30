@@ -9,10 +9,10 @@ pub(in crate::vm) extern "C" fn jit_native_array_multisort_abi(
     arguments: *const i64,
 ) -> php_jit::JitNativeControlResult {
     let Ok(argument_count) = usize::try_from(argument_count) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     if argument_count == 0 || arguments.is_null() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     // Safety: generated code owns this stack slice for the duration of this
     // synchronous fixed native call and passes its exact element count.
@@ -22,7 +22,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_multisort_abi(
     #[allow(unsafe_code)] // Safety: generated code passes the active request-owned fast state.
     let fast = unsafe { &mut *runtime };
     if fast.native_array_multisort(arguments).is_none() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     exact_query_return_bool(true)
 }

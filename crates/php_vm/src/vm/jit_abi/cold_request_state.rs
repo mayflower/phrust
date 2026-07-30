@@ -1,0 +1,143 @@
+//! Cold request coordinator.
+//!
+//! Generated optimizing code receives only [`NativeRequestFastState`].
+//! Baseline and cold modules borrow this coordinator when PHP values or
+//! request-wide compatibility state are required.
+
+use super::*;
+
+pub(in crate::vm) struct NativeRequestColdState<'a> {
+    pub(super) compiled: crate::compiled_unit::CompiledUnit,
+    pub(super) unit: ActiveNativeUnit,
+    pub(super) unit_identity: u64,
+    pub(super) options: &'a crate::vm::VmOptions,
+    pub(super) worker_state: &'a crate::vm::VmWorkerState,
+    pub(super) fast_state: *mut NativeRequestFastState,
+    pub(super) native_entries:
+        Arc<std::collections::BTreeMap<php_ir::FunctionId, php_jit::JitFunctionHandle>>,
+    pub(super) native_call_encoded_scratch: Vec<i64>,
+    pub(super) native_frame_arena: NativeFrameArena,
+    pub(super) baseline_transition_store_owner_pending: bool,
+    pub(super) fiber_suspension_states: php_runtime::api::StableNativeArena<php_jit::JitDeoptState>,
+    pub(super) fiber_suspension_next: Box<u32>,
+    #[allow(clippy::vec_box)]
+    pub(super) native_execution_scopes: Vec<Box<NativeExecutionScope>>,
+    pub(super) current_native_execution_scope: u32,
+    pub(super) native_method_pics: std::collections::BTreeMap<u64, NativeMethodPic>,
+    pub(in crate::vm) output: php_runtime::api::OutputBuffer,
+    pub(super) direct_value_slots: php_runtime::api::StableNativeArena<php_jit::JitNativeValueSlot>,
+    pub(super) direct_value_next: Box<u32>,
+    pub(super) direct_object_owners: php_runtime::api::StableNativeArena<u64>,
+    pub(super) direct_array_states:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeDirectArrayState>,
+    pub(super) direct_array_entries:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeDirectArrayEntry>,
+    pub(super) direct_array_next: Box<u32>,
+    pub(super) direct_value_free_head: Box<u32>,
+    pub(super) direct_value_reused_bytes: Box<u64>,
+    pub(super) direct_array_free_heads: Box<[u32; php_jit::JIT_NATIVE_DIRECT_ARRAY_FREE_BUCKETS]>,
+    pub(super) direct_array_reused_bytes: Box<u64>,
+    pub(super) direct_string_bytes: php_runtime::api::StableNativeArena<u8>,
+    pub(super) direct_string_next: Box<u32>,
+    pub(super) direct_string_free_heads: Box<[u32; php_jit::JIT_NATIVE_DIRECT_STRING_FREE_BUCKETS]>,
+    pub(super) direct_string_reused_bytes: Box<u64>,
+    pub(super) static_property_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeStaticPropertySlot>,
+    pub(super) static_property_next: Box<u32>,
+    pub(super) static_property_indices: std::collections::BTreeMap<(String, String), u32>,
+    pub(super) native_global_reference_handles: std::collections::BTreeMap<String, i64>,
+    pub(super) direct_resource_handles: std::collections::HashMap<u64, u32>,
+    pub(super) direct_closure_handles: std::collections::HashMap<u64, u32>,
+    pub(super) direct_string_interned_slots: std::collections::HashMap<u64, Vec<u32>>,
+    pub(super) cross_unit_stable_values: std::collections::HashSet<usize>,
+    pub(super) native_poll_counter: Box<u32>,
+    pub(super) native_root_mutation_pending: Box<u32>,
+    pub(super) baseline_values: BaselineValueState,
+    pub(super) registered_callbacks: NativeRegisteredCallbackState,
+    pub(super) runtime_class_cache: RuntimeClassCache,
+    pub(super) runtime_class_layout_cache:
+        RefCell<std::collections::HashMap<(Option<usize>, String), u64>>,
+    pub(super) trusted_class_plans: Vec<php_jit::JitNativePreparedClassPlan>,
+    pub(super) root_index: RequestRootIndex,
+    pub(super) resources: php_runtime::api::ResourceTable,
+    pub(super) builtin_request_state: php_runtime::api::BuiltinRequestState,
+    pub(super) registered_extensions: NativeRegisteredExtensionRequestState,
+    pub(super) native_stream_context: NativeStreamContextState,
+    pub(in crate::vm) http_response: php_runtime::api::RuntimeHttpResponseState,
+    pub(in crate::vm) upload_registry: php_runtime::api::UploadRegistry,
+    pub(in crate::vm) session: php_runtime::api::SessionState,
+    pub(super) ini_registry: php_runtime::api::IniRegistry,
+    pub(super) default_timezone: String,
+    pub(super) mysql_state: Rc<RefCell<php_runtime::api::MysqlState>>,
+    pub(super) native_dynamic_constants: std::collections::BTreeMap<String, i64>,
+    pub(super) trusted_dynamic_constant_sites: std::collections::BTreeMap<String, Vec<usize>>,
+    pub(super) visible_function_names: Rc<NativeFunctionNameScope>,
+    pub(super) dynamic_functions: std::collections::BTreeMap<String, php_ir::FunctionId>,
+    pub(super) deployment_functions: Arc<std::collections::HashMap<Arc<str>, php_ir::FunctionId>>,
+    pub(super) deployment_classes: Arc<std::collections::HashSet<Arc<str>>>,
+    pub(super) external_functions: std::collections::HashMap<String, NativeDynamicFunction>,
+    pub(super) external_class_units: std::collections::HashMap<String, usize>,
+    pub(super) external_signature_epoch: u64,
+    pub(super) dynamic_units: Vec<NativeDynamicUnit>,
+    pub(super) current_dynamic_unit: Option<usize>,
+    pub(super) typed_static_reference_constraints:
+        std::collections::BTreeMap<u64, Vec<NativeTypedStaticReferenceConstraint>>,
+    pub(super) class_constant_cache: NativeClassConstantCache,
+    pub(super) baseline_generator_iterators: std::collections::BTreeMap<u64, i64>,
+    pub(super) fiber_executions: std::collections::BTreeMap<u64, NativeFiberExecution>,
+    pub(super) active_fiber: Option<u64>,
+    pub(super) pending_fiber_suspension_value: Option<i64>,
+    pub(super) completed_nested_fiber_call: Option<(u32, u32, php_jit::JitCallStatus, i64)>,
+    pub(super) called_classes: Vec<Arc<str>>,
+    pub(super) lexical_scope_classes: Vec<String>,
+    pub(super) call_frames: Vec<NativeBacktraceFrame>,
+    pub(super) dynamic_classes: std::collections::BTreeSet<String>,
+    pub(super) class_aliases: std::collections::BTreeMap<String, String>,
+    pub(super) shutdown_destructor_queue: Option<Vec<WeakObjectHandle>>,
+    pub(super) destroyed_objects: std::collections::BTreeMap<u64, WeakObjectHandle>,
+    pub(super) autoload_in_progress: std::collections::BTreeSet<String>,
+    pub(super) error_reporting: i64,
+    pub(super) display_errors: bool,
+    pub(super) last_error: Option<NativeLastError>,
+    pub(super) explicit_reference_ids: std::collections::BTreeSet<u64>,
+    pub(super) environment: Arc<Vec<(String, String)>>,
+    pub(super) included_files: std::collections::BTreeSet<std::path::PathBuf>,
+    pub(super) include_path: Arc<Vec<std::path::PathBuf>>,
+    pub(super) cwd: std::path::PathBuf,
+    pub(super) trusted_globals_proxy: i64,
+    pub(super) trusted_request_local_function_offsets: Vec<u32>,
+    pub(super) trusted_request_local_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeRequestLocalSlot>,
+    pub(super) trusted_property_function_offsets: Vec<u32>,
+    pub(super) trusted_property_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedPropertySlot>,
+    pub(super) trusted_closure_plans: php_runtime::api::StableNativeArena<u64>,
+    pub(super) trusted_exception_plans: php_runtime::api::StableNativeArena<u64>,
+    pub(super) trusted_exception_plan_owners:
+        std::collections::BTreeMap<usize, Box<PreparedNativeThrowableSite>>,
+    pub(super) trusted_constant_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedConstantSlot>,
+    pub(super) trusted_literal_slots:
+        std::collections::BTreeMap<u64, Box<[php_jit::JitNativeTrustedLiteralSlot]>>,
+    pub(super) trusted_global_reference_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedGlobalReferenceSlot>,
+    pub(super) trusted_global_reference_names: std::collections::BTreeMap<usize, Box<str>>,
+    pub(super) trusted_static_local_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedStaticLocalSlot>,
+    pub(super) trusted_static_property_slots:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedStaticPropertySlot>,
+    pub(super) trusted_instanceof_plans:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeInstanceOfPlan>,
+    pub(super) trusted_instanceof_entries: Vec<php_jit::JitNativeInstanceOfEntry>,
+    pub(super) trusted_exception_route_plans:
+        php_runtime::api::StableNativeArena<php_jit::JitNativeExceptionRoutePlan>,
+    pub(super) trusted_exception_route_entries: Vec<php_jit::JitNativeExceptionRouteEntry>,
+    pub(super) trusted_exception_route_symbol_epoch: u64,
+    pub(super) native_metadata_preparation_scope: Option<Vec<php_ir::FunctionId>>,
+    pub(super) prepared_native_metadata_functions: std::collections::BTreeSet<php_ir::FunctionId>,
+    pub(super) include_child: bool,
+    pub(super) execution_deadline_at: Option<std::time::Instant>,
+    pub(super) execution_deadline_mutable: bool,
+    pub(super) runtime_telemetry: Rc<RefCell<NativeRuntimeTelemetry>>,
+    pub(in crate::vm) diagnostic: Option<php_runtime::api::RuntimeDiagnostic>,
+}
