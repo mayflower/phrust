@@ -83,6 +83,11 @@ impl ExecutableValueFlow {
     }
 
     #[must_use]
+    pub fn frame_cleanup_locals(&self) -> impl Iterator<Item = LocalId> + '_ {
+        self.frame_cleanup_locals.iter().copied()
+    }
+
+    #[must_use]
     pub fn register_fact(&self, register: RegId) -> SsaValueFact {
         self.register_facts
             .get(&register)

@@ -2,6 +2,5709 @@ use super::*;
 use crate::region_ir::{RegionPropertyName, RegionSemanticOp};
 use std::collections::BTreeSet;
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum NativeEntryArraySource {
+    Parameter(usize),
+    TrustedGlobal(u32),
+}
+
+#[derive(Clone, Debug, Default)]
+struct NativeEntryArrayRequirement {
+    projection_allocations: usize,
+    spread_allocations: usize,
+    entry_allocations_per_entry: usize,
+    value_allocations_per_entry: usize,
+    require_supported_keys: bool,
+    require_plain_values: bool,
+    require_key_values: bool,
+    require_string_values: bool,
+    require_scalar_values: bool,
+    minimum_length: usize,
+    implode_separator_lengths: Vec<usize>,
+    required_integer_keys: BTreeSet<i64>,
+    required_value_types: Vec<(i64, php_ir::IrReturnType)>,
+    probe_paths: Vec<NativeEntryArrayProbeRequirement>,
+    unpack_calls: Vec<NativeEntryArrayUnpackRequirement>,
+    mutations: Vec<NativeEntryArrayMutationRequirement>,
+    all_value_types: Vec<php_ir::IrReturnType>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum NativeEntryArrayKey {
+    Integer(i64),
+    Constant(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeEntryArrayProbeLeaf {
+    ExistsOnly,
+    PlainValue,
+}
+
+#[derive(Clone, Debug)]
+struct NativeEntryArrayProbeRequirement {
+    keys: Vec<NativeEntryArrayKey>,
+    leaf: NativeEntryArrayProbeLeaf,
+}
+
+#[derive(Clone, Debug)]
+struct NativeEntryArrayUnpackRequirement {
+    required_length: usize,
+    fixed_parameters: Vec<(usize, Option<php_ir::IrReturnType>, bool)>,
+    tail_start: usize,
+    tail_type: Option<php_ir::IrReturnType>,
+    tail_by_reference: bool,
+}
+
+#[derive(Clone, Debug)]
+struct NativeEntryPropertyRequirement {
+    parameter_index: usize,
+    continuation_id: u32,
+    required_state: u32,
+    readable: bool,
+    releasable: bool,
+    allow_reference: bool,
+    require_reference: bool,
+    probe_paths: Vec<NativeEntryArrayProbeRequirement>,
+    mutations: Vec<NativeEntryArrayMutationRequirement>,
+}
+
+#[derive(Clone, Debug)]
+struct NativeEntryStaticPropertyRequirement {
+    continuation_id: u32,
+    required_state: u32,
+    readable: bool,
+    releasable: bool,
+    allow_reference: bool,
+    require_reference: bool,
+    probe_paths: Vec<NativeEntryArrayProbeRequirement>,
+    mutations: Vec<NativeEntryArrayMutationRequirement>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeEntryObjectLayoutRequirement {
+    parameter_index: usize,
+    layout_id: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeEntryInstanceofRequirement {
+    parameter_index: usize,
+    continuation_id: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeEntryValueClassRequirement {
+    parameter_index: usize,
+    class: SsaValueClass,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NativeEntryStringOffset {
+    Constant(i64),
+    Parameter(usize),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeEntryStringRequirement {
+    parameter_index: usize,
+    minimum_length: usize,
+    offset: Option<NativeEntryStringOffset>,
+    allocation_multiplier: usize,
+}
+
+#[derive(Clone, Debug)]
+struct NativeEntryIntegerRequirement {
+    parameter_index: usize,
+    minimum: i64,
+    maximum: i64,
+    forbidden_values: Vec<i64>,
+}
+
+#[derive(Clone, Debug)]
+enum NativeEntryArrayMutationRequirement {
+    Assign { parents: Vec<i64>, key: i64 },
+    Append { parents: Vec<i64> },
+    Unset { parents: Vec<i64>, key: i64 },
+    Reference { parents: Vec<i64>, key: i64 },
+    ReferenceAppend { parents: Vec<i64> },
+}
+
+impl NativeEntryArrayMutationRequirement {
+    const fn additional_entries(&self) -> usize {
+        match self {
+            Self::Unset { .. } => 0,
+            Self::Assign { .. }
+            | Self::Append { .. }
+            | Self::Reference { .. }
+            | Self::ReferenceAppend { .. } => 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct NativeOptimizingAdmission {
+    total_array_calls: BTreeSet<u32>,
+    total_fixed_builtin_calls: BTreeSet<u32>,
+    total_array_instructions: BTreeSet<u32>,
+    fresh_array_instructions: BTreeSet<u32>,
+    total_local_loads: BTreeSet<u32>,
+    total_request_local_stores: BTreeSet<u32>,
+    total_return_reference_stores: BTreeSet<u32>,
+    total_return_reference_locals: BTreeSet<LocalId>,
+    total_terminators: BTreeSet<u32>,
+    return_plans: BTreeMap<u32, NativeOptimizingReturnPlan>,
+    total_reference_locals: BTreeSet<LocalId>,
+    array_requirements: BTreeMap<NativeEntryArraySource, NativeEntryArrayRequirement>,
+    initialized_request_locals: BTreeSet<LocalId>,
+    releasable_request_locals: BTreeSet<LocalId>,
+    initialized_globals: BTreeSet<u32>,
+    releasable_globals: BTreeSet<u32>,
+    plain_globals: BTreeSet<u32>,
+    reference_source_parameters: BTreeSet<usize>,
+    property_requirements: Vec<NativeEntryPropertyRequirement>,
+    static_property_requirements: Vec<NativeEntryStaticPropertyRequirement>,
+    object_layout_requirements: Vec<NativeEntryObjectLayoutRequirement>,
+    instanceof_requirements: Vec<NativeEntryInstanceofRequirement>,
+    value_class_requirements: Vec<NativeEntryValueClassRequirement>,
+    string_requirements: Vec<NativeEntryStringRequirement>,
+    integer_requirements: Vec<NativeEntryIntegerRequirement>,
+    trusted_constant_requirements: BTreeSet<u32>,
+    trusted_static_local_requirements: BTreeSet<u32>,
+    equal_array_length_groups: Vec<Vec<NativeEntryArraySource>>,
+    fixed_value_allocations: usize,
+    fixed_array_entries: usize,
+    fixed_string_bytes: usize,
+    fixed_lvalue_insertions: usize,
+    require_non_fiber_scope: bool,
+}
+
+impl NativeOptimizingAdmission {
+    fn array_call_is_total(&self, continuation_id: u32) -> bool {
+        self.total_array_calls.contains(&continuation_id)
+    }
+
+    fn fixed_builtin_call_is_total(&self, continuation_id: u32) -> bool {
+        self.total_fixed_builtin_calls.contains(&continuation_id)
+    }
+
+    fn array_instruction_is_total(&self, continuation_id: u32) -> bool {
+        self.total_array_instructions.contains(&continuation_id)
+    }
+
+    fn array_instruction_is_fresh(&self, continuation_id: u32) -> bool {
+        self.fresh_array_instructions.contains(&continuation_id)
+    }
+
+    fn local_load_is_total(&self, continuation_id: u32) -> bool {
+        self.total_local_loads.contains(&continuation_id)
+    }
+
+    fn request_local_store_is_total(&self, continuation_id: u32) -> bool {
+        self.total_request_local_stores.contains(&continuation_id)
+    }
+
+    fn return_reference_store_is_total(&self, continuation_id: u32) -> bool {
+        self.total_return_reference_stores
+            .contains(&continuation_id)
+    }
+
+    fn return_reference_is_prebound(&self, local: LocalId) -> bool {
+        self.total_reference_locals.contains(&local)
+    }
+
+    fn terminator_is_total(&self, continuation_id: u32) -> bool {
+        self.total_terminators.contains(&continuation_id)
+    }
+
+    fn return_plan(&self, continuation_id: u32) -> Option<NativeOptimizingReturnPlan> {
+        self.return_plans.get(&continuation_id).copied()
+    }
+}
+
+fn publication_root_operand(
+    mut operand: RegionOperand,
+    definitions: &BTreeMap<RegId, RegionOperand>,
+) -> RegionOperand {
+    for _ in 0..=definitions.len() {
+        let RegionOperand::Register(register) = operand else {
+            break;
+        };
+        let Some(definition) = definitions.get(&register) else {
+            break;
+        };
+        operand = *definition;
+    }
+    operand
+}
+
+fn publication_return_plan(
+    operand: RegionOperand,
+    fact: crate::region_ir::SsaValueFact,
+    return_type: &php_ir::IrReturnType,
+    strict: bool,
+    definitions: &BTreeMap<RegId, RegionOperand>,
+    constants: &[IrConstant],
+) -> Option<NativeOptimizingReturnPlan> {
+    use php_ir::IrReturnType as Type;
+    use php_runtime::experimental::numeric_string::{
+        NumericStringKind, NumericStringValue, classify,
+    };
+
+    let return_type = match return_type {
+        Type::Nullable { inner } => inner.as_ref(),
+        return_type => return_type,
+    };
+    let root = publication_root_operand(operand, definitions);
+    let constant = match root {
+        RegionOperand::I64(value) => Some(IrConstant::Int(value)),
+        RegionOperand::Constant(index) => constants.get(index as usize).cloned(),
+        RegionOperand::LinkedConstant { constant, .. } => constants.get(constant as usize).cloned(),
+        RegionOperand::Register(_) | RegionOperand::Local(_) => None,
+    };
+
+    if strict {
+        return match (return_type, constant) {
+            // PHP's sole strict scalar widening is int -> float.
+            (Type::Float, Some(IrConstant::Int(value))) => Some(
+                NativeOptimizingReturnPlan::DirectFloat((value as f64).to_bits()),
+            ),
+            // A non-constant authoritative integer uses the same total CLIF
+            // conversion after its integer class was proved by value flow.
+            (Type::Float, None) if fact.class == SsaValueClass::Int => {
+                Some(NativeOptimizingReturnPlan::IntToFloat)
+            }
+            _ => None,
+        };
+    }
+
+    let immediate_integer = |value| {
+        if native_integer_fits_immediate(value) {
+            NativeOptimizingReturnPlan::Immediate(value)
+        } else {
+            NativeOptimizingReturnPlan::DirectInt(value)
+        }
+    };
+    let numeric_string_plan = |bytes: &[u8]| {
+        let classified = classify(bytes);
+        if !matches!(
+            classified.kind,
+            NumericStringKind::IntString | NumericStringKind::FloatString
+        ) || classified.overflow_or_precision_sensitive
+        {
+            return None;
+        }
+        match (return_type, classified.value?) {
+            (Type::Int, NumericStringValue::Int(value)) => Some(immediate_integer(value)),
+            (Type::Int, NumericStringValue::Float(value))
+                if value.is_finite()
+                    && value.fract() == 0.0
+                    && value >= i64::MIN as f64
+                    && value < -(i64::MIN as f64) =>
+            {
+                Some(immediate_integer(value as i64))
+            }
+            (Type::Float, value) => Some(NativeOptimizingReturnPlan::DirectFloat(
+                value.as_f64().to_bits(),
+            )),
+            _ => None,
+        }
+    };
+    match (return_type, constant) {
+        (Type::Int, Some(IrConstant::Bool(value))) => {
+            Some(NativeOptimizingReturnPlan::Immediate(i64::from(value)))
+        }
+        (Type::Float, Some(IrConstant::Bool(value))) => Some(
+            NativeOptimizingReturnPlan::DirectFloat(f64::from(u8::from(value)).to_bits()),
+        ),
+        (Type::Float, Some(IrConstant::Int(value))) => Some(
+            NativeOptimizingReturnPlan::DirectFloat((value as f64).to_bits()),
+        ),
+        (Type::Int | Type::Float, Some(IrConstant::String(value))) => {
+            numeric_string_plan(value.as_bytes())
+        }
+        (Type::Int | Type::Float, Some(IrConstant::StringBytes(value))) => {
+            numeric_string_plan(&value)
+        }
+        _ => None,
+    }
+}
+
+fn entry_array_source(
+    operand: RegionOperand,
+    definitions: &BTreeMap<RegId, RegionOperand>,
+    parameter_indices: &BTreeMap<LocalId, usize>,
+) -> Option<NativeEntryArraySource> {
+    let mut operand = operand;
+    for _ in 0..32 {
+        match operand {
+            RegionOperand::Register(register) => operand = *definitions.get(&register)?,
+            RegionOperand::Local(local) => {
+                return parameter_indices
+                    .get(&local)
+                    .copied()
+                    .map(NativeEntryArraySource::Parameter);
+            }
+            RegionOperand::Constant(_)
+            | RegionOperand::I64(_)
+            | RegionOperand::LinkedConstant { .. } => return None,
+        }
+    }
+    None
+}
+
+fn entry_array_root_local(
+    operand: RegionOperand,
+    definitions: &BTreeMap<RegId, RegionOperand>,
+) -> Option<LocalId> {
+    let mut operand = operand;
+    for _ in 0..32 {
+        match operand {
+            RegionOperand::Register(register) => operand = *definitions.get(&register)?,
+            RegionOperand::Local(local) => return Some(local),
+            RegionOperand::Constant(_)
+            | RegionOperand::I64(_)
+            | RegionOperand::LinkedConstant { .. } => return None,
+        }
+    }
+    None
+}
+
+fn publication_entry_array_source(
+    region: &RegionGraph,
+    definitions: &BTreeMap<RegId, RegionOperand>,
+    parameter_indices: &BTreeMap<LocalId, usize>,
+    by_ref_parameters: &BTreeSet<LocalId>,
+    operand: RegionOperand,
+    continuation_id: u32,
+    family: &str,
+) -> Result<NativeEntryArraySource, CraneliftLoweringError> {
+    let source = entry_array_source(operand, definitions, parameter_indices).ok_or_else(|| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_SHAPE",
+            format!("{family} at continuation {continuation_id} is not rooted at an entry array",),
+        )
+    })?;
+    let NativeEntryArraySource::Parameter(index) = source else {
+        unreachable!("operand-rooted array families are parameters")
+    };
+    if by_ref_parameters.contains(&region.parameter_locals[index]) {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_REFERENCE",
+            format!(
+                "{family} at continuation {continuation_id} receives a by-reference entry array",
+            ),
+        ));
+    }
+    Ok(source)
+}
+
+fn publication_integer_array_key(constants: &[IrConstant], key: RegionOperand) -> Option<i64> {
+    match key {
+        RegionOperand::Constant(index) => match constants.get(index as usize) {
+            Some(IrConstant::Int(value)) if native_integer_fits_immediate(*value) => Some(*value),
+            _ => None,
+        },
+        RegionOperand::I64(value) if native_integer_fits_immediate(value) => Some(value),
+        RegionOperand::Register(_)
+        | RegionOperand::Local(_)
+        | RegionOperand::I64(_)
+        | RegionOperand::LinkedConstant { .. } => None,
+    }
+}
+
+fn publication_integer_operand(
+    constants: &[IrConstant],
+    definitions: &BTreeMap<RegId, RegionOperand>,
+    operand: RegionOperand,
+) -> Option<i64> {
+    match publication_root_operand(operand, definitions) {
+        RegionOperand::I64(value) => Some(value),
+        RegionOperand::Constant(index)
+        | RegionOperand::LinkedConstant {
+            constant: index, ..
+        } => match constants.get(index as usize) {
+            Some(IrConstant::Int(value)) => Some(*value),
+            _ => None,
+        },
+        RegionOperand::Register(_) | RegionOperand::Local(_) => None,
+    }
+}
+
+fn publication_string_length(
+    constants: &[IrConstant],
+    definitions: &BTreeMap<RegId, RegionOperand>,
+    operand: RegionOperand,
+) -> Option<usize> {
+    match publication_root_operand(operand, definitions) {
+        RegionOperand::Constant(index)
+        | RegionOperand::LinkedConstant {
+            constant: index, ..
+        } => match constants.get(index as usize) {
+            Some(IrConstant::String(value)) => Some(value.len()),
+            Some(IrConstant::StringBytes(value)) => Some(value.len()),
+            _ => None,
+        },
+        RegionOperand::Register(_) | RegionOperand::Local(_) | RegionOperand::I64(_) => None,
+    }
+}
+
+fn publication_string_capacity(length: usize) -> Option<usize> {
+    length
+        .max(crate::JIT_NATIVE_DIRECT_STRING_MIN_CAPACITY as usize)
+        .checked_next_power_of_two()
+        .filter(|capacity| *capacity <= crate::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY)
+}
+
+fn publication_entry_parameter(
+    operand: RegionOperand,
+    definitions: &BTreeMap<RegId, RegionOperand>,
+    parameter_indices: &BTreeMap<LocalId, usize>,
+) -> Option<usize> {
+    match entry_array_source(operand, definitions, parameter_indices)? {
+        NativeEntryArraySource::Parameter(parameter_index) => Some(parameter_index),
+        NativeEntryArraySource::TrustedGlobal(_) => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_publication_scalar_class(
+    admission: &mut NativeOptimizingAdmission,
+    value_flow: &ExecutableValueFlow,
+    constants: &[IrConstant],
+    definitions: &BTreeMap<RegId, RegionOperand>,
+    parameter_indices: &BTreeMap<LocalId, usize>,
+    operand: RegionOperand,
+    class: SsaValueClass,
+    continuation_id: u32,
+    family: &str,
+) -> Result<Option<usize>, CraneliftLoweringError> {
+    let fact = lowering_operand_fact(value_flow, constants, operand);
+    if fact.certainty == crate::region_ir::SsaCertainty::Unknown || fact.class != class {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_SCALAR_PUBLICATION",
+            format!(
+                "{family} at continuation {continuation_id} has no publication-proven {class:?} operand",
+            ),
+        ));
+    }
+    let parameter = publication_entry_parameter(operand, definitions, parameter_indices);
+    if let Some(parameter_index) = parameter {
+        admission
+            .value_class_requirements
+            .push(NativeEntryValueClassRequirement {
+                parameter_index,
+                class,
+            });
+    }
+    Ok(parameter)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_publication_string(
+    admission: &mut NativeOptimizingAdmission,
+    value_flow: &ExecutableValueFlow,
+    constants: &[IrConstant],
+    definitions: &BTreeMap<RegId, RegionOperand>,
+    parameter_indices: &BTreeMap<LocalId, usize>,
+    operand: RegionOperand,
+    minimum_length: usize,
+    allocation_multiplier: usize,
+    continuation_id: u32,
+    family: &str,
+) -> Result<Option<usize>, CraneliftLoweringError> {
+    if let Some(length) = publication_string_length(constants, definitions, operand) {
+        if length < minimum_length {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_STRING_PUBLICATION",
+                format!(
+                    "{family} at continuation {continuation_id} has a fixed string shorter than {minimum_length}",
+                ),
+            ));
+        }
+        if allocation_multiplier != 0 {
+            let output = length.checked_mul(allocation_multiplier).ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_STRING_PUBLICATION",
+                    format!("{family} output length overflows at publication"),
+                )
+            })?;
+            let capacity = publication_string_capacity(output).ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_STRING_PUBLICATION",
+                    format!("{family} output exceeds the native string arena"),
+                )
+            })?;
+            admission.fixed_string_bytes = admission.fixed_string_bytes.saturating_add(capacity);
+        }
+        return Ok(None);
+    }
+    let parameter_index = admit_publication_scalar_class(
+        admission,
+        value_flow,
+        constants,
+        definitions,
+        parameter_indices,
+        operand,
+        SsaValueClass::StringHandle,
+        continuation_id,
+        family,
+    )?
+    .ok_or_else(|| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_STRING_PUBLICATION",
+            format!("{family} at continuation {continuation_id} is not rooted at an entry string",),
+        )
+    })?;
+    admission
+        .string_requirements
+        .push(NativeEntryStringRequirement {
+            parameter_index,
+            minimum_length,
+            offset: None,
+            allocation_multiplier,
+        });
+    Ok(Some(parameter_index))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_publication_integer(
+    admission: &mut NativeOptimizingAdmission,
+    value_flow: &ExecutableValueFlow,
+    constants: &[IrConstant],
+    definitions: &BTreeMap<RegId, RegionOperand>,
+    parameter_indices: &BTreeMap<LocalId, usize>,
+    operand: RegionOperand,
+    minimum: i64,
+    maximum: i64,
+    forbidden_values: &[i64],
+    continuation_id: u32,
+    family: &str,
+) -> Result<Option<i64>, CraneliftLoweringError> {
+    if let Some(value) = publication_integer_operand(constants, definitions, operand) {
+        if !(minimum..=maximum).contains(&value) || forbidden_values.contains(&value) {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_INTEGER_PUBLICATION",
+                format!(
+                    "{family} at continuation {continuation_id} has an invalid fixed integer {value}",
+                ),
+            ));
+        }
+        return Ok(Some(value));
+    }
+    let parameter_index =
+        admit_publication_scalar_class(
+            admission,
+            value_flow,
+            constants,
+            definitions,
+            parameter_indices,
+            operand,
+            SsaValueClass::Int,
+            continuation_id,
+            family,
+        )?
+        .ok_or_else(|| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_INTEGER_PUBLICATION",
+                format!(
+                    "{family} at continuation {continuation_id} is not rooted at an entry integer",
+                ),
+            )
+        })?;
+    admission
+        .integer_requirements
+        .push(NativeEntryIntegerRequirement {
+            parameter_index,
+            minimum,
+            maximum,
+            forbidden_values: forbidden_values.to_vec(),
+        });
+    Ok(None)
+}
+
+fn publication_native_array_key(
+    constants: &[IrConstant],
+    key: RegionOperand,
+) -> Option<NativeEntryArrayKey> {
+    match key {
+        RegionOperand::Constant(index) => match constants.get(index as usize) {
+            Some(IrConstant::Int(value)) if native_integer_fits_immediate(*value) => {
+                Some(NativeEntryArrayKey::Integer(*value))
+            }
+            Some(IrConstant::Bool(value)) => Some(NativeEntryArrayKey::Integer(i64::from(*value))),
+            Some(IrConstant::String(_) | IrConstant::StringBytes(_)) => {
+                Some(NativeEntryArrayKey::Constant(index))
+            }
+            _ => None,
+        },
+        RegionOperand::I64(value) if native_integer_fits_immediate(value) => {
+            Some(NativeEntryArrayKey::Integer(value))
+        }
+        RegionOperand::Register(_)
+        | RegionOperand::Local(_)
+        | RegionOperand::I64(_)
+        | RegionOperand::LinkedConstant { .. } => None,
+    }
+}
+
+fn optimizing_admission_for_region(
+    region: &RegionGraph,
+    constants: &[IrConstant],
+    value_flow: &ExecutableValueFlow,
+    function_params: &BTreeMap<FunctionId, NativeFunctionMetadata>,
+    external_function_signatures: &[crate::JitExternalFunctionSignature],
+) -> Result<NativeOptimizingAdmission, CraneliftLoweringError> {
+    if region.compile_metadata.tier != NativeCompilerTier::Optimizing {
+        return Ok(NativeOptimizingAdmission::default());
+    }
+    // Scalar result encodings are bounded by the static instruction graph.
+    // Reserve a conservative fixed number of direct descriptors per
+    // instruction before entering the region; array/callback loops add their
+    // separate length-dependent budgets below.
+    let instruction_count = region
+        .blocks
+        .iter()
+        .map(|block| block.instructions.len())
+        .sum::<usize>();
+    let mut admission = NativeOptimizingAdmission {
+        fixed_value_allocations: instruction_count.saturating_mul(4),
+        ..NativeOptimizingAdmission::default()
+    };
+    if region
+        .exception_regions
+        .iter()
+        .any(|handler| handler.exception_local.is_some())
+    {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_HANDLER_LVALUE_BOUNDARY",
+            "catch-local replacement is not total at optimizing entry",
+        ));
+    }
+    let parameter_indices = region
+        .parameter_locals
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, local)| (local, index))
+        .collect::<BTreeMap<_, _>>();
+    let by_ref_parameters = region
+        .params
+        .iter()
+        .filter_map(|parameter| parameter.by_ref.then_some(parameter.local))
+        .collect::<BTreeSet<_>>();
+    let variadic_parameters = region
+        .params
+        .iter()
+        .filter_map(|parameter| parameter.variadic.then_some(parameter.local))
+        .collect::<BTreeSet<_>>();
+    let definitions = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::LoadLocal {
+                dst, local, quiet, ..
+            } if !quiet => Some((dst, RegionOperand::Local(local))),
+            RegionInstructionKind::Move { dst, src } => Some((dst, src)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let first_local_write = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| {
+            let local = match &instruction.kind {
+                RegionInstructionKind::StoreLocal { local, .. }
+                | RegionInstructionKind::AssignLocalResult { local, .. }
+                | RegionInstructionKind::BindReference { target: local, .. }
+                | RegionInstructionKind::BindReferenceDim { target: local, .. }
+                | RegionInstructionKind::BindReferenceFromProperty { target: local, .. }
+                | RegionInstructionKind::BindReferenceFromPropertyDim { target: local, .. } => {
+                    Some(*local)
+                }
+                RegionInstructionKind::BindReferenceDimFromProperty {
+                    array: local,
+                    keys,
+                    append: false,
+                    ..
+                } if keys.is_empty() => Some(*local),
+                RegionInstructionKind::NativeCall(RegionNativeCall {
+                    result: RegionCallResult::ReferenceLocal(local),
+                    ..
+                }) => Some(*local),
+                _ => None,
+            }?;
+            Some((local, instruction.continuation_id))
+        })
+        .fold(
+            BTreeMap::<LocalId, u32>::new(),
+            |mut writes, (local, id)| {
+                writes.entry(local).or_insert(id);
+                writes
+            },
+        );
+    let new_array_registers = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::NewArray { dst } => Some(dst),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let foreach_sources = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::ForeachInit { iterator, source } => Some((iterator, source)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let foreach_reference_sources = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::ForeachInitRef { iterator, local } => Some((iterator, local)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let foreach_reference_value_locals = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::ForeachNextRef { value_local, .. } => Some(value_local),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let foreach_reference_local_writes = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::StoreLocal { local, .. }
+            | RegionInstructionKind::AssignLocalResult { local, .. }
+            | RegionInstructionKind::UnsetLocal { local }
+                if foreach_reference_value_locals.contains(&local) =>
+            {
+                Some(instruction.continuation_id)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let new_array_local_sources = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::StoreLocal {
+                local,
+                src: RegionOperand::Register(register),
+            } if new_array_registers.contains(&register) => Some((local, register)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let new_array_local_store_continuations = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::StoreLocal {
+                local,
+                src: RegionOperand::Register(register),
+            } if new_array_registers.contains(&register) => {
+                Some((local, instruction.continuation_id))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let new_array_locals = new_array_local_sources
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let new_array_mutation_counts = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::AppendDim { local, .. }
+            | RegionInstructionKind::AssignDim { local, .. }
+            | RegionInstructionKind::UnsetDim { local, .. }
+                if new_array_locals.contains(local) =>
+            {
+                Some(*local)
+            }
+            _ => None,
+        })
+        .fold(BTreeMap::<LocalId, usize>::new(), |mut counts, local| {
+            *counts.entry(local).or_default() += 1;
+            counts
+        });
+    let array_local_mutation_counts = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::AppendDim { local, .. }
+            | RegionInstructionKind::AssignDim { local, .. }
+            | RegionInstructionKind::UnsetDim { local, .. } => Some(local),
+            _ => None,
+        })
+        .fold(BTreeMap::<LocalId, usize>::new(), |mut counts, local| {
+            *counts.entry(local).or_default() += 1;
+            counts
+        });
+    let new_array_assigned_integer_keys = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::AssignDim { local, keys, .. }
+                if new_array_locals.contains(local) && keys.len() == 1 =>
+            {
+                publication_integer_array_key(constants, keys[0]).map(|key| (*local, key))
+            }
+            _ => None,
+        })
+        .fold(
+            BTreeMap::<LocalId, BTreeSet<i64>>::new(),
+            |mut keys, (local, key)| {
+                keys.entry(local).or_default().insert(key);
+                keys
+            },
+        );
+    let invalidated_locals = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::UnsetLocal { local } => Some(local),
+            RegionInstructionKind::BindReference { target, .. }
+                if region.flags.is_top_level
+                    && value_flow.local_storage(target)
+                        == crate::region_ir::LocalStorageClass::RequestGlobal =>
+            {
+                Some(target)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let request_local_write_counts = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::StoreLocal { local, .. }
+            | RegionInstructionKind::AssignLocalResult { local, .. }
+                if matches!(
+                    value_flow.local_storage(local),
+                    crate::region_ir::LocalStorageClass::RequestGlobal
+                        | crate::region_ir::LocalStorageClass::Superglobal
+                ) =>
+            {
+                Some(local)
+            }
+            _ => None,
+        })
+        .fold(BTreeMap::<LocalId, usize>::new(), |mut counts, local| {
+            *counts.entry(local).or_default() += 1;
+            counts
+        });
+    let mut unstable_before = BTreeSet::new();
+    let mut external_effect_seen = false;
+    for (block_index, block) in region.blocks.iter().enumerate() {
+        for instruction in &block.instructions {
+            if block_index != 0 || external_effect_seen {
+                unstable_before.insert(instruction.continuation_id);
+            }
+            let planned_lvalue_effect = matches!(
+                &instruction.kind,
+                RegionInstructionKind::BindReference { .. }
+                    | RegionInstructionKind::BindReferenceProperty { .. }
+                    | RegionInstructionKind::BindReferenceFromProperty { .. }
+                    | RegionInstructionKind::BindReferenceIntoPropertyDim { .. }
+                    | RegionInstructionKind::BindReferenceFromPropertyDim { .. }
+                    | RegionInstructionKind::BindReferenceDimFromProperty { .. }
+                    | RegionInstructionKind::BindReferenceDim { .. }
+                    | RegionInstructionKind::BindReferenceIntoDim { .. }
+                    | RegionInstructionKind::NativeCall(RegionNativeCall {
+                        target: RegionCallTarget::Semantic {
+                            operation: RegionSemanticOp::PropertyDimAssign { .. }
+                                | RegionSemanticOp::PropertyDimUnset { .. }
+                                | RegionSemanticOp::StaticPropertyDimUnset { .. }
+                                | RegionSemanticOp::StaticPropertyReference { .. },
+                        },
+                        ..
+                    })
+            );
+            external_effect_seen |= !planned_lvalue_effect
+                && matches!(
+                    instruction.kind,
+                    RegionInstructionKind::NativeCall(_)
+                        | RegionInstructionKind::ArrayCallback(_)
+                        | RegionInstructionKind::PregCallbackArray(_)
+                        | RegionInstructionKind::NativeDynamicCode(_)
+                        | RegionInstructionKind::NativeSuspend(_)
+                        | RegionInstructionKind::AssignProperty { .. }
+                        | RegionInstructionKind::AssignDim { .. }
+                        | RegionInstructionKind::AppendDim { .. }
+                        | RegionInstructionKind::UnsetDim { .. }
+                );
+        }
+    }
+    admission.reference_source_parameters = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::BindReference { source, .. }
+            | RegionInstructionKind::BindReferenceIntoDim { source, .. }
+            | RegionInstructionKind::BindReferenceProperty { source, .. }
+            | RegionInstructionKind::BindReferenceIntoPropertyDim { source, .. } => {
+                parameter_indices.get(source).copied()
+            }
+            RegionInstructionKind::NativeCall(RegionNativeCall {
+                target:
+                    RegionCallTarget::Semantic {
+                        operation:
+                            RegionSemanticOp::StaticPropertyReference {
+                                target,
+                                bind_source_into_property: true,
+                                ..
+                            },
+                    },
+                ..
+            }) => parameter_indices.get(target).copied(),
+            _ => None,
+        })
+        .collect();
+    admission.total_reference_locals = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .flat_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::BindReference { target, source } => vec![*target, *source],
+            RegionInstructionKind::BindReferenceDim { target, .. }
+            | RegionInstructionKind::BindReferenceFromProperty { target, .. }
+            | RegionInstructionKind::BindReferenceFromPropertyDim { target, .. } => vec![*target],
+            RegionInstructionKind::BindReferenceIntoDim { source, .. }
+            | RegionInstructionKind::BindReferenceProperty { source, .. }
+            | RegionInstructionKind::BindReferenceIntoPropertyDim { source, .. } => vec![*source],
+            RegionInstructionKind::BindReferenceDimFromProperty {
+                array,
+                keys,
+                append: false,
+                ..
+            } if keys.is_empty() => vec![*array],
+            RegionInstructionKind::NativeCall(RegionNativeCall {
+                result: RegionCallResult::ReferenceLocal(local),
+                target:
+                    RegionCallTarget::Semantic {
+                        operation: RegionSemanticOp::StaticPropertyReference { .. },
+                    },
+                ..
+            }) => vec![*local],
+            _ => Vec::new(),
+        })
+        .collect();
+    let mut admitted_array_fetches = BTreeMap::<RegId, (NativeEntryArraySource, i64)>::new();
+    let mut entry_dependent_continuations = BTreeSet::new();
+    let mut fresh_insert_modes = BTreeMap::<RegId, bool>::new();
+    let mut fresh_insert_keys = BTreeMap::<RegId, BTreeSet<NativeEntryArrayKey>>::new();
+    let mut fresh_insert_counts = BTreeMap::<RegId, usize>::new();
+    let mut fresh_spread_targets = BTreeSet::<RegId>::new();
+    for instruction in region.blocks.iter().flat_map(|block| &block.instructions) {
+        if let RegionInstructionKind::Echo { src } = instruction.kind {
+            let fact = lowering_operand_fact(value_flow, constants, src);
+            if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                || !matches!(
+                    fact.class,
+                    SsaValueClass::Int
+                        | SsaValueClass::Float
+                        | SsaValueClass::StringHandle
+                        | SsaValueClass::Bool
+                        | SsaValueClass::Null
+                )
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ECHO_PUBLICATION",
+                    format!(
+                        "echo at continuation {} has no total scalar string plan",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            if let Some(NativeEntryArraySource::Parameter(parameter_index)) =
+                entry_array_source(src, &definitions, &parameter_indices)
+            {
+                admission
+                    .value_class_requirements
+                    .push(NativeEntryValueClassRequirement {
+                        parameter_index,
+                        class: fact.class,
+                    });
+                entry_dependent_continuations.insert(instruction.continuation_id);
+            }
+        }
+        if let RegionInstructionKind::Cast {
+            op: RegionCastOp::Float,
+            src,
+            ..
+        } = instruction.kind
+        {
+            let fact = lowering_operand_fact(value_flow, constants, src);
+            if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                || !matches!(
+                    fact.class,
+                    SsaValueClass::Int
+                        | SsaValueClass::Float
+                        | SsaValueClass::StringHandle
+                        | SsaValueClass::Bool
+                        | SsaValueClass::Null
+                )
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FLOAT_CAST_PUBLICATION",
+                    format!(
+                        "float cast at continuation {} has no total scalar input class",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            if let Some(NativeEntryArraySource::Parameter(parameter_index)) =
+                entry_array_source(src, &definitions, &parameter_indices)
+            {
+                admission
+                    .value_class_requirements
+                    .push(NativeEntryValueClassRequirement {
+                        parameter_index,
+                        class: fact.class,
+                    });
+                entry_dependent_continuations.insert(instruction.continuation_id);
+            }
+        }
+        if let RegionInstructionKind::UnsetLocal { local } = instruction.kind {
+            let storage = value_flow.local_storage(local);
+            if storage == crate::region_ir::LocalStorageClass::Superglobal
+                || region.flags.is_top_level
+                    && storage == crate::region_ir::LocalStorageClass::RequestGlobal
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_GLOBAL_BINDING_UNSET",
+                    format!(
+                        "global-binding unset at continuation {} is assigned to baseline before region entry",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+        }
+        if matches!(
+            &instruction.kind,
+            RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::Include { .. })
+        ) {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_INCLUDE_PUBLICATION",
+                format!(
+                    "include at continuation {} is assigned to baseline before region entry",
+                    instruction.continuation_id,
+                ),
+            ));
+        }
+        if matches!(
+            &instruction.kind,
+            RegionInstructionKind::FetchConst { .. }
+                | RegionInstructionKind::NativeCall(RegionNativeCall {
+                    target: RegionCallTarget::Semantic {
+                        operation: RegionSemanticOp::ClassConstantFetch { .. },
+                    },
+                    ..
+                })
+        ) {
+            admission
+                .trusted_constant_requirements
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+        }
+        if matches!(
+            &instruction.kind,
+            RegionInstructionKind::InitStaticLocal { .. }
+        ) {
+            admission
+                .trusted_static_local_requirements
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+        }
+        if let RegionInstructionKind::NewArray { .. } = instruction.kind {
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+            admission
+                .fresh_array_instructions
+                .insert(instruction.continuation_id);
+            admission.fixed_value_allocations = admission.fixed_value_allocations.saturating_add(1);
+            admission.fixed_array_entries = admission
+                .fixed_array_entries
+                .saturating_add(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize);
+        }
+        if let RegionInstructionKind::ArrayInsert {
+            array,
+            key,
+            value,
+            by_ref_local,
+        } = instruction.kind
+        {
+            if !new_array_registers.contains(&array) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_LITERAL_ROOT",
+                    format!(
+                        "array insertion at continuation {} is not rooted at a fresh native array",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            if fresh_spread_targets.contains(&array) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_SPREAD_TARGET",
+                    format!(
+                        "array insertion at continuation {} follows a publication-planned spread",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            if by_ref_local.is_some() {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_LITERAL_REFERENCE",
+                    format!(
+                        "array insertion at continuation {} requires a reference-owner plan",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let value_fact = lowering_operand_fact(value_flow, constants, value);
+            if value_fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                || value_fact.class == SsaValueClass::ReferenceHandle
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_LITERAL_VALUE",
+                    format!(
+                        "array insertion at continuation {} has no plain authoritative value",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let append = key.is_none();
+            if fresh_insert_modes
+                .insert(array, append)
+                .is_some_and(|previous| previous != append)
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_LITERAL_MIXED_KEYS",
+                    format!(
+                        "array literal at continuation {} mixes append and explicit-key plans",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            if let Some(key) = key {
+                let normalized = publication_native_array_key(constants, key).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_LITERAL_KEY",
+                        format!(
+                            "array insertion at continuation {} has no publication-normalized key",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+                if matches!(normalized, NativeEntryArrayKey::Integer(i64::MAX))
+                    || !fresh_insert_keys
+                        .entry(array)
+                        .or_default()
+                        .insert(normalized)
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_LITERAL_DUPLICATE_KEY",
+                        format!(
+                            "array insertion at continuation {} can overwrite or overflow a fresh key",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+            }
+            let count = fresh_insert_counts.entry(array).or_default();
+            *count = count.saturating_add(1);
+            if *count > crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_LITERAL_CAPACITY",
+                    format!(
+                        "array literal at continuation {} exceeds its publication-reserved native capacity",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+            admission
+                .fresh_array_instructions
+                .insert(instruction.continuation_id);
+        }
+        if let RegionInstructionKind::ArraySpread { array, source } = instruction.kind {
+            if !new_array_registers.contains(&array)
+                || fresh_insert_counts.get(&array).copied().unwrap_or(0) != 0
+                || !fresh_spread_targets.insert(array)
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_SPREAD_TARGET",
+                    format!(
+                        "array spread at continuation {} is not the sole mutation of a fresh target",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let source =
+                entry_array_source(source, &definitions, &parameter_indices).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_SPREAD_SOURCE",
+                        format!(
+                            "array spread at continuation {} is not rooted at an entry array",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+            let NativeEntryArraySource::Parameter(source_index) = source else {
+                unreachable!("array spread source operands are entry parameters")
+            };
+            if by_ref_parameters.contains(&region.parameter_locals[source_index]) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_SPREAD_REFERENCE",
+                    format!(
+                        "array spread at continuation {} receives a by-reference source",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let requirement = admission.array_requirements.entry(source).or_default();
+            requirement.spread_allocations = requirement.spread_allocations.saturating_add(1);
+            requirement.require_supported_keys = true;
+            requirement.require_plain_values = true;
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+            admission
+                .fresh_array_instructions
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+        }
+        if let RegionInstructionKind::ForeachInit { iterator, source } = instruction.kind {
+            let source =
+                entry_array_source(source, &definitions, &parameter_indices).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_FOREACH_SOURCE",
+                        format!(
+                            "foreach init at continuation {} is not rooted at an entry array",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+            let NativeEntryArraySource::Parameter(source_index) = source else {
+                unreachable!("foreach source operands are entry parameters")
+            };
+            if by_ref_parameters.contains(&region.parameter_locals[source_index]) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FOREACH_REFERENCE_SOURCE",
+                    format!(
+                        "foreach init at continuation {} receives a by-reference array",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let requirement = admission.array_requirements.entry(source).or_default();
+            requirement.require_supported_keys = true;
+            requirement.require_plain_values = true;
+            admission.fixed_value_allocations = admission.fixed_value_allocations.saturating_add(1);
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            debug_assert!(foreach_sources.contains_key(&iterator));
+        }
+        if let RegionInstructionKind::ForeachNext { iterator, .. } = instruction.kind {
+            if !foreach_sources.contains_key(&iterator) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FOREACH_ITERATOR",
+                    format!(
+                        "foreach continuation {} has no publication-planned native iterator",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+        }
+        if let RegionInstructionKind::ForeachCleanup { iterator } = instruction.kind {
+            if !foreach_sources.contains_key(&iterator)
+                && !foreach_reference_sources.contains_key(&iterator)
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FOREACH_ITERATOR",
+                    format!(
+                        "foreach cleanup {} has no publication-planned native iterator",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+        }
+        if let RegionInstructionKind::ForeachInitRef { iterator, local } = instruction.kind {
+            let source = new_array_local_sources.get(&local).copied().ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FOREACH_REFERENCE_PUBLICATION",
+                    format!(
+                        "foreach-by-reference at continuation {} is not rooted at a fresh native array local",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?;
+            let storage = value_flow.local_storage(local);
+            if !(storage == crate::region_ir::LocalStorageClass::SsaPlain
+                || storage.is_reference_slot())
+                || array_local_mutation_counts
+                    .get(&local)
+                    .copied()
+                    .unwrap_or(0)
+                    != 0
+                || fresh_spread_targets.contains(&source)
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FOREACH_REFERENCE_OWNERSHIP",
+                    format!(
+                        "foreach-by-reference at continuation {} has no exclusive fresh-array owner",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let entry_count = fresh_insert_counts.get(&source).copied().unwrap_or(0);
+            admission.fixed_value_allocations = admission
+                .fixed_value_allocations
+                .saturating_add(entry_count.saturating_add(2));
+            if storage.is_reference_slot() {
+                admission.total_reference_locals.insert(local);
+                admission.total_array_instructions.insert(
+                    new_array_local_store_continuations
+                        .get(&local)
+                        .copied()
+                        .expect("fresh foreach reference local has its defining store"),
+                );
+            }
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+            debug_assert_eq!(foreach_reference_sources.get(&iterator), Some(&local));
+        }
+        if let RegionInstructionKind::ForeachNextRef {
+            iterator,
+            value_local,
+            ..
+        } = instruction.kind
+        {
+            if !foreach_reference_sources.contains_key(&iterator)
+                || !value_flow.local_storage(value_local).is_reference_slot()
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FOREACH_REFERENCE_ITERATOR",
+                    format!(
+                        "foreach-by-reference continuation {} has no publication-owned iterator/value slot",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            admission.total_reference_locals.insert(value_local);
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+            admission
+                .total_array_instructions
+                .extend(foreach_reference_local_writes.iter().copied());
+        }
+        if let RegionInstructionKind::AppendDim {
+            local,
+            ref keys,
+            value,
+            ..
+        } = instruction.kind
+            && instruction.native_global_name.is_none()
+            && keys.is_empty()
+            && new_array_locals.contains(&local)
+        {
+            let fact = lowering_operand_fact(value_flow, constants, value);
+            if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                || fact.class == SsaValueClass::ReferenceHandle
+                || value_flow.local_storage(local) != crate::region_ir::LocalStorageClass::SsaPlain
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_APPEND_OWNERSHIP",
+                    format!(
+                        "array append at continuation {} has no total native value/local ownership plan",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+            admission
+                .fresh_array_instructions
+                .insert(instruction.continuation_id);
+        }
+        if let RegionInstructionKind::AppendDim {
+            local,
+            ref keys,
+            value,
+            ..
+        } = instruction.kind
+            && instruction.native_global_name.is_none()
+            && !keys.is_empty()
+            && new_array_locals.contains(&local)
+        {
+            if new_array_mutation_counts.get(&local).copied() != Some(1)
+                || keys
+                    .iter()
+                    .any(|key| publication_integer_array_key(constants, *key).is_none())
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_NESTED_ARRAY_APPEND_SHAPE",
+                    format!(
+                        "nested append at continuation {} is not a single normalized fresh-array path",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let fact = lowering_operand_fact(value_flow, constants, value);
+            if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                || fact.class == SsaValueClass::ReferenceHandle
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_NESTED_ARRAY_APPEND_OWNERSHIP",
+                    format!(
+                        "nested append at continuation {} has no total value ownership plan",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            admission.fixed_value_allocations =
+                admission.fixed_value_allocations.saturating_add(keys.len());
+            admission.fixed_array_entries = admission.fixed_array_entries.saturating_add(
+                keys.len()
+                    .saturating_mul(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize),
+            );
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+            admission
+                .fresh_array_instructions
+                .insert(instruction.continuation_id);
+        }
+        if let RegionInstructionKind::AssignDim {
+            local,
+            ref keys,
+            value,
+            ..
+        } = instruction.kind
+            && instruction.native_global_name.is_none()
+            && keys.len() == 1
+            && new_array_locals.contains(&local)
+        {
+            if publication_integer_array_key(constants, keys[0]).is_none()
+                || new_array_mutation_counts.get(&local).copied().unwrap_or(0)
+                    > crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_ASSIGN_SHAPE",
+                    format!(
+                        "array assignment at continuation {} has no bounded normalized native entry plan",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let fact = lowering_operand_fact(value_flow, constants, value);
+            if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                || !matches!(
+                    fact.class,
+                    SsaValueClass::Int | SsaValueClass::Bool | SsaValueClass::Null
+                )
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_ASSIGN_OWNERSHIP",
+                    format!(
+                        "array assignment at continuation {} has no immediate native ownership plan",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+            admission
+                .fresh_array_instructions
+                .insert(instruction.continuation_id);
+        }
+        if let RegionInstructionKind::AssignDim {
+            local,
+            ref keys,
+            value,
+            ..
+        } = instruction.kind
+            && instruction.native_global_name.is_none()
+            && keys.len() > 1
+            && new_array_locals.contains(&local)
+        {
+            if new_array_mutation_counts.get(&local).copied() != Some(1)
+                || keys
+                    .iter()
+                    .any(|key| publication_integer_array_key(constants, *key).is_none())
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_NESTED_ARRAY_ASSIGN_SHAPE",
+                    format!(
+                        "nested assignment at continuation {} is not a single normalized fresh-array path",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let fact = lowering_operand_fact(value_flow, constants, value);
+            if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                || !matches!(
+                    fact.class,
+                    SsaValueClass::Int | SsaValueClass::Bool | SsaValueClass::Null
+                )
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_NESTED_ARRAY_ASSIGN_OWNERSHIP",
+                    format!(
+                        "nested assignment at continuation {} has no immediate native ownership plan",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let child_count = keys.len().saturating_sub(1);
+            admission.fixed_value_allocations = admission
+                .fixed_value_allocations
+                .saturating_add(child_count);
+            admission.fixed_array_entries = admission.fixed_array_entries.saturating_add(
+                child_count
+                    .saturating_mul(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize),
+            );
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+            admission
+                .fresh_array_instructions
+                .insert(instruction.continuation_id);
+        }
+        if let RegionInstructionKind::UnsetDim { local, ref keys } = instruction.kind
+            && instruction.native_global_name.is_none()
+            && keys.len() == 1
+            && new_array_locals.contains(&local)
+        {
+            if publication_integer_array_key(constants, keys[0]).is_none() {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_UNSET_SHAPE",
+                    format!(
+                        "array unset at continuation {} has no normalized native entry plan",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+            admission
+                .fresh_array_instructions
+                .insert(instruction.continuation_id);
+        }
+        if let RegionInstructionKind::UnsetDim { local, ref keys } = instruction.kind
+            && instruction.native_global_name.is_none()
+            && keys.len() > 1
+            && new_array_locals.contains(&local)
+        {
+            if new_array_mutation_counts.get(&local).copied() != Some(1)
+                || keys
+                    .iter()
+                    .any(|key| publication_integer_array_key(constants, *key).is_none())
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_NESTED_ARRAY_UNSET_SHAPE",
+                    format!(
+                        "nested unset at continuation {} is not a silent fresh-array path",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+            admission
+                .fresh_array_instructions
+                .insert(instruction.continuation_id);
+        }
+        if let RegionInstructionKind::AssignDim {
+            local,
+            ref keys,
+            value,
+            ..
+        } = instruction.kind
+            && instruction.native_global_name.is_none()
+            && !new_array_locals.contains(&local)
+        {
+            let source_index = parameter_indices.get(&local).copied().ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_ASSIGN_ROOT",
+                    format!(
+                        "array assignment at continuation {} is not rooted at an entry parameter",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?;
+            if keys.is_empty()
+                || by_ref_parameters.contains(&local)
+                || value_flow.local_storage(local) != crate::region_ir::LocalStorageClass::SsaPlain
+                || array_local_mutation_counts.get(&local).copied() != Some(1)
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_ASSIGN_LVALUE",
+                    format!(
+                        "array assignment at continuation {} has no single direct entry lvalue",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let normalized = keys
+                .iter()
+                .map(|key| publication_integer_array_key(constants, *key))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_ASSIGN_KEY_NORMALIZATION",
+                        format!(
+                            "array assignment at continuation {} has an unnormalized key path",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+            let fact = lowering_operand_fact(value_flow, constants, value);
+            if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                || !matches!(
+                    fact.class,
+                    SsaValueClass::Int | SsaValueClass::Bool | SsaValueClass::Null
+                )
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_ASSIGN_OWNERSHIP",
+                    format!(
+                        "array assignment at continuation {} has no immediate value ownership",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let (&key, parents) = normalized
+                .split_last()
+                .expect("nonempty assignment path was admitted");
+            admission
+                .array_requirements
+                .entry(NativeEntryArraySource::Parameter(source_index))
+                .or_default()
+                .mutations
+                .push(NativeEntryArrayMutationRequirement::Assign {
+                    parents: parents.to_vec(),
+                    key,
+                });
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+        }
+        if let RegionInstructionKind::AppendDim {
+            local,
+            ref keys,
+            value,
+            ..
+        } = instruction.kind
+            && instruction.native_global_name.is_none()
+            && !new_array_locals.contains(&local)
+        {
+            let source_index = parameter_indices.get(&local).copied().ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_APPEND_ROOT",
+                    format!(
+                        "array append at continuation {} is not rooted at an entry parameter",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?;
+            if by_ref_parameters.contains(&local)
+                || value_flow.local_storage(local) != crate::region_ir::LocalStorageClass::SsaPlain
+                || array_local_mutation_counts.get(&local).copied() != Some(1)
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_APPEND_LVALUE",
+                    format!(
+                        "array append at continuation {} has no single direct entry lvalue",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let parents = keys
+                .iter()
+                .map(|key| publication_integer_array_key(constants, *key))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_APPEND_KEY_NORMALIZATION",
+                        format!(
+                            "array append at continuation {} has an unnormalized key path",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+            let fact = lowering_operand_fact(value_flow, constants, value);
+            if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                || fact.class == SsaValueClass::ReferenceHandle
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_APPEND_OWNERSHIP",
+                    format!(
+                        "array append at continuation {} has no total value ownership",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            admission
+                .array_requirements
+                .entry(NativeEntryArraySource::Parameter(source_index))
+                .or_default()
+                .mutations
+                .push(NativeEntryArrayMutationRequirement::Append { parents });
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+        }
+        if let RegionInstructionKind::UnsetDim { local, ref keys } = instruction.kind
+            && instruction.native_global_name.is_none()
+            && !new_array_locals.contains(&local)
+        {
+            let source_index = parameter_indices.get(&local).copied().ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_UNSET_ROOT",
+                    format!(
+                        "array unset at continuation {} is not rooted at an entry parameter",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?;
+            if keys.is_empty()
+                || by_ref_parameters.contains(&local)
+                || value_flow.local_storage(local) != crate::region_ir::LocalStorageClass::SsaPlain
+                || array_local_mutation_counts.get(&local).copied() != Some(1)
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_UNSET_LVALUE",
+                    format!(
+                        "array unset at continuation {} has no single direct entry lvalue",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let normalized = keys
+                .iter()
+                .map(|key| publication_integer_array_key(constants, *key))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_UNSET_KEY_NORMALIZATION",
+                        format!(
+                            "array unset at continuation {} has an unnormalized key path",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+            let (&key, parents) = normalized
+                .split_last()
+                .expect("nonempty unset path was admitted");
+            admission
+                .array_requirements
+                .entry(NativeEntryArraySource::Parameter(source_index))
+                .or_default()
+                .mutations
+                .push(NativeEntryArrayMutationRequirement::Unset {
+                    parents: parents.to_vec(),
+                    key,
+                });
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+        }
+        if let RegionInstructionKind::UnsetDim { local, ref keys } = instruction.kind
+            && instruction.native_global_name.is_none()
+            && keys.len() > 1
+            && new_array_locals.contains(&local)
+        {
+            if new_array_mutation_counts.get(&local).copied() != Some(1)
+                || keys
+                    .iter()
+                    .any(|key| publication_integer_array_key(constants, *key).is_none())
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_NESTED_ARRAY_UNSET_SHAPE",
+                    format!(
+                        "nested unset at continuation {} is not a silent fresh-array path",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+        }
+        if matches!(
+            instruction.kind,
+            RegionInstructionKind::NativeDynamicCode(_)
+        ) {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION",
+                format!(
+                    "dynamic-code continuation {} must enter the baseline tier before optimizing execution",
+                    instruction.continuation_id,
+                ),
+            ));
+        }
+        if let RegionInstructionKind::StoreLocal { local, .. }
+        | RegionInstructionKind::AssignLocalResult { local, .. } = instruction.kind
+            && matches!(
+                value_flow.local_storage(local),
+                crate::region_ir::LocalStorageClass::RequestGlobal
+                    | crate::region_ir::LocalStorageClass::Superglobal
+            )
+        {
+            if invalidated_locals.contains(&local)
+                || request_local_write_counts.get(&local).copied() != Some(1)
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_REQUEST_LOCAL_COW_SHAPE",
+                    format!(
+                        "request local {} does not have one entry-preflightable native write",
+                        local.raw(),
+                    ),
+                ));
+            }
+            admission
+                .total_request_local_stores
+                .insert(instruction.continuation_id);
+            admission.releasable_request_locals.insert(local);
+        }
+        if let RegionInstructionKind::LoadLocal {
+            local,
+            quiet: false,
+            ..
+        } = instruction.kind
+        {
+            let storage = value_flow.local_storage(local);
+            if storage == crate::region_ir::LocalStorageClass::SsaPlain {
+                admission
+                    .total_local_loads
+                    .insert(instruction.continuation_id);
+            } else if matches!(
+                storage,
+                crate::region_ir::LocalStorageClass::RequestGlobal
+                    | crate::region_ir::LocalStorageClass::Superglobal
+            ) {
+                if invalidated_locals.contains(&local) {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_REQUEST_LOCAL_LVALUE_SHAPE",
+                        format!(
+                            "request local {} may be detached before non-quiet load at continuation {}",
+                            local.raw(),
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                admission
+                    .total_local_loads
+                    .insert(instruction.continuation_id);
+                admission.initialized_request_locals.insert(local);
+            } else if instruction.live_locals.contains(&local) {
+                admission
+                    .total_local_loads
+                    .insert(instruction.continuation_id);
+            } else {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_LOCAL_WARNING_BOUNDARY",
+                    format!(
+                        "non-quiet local load at continuation {} is not definitely initialized before optimizing entry",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+        }
+        if let RegionInstructionKind::FetchDim {
+            dst,
+            array,
+            key,
+            quiet,
+            mode,
+            ..
+        } = instruction.kind
+            && instruction.native_global_name.is_none()
+        {
+            let source = entry_array_source(array, &definitions, &parameter_indices);
+            if source.is_none()
+                && let Some(local) = entry_array_root_local(array, &definitions)
+                && new_array_locals.contains(&local)
+            {
+                let key = publication_integer_array_key(constants, key).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_DIM_KEY_NORMALIZATION",
+                        format!(
+                            "dimension read at continuation {} has no publication-normalized integer key",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+                if !quiet
+                    && mode == php_ir::instruction::DimFetchMode::Read
+                    && !new_array_assigned_integer_keys
+                        .get(&local)
+                        .is_some_and(|keys| keys.contains(&key))
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_DIM_WARNING_BOUNDARY",
+                        format!(
+                            "dimension read at continuation {} may warn after native entry",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                admission
+                    .total_array_instructions
+                    .insert(instruction.continuation_id);
+                continue;
+            }
+            let source = source.ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_DIM_SHAPE",
+                    format!(
+                        "dimension read at continuation {} is not rooted at an entry array",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?;
+            let array_fact = lowering_operand_fact(value_flow, constants, array);
+            let NativeEntryArraySource::Parameter(source_index) = source else {
+                unreachable!("operand-rooted entry arrays are parameters")
+            };
+            let source_local = region.parameter_locals[source_index];
+            if !variadic_parameters.contains(&source_local)
+                && (array_fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                    || array_fact.class != SsaValueClass::ArrayHandle)
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_DIM_TYPE",
+                    format!(
+                        "dimension read at continuation {} has no compile-time array fact",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let key = match key {
+                RegionOperand::Constant(index) => match constants.get(index as usize) {
+                    Some(IrConstant::Int(value)) if native_integer_fits_immediate(*value) => *value,
+                    _ => {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_ARRAY_DIM_KEY_NORMALIZATION",
+                            format!(
+                                "dimension read at continuation {} has no publication-normalized integer key",
+                                instruction.continuation_id,
+                            ),
+                        ));
+                    }
+                },
+                RegionOperand::I64(value) if native_integer_fits_immediate(value) => value,
+                _ => {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_DIM_KEY_NORMALIZATION",
+                        format!(
+                            "dimension read at continuation {} has no publication-normalized integer key",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+            };
+            if by_ref_parameters.contains(&source_local) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_DIM_REFERENCE",
+                    format!(
+                        "dimension read at continuation {} is rooted at a by-reference parameter",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            admitted_array_fetches.insert(dst, (source, key));
+            let requirement = admission.array_requirements.entry(source).or_default();
+            if !quiet && mode == php_ir::instruction::DimFetchMode::Read {
+                requirement.required_integer_keys.insert(key);
+            }
+        }
+        if let RegionInstructionKind::IssetDim { local, keys, .. }
+        | RegionInstructionKind::EmptyDim { local, keys, .. } = &instruction.kind
+        {
+            if keys.is_empty() {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_PROBE_PATH",
+                    format!(
+                        "array probe at continuation {} has no dimension",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let (source, dimensions) = if instruction.native_global_name.is_some() {
+                admission.plain_globals.insert(instruction.continuation_id);
+                (
+                    NativeEntryArraySource::TrustedGlobal(instruction.continuation_id),
+                    &keys[1..],
+                )
+            } else {
+                let parameter_index = parameter_indices.get(local).copied().ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_PROBE_ROOT",
+                        format!(
+                            "array probe at continuation {} is not rooted at an entry parameter",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+                if by_ref_parameters.contains(local)
+                    || value_flow.local_storage(*local)
+                        != crate::region_ir::LocalStorageClass::SsaPlain
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_PROBE_REFERENCE",
+                        format!(
+                            "array probe at continuation {} has no plain entry owner",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                (
+                    NativeEntryArraySource::Parameter(parameter_index),
+                    keys.as_slice(),
+                )
+            };
+            let normalized = dimensions
+                .iter()
+                .copied()
+                .map(|key| publication_native_array_key(constants, key))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_PROBE_KEY_NORMALIZATION",
+                        format!(
+                            "array probe at continuation {} has a key that is not normalized at publication",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+            if normalized.is_empty() {
+                // A global `isset($name)`/`empty($name)` tests the already
+                // published reference payload itself and needs no array plan.
+            } else {
+                admission
+                    .array_requirements
+                    .entry(source)
+                    .or_default()
+                    .probe_paths
+                    .push(NativeEntryArrayProbeRequirement {
+                        keys: normalized,
+                        leaf: NativeEntryArrayProbeLeaf::PlainValue,
+                    });
+            }
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+        }
+        if instruction.native_global_name.is_none()
+            && matches!(
+                instruction.kind,
+                RegionInstructionKind::FetchDim { .. }
+                    | RegionInstructionKind::AssignDim { .. }
+                    | RegionInstructionKind::AppendDim { .. }
+                    | RegionInstructionKind::UnsetDim { .. }
+                    | RegionInstructionKind::IssetDim { .. }
+                    | RegionInstructionKind::EmptyDim { .. }
+            )
+            && !admission
+                .total_array_instructions
+                .contains(&instruction.continuation_id)
+        {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_UNCLASSIFIED_ARRAY_DIMENSION",
+                format!(
+                    "array dimension continuation {} has no complete publication-time shape, COW, and ownership plan",
+                    instruction.continuation_id,
+                ),
+            ));
+        }
+        if instruction.native_global_name.is_none()
+            && matches!(
+                instruction.kind,
+                RegionInstructionKind::AssignDim { local, .. }
+                    | RegionInstructionKind::AppendDim { local, .. }
+                    | RegionInstructionKind::UnsetDim { local, .. }
+                    if !new_array_locals.contains(&local)
+            )
+        {
+            entry_dependent_continuations.insert(instruction.continuation_id);
+        }
+        if instruction.native_global_name.is_some() {
+            let source = NativeEntryArraySource::TrustedGlobal(instruction.continuation_id);
+            match &instruction.kind {
+                RegionInstructionKind::FetchDim {
+                    quiet,
+                    mode: php_ir::instruction::DimFetchMode::Read,
+                    ..
+                } => {
+                    admission.plain_globals.insert(instruction.continuation_id);
+                    if !quiet {
+                        admission
+                            .initialized_globals
+                            .insert(instruction.continuation_id);
+                    }
+                    admission
+                        .total_array_instructions
+                        .insert(instruction.continuation_id);
+                }
+                RegionInstructionKind::AssignDim { keys, value, .. } if keys.len() == 1 => {
+                    let fact = lowering_operand_fact(value_flow, constants, *value);
+                    if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                        || !matches!(
+                            fact.class,
+                            SsaValueClass::Int | SsaValueClass::Bool | SsaValueClass::Null
+                        )
+                    {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_GLOBAL_ASSIGN_OWNERSHIP",
+                            format!(
+                                "global assignment at continuation {} has no immediate ownership plan",
+                                instruction.continuation_id,
+                            ),
+                        ));
+                    }
+                    admission
+                        .releasable_globals
+                        .insert(instruction.continuation_id);
+                    admission.plain_globals.insert(instruction.continuation_id);
+                    admission
+                        .total_array_instructions
+                        .insert(instruction.continuation_id);
+                }
+                RegionInstructionKind::AssignDim { keys, value, .. } if keys.len() > 1 => {
+                    let normalized = keys[1..]
+                        .iter()
+                        .map(|key| publication_integer_array_key(constants, *key))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_GLOBAL_ARRAY_KEY",
+                                format!(
+                                    "global array assignment at continuation {} has an unnormalized key path",
+                                    instruction.continuation_id,
+                                ),
+                            )
+                        })?;
+                    let fact = lowering_operand_fact(value_flow, constants, *value);
+                    if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                        || !matches!(
+                            fact.class,
+                            SsaValueClass::Int | SsaValueClass::Bool | SsaValueClass::Null
+                        )
+                    {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_GLOBAL_ARRAY_OWNERSHIP",
+                            format!(
+                                "global array assignment at continuation {} has no immediate ownership plan",
+                                instruction.continuation_id,
+                            ),
+                        ));
+                    }
+                    let (&key, parents) = normalized
+                        .split_last()
+                        .expect("nested global assignment retains a child key");
+                    admission
+                        .array_requirements
+                        .entry(source)
+                        .or_default()
+                        .mutations
+                        .push(NativeEntryArrayMutationRequirement::Assign {
+                            parents: parents.to_vec(),
+                            key,
+                        });
+                    admission
+                        .total_array_instructions
+                        .insert(instruction.continuation_id);
+                }
+                RegionInstructionKind::AppendDim { keys, value, .. } if !keys.is_empty() => {
+                    let parents = keys[1..]
+                        .iter()
+                        .map(|key| publication_integer_array_key(constants, *key))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_GLOBAL_ARRAY_KEY",
+                                format!(
+                                    "global array append at continuation {} has an unnormalized key path",
+                                    instruction.continuation_id,
+                                ),
+                            )
+                        })?;
+                    let fact = lowering_operand_fact(value_flow, constants, *value);
+                    if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                        || fact.class == SsaValueClass::ReferenceHandle
+                    {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_GLOBAL_ARRAY_OWNERSHIP",
+                            format!(
+                                "global array append at continuation {} has no total ownership plan",
+                                instruction.continuation_id,
+                            ),
+                        ));
+                    }
+                    admission
+                        .array_requirements
+                        .entry(source)
+                        .or_default()
+                        .mutations
+                        .push(NativeEntryArrayMutationRequirement::Append { parents });
+                    admission
+                        .total_array_instructions
+                        .insert(instruction.continuation_id);
+                }
+                RegionInstructionKind::UnsetDim { keys, .. } if keys.len() == 1 => {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_GLOBAL_BINDING_UNSET",
+                        format!(
+                            "global binding unset at continuation {} must enter baseline before optimizing execution",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                RegionInstructionKind::UnsetDim { keys, .. } if keys.len() > 1 => {
+                    let normalized = keys[1..]
+                        .iter()
+                        .map(|key| publication_integer_array_key(constants, *key))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_GLOBAL_ARRAY_KEY",
+                                format!(
+                                    "global array unset at continuation {} has an unnormalized key path",
+                                    instruction.continuation_id,
+                                ),
+                            )
+                        })?;
+                    let (&key, parents) = normalized
+                        .split_last()
+                        .expect("nested global unset retains a child key");
+                    admission
+                        .array_requirements
+                        .entry(source)
+                        .or_default()
+                        .mutations
+                        .push(NativeEntryArrayMutationRequirement::Unset {
+                            parents: parents.to_vec(),
+                            key,
+                        });
+                    admission
+                        .total_array_instructions
+                        .insert(instruction.continuation_id);
+                }
+                RegionInstructionKind::FetchDim { .. }
+                | RegionInstructionKind::AssignDim { .. }
+                | RegionInstructionKind::AppendDim { .. }
+                | RegionInstructionKind::UnsetDim { .. } => {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_GLOBAL_DIMENSION_SHAPE",
+                        format!(
+                            "global dimension continuation {} has no total publication plan",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+            if admission
+                .total_array_instructions
+                .contains(&instruction.continuation_id)
+            {
+                entry_dependent_continuations.insert(instruction.continuation_id);
+            }
+        }
+        if let RegionInstructionKind::FetchProperty { object, .. }
+        | RegionInstructionKind::AssignProperty { object, .. } = &instruction.kind
+        {
+            let NativeEntryArraySource::Parameter(parameter_index) =
+                entry_array_source(*object, &definitions, &parameter_indices).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_PROPERTY_OBJECT_SHAPE",
+                        format!(
+                            "property continuation {} is not rooted at an entry object",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?
+            else {
+                unreachable!("operand-rooted property objects are parameters")
+            };
+            let local = region.parameter_locals[parameter_index];
+            if by_ref_parameters.contains(&local) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_PROPERTY_OBJECT_TYPE",
+                    format!(
+                        "property continuation {} has no plain direct-object entry contract",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let (required_state, readable, releasable) = match &instruction.kind {
+                RegionInstructionKind::FetchProperty { .. } => (
+                    crate::JIT_NATIVE_TRUSTED_PROPERTY_SLOT_PUBLISHED,
+                    true,
+                    false,
+                ),
+                RegionInstructionKind::AssignProperty { value, .. } => {
+                    let value = lowering_operand_fact(value_flow, constants, *value);
+                    if value.certainty == crate::region_ir::SsaCertainty::Unknown
+                        || !matches!(
+                            value.class,
+                            SsaValueClass::Int | SsaValueClass::Bool | SsaValueClass::Null
+                        )
+                    {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_PROPERTY_VALUE_OWNERSHIP",
+                            format!(
+                                "property assignment at continuation {} has no immediate ownership plan",
+                                instruction.continuation_id,
+                            ),
+                        ));
+                    }
+                    (
+                        crate::JIT_NATIVE_TRUSTED_PROPERTY_SLOT_WRITABLE,
+                        false,
+                        true,
+                    )
+                }
+                _ => unreachable!("property requirement kind"),
+            };
+            admission
+                .property_requirements
+                .push(NativeEntryPropertyRequirement {
+                    parameter_index,
+                    continuation_id: instruction.continuation_id,
+                    required_state,
+                    readable,
+                    releasable,
+                    allow_reference: false,
+                    require_reference: false,
+                    probe_paths: Vec::new(),
+                    mutations: Vec::new(),
+                });
+            entry_dependent_continuations.insert(instruction.continuation_id);
+        }
+        if let RegionInstructionKind::ArrayCallback(call) = &instruction.kind {
+            let RegionArrayCallbackTarget::Stable(callback) = &call.callback else {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_CALLBACK_PUBLICATION",
+                    format!(
+                        "runtime callback at continuation {} is not fixed before optimizing entry",
+                        instruction.continuation_id,
+                    ),
+                ));
+            };
+            let provided_argument_count = match call.operation {
+                RegionArrayCallbackOperation::Map => call.arrays.len(),
+                RegionArrayCallbackOperation::FilterValue
+                | RegionArrayCallbackOperation::FilterKey => 1,
+                RegionArrayCallbackOperation::FilterValueAndKey
+                | RegionArrayCallbackOperation::All
+                | RegionArrayCallbackOperation::Any
+                | RegionArrayCallbackOperation::Find
+                | RegionArrayCallbackOperation::FindKey => 2,
+                RegionArrayCallbackOperation::Walk => {
+                    2usize.saturating_add(usize::from(call.initial.is_some()))
+                }
+                RegionArrayCallbackOperation::Reduce
+                | RegionArrayCallbackOperation::Usort
+                | RegionArrayCallbackOperation::Uasort
+                | RegionArrayCallbackOperation::Uksort
+                | RegionArrayCallbackOperation::WalkRecursive
+                | RegionArrayCallbackOperation::PregReplace => {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_CALLBACK_TOTAL_FAMILY",
+                        format!(
+                            "callback operation at continuation {} has no publication-total native family",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+            };
+            if callback.receiver.is_some()
+                || callback.closure.is_some()
+                || call.arrays.is_empty()
+                || call.operation != RegionArrayCallbackOperation::Map && call.arrays.len() != 1
+                || matches!(
+                    call.operation,
+                    RegionArrayCallbackOperation::FilterValue
+                        | RegionArrayCallbackOperation::FilterKey
+                        | RegionArrayCallbackOperation::FilterValueAndKey
+                        | RegionArrayCallbackOperation::All
+                        | RegionArrayCallbackOperation::Any
+                        | RegionArrayCallbackOperation::Find
+                        | RegionArrayCallbackOperation::FindKey
+                        | RegionArrayCallbackOperation::Walk
+                ) && !callback.returns_releasable_scalar
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_CALLBACK_TOTAL_FAMILY",
+                    format!(
+                        "callback operation at continuation {} has no total fixed callback contract",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let function = callback.function.ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_CALLBACK_TARGET",
+                    format!(
+                        "callback at continuation {} has no same-unit published target",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?;
+            let target = function_params.get(&function).ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_CALLBACK_TARGET",
+                    format!(
+                        "callback at continuation {} has no published native signature",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?;
+            let binding = optimizing_callback_binding_plan(
+                OptimizingCompiledCallTarget {
+                    address: OptimizingCompiledCallAddress::Local(function),
+                    params: &target.params,
+                    requires_trampoline: target.requires_trampoline,
+                    arity: target.native_arity,
+                    reference_only_trampoline: target.reference_only_trampoline,
+                    returns_by_reference: target.returns_by_reference,
+                    exception_routes: target.has_exception_handlers.then_some(function),
+                },
+                0,
+                provided_argument_count,
+                usize::from(call.operation == RegionArrayCallbackOperation::Walk),
+            )
+            .ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_CALLBACK_BINDING",
+                    format!(
+                        "callback at continuation {} has no total positional binding",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?;
+            if binding.variadic
+                || target.returns_by_reference
+                || target
+                    .params
+                    .iter()
+                    .take(provided_argument_count)
+                    .enumerate()
+                    .any(|(index, parameter)| {
+                        (parameter.by_ref
+                            && !(call.operation == RegionArrayCallbackOperation::Walk
+                                && index == 0))
+                            || parameter
+                                .type_
+                                .as_ref()
+                                .is_none_or(|type_| !optimizing_type_has_direct_guard(type_))
+                    })
+                || target
+                    .params
+                    .iter()
+                    .skip(provided_argument_count)
+                    .take(
+                        binding
+                            .fixed_parameter_count
+                            .saturating_sub(provided_argument_count),
+                    )
+                    .any(|parameter| {
+                        !matches!(
+                            parameter.default,
+                            Some(IrConstant::Null | IrConstant::Bool(_))
+                        ) && !matches!(
+                            parameter.default,
+                            Some(IrConstant::Int(value))
+                                if native_integer_fits_immediate(value)
+                        )
+                    })
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_CALLBACK_BINDING",
+                    format!(
+                        "callback at continuation {} needs a reference, variadic, or allocated default binding",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            for (index, operand) in call.arrays.iter().copied().enumerate() {
+                let source =
+                    entry_array_source(operand, &definitions, &parameter_indices).ok_or_else(|| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_CALLBACK_ARRAY_SHAPE",
+                            format!(
+                                "callback array {} at continuation {} is not rooted at native entry",
+                                index, instruction.continuation_id,
+                            ),
+                        )
+                    })?;
+                let NativeEntryArraySource::Parameter(source_index) = source else {
+                    unreachable!("callback entry arrays are parameters")
+                };
+                if by_ref_parameters.contains(&region.parameter_locals[source_index]) {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_CALLBACK_ARRAY_REFERENCE",
+                        format!(
+                            "callback array {} at continuation {} is a by-reference parameter",
+                            index, instruction.continuation_id,
+                        ),
+                    ));
+                }
+                let requirement = admission.array_requirements.entry(source).or_default();
+                requirement.require_plain_values = true;
+                let value_parameter = match call.operation {
+                    RegionArrayCallbackOperation::Map => Some(index),
+                    RegionArrayCallbackOperation::FilterValue
+                    | RegionArrayCallbackOperation::FilterValueAndKey
+                    | RegionArrayCallbackOperation::All
+                    | RegionArrayCallbackOperation::Any
+                    | RegionArrayCallbackOperation::Find
+                    | RegionArrayCallbackOperation::FindKey
+                    | RegionArrayCallbackOperation::Walk => Some(0),
+                    RegionArrayCallbackOperation::FilterKey => None,
+                    _ => unreachable!("unsupported callback operation was rejected above"),
+                };
+                if let Some(type_) =
+                    value_parameter.and_then(|parameter| target.params[parameter].type_.as_ref())
+                {
+                    requirement.all_value_types.push(type_.clone());
+                }
+                if matches!(
+                    call.operation,
+                    RegionArrayCallbackOperation::Map
+                        | RegionArrayCallbackOperation::FilterValue
+                        | RegionArrayCallbackOperation::FilterKey
+                        | RegionArrayCallbackOperation::FilterValueAndKey
+                ) {
+                    requirement.projection_allocations =
+                        requirement.projection_allocations.saturating_add(1);
+                }
+                if matches!(
+                    call.operation,
+                    RegionArrayCallbackOperation::FilterKey
+                        | RegionArrayCallbackOperation::FilterValueAndKey
+                        | RegionArrayCallbackOperation::All
+                        | RegionArrayCallbackOperation::Any
+                        | RegionArrayCallbackOperation::Find
+                        | RegionArrayCallbackOperation::FindKey
+                        | RegionArrayCallbackOperation::Walk
+                ) {
+                    requirement.require_supported_keys = true;
+                }
+                if call.operation == RegionArrayCallbackOperation::Walk {
+                    requirement.value_allocations_per_entry =
+                        requirement.value_allocations_per_entry.saturating_add(1);
+                    requirement.projection_allocations =
+                        requirement.projection_allocations.saturating_add(1);
+                }
+            }
+            admission.require_non_fiber_scope = true;
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
+        }
+        if let RegionInstructionKind::PregCallbackArray(call) = &instruction.kind
+            && call
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.callback, RegionArrayCallbackTarget::Runtime(_)))
+        {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_PREG_RUNTIME_CALLBACK_PUBLICATION",
+                format!(
+                    "runtime preg callback map at continuation {} is assigned to baseline before region entry",
+                    instruction.continuation_id,
+                ),
+            ));
+        }
+        let immediate_local = |local: LocalId| {
+            let fact = lowering_operand_fact(value_flow, constants, RegionOperand::Local(local));
+            value_flow.local_storage(local) == crate::region_ir::LocalStorageClass::SsaPlain
+                && fact.certainty != crate::region_ir::SsaCertainty::Unknown
+                && matches!(
+                    fact.class,
+                    SsaValueClass::Int | SsaValueClass::Bool | SsaValueClass::Null
+                )
+        };
+        let reference_source_local =
+            |local: LocalId| immediate_local(local) || parameter_indices.contains_key(&local);
+        let reference_target_local = |local: LocalId| {
+            immediate_local(local)
+                || (!parameter_indices.contains_key(&local)
+                    && first_local_write.get(&local).copied() == Some(instruction.continuation_id))
+        };
+        let reference_mutation =
+            |keys: &[RegionOperand],
+             append: bool|
+             -> Result<NativeEntryArrayMutationRequirement, CraneliftLoweringError> {
+                let normalized = keys
+                .iter()
+                .map(|key| publication_integer_array_key(constants, *key))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_REFERENCE_DIM_KEY_PUBLICATION",
+                        format!(
+                            "reference dimension at continuation {} has an unnormalized key path",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+                if append {
+                    Ok(NativeEntryArrayMutationRequirement::ReferenceAppend {
+                        parents: normalized,
+                    })
+                } else {
+                    let (&key, parents) = normalized.split_last().ok_or_else(|| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_REFERENCE_DIM_ARITY",
+                            format!(
+                                "reference dimension at continuation {} has no leaf key",
+                                instruction.continuation_id,
+                            ),
+                        )
+                    })?;
+                    Ok(NativeEntryArrayMutationRequirement::Reference {
+                        parents: parents.to_vec(),
+                        key,
+                    })
+                }
+            };
+        let property_parameter = |object: RegionOperand| -> Result<usize, CraneliftLoweringError> {
+            let NativeEntryArraySource::Parameter(parameter_index) = entry_array_source(
+                object,
+                &definitions,
+                &parameter_indices,
+            )
+            .ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_REFERENCE_PROPERTY_OBJECT",
+                    format!(
+                        "property reference at continuation {} is not rooted at an entry object",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?
+            else {
+                unreachable!("operand-rooted property reference objects are parameters")
+            };
+            if by_ref_parameters.contains(&region.parameter_locals[parameter_index]) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_REFERENCE_PROPERTY_OBJECT",
+                    format!(
+                        "property reference at continuation {} has no plain object owner",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            Ok(parameter_index)
+        };
+        match &instruction.kind {
+            RegionInstructionKind::BindReference { target, source } => {
+                if value_flow.local_storage(*target)
+                    == crate::region_ir::LocalStorageClass::Superglobal
+                    || region.flags.is_top_level
+                        && value_flow.local_storage(*target)
+                            == crate::region_ir::LocalStorageClass::RequestGlobal
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_REQUEST_REFERENCE_PUBLICATION",
+                        format!(
+                            "request-global reference at continuation {} changes symbol identity",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                if !reference_source_local(*source)
+                    || (*target != *source && !reference_target_local(*target))
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_LOCAL_REFERENCE_PUBLICATION",
+                        format!(
+                            "local reference at continuation {} has no entry-stable immediate ownership plan",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                admission.fixed_value_allocations =
+                    admission.fixed_value_allocations.saturating_add(1);
+                admission
+                    .total_array_instructions
+                    .insert(instruction.continuation_id);
+                entry_dependent_continuations.insert(instruction.continuation_id);
+                continue;
+            }
+            RegionInstructionKind::BindReferenceDim {
+                target,
+                array,
+                keys,
+            }
+            | RegionInstructionKind::BindReferenceIntoDim {
+                array,
+                keys,
+                append: false,
+                source: target,
+            } => {
+                if instruction.native_global_name.is_some() {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_GLOBAL_REFERENCE_DIM_PUBLICATION",
+                        format!(
+                            "global reference dimension at continuation {} changes symbol identity",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                let source_index = parameter_indices.get(array).copied().ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_REFERENCE_DIM_ROOT",
+                        format!(
+                            "reference dimension at continuation {} is not rooted at an entry array",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+                if by_ref_parameters.contains(array)
+                    || value_flow.local_storage(*array)
+                        != crate::region_ir::LocalStorageClass::SsaPlain
+                    || match &instruction.kind {
+                        RegionInstructionKind::BindReferenceDim { .. } => {
+                            !reference_target_local(*target)
+                        }
+                        RegionInstructionKind::BindReferenceIntoDim { .. } => {
+                            !reference_source_local(*target)
+                        }
+                        _ => unreachable!("reference dimension kind"),
+                    }
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_REFERENCE_DIM_OWNERSHIP",
+                        format!(
+                            "reference dimension at continuation {} has no entry-stable COW/ownership plan",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                admission
+                    .array_requirements
+                    .entry(NativeEntryArraySource::Parameter(source_index))
+                    .or_default()
+                    .mutations
+                    .push(reference_mutation(keys, false)?);
+                admission.fixed_value_allocations =
+                    admission.fixed_value_allocations.saturating_add(1);
+                admission
+                    .total_array_instructions
+                    .insert(instruction.continuation_id);
+                entry_dependent_continuations.insert(instruction.continuation_id);
+                continue;
+            }
+            RegionInstructionKind::BindReferenceIntoDim {
+                array,
+                keys,
+                append: true,
+                source,
+            } => {
+                if instruction.native_global_name.is_some() {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_GLOBAL_REFERENCE_DIM_PUBLICATION",
+                        format!(
+                            "global append reference dimension at continuation {} changes symbol identity",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                let source_index = parameter_indices.get(array).copied().ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_REFERENCE_DIM_ROOT",
+                        format!(
+                            "append reference dimension at continuation {} is not rooted at an entry array",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+                if by_ref_parameters.contains(array)
+                    || value_flow.local_storage(*array)
+                        != crate::region_ir::LocalStorageClass::SsaPlain
+                    || !reference_source_local(*source)
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_REFERENCE_DIM_OWNERSHIP",
+                        format!(
+                            "append reference dimension at continuation {} has no entry-stable COW/ownership plan",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                admission
+                    .array_requirements
+                    .entry(NativeEntryArraySource::Parameter(source_index))
+                    .or_default()
+                    .mutations
+                    .push(reference_mutation(keys, true)?);
+                admission.fixed_value_allocations =
+                    admission.fixed_value_allocations.saturating_add(1);
+                admission
+                    .total_array_instructions
+                    .insert(instruction.continuation_id);
+                entry_dependent_continuations.insert(instruction.continuation_id);
+                continue;
+            }
+            RegionInstructionKind::BindReferenceProperty { object, source, .. } => {
+                if !reference_source_local(*source) {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_PROPERTY_REFERENCE_OWNERSHIP",
+                        format!(
+                            "property reference at continuation {} has no entry-stable source owner",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                admission
+                    .property_requirements
+                    .push(NativeEntryPropertyRequirement {
+                        parameter_index: property_parameter(*object)?,
+                        continuation_id: instruction.continuation_id,
+                        required_state: crate::JIT_NATIVE_TRUSTED_PROPERTY_SLOT_REFERENCEABLE,
+                        readable: false,
+                        releasable: true,
+                        allow_reference: true,
+                        require_reference: false,
+                        probe_paths: Vec::new(),
+                        mutations: Vec::new(),
+                    });
+                admission.fixed_value_allocations =
+                    admission.fixed_value_allocations.saturating_add(1);
+                admission
+                    .total_array_instructions
+                    .insert(instruction.continuation_id);
+                entry_dependent_continuations.insert(instruction.continuation_id);
+                continue;
+            }
+            RegionInstructionKind::BindReferenceFromProperty { target, object, .. } => {
+                if !reference_target_local(*target) {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_PROPERTY_REFERENCE_TARGET",
+                        format!(
+                            "property reference at continuation {} has no entry-stable target owner",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                admission
+                    .property_requirements
+                    .push(NativeEntryPropertyRequirement {
+                        parameter_index: property_parameter(*object)?,
+                        continuation_id: instruction.continuation_id,
+                        required_state: crate::JIT_NATIVE_TRUSTED_PROPERTY_SLOT_REFERENCEABLE,
+                        readable: false,
+                        releasable: false,
+                        allow_reference: true,
+                        require_reference: false,
+                        probe_paths: Vec::new(),
+                        mutations: Vec::new(),
+                    });
+                admission.fixed_value_allocations =
+                    admission.fixed_value_allocations.saturating_add(1);
+                admission
+                    .total_array_instructions
+                    .insert(instruction.continuation_id);
+                entry_dependent_continuations.insert(instruction.continuation_id);
+                continue;
+            }
+            RegionInstructionKind::BindReferenceIntoPropertyDim {
+                object,
+                keys,
+                append: _,
+                source,
+                ..
+            }
+            | RegionInstructionKind::BindReferenceFromPropertyDim {
+                target: source,
+                object,
+                keys,
+                ..
+            } => {
+                if match &instruction.kind {
+                    RegionInstructionKind::BindReferenceIntoPropertyDim { .. } => {
+                        !reference_source_local(*source)
+                    }
+                    RegionInstructionKind::BindReferenceFromPropertyDim { .. } => {
+                        !reference_target_local(*source)
+                    }
+                    _ => unreachable!("property dimension reference kind"),
+                } {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_PROPERTY_DIM_REFERENCE_OWNERSHIP",
+                        format!(
+                            "property dimension reference at continuation {} has no entry-stable local owner",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                let append = matches!(
+                    &instruction.kind,
+                    RegionInstructionKind::BindReferenceIntoPropertyDim { append: true, .. }
+                );
+                admission
+                    .property_requirements
+                    .push(NativeEntryPropertyRequirement {
+                        parameter_index: property_parameter(*object)?,
+                        continuation_id: instruction.continuation_id,
+                        required_state: crate::JIT_NATIVE_TRUSTED_PROPERTY_SLOT_DIMENSION_WRITABLE,
+                        readable: true,
+                        releasable: false,
+                        allow_reference: false,
+                        require_reference: false,
+                        probe_paths: Vec::new(),
+                        mutations: vec![reference_mutation(keys, append)?],
+                    });
+                admission.fixed_value_allocations =
+                    admission.fixed_value_allocations.saturating_add(1);
+                admission
+                    .total_array_instructions
+                    .insert(instruction.continuation_id);
+                entry_dependent_continuations.insert(instruction.continuation_id);
+                continue;
+            }
+            RegionInstructionKind::BindReferenceDimFromProperty {
+                array,
+                keys,
+                append: false,
+                object,
+                ..
+            } if keys.is_empty() => {
+                if !reference_target_local(*array) {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_PROPERTY_REFERENCE_TARGET",
+                        format!(
+                            "property reference at continuation {} has no entry-stable target owner",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                admission
+                    .property_requirements
+                    .push(NativeEntryPropertyRequirement {
+                        parameter_index: property_parameter(*object)?,
+                        continuation_id: instruction.continuation_id,
+                        required_state: crate::JIT_NATIVE_TRUSTED_PROPERTY_SLOT_REFERENCEABLE,
+                        readable: false,
+                        releasable: false,
+                        allow_reference: true,
+                        require_reference: false,
+                        probe_paths: Vec::new(),
+                        mutations: Vec::new(),
+                    });
+                admission.fixed_value_allocations =
+                    admission.fixed_value_allocations.saturating_add(1);
+                admission
+                    .total_array_instructions
+                    .insert(instruction.continuation_id);
+                entry_dependent_continuations.insert(instruction.continuation_id);
+                continue;
+            }
+            RegionInstructionKind::BindReferenceDimFromProperty {
+                array,
+                keys,
+                append,
+                object,
+                ..
+            } => {
+                let source_index = parameter_indices.get(array).copied().ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_PROPERTY_REFERENCE_DIM_ROOT",
+                        format!(
+                            "property-to-dimension reference at continuation {} is not rooted at an entry array",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+                if by_ref_parameters.contains(array)
+                    || value_flow.local_storage(*array)
+                        != crate::region_ir::LocalStorageClass::SsaPlain
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_PROPERTY_REFERENCE_DIM_OWNERSHIP",
+                        format!(
+                            "property-to-dimension reference at continuation {} has no entry-stable owner",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                admission
+                    .array_requirements
+                    .entry(NativeEntryArraySource::Parameter(source_index))
+                    .or_default()
+                    .mutations
+                    .push(reference_mutation(keys, *append)?);
+                admission
+                    .property_requirements
+                    .push(NativeEntryPropertyRequirement {
+                        parameter_index: property_parameter(*object)?,
+                        continuation_id: instruction.continuation_id,
+                        required_state: crate::JIT_NATIVE_TRUSTED_PROPERTY_SLOT_REFERENCEABLE,
+                        readable: true,
+                        releasable: false,
+                        allow_reference: true,
+                        require_reference: true,
+                        probe_paths: Vec::new(),
+                        mutations: Vec::new(),
+                    });
+                admission
+                    .total_array_instructions
+                    .insert(instruction.continuation_id);
+                entry_dependent_continuations.insert(instruction.continuation_id);
+                continue;
+            }
+            _ => {}
+        }
+        let RegionInstructionKind::NativeCall(call) = &instruction.kind else {
+            continue;
+        };
+        if let RegionCallTarget::Method {
+            receiver_layout_id: Some(layout_id),
+            ..
+        } = &call.target
+        {
+            let receiver = call.operands.first().copied().flatten().ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_METHOD_RECEIVER_PUBLICATION",
+                    format!(
+                        "specialized method at continuation {} has no receiver",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?;
+            let NativeEntryArraySource::Parameter(parameter_index) = entry_array_source(
+                receiver,
+                &definitions,
+                &parameter_indices,
+            )
+            .ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_METHOD_RECEIVER_PUBLICATION",
+                    format!(
+                        "specialized method at continuation {} is not rooted at an entry receiver",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?
+            else {
+                unreachable!("method receiver operands are entry parameters")
+            };
+            if by_ref_parameters.contains(&region.parameter_locals[parameter_index]) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_METHOD_RECEIVER_REFERENCE",
+                    "specialized method receiver is a by-reference parameter",
+                ));
+            }
+            admission
+                .object_layout_requirements
+                .push(NativeEntryObjectLayoutRequirement {
+                    parameter_index,
+                    layout_id: *layout_id,
+                });
+            entry_dependent_continuations.insert(instruction.continuation_id);
+        }
+        if let RegionCallTarget::Semantic {
+            operation: RegionSemanticOp::InstanceOf { object, .. },
+        } = &call.target
+        {
+            let NativeEntryArraySource::Parameter(parameter_index) =
+                entry_array_source(*object, &definitions, &parameter_indices).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_INSTANCEOF_PUBLICATION",
+                        format!(
+                            "instanceof at continuation {} is not rooted at an entry object",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?
+            else {
+                unreachable!("instanceof object operands are entry parameters")
+            };
+            if by_ref_parameters.contains(&region.parameter_locals[parameter_index]) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_INSTANCEOF_REFERENCE",
+                    "instanceof object is a by-reference parameter",
+                ));
+            }
+            admission
+                .instanceof_requirements
+                .push(NativeEntryInstanceofRequirement {
+                    parameter_index,
+                    continuation_id: instruction.continuation_id,
+                });
+            entry_dependent_continuations.insert(instruction.continuation_id);
+        }
+        if let RegionCallTarget::Semantic {
+            operation:
+                RegionSemanticOp::StaticPropertyReference {
+                    target,
+                    class_name,
+                    dimensions,
+                    bind_source_into_property,
+                    ..
+                },
+        } = &call.target
+        {
+            if !matches!(class_name, crate::region_ir::RegionClassName::Static(_))
+                || if *bind_source_into_property {
+                    !reference_source_local(*target)
+                } else {
+                    !reference_target_local(*target)
+                }
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_STATIC_PROPERTY_REFERENCE_PUBLICATION",
+                    format!(
+                        "static property reference at continuation {} has no fixed class/local ownership plan",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let mutations = if *bind_source_into_property || dimensions.is_empty() {
+                Vec::new()
+            } else {
+                vec![reference_mutation(dimensions, false)?]
+            };
+            let dimension = !mutations.is_empty();
+            admission
+                .static_property_requirements
+                .push(NativeEntryStaticPropertyRequirement {
+                    continuation_id: instruction.continuation_id,
+                    required_state: if dimension {
+                        crate::JIT_NATIVE_TRUSTED_STATIC_PROPERTY_WRITABLE
+                    } else {
+                        crate::JIT_NATIVE_TRUSTED_STATIC_PROPERTY_WRITABLE
+                    },
+                    readable: !*bind_source_into_property || dimension,
+                    releasable: *bind_source_into_property && !dimension,
+                    allow_reference: !dimension,
+                    require_reference: false,
+                    probe_paths: Vec::new(),
+                    mutations,
+                });
+            admission.fixed_value_allocations = admission.fixed_value_allocations.saturating_add(1);
+            admission
+                .total_array_calls
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
+        }
+        if let RegionCallTarget::Semantic { operation } = &call.target
+            && matches!(
+                operation,
+                RegionSemanticOp::PropertyDimAssign { .. }
+                    | RegionSemanticOp::PropertyDimUnset { .. }
+                    | RegionSemanticOp::StaticPropertyDimUnset { .. }
+            )
+        {
+            let (dimensions, append) = match operation {
+                RegionSemanticOp::PropertyDimAssign {
+                    property: RegionPropertyName::Static(_),
+                    dimensions,
+                    value,
+                    append,
+                    ..
+                } => {
+                    let fact = lowering_operand_fact(value_flow, constants, *value);
+                    if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                        || !matches!(
+                            fact.class,
+                            SsaValueClass::Int | SsaValueClass::Bool | SsaValueClass::Null
+                        )
+                    {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_PROPERTY_DIM_VALUE_OWNERSHIP",
+                            format!(
+                                "property dimension assignment at continuation {} has no immediate ownership plan",
+                                instruction.continuation_id,
+                            ),
+                        ));
+                    }
+                    (dimensions, *append)
+                }
+                RegionSemanticOp::PropertyDimUnset {
+                    property: RegionPropertyName::Static(_),
+                    dimensions,
+                    ..
+                }
+                | RegionSemanticOp::StaticPropertyDimUnset {
+                    class_name: crate::region_ir::RegionClassName::Static(_),
+                    dimensions,
+                    ..
+                } => (dimensions, false),
+                RegionSemanticOp::PropertyDimAssign { .. }
+                | RegionSemanticOp::PropertyDimUnset { .. } => {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DYNAMIC_PROPERTY_DIM_MUTATION_PUBLICATION",
+                        format!(
+                            "dynamic property dimension mutation at continuation {} has no fixed publication slot",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                RegionSemanticOp::StaticPropertyDimUnset { .. } => {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DYNAMIC_STATIC_PROPERTY_DIM_MUTATION_PUBLICATION",
+                        format!(
+                            "runtime-class static property dimension mutation at continuation {} has no fixed publication slot",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                _ => unreachable!("property dimension mutation was filtered above"),
+            };
+            if dimensions.is_empty() && !append {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_PROPERTY_DIM_MUTATION_ARITY",
+                    format!(
+                        "property dimension mutation at continuation {} has no dimension",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let normalized = dimensions
+                .iter()
+                .map(|key| publication_integer_array_key(constants, *key))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_PROPERTY_DIM_MUTATION_KEY_NORMALIZATION",
+                        format!(
+                            "property dimension mutation at continuation {} has a key that is not normalized at publication",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+            let mutation = if append {
+                NativeEntryArrayMutationRequirement::Append {
+                    parents: normalized,
+                }
+            } else {
+                let (&key, parents) = normalized
+                    .split_last()
+                    .expect("non-append property mutation retains a key");
+                if matches!(operation, RegionSemanticOp::PropertyDimAssign { .. }) {
+                    NativeEntryArrayMutationRequirement::Assign {
+                        parents: parents.to_vec(),
+                        key,
+                    }
+                } else {
+                    NativeEntryArrayMutationRequirement::Unset {
+                        parents: parents.to_vec(),
+                        key,
+                    }
+                }
+            };
+            match operation {
+                RegionSemanticOp::PropertyDimAssign { object, .. }
+                | RegionSemanticOp::PropertyDimUnset { object, .. } => {
+                    let NativeEntryArraySource::Parameter(parameter_index) =
+                        entry_array_source(*object, &definitions, &parameter_indices).ok_or_else(
+                            || {
+                                CraneliftLoweringError::new(
+                                    "JIT_CRANELIFT_REJECT_PROPERTY_DIM_MUTATION_OBJECT",
+                                    format!(
+                                        "property dimension mutation at continuation {} is not rooted at an entry object",
+                                        instruction.continuation_id,
+                                    ),
+                                )
+                            },
+                        )?
+                    else {
+                        unreachable!("operand-rooted property objects are parameters")
+                    };
+                    if by_ref_parameters.contains(&region.parameter_locals[parameter_index]) {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_PROPERTY_DIM_MUTATION_OBJECT_REFERENCE",
+                            format!(
+                                "property dimension mutation at continuation {} has no plain object owner",
+                                instruction.continuation_id,
+                            ),
+                        ));
+                    }
+                    admission
+                        .property_requirements
+                        .push(NativeEntryPropertyRequirement {
+                            parameter_index,
+                            continuation_id: instruction.continuation_id,
+                            required_state:
+                                crate::JIT_NATIVE_TRUSTED_PROPERTY_SLOT_DIMENSION_WRITABLE,
+                            readable: true,
+                            releasable: false,
+                            allow_reference: false,
+                            require_reference: false,
+                            probe_paths: Vec::new(),
+                            mutations: vec![mutation],
+                        });
+                }
+                RegionSemanticOp::StaticPropertyDimUnset { .. } => {
+                    admission.static_property_requirements.push(
+                        NativeEntryStaticPropertyRequirement {
+                            continuation_id: instruction.continuation_id,
+                            required_state: crate::JIT_NATIVE_TRUSTED_STATIC_PROPERTY_WRITABLE,
+                            readable: true,
+                            releasable: false,
+                            allow_reference: false,
+                            require_reference: false,
+                            probe_paths: Vec::new(),
+                            mutations: vec![mutation],
+                        },
+                    );
+                }
+                _ => unreachable!("property dimension mutation was filtered above"),
+            }
+            admission
+                .total_array_calls
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
+        }
+        if let RegionCallTarget::Semantic { operation } = &call.target
+            && matches!(
+                operation,
+                RegionSemanticOp::PropertyDimIsset { dimensions, .. }
+                    | RegionSemanticOp::PropertyDimEmpty { dimensions, .. }
+                    | RegionSemanticOp::StaticPropertyDimIsset { dimensions, .. }
+                    | RegionSemanticOp::StaticPropertyDimEmpty { dimensions, .. }
+                    if !dimensions.is_empty()
+            )
+        {
+            if matches!(
+                operation,
+                RegionSemanticOp::PropertyDimIsset {
+                    property: RegionPropertyName::Dynamic(_),
+                    ..
+                } | RegionSemanticOp::PropertyDimEmpty {
+                    property: RegionPropertyName::Dynamic(_),
+                    ..
+                }
+            ) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_DYNAMIC_PROPERTY_DIM_PUBLICATION",
+                    format!(
+                        "dynamic property dimension probe at continuation {} has no fixed publication slot",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            if matches!(
+                operation,
+                RegionSemanticOp::StaticPropertyDimIsset {
+                    class_name: crate::region_ir::RegionClassName::Dynamic(_),
+                    ..
+                } | RegionSemanticOp::StaticPropertyDimEmpty {
+                    class_name: crate::region_ir::RegionClassName::Dynamic(_),
+                    ..
+                }
+            ) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_DYNAMIC_STATIC_PROPERTY_DIM_PUBLICATION",
+                    format!(
+                        "runtime-class static property dimension probe at continuation {} has no fixed publication slot",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let dimensions = match operation {
+                RegionSemanticOp::PropertyDimIsset { dimensions, .. }
+                | RegionSemanticOp::PropertyDimEmpty { dimensions, .. }
+                | RegionSemanticOp::StaticPropertyDimIsset { dimensions, .. }
+                | RegionSemanticOp::StaticPropertyDimEmpty { dimensions, .. } => dimensions,
+                _ => unreachable!("property dimension probe was filtered above"),
+            };
+            let normalized = dimensions
+                .iter()
+                .copied()
+                .map(|key| publication_native_array_key(constants, key))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_PROPERTY_DIM_KEY_NORMALIZATION",
+                        format!(
+                            "property dimension probe at continuation {} has a key that is not normalized at publication",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+            let probe = NativeEntryArrayProbeRequirement {
+                keys: normalized,
+                leaf: NativeEntryArrayProbeLeaf::PlainValue,
+            };
+            match operation {
+                RegionSemanticOp::PropertyDimIsset {
+                    object,
+                    property: RegionPropertyName::Static(_),
+                    ..
+                }
+                | RegionSemanticOp::PropertyDimEmpty {
+                    object,
+                    property: RegionPropertyName::Static(_),
+                    ..
+                } => {
+                    let NativeEntryArraySource::Parameter(parameter_index) =
+                        entry_array_source(*object, &definitions, &parameter_indices).ok_or_else(
+                            || {
+                                CraneliftLoweringError::new(
+                                    "JIT_CRANELIFT_REJECT_PROPERTY_DIM_OBJECT_SHAPE",
+                                    format!(
+                                        "property dimension probe at continuation {} is not rooted at an entry object",
+                                        instruction.continuation_id,
+                                    ),
+                                )
+                            },
+                        )?
+                    else {
+                        unreachable!("operand-rooted property objects are parameters")
+                    };
+                    let local = region.parameter_locals[parameter_index];
+                    if by_ref_parameters.contains(&local) {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_PROPERTY_DIM_OBJECT_REFERENCE",
+                            format!(
+                                "property dimension probe at continuation {} has no plain object owner",
+                                instruction.continuation_id,
+                            ),
+                        ));
+                    }
+                    admission
+                        .property_requirements
+                        .push(NativeEntryPropertyRequirement {
+                            parameter_index,
+                            continuation_id: instruction.continuation_id,
+                            required_state: crate::JIT_NATIVE_TRUSTED_PROPERTY_SLOT_PUBLISHED,
+                            readable: true,
+                            releasable: false,
+                            allow_reference: false,
+                            require_reference: false,
+                            probe_paths: vec![probe],
+                            mutations: Vec::new(),
+                        });
+                }
+                RegionSemanticOp::StaticPropertyDimIsset { .. }
+                | RegionSemanticOp::StaticPropertyDimEmpty { .. } => {
+                    admission.static_property_requirements.push(
+                        NativeEntryStaticPropertyRequirement {
+                            continuation_id: instruction.continuation_id,
+                            required_state: crate::JIT_NATIVE_TRUSTED_STATIC_PROPERTY_READABLE,
+                            readable: true,
+                            releasable: false,
+                            allow_reference: false,
+                            require_reference: false,
+                            probe_paths: vec![probe],
+                            mutations: Vec::new(),
+                        },
+                    );
+                }
+                _ => unreachable!("property dimension probe was filtered above"),
+            }
+            admission
+                .total_array_calls
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
+        }
+        if stable_builtin_ord(&call.target) {
+            let operand = (call.args.len() == 1)
+                .then(|| direct_fixed_builtin_operand(call, 0))
+                .flatten()
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ORD_ARGUMENT",
+                        "ord requires one direct positional argument",
+                    )
+                })?;
+            match publication_string_length(constants, &definitions, operand) {
+                Some(length) if length != 0 => {}
+                Some(_) => {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ORD_PUBLICATION",
+                        format!(
+                            "ord at continuation {} receives a fixed empty string",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                None => {
+                    let fact = lowering_operand_fact(value_flow, constants, operand);
+                    let Some(NativeEntryArraySource::Parameter(parameter_index)) =
+                        entry_array_source(operand, &definitions, &parameter_indices)
+                    else {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_ORD_PUBLICATION",
+                            format!(
+                                "ord at continuation {} has no entry-rooted native string",
+                                instruction.continuation_id,
+                            ),
+                        ));
+                    };
+                    if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                        || fact.class != SsaValueClass::StringHandle
+                    {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_ORD_PUBLICATION",
+                            format!(
+                                "ord at continuation {} has no published string class",
+                                instruction.continuation_id,
+                            ),
+                        ));
+                    }
+                    admission
+                        .value_class_requirements
+                        .push(NativeEntryValueClassRequirement {
+                            parameter_index,
+                            class: SsaValueClass::StringHandle,
+                        });
+                    admission
+                        .string_requirements
+                        .push(NativeEntryStringRequirement {
+                            parameter_index,
+                            minimum_length: 1,
+                            offset: None,
+                            allocation_multiplier: 0,
+                        });
+                }
+            }
+            admission
+                .total_fixed_builtin_calls
+                .insert(instruction.continuation_id);
+            continue;
+        }
+        if stable_builtin_string_position(&call.target).is_some() {
+            if !(2..=3).contains(&call.args.len()) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_STRING_POSITION_ARITY",
+                    "string position builtin requires two or three positional arguments",
+                ));
+            }
+            let haystack = direct_fixed_builtin_operand(call, 0);
+            let needle = direct_fixed_builtin_operand(call, 1);
+            let (Some(haystack), Some(needle)) = (haystack, needle) else {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_STRING_POSITION_ARGUMENT",
+                    "string position arguments are not direct positional values",
+                ));
+            };
+            let haystack_length = publication_string_length(constants, &definitions, haystack);
+            let needle_length = publication_string_length(constants, &definitions, needle);
+            let entry_string_parameter = |operand| {
+                let fact = lowering_operand_fact(value_flow, constants, operand);
+                (fact.certainty != crate::region_ir::SsaCertainty::Unknown
+                    && fact.class == SsaValueClass::StringHandle)
+                    .then(|| {
+                        entry_array_source(operand, &definitions, &parameter_indices).and_then(
+                            |source| match source {
+                                NativeEntryArraySource::Parameter(parameter_index) => {
+                                    Some(parameter_index)
+                                }
+                                NativeEntryArraySource::TrustedGlobal(_) => None,
+                            },
+                        )
+                    })
+                    .flatten()
+            };
+            let haystack_parameter = haystack_length
+                .is_none()
+                .then(|| entry_string_parameter(haystack))
+                .flatten();
+            let needle_parameter = needle_length
+                .is_none()
+                .then(|| entry_string_parameter(needle))
+                .flatten();
+            if haystack_length.is_none() && haystack_parameter.is_none()
+                || needle_length.is_none() && needle_parameter.is_none()
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_STRING_POSITION_PUBLICATION",
+                    "string position operands have no fixed or entry-guarded native strings",
+                ));
+            }
+            let offset = call
+                .args
+                .get(2)
+                .map(|_| {
+                    let operand = direct_fixed_builtin_operand(call, 2).ok_or_else(|| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_STRING_POSITION_OFFSET",
+                            "string position offset is not a direct operand",
+                        )
+                    })?;
+                    if let Some(offset) =
+                        publication_integer_operand(constants, &definitions, operand)
+                    {
+                        return Ok(NativeEntryStringOffset::Constant(offset));
+                    }
+                    let fact = lowering_operand_fact(value_flow, constants, operand);
+                    let parameter_index =
+                        entry_array_source(operand, &definitions, &parameter_indices)
+                            .and_then(|source| match source {
+                                NativeEntryArraySource::Parameter(parameter_index) => {
+                                    Some(parameter_index)
+                                }
+                                NativeEntryArraySource::TrustedGlobal(_) => None,
+                            })
+                            .filter(|_| {
+                                fact.certainty != crate::region_ir::SsaCertainty::Unknown
+                                    && fact.class == SsaValueClass::Int
+                            })
+                            .ok_or_else(|| {
+                                CraneliftLoweringError::new(
+                                    "JIT_CRANELIFT_REJECT_STRING_POSITION_OFFSET",
+                                    "string position offset has no fixed or entry-guarded integer",
+                                )
+                            })?;
+                    Ok(NativeEntryStringOffset::Parameter(parameter_index))
+                })
+                .transpose()?
+                .unwrap_or(NativeEntryStringOffset::Constant(0));
+            if let Some(haystack_length) = haystack_length {
+                if let NativeEntryStringOffset::Constant(offset) = offset {
+                    let in_range = if offset < 0 {
+                        offset
+                            .checked_neg()
+                            .and_then(|magnitude| usize::try_from(magnitude).ok())
+                            .is_some_and(|magnitude| magnitude <= haystack_length)
+                    } else {
+                        usize::try_from(offset).is_ok_and(|offset| offset <= haystack_length)
+                    };
+                    if !in_range {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_STRING_POSITION_OFFSET",
+                            "string position offset is outside the fixed haystack",
+                        ));
+                    }
+                }
+            }
+            if let Some(parameter_index) = haystack_parameter {
+                admission
+                    .value_class_requirements
+                    .push(NativeEntryValueClassRequirement {
+                        parameter_index,
+                        class: SsaValueClass::StringHandle,
+                    });
+                admission
+                    .string_requirements
+                    .push(NativeEntryStringRequirement {
+                        parameter_index,
+                        minimum_length: 0,
+                        offset: Some(offset),
+                        allocation_multiplier: 0,
+                    });
+            } else if matches!(offset, NativeEntryStringOffset::Parameter(_)) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_STRING_POSITION_OFFSET",
+                    "dynamic string-position offset requires an entry-rooted haystack",
+                ));
+            }
+            if let Some(parameter_index) = needle_parameter {
+                admission
+                    .value_class_requirements
+                    .push(NativeEntryValueClassRequirement {
+                        parameter_index,
+                        class: SsaValueClass::StringHandle,
+                    });
+                admission
+                    .string_requirements
+                    .push(NativeEntryStringRequirement {
+                        parameter_index,
+                        minimum_length: 0,
+                        offset: None,
+                        allocation_multiplier: 0,
+                    });
+            }
+            if let NativeEntryStringOffset::Parameter(parameter_index) = offset {
+                admission
+                    .value_class_requirements
+                    .push(NativeEntryValueClassRequirement {
+                        parameter_index,
+                        class: SsaValueClass::Int,
+                    });
+            }
+            admission
+                .total_fixed_builtin_calls
+                .insert(instruction.continuation_id);
+            continue;
+        }
+        if stable_builtin_array_key_exists(&call.target) {
+            if call.args.len() != 2
+                || call.args.iter().any(|argument| {
+                    argument.name.is_some()
+                        || argument.unpack
+                        || argument.by_ref_local.is_some()
+                        || argument.by_ref_dim.is_some()
+                        || argument.by_ref_property.is_some()
+                        || argument.by_ref_property_dim.is_some()
+                })
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_KEY_EXISTS_ARITY",
+                    format!(
+                        "array_key_exists at continuation {} is not two positional by-value arguments",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let key = direct_fixed_builtin_operand(call, 0).ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_KEY_EXISTS_KEY",
+                    format!(
+                        "array_key_exists at continuation {} has no direct key operand",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?;
+            let array = direct_fixed_builtin_operand(call, 1).ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_KEY_EXISTS_ARRAY",
+                    format!(
+                        "array_key_exists at continuation {} has no direct array operand",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?;
+            let key = publication_native_array_key(constants, key).ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_KEY_EXISTS_NORMALIZATION",
+                    format!(
+                        "array_key_exists at continuation {} has no publication-normalized key",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?;
+            let source =
+                entry_array_source(array, &definitions, &parameter_indices).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_KEY_EXISTS_SHAPE",
+                        format!(
+                            "array_key_exists at continuation {} is not rooted at an entry array",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+            let NativeEntryArraySource::Parameter(source_index) = source else {
+                unreachable!("operand-rooted array_key_exists arrays are parameters")
+            };
+            if by_ref_parameters.contains(&region.parameter_locals[source_index]) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_KEY_EXISTS_REFERENCE",
+                    format!(
+                        "array_key_exists at continuation {} receives a by-reference array",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            admission
+                .array_requirements
+                .entry(source)
+                .or_default()
+                .probe_paths
+                .push(NativeEntryArrayProbeRequirement {
+                    keys: vec![key],
+                    leaf: NativeEntryArrayProbeLeaf::ExistsOnly,
+                });
+            admission
+                .total_array_calls
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
+        }
+        if let Some(unpack) = call.trailing_unpack_argument()
+            && let Some(function) = call.direct_compiled_unpack_target()
+        {
+            let parameters = &function_params
+                .get(&function)
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_UNPACK_TARGET",
+                        format!(
+                            "compiled unpack call at continuation {} has no published target signature",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?
+                .params;
+            let operand = call
+                .operands
+                .get(call.argument_operand_offset.saturating_add(unpack))
+                .copied()
+                .flatten()
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_UNPACK_OPERAND",
+                        format!(
+                            "compiled unpack call at continuation {} has no direct array operand",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+            let source =
+                entry_array_source(operand, &definitions, &parameter_indices).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_UNPACK_SHAPE",
+                        format!(
+                            "compiled unpack call at continuation {} is not rooted at an entry array",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+            let NativeEntryArraySource::Parameter(source_index) = source else {
+                unreachable!("unpack entry arrays are parameters")
+            };
+            if by_ref_parameters.contains(&region.parameter_locals[source_index]) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_UNPACK_REFERENCE",
+                    format!(
+                        "compiled unpack call at continuation {} receives a by-reference entry array",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let fixed_count = parameters.len().saturating_sub(usize::from(call.variadic));
+            let fixed_parameters = parameters
+                .iter()
+                .take(fixed_count)
+                .skip(unpack)
+                .enumerate()
+                .map(|(index, parameter)| (index, parameter.type_.clone(), parameter.by_ref))
+                .collect::<Vec<_>>();
+            if fixed_parameters
+                .iter()
+                .enumerate()
+                .any(|(index, _)| parameters[unpack + index].default.is_some())
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_UNPACK_DEFAULT_OWNERSHIP",
+                    format!(
+                        "compiled unpack call at continuation {} still needs a conditional default owner",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let required_length = fixed_parameters.len();
+            let variadic_parameter = call
+                .variadic
+                .then(|| parameters.last().filter(|parameter| parameter.variadic))
+                .flatten();
+            let requirement = admission.array_requirements.entry(source).or_default();
+            requirement.projection_allocations =
+                requirement.projection_allocations.saturating_add(1);
+            requirement
+                .unpack_calls
+                .push(NativeEntryArrayUnpackRequirement {
+                    required_length,
+                    fixed_parameters,
+                    tail_start: fixed_count.saturating_sub(unpack),
+                    tail_type: variadic_parameter.and_then(|parameter| parameter.type_.clone()),
+                    tail_by_reference: variadic_parameter.is_some_and(|parameter| parameter.by_ref),
+                });
+            admission
+                .total_array_calls
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
+        }
+        if call.args.iter().any(|argument| argument.unpack) {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_UNPACK_PUBLICATION",
+                format!(
+                    "unclassified unpack call at continuation {} is assigned to baseline before region entry",
+                    instruction.continuation_id,
+                ),
+            ));
+        }
+        let compiled_parameters = call
+            .direct_compiled_target()
+            .and_then(|target| function_params.get(&target))
+            .map(|metadata| metadata.params.as_slice())
+            .or_else(|| {
+                let (name, link_index) = match &call.target {
+                    RegionCallTarget::Function {
+                        name,
+                        function: None,
+                    } => (Some(name.as_str()), None),
+                    RegionCallTarget::Method {
+                        function: None,
+                        linked_function: Some(link_index),
+                        receiver_layout_id: Some(_),
+                        ..
+                    } => (None, Some(*link_index)),
+                    _ => return None,
+                };
+                external_function_signatures
+                    .iter()
+                    .find(|signature| {
+                        signature.published
+                            && (name.is_some_and(|name| {
+                                signature
+                                    .name
+                                    .trim_start_matches('\\')
+                                    .eq_ignore_ascii_case(name.trim_start_matches('\\'))
+                            }) || link_index == Some(signature.link_index))
+                    })
+                    .map(|signature| signature.native_params.as_slice())
+            });
+        if let Some(parameters) = compiled_parameters {
+            for (index, operand) in call
+                .operands
+                .iter()
+                .skip(call.argument_operand_offset)
+                .copied()
+                .enumerate()
+            {
+                let Some(operand) = operand else {
+                    continue;
+                };
+                let Some(parameter) = parameters
+                    .get(index)
+                    .or_else(|| parameters.last().filter(|parameter| parameter.variadic))
+                else {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_COMPILED_CALL_ARITY",
+                        format!(
+                            "compiled call at continuation {} exceeds its published arity",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                };
+                let fact = lowering_operand_fact(value_flow, constants, operand);
+                if parameter
+                    .type_
+                    .as_ref()
+                    .is_some_and(|type_| !optimizing_fact_satisfies_type(fact, type_))
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_CALL_COERCION_PUBLICATION",
+                        format!(
+                            "compiled call argument {index} at continuation {} still requires a runtime scalar coercion",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                if parameter.by_ref {
+                    continue;
+                }
+                match fact.class {
+                    SsaValueClass::Int
+                    | SsaValueClass::Float
+                    | SsaValueClass::StringHandle
+                    | SsaValueClass::Bool
+                    | SsaValueClass::Null
+                        if fact.certainty != crate::region_ir::SsaCertainty::Unknown =>
+                    {
+                        if let Some(NativeEntryArraySource::Parameter(parameter_index)) =
+                            entry_array_source(operand, &definitions, &parameter_indices)
+                        {
+                            admission.value_class_requirements.push(
+                                NativeEntryValueClassRequirement {
+                                    parameter_index,
+                                    class: fact.class,
+                                },
+                            );
+                            entry_dependent_continuations.insert(instruction.continuation_id);
+                        }
+                    }
+                    SsaValueClass::ArrayHandle
+                        if fact.certainty != crate::region_ir::SsaCertainty::Unknown =>
+                    {
+                        let source = publication_entry_array_source(
+                            region,
+                            &definitions,
+                            &parameter_indices,
+                            &by_ref_parameters,
+                            operand,
+                            instruction.continuation_id,
+                            "compiled call array argument",
+                        )?;
+                        admission.array_requirements.entry(source).or_default();
+                        entry_dependent_continuations.insert(instruction.continuation_id);
+                    }
+                    _ if fact.certainty == crate::region_ir::SsaCertainty::Unknown => {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_CALL_VALUE_PUBLICATION",
+                            format!(
+                                "compiled call argument {index} at continuation {} has no authoritative entry class",
+                                instruction.continuation_id,
+                            ),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let direct_arguments = (0..call.args.len())
+            .map(|index| direct_fixed_builtin_operand(call, index))
+            .collect::<Option<Vec<_>>>();
+        if let Some(arguments) = direct_arguments.as_ref() {
+            let continuation = instruction.continuation_id;
+            macro_rules! admit_known_scalar {
+                ($operand:expr, $family:expr) => {{
+                    let operand = $operand;
+                    let family = $family;
+                    let fact = lowering_operand_fact(value_flow, constants, operand);
+                    if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                        || !matches!(
+                            fact.class,
+                            SsaValueClass::Int
+                                | SsaValueClass::Float
+                                | SsaValueClass::StringHandle
+                                | SsaValueClass::Bool
+                                | SsaValueClass::Null
+                        )
+                    {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_SCALAR_PUBLICATION",
+                            format!(
+                                "{family} at continuation {continuation} has no total scalar class",
+                            ),
+                        ));
+                    }
+                    admit_publication_scalar_class(
+                        &mut admission,
+                        value_flow,
+                        constants,
+                        &definitions,
+                        &parameter_indices,
+                        operand,
+                        fact.class,
+                        continuation,
+                        family,
+                    )?;
+                    Ok(fact.class)
+                }};
+            }
+
+            if matches!(
+                stable_builtin_scalar_consumer(&call.target),
+                Some(
+                    StableScalarConsumerBuiltin::GetType
+                        | StableScalarConsumerBuiltin::GetDebugType
+                )
+            ) {
+                if arguments.len() != 1 {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_TYPE_NAME_ARITY",
+                        "type-name builtin requires one positional operand",
+                    ));
+                }
+                admit_known_scalar!(arguments[0], "type-name")?;
+                admission.fixed_string_bytes = admission.fixed_string_bytes.saturating_add(16);
+            }
+
+            if let Some(operation) = stable_builtin_numeric_operator(&call.target) {
+                match operation {
+                    StableNumericOperatorBuiltin::IntDiv => {
+                        if arguments.len() != 2 {
+                            return Err(CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_INTDIV_ARITY",
+                                "intdiv requires two positional operands",
+                            ));
+                        }
+                        admit_publication_integer(
+                            &mut admission,
+                            value_flow,
+                            constants,
+                            &definitions,
+                            &parameter_indices,
+                            arguments[0],
+                            i64::MIN.saturating_add(1),
+                            i64::MAX,
+                            &[],
+                            continuation,
+                            "intdiv dividend",
+                        )?;
+                        admit_publication_integer(
+                            &mut admission,
+                            value_flow,
+                            constants,
+                            &definitions,
+                            &parameter_indices,
+                            arguments[1],
+                            i64::MIN,
+                            i64::MAX,
+                            &[0],
+                            continuation,
+                            "intdiv divisor",
+                        )?;
+                    }
+                    StableNumericOperatorBuiltin::Round => {
+                        let value = arguments.first().copied().ok_or_else(|| {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_ROUND_ARITY",
+                                "round requires a numeric operand",
+                            )
+                        })?;
+                        let class = admit_known_scalar!(value, "round")?;
+                        if !matches!(class, SsaValueClass::Int | SsaValueClass::Float) {
+                            return Err(CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_ROUND_TYPE",
+                                "round operand is not publication-proven numeric",
+                            ));
+                        }
+                        if let Some(&precision) = arguments.get(1) {
+                            admit_publication_integer(
+                                &mut admission,
+                                value_flow,
+                                constants,
+                                &definitions,
+                                &parameter_indices,
+                                precision,
+                                i64::MIN,
+                                i64::MAX,
+                                &[],
+                                continuation,
+                                "round precision",
+                            )?;
+                        }
+                        if let Some(&mode) = arguments.get(2) {
+                            admit_publication_integer(
+                                &mut admission,
+                                value_flow,
+                                constants,
+                                &definitions,
+                                &parameter_indices,
+                                mode,
+                                1,
+                                8,
+                                &[],
+                                continuation,
+                                "round mode",
+                            )?;
+                        }
+                    }
+                    StableNumericOperatorBuiltin::Pow => {}
+                }
+            }
+
+            if let Some(operation) = stable_builtin_extrema(&call.target) {
+                if arguments.len() == 1 {
+                    let source = publication_entry_array_source(
+                        region,
+                        &definitions,
+                        &parameter_indices,
+                        &by_ref_parameters,
+                        arguments[0],
+                        continuation,
+                        "extrema",
+                    )?;
+                    let requirement = admission.array_requirements.entry(source).or_default();
+                    requirement.minimum_length = requirement.minimum_length.max(1);
+                    requirement.require_plain_values = true;
+                    requirement.require_scalar_values = true;
+                    entry_dependent_continuations.insert(continuation);
+                } else {
+                    for &argument in arguments {
+                        admit_known_scalar!(
+                            argument,
+                            match operation {
+                                StableExtremaBuiltin::Max => "max",
+                                StableExtremaBuiltin::Min => "min",
+                            }
+                        )?;
+                    }
+                }
+            }
+
+            if let Some(_operation) = stable_builtin_array_lookup(&call.target) {
+                if !(2..=3).contains(&arguments.len()) {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_LOOKUP_ARGUMENTS",
+                        "array lookup is not a two/three-argument positional call",
+                    ));
+                }
+                admit_known_scalar!(arguments[0], "array lookup needle")?;
+                if let Some(&strict) = arguments.get(2) {
+                    admit_publication_scalar_class(
+                        &mut admission,
+                        value_flow,
+                        constants,
+                        &definitions,
+                        &parameter_indices,
+                        strict,
+                        SsaValueClass::Bool,
+                        continuation,
+                        "array lookup strict flag",
+                    )?;
+                }
+            }
+
+            if stable_builtin_substr(&call.target) {
+                if !(2..=3).contains(&arguments.len()) {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_SUBSTR_ARITY",
+                        "substr requires two or three positional operands",
+                    ));
+                }
+                admit_publication_string(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    arguments[0],
+                    0,
+                    1,
+                    continuation,
+                    "substr",
+                )?;
+                admit_publication_integer(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    arguments[1],
+                    i64::MIN,
+                    i64::MAX,
+                    &[],
+                    continuation,
+                    "substr offset",
+                )?;
+                if let Some(&requested) = arguments.get(2) {
+                    let fact = lowering_operand_fact(value_flow, constants, requested);
+                    if fact.class != SsaValueClass::Null {
+                        admit_publication_integer(
+                            &mut admission,
+                            value_flow,
+                            constants,
+                            &definitions,
+                            &parameter_indices,
+                            requested,
+                            i64::MIN,
+                            i64::MAX,
+                            &[],
+                            continuation,
+                            "substr length",
+                        )?;
+                    }
+                }
+            }
+
+            if stable_builtin_str_repeat(&call.target) {
+                if arguments.len() != 2 {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_STR_REPEAT_ARITY",
+                        "str_repeat requires two positional operands",
+                    ));
+                }
+                let count = publication_integer_operand(constants, &definitions, arguments[1])
+                    .filter(|count| *count >= 0)
+                    .and_then(|count| usize::try_from(count).ok())
+                    .ok_or_else(|| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_STR_REPEAT_PUBLICATION",
+                            "str_repeat count is not a fixed nonnegative integer",
+                        )
+                    })?;
+                admit_publication_string(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    arguments[0],
+                    0,
+                    count,
+                    continuation,
+                    "str_repeat",
+                )?;
+            }
+
+            if stable_builtin_substr_count(&call.target) {
+                if arguments.len() != 2 {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_SUBSTR_COUNT_ARITY",
+                        "substr_count requires two positional operands",
+                    ));
+                }
+                for (operand, minimum, family) in [
+                    (arguments[0], 0, "substr_count haystack"),
+                    (arguments[1], 1, "substr_count needle"),
+                ] {
+                    admit_publication_string(
+                        &mut admission,
+                        value_flow,
+                        constants,
+                        &definitions,
+                        &parameter_indices,
+                        operand,
+                        minimum,
+                        0,
+                        continuation,
+                        family,
+                    )?;
+                }
+            }
+
+            if let Some(operation) = stable_builtin_string_compare(&call.target) {
+                let expected = if operation.bounded() { 3 } else { 2 };
+                if arguments.len() != expected {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_STRING_COMPARE_ARITY",
+                        "string comparison has unsupported arity",
+                    ));
+                }
+                for &operand in &arguments[..2] {
+                    admit_publication_string(
+                        &mut admission,
+                        value_flow,
+                        constants,
+                        &definitions,
+                        &parameter_indices,
+                        operand,
+                        0,
+                        0,
+                        continuation,
+                        "string comparison",
+                    )?;
+                }
+                if operation.bounded() {
+                    admit_publication_integer(
+                        &mut admission,
+                        value_flow,
+                        constants,
+                        &definitions,
+                        &parameter_indices,
+                        arguments[2],
+                        0,
+                        i64::MAX,
+                        &[],
+                        continuation,
+                        "bounded string comparison length",
+                    )?;
+                }
+            }
+
+            if stable_builtin_str_replace(&call.target) {
+                if arguments.len() != 3 {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_STR_REPLACE_ARITY",
+                        "str_replace requires three positional scalar strings",
+                    ));
+                }
+                let search_length =
+                    publication_string_length(constants, &definitions, arguments[0]).ok_or_else(
+                        || {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_STR_REPLACE_PUBLICATION",
+                                "str_replace search string is not fixed at publication",
+                            )
+                        },
+                    )?;
+                let replacement_length =
+                    publication_string_length(constants, &definitions, arguments[1]).ok_or_else(
+                        || {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_STR_REPLACE_PUBLICATION",
+                                "str_replace replacement string is not fixed at publication",
+                            )
+                        },
+                    )?;
+                let multiplier = if search_length == 0 {
+                    1
+                } else {
+                    replacement_length.max(1)
+                };
+                admit_publication_string(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    arguments[2],
+                    0,
+                    multiplier,
+                    continuation,
+                    "str_replace subject",
+                )?;
+            }
+
+            if stable_builtin_explode(&call.target) {
+                if arguments.len() != 2 {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_EXPLODE_ARITY",
+                        "explode requires two positional strings",
+                    ));
+                }
+                let delimiter_length =
+                    publication_string_length(constants, &definitions, arguments[0])
+                        .filter(|length| *length != 0)
+                        .ok_or_else(|| {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_EXPLODE_PUBLICATION",
+                                "explode delimiter is not a fixed nonempty string",
+                            )
+                        })?;
+                let input_length = publication_string_length(constants, &definitions, arguments[1])
+                    .ok_or_else(|| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_EXPLODE_PUBLICATION",
+                            "explode input is not a fixed string",
+                        )
+                    })?;
+                let pieces = input_length
+                    .checked_div(delimiter_length)
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                admission.fixed_value_allocations = admission
+                    .fixed_value_allocations
+                    .saturating_add(pieces.saturating_add(1));
+                admission.fixed_array_entries = admission.fixed_array_entries.saturating_add(
+                    pieces
+                        .max(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
+                        .next_power_of_two(),
+                );
+                admission.fixed_string_bytes =
+                    admission.fixed_string_bytes.saturating_add(
+                        input_length
+                            .saturating_add(pieces.saturating_mul(
+                                crate::JIT_NATIVE_DIRECT_STRING_MIN_CAPACITY as usize,
+                            ))
+                            .saturating_mul(2),
+                    );
+            }
+
+            if stable_builtin_implode(&call.target) {
+                if arguments.len() != 2 {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_IMPLODE_ARITY",
+                        "implode requires a fixed separator and an entry array",
+                    ));
+                }
+                let separator_length =
+                    publication_string_length(constants, &definitions, arguments[0]).ok_or_else(
+                        || {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_IMPLODE_PUBLICATION",
+                                "implode separator is not fixed at publication",
+                            )
+                        },
+                    )?;
+                let source = publication_entry_array_source(
+                    region,
+                    &definitions,
+                    &parameter_indices,
+                    &by_ref_parameters,
+                    arguments[1],
+                    continuation,
+                    "implode",
+                )?;
+                let requirement = admission.array_requirements.entry(source).or_default();
+                requirement.require_plain_values = true;
+                requirement.require_string_values = true;
+                requirement.implode_separator_lengths.push(separator_length);
+                entry_dependent_continuations.insert(continuation);
+            }
+
+            if let Some(_operation) = stable_builtin_ascii_case(&call.target)
+                && arguments.len() == 1
+            {
+                admit_publication_string(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    arguments[0],
+                    0,
+                    1,
+                    continuation,
+                    "ASCII case conversion",
+                )?;
+            }
+            if let Some(_operation) = stable_builtin_string_transform(&call.target)
+                && arguments.len() == 1
+            {
+                admit_publication_string(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    arguments[0],
+                    0,
+                    1,
+                    continuation,
+                    "string transform",
+                )?;
+            }
+            if stable_builtin_addslashes(&call.target) && arguments.len() == 1 {
+                admit_publication_string(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    arguments[0],
+                    0,
+                    2,
+                    continuation,
+                    "addslashes",
+                )?;
+            }
+        }
+        if let Some(operation) = stable_builtin_array_constructor(&call.target) {
+            let arguments = direct_arguments.as_ref().ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_CONSTRUCTOR_ARGUMENTS",
+                    format!(
+                        "array constructor at continuation {} is not fully positional and direct",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?;
+            let expected = match operation {
+                StableArrayConstructorBuiltin::Fill => 3,
+                StableArrayConstructorBuiltin::FillKeys
+                | StableArrayConstructorBuiltin::Combine => 2,
+                StableArrayConstructorBuiltin::Flip => 1,
+            };
+            if arguments.len() != expected {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_CONSTRUCTOR_ARITY",
+                    format!(
+                        "array constructor at continuation {} has arity {}, expected {expected}",
+                        instruction.continuation_id,
+                        arguments.len(),
+                    ),
+                ));
+            }
+            if operation == StableArrayConstructorBuiltin::Fill {
+                let start = publication_integer_operand(constants, &definitions, arguments[0]);
+                let count = publication_integer_operand(constants, &definitions, arguments[1]);
+                let (Some(start), Some(count)) = (start, count) else {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_FILL_PUBLICATION",
+                        format!(
+                            "array_fill at continuation {} has no fixed integer range",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                };
+                let count = usize::try_from(count).ok().filter(|count| {
+                    *count <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY as usize
+                });
+                let Some(count) = count else {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_FILL_RANGE",
+                        format!(
+                            "array_fill at continuation {} exceeds the native result bound",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                };
+                if count != 0
+                    && start
+                        .checked_add(i64::try_from(count - 1).unwrap_or(i64::MAX))
+                        .is_none()
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_FILL_RANGE",
+                        format!(
+                            "array_fill at continuation {} overflows its integer-key range",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                let value = lowering_operand_fact(value_flow, constants, arguments[2]);
+                if value.certainty == crate::region_ir::SsaCertainty::Unknown
+                    || matches!(
+                        value.class,
+                        SsaValueClass::ReferenceHandle | SsaValueClass::MixedHandle
+                    )
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_FILL_VALUE",
+                        format!(
+                            "array_fill at continuation {} has no publication-stable value owner",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                let capacity = count
+                    .max(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
+                    .checked_next_power_of_two()
+                    .filter(|capacity| {
+                        *capacity <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY as usize
+                    })
+                    .ok_or_else(|| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_ARRAY_FILL_CAPACITY",
+                            "array_fill result capacity does not fit the native arena",
+                        )
+                    })?;
+                admission.fixed_array_entries =
+                    admission.fixed_array_entries.saturating_add(capacity);
+                admission.fixed_value_allocations = admission
+                    .fixed_value_allocations
+                    .saturating_add(count.saturating_add(1));
+            } else {
+                let source_count =
+                    usize::from(operation == StableArrayConstructorBuiltin::Combine) + 1;
+                let mut sources = Vec::with_capacity(source_count);
+                for operand in arguments.iter().copied().take(source_count) {
+                    let source = publication_entry_array_source(
+                        region,
+                        &definitions,
+                        &parameter_indices,
+                        &by_ref_parameters,
+                        operand,
+                        instruction.continuation_id,
+                        "array constructor",
+                    )?;
+                    let requirement = admission.array_requirements.entry(source).or_default();
+                    requirement.require_plain_values = true;
+                    requirement.projection_allocations =
+                        requirement.projection_allocations.saturating_add(1);
+                    sources.push(source);
+                }
+                let keys = admission
+                    .array_requirements
+                    .get_mut(&sources[0])
+                    .expect("constructor source was inserted");
+                keys.require_key_values = true;
+                if operation == StableArrayConstructorBuiltin::Combine {
+                    admission.equal_array_length_groups.push(sources);
+                }
+            }
+            admission
+                .total_array_calls
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
+        }
+        if let Some(operation) = stable_builtin_array_shape(&call.target) {
+            let arguments = direct_arguments.as_ref().ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_SHAPE_ARGUMENTS",
+                    format!(
+                        "array shape operation at continuation {} is not fully positional and direct",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?;
+            if operation == StableArrayShapeBuiltin::Range {
+                if !(2..=3).contains(&arguments.len()) {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_RANGE_ARITY",
+                        "range requires two or three positional arguments",
+                    ));
+                }
+                let start = publication_integer_operand(constants, &definitions, arguments[0]);
+                let end = publication_integer_operand(constants, &definitions, arguments[1]);
+                let step = arguments
+                    .get(2)
+                    .map(|operand| publication_integer_operand(constants, &definitions, *operand))
+                    .unwrap_or(Some(1));
+                let (Some(start), Some(end), Some(step)) = (start, end, step) else {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_RANGE_PUBLICATION",
+                        format!(
+                            "range at continuation {} is not fixed before publication",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                };
+                if step <= 0 {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_RANGE_STEP",
+                        "range step is not a positive native integer",
+                    ));
+                }
+                let distance = (i128::from(end) - i128::from(start)).abs();
+                let count = distance / i128::from(step) + 1;
+                let count = usize::try_from(count).ok().filter(|count| {
+                    *count <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY as usize
+                });
+                let Some(count) = count else {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_RANGE_CAPACITY",
+                        "range result exceeds the native arena",
+                    ));
+                };
+                let capacity = count
+                    .max(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
+                    .checked_next_power_of_two()
+                    .ok_or_else(|| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_RANGE_CAPACITY",
+                            "range result capacity overflowed",
+                        )
+                    })?;
+                admission.fixed_array_entries =
+                    admission.fixed_array_entries.saturating_add(capacity);
+                admission.fixed_value_allocations = admission
+                    .fixed_value_allocations
+                    .saturating_add(count.saturating_add(1));
+            } else {
+                let expected = match operation {
+                    StableArrayShapeBuiltin::Pad => 3..=3,
+                    StableArrayShapeBuiltin::Chunk | StableArrayShapeBuiltin::Column => 2..=3,
+                    StableArrayShapeBuiltin::Unique => 1..=2,
+                    StableArrayShapeBuiltin::Range => unreachable!(),
+                };
+                if !expected.contains(&arguments.len()) {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_SHAPE_ARITY",
+                        format!(
+                            "array shape operation at continuation {} has unsupported arity",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                if operation == StableArrayShapeBuiltin::Column {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_COLUMN_NESTED_PUBLICATION",
+                        format!(
+                            "array_column at continuation {} requires a nested-row publication plan",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                let source = publication_entry_array_source(
+                    region,
+                    &definitions,
+                    &parameter_indices,
+                    &by_ref_parameters,
+                    arguments[0],
+                    instruction.continuation_id,
+                    "array shape operation",
+                )?;
+                let requirement = admission.array_requirements.entry(source).or_default();
+                requirement.require_plain_values = true;
+                requirement.require_supported_keys = true;
+                requirement.projection_allocations =
+                    requirement.projection_allocations.saturating_add(1);
+                match operation {
+                    StableArrayShapeBuiltin::Pad => {
+                        let requested =
+                            publication_integer_operand(constants, &definitions, arguments[1])
+                                .filter(|value| *value != i64::MIN)
+                                .ok_or_else(|| {
+                                    CraneliftLoweringError::new(
+                                        "JIT_CRANELIFT_REJECT_ARRAY_PAD_PUBLICATION",
+                                        "array_pad length is not a fixed valid integer",
+                                    )
+                                })?;
+                        let magnitude =
+                            usize::try_from(requested.unsigned_abs()).map_err(|_| {
+                                CraneliftLoweringError::new(
+                                    "JIT_CRANELIFT_REJECT_ARRAY_PAD_CAPACITY",
+                                    "array_pad length does not fit the native arena",
+                                )
+                            })?;
+                        let capacity = magnitude
+                            .max(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
+                            .checked_next_power_of_two()
+                            .filter(|capacity| {
+                                *capacity <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY as usize
+                            })
+                            .ok_or_else(|| {
+                                CraneliftLoweringError::new(
+                                    "JIT_CRANELIFT_REJECT_ARRAY_PAD_CAPACITY",
+                                    "array_pad result exceeds the native arena",
+                                )
+                            })?;
+                        admission.fixed_array_entries =
+                            admission.fixed_array_entries.saturating_add(capacity);
+                    }
+                    StableArrayShapeBuiltin::Chunk => {
+                        publication_integer_operand(constants, &definitions, arguments[1])
+                            .filter(|size| *size > 0)
+                            .ok_or_else(|| {
+                                CraneliftLoweringError::new(
+                                    "JIT_CRANELIFT_REJECT_ARRAY_CHUNK_PUBLICATION",
+                                    "array_chunk size is not a fixed positive integer",
+                                )
+                            })?;
+                        requirement.value_allocations_per_entry =
+                            requirement.value_allocations_per_entry.saturating_add(1);
+                        requirement.entry_allocations_per_entry =
+                            requirement.entry_allocations_per_entry.saturating_add(
+                                crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize,
+                            );
+                    }
+                    StableArrayShapeBuiltin::Unique => {
+                        if let Some(flags) = arguments.get(1)
+                            && publication_integer_operand(constants, &definitions, *flags)
+                                != Some(2)
+                        {
+                            return Err(CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_ARRAY_UNIQUE_FLAGS",
+                                "array_unique optimizing publication accepts only SORT_STRING",
+                            ));
+                        }
+                        requirement.require_string_values = true;
+                    }
+                    StableArrayShapeBuiltin::Column | StableArrayShapeBuiltin::Range => {
+                        unreachable!()
+                    }
+                }
+            }
+            admission
+                .total_array_calls
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
+        }
+        if let Some(operation) = stable_builtin_array_set(&call.target) {
+            let arguments = direct_arguments.as_ref().ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_SET_ARGUMENTS",
+                    "array set operation is not fully positional and direct",
+                )
+            })?;
+            if arguments.is_empty() || operation.requires_two_arrays() && arguments.len() < 2 {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_SET_ARITY",
+                    "array set operation has insufficient array arguments",
+                ));
+            }
+            for (index, operand) in arguments.iter().copied().enumerate() {
+                let source = publication_entry_array_source(
+                    region,
+                    &definitions,
+                    &parameter_indices,
+                    &by_ref_parameters,
+                    operand,
+                    instruction.continuation_id,
+                    "array set operation",
+                )?;
+                let requirement = admission.array_requirements.entry(source).or_default();
+                requirement.require_plain_values = true;
+                requirement.require_supported_keys = true;
+                requirement.require_string_values |= operation.value_sensitive();
+                if index == 0 || operation == StableArraySetBuiltin::Replace {
+                    requirement.projection_allocations =
+                        requirement.projection_allocations.saturating_add(1);
+                }
+            }
+            admission
+                .total_array_calls
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
+        }
+        if let Some(operation) = stable_builtin_callback_neutral_array(&call.target) {
+            let arguments = direct_arguments.as_ref().ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_CALLBACK_NEUTRAL_ARGUMENTS",
+                    "callback-neutral array operation is not positional and direct",
+                )
+            })?;
+            let arrays = match operation {
+                StableCallbackNeutralArrayBuiltin::MapNull if arguments.len() >= 2 => {
+                    &arguments[1..]
+                }
+                StableCallbackNeutralArrayBuiltin::FilterTruthy
+                    if (1..=2).contains(&arguments.len()) =>
+                {
+                    &arguments[..1]
+                }
+                _ => {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_CALLBACK_NEUTRAL_ARITY",
+                        "callback-neutral array operation has unsupported arity",
+                    ));
+                }
+            };
+            if operation == StableCallbackNeutralArrayBuiltin::MapNull {
+                let callback = lowering_operand_fact(value_flow, constants, arguments[0]);
+                if callback.certainty == crate::region_ir::SsaCertainty::Unknown
+                    || callback.class != SsaValueClass::Null
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_MAP_NULL_PUBLICATION",
+                        "array_map callback is not publication-proven null",
+                    ));
+                }
+            } else if let Some(callback) = arguments.get(1) {
+                let callback = lowering_operand_fact(value_flow, constants, *callback);
+                if callback.certainty == crate::region_ir::SsaCertainty::Unknown
+                    || callback.class != SsaValueClass::Null
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_FILTER_NULL_PUBLICATION",
+                        "array_filter callback is not publication-proven null",
+                    ));
+                }
+            }
+            for operand in arrays {
+                let source = publication_entry_array_source(
+                    region,
+                    &definitions,
+                    &parameter_indices,
+                    &by_ref_parameters,
+                    *operand,
+                    instruction.continuation_id,
+                    "callback-neutral array operation",
+                )?;
+                let requirement = admission.array_requirements.entry(source).or_default();
+                requirement.require_plain_values = true;
+                requirement.require_supported_keys = true;
+                requirement.projection_allocations =
+                    requirement.projection_allocations.saturating_add(1);
+                if operation == StableCallbackNeutralArrayBuiltin::MapNull && arrays.len() > 1 {
+                    requirement.value_allocations_per_entry =
+                        requirement.value_allocations_per_entry.saturating_add(1);
+                    requirement.entry_allocations_per_entry =
+                        requirement.entry_allocations_per_entry.saturating_add(
+                            arrays
+                                .len()
+                                .max(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
+                                .next_power_of_two(),
+                        );
+                }
+            }
+            admission
+                .total_array_calls
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
+        }
+        if stable_builtin_array_slice(&call.target)
+            || stable_builtin_array_reverse(&call.target)
+            || stable_builtin_array_merge(&call.target)
+        {
+            let arguments = direct_arguments.as_ref().ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_COPY_ARGUMENTS",
+                    "array copy operation is not positional and direct",
+                )
+            })?;
+            let array_operands: &[RegionOperand] = if stable_builtin_array_merge(&call.target) {
+                if arguments.is_empty() {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_MERGE_ARITY",
+                        "array_merge requires at least one array",
+                    ));
+                }
+                arguments
+            } else {
+                if stable_builtin_array_slice(&call.target) && !(2..=4).contains(&arguments.len())
+                    || stable_builtin_array_reverse(&call.target)
+                        && !(1..=2).contains(&arguments.len())
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_COPY_ARITY",
+                        "array copy operation has unsupported arity",
+                    ));
+                }
+                &arguments[..1]
+            };
+            if stable_builtin_array_slice(&call.target) {
+                publication_integer_operand(constants, &definitions, arguments[1]).ok_or_else(
+                    || {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_ARRAY_SLICE_OFFSET",
+                            "array_slice offset is not fixed at publication",
+                        )
+                    },
+                )?;
+                if let Some(length) = arguments.get(2) {
+                    let fact = lowering_operand_fact(value_flow, constants, *length);
+                    if publication_integer_operand(constants, &definitions, *length).is_none()
+                        && fact.class != SsaValueClass::Null
+                    {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_ARRAY_SLICE_LENGTH",
+                            "array_slice length is neither fixed integer nor null",
+                        ));
+                    }
+                }
+            }
+            for operand in array_operands {
+                let source = publication_entry_array_source(
+                    region,
+                    &definitions,
+                    &parameter_indices,
+                    &by_ref_parameters,
+                    *operand,
+                    instruction.continuation_id,
+                    "array copy operation",
+                )?;
+                let requirement = admission.array_requirements.entry(source).or_default();
+                requirement.require_plain_values = true;
+                requirement.require_supported_keys = true;
+                requirement.projection_allocations =
+                    requirement.projection_allocations.saturating_add(1);
+            }
+            admission
+                .total_array_calls
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
+        }
+        if let Some(_operation) = stable_builtin_array_lookup(&call.target) {
+            let arguments = direct_arguments
+                .as_ref()
+                .filter(|args| (2..=3).contains(&args.len()))
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_LOOKUP_ARGUMENTS",
+                        "array lookup is not a two/three-argument positional call",
+                    )
+                })?;
+            let source = publication_entry_array_source(
+                region,
+                &definitions,
+                &parameter_indices,
+                &by_ref_parameters,
+                arguments[1],
+                instruction.continuation_id,
+                "array lookup",
+            )?;
+            let requirement = admission.array_requirements.entry(source).or_default();
+            requirement.require_plain_values = true;
+            requirement.require_supported_keys = true;
+            requirement.require_scalar_values = true;
+            admission
+                .total_array_calls
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
+        }
+        if let Some(operation) = stable_builtin_array_pointer(&call.target) {
+            if call.args.len() != 1 {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_POINTER_ARITY",
+                    "array pointer operation requires one argument",
+                ));
+            }
+            let operand = if operation.is_read_only() {
+                direct_fixed_builtin_operand(call, 0).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_POINTER_ARGUMENT",
+                        "read-only array pointer has no direct array operand",
+                    )
+                })?
+            } else {
+                let local = call.args[0]
+                    .by_ref_local
+                    .filter(|_| call.args[0].name.is_none() && !call.args[0].unpack)
+                    .ok_or_else(|| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_ARRAY_POINTER_LVALUE",
+                            "mutating array pointer has no direct local lvalue",
+                        )
+                    })?;
+                RegionOperand::Local(local)
+            };
+            let source = publication_entry_array_source(
+                region,
+                &definitions,
+                &parameter_indices,
+                &by_ref_parameters,
+                operand,
+                instruction.continuation_id,
+                "array pointer operation",
+            )?;
+            let requirement = admission.array_requirements.entry(source).or_default();
+            requirement.require_supported_keys = true;
+            requirement.require_plain_values = true;
+            if !operation.is_read_only() {
+                requirement.projection_allocations =
+                    requirement.projection_allocations.saturating_add(1);
+            }
+            admission
+                .total_array_calls
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
+        }
+        if let Some(operation) = stable_builtin_array_stack(&call.target) {
+            if call.args.len() < operation.minimum_arity() {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_STACK_ARITY",
+                    "array stack operation has insufficient arguments",
+                ));
+            }
+            let local = call.args[0]
+                .by_ref_local
+                .filter(|_| call.args[0].name.is_none() && !call.args[0].unpack)
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_STACK_LVALUE",
+                        "array stack operation has no direct local lvalue",
+                    )
+                })?;
+            let source = publication_entry_array_source(
+                region,
+                &definitions,
+                &parameter_indices,
+                &by_ref_parameters,
+                RegionOperand::Local(local),
+                instruction.continuation_id,
+                "array stack operation",
+            )?;
+            if call
+                .args
+                .iter()
+                .skip(1)
+                .enumerate()
+                .any(|(index, argument)| {
+                    argument.name.is_some()
+                        || argument.unpack
+                        || direct_fixed_builtin_operand(call, index + 1).is_none_or(|operand| {
+                            let fact = lowering_operand_fact(value_flow, constants, operand);
+                            fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                                || matches!(
+                                    fact.class,
+                                    SsaValueClass::ReferenceHandle | SsaValueClass::MixedHandle
+                                )
+                        })
+                })
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_STACK_VALUE",
+                    "array stack values have no publication-stable ownership",
+                ));
+            }
+            let requirement = admission.array_requirements.entry(source).or_default();
+            requirement.require_supported_keys = true;
+            requirement.require_plain_values = true;
+            requirement.projection_allocations =
+                requirement.projection_allocations.saturating_add(1);
+            admission.fixed_array_entries = admission.fixed_array_entries.saturating_add(
+                call.args
+                    .len()
+                    .saturating_sub(1)
+                    .saturating_mul(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize),
+            );
+            admission
+                .total_array_calls
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
+        }
+        if stable_builtin_array_splice(&call.target) {
+            if !(2..=4).contains(&call.args.len()) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_SPLICE_ARITY",
+                    "array_splice has unsupported arity",
+                ));
+            }
+            let local = call.args[0]
+                .by_ref_local
+                .filter(|_| call.args[0].name.is_none() && !call.args[0].unpack)
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_SPLICE_LVALUE",
+                        "array_splice has no direct local lvalue",
+                    )
+                })?;
+            let source = publication_entry_array_source(
+                region,
+                &definitions,
+                &parameter_indices,
+                &by_ref_parameters,
+                RegionOperand::Local(local),
+                instruction.continuation_id,
+                "array_splice",
+            )?;
+            let arguments = (1..call.args.len())
+                .map(|index| direct_fixed_builtin_operand(call, index))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_SPLICE_ARGUMENTS",
+                        "array_splice arguments are not direct positional values",
+                    )
+                })?;
+            publication_integer_operand(constants, &definitions, arguments[0]).ok_or_else(
+                || {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_SPLICE_OFFSET",
+                        "array_splice offset is not fixed at publication",
+                    )
+                },
+            )?;
+            if let Some(length) = arguments.get(1) {
+                let fact = lowering_operand_fact(value_flow, constants, *length);
+                if publication_integer_operand(constants, &definitions, *length).is_none()
+                    && fact.class != SsaValueClass::Null
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_SPLICE_LENGTH",
+                        "array_splice length is neither fixed integer nor null",
+                    ));
+                }
+            }
+            let requirement = admission.array_requirements.entry(source).or_default();
+            requirement.require_supported_keys = true;
+            requirement.require_plain_values = true;
+            requirement.projection_allocations =
+                requirement.projection_allocations.saturating_add(2);
+            if let Some(replacement) = arguments.get(2) {
+                let replacement_source = publication_entry_array_source(
+                    region,
+                    &definitions,
+                    &parameter_indices,
+                    &by_ref_parameters,
+                    *replacement,
+                    instruction.continuation_id,
+                    "array_splice replacement",
+                )?;
+                let replacement = admission
+                    .array_requirements
+                    .entry(replacement_source)
+                    .or_default();
+                replacement.require_plain_values = true;
+                replacement.require_supported_keys = true;
+                replacement.projection_allocations =
+                    replacement.projection_allocations.saturating_add(1);
+            }
+            admission
+                .total_array_calls
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
+        }
+        let projection = stable_builtin_array_projection(&call.target).is_some();
+        let read_only_pointer =
+            stable_builtin_array_pointer(&call.target) == Some(StableArrayPointerBuiltin::Key);
+        let direct_count = matches!(
+            stable_builtin_array_aggregate(&call.target),
+            Some(StableArrayAggregateBuiltin::Count | StableArrayAggregateBuiltin::SizeOf)
+        ) && call.args.len() == 1;
+        if !projection
+            && stable_builtin_array_edge_key(&call.target).is_none()
+            && !stable_builtin_array_is_list(&call.target)
+            && !read_only_pointer
+            && !direct_count
+        {
+            continue;
+        }
+        if call.args.len() != 1
+            || call.args[0].name.is_some()
+            || call.args[0].unpack
+            || call.args[0].by_ref_local.is_some()
+            || call.args[0].by_ref_dim.is_some()
+            || call.args[0].by_ref_property.is_some()
+            || call.args[0].by_ref_property_dim.is_some()
+        {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_ARITY_SHAPE",
+                format!(
+                    "array operation at continuation {} is not one positional by-value argument",
+                    instruction.continuation_id
+                ),
+            ));
+        }
+        let operand = direct_fixed_builtin_operand(call, 0).ok_or_else(|| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_OPERAND",
+                format!(
+                    "array operation at continuation {} has no direct operand",
+                    instruction.continuation_id
+                ),
+            )
+        })?;
+        let fact = lowering_operand_fact(value_flow, constants, operand);
+        if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+            || fact.class != SsaValueClass::ArrayHandle
+        {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_TYPE",
+                format!(
+                    "array operation at continuation {} has no compile-time array fact",
+                    instruction.continuation_id
+                ),
+            ));
+        }
+        let source = entry_array_source(operand, &definitions, &parameter_indices).ok_or_else(|| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_SHAPE",
+                format!(
+                    "array operation at continuation {} is not provably available at optimizing entry",
+                    instruction.continuation_id
+                ),
+            )
+        })?;
+        match source {
+            NativeEntryArraySource::Parameter(index) => {
+                let local = region.parameter_locals[index];
+                if by_ref_parameters.contains(&local) {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_REFERENCE",
+                        format!(
+                            "array operation at continuation {} receives a by-reference parameter",
+                            instruction.continuation_id
+                        ),
+                    ));
+                }
+            }
+            NativeEntryArraySource::TrustedGlobal(_) => {
+                unreachable!("operand-rooted array families are parameters")
+            }
+        }
+        admission
+            .total_array_calls
+            .insert(instruction.continuation_id);
+        entry_dependent_continuations.insert(instruction.continuation_id);
+        admission
+            .array_requirements
+            .entry(source)
+            .or_default()
+            .projection_allocations += usize::from(projection);
+    }
+    if let Some(continuation_id) = entry_dependent_continuations
+        .intersection(&unstable_before)
+        .next()
+        .copied()
+    {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_STALE_ENTRY_PLAN",
+            format!(
+                "continuation {continuation_id} depends on entry data after an external effect or control-flow join",
+            ),
+        ));
+    }
+    if let Some(return_type) = region.return_type.as_ref()
+        && optimizing_type_has_direct_guard(return_type)
+    {
+        for block in &region.blocks {
+            let RegionTerminator::Return {
+                value: RegionOperand::Register(register),
+                finally: None,
+            } = block.terminator
+            else {
+                continue;
+            };
+            let Some((source, key)) = admitted_array_fetches.get(&register).copied() else {
+                continue;
+            };
+            if optimizing_fact_satisfies_type(
+                lowering_operand_fact(value_flow, constants, RegionOperand::Register(register)),
+                return_type,
+            ) {
+                continue;
+            }
+            admission
+                .array_requirements
+                .entry(source)
+                .or_default()
+                .required_value_types
+                .push((key, return_type.clone()));
+            admission
+                .total_terminators
+                .insert(block.terminator_continuation_id);
+        }
+    }
+    let cleanup_local_is_total = |local: LocalId| {
+        if !value_flow.releases_local_at_frame_exit(local) {
+            return true;
+        }
+        let storage = value_flow.local_storage(local);
+        let fact = value_flow.local_fact(local);
+        admission.total_reference_locals.contains(&local)
+            || by_ref_parameters.contains(&local)
+            || storage == crate::region_ir::LocalStorageClass::SsaPlain
+                && fact.certainty != crate::region_ir::SsaCertainty::Unknown
+                && (matches!(
+                    fact.class,
+                    SsaValueClass::Float
+                        | SsaValueClass::StringHandle
+                        | SsaValueClass::ArrayHandle
+                        | SsaValueClass::ReferenceHandle
+                ) || new_array_locals.contains(&local))
+    };
+    let operand_root_local = |mut operand: RegionOperand| {
+        for _ in 0..=definitions.len() {
+            match operand {
+                RegionOperand::Local(local) => return Some(local),
+                RegionOperand::Register(register) => {
+                    operand = *definitions.get(&register)?;
+                }
+                RegionOperand::Constant(_)
+                | RegionOperand::I64(_)
+                | RegionOperand::LinkedConstant { .. } => return None,
+            }
+        }
+        None
+    };
+    let local_store_sources = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::StoreLocal { local, src } => {
+                Some((local, (instruction.continuation_id, src)))
+            }
+            _ => None,
+        })
+        .fold(
+            BTreeMap::<LocalId, Vec<(u32, RegionOperand)>>::new(),
+            |mut sources, (local, write)| {
+                sources.entry(local).or_default().push(write);
+                sources
+            },
+        );
+    let has_instruction_frame_exit = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| {
+            matches!(
+                instruction.kind,
+                RegionInstructionKind::NativeControl(RegionNativeControl::Throw { .. })
+                    | RegionInstructionKind::NativeControl(RegionNativeControl::EndFinally {
+                        outer_finally: None,
+                        ..
+                    })
+            )
+        });
+    if has_instruction_frame_exit
+        && let Some(local) = value_flow
+            .frame_cleanup_locals()
+            .find(|local| !cleanup_local_is_total(*local))
+    {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_DESTRUCTOR_PUBLICATION",
+            format!(
+                "frame-exit cleanup for local {} can require a PHP-visible destructor or cold owner",
+                local.raw(),
+            ),
+        ));
+    }
+    for block in &region.blocks {
+        let return_plan = region.return_type.as_ref().and_then(|return_type| {
+            let (operand, fact) = match block.terminator {
+                RegionTerminator::Return {
+                    value,
+                    finally: None,
+                } => (value, lowering_operand_fact(value_flow, constants, value)),
+                RegionTerminator::ReturnReference {
+                    local,
+                    finally: None,
+                } => {
+                    let sources = local_store_sources.get(&local)?;
+                    let [(_, source)] = sources.as_slice() else {
+                        return None;
+                    };
+                    (
+                        *source,
+                        lowering_operand_fact(value_flow, constants, *source),
+                    )
+                }
+                _ => return None,
+            };
+            (!optimizing_fact_satisfies_type(fact, return_type))
+                .then(|| {
+                    publication_return_plan(
+                        operand,
+                        fact,
+                        return_type,
+                        region.strict_types,
+                        &definitions,
+                        constants,
+                    )
+                })
+                .flatten()
+        });
+        if let Some(plan) = return_plan {
+            admission
+                .return_plans
+                .insert(block.terminator_continuation_id, plan);
+            admission.fixed_value_allocations = admission
+                .fixed_value_allocations
+                .saturating_add(plan.value_allocations());
+        }
+        if let RegionTerminator::ReturnReference {
+            local,
+            finally: None,
+        } = block.terminator
+            && !admission.total_reference_locals.contains(&local)
+            && let Some([(store, source)]) = local_store_sources.get(&local).map(Vec::as_slice)
+        {
+            let fact = lowering_operand_fact(value_flow, constants, *source);
+            if fact.certainty != crate::region_ir::SsaCertainty::Unknown
+                && !matches!(
+                    fact.class,
+                    SsaValueClass::ReferenceHandle | SsaValueClass::MixedHandle
+                )
+            {
+                admission.total_return_reference_stores.insert(*store);
+                admission.total_return_reference_locals.insert(local);
+                admission.fixed_value_allocations =
+                    admission.fixed_value_allocations.saturating_add(1);
+            }
+        }
+        let cleanup_total = block
+            .terminator_live_locals
+            .iter()
+            .copied()
+            .all(&cleanup_local_is_total);
+        let total = match block.terminator {
+            RegionTerminator::Jump { .. }
+            | RegionTerminator::JumpIfFalse { .. }
+            | RegionTerminator::JumpIfTrue { .. }
+            | RegionTerminator::JumpIf { .. } => true,
+            RegionTerminator::Return {
+                value,
+                finally: None,
+            } => {
+                let return_type_total = region.return_type.as_ref().is_none_or(|return_type| {
+                    optimizing_fact_satisfies_type(
+                        lowering_operand_fact(value_flow, constants, value),
+                        return_type,
+                    ) || matches!(return_type, php_ir::IrReturnType::Array)
+                        && operand_root_local(value)
+                            .is_some_and(|local| new_array_locals.contains(&local))
+                        || admission
+                            .return_plans
+                            .contains_key(&block.terminator_continuation_id)
+                        || admission
+                            .total_terminators
+                            .contains(&block.terminator_continuation_id)
+                });
+                return_type_total && cleanup_total
+            }
+            RegionTerminator::ReturnReference {
+                local,
+                finally: None,
+            } => {
+                let reference_total = value_flow.local_storage(local).is_reference_slot()
+                    && (admission.total_reference_locals.contains(&local)
+                        || by_ref_parameters.contains(&local)
+                        || admission.total_return_reference_locals.contains(&local));
+                let return_type_total = region.return_type.as_ref().is_none_or(|return_type| {
+                    optimizing_fact_satisfies_type(
+                        lowering_operand_fact(value_flow, constants, RegionOperand::Local(local)),
+                        return_type,
+                    ) || admission
+                        .return_plans
+                        .contains_key(&block.terminator_continuation_id)
+                        || local_store_sources.get(&local).is_some_and(|sources| {
+                            matches!(
+                                sources.as_slice(),
+                                [(_, source)]
+                                    if optimizing_fact_satisfies_type(
+                                        lowering_operand_fact(value_flow, constants, *source),
+                                        return_type,
+                                    )
+                            )
+                        })
+                        || region.params.iter().any(|parameter| {
+                            parameter.local == local
+                                && parameter.by_ref
+                                && parameter.type_.as_ref() == Some(return_type)
+                        })
+                });
+                reference_total && return_type_total && cleanup_total
+            }
+            RegionTerminator::Exit {
+                value,
+                finally: None,
+            } => {
+                let value_total = value.is_none_or(|value| match value {
+                    RegionOperand::Local(local)
+                        if value_flow.local_storage(local).is_reference_slot() =>
+                    {
+                        admission.total_reference_locals.contains(&local)
+                            || by_ref_parameters.contains(&local)
+                    }
+                    _ => {
+                        lowering_operand_fact(value_flow, constants, value).certainty
+                            != crate::region_ir::SsaCertainty::Unknown
+                    }
+                });
+                value_total && cleanup_total
+            }
+            RegionTerminator::Return {
+                finally: Some(_), ..
+            }
+            | RegionTerminator::ReturnReference {
+                finally: Some(_), ..
+            }
+            | RegionTerminator::Exit {
+                finally: Some(_), ..
+            } => false,
+        };
+        if !total {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_NON_TOTAL_TERMINATOR_PUBLICATION",
+                format!(
+                    "terminator at continuation {} has no total native return/type/ownership/cleanup plan",
+                    block.terminator_continuation_id,
+                ),
+            ));
+        }
+        admission
+            .total_terminators
+            .insert(block.terminator_continuation_id);
+    }
+    admission.fixed_lvalue_insertions = admission
+        .array_requirements
+        .values()
+        .flat_map(|requirement| &requirement.mutations)
+        .chain(
+            admission
+                .property_requirements
+                .iter()
+                .flat_map(|requirement| &requirement.mutations),
+        )
+        .chain(
+            admission
+                .static_property_requirements
+                .iter()
+                .flat_map(|requirement| &requirement.mutations),
+        )
+        .map(NativeEntryArrayMutationRequirement::additional_entries)
+        .sum();
+    Ok(admission)
+}
+
 #[derive(Clone, Debug)]
 struct NativeFragmentLayout {
     id: u32,
@@ -755,119 +6458,6 @@ pub(super) fn instruction_has_native_transition(
     )
 }
 
-fn optimizing_instruction_family_is_direct(instruction: &RegionInstruction) -> bool {
-    match &instruction.kind {
-        RegionInstructionKind::AssignDim { keys, .. }
-        | RegionInstructionKind::UnsetDim { keys, .. } => !keys.is_empty(),
-        RegionInstructionKind::AppendDim { .. } => true,
-        RegionInstructionKind::ArrayInsert {
-            key, by_ref_local, ..
-        } => key.is_none() && by_ref_local.is_none(),
-        RegionInstructionKind::BindReferenceIntoDim { append, keys, .. } => {
-            instruction.native_global_name.is_none() && (*append || !keys.is_empty())
-        }
-        RegionInstructionKind::BindReferenceDim { keys, .. }
-        | RegionInstructionKind::BindReferenceFromPropertyDim { keys, .. } => !keys.is_empty(),
-        RegionInstructionKind::BindReferenceIntoPropertyDim { append, keys, .. } => {
-            *append || !keys.is_empty()
-        }
-        RegionInstructionKind::NewObject { prepared, .. } => *prepared,
-        RegionInstructionKind::CloneObject { plain, .. } => *plain,
-        RegionInstructionKind::FetchDim { mode, .. } => {
-            *mode == php_ir::instruction::DimFetchMode::Read
-        }
-        RegionInstructionKind::Nop
-        | RegionInstructionKind::Move { .. }
-        | RegionInstructionKind::LoadLocal { .. }
-        | RegionInstructionKind::StoreLocal { .. }
-        | RegionInstructionKind::AssignLocalResult { .. }
-        | RegionInstructionKind::BindReference { .. }
-        | RegionInstructionKind::BindReferenceProperty { .. }
-        | RegionInstructionKind::BindReferenceFromProperty { .. }
-        | RegionInstructionKind::BindReferenceDimFromProperty { .. }
-        | RegionInstructionKind::InitStaticLocal { .. }
-        | RegionInstructionKind::Discard { .. }
-        | RegionInstructionKind::Binary { .. }
-        | RegionInstructionKind::Unary { .. }
-        | RegionInstructionKind::Compare { .. }
-        | RegionInstructionKind::Cast { .. }
-        | RegionInstructionKind::Echo { .. }
-        | RegionInstructionKind::NewArray { .. }
-        | RegionInstructionKind::FetchProperty { .. }
-        | RegionInstructionKind::FetchObjectClassName { .. }
-        | RegionInstructionKind::AssignProperty { .. }
-        | RegionInstructionKind::ArraySpread { .. }
-        | RegionInstructionKind::FetchConst { .. }
-        | RegionInstructionKind::IssetDim { .. }
-        | RegionInstructionKind::EmptyDim { .. }
-        | RegionInstructionKind::IssetLocal { .. }
-        | RegionInstructionKind::EmptyLocal { .. }
-        | RegionInstructionKind::UnsetLocal { .. }
-        | RegionInstructionKind::ForeachInit { .. }
-        | RegionInstructionKind::ForeachInitRef { .. }
-        | RegionInstructionKind::ForeachNext { .. }
-        | RegionInstructionKind::ForeachNextRef { .. }
-        | RegionInstructionKind::ForeachCleanup { .. }
-        | RegionInstructionKind::ArrayCallback(_)
-        | RegionInstructionKind::PregCallbackArray(_)
-        | RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::MakeClosure {
-            ..
-        })
-        | RegionInstructionKind::NativeSuspend(_)
-        | RegionInstructionKind::NativeCall(_) => true,
-        RegionInstructionKind::FetchDynamicStaticProperty { .. }
-        | RegionInstructionKind::CloneWith { .. }
-        | RegionInstructionKind::NativeControl(_)
-        | RegionInstructionKind::NativeDynamicCode(_)
-        | RegionInstructionKind::RuntimeFatal { .. }
-        | RegionInstructionKind::CompileTimeFatal { .. } => false,
-    }
-}
-
-fn optimizing_direct_instruction_may_transition(kind: &RegionInstructionKind) -> bool {
-    !matches!(
-        kind,
-        RegionInstructionKind::Nop | RegionInstructionKind::Move { .. }
-    )
-}
-
-fn prepare_optimizing_baseline_islands(mut region: RegionGraph) -> RegionGraph {
-    let boundaries = region
-        .blocks
-        .iter()
-        .filter_map(|block| {
-            let mut previous = None;
-            let boundaries = block
-                .instructions
-                .iter()
-                .enumerate()
-                .filter_map(|(index, instruction)| {
-                    let direct = optimizing_instruction_family_is_direct(instruction);
-                    let changed = previous.is_some_and(|previous| previous != direct);
-                    previous = Some(direct);
-                    (index != 0 && changed).then_some(index)
-                })
-                .collect::<BTreeSet<_>>();
-            (!boundaries.is_empty()).then_some((block.id, boundaries))
-        })
-        .collect::<BTreeMap<_, _>>();
-    region = super::module_layout::split_region_blocks_at_boundaries(region, &boundaries);
-    for block in &mut region.blocks {
-        let direct = block
-            .instructions
-            .first()
-            .is_none_or(optimizing_instruction_family_is_direct);
-        for (index, instruction) in block.instructions.iter_mut().enumerate() {
-            instruction.optimizer_transition_entry = if direct {
-                optimizing_direct_instruction_may_transition(&instruction.kind)
-            } else {
-                index == 0
-            };
-        }
-    }
-    region
-}
-
 fn instruction_has_sparse_snapshot(
     instruction: &RegionInstruction,
     tier: NativeCompilerTier,
@@ -1207,63 +6797,6 @@ impl NativeRegisterLiveness {
         Self {
             block_live_in,
             transition_live,
-        }
-    }
-}
-
-fn native_register_state_points(region: &RegionGraph) -> BTreeMap<u32, Vec<RegId>> {
-    let block_live_in = native_register_live_in(region);
-    let mut state_points = BTreeMap::new();
-    for block in &region.blocks {
-        let mut live = native_transition_successors(&block.terminator)
-            .into_iter()
-            .filter_map(|successor| block_live_in.get(&successor))
-            .flat_map(|registers| registers.iter().copied())
-            .collect::<BTreeSet<_>>();
-        live.extend(block.terminator.register_uses());
-        state_points.insert(
-            block.terminator_continuation_id,
-            live.iter().copied().collect(),
-        );
-        for instruction in block.instructions.iter().rev() {
-            for defined in region_instruction_defined_registers(&instruction.kind) {
-                live.remove(&defined);
-            }
-            live.extend(instruction.register_uses());
-            state_points.insert(instruction.continuation_id, live.iter().copied().collect());
-        }
-    }
-    state_points
-}
-
-fn pin_native_transition_registers(
-    region: &mut RegionGraph,
-    source_state_points: &BTreeMap<u32, Vec<RegId>>,
-) {
-    for block in &mut region.blocks {
-        block.terminator_live_registers = None;
-        for instruction in &mut block.instructions {
-            instruction.transition_live_registers = None;
-        }
-    }
-    for block in &mut region.blocks {
-        if block_terminator_has_native_transition(block, region.compile_metadata.tier) {
-            block.terminator_live_registers = Some(
-                source_state_points
-                    .get(&block.terminator_continuation_id)
-                    .cloned()
-                    .expect("native terminator continuation belongs to the source region"),
-            );
-        }
-        for instruction in &mut block.instructions {
-            if instruction_has_sparse_snapshot(instruction, region.compile_metadata.tier) {
-                instruction.transition_live_registers = Some(
-                    source_state_points
-                        .get(&instruction.continuation_id)
-                        .cloned()
-                        .expect("native instruction continuation belongs to the source region"),
-                );
-            }
         }
     }
 }
@@ -1736,7 +7269,14 @@ pub(super) fn compile_region_graph_native(
                     region_contains(region, |kind| {
                         matches!(kind, RegionInstructionKind::NativeCall(call)
                             if stable_builtin_array_aggregate(&call.target)
-                                .is_some_and(|builtin| builtin.index() == index))
+                                .is_some_and(|builtin| builtin.index() == index)
+                                && !(matches!(
+                                    stable_builtin_array_aggregate(&call.target),
+                                    Some(
+                                        StableArrayAggregateBuiltin::Count
+                                            | StableArrayAggregateBuiltin::SizeOf
+                                    )
+                                ) && call.args.len() == 1))
                     })
                 })
         });
@@ -6485,24 +12025,6 @@ pub(super) fn compile_region_graph_native(
                         )
                     })?;
                 functions.insert(array_child_entry_symbol, array_child_entry);
-                let value_release_validate_symbol = FunctionId::new(next_synthetic);
-                next_synthetic = next_synthetic.checked_add(1).ok_or_else(|| {
-                    CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_FRAGMENT_SYMBOL_LIMIT",
-                        "native value-release validator symbol id overflowed",
-                    )
-                })?;
-                let symbol = format!("{name}.native.value_release_validate");
-                let signature = direct_value_release_signature(module);
-                let value_release_validate = module
-                    .declare_function(&symbol, Linkage::Local, &signature)
-                    .map_err(|error| {
-                        CraneliftLoweringError::new(
-                            "JIT_CRANELIFT_REJECT_DECLARE",
-                            format!("failed to declare {symbol}: {error}"),
-                        )
-                    })?;
-                functions.insert(value_release_validate_symbol, value_release_validate);
                 let value_release_commit_symbol = FunctionId::new(next_synthetic);
                 next_synthetic = next_synthetic.checked_add(1).ok_or_else(|| {
                     CraneliftLoweringError::new(
@@ -6606,8 +12128,6 @@ pub(super) fn compile_region_graph_native(
                         array_ensure_unique_symbol,
                         array_child_entry,
                         array_child_entry_symbol,
-                        value_release_validate,
-                        value_release_validate_symbol,
                         value_release_commit,
                         value_release_commit_symbol,
                     },
@@ -7197,8 +12717,6 @@ pub(super) fn compile_region_graph_native(
                     referenced.contains(&operations.array_ensure_unique_symbol);
                 let needs_child =
                     referenced.contains(&operations.array_child_entry_symbol);
-                let needs_validate =
-                    referenced.contains(&operations.value_release_validate_symbol);
                 let needs_commit =
                     referenced.contains(&operations.value_release_commit_symbol);
 
@@ -7225,21 +12743,6 @@ pub(super) fn compile_region_graph_native(
                     )?;
                     let _ = append_defined(
                         operations.array_child_entry_symbol,
-                        0,
-                        0,
-                        defined,
-                    )?;
-                }
-                if needs_validate {
-                    let defined = define_direct_value_release_validate_function(
-                        module,
-                        codegen_context,
-                        builder_context,
-                        operations.value_release_validate,
-                        operations.value_release_validate_symbol,
-                    )?;
-                    let _ = append_defined(
-                        operations.value_release_validate_symbol,
                         0,
                         0,
                         defined,
@@ -7804,39 +13307,18 @@ pub(super) fn select_native_region_tier(
     _plan: &NativeCompilePlan,
     _constants: &[IrConstant],
 ) {
-    let source_register_state = (candidate.compile_metadata.tier == NativeCompilerTier::Optimizing)
-        .then(|| {
-            let mut source = candidate.clone();
-            for block in &mut source.blocks {
-                block.terminator_live_registers = None;
-                for instruction in &mut block.instructions {
-                    instruction.transition_live_registers = None;
-                }
-            }
-            native_register_state_points(&source)
-        });
-    // Baseline and optimizing code must share real CFG boundaries around a
-    // baseline-only island.  Otherwise baseline has no edge on which it can
-    // re-enter the published optimizing continuation and one unsupported
-    // operation silently downgrades the rest of the PHP block.
-    *candidate = prepare_optimizing_baseline_islands(candidate.clone());
     if candidate.compile_metadata.tier == NativeCompilerTier::Optimizing {
-        pin_native_transition_registers(
-            candidate,
-            source_register_state
-                .as_ref()
-                .expect("optimizing tier owns source register state"),
-        );
         let _ = crate::region_ir::opt::optimize_executable_region(candidate);
-        // Optimization may remove instructions, but it must not collapse a
-        // direct/unsupported family boundary into one lowering block.
-        *candidate = prepare_optimizing_baseline_islands(candidate.clone());
-        pin_native_transition_registers(
-            candidate,
-            source_register_state
-                .as_ref()
-                .expect("optimizing tier owns source register state"),
-        );
+        for block in &mut candidate.blocks {
+            for instruction in &mut block.instructions {
+                // Optimizing publication is now all-or-nothing. Unsupported
+                // semantic shapes reject the complete optimizing artifact
+                // before publication, so no instruction is a local
+                // fast/slow-island entry.
+                instruction.optimizer_transition_entry = false;
+                instruction.transition_live_registers = None;
+            }
+        }
     }
 }
 
@@ -8995,6 +14477,2279 @@ fn capture_relocation(
     })
 }
 
+fn lower_entry_array_source(
+    builder: &mut FunctionBuilder<'_>,
+    arguments: ir::Value,
+    deopt_out: ir::Value,
+    function: FunctionId,
+    source: NativeEntryArraySource,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    match source {
+        NativeEntryArraySource::Parameter(index) => Ok(builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            arguments,
+            i32::try_from(index.saturating_mul(8)).map_err(|_| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_ADMISSION_OFFSET",
+                    "array admission parameter offset does not fit the native ABI",
+                )
+            })?,
+        )),
+        NativeEntryArraySource::TrustedGlobal(continuation_id) => {
+            let reference = lower_trusted_global_reference_at_continuation(
+                builder,
+                function,
+                continuation_id,
+                deopt_out,
+            );
+            let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
+            Ok(builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                slot,
+                std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+            ))
+        }
+    }
+}
+
+fn emit_optimizing_entry_direct_array_descriptor(
+    builder: &mut FunctionBuilder<'_>,
+    array: ir::Value,
+    deopt_out: ir::Value,
+    rejected: ir::Block,
+) -> (ir::Value, ir::Value, ir::Value) {
+    let pointer_type = builder.func.dfg.value_type(deopt_out);
+    let inspect_index = builder.create_block();
+    let inspect_slot = builder.create_block();
+    let accepted = builder.create_block();
+    builder.append_block_param(inspect_slot, types::I64);
+    builder.append_block_param(accepted, pointer_type);
+    builder.append_block_param(accepted, types::I64);
+    builder.append_block_param(accepted, pointer_type);
+
+    let tagged = lower_value_has_tag(builder, array, crate::JIT_VALUE_RUNTIME_ARRAY_TAG);
+    let encoded_index = builder.ins().ireduce(types::I32, array);
+    let direct_index = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        encoded_index,
+        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+    );
+    let direct = builder.ins().band(tagged, direct_index);
+    builder
+        .ins()
+        .brif(direct, inspect_index, &[], rejected, &[]);
+
+    builder.switch_to_block(inspect_index);
+    let index = builder.ins().iadd_imm(
+        encoded_index,
+        -i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+    );
+    let in_bounds = builder.ins().icmp_imm(
+        IntCC::UnsignedLessThan,
+        index,
+        crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY as i64,
+    );
+    builder
+        .ins()
+        .brif(in_bounds, inspect_slot, &[array.into()], rejected, &[]);
+
+    builder.switch_to_block(inspect_slot);
+    let array = builder.block_params(inspect_slot)[0];
+    let slot = lower_optimizing_slot_address(builder, array, deopt_out);
+    let kind = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+    );
+    let length = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+    );
+    let entries = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, aux) as i32,
+    );
+    let flags = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+    );
+    let direct_kind = builder.ins().icmp_imm(
+        IntCC::Equal,
+        kind,
+        i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY),
+    );
+    let abi_mask = (1_i64 << crate::JIT_NATIVE_DIRECT_ARRAY_CURSOR_SHIFT) - 1;
+    let abi = builder.ins().band_imm(flags, abi_mask);
+    let abi_matches = builder.ins().icmp_imm(
+        IntCC::Equal,
+        abi,
+        i64::from(crate::JIT_NATIVE_DIRECT_ARRAY_ABI_VERSION),
+    );
+    let bounded = builder.ins().icmp_imm(
+        IntCC::UnsignedLessThanOrEqual,
+        length,
+        crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY as i64,
+    );
+    let admitted = builder.ins().band(direct_kind, abi_matches);
+    let admitted = builder.ins().band(admitted, bounded);
+    builder.ins().brif(
+        admitted,
+        accepted,
+        &[slot.into(), length.into(), entries.into()],
+        rejected,
+        &[],
+    );
+
+    builder.switch_to_block(accepted);
+    (
+        builder.block_params(accepted)[0],
+        builder.block_params(accepted)[1],
+        builder.block_params(accepted)[2],
+    )
+}
+
+fn lower_optimizing_entry_array_key(
+    builder: &mut FunctionBuilder<'_>,
+    key: &NativeEntryArrayKey,
+    _deopt_out: ir::Value,
+) -> ir::Value {
+    match key {
+        NativeEntryArrayKey::Integer(value) => builder.ins().iconst(types::I64, *value),
+        NativeEntryArrayKey::Constant(index) => builder
+            .ins()
+            .iconst(types::I64, crate::jit_encode_constant(*index)),
+    }
+}
+
+fn emit_optimizing_entry_array_probe_paths(
+    builder: &mut FunctionBuilder<'_>,
+    paths: &[NativeEntryArrayProbeRequirement],
+    root_length: ir::Value,
+    root_entries: ir::Value,
+    deopt_out: ir::Value,
+    rejected: ir::Block,
+) {
+    for path in paths {
+        let path_done = builder.create_block();
+        let mut length = root_length;
+        let mut entries = root_entries;
+        for (index, key) in path.keys.iter().enumerate() {
+            let key = lower_optimizing_entry_array_key(builder, key, deopt_out);
+            let (found, value) = lower_optimizing_direct_array_lookup_optional(
+                builder, length, entries, key, deopt_out,
+            );
+            let found_block = builder.create_block();
+            builder.ins().brif(found, found_block, &[], path_done, &[]);
+            builder.switch_to_block(found_block);
+            if index + 1 < path.keys.len() {
+                let (_, child_length, child_entries) =
+                    emit_optimizing_entry_direct_array_descriptor(
+                        builder, value, deopt_out, rejected,
+                    );
+                length = child_length;
+                entries = child_entries;
+            } else {
+                if path.leaf == NativeEntryArrayProbeLeaf::PlainValue {
+                    let authoritative =
+                        lower_optimizing_call_value_is_authoritative(builder, value);
+                    let reference =
+                        lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
+                    let plain = builder.ins().icmp_imm(IntCC::Equal, reference, 0);
+                    let admitted = builder.ins().band(authoritative, plain);
+                    let value_ready = builder.create_block();
+                    builder
+                        .ins()
+                        .brif(admitted, value_ready, &[], rejected, &[]);
+                    builder.switch_to_block(value_ready);
+                }
+                builder.ins().jump(path_done, &[]);
+            }
+        }
+        builder.switch_to_block(path_done);
+    }
+}
+
+fn emit_optimizing_entry_array_mutations(
+    builder: &mut FunctionBuilder<'_>,
+    mutations: &[NativeEntryArrayMutationRequirement],
+    root: ir::Value,
+    insertion_budget: usize,
+    deopt_out: ir::Value,
+    rejected: ir::Block,
+) {
+    for mutation in mutations {
+        let (root_slot, root_length, root_entries) =
+            emit_optimizing_entry_direct_array_descriptor(builder, root, deopt_out, rejected);
+        let root_refcount = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            root_slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, refcount) as i32,
+        );
+        let root_unique = builder.ins().icmp_imm(IntCC::Equal, root_refcount, 1);
+        let root_ready = builder.create_block();
+        builder
+            .ins()
+            .brif(root_unique, root_ready, &[], rejected, &[]);
+        builder.switch_to_block(root_ready);
+
+        let parents = match mutation {
+            NativeEntryArrayMutationRequirement::Assign { parents, .. }
+            | NativeEntryArrayMutationRequirement::Append { parents }
+            | NativeEntryArrayMutationRequirement::Unset { parents, .. }
+            | NativeEntryArrayMutationRequirement::Reference { parents, .. }
+            | NativeEntryArrayMutationRequirement::ReferenceAppend { parents } => parents,
+        };
+        let mut current_array = root;
+        let mut current_slot = root_slot;
+        let mut current_length = root_length;
+        let mut current_entries = root_entries;
+        for parent in parents {
+            let parent = builder.ins().iconst(types::I64, *parent);
+            let (found, child) = lower_optimizing_direct_array_lookup_optional(
+                builder,
+                current_length,
+                current_entries,
+                parent,
+                deopt_out,
+            );
+            let child_found = builder.create_block();
+            builder.ins().brif(found, child_found, &[], rejected, &[]);
+            builder.switch_to_block(child_found);
+            let (child_slot, child_length, child_entries) =
+                emit_optimizing_entry_direct_array_descriptor(builder, child, deopt_out, rejected);
+            let child_refcount = builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                child_slot,
+                std::mem::offset_of!(crate::JitNativeValueSlot, refcount) as i32,
+            );
+            let child_unique = builder.ins().icmp_imm(IntCC::Equal, child_refcount, 1);
+            let child_ready = builder.create_block();
+            builder
+                .ins()
+                .brif(child_unique, child_ready, &[], rejected, &[]);
+            builder.switch_to_block(child_ready);
+            current_array = child;
+            current_slot = child_slot;
+            current_length = child_length;
+            current_entries = child_entries;
+        }
+
+        if !matches!(mutation, NativeEntryArrayMutationRequirement::Unset { .. }) {
+            let reserved = builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                current_slot,
+                std::mem::offset_of!(crate::JitNativeValueSlot, reserved) as i32,
+            );
+            let reserved = builder.ins().uextend(types::I64, reserved);
+            let required = builder.ins().iadd_imm(
+                current_length,
+                i64::try_from(insertion_budget).unwrap_or(i64::MAX),
+            );
+            let has_capacity =
+                builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, reserved, required);
+            let capacity_ready = builder.create_block();
+            builder
+                .ins()
+                .brif(has_capacity, capacity_ready, &[], rejected, &[]);
+            builder.switch_to_block(capacity_ready);
+        }
+
+        match mutation {
+            NativeEntryArrayMutationRequirement::Append { .. }
+            | NativeEntryArrayMutationRequirement::ReferenceAppend { .. } => {
+                let state = lower_direct_array_state_address(builder, current_array, deopt_out);
+                let next_key = builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    state,
+                    std::mem::offset_of!(crate::JitNativeDirectArrayState, next_append_key) as i32,
+                );
+                let has_next = builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    state,
+                    std::mem::offset_of!(crate::JitNativeDirectArrayState, has_next_append_key)
+                        as i32,
+                );
+                let maximum = builder.ins().icmp_imm(
+                    IntCC::SignedGreaterThan,
+                    next_key,
+                    i64::MAX.saturating_sub(i64::try_from(insertion_budget).unwrap_or(i64::MAX)),
+                );
+                let has_next = builder.ins().icmp_imm(IntCC::NotEqual, has_next, 0);
+                let overflow = builder.ins().band(maximum, has_next);
+                let safe = builder.ins().icmp_imm(IntCC::Equal, overflow, 0);
+                let append_ready = builder.create_block();
+                builder.ins().brif(safe, append_ready, &[], rejected, &[]);
+                builder.switch_to_block(append_ready);
+            }
+            NativeEntryArrayMutationRequirement::Assign { key, .. }
+            | NativeEntryArrayMutationRequirement::Unset { key, .. }
+            | NativeEntryArrayMutationRequirement::Reference { key, .. } => {
+                let key = builder.ins().iconst(types::I64, *key);
+                let (found, old) = lower_optimizing_direct_array_lookup_optional(
+                    builder,
+                    current_length,
+                    current_entries,
+                    key,
+                    deopt_out,
+                );
+                let runtime = lower_is_runtime_handle(builder, old);
+                let immediate = builder.ins().icmp_imm(IntCC::Equal, runtime, 0);
+                let missing = builder.ins().icmp_imm(IntCC::Equal, found, 0);
+                let safe = builder.ins().bor(missing, immediate);
+                let value_ready = builder.create_block();
+                builder.ins().brif(safe, value_ready, &[], rejected, &[]);
+                builder.switch_to_block(value_ready);
+            }
+        }
+    }
+}
+
+fn emit_optimizing_entry_property_slot(
+    builder: &mut FunctionBuilder<'_>,
+    object: ir::Value,
+    deopt_out: ir::Value,
+    function: FunctionId,
+    requirement: NativeEntryPropertyRequirement,
+    insertion_budget: usize,
+    rejected: ir::Block,
+) -> ir::Value {
+    let pointer_type = builder.func.dfg.value_type(deopt_out);
+    let inspect = builder.create_block();
+    let inspect_plan = builder.create_block();
+    let accepted = builder.create_block();
+    builder.append_block_param(accepted, pointer_type);
+
+    let tagged = lower_value_has_tag(builder, object, crate::JIT_VALUE_RUNTIME_OBJECT_TAG);
+    let raw_index = builder.ins().ireduce(types::I32, object);
+    let direct_index = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        raw_index,
+        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+    );
+    let direct = builder.ins().band(tagged, direct_index);
+    builder.ins().brif(direct, inspect, &[], rejected, &[]);
+
+    builder.switch_to_block(inspect);
+    let object_slot = lower_optimizing_slot_address(builder, object, deopt_out);
+    let kind = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        object_slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+    );
+    let flags = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        object_slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+    );
+    let layout_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        object_slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+    );
+    let slot_count = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        object_slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, reserved) as i32,
+    );
+    let property_slots = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        object_slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, aux) as i32,
+    );
+    let kind_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        kind,
+        i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT),
+    );
+    let version = builder.ins().band_imm(
+        flags,
+        i64::from(crate::JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_MASK),
+    );
+    let version_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        version,
+        i64::from(crate::JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_VERSION),
+    );
+    let slots_ok = builder.ins().icmp_imm(IntCC::NotEqual, property_slots, 0);
+    let admitted = builder.ins().band(kind_ok, version_ok);
+    let admitted = builder.ins().band(admitted, slots_ok);
+    builder
+        .ins()
+        .brif(admitted, inspect_plan, &[], rejected, &[]);
+
+    builder.switch_to_block(inspect_plan);
+    let view = lower_active_runtime_view(builder, deopt_out);
+    let offsets = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(
+            crate::JitNativeRuntimeView,
+            trusted_property_function_offsets,
+        ) as i32,
+    );
+    let plans = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, trusted_property_slots) as i32,
+    );
+    let function_entry = builder.ins().iadd_imm(
+        offsets,
+        i64::try_from(function.index().saturating_mul(4)).unwrap_or(i64::MAX),
+    );
+    let plan_base = builder
+        .ins()
+        .load(types::I32, MemFlagsData::new(), function_entry, 0);
+    let plan_index = builder
+        .ins()
+        .iadd_imm(plan_base, i64::from(requirement.continuation_id));
+    let wide_plan_index = builder.ins().uextend(pointer_type, plan_index);
+    let plan_offset = builder.ins().ishl_imm(wide_plan_index, 4);
+    let plan = builder.ins().iadd(plans, plan_offset);
+    let state = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        plan,
+        std::mem::offset_of!(crate::JitNativeTrustedPropertySlot, state) as i32,
+    );
+    let expected_layout = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        plan,
+        std::mem::offset_of!(crate::JitNativeTrustedPropertySlot, layout_id) as i32,
+    );
+    let property_index = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        plan,
+        std::mem::offset_of!(crate::JitNativeTrustedPropertySlot, slot_index) as i32,
+    );
+    let published =
+        builder
+            .ins()
+            .icmp_imm(IntCC::Equal, state, i64::from(requirement.required_state));
+    let family = builder.ins().icmp_imm(IntCC::Equal, expected_layout, 0);
+    let exact = builder.ins().icmp(IntCC::Equal, layout_id, expected_layout);
+    let layout_ok = builder.ins().bor(family, exact);
+    let index_ok = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, property_index, slot_count);
+    let admitted = builder.ins().band(published, layout_ok);
+    let admitted = builder.ins().band(admitted, index_ok);
+    let property_ready = builder.create_block();
+    builder
+        .ins()
+        .brif(admitted, property_ready, &[], rejected, &[]);
+
+    builder.switch_to_block(property_ready);
+    let wide_property_index = builder.ins().uextend(pointer_type, property_index);
+    let property_offset = builder.ins().ishl_imm(wide_property_index, 4);
+    let property_slot = builder.ins().iadd(property_slots, property_offset);
+    let initialized = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        property_slot,
+        std::mem::offset_of!(php_runtime::api::NativeDeclaredPropertySlot, initialized) as i32,
+    );
+    let value = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        property_slot,
+        std::mem::offset_of!(php_runtime::api::NativeDeclaredPropertySlot, value) as i32,
+    );
+    let initialized = builder.ins().icmp_imm(IntCC::NotEqual, initialized, 0);
+    let reference = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
+    let plain = builder.ins().icmp_imm(IntCC::Equal, reference, 0);
+    let authoritative = lower_optimizing_call_value_is_authoritative(builder, value);
+    let reference_shape = if requirement.require_reference {
+        reference
+    } else if requirement.allow_reference {
+        builder.ins().iconst(types::I8, 1)
+    } else {
+        plain
+    };
+    let mut value_ok = builder.ins().band(reference_shape, authoritative);
+    if requirement.readable {
+        let uninitialized = builder.ins().icmp_imm(
+            IntCC::Equal,
+            value,
+            crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED),
+        );
+        let initialized_value = builder.ins().icmp_imm(IntCC::Equal, uninitialized, 0);
+        value_ok = builder.ins().band(value_ok, initialized);
+        value_ok = builder.ins().band(value_ok, initialized_value);
+    }
+    let value_ready = builder.create_block();
+    builder
+        .ins()
+        .brif(value_ok, value_ready, &[], rejected, &[]);
+    builder.switch_to_block(value_ready);
+    if !requirement.probe_paths.is_empty() {
+        let (_, length, entries) =
+            emit_optimizing_entry_direct_array_descriptor(builder, value, deopt_out, rejected);
+        emit_optimizing_entry_array_probe_paths(
+            builder,
+            &requirement.probe_paths,
+            length,
+            entries,
+            deopt_out,
+            rejected,
+        );
+    }
+    if !requirement.mutations.is_empty() {
+        emit_optimizing_entry_array_mutations(
+            builder,
+            &requirement.mutations,
+            value,
+            insertion_budget,
+            deopt_out,
+            rejected,
+        );
+    }
+    if requirement.releasable {
+        let runtime = lower_is_runtime_handle(builder, value);
+        let inspect_runtime = builder.create_block();
+        builder.ins().brif(
+            runtime,
+            inspect_runtime,
+            &[],
+            accepted,
+            &[property_slot.into()],
+        );
+        builder.switch_to_block(inspect_runtime);
+        let value_slot = lower_optimizing_slot_address(builder, value, deopt_out);
+        let refcount = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            value_slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, refcount) as i32,
+        );
+        let shared = builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThan, refcount, 1);
+        builder
+            .ins()
+            .brif(shared, accepted, &[property_slot.into()], rejected, &[]);
+    } else {
+        builder.ins().jump(accepted, &[property_slot.into()]);
+    }
+    builder.switch_to_block(accepted);
+    builder.block_params(accepted)[0]
+}
+
+fn emit_optimizing_entry_static_property(
+    builder: &mut FunctionBuilder<'_>,
+    deopt_out: ir::Value,
+    function: FunctionId,
+    requirement: &NativeEntryStaticPropertyRequirement,
+    insertion_budget: usize,
+    rejected: ir::Block,
+) {
+    let pointer_type = builder.func.dfg.value_type(deopt_out);
+    let view = lower_active_runtime_view(builder, deopt_out);
+    let offsets = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(
+            crate::JitNativeRuntimeView,
+            trusted_property_function_offsets,
+        ) as i32,
+    );
+    let plans = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, trusted_static_property_slots) as i32,
+    );
+    let slots = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, static_property_slots) as i32,
+    );
+    let function_entry = builder.ins().iadd_imm(
+        offsets,
+        i64::try_from(function.index().saturating_mul(4)).unwrap_or(i64::MAX),
+    );
+    let plan_base = builder
+        .ins()
+        .load(types::I32, MemFlagsData::new(), function_entry, 0);
+    let plan_index = builder
+        .ins()
+        .iadd_imm(plan_base, i64::from(requirement.continuation_id));
+    let wide_plan_index = builder.ins().uextend(pointer_type, plan_index);
+    let plan_offset = builder.ins().ishl_imm(wide_plan_index, 3);
+    let plan = builder.ins().iadd(plans, plan_offset);
+    let state = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        plan,
+        std::mem::offset_of!(crate::JitNativeTrustedStaticPropertySlot, state) as i32,
+    );
+    let slot_index = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        plan,
+        std::mem::offset_of!(crate::JitNativeTrustedStaticPropertySlot, slot_index) as i32,
+    );
+    let state = builder
+        .ins()
+        .band_imm(state, i64::from(requirement.required_state));
+    let published =
+        builder
+            .ins()
+            .icmp_imm(IntCC::Equal, state, i64::from(requirement.required_state));
+    let slot_count = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, static_property_slot_count) as i32,
+    );
+    let in_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, slot_index, slot_count);
+    let admitted = builder.ins().band(published, in_bounds);
+    let plan_ready = builder.create_block();
+    builder.ins().brif(admitted, plan_ready, &[], rejected, &[]);
+    builder.switch_to_block(plan_ready);
+
+    let wide_slot_index = builder.ins().uextend(pointer_type, slot_index);
+    let slot_offset = builder.ins().ishl_imm(wide_slot_index, 4);
+    let slot = builder.ins().iadd(slots, slot_offset);
+    let initialized = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeStaticPropertySlot, initialized) as i32,
+    );
+    let initialized = builder.ins().icmp_imm(IntCC::NotEqual, initialized, 0);
+    let value = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeStaticPropertySlot, value) as i32,
+    );
+    let authoritative = lower_optimizing_call_value_is_authoritative(builder, value);
+    let reference = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
+    let plain = builder.ins().icmp_imm(IntCC::Equal, reference, 0);
+    let reference_shape = if requirement.require_reference {
+        reference
+    } else if requirement.allow_reference {
+        builder.ins().iconst(types::I8, 1)
+    } else {
+        plain
+    };
+    let mut admitted = builder.ins().band(authoritative, reference_shape);
+    if requirement.readable {
+        admitted = builder.ins().band(admitted, initialized);
+    }
+    let value_ready = builder.create_block();
+    builder
+        .ins()
+        .brif(admitted, value_ready, &[], rejected, &[]);
+    builder.switch_to_block(value_ready);
+    if !requirement.probe_paths.is_empty() {
+        let (_, length, entries) =
+            emit_optimizing_entry_direct_array_descriptor(builder, value, deopt_out, rejected);
+        emit_optimizing_entry_array_probe_paths(
+            builder,
+            &requirement.probe_paths,
+            length,
+            entries,
+            deopt_out,
+            rejected,
+        );
+    }
+    if !requirement.mutations.is_empty() {
+        emit_optimizing_entry_array_mutations(
+            builder,
+            &requirement.mutations,
+            value,
+            insertion_budget,
+            deopt_out,
+            rejected,
+        );
+    }
+    if requirement.releasable {
+        let runtime = lower_is_runtime_handle(builder, value);
+        let inspect_runtime = builder.create_block();
+        let done = builder.create_block();
+        builder.ins().brif(runtime, inspect_runtime, &[], done, &[]);
+        builder.switch_to_block(inspect_runtime);
+        let value_slot = lower_optimizing_slot_address(builder, value, deopt_out);
+        let refcount = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            value_slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, refcount) as i32,
+        );
+        let shared = builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThan, refcount, 1);
+        builder.ins().brif(shared, done, &[], rejected, &[]);
+        builder.switch_to_block(done);
+    }
+}
+
+fn emit_optimizing_entry_instanceof(
+    builder: &mut FunctionBuilder<'_>,
+    arguments: ir::Value,
+    deopt_out: ir::Value,
+    function: FunctionId,
+    requirement: NativeEntryInstanceofRequirement,
+    rejected: ir::Block,
+) -> Result<(), CraneliftLoweringError> {
+    let pointer_type = builder.func.dfg.value_type(deopt_out);
+    let object = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        arguments,
+        i32::try_from(requirement.parameter_index.saturating_mul(8)).map_err(|_| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_INSTANCEOF_OFFSET",
+                "instanceof parameter offset does not fit the native ABI",
+            )
+        })?,
+    );
+    let object_tag = lower_value_has_tag(builder, object, crate::JIT_VALUE_RUNTIME_OBJECT_TAG);
+    let index = builder.ins().ireduce(types::I32, object);
+    let direct = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        index,
+        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+    );
+    let direct_object = builder.ins().band(object_tag, direct);
+    let inspect = builder.create_block();
+    builder
+        .ins()
+        .brif(direct_object, inspect, &[], rejected, &[]);
+    builder.switch_to_block(inspect);
+    let slot = lower_optimizing_slot_address(builder, object, deopt_out);
+    let kind = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+    );
+    let flags = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+    );
+    let layout_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+    );
+    let kind_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        kind,
+        i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT),
+    );
+    let abi = builder.ins().band_imm(
+        flags,
+        i64::from(crate::JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_MASK),
+    );
+    let abi_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        abi,
+        i64::from(crate::JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_VERSION),
+    );
+    let shape_ok = builder.ins().band(kind_ok, abi_ok);
+    let inspect_plan = builder.create_block();
+    builder
+        .ins()
+        .brif(shape_ok, inspect_plan, &[], rejected, &[]);
+    builder.switch_to_block(inspect_plan);
+
+    let view = lower_active_runtime_view(builder, deopt_out);
+    let offsets = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(
+            crate::JitNativeRuntimeView,
+            trusted_property_function_offsets,
+        ) as i32,
+    );
+    let plans = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, trusted_instanceof_plans) as i32,
+    );
+    let entries = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, trusted_instanceof_entries) as i32,
+    );
+    let function_entry = builder.ins().iadd_imm(
+        offsets,
+        i64::try_from(function.index().saturating_mul(4)).unwrap_or(i64::MAX),
+    );
+    let plan_base = builder
+        .ins()
+        .load(types::I32, MemFlagsData::new(), function_entry, 0);
+    let plan_index = builder
+        .ins()
+        .iadd_imm(plan_base, i64::from(requirement.continuation_id));
+    let wide_plan_index = builder.ins().uextend(pointer_type, plan_index);
+    let plan_offset = builder.ins().ishl_imm(wide_plan_index, 4);
+    let plan = builder.ins().iadd(plans, plan_offset);
+    let entry_offset = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        plan,
+        std::mem::offset_of!(crate::JitNativeInstanceOfPlan, entry_offset) as i32,
+    );
+    let mask = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        plan,
+        std::mem::offset_of!(crate::JitNativeInstanceOfPlan, mask) as i32,
+    );
+    let state = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        plan,
+        std::mem::offset_of!(crate::JitNativeInstanceOfPlan, state) as i32,
+    );
+    let published = builder.ins().icmp_imm(
+        IntCC::Equal,
+        state,
+        i64::from(crate::JIT_NATIVE_INSTANCEOF_PLAN_PUBLISHED),
+    );
+    let lookup = builder.create_block();
+    builder.append_block_param(lookup, types::I32);
+    let hash = builder.ins().ushr_imm(layout_id, 30);
+    let hash = builder.ins().bxor(layout_id, hash);
+    let hash = builder
+        .ins()
+        .imul_imm(hash, 0xbf58_476d_1ce4_e5b9_u64 as i64);
+    let folded = builder.ins().ushr_imm(hash, 27);
+    let hash = builder.ins().bxor(hash, folded);
+    let hash = builder
+        .ins()
+        .imul_imm(hash, 0x94d0_49bb_1331_11eb_u64 as i64);
+    let folded = builder.ins().ushr_imm(hash, 31);
+    let hash = builder.ins().bxor(hash, folded);
+    let hash = builder.ins().ireduce(types::I32, hash);
+    let bucket = builder.ins().band(hash, mask);
+    builder
+        .ins()
+        .brif(published, lookup, &[bucket.into()], rejected, &[]);
+    builder.switch_to_block(lookup);
+    let bucket = builder.block_params(lookup)[0];
+    let entry_index = builder.ins().iadd(entry_offset, bucket);
+    let wide_entry_index = builder.ins().uextend(pointer_type, entry_index);
+    let byte_offset = builder.ins().ishl_imm(wide_entry_index, 4);
+    let entry = builder.ins().iadd(entries, byte_offset);
+    let candidate = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        entry,
+        std::mem::offset_of!(crate::JitNativeInstanceOfEntry, layout_id) as i32,
+    );
+    let hit = builder.ins().icmp(IntCC::Equal, candidate, layout_id);
+    let inspect_empty = builder.create_block();
+    let accepted = builder.create_block();
+    builder.ins().brif(hit, accepted, &[], inspect_empty, &[]);
+    builder.switch_to_block(inspect_empty);
+    let empty = builder.ins().icmp_imm(IntCC::Equal, candidate, 0);
+    let next_bucket = builder.ins().iadd_imm(bucket, 1);
+    let next_bucket = builder.ins().band(next_bucket, mask);
+    builder
+        .ins()
+        .brif(empty, rejected, &[], lookup, &[next_bucket.into()]);
+    builder.switch_to_block(accepted);
+    Ok(())
+}
+
+fn emit_optimizing_entry_admission(
+    builder: &mut FunctionBuilder<'_>,
+    admission: &NativeOptimizingAdmission,
+    arguments: ir::Value,
+    deopt_out: ir::Value,
+    function: FunctionId,
+    accepted: ir::Block,
+) -> Result<(), CraneliftLoweringError> {
+    if admission.array_requirements.is_empty()
+        && admission.initialized_request_locals.is_empty()
+        && admission.releasable_request_locals.is_empty()
+        && admission.initialized_globals.is_empty()
+        && admission.releasable_globals.is_empty()
+        && admission.plain_globals.is_empty()
+        && admission.reference_source_parameters.is_empty()
+        && admission.property_requirements.is_empty()
+        && admission.static_property_requirements.is_empty()
+        && admission.object_layout_requirements.is_empty()
+        && admission.instanceof_requirements.is_empty()
+        && admission.value_class_requirements.is_empty()
+        && admission.string_requirements.is_empty()
+        && admission.integer_requirements.is_empty()
+        && admission.trusted_constant_requirements.is_empty()
+        && admission.trusted_static_local_requirements.is_empty()
+        && admission.fixed_value_allocations == 0
+        && admission.fixed_array_entries == 0
+        && admission.fixed_string_bytes == 0
+        && !admission.require_non_fiber_scope
+    {
+        builder.ins().jump(accepted, &[]);
+        return Ok(());
+    }
+    let rejected = builder.create_block();
+    builder.set_cold_block(rejected);
+    let pointer_type = builder.func.dfg.value_type(deopt_out);
+    if admission.require_non_fiber_scope {
+        let view = lower_active_runtime_view(builder, deopt_out);
+        let scope = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            view,
+            std::mem::offset_of!(crate::JitNativeRuntimeView, fiber_execution_scope) as i32,
+        );
+        let ordinary = builder.ins().icmp_imm(IntCC::Equal, scope, 0);
+        let next = builder.create_block();
+        builder.ins().brif(ordinary, next, &[], rejected, &[]);
+        builder.switch_to_block(next);
+    }
+    for requirement in &admission.object_layout_requirements {
+        let object = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            arguments,
+            i32::try_from(requirement.parameter_index.saturating_mul(8)).map_err(|_| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_METHOD_RECEIVER_OFFSET",
+                    "method receiver parameter offset does not fit the native ABI",
+                )
+            })?,
+        );
+        let object_tag = lower_value_has_tag(builder, object, crate::JIT_VALUE_RUNTIME_OBJECT_TAG);
+        let index = builder.ins().ireduce(types::I32, object);
+        let direct = builder.ins().icmp_imm(
+            IntCC::UnsignedGreaterThanOrEqual,
+            index,
+            i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+        );
+        let object_shape = builder.ins().band(object_tag, direct);
+        let inspect = builder.create_block();
+        builder
+            .ins()
+            .brif(object_shape, inspect, &[], rejected, &[]);
+        builder.switch_to_block(inspect);
+        let slot = lower_optimizing_slot_address(builder, object, deopt_out);
+        let kind = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+        );
+        let flags = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+        );
+        let layout = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+        );
+        let kind_ok = builder.ins().icmp_imm(
+            IntCC::Equal,
+            kind,
+            i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT),
+        );
+        let abi = builder.ins().band_imm(
+            flags,
+            i64::from(crate::JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_MASK),
+        );
+        let abi_ok = builder.ins().icmp_imm(
+            IntCC::Equal,
+            abi,
+            i64::from(crate::JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_VERSION),
+        );
+        let layout_ok = builder
+            .ins()
+            .icmp_imm(IntCC::Equal, layout, requirement.layout_id as i64);
+        let accepted_layout = builder.ins().band(kind_ok, abi_ok);
+        let accepted_layout = builder.ins().band(accepted_layout, layout_ok);
+        let next = builder.create_block();
+        builder
+            .ins()
+            .brif(accepted_layout, next, &[], rejected, &[]);
+        builder.switch_to_block(next);
+    }
+    for requirement in &admission.value_class_requirements {
+        let value = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            arguments,
+            i32::try_from(requirement.parameter_index.saturating_mul(8)).map_err(|_| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_VALUE_CLASS_OFFSET",
+                    "value-class parameter offset does not fit the native ABI",
+                )
+            })?,
+        );
+        let admitted = match requirement.class {
+            SsaValueClass::Int => lower_optimizing_integer_candidate(builder, value, deopt_out).0,
+            SsaValueClass::StringHandle => {
+                lower_native_string_key_descriptor(builder, value, deopt_out).0
+            }
+            SsaValueClass::Bool => {
+                let yes = builder.ins().icmp_imm(
+                    IntCC::Equal,
+                    value,
+                    crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
+                );
+                let no = builder.ins().icmp_imm(
+                    IntCC::Equal,
+                    value,
+                    crate::jit_encode_constant(crate::JIT_VALUE_FALSE),
+                );
+                builder.ins().bor(yes, no)
+            }
+            SsaValueClass::Null => {
+                builder
+                    .ins()
+                    .icmp_imm(IntCC::Equal, value, crate::jit_encode_constant(u32::MAX))
+            }
+            SsaValueClass::Float => {
+                let runtime = lower_is_runtime_handle(builder, value);
+                let tag = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_FLOAT_TAG);
+                let index = builder.ins().ireduce(types::I32, value);
+                let direct = builder.ins().icmp_imm(
+                    IntCC::UnsignedGreaterThanOrEqual,
+                    index,
+                    i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+                );
+                let direct_float = builder.ins().band(runtime, tag);
+                let direct_float = builder.ins().band(direct_float, direct);
+                let first_direct = builder.ins().iconst(
+                    types::I64,
+                    (crate::JIT_VALUE_RUNTIME_FLOAT_TAG
+                        | u64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE))
+                        as i64,
+                );
+                let safe = builder.ins().select(direct_float, value, first_direct);
+                let slot = lower_optimizing_slot_address(builder, safe, deopt_out);
+                let kind = builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    slot,
+                    std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+                );
+                let kind_ok = builder.ins().icmp_imm(
+                    IntCC::Equal,
+                    kind,
+                    i64::from(crate::JIT_NATIVE_VALUE_VIEW_FLOAT),
+                );
+                builder.ins().band(direct_float, kind_ok)
+            }
+            _ => unreachable!("only scalar echo value classes are admitted"),
+        };
+        let next = builder.create_block();
+        builder.ins().brif(admitted, next, &[], rejected, &[]);
+        builder.switch_to_block(next);
+    }
+    for requirement in &admission.integer_requirements {
+        let encoded = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            arguments,
+            i32::try_from(requirement.parameter_index.saturating_mul(8)).map_err(|_| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_INTEGER_REQUIREMENT_OFFSET",
+                    "integer-requirement parameter offset does not fit the native ABI",
+                )
+            })?,
+        );
+        let (integer, value) = lower_optimizing_integer_candidate(builder, encoded, deopt_out);
+        let minimum =
+            builder
+                .ins()
+                .icmp_imm(IntCC::SignedGreaterThanOrEqual, value, requirement.minimum);
+        let maximum =
+            builder
+                .ins()
+                .icmp_imm(IntCC::SignedLessThanOrEqual, value, requirement.maximum);
+        let mut admitted = builder.ins().band(integer, minimum);
+        admitted = builder.ins().band(admitted, maximum);
+        for forbidden in &requirement.forbidden_values {
+            let different = builder.ins().icmp_imm(IntCC::NotEqual, value, *forbidden);
+            admitted = builder.ins().band(admitted, different);
+        }
+        let next = builder.create_block();
+        builder.ins().brif(admitted, next, &[], rejected, &[]);
+        builder.switch_to_block(next);
+    }
+    let mut required_string_bytes = builder.ins().iconst(
+        types::I64,
+        i64::try_from(admission.fixed_string_bytes).map_err(|_| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_STRING_ADMISSION_BUDGET",
+                "fixed string-byte budget does not fit i64",
+            )
+        })?,
+    );
+    for requirement in admission.string_requirements.iter().copied() {
+        let value = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            arguments,
+            i32::try_from(requirement.parameter_index.saturating_mul(8)).map_err(|_| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_STRING_REQUIREMENT_OFFSET",
+                    "string-requirement parameter offset does not fit the native ABI",
+                )
+            })?,
+        );
+        let (valid, length, _) = lower_native_string_key_descriptor(builder, value, deopt_out);
+        let minimum = builder.ins().icmp_imm(
+            IntCC::UnsignedGreaterThanOrEqual,
+            length,
+            i64::try_from(requirement.minimum_length).unwrap_or(i64::MAX),
+        );
+        let accepted_string = builder.ins().band(valid, minimum);
+        let next = builder.create_block();
+        builder
+            .ins()
+            .brif(accepted_string, next, &[], rejected, &[]);
+        builder.switch_to_block(next);
+        if let Some(offset) = requirement.offset {
+            let offset = match offset {
+                NativeEntryStringOffset::Constant(offset) => {
+                    builder.ins().iconst(types::I64, offset)
+                }
+                NativeEntryStringOffset::Parameter(parameter_index) => {
+                    let encoded = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::new(),
+                        arguments,
+                        i32::try_from(parameter_index.saturating_mul(8)).map_err(|_| {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_STRING_OFFSET_PARAMETER",
+                                "string-offset parameter does not fit the native ABI",
+                            )
+                        })?,
+                    );
+                    lower_optimizing_integer_candidate(builder, encoded, deopt_out).1
+                }
+            };
+            let negative = builder.ins().icmp_imm(IntCC::SignedLessThan, offset, 0);
+            let magnitude = builder.ins().ineg(offset);
+            let negative_in_range =
+                builder
+                    .ins()
+                    .icmp(IntCC::UnsignedLessThanOrEqual, magnitude, length);
+            let positive_in_range =
+                builder
+                    .ins()
+                    .icmp(IntCC::UnsignedLessThanOrEqual, offset, length);
+            let in_range = builder
+                .ins()
+                .select(negative, negative_in_range, positive_in_range);
+            let next = builder.create_block();
+            builder.ins().brif(in_range, next, &[], rejected, &[]);
+            builder.switch_to_block(next);
+        }
+        if requirement.allocation_multiplier != 0 {
+            let allocation_length = builder.ins().imul_imm(
+                length,
+                i64::try_from(requirement.allocation_multiplier).map_err(|_| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_STRING_ADMISSION_BUDGET",
+                        "string allocation multiplier does not fit i64",
+                    )
+                })?,
+            );
+            let within_limit = builder.ins().icmp_imm(
+                IntCC::UnsignedLessThanOrEqual,
+                allocation_length,
+                crate::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY as i64,
+            );
+            let next = builder.create_block();
+            builder.ins().brif(within_limit, next, &[], rejected, &[]);
+            builder.switch_to_block(next);
+            let minimum = builder.ins().iconst(
+                types::I64,
+                i64::from(crate::JIT_NATIVE_DIRECT_STRING_MIN_CAPACITY),
+            );
+            let adjusted = builder.ins().umax(allocation_length, minimum);
+            let below = builder.ins().iadd_imm(adjusted, -1);
+            let leading = builder.ins().clz(below);
+            let bit_width = builder.ins().iconst(types::I64, 64);
+            let width = builder.ins().isub(bit_width, leading);
+            let one = builder.ins().iconst(types::I64, 1);
+            let capacity = builder.ins().ishl(one, width);
+            required_string_bytes = builder.ins().iadd(required_string_bytes, capacity);
+        }
+    }
+    for requirement in admission.instanceof_requirements.iter().copied() {
+        emit_optimizing_entry_instanceof(
+            builder,
+            arguments,
+            deopt_out,
+            function,
+            requirement,
+            rejected,
+        )?;
+    }
+    for continuation in admission.trusted_constant_requirements.iter().copied() {
+        let view = lower_active_runtime_view(builder, deopt_out);
+        let offsets = builder.ins().load(
+            pointer_type,
+            MemFlagsData::new(),
+            view,
+            std::mem::offset_of!(
+                crate::JitNativeRuntimeView,
+                trusted_property_function_offsets,
+            ) as i32,
+        );
+        let plans = builder.ins().load(
+            pointer_type,
+            MemFlagsData::new(),
+            view,
+            std::mem::offset_of!(crate::JitNativeRuntimeView, trusted_constant_slots) as i32,
+        );
+        let function_entry = builder.ins().iadd_imm(
+            offsets,
+            i64::try_from(function.index().saturating_mul(4)).unwrap_or(i64::MAX),
+        );
+        let plan_base = builder
+            .ins()
+            .load(types::I32, MemFlagsData::new(), function_entry, 0);
+        let plan_index = builder.ins().iadd_imm(plan_base, i64::from(continuation));
+        let wide_plan_index = builder.ins().uextend(pointer_type, plan_index);
+        let plan_offset = builder.ins().ishl_imm(wide_plan_index, 4);
+        let plan = builder.ins().iadd(plans, plan_offset);
+        let state = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            plan,
+            std::mem::offset_of!(crate::JitNativeTrustedConstantSlot, state) as i32,
+        );
+        let published = builder.ins().icmp_imm(
+            IntCC::Equal,
+            state,
+            i64::from(crate::JIT_NATIVE_TRUSTED_CONSTANT_PUBLISHED),
+        );
+        let next = builder.create_block();
+        builder.ins().brif(published, next, &[], rejected, &[]);
+        builder.switch_to_block(next);
+    }
+    for continuation in admission.trusted_static_local_requirements.iter().copied() {
+        let view = lower_active_runtime_view(builder, deopt_out);
+        let offsets = builder.ins().load(
+            pointer_type,
+            MemFlagsData::new(),
+            view,
+            std::mem::offset_of!(
+                crate::JitNativeRuntimeView,
+                trusted_property_function_offsets,
+            ) as i32,
+        );
+        let plans = builder.ins().load(
+            pointer_type,
+            MemFlagsData::new(),
+            view,
+            std::mem::offset_of!(crate::JitNativeRuntimeView, trusted_static_local_slots) as i32,
+        );
+        let function_entry = builder.ins().iadd_imm(
+            offsets,
+            i64::try_from(function.index().saturating_mul(4)).unwrap_or(i64::MAX),
+        );
+        let plan_base = builder
+            .ins()
+            .load(types::I32, MemFlagsData::new(), function_entry, 0);
+        let plan_index = builder.ins().iadd_imm(plan_base, i64::from(continuation));
+        let wide_plan_index = builder.ins().uextend(pointer_type, plan_index);
+        let plan_offset = builder.ins().ishl_imm(wide_plan_index, 4);
+        let plan = builder.ins().iadd(plans, plan_offset);
+        let state = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            plan,
+            std::mem::offset_of!(crate::JitNativeTrustedStaticLocalSlot, state) as i32,
+        );
+        let published = builder.ins().icmp_imm(
+            IntCC::Equal,
+            state,
+            i64::from(crate::JIT_NATIVE_TRUSTED_STATIC_LOCAL_PUBLISHED),
+        );
+        let next = builder.create_block();
+        builder.ins().brif(published, next, &[], rejected, &[]);
+        builder.switch_to_block(next);
+    }
+    for local in admission.initialized_request_locals.iter().copied() {
+        let reference = lower_trusted_request_local_reference(builder, deopt_out, function, local);
+        let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
+        let payload = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+        );
+        let initialized = builder.ins().icmp_imm(
+            IntCC::NotEqual,
+            payload,
+            crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED),
+        );
+        let next = builder.create_block();
+        builder.ins().brif(initialized, next, &[], rejected, &[]);
+        builder.switch_to_block(next);
+    }
+    for continuation_id in admission.initialized_globals.iter().copied() {
+        let reference = lower_trusted_global_reference_at_continuation(
+            builder,
+            function,
+            continuation_id,
+            deopt_out,
+        );
+        let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
+        let payload = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+        );
+        let initialized = builder.ins().icmp_imm(
+            IntCC::NotEqual,
+            payload,
+            crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED),
+        );
+        let next = builder.create_block();
+        builder.ins().brif(initialized, next, &[], rejected, &[]);
+        builder.switch_to_block(next);
+    }
+    for continuation_id in admission.plain_globals.iter().copied() {
+        let reference = lower_trusted_global_reference_at_continuation(
+            builder,
+            function,
+            continuation_id,
+            deopt_out,
+        );
+        let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
+        let payload = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+        );
+        let authoritative = lower_optimizing_call_value_is_authoritative(builder, payload);
+        let reference =
+            lower_value_has_tag(builder, payload, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
+        let plain = builder.ins().icmp_imm(IntCC::Equal, reference, 0);
+        let admitted = builder.ins().band(authoritative, plain);
+        let next = builder.create_block();
+        builder.ins().brif(admitted, next, &[], rejected, &[]);
+        builder.switch_to_block(next);
+    }
+    for parameter_index in admission.reference_source_parameters.iter().copied() {
+        let value = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            arguments,
+            i32::try_from(parameter_index.saturating_mul(8)).map_err(|_| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_REFERENCE_SOURCE_OFFSET",
+                    "reference source parameter offset does not fit the native ABI",
+                )
+            })?,
+        );
+        let authoritative = lower_optimizing_call_value_is_authoritative(builder, value);
+        let next = builder.create_block();
+        builder.ins().brif(authoritative, next, &[], rejected, &[]);
+        builder.switch_to_block(next);
+    }
+    for local in admission.releasable_request_locals.iter().copied() {
+        let reference = lower_trusted_request_local_reference(builder, deopt_out, function, local);
+        let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
+        let payload = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+        );
+        let inspect_runtime = builder.create_block();
+        let next = builder.create_block();
+        let runtime = lower_is_runtime_handle(builder, payload);
+        builder.ins().brif(runtime, inspect_runtime, &[], next, &[]);
+        builder.switch_to_block(inspect_runtime);
+        let payload_slot = lower_optimizing_slot_address(builder, payload, deopt_out);
+        let refcount = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            payload_slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, refcount) as i32,
+        );
+        let shared = builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThan, refcount, 1);
+        builder.ins().brif(shared, next, &[], rejected, &[]);
+        builder.switch_to_block(next);
+    }
+    for continuation_id in admission.releasable_globals.iter().copied() {
+        let reference = lower_trusted_global_reference_at_continuation(
+            builder,
+            function,
+            continuation_id,
+            deopt_out,
+        );
+        let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
+        let payload = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+        );
+        let inspect_runtime = builder.create_block();
+        let next = builder.create_block();
+        let runtime = lower_is_runtime_handle(builder, payload);
+        builder.ins().brif(runtime, inspect_runtime, &[], next, &[]);
+        builder.switch_to_block(inspect_runtime);
+        let payload_slot = lower_optimizing_slot_address(builder, payload, deopt_out);
+        let refcount = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            payload_slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, refcount) as i32,
+        );
+        let shared = builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThan, refcount, 1);
+        builder.ins().brif(shared, next, &[], rejected, &[]);
+        builder.switch_to_block(next);
+    }
+    for requirement in admission.property_requirements.iter().cloned() {
+        let object = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            arguments,
+            i32::try_from(requirement.parameter_index.saturating_mul(8)).map_err(|_| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_PROPERTY_ADMISSION_OFFSET",
+                    "property admission parameter offset does not fit the native ABI",
+                )
+            })?,
+        );
+        let _ = emit_optimizing_entry_property_slot(
+            builder,
+            object,
+            deopt_out,
+            function,
+            requirement,
+            admission.fixed_lvalue_insertions,
+            rejected,
+        );
+    }
+    for requirement in &admission.static_property_requirements {
+        emit_optimizing_entry_static_property(
+            builder,
+            deopt_out,
+            function,
+            requirement,
+            admission.fixed_lvalue_insertions,
+            rejected,
+        );
+    }
+    if admission.array_requirements.is_empty()
+        && admission.fixed_value_allocations == 0
+        && admission.fixed_array_entries == 0
+        && admission.fixed_string_bytes == 0
+        && admission
+            .string_requirements
+            .iter()
+            .all(|requirement| requirement.allocation_multiplier == 0)
+    {
+        builder.ins().jump(accepted, &[]);
+        builder.switch_to_block(rejected);
+        let retry_baseline = builder.ins().iconst(
+            types::I32,
+            i64::from(crate::JitCallStatus::RECOMPILE_REQUESTED.0),
+        );
+        builder.ins().return_(&[retry_baseline]);
+        return Ok(());
+    }
+    let mut required_entries = builder.ins().iconst(
+        types::I64,
+        i64::try_from(admission.fixed_array_entries).map_err(|_| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_ARRAY_ADMISSION_BUDGET",
+                "fixed array entry budget does not fit i64",
+            )
+        })?,
+    );
+    let fixed_value_allocations = admission.fixed_value_allocations.saturating_add(
+        admission
+            .array_requirements
+            .values()
+            .map(|requirement| requirement.projection_allocations)
+            .sum::<usize>(),
+    );
+    let mut required_values = builder.ins().iconst(
+        types::I64,
+        i64::try_from(fixed_value_allocations).map_err(|_| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_ARRAY_ADMISSION_BUDGET",
+                "fixed value-slot budget does not fit i64",
+            )
+        })?,
+    );
+    let mut admitted_array_lengths = BTreeMap::new();
+    for (source, requirement) in &admission.array_requirements {
+        let inspect = builder.create_block();
+        let inspect_slot = builder.create_block();
+        let source_accepted = builder.create_block();
+        builder.append_block_param(inspect_slot, types::I64);
+        builder.append_block_param(source_accepted, types::I64);
+        builder.append_block_param(source_accepted, pointer_type);
+        let array = lower_entry_array_source(builder, arguments, deopt_out, function, *source)?;
+        let tagged = lower_value_has_tag(builder, array, crate::JIT_VALUE_RUNTIME_ARRAY_TAG);
+        let encoded_index = builder.ins().ireduce(types::I32, array);
+        let direct_index = builder.ins().icmp_imm(
+            IntCC::UnsignedGreaterThanOrEqual,
+            encoded_index,
+            i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+        );
+        let direct = builder.ins().band(tagged, direct_index);
+        builder.ins().brif(direct, inspect, &[], rejected, &[]);
+
+        builder.switch_to_block(inspect);
+        let index = builder.ins().iadd_imm(
+            encoded_index,
+            -i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+        );
+        let in_bounds = builder.ins().icmp_imm(
+            IntCC::UnsignedLessThan,
+            index,
+            crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY as i64,
+        );
+        builder
+            .ins()
+            .brif(in_bounds, inspect_slot, &[array.into()], rejected, &[]);
+
+        builder.switch_to_block(inspect_slot);
+        let array = builder.block_params(inspect_slot)[0];
+        let slot = lower_optimizing_slot_address(builder, array, deopt_out);
+        let kind = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+        );
+        let length = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+        );
+        let entries = builder.ins().load(
+            pointer_type,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, aux) as i32,
+        );
+        let flags = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+        );
+        let direct_kind = builder.ins().icmp_imm(
+            IntCC::Equal,
+            kind,
+            i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY),
+        );
+        let abi_mask = (1_i64 << crate::JIT_NATIVE_DIRECT_ARRAY_CURSOR_SHIFT) - 1;
+        let abi = builder.ins().band_imm(flags, abi_mask);
+        let abi_matches = builder.ins().icmp_imm(
+            IntCC::Equal,
+            abi,
+            i64::from(crate::JIT_NATIVE_DIRECT_ARRAY_ABI_VERSION),
+        );
+        let bounded = builder.ins().icmp_imm(
+            IntCC::UnsignedLessThanOrEqual,
+            length,
+            crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY as i64,
+        );
+        let admitted = builder.ins().band(direct_kind, abi_matches);
+        let admitted = builder.ins().band(admitted, bounded);
+        builder.ins().brif(
+            admitted,
+            source_accepted,
+            &[length.into(), entries.into()],
+            rejected,
+            &[],
+        );
+
+        builder.switch_to_block(source_accepted);
+        let length = builder.block_params(source_accepted)[0];
+        let entries = builder.block_params(source_accepted)[1];
+        admitted_array_lengths.insert(*source, length);
+        if requirement.minimum_length != 0 {
+            let enough = builder.ins().icmp_imm(
+                IntCC::UnsignedGreaterThanOrEqual,
+                length,
+                i64::try_from(requirement.minimum_length).unwrap_or(i64::MAX),
+            );
+            let next = builder.create_block();
+            builder.ins().brif(enough, next, &[], rejected, &[]);
+            builder.switch_to_block(next);
+        }
+        emit_optimizing_entry_array_probe_paths(
+            builder,
+            &requirement.probe_paths,
+            length,
+            entries,
+            deopt_out,
+            rejected,
+        );
+        for key in &requirement.required_integer_keys {
+            let key = builder.ins().iconst(types::I64, *key);
+            let (found, _) = lower_optimizing_direct_array_lookup_optional(
+                builder, length, entries, key, deopt_out,
+            );
+            let next = builder.create_block();
+            builder.ins().brif(found, next, &[], rejected, &[]);
+            builder.switch_to_block(next);
+        }
+        for (key, type_) in &requirement.required_value_types {
+            let key = builder.ins().iconst(types::I64, *key);
+            let (found, value) = lower_optimizing_direct_array_lookup_optional(
+                builder, length, entries, key, deopt_out,
+            );
+            let typed = lower_optimizing_type_guard(builder, value, type_, deopt_out)
+                .expect("publication admitted only directly guardable array element types");
+            let admitted = builder.ins().band(found, typed);
+            let next = builder.create_block();
+            builder.ins().brif(admitted, next, &[], rejected, &[]);
+            builder.switch_to_block(next);
+        }
+        if requirement.require_supported_keys
+            || requirement.require_plain_values
+            || requirement.require_key_values
+            || requirement.require_string_values
+            || requirement.require_scalar_values
+            || !requirement.all_value_types.is_empty()
+        {
+            let scan = builder.create_block();
+            let inspect = builder.create_block();
+            let finished = builder.create_block();
+            builder.append_block_param(scan, types::I64);
+            let zero = builder.ins().iconst(types::I64, 0);
+            builder.ins().jump(scan, &[zero.into()]);
+            builder.switch_to_block(scan);
+            let index = builder.block_params(scan)[0];
+            let done = builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, index, length);
+            builder.ins().brif(done, finished, &[], inspect, &[]);
+            builder.switch_to_block(inspect);
+            let entry =
+                lower_optimizing_direct_array_entry_address(builder, entries, index, pointer_type);
+            let key = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                entry,
+                std::mem::offset_of!(crate::JitNativeDirectArrayEntry, key) as i32,
+            );
+            let value = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                entry,
+                std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
+            );
+            let authoritative = lower_optimizing_call_value_is_authoritative(builder, value);
+            let reference =
+                lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
+            let plain = builder.ins().icmp_imm(IntCC::Equal, reference, 0);
+            let mut admitted = authoritative;
+            if requirement.require_plain_values {
+                admitted = builder.ins().band(admitted, plain);
+            }
+            if requirement.require_supported_keys {
+                let integer = lower_native_array_key_integer_candidate(builder, key, deopt_out).0;
+                let string = lower_native_string_key_descriptor(builder, key, deopt_out).0;
+                let supported = builder.ins().bor(integer, string);
+                admitted = builder.ins().band(admitted, supported);
+            }
+            if requirement.require_key_values {
+                let integer = lower_native_array_key_integer_candidate(builder, value, deopt_out).0;
+                let string = lower_native_string_key_descriptor(builder, value, deopt_out).0;
+                let key_value = builder.ins().bor(integer, string);
+                admitted = builder.ins().band(admitted, key_value);
+            }
+            if requirement.require_string_values {
+                let string = lower_native_string_key_descriptor(builder, value, deopt_out).0;
+                admitted = builder.ins().band(admitted, string);
+            }
+            if requirement.require_scalar_values {
+                let integer = lower_optimizing_integer_candidate(builder, value, deopt_out).0;
+                let string = lower_native_string_key_descriptor(builder, value, deopt_out).0;
+                let float = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_FLOAT_TAG);
+                let true_value = builder.ins().icmp_imm(
+                    IntCC::Equal,
+                    value,
+                    crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
+                );
+                let false_value = builder.ins().icmp_imm(
+                    IntCC::Equal,
+                    value,
+                    crate::jit_encode_constant(crate::JIT_VALUE_FALSE),
+                );
+                let null_value = builder.ins().icmp_imm(
+                    IntCC::Equal,
+                    value,
+                    crate::jit_encode_constant(u32::MAX),
+                );
+                let scalar = builder.ins().bor(integer, string);
+                let scalar = builder.ins().bor(scalar, float);
+                let scalar = builder.ins().bor(scalar, true_value);
+                let scalar = builder.ins().bor(scalar, false_value);
+                let scalar = builder.ins().bor(scalar, null_value);
+                admitted = builder.ins().band(admitted, scalar);
+            }
+            for type_ in &requirement.all_value_types {
+                let typed = lower_optimizing_type_guard(builder, value, type_, deopt_out)
+                    .expect("publication admitted only directly guardable callback array types");
+                admitted = builder.ins().band(admitted, typed);
+            }
+            let next = builder.create_block();
+            builder.ins().brif(admitted, next, &[], rejected, &[]);
+            builder.switch_to_block(next);
+            let next_index = builder.ins().iadd_imm(index, 1);
+            builder.ins().jump(scan, &[next_index.into()]);
+            builder.switch_to_block(finished);
+        }
+        for separator_length in &requirement.implode_separator_lengths {
+            let scan = builder.create_block();
+            let inspect = builder.create_block();
+            let finished = builder.create_block();
+            builder.append_block_param(scan, types::I64);
+            builder.append_block_param(scan, types::I64);
+            builder.append_block_param(finished, types::I64);
+            let zero = builder.ins().iconst(types::I64, 0);
+            builder.ins().jump(scan, &[zero.into(), zero.into()]);
+            builder.switch_to_block(scan);
+            let index = builder.block_params(scan)[0];
+            let total = builder.block_params(scan)[1];
+            let done = builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, index, length);
+            builder
+                .ins()
+                .brif(done, finished, &[total.into()], inspect, &[]);
+            builder.switch_to_block(inspect);
+            let entry =
+                lower_optimizing_direct_array_entry_address(builder, entries, index, pointer_type);
+            let value = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                entry,
+                std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
+            );
+            let (_, value_length, _) =
+                lower_native_string_key_descriptor(builder, value, deopt_out);
+            let first = builder.ins().icmp_imm(IntCC::Equal, index, 0);
+            let separator = builder.ins().iconst(
+                types::I64,
+                i64::try_from(*separator_length).unwrap_or(i64::MAX),
+            );
+            let separator = builder.ins().select(first, zero, separator);
+            let next_total = builder.ins().iadd(total, separator);
+            let next_total = builder.ins().iadd(next_total, value_length);
+            let next_index = builder.ins().iadd_imm(index, 1);
+            builder
+                .ins()
+                .jump(scan, &[next_index.into(), next_total.into()]);
+            builder.switch_to_block(finished);
+            let total = builder.block_params(finished)[0];
+            let within_limit = builder.ins().icmp_imm(
+                IntCC::UnsignedLessThanOrEqual,
+                total,
+                crate::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY as i64,
+            );
+            let next = builder.create_block();
+            builder.ins().brif(within_limit, next, &[], rejected, &[]);
+            builder.switch_to_block(next);
+            let minimum = builder.ins().iconst(
+                types::I64,
+                i64::from(crate::JIT_NATIVE_DIRECT_STRING_MIN_CAPACITY),
+            );
+            let adjusted = builder.ins().umax(total, minimum);
+            let below = builder.ins().iadd_imm(adjusted, -1);
+            let leading = builder.ins().clz(below);
+            let bit_width = builder.ins().iconst(types::I64, 64);
+            let width = builder.ins().isub(bit_width, leading);
+            let one = builder.ins().iconst(types::I64, 1);
+            let capacity = builder.ins().ishl(one, width);
+            required_string_bytes = builder.ins().iadd(required_string_bytes, capacity);
+        }
+        for unpack in &requirement.unpack_calls {
+            let enough = builder.ins().icmp_imm(
+                IntCC::UnsignedGreaterThanOrEqual,
+                length,
+                i64::try_from(unpack.required_length).map_err(|_| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_UNPACK_ARITY",
+                        "required unpack length does not fit the native ABI",
+                    )
+                })?,
+            );
+            let length_accepted = builder.create_block();
+            builder
+                .ins()
+                .brif(enough, length_accepted, &[], rejected, &[]);
+            builder.switch_to_block(length_accepted);
+            for (index, type_, by_reference) in &unpack.fixed_parameters {
+                let entry =
+                    builder.ins().iadd_imm(
+                        entries,
+                        i64::try_from(index.saturating_mul(std::mem::size_of::<
+                            crate::JitNativeDirectArrayEntry,
+                        >()))
+                        .map_err(|_| {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_ARRAY_UNPACK_OFFSET",
+                                "fixed unpack entry offset does not fit the native ABI",
+                            )
+                        })?,
+                    );
+                let key = builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), entry, 0);
+                let integer_key =
+                    lower_native_array_key_integer_candidate(builder, key, deopt_out).0;
+                let value = builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    entry,
+                    std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
+                );
+                let authoritative = lower_optimizing_call_value_is_authoritative(builder, value);
+                let reference =
+                    lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
+                let reference_shape = if *by_reference {
+                    reference
+                } else {
+                    builder.ins().icmp_imm(IntCC::Equal, reference, 0)
+                };
+                let mut admitted = builder.ins().band(integer_key, authoritative);
+                admitted = builder.ins().band(admitted, reference_shape);
+                if let Some(type_) = type_ {
+                    let typed = lower_optimizing_type_guard(builder, value, type_, deopt_out)
+                        .expect("publication admitted only directly guardable unpack types");
+                    admitted = builder.ins().band(admitted, typed);
+                }
+                let next = builder.create_block();
+                builder.ins().brif(admitted, next, &[], rejected, &[]);
+                builder.switch_to_block(next);
+            }
+            let scan = builder.create_block();
+            let inspect = builder.create_block();
+            let finished = builder.create_block();
+            builder.append_block_param(scan, types::I64);
+            let start = builder.ins().iconst(
+                types::I64,
+                i64::try_from(unpack.tail_start).map_err(|_| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_UNPACK_OFFSET",
+                        "variadic unpack start does not fit the native ABI",
+                    )
+                })?,
+            );
+            builder.ins().jump(scan, &[start.into()]);
+            builder.switch_to_block(scan);
+            let index = builder.block_params(scan)[0];
+            let done = builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, index, length);
+            builder.ins().brif(done, finished, &[], inspect, &[]);
+            builder.switch_to_block(inspect);
+            let entry =
+                lower_optimizing_direct_array_entry_address(builder, entries, index, pointer_type);
+            let key = builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), entry, 0);
+            let integer_key = lower_native_array_key_integer_candidate(builder, key, deopt_out).0;
+            let value = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                entry,
+                std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
+            );
+            let authoritative = lower_optimizing_call_value_is_authoritative(builder, value);
+            let reference =
+                lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
+            let reference_shape = if unpack.tail_by_reference {
+                reference
+            } else {
+                builder.ins().icmp_imm(IntCC::Equal, reference, 0)
+            };
+            let mut admitted = builder.ins().band(integer_key, authoritative);
+            admitted = builder.ins().band(admitted, reference_shape);
+            if let Some(type_) = unpack.tail_type.as_ref() {
+                let typed = lower_optimizing_type_guard(builder, value, type_, deopt_out)
+                    .expect("publication admitted only directly guardable variadic types");
+                admitted = builder.ins().band(admitted, typed);
+            }
+            let next = builder.create_block();
+            builder.ins().brif(admitted, next, &[], rejected, &[]);
+            builder.switch_to_block(next);
+            let next_index = builder.ins().iadd_imm(index, 1);
+            builder.ins().jump(scan, &[next_index.into()]);
+            builder.switch_to_block(finished);
+        }
+        for mutation in &requirement.mutations {
+            let refcount = builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                slot,
+                std::mem::offset_of!(crate::JitNativeValueSlot, refcount) as i32,
+            );
+            let unique = builder.ins().icmp_imm(IntCC::Equal, refcount, 1);
+            let root_unique = builder.create_block();
+            builder.ins().brif(unique, root_unique, &[], rejected, &[]);
+            builder.switch_to_block(root_unique);
+
+            let parents = match mutation {
+                NativeEntryArrayMutationRequirement::Assign { parents, .. }
+                | NativeEntryArrayMutationRequirement::Append { parents }
+                | NativeEntryArrayMutationRequirement::Unset { parents, .. }
+                | NativeEntryArrayMutationRequirement::Reference { parents, .. }
+                | NativeEntryArrayMutationRequirement::ReferenceAppend { parents } => parents,
+            };
+            let mut current_array = array;
+            let mut current_slot = slot;
+            let mut current_length = length;
+            let mut current_entries = entries;
+            for parent in parents {
+                let parent = builder.ins().iconst(types::I64, *parent);
+                let (found, child) = lower_optimizing_direct_array_lookup_optional(
+                    builder,
+                    current_length,
+                    current_entries,
+                    parent,
+                    deopt_out,
+                );
+                let child_found = builder.create_block();
+                builder.ins().brif(found, child_found, &[], rejected, &[]);
+                builder.switch_to_block(child_found);
+                let (child_slot, child_length, child_entries) =
+                    emit_optimizing_entry_direct_array_descriptor(
+                        builder, child, deopt_out, rejected,
+                    );
+                let child_refcount = builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    child_slot,
+                    std::mem::offset_of!(crate::JitNativeValueSlot, refcount) as i32,
+                );
+                let child_unique = builder.ins().icmp_imm(IntCC::Equal, child_refcount, 1);
+                let child_accepted = builder.create_block();
+                builder
+                    .ins()
+                    .brif(child_unique, child_accepted, &[], rejected, &[]);
+                builder.switch_to_block(child_accepted);
+                current_array = child;
+                current_slot = child_slot;
+                current_length = child_length;
+                current_entries = child_entries;
+            }
+            let additional = usize::from(!matches!(
+                mutation,
+                NativeEntryArrayMutationRequirement::Unset { .. }
+            ));
+            if additional != 0 {
+                let reserved = builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    current_slot,
+                    std::mem::offset_of!(crate::JitNativeValueSlot, reserved) as i32,
+                );
+                let reserved = builder.ins().uextend(types::I64, reserved);
+                let required = builder.ins().iadd_imm(
+                    current_length,
+                    i64::try_from(admission.fixed_lvalue_insertions).unwrap_or(i64::MAX),
+                );
+                let capacity =
+                    builder
+                        .ins()
+                        .icmp(IntCC::UnsignedGreaterThanOrEqual, reserved, required);
+                let capacity_accepted = builder.create_block();
+                builder
+                    .ins()
+                    .brif(capacity, capacity_accepted, &[], rejected, &[]);
+                builder.switch_to_block(capacity_accepted);
+            }
+            match mutation {
+                NativeEntryArrayMutationRequirement::Append { .. }
+                | NativeEntryArrayMutationRequirement::ReferenceAppend { .. } => {
+                    let state = lower_direct_array_state_address(builder, current_array, deopt_out);
+                    let next_key = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::new(),
+                        state,
+                        std::mem::offset_of!(crate::JitNativeDirectArrayState, next_append_key,)
+                            as i32,
+                    );
+                    let has_next = builder.ins().load(
+                        types::I32,
+                        MemFlagsData::new(),
+                        state,
+                        std::mem::offset_of!(crate::JitNativeDirectArrayState, has_next_append_key,)
+                            as i32,
+                    );
+                    let maximum = builder.ins().icmp_imm(
+                        IntCC::SignedGreaterThan,
+                        next_key,
+                        i64::MAX.saturating_sub(
+                            i64::try_from(admission.fixed_lvalue_insertions).unwrap_or(i64::MAX),
+                        ),
+                    );
+                    let has_next = builder.ins().icmp_imm(IntCC::NotEqual, has_next, 0);
+                    let overflow = builder.ins().band(maximum, has_next);
+                    let safe = builder.ins().icmp_imm(IntCC::Equal, overflow, 0);
+                    let next = builder.create_block();
+                    builder.ins().brif(safe, next, &[], rejected, &[]);
+                    builder.switch_to_block(next);
+                }
+                NativeEntryArrayMutationRequirement::Assign { key, .. }
+                | NativeEntryArrayMutationRequirement::Unset { key, .. }
+                | NativeEntryArrayMutationRequirement::Reference { key, .. } => {
+                    let key = builder.ins().iconst(types::I64, *key);
+                    let (found, old) = lower_optimizing_direct_array_lookup_optional(
+                        builder,
+                        current_length,
+                        current_entries,
+                        key,
+                        deopt_out,
+                    );
+                    let runtime = lower_is_runtime_handle(builder, old);
+                    let immediate = builder.ins().icmp_imm(IntCC::Equal, runtime, 0);
+                    let missing = builder.ins().icmp_imm(IntCC::Equal, found, 0);
+                    let safe = builder.ins().bor(missing, immediate);
+                    let next = builder.create_block();
+                    builder.ins().brif(safe, next, &[], rejected, &[]);
+                    builder.switch_to_block(next);
+                }
+            }
+        }
+        if requirement.projection_allocations != 0 {
+            let capacity = lower_optimizing_direct_array_capacity(builder, length);
+            let capacity = builder.ins().imul_imm(
+                capacity,
+                i64::try_from(requirement.projection_allocations).map_err(|_| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_ADMISSION_BUDGET",
+                        "array projection count does not fit the native admission ABI",
+                    )
+                })?,
+            );
+            required_entries = builder.ins().iadd(required_entries, capacity);
+        }
+        if requirement.spread_allocations != 0 {
+            let capacity = lower_optimizing_direct_array_capacity(builder, length);
+            let capacity = builder.ins().imul_imm(
+                capacity,
+                i64::try_from(requirement.spread_allocations).map_err(|_| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_SPREAD_BUDGET",
+                        "array spread count does not fit the native admission ABI",
+                    )
+                })?,
+            );
+            required_entries = builder.ins().iadd(required_entries, capacity);
+        }
+        if requirement.value_allocations_per_entry != 0 {
+            let values = builder.ins().imul_imm(
+                length,
+                i64::try_from(requirement.value_allocations_per_entry).map_err(|_| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_ADMISSION_BUDGET",
+                        "per-entry value-slot budget does not fit the native admission ABI",
+                    )
+                })?,
+            );
+            required_values = builder.ins().iadd(required_values, values);
+        }
+        if requirement.entry_allocations_per_entry != 0 {
+            let entries = builder.ins().imul_imm(
+                length,
+                i64::try_from(requirement.entry_allocations_per_entry).map_err(|_| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_ADMISSION_BUDGET",
+                        "per-entry array budget does not fit the native admission ABI",
+                    )
+                })?,
+            );
+            required_entries = builder.ins().iadd(required_entries, entries);
+        }
+    }
+    for group in &admission.equal_array_length_groups {
+        let Some((first, rest)) = group.split_first() else {
+            continue;
+        };
+        let first_length = admitted_array_lengths[first];
+        for source in rest {
+            let same =
+                builder
+                    .ins()
+                    .icmp(IntCC::Equal, first_length, admitted_array_lengths[source]);
+            let next = builder.create_block();
+            builder.ins().brif(same, next, &[], rejected, &[]);
+            builder.switch_to_block(next);
+        }
+    }
+
+    let requires_resource_budget = fixed_value_allocations != 0
+        || admission.fixed_array_entries != 0
+        || admission.fixed_string_bytes != 0
+        || admission
+            .string_requirements
+            .iter()
+            .any(|requirement| requirement.allocation_multiplier != 0)
+        || admission
+            .array_requirements
+            .values()
+            .any(|requirement| !requirement.implode_separator_lengths.is_empty())
+        || admission.array_requirements.values().any(|requirement| {
+            requirement.value_allocations_per_entry != 0
+                || requirement.entry_allocations_per_entry != 0
+        });
+    if !requires_resource_budget {
+        builder.ins().jump(accepted, &[]);
+        builder.switch_to_block(rejected);
+        let retry_baseline = builder.ins().iconst(
+            types::I32,
+            i64::from(crate::JitCallStatus::RECOMPILE_REQUESTED.0),
+        );
+        builder.ins().return_(&[retry_baseline]);
+        return Ok(());
+    }
+
+    let view = lower_active_runtime_view(builder, deopt_out);
+    let direct_value_next = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, direct_value_next) as i32,
+    );
+    let direct_value_next =
+        builder
+            .ins()
+            .load(types::I32, MemFlagsData::new(), direct_value_next, 0);
+    let direct_value_next = builder.ins().uextend(types::I64, direct_value_next);
+    let value_end = builder.ins().iadd(direct_value_next, required_values);
+    let values_fit = builder.ins().icmp_imm(
+        IntCC::UnsignedLessThanOrEqual,
+        value_end,
+        crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY as i64,
+    );
+    let requires_array_entries = admission.fixed_array_entries != 0
+        || admission.array_requirements.values().any(|requirement| {
+            requirement.projection_allocations != 0
+                || requirement.spread_allocations != 0
+                || requirement.entry_allocations_per_entry != 0
+        });
+    let arrays_fit = if requires_array_entries {
+        let direct_array_next = builder.ins().load(
+            pointer_type,
+            MemFlagsData::new(),
+            view,
+            std::mem::offset_of!(crate::JitNativeRuntimeView, direct_array_next) as i32,
+        );
+        let direct_array_next =
+            builder
+                .ins()
+                .load(types::I32, MemFlagsData::new(), direct_array_next, 0);
+        let direct_array_next = builder.ins().uextend(types::I64, direct_array_next);
+        let array_end = builder.ins().iadd(direct_array_next, required_entries);
+        builder.ins().icmp_imm(
+            IntCC::UnsignedLessThanOrEqual,
+            array_end,
+            crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY as i64,
+        )
+    } else {
+        builder.ins().iconst(types::I8, 1)
+    };
+    let requires_string_bytes = admission.fixed_string_bytes != 0
+        || admission
+            .string_requirements
+            .iter()
+            .any(|requirement| requirement.allocation_multiplier != 0)
+        || admission
+            .array_requirements
+            .values()
+            .any(|requirement| !requirement.implode_separator_lengths.is_empty());
+    let strings_fit = if requires_string_bytes {
+        let direct_string_next = builder.ins().load(
+            pointer_type,
+            MemFlagsData::new(),
+            view,
+            std::mem::offset_of!(crate::JitNativeRuntimeView, direct_string_next) as i32,
+        );
+        let direct_string_next =
+            builder
+                .ins()
+                .load(types::I32, MemFlagsData::new(), direct_string_next, 0);
+        let direct_string_next = builder.ins().uextend(types::I64, direct_string_next);
+        let string_end = builder
+            .ins()
+            .iadd(direct_string_next, required_string_bytes);
+        builder.ins().icmp_imm(
+            IntCC::UnsignedLessThanOrEqual,
+            string_end,
+            crate::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY as i64,
+        )
+    } else {
+        builder.ins().iconst(types::I8, 1)
+    };
+    let resources_fit = builder.ins().band(values_fit, arrays_fit);
+    let resources_fit = builder.ins().band(resources_fit, strings_fit);
+    builder
+        .ins()
+        .brif(resources_fit, accepted, &[], rejected, &[]);
+
+    builder.switch_to_block(rejected);
+    let retry_baseline = builder.ins().iconst(
+        types::I32,
+        i64::from(crate::JitCallStatus::RECOMPILE_REQUESTED.0),
+    );
+    builder.ins().return_(&[retry_baseline]);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn define_region_graph_function(
     module: &mut JITModule,
@@ -9018,6 +16773,13 @@ fn define_region_graph_function(
     preflight_only: bool,
 ) -> Result<DefinedRegionFunction, CraneliftLoweringError> {
     let pointer_type = module.target_config().pointer_type();
+    let optimizing_admission = optimizing_admission_for_region(
+        region,
+        constants,
+        value_flow,
+        function_params,
+        external_function_signatures,
+    )?;
     let mut maximum_temporary_cache_entries = 0_usize;
     let mut production_lowering = Vec::new();
     ctx.func.signature = if fragment.is_some() && !inline_fragment_entry {
@@ -9091,9 +16853,6 @@ fn define_region_graph_function(
         builder.set_cold_block(terminal_exit);
         builder.append_block_param(terminal_exit, types::I32);
         builder.append_block_param(terminal_exit, types::I64);
-        let optimizing_baseline_resume =
-            matches!(tier_operations, NativeTierOperations::Optimizing { .. })
-                .then(|| builder.create_block());
         let normal_entry = blocks.values().next().copied().ok_or_else(|| {
             CraneliftLoweringError::new(
                 "JIT_CRANELIFT_REJECT_HELPER_CONTROL_FLOW",
@@ -9498,6 +17257,36 @@ fn define_region_graph_function(
                 builder.def_var(variable, initial);
             }
         }
+        if matches!(tier_operations, NativeTierOperations::Optimizing { .. })
+            && (fragment.is_none() || inline_fragment_entry)
+            && (!optimizing_admission.array_requirements.is_empty()
+                || !optimizing_admission.initialized_request_locals.is_empty()
+                || !optimizing_admission.releasable_request_locals.is_empty()
+                || !optimizing_admission.initialized_globals.is_empty()
+                || !optimizing_admission.releasable_globals.is_empty()
+                || !optimizing_admission.plain_globals.is_empty()
+                || !optimizing_admission.property_requirements.is_empty()
+                || optimizing_admission.fixed_value_allocations != 0
+                || optimizing_admission.fixed_array_entries != 0
+                || optimizing_admission.require_non_fiber_scope)
+        {
+            let admission = builder.create_block();
+            let bind_parameters = builder.create_block();
+            let normal_invocation = builder.ins().icmp_imm(IntCC::Equal, resume_id, -1);
+            builder
+                .ins()
+                .brif(normal_invocation, admission, &[], bind_parameters, &[]);
+            builder.switch_to_block(admission);
+            emit_optimizing_entry_admission(
+                &mut builder,
+                &optimizing_admission,
+                arguments,
+                deopt_out,
+                region.function,
+                bind_parameters,
+            )?;
+            builder.switch_to_block(bind_parameters);
+        }
         if fragment.is_none() {
             for (index, param) in region.parameter_locals.iter().enumerate() {
                 let value = builder.ins().load(
@@ -9776,68 +17565,10 @@ fn define_region_graph_function(
             // caught Error with NULL.
             if let Some(exception_locals) = handler_exception_locals.get(&target) {
                 if matches!(tier_operations, NativeTierOperations::Optimizing { .. }) {
-                    // Catch binding can overwrite an object whose destructor
-                    // re-enters PHP. Exception paths are cold, so hand the
-                    // complete pre-bind frame and pending throwable to the
-                    // exact baseline handler entry once instead of embedding
-                    // a partial release/store sequence in optimizing code.
-                    let transition_locals = target_block
-                        .entry_live_locals
-                        .iter()
-                        .copied()
-                        .chain(exception_locals.iter().copied())
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .into_iter()
-                        .collect::<Vec<_>>();
-                    publish_native_continuation_state(
-                        &mut builder,
-                        deopt_out,
-                        region.function,
-                        region.local_count,
-                        // Catch-bind transitions resume by exact handler block,
-                        // including an empty handler with no instruction
-                        // continuation of its own.
-                        target.raw(),
-                        &transition_locals,
-                        &locals,
-                        native_version,
-                    )?;
-                    builder.ins().store(
-                        MemFlagsData::new(),
-                        status,
-                        deopt_out,
-                        std::mem::offset_of!(crate::JitDeoptState, control_status) as i32,
-                    );
-                    let detail = builder.ins().iconst(
-                        types::I32,
-                        i64::from(crate::JIT_NATIVE_CATCH_BIND_TRANSITION_DETAIL),
-                    );
-                    builder.ins().store(
-                        MemFlagsData::new(),
-                        detail,
-                        deopt_out,
-                        std::mem::offset_of!(crate::JitDeoptState, control_reserved) as i32,
-                    );
-                    builder.ins().store(
-                        MemFlagsData::new(),
-                        value,
-                        deopt_out,
-                        std::mem::offset_of!(crate::JitDeoptState, control_value) as i32,
-                    );
-                    let empty = builder
-                        .ins()
-                        .iconst(types::I64, crate::jit_encode_constant(u32::MAX));
-                    builder
-                        .ins()
-                        .store(MemFlagsData::new(), empty, result_out, 0);
-                    builder.ins().jump(
-                        optimizing_baseline_resume
-                            .expect("optimizing catch transition requires baseline resume"),
-                        &[],
-                    );
-                    let unreachable = builder.create_block();
-                    builder.switch_to_block(unreachable);
-                    builder.seal_block(unreachable);
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_HANDLER_LVALUE_BOUNDARY",
+                        "optimizing catch-local binding was not rejected during entry admission",
+                    ));
                 } else {
                     for local in exception_locals {
                         let current = use_local_variable(&mut builder, &locals, *local)?;
@@ -10319,6 +18050,18 @@ fn define_region_graph_function(
                             &mut registers,
                             instruction,
                             transition_live_registers,
+                            optimizing_admission.array_call_is_total(instruction.continuation_id)
+                                || optimizing_admission
+                                    .fixed_builtin_call_is_total(instruction.continuation_id),
+                            optimizing_admission
+                                .array_instruction_is_total(instruction.continuation_id),
+                            optimizing_admission
+                                .array_instruction_is_fresh(instruction.continuation_id),
+                            optimizing_admission.local_load_is_total(instruction.continuation_id),
+                            optimizing_admission
+                                .request_local_store_is_total(instruction.continuation_id),
+                            optimizing_admission
+                                .return_reference_store_is_total(instruction.continuation_id),
                             constants,
                             value_flow,
                             inline_constants,
@@ -10336,8 +18079,6 @@ fn define_region_graph_function(
                             native_version,
                             unit_identity,
                             operations.with_runtime(runtime),
-                            optimizing_baseline_resume
-                                .expect("optimizing instruction requires baseline resume"),
                         )
                         .map(|emitted| {
                             production_lowering.push(crate::JitProductionLoweringMetadata {
@@ -10349,7 +18090,6 @@ fn define_region_graph_function(
                                 .variant
                                 .to_owned(),
                                 class: emitted.class,
-                                operation_local_transition: emitted.operation_local_transition,
                             });
                         })
                     }
@@ -10439,40 +18179,34 @@ fn define_region_graph_function(
             // authoritative slots above.
             match tier_operations {
                 NativeTierOperations::Optimizing { operations } => {
-                    let value_release_validate = module
-                        .declare_func_in_func(operations.value_release_validate, builder.func);
                     let value_release_commit =
                         module.declare_func_in_func(operations.value_release_commit, builder.func);
+                    debug_assert!(
+                        optimizing_admission
+                            .terminator_is_total(region_block.terminator_continuation_id),
+                        "optimizing terminators are total before lowering"
+                    );
                     lower_optimizing_region_terminator(
-                        module,
                         &mut builder,
                         &blocks,
                         &locals,
                         &registers,
                         result_out,
                         deopt_out,
-                        region.function,
-                        region.local_count,
-                        region_block.terminator_continuation_id,
-                        &region_block.terminator_live_locals,
-                        transition_register_liveness
-                            .get(&region_block.terminator_continuation_id)
-                            .map(Vec::as_slice)
-                            .unwrap_or_default(),
-                        native_version,
-                        value_release_validate,
                         value_release_commit,
-                        operations.numeric_string,
-                        operations
-                            .string_cast
-                            .map(|helper| helper.with_runtime(runtime)),
-                        region.strict_types,
-                        region.return_type.as_ref(),
+                        optimizing_admission.return_plan(region_block.terminator_continuation_id),
+                        match region_block.terminator {
+                            RegionTerminator::ReturnReference { local, .. } => {
+                                optimizing_admission.return_reference_is_prebound(local)
+                                    || region.params.iter().any(|parameter| {
+                                        parameter.local == local && parameter.by_ref
+                                    })
+                            }
+                            _ => false,
+                        },
                         &region_block.terminator,
                         constants,
                         value_flow,
-                        optimizing_baseline_resume
-                            .expect("optimizing terminator requires baseline resume"),
                     )
                     .map(|emitted| {
                         production_lowering.push(crate::JitProductionLoweringMetadata {
@@ -10484,7 +18218,6 @@ fn define_region_graph_function(
                             .variant
                             .to_owned(),
                             class: emitted.class,
-                            operation_local_transition: emitted.operation_local_transition,
                         });
                     })
                 }
@@ -10664,91 +18397,6 @@ fn define_region_graph_function(
         if let (Some(dispatch), Some(resume_default)) = (resume_dispatch, resume_default) {
             builder.switch_to_block(dispatch);
             resume_switch.emit(&mut builder, resume_id, resume_default);
-        }
-        if let Some(baseline_resume) = optimizing_baseline_resume {
-            builder.switch_to_block(baseline_resume);
-            builder.set_cold_block(baseline_resume);
-            let runtime_view = lower_active_runtime_view(&mut builder, deopt_out);
-            let baseline_entries = builder.ins().load(
-                pointer_type,
-                MemFlagsData::new(),
-                runtime_view,
-                std::mem::offset_of!(crate::JitNativeRuntimeView, trusted_function_entries) as i32,
-            );
-            let rejected_function = builder.ins().load(
-                types::I32,
-                MemFlagsData::new(),
-                deopt_out,
-                std::mem::offset_of!(crate::JitDeoptState, function_id) as i32,
-            );
-            let rejected_function = builder.ins().uextend(pointer_type, rejected_function);
-            let rejected_offset = builder
-                .ins()
-                .imul_imm(rejected_function, i64::from(pointer_type.bytes()));
-            let rejected_entry = builder.ins().iadd(baseline_entries, rejected_offset);
-            let rejected_address =
-                builder
-                    .ins()
-                    .atomic_load(pointer_type, MemFlagsData::new(), rejected_entry);
-            let resume_published = builder.create_block();
-            let resume_unavailable = builder.create_block();
-            let published = builder.ins().icmp_imm(IntCC::NotEqual, rejected_address, 0);
-            builder
-                .ins()
-                .brif(published, resume_published, &[], resume_unavailable, &[]);
-
-            builder.switch_to_block(resume_unavailable);
-            let recompile = builder.ins().iconst(
-                types::I32,
-                i64::from(crate::JitCallStatus::RECOMPILE_REQUESTED.0),
-            );
-            builder.ins().return_(&[recompile]);
-
-            builder.switch_to_block(resume_published);
-            let rejected_continuation = builder.ins().load(
-                types::I32,
-                MemFlagsData::new(),
-                deopt_out,
-                std::mem::offset_of!(crate::JitDeoptState, continuation_id) as i32,
-            );
-            let transition_resume_id = builder.ins().bor_imm(
-                rejected_continuation,
-                i64::from(crate::JIT_NATIVE_TRANSITION_RESUME_TAG),
-            );
-            let handler_resume_id = builder.ins().bor_imm(
-                rejected_continuation,
-                i64::from(crate::JIT_NATIVE_HANDLER_RESUME_TAG),
-            );
-            let control_reserved = builder.ins().load(
-                types::I32,
-                MemFlagsData::new(),
-                deopt_out,
-                std::mem::offset_of!(crate::JitDeoptState, control_reserved) as i32,
-            );
-            let catch_bind = builder.ins().icmp_imm(
-                IntCC::Equal,
-                control_reserved,
-                i64::from(crate::JIT_NATIVE_CATCH_BIND_TRANSITION_DETAIL),
-            );
-            let rejected_resume_id =
-                builder
-                    .ins()
-                    .select(catch_bind, handler_resume_id, transition_resume_id);
-            let signature = builder.import_signature(native_php_entry_signature(module));
-            let resumed = builder.ins().call_indirect(
-                signature,
-                rejected_address,
-                &[
-                    runtime,
-                    arguments,
-                    result_out,
-                    deopt_out,
-                    rejected_resume_id,
-                    deopt_out,
-                ],
-            );
-            let resumed_status = builder.inst_results(resumed)[0];
-            builder.ins().return_(&[resumed_status]);
         }
         builder.switch_to_block(terminal_exit);
         let terminal_status = builder.block_params(terminal_exit)[0];

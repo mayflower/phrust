@@ -2624,31 +2624,6 @@ pub(super) fn stable_builtin_path(target: &RegionCallTarget) -> Option<StablePat
     }
 }
 
-/// Fixed builtins whose current complete semantics require one cold
-/// continuation before any effect. Optimizing code emits that transition
-/// directly instead of importing the generic builtin dispatcher.
-pub(super) fn stable_builtin_baseline_continuation(target: &RegionCallTarget) -> bool {
-    let RegionCallTarget::Function { name, .. } = target else {
-        return false;
-    };
-    let normalized = name.trim_start_matches('\\');
-    !normalized.contains('\\')
-        && matches!(
-            normalized.to_ascii_lowercase().as_str(),
-            "chgrp"
-                | "chown"
-                | "copy"
-                | "dir"
-                | "fprintf"
-                | "ftok"
-                | "move_uploaded_file"
-                | "stream_filter_register"
-                | "stream_socket_server"
-                | "stream_wrapper_register"
-                | "vfprintf"
-        )
-}
-
 /// Exact request-local output-buffer operations selected at compile time.
 ///
 /// The default output-buffer operations consume only the authoritative

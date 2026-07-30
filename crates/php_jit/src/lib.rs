@@ -1113,7 +1113,6 @@ pub enum JitProductionLoweringClass {
     DirectClif,
     DirectNativeData,
     CompiledNativeCall,
-    BaselineFragmentTransition,
 }
 
 /// Emitted-code contract row for one optimizing instruction.
@@ -1124,10 +1123,6 @@ pub struct JitProductionLoweringMetadata {
     /// Stable authoritative `InstructionKind` variant name.
     pub operation: String,
     pub class: JitProductionLoweringClass,
-    /// True only when otherwise-direct optimizing code embeds its own exit to
-    /// the generic baseline implementation.  These sites are removed family
-    /// by family by the native hot-path replacement contract.
-    pub operation_local_transition: bool,
 }
 
 /// Process-local generated entry for one function in a compiled unit graph.

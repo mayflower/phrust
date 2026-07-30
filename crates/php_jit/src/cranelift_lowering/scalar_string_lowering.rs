@@ -303,19 +303,11 @@ fn lower_optimizing_require_direct_numeric_candidate(
     transition: NativeOptimizingTransition<'_>,
 ) -> Result<NativeNumericCandidate, CraneliftLoweringError> {
     let value = lower_optimizing_reference_scalar(builder, value, false, transition)?;
-    let candidate = lower_optimizing_numeric_candidate_f64(builder, value, transition.deopt_out);
-    let accepted = builder.create_block();
-    let rejected = builder.create_block();
-    builder
-        .ins()
-        .brif(candidate.is_numeric, accepted, &[], rejected, &[]);
-
-    builder.switch_to_block(rejected);
-    let _ = transition.emit_value(builder)?;
-    builder.ins().jump(accepted, &[]);
-
-    builder.switch_to_block(accepted);
-    Ok(candidate)
+    Ok(lower_optimizing_numeric_candidate_f64(
+        builder,
+        value,
+        transition.deopt_out,
+    ))
 }
 
 fn lower_optimizing_boolean_result(
@@ -496,7 +488,7 @@ fn lower_optimizing_scalar_conversion(
             let truthy = lower_optimizing_truthy(builder, encoded, transition)?;
             Ok(encode_native_bool(builder, truthy))
         }
-        StableScalarConsumerBuiltin::FloatVal => lower_optimizing_typed_control_value_call(
+        StableScalarConsumerBuiltin::FloatVal => emit_exact_native_control_value!(
             module,
             builder,
             float_cast,
@@ -504,7 +496,7 @@ fn lower_optimizing_scalar_conversion(
             transition,
             "exact native float-cast handler was not declared",
         ),
-        StableScalarConsumerBuiltin::IntVal => lower_optimizing_typed_control_value_call(
+        StableScalarConsumerBuiltin::IntVal => emit_exact_native_control_value!(
             module,
             builder,
             int_cast,
@@ -512,7 +504,7 @@ fn lower_optimizing_scalar_conversion(
             transition,
             "exact native integer-cast handler was not declared",
         ),
-        StableScalarConsumerBuiltin::StrVal => lower_optimizing_typed_control_value_call(
+        StableScalarConsumerBuiltin::StrVal => emit_exact_native_control_value!(
             module,
             builder,
             string_cast,
@@ -526,215 +518,50 @@ fn lower_optimizing_scalar_conversion(
     }
 }
 
-fn lower_optimizing_static_type_name_block(
-    builder: &mut FunctionBuilder<'_>,
-    block: ir::Block,
-    merge: ir::Block,
-    bytes: &'static [u8],
-    transition: NativeOptimizingTransition<'_>,
-) -> Result<(), CraneliftLoweringError> {
-    builder.switch_to_block(block);
-    let value = lower_optimizing_static_string(builder, bytes, transition)?;
-    builder.ins().jump(merge, &[value.into()]);
-    Ok(())
-}
-
 fn lower_optimizing_type_name(
-    module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     operation: StableScalarConsumerBuiltin,
-    encoded: ir::Value,
-    object_class_name: Option<NativeHelper>,
+    fact: SsaValueFact,
     transition: NativeOptimizingTransition<'_>,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     debug_assert!(matches!(
         operation,
         StableScalarConsumerBuiltin::GetType | StableScalarConsumerBuiltin::GetDebugType
     ));
-    let value = lower_optimizing_reference_scalar(builder, encoded, false, transition)?;
-    let classify_boolean = builder.create_block();
-    let boolean = builder.create_block();
-    let classify_integer = builder.create_block();
-    let integer = builder.create_block();
-    let classify_string = builder.create_block();
-    let string = builder.create_block();
-    let classify_runtime = builder.create_block();
-    let classify_float = builder.create_block();
-    let float = builder.create_block();
-    let classify_array = builder.create_block();
-    let array = builder.create_block();
-    let classify_object = builder.create_block();
-    let object = builder.create_block();
-    let classify_callable = builder.create_block();
-    let callable = builder.create_block();
-    let classify_generator = builder.create_block();
-    let generator = builder.create_block();
-    let classify_fiber = builder.create_block();
-    let fiber = builder.create_block();
-    let rejected = builder.create_block();
-    let null = builder.create_block();
-    let merge = builder.create_block();
-    builder.append_block_param(merge, types::I64);
-
-    let is_null = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, value, crate::jit_encode_constant(u32::MAX));
-    let is_uninitialized = builder.ins().icmp_imm(
-        IntCC::Equal,
-        value,
-        crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED),
-    );
-    let is_null = builder.ins().bor(is_null, is_uninitialized);
-    builder
-        .ins()
-        .brif(is_null, null, &[], classify_boolean, &[]);
-
-    builder.switch_to_block(classify_boolean);
-    let is_false = builder.ins().icmp_imm(
-        IntCC::Equal,
-        value,
-        crate::jit_encode_constant(crate::JIT_VALUE_FALSE),
-    );
-    let is_true = builder.ins().icmp_imm(
-        IntCC::Equal,
-        value,
-        crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
-    );
-    let is_boolean = builder.ins().bor(is_false, is_true);
-    builder
-        .ins()
-        .brif(is_boolean, boolean, &[], classify_integer, &[]);
-
-    builder.switch_to_block(classify_integer);
-    let (is_integer, _) = lower_optimizing_integer_candidate(builder, value, transition.deopt_out);
-    builder
-        .ins()
-        .brif(is_integer, integer, &[], classify_string, &[]);
-
-    builder.switch_to_block(classify_string);
-    let (constant_string, _, _) =
-        lower_native_string_key_descriptor(builder, value, transition.deopt_out);
-    let runtime_string = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_STRING_TAG);
-    let is_string = builder.ins().bor(constant_string, runtime_string);
-    builder
-        .ins()
-        .brif(is_string, string, &[], classify_runtime, &[]);
-
-    builder.switch_to_block(classify_runtime);
-    let is_runtime = lower_is_runtime_handle(builder, value);
-    builder
-        .ins()
-        .brif(is_runtime, classify_float, &[], rejected, &[]);
-
-    builder.switch_to_block(classify_float);
-    let is_float = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_FLOAT_TAG);
-    builder
-        .ins()
-        .brif(is_float, float, &[], classify_array, &[]);
-
-    builder.switch_to_block(classify_array);
-    let is_array = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_ARRAY_TAG);
-    builder
-        .ins()
-        .brif(is_array, array, &[], classify_object, &[]);
-
-    builder.switch_to_block(classify_object);
-    let is_object = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_OBJECT_TAG);
-    builder
-        .ins()
-        .brif(is_object, object, &[], classify_callable, &[]);
-
-    builder.switch_to_block(classify_callable);
-    let is_callable = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_CALLABLE_TAG);
-    builder
-        .ins()
-        .brif(is_callable, callable, &[], classify_generator, &[]);
-
-    builder.switch_to_block(classify_generator);
-    let is_generator = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_GENERATOR_TAG);
-    builder
-        .ins()
-        .brif(is_generator, generator, &[], classify_fiber, &[]);
-
-    builder.switch_to_block(classify_fiber);
-    let is_fiber = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_FIBER_TAG);
-    builder.ins().brif(is_fiber, fiber, &[], rejected, &[]);
-
     let debug = operation == StableScalarConsumerBuiltin::GetDebugType;
-    lower_optimizing_static_type_name_block(
-        builder,
-        null,
-        merge,
-        if debug { b"null" } else { b"NULL" },
-        transition,
-    )?;
-    lower_optimizing_static_type_name_block(
-        builder,
-        boolean,
-        merge,
-        if debug { b"bool" } else { b"boolean" },
-        transition,
-    )?;
-    lower_optimizing_static_type_name_block(
-        builder,
-        integer,
-        merge,
-        if debug { b"int" } else { b"integer" },
-        transition,
-    )?;
-    lower_optimizing_static_type_name_block(builder, string, merge, b"string", transition)?;
-    lower_optimizing_static_type_name_block(
-        builder,
-        float,
-        merge,
-        if debug { b"float" } else { b"double" },
-        transition,
-    )?;
-    lower_optimizing_static_type_name_block(builder, array, merge, b"array", transition)?;
-
-    builder.switch_to_block(object);
-    let object_result = if debug {
-        lower_optimizing_typed_control_value_call(
-            module,
-            builder,
-            object_class_name,
-            &[value],
-            transition,
-            "exact native object class-name handler was not declared",
-        )?
-    } else {
-        lower_optimizing_static_string(builder, b"object", transition)?
+    let bytes: &[u8] = match fact.class {
+        SsaValueClass::Null => {
+            if debug {
+                b"null"
+            } else {
+                b"NULL"
+            }
+        }
+        SsaValueClass::Bool => {
+            if debug {
+                b"bool"
+            } else {
+                b"boolean"
+            }
+        }
+        SsaValueClass::Int => {
+            if debug {
+                b"int"
+            } else {
+                b"integer"
+            }
+        }
+        SsaValueClass::Float => {
+            if debug {
+                b"float"
+            } else {
+                b"double"
+            }
+        }
+        SsaValueClass::StringHandle => b"string",
+        _ => unreachable!("publication admits only total scalar type-name classes"),
     };
-    builder.ins().jump(merge, &[object_result.into()]);
-
-    lower_optimizing_static_type_name_block(
-        builder,
-        callable,
-        merge,
-        if debug { b"Closure" } else { b"object" },
-        transition,
-    )?;
-    lower_optimizing_static_type_name_block(
-        builder,
-        generator,
-        merge,
-        if debug { b"Generator" } else { b"object" },
-        transition,
-    )?;
-    lower_optimizing_static_type_name_block(
-        builder,
-        fiber,
-        merge,
-        if debug { b"Fiber" } else { b"object" },
-        transition,
-    )?;
-
-    builder.switch_to_block(rejected);
-    let placeholder = transition.emit_value(builder)?;
-    builder.ins().jump(merge, &[placeholder.into()]);
-
-    builder.switch_to_block(merge);
-    Ok(builder.block_params(merge)[0])
+    lower_optimizing_static_string(builder, bytes, transition)
 }
 
 fn lower_optimizing_require_direct_integer(
@@ -743,18 +570,7 @@ fn lower_optimizing_require_direct_integer(
     transition: NativeOptimizingTransition<'_>,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     let encoded = lower_optimizing_reference_scalar(builder, encoded, false, transition)?;
-    let (is_integer, integer) =
-        lower_optimizing_integer_candidate(builder, encoded, transition.deopt_out);
-    let accepted = builder.create_block();
-    let rejected = builder.create_block();
-    builder.ins().brif(is_integer, accepted, &[], rejected, &[]);
-
-    builder.switch_to_block(rejected);
-    let _ = transition.emit_value(builder)?;
-    builder.ins().jump(accepted, &[]);
-
-    builder.switch_to_block(accepted);
-    Ok(integer)
+    Ok(lower_optimizing_integer_candidate(builder, encoded, transition.deopt_out).1)
 }
 
 fn lower_optimizing_intdiv(
@@ -765,20 +581,6 @@ fn lower_optimizing_intdiv(
 ) -> Result<ir::Value, CraneliftLoweringError> {
     let dividend = lower_optimizing_require_direct_integer(builder, dividend, transition)?;
     let divisor = lower_optimizing_require_direct_integer(builder, divisor, transition)?;
-    let accepted = builder.create_block();
-    let rejected = builder.create_block();
-    let divisor_zero = builder.ins().icmp_imm(IntCC::Equal, divisor, 0);
-    let minimum = builder.ins().icmp_imm(IntCC::Equal, dividend, i64::MIN);
-    let negative_one = builder.ins().icmp_imm(IntCC::Equal, divisor, -1);
-    let overflow = builder.ins().band(minimum, negative_one);
-    let invalid = builder.ins().bor(divisor_zero, overflow);
-    builder.ins().brif(invalid, rejected, &[], accepted, &[]);
-
-    builder.switch_to_block(rejected);
-    let _ = transition.emit_value(builder)?;
-    builder.ins().jump(accepted, &[]);
-
-    builder.switch_to_block(accepted);
     let result = builder.ins().sdiv(dividend, divisor);
     lower_optimizing_admit_integer_result(builder, result, transition)
 }
@@ -803,22 +605,6 @@ fn lower_optimizing_round(
     } else {
         builder.ins().iconst(types::I64, 1)
     };
-    let accepted = builder.create_block();
-    let rejected = builder.create_block();
-    let at_least_first = builder
-        .ins()
-        .icmp_imm(IntCC::SignedGreaterThanOrEqual, mode, 1);
-    let at_most_last = builder
-        .ins()
-        .icmp_imm(IntCC::SignedLessThanOrEqual, mode, 8);
-    let valid = builder.ins().band(at_least_first, at_most_last);
-    builder.ins().brif(valid, accepted, &[], rejected, &[]);
-
-    builder.switch_to_block(rejected);
-    let _ = transition.emit_value(builder)?;
-    builder.ins().jump(accepted, &[]);
-
-    builder.switch_to_block(accepted);
     let handler = handler.ok_or_else(|| {
         CraneliftLoweringError::new(
             "JIT_CRANELIFT_NATIVE_ROUND_F64",
@@ -1117,7 +903,6 @@ fn lower_optimizing_array_lookup(
     let strict = strict
         .map(|strict| lower_optimizing_require_boolean_flag(builder, strict, transition))
         .transpose()?;
-    let rejected = builder.create_block();
     let scan = builder.create_block();
     let compare = builder.create_block();
     let next = builder.create_block();
@@ -1156,7 +941,7 @@ fn lower_optimizing_array_lookup(
         std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
     );
     let candidate = lower_optimizing_reference_scalar(builder, candidate, false, transition)?;
-    let (supported, equal) = if let Some(strict) = strict {
+    let (_supported, equal) = if let Some(strict) = strict {
         let compare_strict = builder.create_block();
         let compare_loose = builder.create_block();
         let compared = builder.create_block();
@@ -1202,11 +987,6 @@ fn lower_optimizing_array_lookup(
             transition,
         )?
     };
-    let compare_supported = builder.create_block();
-    builder
-        .ins()
-        .brif(supported, compare_supported, &[], rejected, &[]);
-    builder.switch_to_block(compare_supported);
     builder
         .ins()
         .brif(equal, matched, &[index.into()], next, &[index.into()]);
@@ -1246,10 +1026,6 @@ fn lower_optimizing_array_lookup(
     );
     builder.ins().jump(merge, &[no.into()]);
 
-    builder.switch_to_block(rejected);
-    let placeholder = transition.emit_value(builder)?;
-    builder.ins().jump(merge, &[placeholder.into()]);
-
     builder.switch_to_block(merge);
     Ok(builder.block_params(merge)[0])
 }
@@ -1258,10 +1034,14 @@ fn lower_optimizing_array_edge_key(
     builder: &mut FunctionBuilder<'_>,
     operation: StableArrayEdgeKeyBuiltin,
     array: ir::Value,
+    total: bool,
     transition: NativeOptimizingTransition<'_>,
 ) -> Result<ir::Value, CraneliftLoweringError> {
-    let (_, length, entries) =
-        lower_optimizing_direct_array_descriptor(builder, array, transition)?;
+    let (_, length, entries) = if total {
+        lower_total_native_array_descriptor(builder, array, transition.deopt_out)
+    } else {
+        lower_optimizing_direct_array_descriptor(builder, array, transition)?
+    };
     let present = builder.create_block();
     let missing = builder.create_block();
     let merge = builder.create_block();
@@ -1300,10 +1080,14 @@ fn lower_optimizing_array_edge_key(
 fn lower_optimizing_array_is_list(
     builder: &mut FunctionBuilder<'_>,
     array: ir::Value,
+    total: bool,
     transition: NativeOptimizingTransition<'_>,
 ) -> Result<ir::Value, CraneliftLoweringError> {
-    let (_, length, entries) =
-        lower_optimizing_direct_array_descriptor(builder, array, transition)?;
+    let (_, length, entries) = if total {
+        lower_total_native_array_descriptor(builder, array, transition.deopt_out)
+    } else {
+        lower_optimizing_direct_array_descriptor(builder, array, transition)?
+    };
     let scan = builder.create_block();
     let compare = builder.create_block();
     let matched = builder.create_block();
@@ -1380,33 +1164,18 @@ fn lower_optimizing_allocate_string(
     let reuse = builder.create_block();
     let bump = builder.create_block();
     let initialize = builder.create_block();
-    let rejected = builder.create_block();
-    let merge = builder.create_block();
     for block in [sizing, resources, allocate, reuse, bump] {
         builder.append_block_param(block, types::I32);
     }
     builder.append_block_param(initialize, pointer_type);
     builder.append_block_param(initialize, types::I32);
-    builder.append_block_param(merge, types::I64);
-    builder.append_block_param(merge, pointer_type);
-    builder.append_block_param(merge, pointer_type);
 
     let length32 = builder.ins().ireduce(types::I32, length);
-    let length_round_trip = builder.ins().uextend(types::I64, length32);
-    let length_fits = builder.ins().icmp(IntCC::Equal, length, length_round_trip);
-    let within_limit = builder.ins().icmp_imm(
-        IntCC::UnsignedLessThanOrEqual,
-        length,
-        crate::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY as i64,
-    );
-    let admitted = builder.ins().band(length_fits, within_limit);
     let minimum = builder.ins().iconst(
         types::I32,
         i64::from(crate::JIT_NATIVE_DIRECT_STRING_MIN_CAPACITY),
     );
-    builder
-        .ins()
-        .brif(admitted, sizing, &[minimum.into()], rejected, &[]);
+    builder.ins().jump(sizing, &[minimum.into()]);
 
     builder.switch_to_block(sizing);
     let capacity = builder.block_params(sizing)[0];
@@ -1467,19 +1236,11 @@ fn lower_optimizing_allocate_string(
         .ins()
         .load(types::I32, MemFlagsData::new(), byte_next_ptr, 0);
     let byte_end = builder.ins().iadd(byte_next, capacity);
-    let byte_room = builder.ins().icmp_imm(
-        IntCC::UnsignedLessThanOrEqual,
-        byte_end,
-        crate::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY as i64,
-    );
-    let has_storage = builder.ins().bor(has_free, byte_room);
-    builder
-        .ins()
-        .brif(has_storage, allocate, &[capacity.into()], rejected, &[]);
+    builder.ins().jump(allocate, &[capacity.into()]);
 
     builder.switch_to_block(allocate);
     let capacity = builder.block_params(allocate)[0];
-    let slot_next = lower_reserve_direct_value_index(builder, transition.deopt_out, rejected);
+    let slot_next = lower_reserve_direct_value_index(builder, transition.deopt_out, None);
     builder.ins().brif(
         has_free,
         reuse,
@@ -1584,22 +1345,10 @@ fn lower_optimizing_allocate_string(
     let encoded = builder
         .ins()
         .bor_imm(encoded_index, crate::JIT_VALUE_RUNTIME_STRING_TAG as i64);
-    builder
-        .ins()
-        .jump(merge, &[encoded.into(), output.into(), slot.into()]);
-
-    builder.switch_to_block(rejected);
-    let placeholder = transition.emit_value(builder)?;
-    let null = builder.ins().iconst(pointer_type, 0);
-    builder
-        .ins()
-        .jump(merge, &[placeholder.into(), null.into(), null.into()]);
-
-    builder.switch_to_block(merge);
     Ok(NativeStringAllocation {
-        value: builder.block_params(merge)[0],
-        output: builder.block_params(merge)[1],
-        slot: builder.block_params(merge)[2],
+        value: encoded,
+        output,
+        slot,
     })
 }
 
@@ -1697,15 +1446,8 @@ fn lower_optimizing_string_descriptor(
     value: ir::Value,
     transition: NativeOptimizingTransition<'_>,
 ) -> Result<(ir::Value, ir::Value), CraneliftLoweringError> {
-    let (valid, length, bytes) =
+    let (_, length, bytes) =
         lower_native_string_key_descriptor(builder, value, transition.deopt_out);
-    let accepted = builder.create_block();
-    let rejected = builder.create_block();
-    builder.ins().brif(valid, accepted, &[], rejected, &[]);
-    builder.switch_to_block(rejected);
-    let _ = transition.emit_value(builder)?;
-    builder.ins().jump(accepted, &[]);
-    builder.switch_to_block(accepted);
     Ok((length, bytes))
 }
 
@@ -1815,6 +1557,83 @@ struct NativeScalarStringCoercion {
     /// True when this coercion allocated the only owner of `value`. Consumers
     /// that merely inspect/copy its bytes must commit that owner themselves.
     temporary: ir::Value,
+}
+
+fn lower_total_native_scalar_string_coercion(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    encoded: ir::Value,
+    fact: SsaValueFact,
+    float_to_string: Option<NativeHelper>,
+    transition: NativeOptimizingTransition<'_>,
+) -> Result<NativeScalarStringCoercion, CraneliftLoweringError> {
+    let encoded = lower_optimizing_reference_scalar(builder, encoded, false, transition)?;
+    let temporary = |builder: &mut FunctionBuilder<'_>, value, owned| NativeScalarStringCoercion {
+        value,
+        temporary: builder.ins().iconst(types::I8, i64::from(owned)),
+    };
+    match fact.class {
+        SsaValueClass::Int => {
+            let integer =
+                lower_optimizing_authoritative_integer(builder, encoded, transition.deopt_out);
+            let value = lower_optimizing_integer_to_string(builder, integer, transition)?;
+            Ok(temporary(builder, value, true))
+        }
+        SsaValueClass::StringHandle => Ok(temporary(builder, encoded, false)),
+        SsaValueClass::Null => {
+            let length = builder.ins().iconst(types::I64, 0);
+            let byte = builder.ins().iconst(types::I8, 0);
+            let value = lower_optimizing_materialize_string(
+                builder,
+                length,
+                NativeStringMaterialization::Byte { value: byte },
+                transition,
+            )?;
+            Ok(temporary(builder, value, true))
+        }
+        SsaValueClass::Bool => {
+            let is_true = builder.ins().icmp_imm(
+                IntCC::Equal,
+                encoded,
+                crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
+            );
+            let length = builder.ins().uextend(types::I64, is_true);
+            let byte = builder.ins().iconst(types::I8, i64::from(b'1'));
+            let value = lower_optimizing_materialize_string(
+                builder,
+                length,
+                NativeStringMaterialization::Byte { value: byte },
+                transition,
+            )?;
+            Ok(temporary(builder, value, true))
+        }
+        SsaValueClass::Float => {
+            let slot =
+                lower_optimizing_slot_address(builder, encoded, transition.deopt_out);
+            let bits = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                slot,
+                std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+            );
+            let value = builder
+                .ins()
+                .bitcast(types::F64, MemFlagsData::new(), bits);
+            let value = emit_exact_native_control_value!(
+                module,
+                builder,
+                float_to_string,
+                &[value],
+                transition,
+                "exact native float-to-string handler was not declared",
+            )?;
+            Ok(temporary(builder, value, true))
+        }
+        _ => Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_SCALAR_STRING_PUBLICATION",
+            "non-scalar value reached a publication-total string coercion",
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1995,7 +1814,7 @@ fn lower_optimizing_scalar_string_coercion(
 
     builder.switch_to_block(float);
     let value = builder.block_params(float)[0];
-    let value = lower_optimizing_typed_control_value_call(
+    let value = emit_exact_native_control_value!(
         module,
         builder,
         float_to_string,
@@ -2084,8 +1903,6 @@ fn lower_optimizing_explode(
     let matched = builder.create_block();
     let different = builder.create_block();
     let counted = builder.create_block();
-    let preflight = builder.create_block();
-    let rejected = builder.create_block();
     builder.append_block_param(scan, types::I64);
     builder.append_block_param(scan, types::I64);
     builder.append_block_param(matched, types::I64);
@@ -2093,20 +1910,9 @@ fn lower_optimizing_explode(
     builder.append_block_param(different, types::I64);
     builder.append_block_param(different, types::I64);
     builder.append_block_param(counted, types::I64);
-    builder.append_block_param(preflight, types::I64);
-    let delimiter_nonempty =
-        builder
-            .ins()
-            .icmp_imm(IntCC::UnsignedGreaterThan, delimiter_length, 0);
     let zero = builder.ins().iconst(types::I64, 0);
     let one = builder.ins().iconst(types::I64, 1);
-    builder.ins().brif(
-        delimiter_nonempty,
-        scan,
-        &[zero.into(), one.into()],
-        rejected,
-        &[],
-    );
+    builder.ins().jump(scan, &[zero.into(), one.into()]);
 
     builder.switch_to_block(scan);
     let position = builder.block_params(scan)[0];
@@ -2152,43 +1958,8 @@ fn lower_optimizing_explode(
     let count = builder.block_params(counted)[0];
     let required_slots = builder.ins().iadd_imm(count, 1);
     lower_optimizing_require_direct_value_capacity(builder, required_slots, transition)?;
-    let separators = builder.ins().iadd_imm(count, -1);
-    let separator_bytes = builder.ins().imul(separators, delimiter_length);
-    let piece_bytes = builder.ins().isub(input_length, separator_bytes);
     let pointer_type = builder.func.dfg.value_type(transition.deopt_out);
-    let view = lower_active_runtime_view(builder, transition.deopt_out);
-    let string_next_ptr = builder.ins().load(
-        pointer_type,
-        MemFlagsData::new(),
-        view,
-        std::mem::offset_of!(crate::JitNativeRuntimeView, direct_string_next) as i32,
-    );
-    let string_next = builder
-        .ins()
-        .load(types::I32, MemFlagsData::new(), string_next_ptr, 0);
-    let piece_bytes32 = builder.ins().ireduce(types::I32, piece_bytes);
-    let piece_bytes_round_trip = builder.ins().uextend(types::I64, piece_bytes32);
-    let bytes_fit = builder
-        .ins()
-        .icmp(IntCC::Equal, piece_bytes, piece_bytes_round_trip);
-    let string_end = builder.ins().iadd(string_next, piece_bytes32);
-    let string_room = builder.ins().icmp_imm(
-        IntCC::UnsignedLessThanOrEqual,
-        string_end,
-        crate::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY as i64,
-    );
-    let admitted = builder.ins().band(bytes_fit, string_room);
-    builder
-        .ins()
-        .brif(admitted, preflight, &[count.into()], rejected, &[]);
-
-    builder.switch_to_block(rejected);
-    let _ = transition.emit_value(builder)?;
-    builder.ins().jump(preflight, &[one.into()]);
-
-    builder.switch_to_block(preflight);
-    let count = builder.block_params(preflight)[0];
-    let result = lower_optimizing_allocate_direct_array(builder, count, transition)?;
+    let result = lower_optimizing_allocate_direct_array(builder, count, false, transition)?;
     let result_slot = lower_optimizing_slot_address(builder, result, transition.deopt_out);
     let result_entries = builder.ins().load(
         pointer_type,
@@ -2343,7 +2114,6 @@ fn lower_optimizing_implode(
     let inspect_value = builder.create_block();
     let preflight_next = builder.create_block();
     let allocate = builder.create_block();
-    let rejected = builder.create_block();
     builder.append_block_param(preflight, types::I64);
     builder.append_block_param(preflight, types::I64);
     builder.append_block_param(preflight_next, types::I64);
@@ -2377,43 +2147,21 @@ fn lower_optimizing_implode(
         std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
     );
     let value = lower_optimizing_admitted_reference_scalar(builder, value, transition.deopt_out);
-    let (valid, value_length, _) =
+    let (_, value_length, _) =
         lower_native_string_key_descriptor(builder, value, transition.deopt_out);
     let first = builder.ins().icmp_imm(IntCC::Equal, index, 0);
     let separator_addition = builder.ins().select(first, zero, separator_length);
     let separated = builder.ins().iadd(total, separator_addition);
-    let separator_overflow = builder
-        .ins()
-        .icmp(IntCC::UnsignedLessThan, separated, total);
     let next_total = builder.ins().iadd(separated, value_length);
-    let value_overflow = builder
+    builder
         .ins()
-        .icmp(IntCC::UnsignedLessThan, next_total, separated);
-    let overflow = builder.ins().bor(separator_overflow, value_overflow);
-    let within_limit = builder.ins().icmp_imm(
-        IntCC::UnsignedLessThanOrEqual,
-        next_total,
-        crate::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY as i64,
-    );
-    let admitted = builder.ins().band_not(valid, overflow);
-    let admitted = builder.ins().band(admitted, within_limit);
-    builder.ins().brif(
-        admitted,
-        preflight_next,
-        &[index.into(), next_total.into()],
-        rejected,
-        &[],
-    );
+        .jump(preflight_next, &[index.into(), next_total.into()]);
 
     builder.switch_to_block(preflight_next);
     let index = builder.block_params(preflight_next)[0];
     let total = builder.block_params(preflight_next)[1];
     let next = builder.ins().iadd_imm(index, 1);
     builder.ins().jump(preflight, &[next.into(), total.into()]);
-
-    builder.switch_to_block(rejected);
-    let _ = transition.emit_value(builder)?;
-    builder.ins().jump(allocate, &[zero.into()]);
 
     builder.switch_to_block(allocate);
     let total = builder.block_params(allocate)[0];
@@ -2619,7 +2367,6 @@ fn lower_optimizing_str_replace(
     let matched = builder.create_block();
     let different = builder.create_block();
     let counted = builder.create_block();
-    let rejected = builder.create_block();
     let merge = builder.create_block();
     builder.append_block_param(scan, types::I64);
     builder.append_block_param(scan, types::I64);
@@ -2681,20 +2428,6 @@ fn lower_optimizing_str_replace(
     let position = builder.block_params(matched)[0];
     let output_length = builder.block_params(matched)[1];
     let next_output = builder.ins().iadd(output_length, replacement_length);
-    let overflow = builder
-        .ins()
-        .icmp(IntCC::UnsignedLessThan, next_output, output_length);
-    let within_limit = builder.ins().icmp_imm(
-        IntCC::UnsignedLessThanOrEqual,
-        next_output,
-        crate::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY as i64,
-    );
-    let admitted = builder.ins().band_not(within_limit, overflow);
-    let matched_next = builder.create_block();
-    builder
-        .ins()
-        .brif(admitted, matched_next, &[], rejected, &[]);
-    builder.switch_to_block(matched_next);
     let next_position = builder.ins().iadd(position, search_length);
     builder
         .ins()
@@ -2708,10 +2441,6 @@ fn lower_optimizing_str_replace(
     builder
         .ins()
         .jump(scan, &[next_position.into(), next_output.into()]);
-
-    builder.switch_to_block(rejected);
-    let placeholder = transition.emit_value(builder)?;
-    builder.ins().jump(merge, &[placeholder.into()]);
 
     builder.switch_to_block(counted);
     let position = builder.block_params(counted)[0];
@@ -3002,16 +2731,8 @@ fn lower_optimizing_substr(
             requested,
             crate::jit_encode_constant(u32::MAX),
         );
-        let (integer, requested_raw) =
+        let (_, requested_raw) =
             lower_optimizing_integer_candidate(builder, requested, transition.deopt_out);
-        let supported = builder.ins().bor(integer, is_null);
-        let accepted = builder.create_block();
-        let rejected = builder.create_block();
-        builder.ins().brif(supported, accepted, &[], rejected, &[]);
-        builder.switch_to_block(rejected);
-        let _ = transition.emit_value(builder)?;
-        builder.ins().jump(accepted, &[]);
-        builder.switch_to_block(accepted);
         let requested_negative = builder
             .ins()
             .icmp_imm(IntCC::SignedLessThan, requested_raw, 0);
@@ -3198,51 +2919,7 @@ fn lower_optimizing_str_repeat(
 ) -> Result<ir::Value, CraneliftLoweringError> {
     let (length, input) = lower_optimizing_string_descriptor(builder, value, transition)?;
     let count = lower_optimizing_require_immediate_integer(builder, count, transition)?;
-    let admitted = builder.create_block();
-    let rejected = builder.create_block();
-    let zero_length = builder.create_block();
-    let size_nonzero = builder.create_block();
-    let allocate = builder.create_block();
-    let merge_size = builder.create_block();
-    builder.append_block_param(merge_size, types::I64);
-    let nonnegative = builder
-        .ins()
-        .icmp_imm(IntCC::SignedGreaterThanOrEqual, count, 0);
-    builder
-        .ins()
-        .brif(nonnegative, admitted, &[], rejected, &[]);
-    builder.switch_to_block(rejected);
-    let _ = transition.emit_value_with_detail(builder, 0x1501)?;
-    let rejected_length = builder.ins().iconst(types::I64, 0);
-    builder.ins().jump(merge_size, &[rejected_length.into()]);
-
-    builder.switch_to_block(admitted);
-    let count_zero = builder.ins().icmp_imm(IntCC::Equal, count, 0);
-    let input_zero = builder.ins().icmp_imm(IntCC::Equal, length, 0);
-    let empty = builder.ins().bor(count_zero, input_zero);
-    builder
-        .ins()
-        .brif(empty, zero_length, &[], size_nonzero, &[]);
-    builder.switch_to_block(zero_length);
-    let zero = builder.ins().iconst(types::I64, 0);
-    builder.ins().jump(merge_size, &[zero.into()]);
-
-    builder.switch_to_block(size_nonzero);
-    let limit = builder.ins().iconst(
-        types::I64,
-        crate::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY as i64,
-    );
-    let maximum_count = builder.ins().udiv(limit, length);
-    let fits = builder
-        .ins()
-        .icmp(IntCC::UnsignedLessThanOrEqual, count, maximum_count);
-    builder.ins().brif(fits, allocate, &[], rejected, &[]);
-    builder.switch_to_block(allocate);
     let output_length = builder.ins().imul(length, count);
-    builder.ins().jump(merge_size, &[output_length.into()]);
-
-    builder.switch_to_block(merge_size);
-    let output_length = builder.block_params(merge_size)[0];
     let allocation = lower_optimizing_allocate_string(builder, output_length, transition)?;
     let copy = builder.create_block();
     let copy_byte = builder.create_block();
@@ -3423,15 +3100,12 @@ fn lower_optimizing_substr_count(
         lower_optimizing_string_descriptor(builder, haystack, transition)?;
     let (needle_length, needle_bytes) =
         lower_optimizing_string_descriptor(builder, needle, transition)?;
-    let admitted = builder.create_block();
-    let rejected = builder.create_block();
     let scan = builder.create_block();
     let compare = builder.create_block();
     let compare_byte = builder.create_block();
     let matched = builder.create_block();
     let advance = builder.create_block();
     let finish = builder.create_block();
-    let merge = builder.create_block();
     builder.append_block_param(scan, types::I64);
     builder.append_block_param(scan, types::I64);
     builder.append_block_param(compare, types::I64);
@@ -3442,15 +3116,6 @@ fn lower_optimizing_substr_count(
     builder.append_block_param(advance, types::I64);
     builder.append_block_param(advance, types::I64);
     builder.append_block_param(finish, types::I64);
-    builder.append_block_param(merge, types::I64);
-    let nonempty = builder.ins().icmp_imm(IntCC::NotEqual, needle_length, 0);
-    builder.ins().brif(nonempty, admitted, &[], rejected, &[]);
-
-    builder.switch_to_block(rejected);
-    let placeholder = transition.emit_value_with_detail(builder, 0x1503)?;
-    builder.ins().jump(merge, &[placeholder.into()]);
-
-    builder.switch_to_block(admitted);
     let zero = builder.ins().iconst(types::I64, 0);
     builder.ins().jump(scan, &[zero.into(), zero.into()]);
 
@@ -3525,9 +3190,7 @@ fn lower_optimizing_substr_count(
 
     builder.switch_to_block(finish);
     let count = builder.block_params(finish)[0];
-    builder.ins().jump(merge, &[count.into()]);
-    builder.switch_to_block(merge);
-    Ok(builder.block_params(merge)[0])
+    Ok(count)
 }
 
 fn lower_optimizing_string_compare(
@@ -3547,25 +3210,8 @@ fn lower_optimizing_string_compare(
             requested_length.expect("bounded string comparison has a length"),
             transition,
         )?;
-        let accepted = builder.create_block();
-        let rejected = builder.create_block();
-        let merge = builder.create_block();
-        builder.append_block_param(merge, types::I64);
-        let nonnegative = builder
-            .ins()
-            .icmp_imm(IntCC::SignedGreaterThanOrEqual, requested, 0);
-        builder
-            .ins()
-            .brif(nonnegative, accepted, &[], rejected, &[]);
-        builder.switch_to_block(rejected);
-        let _ = transition.emit_value_with_detail(builder, 0x1502)?;
-        let zero = builder.ins().iconst(types::I64, 0);
-        builder.ins().jump(merge, &[zero.into()]);
-        builder.switch_to_block(accepted);
         let limit = builder.ins().umin(minimum, requested);
-        builder.ins().jump(merge, &[limit.into()]);
-        builder.switch_to_block(merge);
-        (builder.block_params(merge)[0], Some(requested))
+        (limit, Some(requested))
     } else {
         (minimum, None)
     };
@@ -3692,7 +3338,7 @@ fn lower_optimizing_extrema(
         for &candidate in &arguments[1..] {
             let candidate =
                 lower_optimizing_reference_scalar(builder, candidate, false, transition)?;
-            let ordering = lower_optimizing_typed_control_value_call(
+            let ordering = emit_exact_native_control_value!(
                 module,
                 builder,
                 spaceship,
@@ -3710,25 +3356,12 @@ fn lower_optimizing_extrema(
     let array = lower_optimizing_reference_scalar(builder, arguments[0], false, transition)?;
     let (_, length, entries) =
         lower_optimizing_direct_array_descriptor(builder, array, transition)?;
-    let nonempty = builder.create_block();
-    let rejected = builder.create_block();
     let scan = builder.create_block();
     let inspect = builder.create_block();
     let done = builder.create_block();
-    let merge = builder.create_block();
     builder.append_block_param(scan, types::I64);
     builder.append_block_param(scan, types::I64);
     builder.append_block_param(done, types::I64);
-    builder.append_block_param(merge, types::I64);
-
-    let empty = builder.ins().icmp_imm(IntCC::Equal, length, 0);
-    builder.ins().brif(empty, rejected, &[], nonempty, &[]);
-
-    builder.switch_to_block(rejected);
-    let placeholder = transition.emit_value_with_detail(builder, 0x1701)?;
-    builder.ins().jump(merge, &[placeholder.into()]);
-
-    builder.switch_to_block(nonempty);
     let first = builder.ins().load(
         types::I64,
         MemFlagsData::new(),
@@ -3765,7 +3398,7 @@ fn lower_optimizing_extrema(
         std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
     );
     let candidate = lower_optimizing_reference_scalar(builder, candidate, false, transition)?;
-    let ordering = lower_optimizing_typed_control_value_call(
+    let ordering = emit_exact_native_control_value!(
         module,
         builder,
         spaceship,
@@ -3781,8 +3414,5 @@ fn lower_optimizing_extrema(
     builder.switch_to_block(done);
     let selected = builder.block_params(done)[0];
     lower_optimizing_retain(builder, selected, transition.deopt_out);
-    builder.ins().jump(merge, &[selected.into()]);
-
-    builder.switch_to_block(merge);
-    Ok(builder.block_params(merge)[0])
+    Ok(selected)
 }

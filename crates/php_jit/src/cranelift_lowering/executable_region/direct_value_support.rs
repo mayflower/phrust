@@ -112,227 +112,6 @@ fn lower_direct_array_child_entry_body(builder: &mut FunctionBuilder<'_>) {
     builder.ins().return_(&[zero_value, null_entry]);
 }
 
-fn lower_direct_value_release_validate_body(
-    module: &mut JITModule,
-    builder: &mut FunctionBuilder<'_>,
-    func_id: FuncId,
-) {
-    let entry = builder.create_block();
-    let inspect = builder.create_block();
-    let inspect_last = builder.create_block();
-    let validate_reference = builder.create_block();
-    let inspect_composite = builder.create_block();
-    let inspect_foreach = builder.create_block();
-    let validate_foreach = builder.create_block();
-    let scan = builder.create_block();
-    let validate_key = builder.create_block();
-    let validate_value = builder.create_block();
-    let next = builder.create_block();
-    let accepted = builder.create_block();
-    let rejected = builder.create_block();
-    builder.append_block_params_for_function_params(entry);
-    builder.append_block_param(inspect_composite, types::I8);
-    builder.append_block_param(inspect_foreach, types::I8);
-    builder.append_block_param(scan, types::I64);
-    builder.append_block_param(validate_value, types::I64);
-    builder.append_block_param(next, types::I64);
-
-    let recurse = module.declare_func_in_func(func_id, builder.func);
-    builder.switch_to_block(entry);
-    let deopt_out = builder.block_params(entry)[0];
-    let value = builder.block_params(entry)[1];
-    let pointer_type = builder.func.dfg.value_type(deopt_out);
-    let runtime = lower_is_runtime_handle(builder, value);
-    builder.ins().brif(runtime, inspect, &[], accepted, &[]);
-
-    builder.switch_to_block(inspect);
-    let slot = lower_optimizing_slot_address(builder, value, deopt_out);
-    let refcount = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, refcount) as i32,
-    );
-    let shared = builder
-        .ins()
-        .icmp_imm(IntCC::UnsignedGreaterThan, refcount, 1);
-    let last = builder.ins().icmp_imm(IntCC::Equal, refcount, 1);
-    builder.ins().brif(shared, accepted, &[], inspect_last, &[]);
-
-    builder.switch_to_block(inspect_last);
-    let index = builder.ins().ireduce(types::I32, value);
-    let direct = builder.ins().icmp_imm(
-        IntCC::UnsignedGreaterThanOrEqual,
-        index,
-        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
-    );
-    let kind = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
-    );
-    let direct_reference = builder.ins().icmp_imm(
-        IntCC::Equal,
-        kind,
-        i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR),
-    );
-    let direct_string = builder.ins().icmp_imm(
-        IntCC::Equal,
-        kind,
-        i64::from(crate::JIT_NATIVE_VALUE_VIEW_STRING),
-    );
-    let direct_float = builder.ins().icmp_imm(
-        IntCC::Equal,
-        kind,
-        i64::from(crate::JIT_NATIVE_VALUE_VIEW_FLOAT),
-    );
-    let direct_int = builder.ins().icmp_imm(
-        IntCC::Equal,
-        kind,
-        i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_INT),
-    );
-    let scalar = builder.ins().bor(direct_string, direct_float);
-    let scalar = builder.ins().bor(scalar, direct_int);
-    let scalar = builder.ins().band(direct, scalar);
-    let valid_last = builder.ins().band(direct, last);
-    let reference = builder.ins().band(valid_last, direct_reference);
-    let inspect_reference = builder.create_block();
-    builder
-        .ins()
-        .brif(scalar, accepted, &[], inspect_reference, &[]);
-
-    builder.switch_to_block(inspect_reference);
-    builder.ins().brif(
-        reference,
-        validate_reference,
-        &[],
-        inspect_composite,
-        &[valid_last.into()],
-    );
-
-    builder.switch_to_block(validate_reference);
-    let payload = builder.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
-    );
-    let call = builder.ins().call(recurse, &[deopt_out, payload]);
-    let valid = builder.inst_results(call)[0];
-    builder.ins().brif(valid, accepted, &[], rejected, &[]);
-
-    builder.switch_to_block(inspect_composite);
-    let valid_last = builder.block_params(inspect_composite)[0];
-    let direct_array = builder.ins().icmp_imm(
-        IntCC::Equal,
-        kind,
-        i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY),
-    );
-    let direct_array = builder.ins().band(valid_last, direct_array);
-    let zero = builder.ins().iconst(types::I64, 0);
-    builder.ins().brif(
-        direct_array,
-        scan,
-        &[zero.into()],
-        inspect_foreach,
-        &[valid_last.into()],
-    );
-
-    builder.switch_to_block(inspect_foreach);
-    let valid_last = builder.block_params(inspect_foreach)[0];
-    let direct_foreach = builder.ins().icmp_imm(
-        IntCC::Equal,
-        kind,
-        i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_FOREACH),
-    );
-    let direct_foreach = builder.ins().band(valid_last, direct_foreach);
-    builder
-        .ins()
-        .brif(direct_foreach, validate_foreach, &[], rejected, &[]);
-
-    builder.switch_to_block(validate_foreach);
-    let source = builder.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
-    );
-    let call = builder.ins().call(recurse, &[deopt_out, source]);
-    let valid = builder.inst_results(call)[0];
-    builder.ins().brif(valid, accepted, &[], rejected, &[]);
-
-    builder.switch_to_block(scan);
-    let scan_index = builder.block_params(scan)[0];
-    let length = builder.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
-    );
-    let finished = builder
-        .ins()
-        .icmp(IntCC::UnsignedGreaterThanOrEqual, scan_index, length);
-    builder
-        .ins()
-        .brif(finished, accepted, &[], validate_key, &[]);
-
-    builder.switch_to_block(validate_key);
-    let entries = builder.ins().load(
-        pointer_type,
-        MemFlagsData::new(),
-        slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, aux) as i32,
-    );
-    let pointer_index = if pointer_type == types::I64 {
-        scan_index
-    } else {
-        builder.ins().ireduce(pointer_type, scan_index)
-    };
-    let offset = builder.ins().ishl_imm(pointer_index, 4);
-    let array_entry = builder.ins().iadd(entries, offset);
-    let key = builder
-        .ins()
-        .load(types::I64, MemFlagsData::new(), array_entry, 0);
-    let call = builder.ins().call(recurse, &[deopt_out, key]);
-    let valid = builder.inst_results(call)[0];
-    builder
-        .ins()
-        .brif(valid, validate_value, &[scan_index.into()], rejected, &[]);
-
-    builder.switch_to_block(validate_value);
-    let scan_index = builder.block_params(validate_value)[0];
-    let pointer_index = if pointer_type == types::I64 {
-        scan_index
-    } else {
-        builder.ins().ireduce(pointer_type, scan_index)
-    };
-    let offset = builder.ins().ishl_imm(pointer_index, 4);
-    let array_entry = builder.ins().iadd(entries, offset);
-    let child = builder.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        array_entry,
-        std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
-    );
-    let call = builder.ins().call(recurse, &[deopt_out, child]);
-    let valid = builder.inst_results(call)[0];
-    builder
-        .ins()
-        .brif(valid, next, &[scan_index.into()], rejected, &[]);
-
-    builder.switch_to_block(next);
-    let scan_index = builder.block_params(next)[0];
-    let next_index = builder.ins().iadd_imm(scan_index, 1);
-    builder.ins().jump(scan, &[next_index.into()]);
-
-    builder.switch_to_block(accepted);
-    let yes = builder.ins().iconst(types::I8, 1);
-    builder.ins().return_(&[yes]);
-    builder.switch_to_block(rejected);
-    let no = builder.ins().iconst(types::I8, 0);
-    builder.ins().return_(&[no]);
-}
 
 fn lower_free_direct_array_entries(
     builder: &mut FunctionBuilder<'_>,
@@ -940,7 +719,7 @@ fn lower_direct_array_ensure_unique_body(builder: &mut FunctionBuilder<'_>) {
     builder.ins().brif(clone, clone_slot, &[], move_slot, &[]);
 
     builder.switch_to_block(clone_slot);
-    let new_index = lower_reserve_direct_value_index(builder, deopt_out, failed);
+    let new_index = lower_reserve_direct_value_index(builder, deopt_out, Some(failed));
     let slots = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
@@ -1265,16 +1044,6 @@ fn define_direct_array_child_entry_function(
     })
 }
 
-fn define_direct_value_release_validate_function(
-    module: &mut JITModule,
-    ctx: &mut cranelift_codegen::Context,
-    builder_context: &mut FunctionBuilderContext,
-    func_id: FuncId,
-    symbol: FunctionId,
-) -> Result<DefinedRegionFunction, CraneliftLoweringError> {
-    define_direct_value_release_function(module, ctx, builder_context, func_id, symbol, false)
-}
-
 fn define_direct_value_release_commit_function(
     module: &mut JITModule,
     ctx: &mut cranelift_codegen::Context,
@@ -1282,35 +1051,19 @@ fn define_direct_value_release_commit_function(
     func_id: FuncId,
     symbol: FunctionId,
 ) -> Result<DefinedRegionFunction, CraneliftLoweringError> {
-    define_direct_value_release_function(module, ctx, builder_context, func_id, symbol, true)
-}
-
-fn define_direct_value_release_function(
-    module: &mut JITModule,
-    ctx: &mut cranelift_codegen::Context,
-    builder_context: &mut FunctionBuilderContext,
-    func_id: FuncId,
-    symbol: FunctionId,
-    commit: bool,
-) -> Result<DefinedRegionFunction, CraneliftLoweringError> {
     ctx.func.signature = direct_value_release_signature(module);
     ctx.func.name = UserFuncName::user(0, func_id.as_u32());
     {
         let mut builder = FunctionBuilder::new(&mut ctx.func, builder_context);
-        if commit {
-            lower_direct_value_release_commit_body(module, &mut builder, func_id);
-        } else {
-            lower_direct_value_release_validate_body(module, &mut builder, func_id);
-        }
+        lower_direct_value_release_commit_body(module, &mut builder, func_id);
         builder.seal_all_blocks();
         builder.finalize();
     }
-    let phase = if commit { "commit" } else { "validator" };
     let verifier_flags = settings::Flags::new(settings::builder());
     verify_function(&ctx.func, &verifier_flags).map_err(|error| {
         CraneliftLoweringError::new(
             "JIT_CRANELIFT_REJECT_VERIFIER",
-            format!("direct value-release {phase} verifier failure: {error}"),
+            format!("direct value-release commit verifier failure: {error}"),
         )
     })?;
     let clif_blocks = ctx.func.layout.blocks().count();
@@ -1334,13 +1087,13 @@ fn define_direct_value_release_function(
     module.define_function(func_id, ctx).map_err(|error| {
         CraneliftLoweringError::new(
             "JIT_CRANELIFT_REJECT_DEFINE",
-            format!("failed to define direct value-release {phase}: {error}"),
+            format!("failed to define direct value-release commit: {error}"),
         )
     })?;
     let compiled = ctx.compiled_code().ok_or_else(|| {
         CraneliftLoweringError::new(
             "JIT_CRANELIFT_REJECT_CACHE_CODE",
-            format!("Cranelift returned no direct value-release {phase} code"),
+            "Cranelift returned no direct value-release commit code",
         )
     })?;
     let native_stack_bytes = compiled

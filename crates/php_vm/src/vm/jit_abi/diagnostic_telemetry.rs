@@ -527,9 +527,6 @@ impl NativeRequestColdState<'_> {
                     php_jit::JitProductionLoweringClass::DirectClif => "DirectClif",
                     php_jit::JitProductionLoweringClass::DirectNativeData => "DirectNativeData",
                     php_jit::JitProductionLoweringClass::CompiledNativeCall => "CompiledNativeCall",
-                    php_jit::JitProductionLoweringClass::BaselineFragmentTransition => {
-                        "BaselineFragmentTransition"
-                    }
                 };
                 telemetry
                     .counters
@@ -544,7 +541,7 @@ impl NativeRequestColdState<'_> {
                             lowering.operation,
                             class,
                         ),
-                        u64::from(lowering.operation_local_transition),
+                        0,
                     );
             }
             let mut unit_code_bytes = 0_u64;
