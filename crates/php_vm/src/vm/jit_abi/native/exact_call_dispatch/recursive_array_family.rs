@@ -560,7 +560,7 @@ fn exact_merge_recursive_owned(
     exact_finish_consuming_array(fast, left_owned, result)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_array_merge_recursive_abi(
+pub(crate) extern "C" fn jit_native_array_merge_recursive_abi(
     runtime: *mut NativeRequestFastState,
     left_owned: i64,
     right: i64,
@@ -577,7 +577,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_merge_recursive_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_array_replace_recursive_abi(
+pub(crate) extern "C" fn jit_native_array_replace_recursive_abi(
     runtime: *mut NativeRequestFastState,
     left_owned: i64,
     right: i64,

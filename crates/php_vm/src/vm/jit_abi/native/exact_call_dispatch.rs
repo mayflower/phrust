@@ -40,7 +40,7 @@ fn native_object_vars_result(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_object_vars_abi(
+pub(crate) extern "C" fn jit_native_get_object_vars_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -50,7 +50,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_object_vars_abi(
     native_object_vars_result(fast, argument_0, false)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_mangled_object_vars_abi(
+pub(crate) extern "C" fn jit_native_get_mangled_object_vars_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -149,7 +149,7 @@ fn native_bool_result(value: bool) -> php_jit::JitNativeControlResult {
     }))
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_class_methods_abi(
+pub(crate) extern "C" fn jit_native_get_class_methods_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     caller_function: i64,
@@ -190,7 +190,7 @@ struct ExactClassVarProjection {
     property: usize,
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_class_vars_abi(
+pub(crate) extern "C" fn jit_native_get_class_vars_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     caller_function: i64,
@@ -272,7 +272,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_class_vars_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_is_callable_abi(
+pub(crate) extern "C" fn jit_native_is_callable_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -307,7 +307,7 @@ pub(in crate::vm) extern "C" fn jit_native_is_callable_abi(
     native_bool_result(callable)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_set_error_handler_abi(
+pub(crate) extern "C" fn jit_native_set_error_handler_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -321,7 +321,7 @@ pub(in crate::vm) extern "C" fn jit_native_set_error_handler_abi(
         )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_restore_error_handler_abi(
+pub(crate) extern "C" fn jit_native_restore_error_handler_abi(
     runtime: *mut NativeRequestFastState,
     _argument_0: i64,
     _argument_1: i64,
@@ -334,7 +334,7 @@ pub(in crate::vm) extern "C" fn jit_native_restore_error_handler_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_set_exception_handler_abi(
+pub(crate) extern "C" fn jit_native_set_exception_handler_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     _argument_1: i64,
@@ -347,7 +347,7 @@ pub(in crate::vm) extern "C" fn jit_native_set_exception_handler_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_restore_exception_handler_abi(
+pub(crate) extern "C" fn jit_native_restore_exception_handler_abi(
     runtime: *mut NativeRequestFastState,
     _argument_0: i64,
     _argument_1: i64,
@@ -360,7 +360,7 @@ pub(in crate::vm) extern "C" fn jit_native_restore_exception_handler_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_exception_handler_abi(
+pub(crate) extern "C" fn jit_native_get_exception_handler_abi(
     runtime: *mut NativeRequestFastState,
     _argument_0: i64,
     _argument_1: i64,
@@ -373,7 +373,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_exception_handler_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_spl_autoload_register_abi(
+pub(crate) extern "C" fn jit_native_spl_autoload_register_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -400,7 +400,7 @@ pub(in crate::vm) extern "C" fn jit_native_spl_autoload_register_abi(
         )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_spl_autoload_unregister_abi(
+pub(crate) extern "C" fn jit_native_spl_autoload_unregister_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     _argument_1: i64,
@@ -415,7 +415,7 @@ pub(in crate::vm) extern "C" fn jit_native_spl_autoload_unregister_abi(
         )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_spl_autoload_functions_abi(
+pub(crate) extern "C" fn jit_native_spl_autoload_functions_abi(
     runtime: *mut NativeRequestFastState,
     _argument_0: i64,
     _argument_1: i64,
@@ -429,7 +429,7 @@ pub(in crate::vm) extern "C" fn jit_native_spl_autoload_functions_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_register_shutdown_function_abi(
+pub(crate) extern "C" fn jit_native_register_shutdown_function_abi(
     runtime: *mut NativeRequestFastState,
     argument_count: i32,
     arguments: *const i64,
@@ -453,7 +453,7 @@ pub(in crate::vm) extern "C" fn jit_native_register_shutdown_function_abi(
         )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_parent_class_abi(
+pub(crate) extern "C" fn jit_native_get_parent_class_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -502,7 +502,7 @@ fn native_class_is_a(
     symbols.class_is_a(class_name, expected).unwrap_or(false)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_is_subclass_of_abi(
+pub(crate) extern "C" fn jit_native_is_subclass_of_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -540,7 +540,7 @@ pub(in crate::vm) extern "C" fn jit_native_is_subclass_of_abi(
     ))
 }
 
-pub(in crate::vm) extern "C" fn jit_native_is_a_abi(
+pub(crate) extern "C" fn jit_native_is_a_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -618,7 +618,7 @@ fn exact_visit_class_interfaces(
 }
 
 #[allow(unsafe_code)] // Immutable class metadata stays live while the disjoint native result arena mutates.
-pub(in crate::vm) extern "C" fn jit_native_class_implements_abi(
+pub(crate) extern "C" fn jit_native_class_implements_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -698,7 +698,7 @@ pub(in crate::vm) extern "C" fn jit_native_class_implements_abi(
         )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_extension_loaded_abi(
+pub(crate) extern "C" fn jit_native_extension_loaded_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -732,7 +732,7 @@ fn native_memory_usage_result(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_memory_get_usage_abi(
+pub(crate) extern "C" fn jit_native_memory_get_usage_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -742,7 +742,7 @@ pub(in crate::vm) extern "C" fn jit_native_memory_get_usage_abi(
     native_memory_usage_result(fast, argument_0)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_memory_get_peak_usage_abi(
+pub(crate) extern "C" fn jit_native_memory_get_peak_usage_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -764,7 +764,7 @@ fn native_gc_state_mut(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_gc_collect_cycles_abi(
+pub(crate) extern "C" fn jit_native_gc_collect_cycles_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     #[allow(unsafe_code)]
@@ -775,7 +775,7 @@ pub(in crate::vm) extern "C" fn jit_native_gc_collect_cycles_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_gc_disable_abi(
+pub(crate) extern "C" fn jit_native_gc_disable_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     #[allow(unsafe_code)]
@@ -787,7 +787,7 @@ pub(in crate::vm) extern "C" fn jit_native_gc_disable_abi(
     php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(u32::MAX))
 }
 
-pub(in crate::vm) extern "C" fn jit_native_gc_enable_abi(
+pub(crate) extern "C" fn jit_native_gc_enable_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     #[allow(unsafe_code)]
@@ -799,7 +799,7 @@ pub(in crate::vm) extern "C" fn jit_native_gc_enable_abi(
     php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(u32::MAX))
 }
 
-pub(in crate::vm) extern "C" fn jit_native_gc_enabled_abi(
+pub(crate) extern "C" fn jit_native_gc_enabled_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     #[allow(unsafe_code)]
@@ -810,7 +810,7 @@ pub(in crate::vm) extern "C" fn jit_native_gc_enabled_abi(
     native_bool_result(state.enabled())
 }
 
-pub(in crate::vm) extern "C" fn jit_native_gc_mem_caches_abi(
+pub(crate) extern "C" fn jit_native_gc_mem_caches_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     #[allow(unsafe_code)]
@@ -842,7 +842,7 @@ const NATIVE_GC_STATUS: [(&[u8], NativeGcStatusValue); 12] = [
     (b"free_time", NativeGcStatusValue::Float(0.0)),
 ];
 
-pub(in crate::vm) extern "C" fn jit_native_gc_status_abi(
+pub(crate) extern "C" fn jit_native_gc_status_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     #[allow(unsafe_code)]
@@ -879,7 +879,7 @@ pub(in crate::vm) extern "C" fn jit_native_gc_status_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_resource_id_abi(
+pub(crate) extern "C" fn jit_native_get_resource_id_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -897,7 +897,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_resource_id_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_resource_type_abi(
+pub(crate) extern "C" fn jit_native_get_resource_type_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -914,7 +914,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_resource_type_abi(
         )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_resources_abi(
+pub(crate) extern "C" fn jit_native_get_resources_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -979,7 +979,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_resources_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_settype_abi(
+pub(crate) extern "C" fn jit_native_settype_abi(
     runtime: *mut NativeRequestFastState,
     reference: i64,
     type_name: i64,
@@ -1044,7 +1044,7 @@ pub(in crate::vm) extern "C" fn jit_native_settype_abi(
     native_bool_result(true)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_error_get_last_abi(
+pub(crate) extern "C" fn jit_native_error_get_last_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     #[allow(unsafe_code)]
@@ -1088,7 +1088,7 @@ pub(in crate::vm) extern "C" fn jit_native_error_get_last_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_error_clear_last_abi(
+pub(crate) extern "C" fn jit_native_error_clear_last_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     #[allow(unsafe_code)]
@@ -1506,7 +1506,7 @@ where
     result.ok()
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_loaded_extensions_abi(
+pub(crate) extern "C" fn jit_native_get_loaded_extensions_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -1584,7 +1584,7 @@ fn native_configuration_result(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_ini_get_abi(
+pub(crate) extern "C" fn jit_native_ini_get_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -1594,7 +1594,7 @@ pub(in crate::vm) extern "C" fn jit_native_ini_get_abi(
     native_configuration_result(fast, argument_0, NativeConfigurationQuery::Current)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_ini_get_all_abi(
+pub(crate) extern "C" fn jit_native_ini_get_all_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -1698,7 +1698,7 @@ pub(in crate::vm) extern "C" fn jit_native_ini_get_all_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_cfg_var_abi(
+pub(crate) extern "C" fn jit_native_get_cfg_var_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -1708,7 +1708,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_cfg_var_abi(
     native_configuration_result(fast, argument_0, NativeConfigurationQuery::Configured)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_include_path_abi(
+pub(crate) extern "C" fn jit_native_get_include_path_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -1749,7 +1749,7 @@ fn exact_native_configuration_set(
         )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_ini_set_abi(
+pub(crate) extern "C" fn jit_native_ini_set_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -1766,7 +1766,7 @@ pub(in crate::vm) extern "C" fn jit_native_ini_set_abi(
     exact_native_configuration_set(fast, name.into_lossy_owned(), value.into_lossy_owned())
 }
 
-pub(in crate::vm) extern "C" fn jit_native_set_include_path_abi(
+pub(crate) extern "C" fn jit_native_set_include_path_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -1779,7 +1779,7 @@ pub(in crate::vm) extern "C" fn jit_native_set_include_path_abi(
     exact_native_configuration_set(fast, "include_path".to_owned(), value.into_lossy_owned())
 }
 
-pub(in crate::vm) extern "C" fn jit_native_date_default_timezone_get_abi(
+pub(crate) extern "C" fn jit_native_date_default_timezone_get_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -1803,7 +1803,7 @@ pub(in crate::vm) extern "C" fn jit_native_date_default_timezone_get_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_date_default_timezone_set_abi(
+pub(crate) extern "C" fn jit_native_date_default_timezone_set_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -1851,7 +1851,7 @@ fn exact_session_ini_bool(value: Option<&str>) -> bool {
     })
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_status_abi(
+pub(crate) extern "C" fn jit_native_session_status_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -1864,7 +1864,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_status_abi(
         )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_cache_expire_abi(
+pub(crate) extern "C" fn jit_native_session_cache_expire_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -1901,7 +1901,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_cache_expire_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_cache_limiter_abi(
+pub(crate) extern "C" fn jit_native_session_cache_limiter_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -1938,7 +1938,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_cache_limiter_abi(
     exact_session_publish_string(fast, previous)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_id_abi(
+pub(crate) extern "C" fn jit_native_session_id_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -1973,7 +1973,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_id_abi(
     exact_session_publish_string(fast, previous)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_module_name_abi(
+pub(crate) extern "C" fn jit_native_session_module_name_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -2005,7 +2005,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_module_name_abi(
     exact_session_publish_string(fast, previous)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_name_abi(
+pub(crate) extern "C" fn jit_native_session_name_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -2047,7 +2047,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_name_abi(
     exact_session_publish_string(fast, previous)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_save_path_abi(
+pub(crate) extern "C" fn jit_native_session_save_path_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -2110,7 +2110,7 @@ fn exact_session_cookie_value(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_get_cookie_params_abi(
+pub(crate) extern "C" fn jit_native_session_get_cookie_params_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -2144,7 +2144,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_get_cookie_params_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_set_cookie_params_abi(
+pub(crate) extern "C" fn jit_native_session_set_cookie_params_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -2197,7 +2197,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_set_cookie_params_abi(
     exact_query_return_bool(true)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_gc_abi(
+pub(crate) extern "C" fn jit_native_session_gc_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -2209,7 +2209,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_gc_abi(
     php_jit::JitNativeControlResult::returning(0)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_register_shutdown_abi(
+pub(crate) extern "C" fn jit_native_session_register_shutdown_abi(
     _runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(u32::MAX))
@@ -2228,7 +2228,7 @@ fn exact_session_lifecycle_result(value: bool) -> php_jit::JitNativeControlResul
     exact_query_return_bool(value)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_abort_abi(
+pub(crate) extern "C" fn jit_native_session_abort_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -2243,7 +2243,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_abort_abi(
     exact_session_lifecycle_result(fast.session.control_mut().close_value_free())
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_commit_abi(
+pub(crate) extern "C" fn jit_native_session_commit_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -2258,7 +2258,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_commit_abi(
     exact_session_lifecycle_result(fast.session.control_mut().close_value_free())
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_destroy_abi(
+pub(crate) extern "C" fn jit_native_session_destroy_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -2274,7 +2274,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_destroy_abi(
     exact_session_lifecycle_result(fast.session.control_mut().destroy_value_free())
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_decode_abi(
+pub(crate) extern "C" fn jit_native_session_decode_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -2289,7 +2289,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_decode_abi(
     exact_session_lifecycle_result(true)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_encode_abi(
+pub(crate) extern "C" fn jit_native_session_encode_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -2317,7 +2317,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_encode_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_create_id_abi(
+pub(crate) extern "C" fn jit_native_session_create_id_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -2360,7 +2360,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_create_id_abi(
     exact_session_publish_string(fast, id)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_regenerate_id_abi(
+pub(crate) extern "C" fn jit_native_session_regenerate_id_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -2383,7 +2383,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_regenerate_id_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_reset_abi(
+pub(crate) extern "C" fn jit_native_session_reset_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -2398,7 +2398,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_reset_abi(
     exact_session_lifecycle_result(true)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_set_save_handler_abi(
+pub(crate) extern "C" fn jit_native_session_set_save_handler_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     _argument_1: i64,
@@ -2434,7 +2434,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_set_save_handler_abi(
     exact_session_lifecycle_result(true)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_start_abi(
+pub(crate) extern "C" fn jit_native_session_start_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -2483,7 +2483,7 @@ pub(in crate::vm) extern "C" fn jit_native_session_start_abi(
     exact_session_lifecycle_result(true)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_unset_abi(
+pub(crate) extern "C" fn jit_native_session_unset_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -2498,13 +2498,13 @@ pub(in crate::vm) extern "C" fn jit_native_session_unset_abi(
     exact_session_lifecycle_result(true)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_session_write_close_abi(
+pub(crate) extern "C" fn jit_native_session_write_close_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     jit_native_session_commit_abi(runtime)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_header_abi(
+pub(crate) extern "C" fn jit_native_header_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -2556,7 +2556,7 @@ pub(in crate::vm) extern "C" fn jit_native_header_abi(
     php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(u32::MAX))
 }
 
-pub(in crate::vm) extern "C" fn jit_native_header_remove_abi(
+pub(crate) extern "C" fn jit_native_header_remove_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -2584,7 +2584,7 @@ pub(in crate::vm) extern "C" fn jit_native_header_remove_abi(
     php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(u32::MAX))
 }
 
-pub(in crate::vm) extern "C" fn jit_native_headers_list_abi(
+pub(crate) extern "C" fn jit_native_headers_list_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -2609,7 +2609,7 @@ pub(in crate::vm) extern "C" fn jit_native_headers_list_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_headers_sent_abi(
+pub(crate) extern "C" fn jit_native_headers_sent_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -2618,7 +2618,7 @@ pub(in crate::vm) extern "C" fn jit_native_headers_sent_abi(
     exact_query_return_bool(fast.http_response.response().headers_sent)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_http_response_code_abi(
+pub(crate) extern "C" fn jit_native_http_response_code_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -2757,7 +2757,7 @@ fn exact_native_cookie<const RAW: bool>(
     exact_query_return_bool(true)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_setcookie_abi(
+pub(crate) extern "C" fn jit_native_setcookie_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -2775,7 +2775,7 @@ pub(in crate::vm) extern "C" fn jit_native_setcookie_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_setrawcookie_abi(
+pub(crate) extern "C" fn jit_native_setrawcookie_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -2799,7 +2799,7 @@ fn exact_native_clock_elapsed() -> Option<std::time::Duration> {
         .ok()
 }
 
-pub(in crate::vm) extern "C" fn jit_native_time_abi(
+pub(crate) extern "C" fn jit_native_time_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -2812,7 +2812,7 @@ pub(in crate::vm) extern "C" fn jit_native_time_abi(
         )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_microtime_abi(
+pub(crate) extern "C" fn jit_native_microtime_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -2849,7 +2849,7 @@ pub(in crate::vm) extern "C" fn jit_native_microtime_abi(
         )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_hrtime_abi(
+pub(crate) extern "C" fn jit_native_hrtime_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -2973,7 +2973,7 @@ fn exact_native_format_date<const UTC: bool>(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_checkdate_abi(
+pub(crate) extern "C" fn jit_native_checkdate_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -2994,7 +2994,7 @@ pub(in crate::vm) extern "C" fn jit_native_checkdate_abi(
     ))
 }
 
-pub(in crate::vm) extern "C" fn jit_native_date_abi(
+pub(crate) extern "C" fn jit_native_date_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -3005,7 +3005,7 @@ pub(in crate::vm) extern "C" fn jit_native_date_abi(
     exact_native_format_date::<false>(fast, argument_0, argument_1)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_gmdate_abi(
+pub(crate) extern "C" fn jit_native_gmdate_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -3016,7 +3016,7 @@ pub(in crate::vm) extern "C" fn jit_native_gmdate_abi(
     exact_native_format_date::<true>(fast, argument_0, argument_1)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_strtotime_abi(
+pub(crate) extern "C" fn jit_native_strtotime_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -3099,7 +3099,7 @@ fn exact_native_mktime<const UTC: bool>(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_mktime_abi(
+pub(crate) extern "C" fn jit_native_mktime_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -3119,7 +3119,7 @@ pub(in crate::vm) extern "C" fn jit_native_mktime_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_gmmktime_abi(
+pub(crate) extern "C" fn jit_native_gmmktime_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -3139,7 +3139,7 @@ pub(in crate::vm) extern "C" fn jit_native_gmmktime_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_timezone_identifiers_list_abi(
+pub(crate) extern "C" fn jit_native_timezone_identifiers_list_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -3157,7 +3157,7 @@ pub(in crate::vm) extern "C" fn jit_native_timezone_identifiers_list_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_sys_get_temp_dir_abi(
+pub(crate) extern "C" fn jit_native_sys_get_temp_dir_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     let path = std::env::temp_dir();
@@ -3171,7 +3171,7 @@ pub(in crate::vm) extern "C" fn jit_native_sys_get_temp_dir_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_getcwd_abi(
+pub(crate) extern "C" fn jit_native_getcwd_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -3192,7 +3192,7 @@ pub(in crate::vm) extern "C" fn jit_native_getcwd_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_chdir_abi(
+pub(crate) extern "C" fn jit_native_chdir_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -3218,7 +3218,7 @@ pub(in crate::vm) extern "C" fn jit_native_chdir_abi(
     exact_query_return_bool(true)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_umask_abi(
+pub(crate) extern "C" fn jit_native_umask_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -3248,7 +3248,7 @@ pub(in crate::vm) extern "C" fn jit_native_umask_abi(
     php_jit::JitNativeControlResult::returning(encoded_previous)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_clearstatcache_abi(
+pub(crate) extern "C" fn jit_native_clearstatcache_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -3264,7 +3264,7 @@ pub(in crate::vm) extern "C" fn jit_native_clearstatcache_abi(
     php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(u32::MAX))
 }
 
-pub(in crate::vm) extern "C" fn jit_native_getenv_abi(
+pub(crate) extern "C" fn jit_native_getenv_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -3315,7 +3315,7 @@ pub(in crate::vm) extern "C" fn jit_native_getenv_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_php_sapi_name_abi(
+pub(crate) extern "C" fn jit_native_php_sapi_name_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -3335,7 +3335,7 @@ pub(in crate::vm) extern "C" fn jit_native_php_sapi_name_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_php_uname_abi(
+pub(crate) extern "C" fn jit_native_php_uname_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -3367,7 +3367,7 @@ pub(in crate::vm) extern "C" fn jit_native_php_uname_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_current_user_abi(
+pub(crate) extern "C" fn jit_native_get_current_user_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -3379,7 +3379,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_current_user_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_included_files_abi(
+pub(crate) extern "C" fn jit_native_get_included_files_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -3406,7 +3406,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_included_files_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_defined_functions_abi(
+pub(crate) extern "C" fn jit_native_get_defined_functions_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -3451,7 +3451,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_defined_functions_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_declared_classes_abi(
+pub(crate) extern "C" fn jit_native_get_declared_classes_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -3483,7 +3483,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_declared_classes_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_declared_interfaces_abi(
+pub(crate) extern "C" fn jit_native_get_declared_interfaces_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -3515,7 +3515,7 @@ pub(in crate::vm) extern "C" fn jit_native_get_declared_interfaces_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_declared_traits_abi(
+pub(crate) extern "C" fn jit_native_get_declared_traits_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -4080,7 +4080,7 @@ fn publish_exact_uncategorized_constants(
     })
 }
 
-pub(in crate::vm) extern "C" fn jit_native_get_defined_constants_abi(
+pub(crate) extern "C" fn jit_native_get_defined_constants_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -4196,7 +4196,7 @@ fn exact_compact_visit_names(
 }
 
 #[allow(unsafe_code)] // Stable compiled metadata/input arenas stay live while the disjoint result arena mutates.
-pub(in crate::vm) extern "C" fn jit_native_compact_abi(
+pub(crate) extern "C" fn jit_native_compact_abi(
     runtime: *mut NativeRequestFastState,
     function_id: i64,
     local_values: i64,
@@ -4348,7 +4348,7 @@ pub(in crate::vm) extern "C" fn jit_native_compact_abi(
         )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_func_num_args_abi(
+pub(crate) extern "C" fn jit_native_func_num_args_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -4360,7 +4360,7 @@ pub(in crate::vm) extern "C" fn jit_native_func_num_args_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_func_get_arg_abi(
+pub(crate) extern "C" fn jit_native_func_get_arg_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -4382,7 +4382,7 @@ pub(in crate::vm) extern "C" fn jit_native_func_get_arg_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_func_get_args_abi(
+pub(crate) extern "C" fn jit_native_func_get_args_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -4394,7 +4394,7 @@ pub(in crate::vm) extern "C" fn jit_native_func_get_args_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_base64_decode_abi(
+pub(crate) extern "C" fn jit_native_base64_decode_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -4445,7 +4445,7 @@ fn exact_native_parsed_base_result(
 
 macro_rules! exact_native_parse_base_abi {
     ($abi:ident, $base:literal) => {
-        pub(in crate::vm) extern "C" fn $abi(
+        pub(crate) extern "C" fn $abi(
             runtime: *mut NativeRequestFastState,
             argument_0: i64,
         ) -> php_jit::JitNativeControlResult {
@@ -4469,7 +4469,7 @@ exact_native_parse_base_abi!(jit_native_octdec_abi, 8);
 
 macro_rules! exact_native_decimal_to_base_abi {
     ($abi:ident, $base:literal) => {
-        pub(in crate::vm) extern "C" fn $abi(
+        pub(crate) extern "C" fn $abi(
             runtime: *mut NativeRequestFastState,
             argument_0: i64,
         ) -> php_jit::JitNativeControlResult {
@@ -4501,7 +4501,7 @@ exact_native_decimal_to_base_abi!(jit_native_decbin_abi, 2);
 exact_native_decimal_to_base_abi!(jit_native_dechex_abi, 16);
 exact_native_decimal_to_base_abi!(jit_native_decoct_abi, 8);
 
-pub(in crate::vm) extern "C" fn jit_native_base_convert_abi(
+pub(crate) extern "C" fn jit_native_base_convert_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -4535,7 +4535,7 @@ pub(in crate::vm) extern "C" fn jit_native_base_convert_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_ip2long_abi(
+pub(crate) extern "C" fn jit_native_ip2long_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -4554,7 +4554,7 @@ pub(in crate::vm) extern "C" fn jit_native_ip2long_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_long2ip_abi(
+pub(crate) extern "C" fn jit_native_long2ip_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -4574,7 +4574,7 @@ pub(in crate::vm) extern "C" fn jit_native_long2ip_abi(
 
 macro_rules! exact_native_network_string_abi {
     ($abi:ident, $operation:path) => {
-        pub(in crate::vm) extern "C" fn $abi(
+        pub(crate) extern "C" fn $abi(
             runtime: *mut NativeRequestFastState,
             argument_0: i64,
         ) -> php_jit::JitNativeControlResult {
@@ -4609,7 +4609,7 @@ fn exact_native_max_length(fast: &NativeRequestFastState, encoded: i64) -> Optio
 
 macro_rules! exact_native_compression_encode_abi {
     ($abi:ident, $encoding:expr) => {
-        pub(in crate::vm) extern "C" fn $abi(
+        pub(crate) extern "C" fn $abi(
             runtime: *mut NativeRequestFastState,
             argument_0: i64,
             argument_1: i64,
@@ -4666,7 +4666,7 @@ exact_native_compression_encode_abi!(
 
 macro_rules! exact_native_compression_decode_abi {
     ($abi:ident, $encoding:expr) => {
-        pub(in crate::vm) extern "C" fn $abi(
+        pub(crate) extern "C" fn $abi(
             runtime: *mut NativeRequestFastState,
             argument_0: i64,
             argument_1: i64,
@@ -4719,7 +4719,7 @@ exact_native_compression_decode_abi!(
     php_runtime::api::ZLIB_ENCODING_RAW
 );
 
-pub(in crate::vm) extern "C" fn jit_native_zlib_decode_abi(
+pub(crate) extern "C" fn jit_native_zlib_decode_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -4755,7 +4755,7 @@ pub(in crate::vm) extern "C" fn jit_native_zlib_decode_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_zlib_encode_abi(
+pub(crate) extern "C" fn jit_native_zlib_encode_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -4795,7 +4795,7 @@ pub(in crate::vm) extern "C" fn jit_native_zlib_encode_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_basename_abi(
+pub(crate) extern "C" fn jit_native_basename_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -4841,7 +4841,7 @@ pub(in crate::vm) extern "C" fn jit_native_basename_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_dirname_abi(
+pub(crate) extern "C" fn jit_native_dirname_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -4884,7 +4884,7 @@ pub(in crate::vm) extern "C" fn jit_native_dirname_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_pathinfo_abi(
+pub(crate) extern "C" fn jit_native_pathinfo_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -4972,7 +4972,7 @@ enum ExactStatField {
 
 macro_rules! exact_native_stat_abi {
     ($abi:ident, $follow_links:expr) => {
-        pub(in crate::vm) extern "C" fn $abi(
+        pub(crate) extern "C" fn $abi(
             runtime: *mut NativeRequestFastState,
             argument_0: i64,
         ) -> php_jit::JitNativeControlResult {
@@ -5000,7 +5000,7 @@ macro_rules! exact_native_stat_abi {
 exact_native_stat_abi!(jit_native_stat_abi, true);
 exact_native_stat_abi!(jit_native_lstat_abi, false);
 
-pub(in crate::vm) extern "C" fn jit_native_file_abi(
+pub(crate) extern "C" fn jit_native_file_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -5032,7 +5032,7 @@ pub(in crate::vm) extern "C" fn jit_native_file_abi(
     php_jit::JitNativeControlResult::returning(lines)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_glob_abi(
+pub(crate) extern "C" fn jit_native_glob_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -5053,7 +5053,7 @@ pub(in crate::vm) extern "C" fn jit_native_glob_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_opendir_abi(
+pub(crate) extern "C" fn jit_native_opendir_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -5084,7 +5084,7 @@ pub(in crate::vm) extern "C" fn jit_native_opendir_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_readdir_abi(
+pub(crate) extern "C" fn jit_native_readdir_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -5112,7 +5112,7 @@ pub(in crate::vm) extern "C" fn jit_native_readdir_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_rewinddir_abi(
+pub(crate) extern "C" fn jit_native_rewinddir_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -5129,7 +5129,7 @@ pub(in crate::vm) extern "C" fn jit_native_rewinddir_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_closedir_abi(
+pub(crate) extern "C" fn jit_native_closedir_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -5145,7 +5145,7 @@ pub(in crate::vm) extern "C" fn jit_native_closedir_abi(
     php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(u32::MAX))
 }
 
-pub(in crate::vm) extern "C" fn jit_native_scandir_abi(
+pub(crate) extern "C" fn jit_native_scandir_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -5173,7 +5173,7 @@ pub(in crate::vm) extern "C" fn jit_native_scandir_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_get_wrappers_abi(
+pub(crate) extern "C" fn jit_native_stream_get_wrappers_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     #[allow(unsafe_code)]
@@ -5184,7 +5184,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_get_wrappers_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_get_meta_data_abi(
+pub(crate) extern "C" fn jit_native_stream_get_meta_data_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -5245,7 +5245,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_get_meta_data_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_is_local_abi(
+pub(crate) extern "C" fn jit_native_stream_is_local_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -5270,7 +5270,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_is_local_abi(
     ))
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_resolve_include_path_abi(
+pub(crate) extern "C" fn jit_native_stream_resolve_include_path_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -5325,7 +5325,7 @@ fn publish_native_stream_context(
     Ok(encoded)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_context_create_abi(
+pub(crate) extern "C" fn jit_native_stream_context_create_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -5348,7 +5348,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_context_create_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_context_get_default_abi(
+pub(crate) extern "C" fn jit_native_stream_context_get_default_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -5397,7 +5397,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_context_get_default_abi(
     php_jit::JitNativeControlResult::returning(resource)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_context_get_options_abi(
+pub(crate) extern "C" fn jit_native_stream_context_get_options_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -5416,7 +5416,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_context_get_options_abi(
         )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_context_set_default_abi(
+pub(crate) extern "C" fn jit_native_stream_context_set_default_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -5435,7 +5435,7 @@ fn merge_native_stream_context_resource(
     fast.insert_native_stream_context_resource_owned(resource, merged)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_context_set_options_abi(
+pub(crate) extern "C" fn jit_native_stream_context_set_options_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -5454,7 +5454,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_context_set_options_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_context_set_option_abi(
+pub(crate) extern "C" fn jit_native_stream_context_set_option_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -5549,7 +5549,7 @@ fn attach_native_stream_filter(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_filter_append_abi(
+pub(crate) extern "C" fn jit_native_stream_filter_append_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -5561,7 +5561,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_filter_append_abi(
     attach_native_stream_filter(fast, argument_0, argument_1, argument_2, false)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_filter_prepend_abi(
+pub(crate) extern "C" fn jit_native_stream_filter_prepend_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -5573,7 +5573,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_filter_prepend_abi(
     attach_native_stream_filter(fast, argument_0, argument_1, argument_2, true)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_filter_remove_abi(
+pub(crate) extern "C" fn jit_native_stream_filter_remove_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -5585,7 +5585,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_filter_remove_abi(
     exact_query_return_bool(filter.remove_stream_filter_resource())
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_isatty_abi(
+pub(crate) extern "C" fn jit_native_stream_isatty_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -5597,7 +5597,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_isatty_abi(
     exact_query_return_bool(false)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_set_timeout_abi(
+pub(crate) extern "C" fn jit_native_stream_set_timeout_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -5626,7 +5626,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_set_timeout_abi(
     exact_query_return_bool(false)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_realpath_abi(
+pub(crate) extern "C" fn jit_native_realpath_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -5650,7 +5650,7 @@ pub(in crate::vm) extern "C" fn jit_native_realpath_abi(
 
 macro_rules! exact_native_boolean_path_abi {
     ($abi:ident, $native:path) => {
-        pub(in crate::vm) extern "C" fn $abi(
+        pub(crate) extern "C" fn $abi(
             runtime: *mut NativeRequestFastState,
             argument_0: i64,
         ) -> php_jit::JitNativeControlResult {
@@ -5689,7 +5689,7 @@ exact_native_boolean_path_abi!(jit_native_is_link_abi, php_runtime::api::native_
 
 macro_rules! exact_native_integer_path_abi {
     ($abi:ident, $native:path) => {
-        pub(in crate::vm) extern "C" fn $abi(
+        pub(crate) extern "C" fn $abi(
             runtime: *mut NativeRequestFastState,
             argument_0: i64,
         ) -> php_jit::JitNativeControlResult {
@@ -5720,7 +5720,7 @@ exact_native_integer_path_abi!(jit_native_fileperms_abi, php_runtime::api::nativ
 exact_native_integer_path_abi!(jit_native_fileowner_abi, php_runtime::api::native_fileowner);
 exact_native_integer_path_abi!(jit_native_filegroup_abi, php_runtime::api::native_filegroup);
 
-pub(in crate::vm) extern "C" fn jit_native_filetype_abi(
+pub(crate) extern "C" fn jit_native_filetype_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -5745,7 +5745,7 @@ pub(in crate::vm) extern "C" fn jit_native_filetype_abi(
 
 macro_rules! exact_native_disk_space_abi {
     ($abi:ident) => {
-        pub(in crate::vm) extern "C" fn $abi(
+        pub(crate) extern "C" fn $abi(
             runtime: *mut NativeRequestFastState,
             argument_0: i64,
         ) -> php_jit::JitNativeControlResult {
@@ -5773,7 +5773,7 @@ macro_rules! exact_native_disk_space_abi {
 exact_native_disk_space_abi!(jit_native_disk_free_space_abi);
 exact_native_disk_space_abi!(jit_native_disk_total_space_abi);
 
-pub(in crate::vm) extern "C" fn jit_native_file_get_contents_abi(
+pub(crate) extern "C" fn jit_native_file_get_contents_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -5838,7 +5838,7 @@ pub(in crate::vm) extern "C" fn jit_native_file_get_contents_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_file_put_contents_abi(
+pub(crate) extern "C" fn jit_native_file_put_contents_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -5887,7 +5887,7 @@ pub(in crate::vm) extern "C" fn jit_native_file_put_contents_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_rename_abi(
+pub(crate) extern "C" fn jit_native_rename_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -5912,7 +5912,7 @@ pub(in crate::vm) extern "C" fn jit_native_rename_abi(
 
 macro_rules! exact_native_unary_path_mutation_abi {
     ($abi:ident, $native:path) => {
-        pub(in crate::vm) extern "C" fn $abi(
+        pub(crate) extern "C" fn $abi(
             runtime: *mut NativeRequestFastState,
             argument_0: i64,
         ) -> php_jit::JitNativeControlResult {
@@ -5938,7 +5938,7 @@ exact_native_unary_path_mutation_abi!(jit_native_mkdir_abi, php_runtime::api::na
 exact_native_unary_path_mutation_abi!(jit_native_rmdir_abi, php_runtime::api::native_rmdir);
 exact_native_unary_path_mutation_abi!(jit_native_touch_abi, php_runtime::api::native_touch);
 
-pub(in crate::vm) extern "C" fn jit_native_chmod_abi(
+pub(crate) extern "C" fn jit_native_chmod_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -5960,7 +5960,7 @@ pub(in crate::vm) extern "C" fn jit_native_chmod_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_symlink_abi(
+pub(crate) extern "C" fn jit_native_symlink_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -5982,7 +5982,7 @@ pub(in crate::vm) extern "C" fn jit_native_symlink_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_readfile_abi(
+pub(crate) extern "C" fn jit_native_readfile_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -6007,7 +6007,7 @@ pub(in crate::vm) extern "C" fn jit_native_readfile_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_is_uploaded_file_abi(
+pub(crate) extern "C" fn jit_native_is_uploaded_file_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -6023,7 +6023,7 @@ pub(in crate::vm) extern "C" fn jit_native_is_uploaded_file_abi(
     exact_query_return_bool(registry.is_active_upload(&path))
 }
 
-pub(in crate::vm) extern "C" fn jit_native_tempnam_abi(
+pub(crate) extern "C" fn jit_native_tempnam_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -6055,7 +6055,7 @@ pub(in crate::vm) extern "C" fn jit_native_tempnam_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_tmpfile_abi(
+pub(crate) extern "C" fn jit_native_tmpfile_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     #[allow(unsafe_code)]
@@ -6075,7 +6075,7 @@ pub(in crate::vm) extern "C" fn jit_native_tmpfile_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_fopen_abi(
+pub(crate) extern "C" fn jit_native_fopen_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -6108,7 +6108,7 @@ pub(in crate::vm) extern "C" fn jit_native_fopen_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_fwrite_abi(
+pub(crate) extern "C" fn jit_native_fwrite_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -6161,7 +6161,7 @@ pub(in crate::vm) extern "C" fn jit_native_fwrite_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_fclose_abi(
+pub(crate) extern "C" fn jit_native_fclose_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -6202,7 +6202,7 @@ fn exact_stream_publish_read(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_fread_abi(
+pub(crate) extern "C" fn jit_native_fread_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -6229,7 +6229,7 @@ pub(in crate::vm) extern "C" fn jit_native_fread_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_fgets_abi(
+pub(crate) extern "C" fn jit_native_fgets_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -6270,7 +6270,7 @@ pub(in crate::vm) extern "C" fn jit_native_fgets_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_fgetc_abi(
+pub(crate) extern "C" fn jit_native_fgetc_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -6290,7 +6290,7 @@ pub(in crate::vm) extern "C" fn jit_native_fgetc_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_feof_abi(
+pub(crate) extern "C" fn jit_native_feof_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -6303,7 +6303,7 @@ pub(in crate::vm) extern "C" fn jit_native_feof_abi(
     exact_query_return_bool(resource.eof().unwrap_or(true))
 }
 
-pub(in crate::vm) extern "C" fn jit_native_fflush_abi(
+pub(crate) extern "C" fn jit_native_fflush_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -6316,7 +6316,7 @@ pub(in crate::vm) extern "C" fn jit_native_fflush_abi(
     exact_query_return_bool(resource.flush().is_ok())
 }
 
-pub(in crate::vm) extern "C" fn jit_native_fseek_abi(
+pub(crate) extern "C" fn jit_native_fseek_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -6353,7 +6353,7 @@ pub(in crate::vm) extern "C" fn jit_native_fseek_abi(
     })
 }
 
-pub(in crate::vm) extern "C" fn jit_native_ftell_abi(
+pub(crate) extern "C" fn jit_native_ftell_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -6372,7 +6372,7 @@ pub(in crate::vm) extern "C" fn jit_native_ftell_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_ftruncate_abi(
+pub(crate) extern "C" fn jit_native_ftruncate_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -6392,7 +6392,7 @@ pub(in crate::vm) extern "C" fn jit_native_ftruncate_abi(
     exact_query_return_bool(resource.truncate(size as usize).is_ok())
 }
 
-pub(in crate::vm) extern "C" fn jit_native_rewind_abi(
+pub(crate) extern "C" fn jit_native_rewind_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -6405,7 +6405,7 @@ pub(in crate::vm) extern "C" fn jit_native_rewind_abi(
     exact_query_return_bool(resource.rewind().is_ok())
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_get_contents_abi(
+pub(crate) extern "C" fn jit_native_stream_get_contents_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -6456,7 +6456,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_get_contents_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_stream_copy_to_stream_abi(
+pub(crate) extern "C" fn jit_native_stream_copy_to_stream_abi(
     runtime: *mut NativeRequestFastState,
     argument_0: i64,
     argument_1: i64,
@@ -6508,7 +6508,7 @@ pub(in crate::vm) extern "C" fn jit_native_stream_copy_to_stream_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_ob_start_abi(
+pub(crate) extern "C" fn jit_native_ob_start_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -6521,7 +6521,7 @@ pub(in crate::vm) extern "C" fn jit_native_ob_start_abi(
     exact_query_return_bool(true)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_ob_get_clean_abi(
+pub(crate) extern "C" fn jit_native_ob_get_clean_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -6539,7 +6539,7 @@ pub(in crate::vm) extern "C" fn jit_native_ob_get_clean_abi(
     php_jit::JitNativeControlResult::returning(encoded)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_ob_get_contents_abi(
+pub(crate) extern "C" fn jit_native_ob_get_contents_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -6552,7 +6552,7 @@ pub(in crate::vm) extern "C" fn jit_native_ob_get_contents_abi(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_ob_get_flush_abi(
+pub(crate) extern "C" fn jit_native_ob_get_flush_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -6574,7 +6574,7 @@ pub(in crate::vm) extern "C" fn jit_native_ob_get_flush_abi(
     php_jit::JitNativeControlResult::returning(encoded)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_ob_get_length_abi(
+pub(crate) extern "C" fn jit_native_ob_get_length_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -6589,7 +6589,7 @@ pub(in crate::vm) extern "C" fn jit_native_ob_get_length_abi(
     php_jit::JitNativeControlResult::returning(i64::try_from(length).unwrap_or(i64::MAX))
 }
 
-pub(in crate::vm) extern "C" fn jit_native_ob_get_level_abi(
+pub(crate) extern "C" fn jit_native_ob_get_level_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -6603,7 +6603,7 @@ pub(in crate::vm) extern "C" fn jit_native_ob_get_level_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_ob_end_flush_abi(
+pub(crate) extern "C" fn jit_native_ob_end_flush_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
@@ -6619,7 +6619,7 @@ pub(in crate::vm) extern "C" fn jit_native_ob_end_flush_abi(
     exact_query_return_bool(true)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_ob_end_clean_abi(
+pub(crate) extern "C" fn jit_native_ob_end_clean_abi(
     runtime: *mut NativeRequestFastState,
 ) -> php_jit::JitNativeControlResult {
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.

@@ -255,8 +255,11 @@ fn exact_configuration_family_mutates_the_shared_request_state_without_value_mat
     let runtime = context.fast_state;
     let _activation = super::activate_native_context(&mut context);
 
-    let display_result =
-        super::exact_call_dispatch::jit_native_ini_set_abi(runtime, display_name, disabled);
+    let display_result = crate::native_exact::exact_call_dispatch::jit_native_ini_set_abi(
+        runtime,
+        display_name,
+        disabled,
+    );
     assert_eq!(display_result.status, php_jit::JitCallStatus::RETURN);
     #[allow(unsafe_code)]
     let previous_display = unsafe {
@@ -269,8 +272,10 @@ fn exact_configuration_family_mutates_the_shared_request_state_without_value_mat
     assert_eq!(context.ini_registry.get("display_errors"), Some("0"));
     assert!(!context.display_errors);
 
-    let include_result =
-        super::exact_call_dispatch::jit_native_set_include_path_abi(runtime, include_path);
+    let include_result = crate::native_exact::exact_call_dispatch::jit_native_set_include_path_abi(
+        runtime,
+        include_path,
+    );
     assert_eq!(include_result.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         context.ini_registry.get("include_path"),
@@ -285,7 +290,9 @@ fn exact_configuration_family_mutates_the_shared_request_state_without_value_mat
     );
 
     let timezone_result =
-        super::exact_call_dispatch::jit_native_date_default_timezone_set_abi(runtime, timezone);
+        crate::native_exact::exact_call_dispatch::jit_native_date_default_timezone_set_abi(
+            runtime, timezone,
+        );
     assert_eq!(timezone_result.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         timezone_result.value,
@@ -294,7 +301,7 @@ fn exact_configuration_family_mutates_the_shared_request_state_without_value_mat
     assert_eq!(context.default_timezone, "Europe/Berlin");
 
     let timezone_get =
-        super::exact_call_dispatch::jit_native_date_default_timezone_get_abi(runtime);
+        crate::native_exact::exact_call_dispatch::jit_native_date_default_timezone_get_abi(runtime);
     assert_eq!(timezone_get.status, php_jit::JitCallStatus::RETURN);
     #[allow(unsafe_code)]
     let published_timezone = unsafe {
@@ -343,11 +350,12 @@ fn exact_http_response_family_mutates_and_projects_only_native_request_state() {
     let _activation = super::activate_native_context(&mut context);
 
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
-    let first_result =
-        super::exact_call_dispatch::jit_native_header_abi(runtime, first, missing, missing);
+    let first_result = crate::native_exact::exact_call_dispatch::jit_native_header_abi(
+        runtime, first, missing, missing,
+    );
     assert_eq!(first_result.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(first_result.value, php_jit::jit_encode_constant(u32::MAX));
-    let second_result = super::exact_call_dispatch::jit_native_header_abi(
+    let second_result = crate::native_exact::exact_call_dispatch::jit_native_header_abi(
         runtime,
         second,
         php_jit::jit_encode_constant(php_jit::JIT_VALUE_FALSE),
@@ -357,7 +365,7 @@ fn exact_http_response_family_mutates_and_projects_only_native_request_state() {
     assert_eq!(context.http_response.status_code, 201);
     assert_eq!(context.http_response.headers.len(), 2);
 
-    let listed = super::exact_call_dispatch::jit_native_headers_list_abi(runtime);
+    let listed = crate::native_exact::exact_call_dispatch::jit_native_headers_list_abi(runtime);
     assert_eq!(listed.status, php_jit::JitCallStatus::RETURN);
     #[allow(unsafe_code)]
     let serialized_headers = unsafe {
@@ -369,19 +377,23 @@ fn exact_http_response_family_mutates_and_projects_only_native_request_state() {
         b"a:2:{i:0;s:13:\"X-Phrust: one\";i:1;s:13:\"X-Phrust: two\";}"
     );
 
-    let response_code = super::exact_call_dispatch::jit_native_http_response_code_abi(runtime, 204);
+    let response_code =
+        crate::native_exact::exact_call_dispatch::jit_native_http_response_code_abi(runtime, 204);
     assert_eq!(response_code.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(response_code.value, 201);
     assert_eq!(context.http_response.status_code, 204);
 
-    let sent = super::exact_call_dispatch::jit_native_headers_sent_abi(runtime);
+    let sent = crate::native_exact::exact_call_dispatch::jit_native_headers_sent_abi(runtime);
     assert_eq!(sent.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         sent.value,
         php_jit::jit_encode_constant(php_jit::JIT_VALUE_FALSE)
     );
 
-    let removed = super::exact_call_dispatch::jit_native_header_remove_abi(runtime, header_name);
+    let removed = crate::native_exact::exact_call_dispatch::jit_native_header_remove_abi(
+        runtime,
+        header_name,
+    );
     assert_eq!(removed.status, php_jit::JitCallStatus::RETURN);
     assert!(context.http_response.headers.is_empty());
     assert!(context.diagnostic.is_none());
@@ -452,7 +464,7 @@ fn exact_cookie_family_consumes_seven_arguments_and_direct_options_arrays() {
     let runtime = context.fast_state;
     let _activation = super::activate_native_context(&mut context);
 
-    let encoded = super::exact_call_dispatch::jit_native_setcookie_abi(
+    let encoded = crate::native_exact::exact_call_dispatch::jit_native_setcookie_abi(
         runtime,
         encoded_name,
         encoded_value,
@@ -468,7 +480,7 @@ fn exact_cookie_family_consumes_seven_arguments_and_direct_options_arrays() {
         php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE)
     );
 
-    let raw = super::exact_call_dispatch::jit_native_setrawcookie_abi(
+    let raw = crate::native_exact::exact_call_dispatch::jit_native_setrawcookie_abi(
         runtime,
         raw_name,
         raw_value,
@@ -519,7 +531,7 @@ fn exact_clock_family_publishes_only_authoritative_native_results() {
     let runtime = context.fast_state;
     let _activation = super::activate_native_context(&mut context);
 
-    let time = super::exact_call_dispatch::jit_native_time_abi(runtime);
+    let time = crate::native_exact::exact_call_dispatch::jit_native_time_abi(runtime);
     assert_eq!(time.status, php_jit::JitCallStatus::RETURN);
     assert!(
         time.value > 1_700_000_000,
@@ -527,7 +539,8 @@ fn exact_clock_family_publishes_only_authoritative_native_results() {
     );
 
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
-    let microtime = super::exact_call_dispatch::jit_native_microtime_abi(runtime, missing);
+    let microtime =
+        crate::native_exact::exact_call_dispatch::jit_native_microtime_abi(runtime, missing);
     assert_eq!(microtime.status, php_jit::JitCallStatus::RETURN);
     #[allow(unsafe_code)]
     let microtime_bytes = unsafe {
@@ -538,7 +551,7 @@ fn exact_clock_family_publishes_only_authoritative_native_results() {
     assert!(microtime_bytes.starts_with(b"0."));
     assert!(microtime_bytes.contains(&b' '));
 
-    let microtime_float = super::exact_call_dispatch::jit_native_microtime_abi(
+    let microtime_float = crate::native_exact::exact_call_dispatch::jit_native_microtime_abi(
         runtime,
         php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE),
     );
@@ -554,7 +567,7 @@ fn exact_clock_family_publishes_only_authoritative_native_results() {
         php_runtime::api::NativePrintfScalar::Float(value) if value > 1_700_000_000.0
     ));
 
-    let hrtime = super::exact_call_dispatch::jit_native_hrtime_abi(runtime, missing);
+    let hrtime = crate::native_exact::exact_call_dispatch::jit_native_hrtime_abi(runtime, missing);
     assert_eq!(hrtime.status, php_jit::JitCallStatus::RETURN);
     #[allow(unsafe_code)]
     let serialized_hrtime = unsafe {
@@ -563,7 +576,7 @@ fn exact_clock_family_publishes_only_authoritative_native_results() {
     };
     assert!(serialized_hrtime.starts_with(b"a:2:{i:0;i:"));
 
-    let hrtime_number = super::exact_call_dispatch::jit_native_hrtime_abi(
+    let hrtime_number = crate::native_exact::exact_call_dispatch::jit_native_hrtime_abi(
         runtime,
         php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE),
     );
@@ -1013,7 +1026,7 @@ fn object_cast_maps_authoritative_array_properties_and_preserves_identity() {
         ..super::NativeRequestFastState::default()
     };
 
-    let cast = super::exact_runtime_ops::jit_native_object_cast_abi(
+    let cast = crate::native_exact::exact_runtime_ops::jit_native_object_cast_abi(
         std::ptr::from_mut(&mut fast_state),
         array_value,
     );
@@ -1047,7 +1060,7 @@ fn object_cast_maps_authoritative_array_properties_and_preserves_identity() {
     assert_eq!(order, ["first", "7"]);
     assert_eq!(slots[2].refcount, 2);
 
-    let identity = super::exact_runtime_ops::jit_native_object_cast_abi(
+    let identity = crate::native_exact::exact_runtime_ops::jit_native_object_cast_abi(
         std::ptr::from_mut(&mut fast_state),
         cast.value,
     );
@@ -1141,7 +1154,7 @@ fn dynamic_property_slot_resolver_reserves_one_stable_stdclass_tombstone() {
         php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 1,
         php_jit::JIT_VALUE_RUNTIME_STRING_TAG,
     );
-    let absent = super::exact_runtime_ops::jit_native_dynamic_property_test_slot_abi(
+    let absent = crate::native_exact::exact_runtime_ops::jit_native_dynamic_property_test_slot_abi(
         std::ptr::from_mut(&mut fast_state),
         object_value,
         property_value,
@@ -1150,11 +1163,12 @@ fn dynamic_property_slot_resolver_reserves_one_stable_stdclass_tombstone() {
     let absent_cell = absent.value as usize as *mut php_runtime::api::NativeDeclaredPropertySlot;
     assert!(!absent_cell.is_null());
     assert_eq!(unsafe { *absent_cell }, Default::default());
-    let repeated_absent = super::exact_runtime_ops::jit_native_dynamic_property_test_slot_abi(
-        std::ptr::from_mut(&mut fast_state),
-        object_value,
-        property_value,
-    );
+    let repeated_absent =
+        crate::native_exact::exact_runtime_ops::jit_native_dynamic_property_test_slot_abi(
+            std::ptr::from_mut(&mut fast_state),
+            object_value,
+            property_value,
+        );
     assert_eq!(repeated_absent.value, absent.value);
     assert_eq!(
         object.native_dynamic_property_slot_location(layout_id, "created"),
@@ -1162,7 +1176,7 @@ fn dynamic_property_slot_resolver_reserves_one_stable_stdclass_tombstone() {
         "non-mutating tests must not reserve a dynamic-property tombstone"
     );
 
-    let first = super::exact_runtime_ops::jit_native_dynamic_property_slot_abi(
+    let first = crate::native_exact::exact_runtime_ops::jit_native_dynamic_property_slot_abi(
         std::ptr::from_mut(&mut fast_state),
         object_value,
         property_value,
@@ -1171,7 +1185,7 @@ fn dynamic_property_slot_resolver_reserves_one_stable_stdclass_tombstone() {
     let cell = first.value as usize as *mut php_runtime::api::NativeDeclaredPropertySlot;
     assert!(!cell.is_null());
     assert_eq!(unsafe { (*cell).initialized }, 0);
-    let second = super::exact_runtime_ops::jit_native_dynamic_property_slot_abi(
+    let second = crate::native_exact::exact_runtime_ops::jit_native_dynamic_property_slot_abi(
         std::ptr::from_mut(&mut fast_state),
         object_value,
         property_value,
@@ -1324,23 +1338,26 @@ fn dynamic_property_test_slot_rejects_unpublished_magic_and_visibility_shapes() 
     let missing_value = encoded(2, php_jit::JIT_VALUE_RUNTIME_STRING_TAG);
     let known_value = encoded(3, php_jit::JIT_VALUE_RUNTIME_STRING_TAG);
 
-    let magic_result = super::exact_runtime_ops::jit_native_dynamic_property_test_slot_abi(
-        std::ptr::from_mut(&mut fast_state),
-        magic_value,
-        missing_value,
-    );
+    let magic_result =
+        crate::native_exact::exact_runtime_ops::jit_native_dynamic_property_test_slot_abi(
+            std::ptr::from_mut(&mut fast_state),
+            magic_value,
+            missing_value,
+        );
     assert_eq!(magic_result.status, php_jit::JitCallStatus::ABI_MISMATCH);
-    let declared_result = super::exact_runtime_ops::jit_native_dynamic_property_test_slot_abi(
-        std::ptr::from_mut(&mut fast_state),
-        declared_value,
-        known_value,
-    );
+    let declared_result =
+        crate::native_exact::exact_runtime_ops::jit_native_dynamic_property_test_slot_abi(
+            std::ptr::from_mut(&mut fast_state),
+            declared_value,
+            known_value,
+        );
     assert_eq!(declared_result.status, php_jit::JitCallStatus::ABI_MISMATCH);
-    let ordinary_missing = super::exact_runtime_ops::jit_native_dynamic_property_test_slot_abi(
-        std::ptr::from_mut(&mut fast_state),
-        declared_value,
-        missing_value,
-    );
+    let ordinary_missing =
+        crate::native_exact::exact_runtime_ops::jit_native_dynamic_property_test_slot_abi(
+            std::ptr::from_mut(&mut fast_state),
+            declared_value,
+            missing_value,
+        );
     assert_eq!(ordinary_missing.status, php_jit::JitCallStatus::RETURN);
 }
 
@@ -1506,7 +1523,7 @@ fn exact_parse_str_publishes_keyed_native_array_through_direct_reference() {
         php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 2,
         php_jit::JIT_VALUE_RUNTIME_STRING_TAG,
     );
-    let result = super::exact_call_dispatch::jit_native_parse_str_abi(
+    let result = crate::native_exact::exact_call_dispatch::jit_native_parse_str_abi(
         std::ptr::from_mut(&mut fast_state),
         input,
         output_reference,
@@ -1524,7 +1541,7 @@ fn exact_parse_str_publishes_keyed_native_array_through_direct_reference() {
         b"plain=value&list%5B0%5D=a&list%5B1%5D=b&12=numeric&nested%5Bx%5D=new&flip%5Bchild%5D=nested&collapse=scalar&extra1=1&extra2=2"
     );
 
-    let replaced = super::exact_call_dispatch::jit_native_parse_str_abi(
+    let replaced = crate::native_exact::exact_call_dispatch::jit_native_parse_str_abi(
         std::ptr::from_mut(&mut fast_state),
         replacement_input,
         output_reference,
@@ -1631,8 +1648,12 @@ fn exact_string_rewrite_and_json_consume_authoritative_native_arrays() {
     let _activation = super::activate_native_context(&mut context);
 
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
-    let rewritten =
-        super::exact_call_dispatch::jit_native_strtr_abi(runtime, subject, replacements, missing);
+    let rewritten = crate::native_exact::exact_call_dispatch::jit_native_strtr_abi(
+        runtime,
+        subject,
+        replacements,
+        missing,
+    );
     assert_eq!(rewritten.status, php_jit::JitCallStatus::RETURN);
     #[allow(unsafe_code)]
     let rewritten_bytes = unsafe {
@@ -1642,8 +1663,12 @@ fn exact_string_rewrite_and_json_consume_authoritative_native_arrays() {
     };
     assert_eq!(rewritten_bytes, b"hello native");
 
-    let encoded =
-        super::exact_call_dispatch::jit_native_json_encode_abi(runtime, replacements, 0, 512);
+    let encoded = crate::native_exact::exact_call_dispatch::jit_native_json_encode_abi(
+        runtime,
+        replacements,
+        0,
+        512,
+    );
     assert_eq!(encoded.status, php_jit::JitCallStatus::RETURN);
     #[allow(unsafe_code)]
     let encoded_bytes = unsafe {
@@ -1657,8 +1682,9 @@ fn exact_string_rewrite_and_json_consume_authoritative_native_arrays() {
         | php_runtime::api::NATIVE_JSON_UNESCAPED_UNICODE
         | php_runtime::api::NATIVE_JSON_PRETTY_PRINT
         | php_runtime::api::NATIVE_JSON_PRESERVE_ZERO_FRACTION;
-    let encoded =
-        super::exact_call_dispatch::jit_native_json_encode_abi(runtime, packed, flags, 512);
+    let encoded = crate::native_exact::exact_call_dispatch::jit_native_json_encode_abi(
+        runtime, packed, flags, 512,
+    );
     assert_eq!(encoded.status, php_jit::JitCallStatus::RETURN);
     #[allow(unsafe_code)]
     let encoded_bytes = unsafe {
@@ -1668,7 +1694,7 @@ fn exact_string_rewrite_and_json_consume_authoritative_native_arrays() {
     };
     assert_eq!(encoded_bytes, "[\n    \"ä/x\",\n    1.0\n]".as_bytes());
 
-    let encoded = super::exact_call_dispatch::jit_native_json_encode_abi(
+    let encoded = crate::native_exact::exact_call_dispatch::jit_native_json_encode_abi(
         runtime,
         packed,
         flags | php_runtime::api::NATIVE_JSON_FORCE_OBJECT,
@@ -1686,8 +1712,9 @@ fn exact_string_rewrite_and_json_consume_authoritative_native_arrays() {
         "{\n    \"0\": \"ä/x\",\n    \"1\": 1.0\n}".as_bytes()
     );
 
-    let encoded =
-        super::exact_call_dispatch::jit_native_json_encode_abi(runtime, object, flags, 512);
+    let encoded = crate::native_exact::exact_call_dispatch::jit_native_json_encode_abi(
+        runtime, object, flags, 512,
+    );
     assert_eq!(encoded.status, php_jit::JitCallStatus::RETURN);
     #[allow(unsafe_code)]
     let encoded_bytes = unsafe {
@@ -1700,7 +1727,7 @@ fn exact_string_rewrite_and_json_consume_authoritative_native_arrays() {
         "{\n    \"path\": \"ä/x\",\n    \"count\": 2\n}".as_bytes()
     );
 
-    let encoded = super::exact_call_dispatch::jit_native_json_encode_abi(
+    let encoded = crate::native_exact::exact_call_dispatch::jit_native_json_encode_abi(
         runtime,
         numeric_string,
         php_runtime::api::NATIVE_JSON_NUMERIC_CHECK,
@@ -1715,7 +1742,7 @@ fn exact_string_rewrite_and_json_consume_authoritative_native_arrays() {
     };
     assert_eq!(encoded_bytes, b"1.0");
 
-    let encoded = super::exact_call_dispatch::jit_native_json_encode_abi(
+    let encoded = crate::native_exact::exact_call_dispatch::jit_native_json_encode_abi(
         runtime,
         invalid_string,
         php_runtime::api::NATIVE_JSON_INVALID_UTF8_SUBSTITUTE,
@@ -1778,7 +1805,8 @@ fn exact_by_value_readers_follow_authoritative_native_references() {
     let runtime = context.fast_state;
     let _activation = super::activate_native_context(&mut context);
 
-    let equal = super::exact_call_dispatch::jit_native_hash_equals_abi(runtime, known, user);
+    let equal =
+        crate::native_exact::exact_call_dispatch::jit_native_hash_equals_abi(runtime, known, user);
     assert_eq!(equal.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         equal.value,
@@ -1831,7 +1859,7 @@ fn exact_preg_match_publishes_and_replaces_named_native_captures() {
 
     for _ in 0..2 {
         let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
-        let result = super::exact_call_dispatch::jit_native_preg_match_abi(
+        let result = crate::native_exact::exact_call_dispatch::jit_native_preg_match_abi(
             runtime,
             pattern,
             subject,
@@ -1925,8 +1953,10 @@ fn exact_serialization_roundtrip_never_materializes_the_value_plane() {
         php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
         php_jit::JIT_VALUE_RUNTIME_ARRAY_TAG,
     );
-    let serialized =
-        super::exact_call_dispatch::jit_native_serialize_abi(std::ptr::from_mut(&mut fast), input);
+    let serialized = crate::native_exact::exact_call_dispatch::jit_native_serialize_abi(
+        std::ptr::from_mut(&mut fast),
+        input,
+    );
     assert_eq!(serialized.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         fast.native_string_view(serialized.value)
@@ -1934,7 +1964,7 @@ fn exact_serialization_roundtrip_never_materializes_the_value_plane() {
         b"a:2:{i:0;i:7;s:1:\"x\";b:1;}"
     );
 
-    let decoded = super::exact_call_dispatch::jit_native_unserialize_abi(
+    let decoded = crate::native_exact::exact_call_dispatch::jit_native_unserialize_abi(
         std::ptr::from_mut(&mut fast),
         serialized.value,
     );
@@ -1997,7 +2027,7 @@ fn exact_tokenizer_publishes_lexer_records_directly_into_native_slots() {
         php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
         php_jit::JIT_VALUE_RUNTIME_STRING_TAG,
     );
-    let result = super::exact_call_dispatch::jit_native_token_get_all_abi(
+    let result = crate::native_exact::exact_call_dispatch::jit_native_token_get_all_abi(
         std::ptr::from_mut(&mut fast),
         source,
         php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING),
@@ -2035,7 +2065,7 @@ fn exact_tokenizer_publishes_lexer_records_directly_into_native_slots() {
         .iter()
         .find(|token| token.named)
         .expect("fixture has a named token");
-    let name = super::exact_call_dispatch::jit_native_token_name_abi(
+    let name = crate::native_exact::exact_call_dispatch::jit_native_token_name_abi(
         std::ptr::from_mut(&mut fast),
         named.id,
     );
@@ -2111,12 +2141,15 @@ fn exact_mbstring_family_keeps_strings_and_request_encoding_native() {
     let runtime = std::ptr::from_mut(&mut fast);
 
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
-    let length = super::exact_call_dispatch::jit_native_mb_strlen_abi(runtime, source, missing);
+    let length = crate::native_exact::exact_call_dispatch::jit_native_mb_strlen_abi(
+        runtime, source, missing,
+    );
     assert_eq!(length.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(length.value, 5);
 
-    let uppercase =
-        super::exact_call_dispatch::jit_native_mb_strtoupper_abi(runtime, source, missing);
+    let uppercase = crate::native_exact::exact_call_dispatch::jit_native_mb_strtoupper_abi(
+        runtime, source, missing,
+    );
     assert_eq!(uppercase.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         fast.native_string_view(uppercase.value)
@@ -2124,11 +2157,14 @@ fn exact_mbstring_family_keeps_strings_and_request_encoding_native() {
         "GRÜSSE".as_bytes()
     );
 
-    let changed = super::exact_call_dispatch::jit_native_mb_internal_encoding_abi(runtime, binary);
+    let changed = crate::native_exact::exact_call_dispatch::jit_native_mb_internal_encoding_abi(
+        runtime, binary,
+    );
     assert_eq!(changed.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(internal_encoding, "8BIT");
-    let byte_length =
-        super::exact_call_dispatch::jit_native_mb_strlen_abi(runtime, source, missing);
+    let byte_length = crate::native_exact::exact_call_dispatch::jit_native_mb_strlen_abi(
+        runtime, source, missing,
+    );
     assert_eq!(byte_length.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(byte_length.value, source_bytes.len() as i64);
 }
@@ -2168,11 +2204,11 @@ fn exact_bcmath_family_shares_scale_and_publishes_native_decimal_strings() {
     let runtime = context.fast_state;
     let _activation = super::activate_native_context(&mut context);
 
-    let changed = super::exact_call_dispatch::jit_native_bcscale_abi(runtime, scale);
+    let changed = crate::native_exact::exact_call_dispatch::jit_native_bcscale_abi(runtime, scale);
     assert_eq!(changed.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(changed.value, 0);
 
-    let sum = super::exact_call_dispatch::jit_native_bcadd_abi(
+    let sum = crate::native_exact::exact_call_dispatch::jit_native_bcadd_abi(
         runtime,
         left,
         right,
@@ -2226,20 +2262,23 @@ fn exact_filter_family_reads_prepublished_request_roots_and_native_values() {
     let _activation = super::activate_native_context(&mut context);
 
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
-    let present = super::exact_call_dispatch::jit_native_filter_has_var_abi(runtime, 1, age);
+    let present =
+        crate::native_exact::exact_call_dispatch::jit_native_filter_has_var_abi(runtime, 1, age);
     assert_eq!(present.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         present.value,
         php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE)
     );
 
-    let validated =
-        super::exact_call_dispatch::jit_native_filter_input_abi(runtime, 1, age, 257, missing);
+    let validated = crate::native_exact::exact_call_dispatch::jit_native_filter_input_abi(
+        runtime, 1, age, 257, missing,
+    );
     assert_eq!(validated.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(validated.value, 42);
 
-    let sanitized =
-        super::exact_call_dispatch::jit_native_filter_var_abi(runtime, email, 517, missing);
+    let sanitized = crate::native_exact::exact_call_dispatch::jit_native_filter_var_abi(
+        runtime, email, 517, missing,
+    );
     assert_eq!(sanitized.status, php_jit::JitCallStatus::RETURN);
     #[allow(unsafe_code)]
     let sanitized = unsafe { &*runtime }
@@ -2247,8 +2286,9 @@ fn exact_filter_family_reads_prepublished_request_roots_and_native_values() {
         .expect("filter_var publishes native string bytes");
     assert_eq!(sanitized, b"person@example.com");
 
-    let input_array =
-        super::exact_call_dispatch::jit_native_filter_input_array_abi(runtime, 1, missing, missing);
+    let input_array = crate::native_exact::exact_call_dispatch::jit_native_filter_input_array_abi(
+        runtime, 1, missing, missing,
+    );
     assert_eq!(input_array.status, php_jit::JitCallStatus::RETURN);
     #[allow(unsafe_code)]
     let entries = unsafe { &*runtime }
@@ -2262,7 +2302,7 @@ fn exact_filter_family_reads_prepublished_request_roots_and_native_values() {
             && fast.native_string_view(entry.value) == Some(b"42")
     }));
 
-    let required_array = super::exact_call_dispatch::jit_native_filter_var_abi(
+    let required_array = crate::native_exact::exact_call_dispatch::jit_native_filter_var_abi(
         runtime,
         input_array.value,
         257,
@@ -2279,7 +2319,7 @@ fn exact_filter_family_reads_prepublished_request_roots_and_native_values() {
         fast.native_string_view(entry.key) == Some(b"age") && entry.value == 42
     }));
 
-    let filtered_array = super::exact_call_dispatch::jit_native_filter_var_array_abi(
+    let filtered_array = crate::native_exact::exact_call_dispatch::jit_native_filter_var_array_abi(
         runtime,
         input_array.value,
         php_runtime::api::FILTER_DEFAULT,
@@ -2292,11 +2332,12 @@ fn exact_filter_family_reads_prepublished_request_roots_and_native_values() {
         .expect("filter_var_array publishes a native array");
     assert_eq!(filtered_entries.len(), 2);
 
-    let filter_id = super::exact_call_dispatch::jit_native_filter_id_abi(runtime, int_name);
+    let filter_id =
+        crate::native_exact::exact_call_dispatch::jit_native_filter_id_abi(runtime, int_name);
     assert_eq!(filter_id.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(filter_id.value, 257);
 
-    let names = super::exact_call_dispatch::jit_native_filter_list_abi(runtime);
+    let names = crate::native_exact::exact_call_dispatch::jit_native_filter_list_abi(runtime);
     assert_eq!(names.status, php_jit::JitCallStatus::RETURN);
     #[allow(unsafe_code)]
     let names = unsafe { &*runtime }
@@ -2332,7 +2373,7 @@ fn native_unserialize_publishes_nested_duplicate_keys_in_place() {
     let runtime = context.fast_state;
     let _activation = super::activate_native_context(&mut context);
     let serialized = b"a:3:{s:1:\"x\";i:1;s:1:\"y\";a:1:{i:0;s:3:\"old\";}s:1:\"x\";a:2:{i:0;s:3:\"new\";i:0;s:5:\"final\";}}";
-    let parsed = super::NativeSerializedParser {
+    let parsed = crate::native_exact::NativeSerializedParser {
         bytes: serialized,
         offset: 0,
         parsed_items: 0,
@@ -2418,50 +2459,60 @@ fn exact_session_family_keeps_lifecycle_payload_and_commit_native() {
     let _activation = super::activate_native_context(&mut context);
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
 
-    let status = super::exact_call_dispatch::jit_native_session_status_abi(runtime);
+    let status = crate::native_exact::exact_call_dispatch::jit_native_session_status_abi(runtime);
     assert_eq!(status.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(status.value, php_runtime::api::PHP_SESSION_NONE);
 
-    let old_name = super::exact_call_dispatch::jit_native_session_name_abi(runtime, app_name);
+    let old_name =
+        crate::native_exact::exact_call_dispatch::jit_native_session_name_abi(runtime, app_name);
     assert_eq!(old_name.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         unsafe { &*runtime }.native_string_view(old_name.value),
         Some(b"PHPSESSID".as_slice())
     );
 
-    let old_id = super::exact_call_dispatch::jit_native_session_id_abi(runtime, session_id);
+    let old_id =
+        crate::native_exact::exact_call_dispatch::jit_native_session_id_abi(runtime, session_id);
     assert_eq!(old_id.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         unsafe { &*runtime }.native_string_view(old_id.value),
         Some(b"".as_slice())
     );
 
-    let old_expire = super::exact_call_dispatch::jit_native_session_cache_expire_abi(runtime, 60);
+    let old_expire =
+        crate::native_exact::exact_call_dispatch::jit_native_session_cache_expire_abi(runtime, 60);
     assert_eq!(old_expire.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(old_expire.value, 180);
 
     let old_limiter =
-        super::exact_call_dispatch::jit_native_session_cache_limiter_abi(runtime, limiter);
+        crate::native_exact::exact_call_dispatch::jit_native_session_cache_limiter_abi(
+            runtime, limiter,
+        );
     assert_eq!(old_limiter.status, php_jit::JitCallStatus::RETURN);
 
-    let old_path = super::exact_call_dispatch::jit_native_session_save_path_abi(runtime, save_path);
+    let old_path = crate::native_exact::exact_call_dispatch::jit_native_session_save_path_abi(
+        runtime, save_path,
+    );
     assert_eq!(old_path.status, php_jit::JitCallStatus::RETURN);
 
-    let old_module = super::exact_call_dispatch::jit_native_session_module_name_abi(runtime, files);
+    let old_module = crate::native_exact::exact_call_dispatch::jit_native_session_module_name_abi(
+        runtime, files,
+    );
     assert_eq!(old_module.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         unsafe { &*runtime }.native_string_view(old_module.value),
         Some(b"files".as_slice())
     );
 
-    let set_cookie = super::exact_call_dispatch::jit_native_session_set_cookie_params_abi(
-        runtime,
-        3_600,
-        cookie_path,
-        cookie_domain,
-        php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE),
-        php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE),
-    );
+    let set_cookie =
+        crate::native_exact::exact_call_dispatch::jit_native_session_set_cookie_params_abi(
+            runtime,
+            3_600,
+            cookie_path,
+            cookie_domain,
+            php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE),
+            php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE),
+        );
     assert_eq!(set_cookie.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         set_cookie.value,
@@ -2469,7 +2520,7 @@ fn exact_session_family_keeps_lifecycle_payload_and_commit_native() {
     );
 
     let cookie_params =
-        super::exact_call_dispatch::jit_native_session_get_cookie_params_abi(runtime);
+        crate::native_exact::exact_call_dispatch::jit_native_session_get_cookie_params_abi(runtime);
     assert_eq!(cookie_params.status, php_jit::JitCallStatus::RETURN);
     let cookie_entries = unsafe { &*runtime }
         .native_direct_array_entries(cookie_params.value)
@@ -2480,35 +2531,42 @@ fn exact_session_family_keeps_lifecycle_payload_and_commit_native() {
         fast.native_string_view(entry.key) == Some(b"lifetime") && entry.value == 3_600
     }));
 
-    let shutdown = super::exact_call_dispatch::jit_native_session_register_shutdown_abi(runtime);
+    let shutdown =
+        crate::native_exact::exact_call_dispatch::jit_native_session_register_shutdown_abi(runtime);
     assert_eq!(shutdown.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(shutdown.value, php_jit::jit_encode_constant(u32::MAX));
 
-    let _ = super::exact_call_dispatch::jit_native_session_save_path_abi(runtime, empty);
+    let _ =
+        crate::native_exact::exact_call_dispatch::jit_native_session_save_path_abi(runtime, empty);
 
-    let lifecycle = super::exact_call_dispatch::jit_native_session_start_abi(runtime, missing);
+    let lifecycle =
+        crate::native_exact::exact_call_dispatch::jit_native_session_start_abi(runtime, missing);
     assert_eq!(lifecycle.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         lifecycle.value,
         php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE)
     );
 
-    let decoded = super::exact_call_dispatch::jit_native_session_decode_abi(runtime, serialized);
+    let decoded = crate::native_exact::exact_call_dispatch::jit_native_session_decode_abi(
+        runtime, serialized,
+    );
     assert_eq!(decoded.status, php_jit::JitCallStatus::RETURN);
-    let encoded = super::exact_call_dispatch::jit_native_session_encode_abi(runtime);
+    let encoded = crate::native_exact::exact_call_dispatch::jit_native_session_encode_abi(runtime);
     assert_eq!(encoded.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         unsafe { &*runtime }.native_string_view(encoded.value),
         Some(b"foo|s:3:\"bar\";".as_slice())
     );
 
-    let committed = super::exact_call_dispatch::jit_native_session_commit_abi(runtime);
+    let committed =
+        crate::native_exact::exact_call_dispatch::jit_native_session_commit_abi(runtime);
     assert_eq!(committed.status, php_jit::JitCallStatus::RETURN);
-    let restarted = super::exact_call_dispatch::jit_native_session_start_abi(runtime, missing);
+    let restarted =
+        crate::native_exact::exact_call_dispatch::jit_native_session_start_abi(runtime, missing);
     assert_eq!(restarted.status, php_jit::JitCallStatus::RETURN);
-    let unset = super::exact_call_dispatch::jit_native_session_unset_abi(runtime);
+    let unset = crate::native_exact::exact_call_dispatch::jit_native_session_unset_abi(runtime);
     assert_eq!(unset.status, php_jit::JitCallStatus::RETURN);
-    let aborted = super::exact_call_dispatch::jit_native_session_abort_abi(runtime);
+    let aborted = crate::native_exact::exact_call_dispatch::jit_native_session_abort_abi(runtime);
     assert_eq!(aborted.status, php_jit::JitCallStatus::RETURN);
 
     let payload = unsafe { &*runtime }
@@ -2601,7 +2659,9 @@ fn exact_key_preserving_sorts_reorder_authoritative_entries_in_place() {
     };
     let runtime = std::ptr::from_mut(&mut fast_state);
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
-    let result = super::exact_call_dispatch::jit_native_natsort_abi(runtime, reference, missing);
+    let result = crate::native_exact::exact_call_dispatch::jit_native_natsort_abi(
+        runtime, reference, missing,
+    );
     assert_eq!(result.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         entries
@@ -2617,7 +2677,9 @@ fn exact_key_preserving_sorts_reorder_authoritative_entries_in_place() {
         Some(0)
     );
 
-    let result = super::exact_call_dispatch::jit_native_krsort_abi(runtime, reference, missing);
+    let result = crate::native_exact::exact_call_dispatch::jit_native_krsort_abi(
+        runtime, reference, missing,
+    );
     assert_eq!(result.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         entries
@@ -2682,21 +2744,25 @@ fn exact_count_family_traverses_only_authoritative_direct_arrays() {
     let runtime = std::ptr::from_mut(&mut fast_state);
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
 
-    let shallow = super::exact_runtime_ops::jit_native_count_abi(runtime, array(0), missing);
+    let shallow =
+        crate::native_exact::exact_runtime_ops::jit_native_count_abi(runtime, array(0), missing);
     assert_eq!(shallow.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(shallow.value, 2);
 
-    let recursive = super::exact_runtime_ops::jit_native_sizeof_abi(runtime, array(0), 1);
+    let recursive =
+        crate::native_exact::exact_runtime_ops::jit_native_sizeof_abi(runtime, array(0), 1);
     assert_eq!(recursive.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(recursive.value, 5);
 
-    let invalid_mode = super::exact_runtime_ops::jit_native_count_abi(runtime, array(0), 2);
+    let invalid_mode =
+        crate::native_exact::exact_runtime_ops::jit_native_count_abi(runtime, array(0), 2);
     assert_eq!(invalid_mode.status, php_jit::JitCallStatus::ABI_MISMATCH);
-    let scalar = super::exact_runtime_ops::jit_native_count_abi(runtime, 42, missing);
+    let scalar = crate::native_exact::exact_runtime_ops::jit_native_count_abi(runtime, 42, missing);
     assert_eq!(scalar.status, php_jit::JitCallStatus::ABI_MISMATCH);
 
     nested_entries[0].value = array(0);
-    let recursive_cycle = super::exact_runtime_ops::jit_native_count_abi(runtime, array(0), 1);
+    let recursive_cycle =
+        crate::native_exact::exact_runtime_ops::jit_native_count_abi(runtime, array(0), 1);
     assert_eq!(recursive_cycle.status, php_jit::JitCallStatus::ABI_MISMATCH);
 }
 
@@ -2866,7 +2932,7 @@ fn exact_array_multisort_applies_one_permutation_to_all_native_arrays() {
         ..super::NativeRequestFastState::default()
     };
     let arguments = [reference(2), 4, 1, reference(3), 3, 1];
-    let result = super::exact_call_dispatch::jit_native_array_multisort_abi(
+    let result = crate::native_exact::exact_call_dispatch::jit_native_array_multisort_abi(
         std::ptr::from_mut(&mut fast_state),
         arguments.len() as u32,
         arguments.as_ptr(),
@@ -2938,15 +3004,16 @@ fn exact_frame_introspection_keeps_arguments_in_the_native_plane() {
     };
     let runtime = std::ptr::from_mut(&mut fast);
 
-    let count = super::exact_call_dispatch::jit_native_func_num_args_abi(runtime);
+    let count = crate::native_exact::exact_call_dispatch::jit_native_func_num_args_abi(runtime);
     assert_eq!(count.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(count.value, 2);
 
-    let argument = super::exact_call_dispatch::jit_native_func_get_arg_abi(runtime, 1);
+    let argument =
+        crate::native_exact::exact_call_dispatch::jit_native_func_get_arg_abi(runtime, 1);
     assert_eq!(argument.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(argument.value, 44);
 
-    let all = super::exact_call_dispatch::jit_native_func_get_args_abi(runtime);
+    let all = crate::native_exact::exact_call_dispatch::jit_native_func_get_args_abi(runtime);
     assert_eq!(all.status, php_jit::JitCallStatus::RETURN);
     let entries = fast
         .native_direct_array_entries(all.value)
@@ -3017,15 +3084,16 @@ fn exact_frame_introspection_reads_segmented_unpack_tail_arguments() {
     };
     let runtime = std::ptr::from_mut(&mut fast);
 
-    let count = super::exact_call_dispatch::jit_native_func_num_args_abi(runtime);
+    let count = crate::native_exact::exact_call_dispatch::jit_native_func_num_args_abi(runtime);
     assert_eq!(count.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(count.value, 4);
 
-    let argument = super::exact_call_dispatch::jit_native_func_get_arg_abi(runtime, 2);
+    let argument =
+        crate::native_exact::exact_call_dispatch::jit_native_func_get_arg_abi(runtime, 2);
     assert_eq!(argument.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(argument.value, 55);
 
-    let all = super::exact_call_dispatch::jit_native_func_get_args_abi(runtime);
+    let all = crate::native_exact::exact_call_dispatch::jit_native_func_get_args_abi(runtime);
     assert_eq!(all.status, php_jit::JitCallStatus::RETURN);
     let entries = fast
         .native_direct_array_entries(all.value)
@@ -3288,22 +3356,28 @@ fn exact_native_array_comparison_handlers_traverse_authoritative_entries() {
         ..super::NativeRequestFastState::default()
     };
     let runtime = std::ptr::from_mut(&mut fast_state);
-    let identical =
-        super::exact_runtime_ops::jit_native_identical_abi(runtime, array_value(0), array_value(1));
+    let identical = crate::native_exact::exact_runtime_ops::jit_native_identical_abi(
+        runtime,
+        array_value(0),
+        array_value(1),
+    );
     assert_eq!(identical.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         identical.value,
         php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE)
     );
-    let reordered_identity =
-        super::exact_runtime_ops::jit_native_identical_abi(runtime, array_value(0), array_value(2));
+    let reordered_identity = crate::native_exact::exact_runtime_ops::jit_native_identical_abi(
+        runtime,
+        array_value(0),
+        array_value(2),
+    );
     assert_eq!(reordered_identity.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         reordered_identity.value,
         php_jit::jit_encode_constant(php_jit::JIT_VALUE_FALSE)
     );
     for right in [2, 3] {
-        let equal = super::exact_runtime_ops::jit_native_equal_abi(
+        let equal = crate::native_exact::exact_runtime_ops::jit_native_equal_abi(
             runtime,
             array_value(0),
             array_value(right),
@@ -3314,22 +3388,28 @@ fn exact_native_array_comparison_handlers_traverse_authoritative_entries() {
             php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE)
         );
     }
-    let unequal =
-        super::exact_runtime_ops::jit_native_equal_abi(runtime, array_value(0), array_value(6));
+    let unequal = crate::native_exact::exact_runtime_ops::jit_native_equal_abi(
+        runtime,
+        array_value(0),
+        array_value(6),
+    );
     assert_eq!(unequal.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         unequal.value,
         php_jit::jit_encode_constant(php_jit::JIT_VALUE_FALSE)
     );
-    let compared =
-        super::exact_runtime_ops::jit_native_spaceship_abi(runtime, array_value(4), array_value(5));
+    let compared = crate::native_exact::exact_runtime_ops::jit_native_spaceship_abi(
+        runtime,
+        array_value(4),
+        array_value(5),
+    );
     assert_eq!(compared.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(compared.value, -1);
     for compare in [
-        super::exact_runtime_ops::jit_native_less_abi,
-        super::exact_runtime_ops::jit_native_less_equal_abi,
-        super::exact_runtime_ops::jit_native_greater_abi,
-        super::exact_runtime_ops::jit_native_greater_equal_abi,
+        crate::native_exact::exact_runtime_ops::jit_native_less_abi,
+        crate::native_exact::exact_runtime_ops::jit_native_less_equal_abi,
+        crate::native_exact::exact_runtime_ops::jit_native_greater_abi,
+        crate::native_exact::exact_runtime_ops::jit_native_greater_equal_abi,
     ] {
         let result = compare(runtime, array_value(9), array_value(10));
         assert_eq!(result.status, php_jit::JitCallStatus::RETURN);
@@ -3338,7 +3418,7 @@ fn exact_native_array_comparison_handlers_traverse_authoritative_entries() {
             php_jit::jit_encode_constant(php_jit::JIT_VALUE_FALSE)
         );
     }
-    let compared = super::exact_runtime_ops::jit_native_spaceship_abi(
+    let compared = crate::native_exact::exact_runtime_ops::jit_native_spaceship_abi(
         runtime,
         array_value(9),
         array_value(10),
@@ -3472,8 +3552,11 @@ fn exact_native_object_comparison_uses_identity_and_authoritative_slots() {
     };
     let runtime = std::ptr::from_mut(&mut fast_state);
 
-    let nested_identity =
-        super::exact_runtime_ops::jit_native_identical_abi(runtime, array_value(5), array_value(6));
+    let nested_identity = crate::native_exact::exact_runtime_ops::jit_native_identical_abi(
+        runtime,
+        array_value(5),
+        array_value(6),
+    );
     assert_eq!(nested_identity.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         nested_identity.value,
@@ -3481,21 +3564,27 @@ fn exact_native_object_comparison_uses_identity_and_authoritative_slots() {
         "different objects sharing one layout must not become identical"
     );
 
-    let equal =
-        super::exact_runtime_ops::jit_native_equal_abi(runtime, object_value(0), object_value(1));
+    let equal = crate::native_exact::exact_runtime_ops::jit_native_equal_abi(
+        runtime,
+        object_value(0),
+        object_value(1),
+    );
     assert_eq!(equal.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         equal.value,
         php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE)
     );
-    let unequal_class =
-        super::exact_runtime_ops::jit_native_equal_abi(runtime, object_value(0), object_value(3));
+    let unequal_class = crate::native_exact::exact_runtime_ops::jit_native_equal_abi(
+        runtime,
+        object_value(0),
+        object_value(3),
+    );
     assert_eq!(unequal_class.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(
         unequal_class.value,
         php_jit::jit_encode_constant(php_jit::JIT_VALUE_FALSE)
     );
-    let compared = super::exact_runtime_ops::jit_native_spaceship_abi(
+    let compared = crate::native_exact::exact_runtime_ops::jit_native_spaceship_abi(
         runtime,
         object_value(0),
         object_value(2),
@@ -3503,7 +3592,7 @@ fn exact_native_object_comparison_uses_identity_and_authoritative_slots() {
     assert_eq!(compared.status, php_jit::JitCallStatus::RETURN);
     assert_eq!(compared.value, -1);
 
-    let object_boolean = super::exact_runtime_ops::jit_native_equal_abi(
+    let object_boolean = crate::native_exact::exact_runtime_ops::jit_native_equal_abi(
         runtime,
         object_value(0),
         php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE),
@@ -3524,7 +3613,8 @@ fn exact_native_object_comparison_uses_identity_and_authoritative_slots() {
             php_jit::jit_encode_constant(php_jit::JIT_VALUE_FALSE),
         ),
     ] {
-        let equal = super::exact_runtime_ops::jit_native_equal_abi(runtime, left, right);
+        let equal =
+            crate::native_exact::exact_runtime_ops::jit_native_equal_abi(runtime, left, right);
         assert_eq!(equal.status, php_jit::JitCallStatus::RETURN);
         assert_eq!(
             equal.value,
@@ -3532,8 +3622,11 @@ fn exact_native_object_comparison_uses_identity_and_authoritative_slots() {
         );
     }
 
-    let cold_dynamic =
-        super::exact_runtime_ops::jit_native_equal_abi(runtime, object_value(0), object_value(4));
+    let cold_dynamic = crate::native_exact::exact_runtime_ops::jit_native_equal_abi(
+        runtime,
+        object_value(0),
+        object_value(4),
+    );
     assert_eq!(cold_dynamic.status, php_jit::JitCallStatus::ABI_MISMATCH);
 }
 
@@ -3758,24 +3851,27 @@ fn common_and_exact_native_sources_cannot_import_the_rust_value_plane() {
         ("jit_abi.rs", include_str!("../jit_abi.rs")),
         (
             "exact_call_dispatch.rs",
-            include_str!("exact_call_dispatch.rs"),
+            include_str!("native/exact_call_dispatch.rs"),
         ),
         (
             "exact_call_dispatch/array_multisort.rs",
-            include_str!("exact_call_dispatch/array_multisort.rs"),
+            include_str!("native/exact_call_dispatch/array_multisort.rs"),
         ),
         (
             "exact_call_dispatch/recursive_array_family.rs",
-            include_str!("exact_call_dispatch/recursive_array_family.rs"),
+            include_str!("native/exact_call_dispatch/recursive_array_family.rs"),
         ),
         (
             "exact_call_dispatch/scalar_and_filter_families.rs",
-            include_str!("exact_call_dispatch/scalar_and_filter_families.rs"),
+            include_str!("native/exact_call_dispatch/scalar_and_filter_families.rs"),
         ),
-        ("exact_runtime_ops.rs", include_str!("exact_runtime_ops.rs")),
+        (
+            "exact_runtime_ops.rs",
+            include_str!("native/exact_runtime_ops.rs"),
+        ),
         (
             "native_request_fast_state.rs",
-            include_str!("native_request_fast_state.rs"),
+            include_str!("native/fast_state_impl.rs"),
         ),
         ("frame_arena.rs", include_str!("frame_arena.rs")),
         ("request_state.rs", include_str!("request_state.rs")),
@@ -3807,7 +3903,7 @@ fn common_and_exact_native_sources_cannot_import_the_rust_value_plane() {
         }
     }
 
-    let exact_runtime = include_str!("exact_runtime_ops.rs");
+    let exact_runtime = include_str!("native/exact_runtime_ops.rs");
     for deleted in [
         "native_compound_comparison_baseline",
         "native_object_cast_baseline",
@@ -3827,19 +3923,19 @@ fn common_and_exact_native_sources_cannot_import_the_rust_value_plane() {
     for (name, source) in [
         (
             "exact_call_dispatch.rs",
-            include_str!("exact_call_dispatch.rs"),
+            include_str!("native/exact_call_dispatch.rs"),
         ),
         (
             "exact_call_dispatch/array_multisort.rs",
-            include_str!("exact_call_dispatch/array_multisort.rs"),
+            include_str!("native/exact_call_dispatch/array_multisort.rs"),
         ),
         (
             "exact_call_dispatch/recursive_array_family.rs",
-            include_str!("exact_call_dispatch/recursive_array_family.rs"),
+            include_str!("native/exact_call_dispatch/recursive_array_family.rs"),
         ),
         (
             "exact_call_dispatch/scalar_and_filter_families.rs",
-            include_str!("exact_call_dispatch/scalar_and_filter_families.rs"),
+            include_str!("native/exact_call_dispatch/scalar_and_filter_families.rs"),
         ),
     ] {
         assert!(
@@ -3851,6 +3947,58 @@ fn common_and_exact_native_sources_cannot_import_the_rust_value_plane() {
             "{name} retained a runtime retry result"
         );
     }
+}
+
+#[test]
+fn exact_native_tree_has_a_compiler_enforced_cold_state_firewall() {
+    let native_sources = [
+        ("native/mod.rs", include_str!("native/mod.rs")),
+        (
+            "native/fast_state_impl.rs",
+            include_str!("native/fast_state_impl.rs"),
+        ),
+        (
+            "native/exact_call_dispatch.rs",
+            include_str!("native/exact_call_dispatch.rs"),
+        ),
+        (
+            "native/exact_call_dispatch/array_multisort.rs",
+            include_str!("native/exact_call_dispatch/array_multisort.rs"),
+        ),
+        (
+            "native/exact_call_dispatch/recursive_array_family.rs",
+            include_str!("native/exact_call_dispatch/recursive_array_family.rs"),
+        ),
+        (
+            "native/exact_call_dispatch/scalar_and_filter_families.rs",
+            include_str!("native/exact_call_dispatch/scalar_and_filter_families.rs"),
+        ),
+        (
+            "native/exact_runtime_ops.rs",
+            include_str!("native/exact_runtime_ops.rs"),
+        ),
+    ];
+    for (name, source) in native_sources {
+        for forbidden in [
+            "NativeRequestColdState",
+            "baseline_value_plane",
+            "decode_baseline_value",
+            "encode_baseline_value",
+            "use php_runtime::api::Value",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{name} crossed the exact-native visibility firewall through {forbidden}"
+            );
+        }
+    }
+
+    let crate_root = include_str!("../../lib.rs");
+    let vm_root = include_str!("../mod.rs");
+    let common = include_str!("../jit_abi.rs");
+    assert!(crate_root.contains("mod native_exact;"));
+    assert!(vm_root.contains("pub(crate) mod jit_abi;"));
+    assert!(common.contains("pub(in crate::vm) use cold_request_state::NativeRequestColdState;"));
 }
 
 #[test]

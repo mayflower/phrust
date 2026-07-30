@@ -3,7 +3,7 @@
 /// The argument pointer addresses synchronous generated stack storage. Every
 /// element is an authoritative native encoding; this handler never constructs
 /// a Rust `Value` or enters builtin dispatch.
-pub(in crate::vm) extern "C" fn jit_native_array_multisort_abi(
+pub(crate) extern "C" fn jit_native_array_multisort_abi(
     runtime: *mut NativeRequestFastState,
     argument_count: u32,
     arguments: *const i64,

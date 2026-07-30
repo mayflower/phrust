@@ -170,7 +170,7 @@ struct FrameAllocation {
 
 /// Bounded request-local storage for generated PHP call frames and slot tables.
 #[derive(Debug)]
-pub(super) struct NativeFrameArena {
+pub(crate) struct NativeFrameArena {
     chunks: Vec<FrameChunk>,
     allocations: Vec<FrameAllocation>,
     capacity_bytes: usize,

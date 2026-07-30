@@ -27,7 +27,7 @@ pub(super) struct NativeBacktraceFrame {
 /// Keeping parent scopes avoids cloning the complete request symbol table for
 /// every include while preserving PHP's request-wide function visibility.
 #[derive(Default)]
-pub(super) struct NativeFunctionNameScope {
+pub(crate) struct NativeFunctionNameScope {
     parent: Option<Rc<Self>>,
     names: BTreeSet<String>,
 }
@@ -58,11 +58,11 @@ impl NativeFunctionNameScope {
 }
 
 #[derive(Clone)]
-pub(super) struct NativeLastError {
-    pub(super) error_type: i64,
-    pub(super) message: String,
-    pub(super) file: String,
-    pub(super) line: usize,
+pub(crate) struct NativeLastError {
+    pub(crate) error_type: i64,
+    pub(crate) message: String,
+    pub(crate) file: String,
+    pub(crate) line: usize,
 }
 
 #[derive(Debug)]

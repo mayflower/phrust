@@ -345,3 +345,1438 @@ impl<'a> NativeRequestColdState<'a> {
             .and_then(|value| self.encode_baseline_value(value))
     }
 }
+
+pub(super) fn native_publication_constant_is_stable(constant: &php_ir::IrConstant) -> bool {
+    match constant {
+        php_ir::IrConstant::Null
+        | php_ir::IrConstant::Bool(_)
+        | php_ir::IrConstant::Int(_)
+        | php_ir::IrConstant::Float(_)
+        | php_ir::IrConstant::String(_)
+        | php_ir::IrConstant::StringBytes(_) => true,
+        php_ir::IrConstant::Array(entries) => entries.iter().all(|entry| {
+            entry
+                .key
+                .as_ref()
+                .is_none_or(native_publication_constant_is_stable)
+                && native_publication_constant_is_stable(&entry.value)
+        }),
+        php_ir::IrConstant::NamedConstant(_) | php_ir::IrConstant::ClassConstant { .. } => false,
+    }
+}
+
+pub(super) fn native_internal_class_is_available(class_name: &str) -> bool {
+    php_std::ExtensionRegistry::standard_library()
+        .enabled_class(class_name)
+        .is_some()
+        || matches!(
+            class_name,
+            "stdclass"
+                | "exception"
+                | "errorexception"
+                | "error"
+                | "typeerror"
+                | "valueerror"
+                | "argumentcounterror"
+                | "fibererror"
+                | "closure"
+                | "generator"
+                | "fiber"
+                | "arrayobject"
+                | "arrayiterator"
+        )
+}
+
+pub(super) fn native_class_is_publication_allocatable(
+    context: &NativeRequestColdState<'_>,
+    owner_unit: Option<usize>,
+    class: &php_ir::module::ClassEntry,
+) -> bool {
+    let owner_ir_unit = |owner: Option<usize>| -> Option<&php_ir::IrUnit> {
+        match owner {
+            None => Some(&*context.unit),
+            Some(unit) => context
+                .dynamic_units
+                .get(unit)
+                .map(|package| package.compiled.unit()),
+        }
+    };
+    let mut current = Some((owner_unit, class));
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some((owner, candidate)) = current {
+        if candidate.flags.is_abstract
+            || candidate.flags.is_interface
+            || candidate.flags.is_trait
+            || candidate.flags.is_enum
+            || !visited.insert((owner, candidate.name.as_str()))
+        {
+            return false;
+        }
+        let Some(constants) = owner_ir_unit(owner).map(|unit| unit.constants.as_slice()) else {
+            return false;
+        };
+        if candidate.properties.iter().any(|property| {
+            property
+                .default
+                .and_then(|constant| constants.get(constant.index()))
+                .is_some_and(|constant| !native_publication_constant_is_stable(constant))
+        }) {
+            return false;
+        }
+        current = match candidate.parent.as_deref() {
+            None => None,
+            Some(parent) => {
+                let parent = normalize_class_name(parent);
+                if let Some(parent) = owner_ir_unit(owner)
+                    .into_iter()
+                    .flat_map(|unit| &unit.classes)
+                    .find(|class| class.name == parent)
+                {
+                    Some((owner, parent))
+                } else if let Some((unit, parent)) = native_external_class_ref(context, &parent) {
+                    Some((Some(unit), parent))
+                } else {
+                    if !native_internal_class_is_available(&parent) {
+                        return false;
+                    }
+                    None
+                }
+            }
+        };
+    }
+    true
+}
+
+pub(super) struct NativeStaticPropertyDeclaration {
+    pub(super) owner_unit: Option<usize>,
+    pub(super) owner_name: String,
+    pub(super) owner_display_name: String,
+    pub(super) caller_owns_scope: bool,
+    pub(super) flags: php_ir::module::ClassPropertyFlags,
+    pub(super) default: Option<php_ir::ConstId>,
+    pub(super) has_deferred_default: bool,
+    pub(super) type_: Option<php_ir::IrReturnType>,
+}
+
+#[derive(Clone)]
+pub(super) struct NativeInstancePropertyDeclaration {
+    pub(super) owner_unit: Option<usize>,
+    pub(super) owner: crate::compiled_unit::CompiledClass,
+    pub(super) entry: php_ir::module::ClassPropertyEntry,
+}
+
+pub(super) fn native_instance_property_declaration(
+    context: &NativeRequestColdState<'_>,
+    class_name: &str,
+    property: &str,
+    caller_function: u32,
+) -> Option<NativeInstancePropertyDeclaration> {
+    let mut candidate = normalize_class_name(class_name);
+    if let Some(caller_name) =
+        native_effective_calling_class(context, caller_function).map(|class| class.name.clone())
+        && native_class_is_a(context, &candidate, &caller_name)
+    {
+        let scoped_owner = native_active_class_handle(context, &caller_name).map_or_else(
+            || {
+                native_external_class_handle(context, &caller_name)
+                    .map(|(unit, class)| (Some(unit), class))
+            },
+            |class| Some((None, class)),
+        );
+        if let Some((owner_unit, owner)) = scoped_owner
+            && let Some(entry) = owner
+                .properties
+                .iter()
+                .find(|entry| {
+                    !entry.flags.is_static && entry.flags.is_private && entry.name == property
+                })
+                .cloned()
+        {
+            return Some(NativeInstancePropertyDeclaration {
+                owner_unit,
+                owner,
+                entry,
+            });
+        }
+    }
+    let mut visited = std::collections::BTreeSet::new();
+    while visited.insert(candidate.clone()) {
+        let (owner_unit, owner) = native_active_class_handle(context, &candidate).map_or_else(
+            || {
+                native_external_class_handle(context, &candidate)
+                    .map(|(unit, class)| (Some(unit), class))
+            },
+            |class| Some((None, class)),
+        )?;
+        if let Some(entry) = owner
+            .properties
+            .iter()
+            .find(|entry| !entry.flags.is_static && entry.name == property)
+            .cloned()
+        {
+            return Some(NativeInstancePropertyDeclaration {
+                owner_unit,
+                owner,
+                entry,
+            });
+        }
+        candidate = normalize_class_name(owner.parent.as_ref()?);
+    }
+    None
+}
+
+pub(super) fn native_instance_property_readable(
+    context: &NativeRequestColdState<'_>,
+    declaration: &NativeInstancePropertyDeclaration,
+    caller_function: u32,
+) -> bool {
+    if !declaration.entry.flags.is_private && !declaration.entry.flags.is_protected {
+        return true;
+    }
+    let Some(caller) = native_effective_calling_class(context, caller_function) else {
+        return false;
+    };
+    if declaration.entry.flags.is_private {
+        caller.name == declaration.owner.name
+    } else {
+        native_class_is_a(context, &caller.name, &declaration.owner.name)
+    }
+}
+
+pub(super) fn native_instance_property_writable(
+    context: &NativeRequestColdState<'_>,
+    declaration: &NativeInstancePropertyDeclaration,
+    caller_function: u32,
+) -> bool {
+    if !declaration.entry.flags.set_is_private && !declaration.entry.flags.set_is_protected {
+        return true;
+    }
+    let Some(caller) = native_effective_calling_class(context, caller_function) else {
+        return false;
+    };
+    if declaration.entry.flags.set_is_private {
+        caller.name == declaration.owner.name
+    } else {
+        native_class_is_a(context, &caller.name, &declaration.owner.name)
+    }
+}
+
+pub(super) fn native_static_property_declaration(
+    context: &NativeRequestColdState<'_>,
+    class_name: &str,
+    property: &str,
+    caller_function: u32,
+) -> Option<NativeStaticPropertyDeclaration> {
+    let mut candidate = normalize_class_name(class_name);
+    let mut visited = std::collections::BTreeSet::new();
+    while visited.insert(candidate.clone()) {
+        let (unit, class) = if let Some(class) = context
+            .unit
+            .classes
+            .iter()
+            .find(|class| class.name == candidate)
+        {
+            (None, class)
+        } else {
+            let (unit, class) = native_external_class_ref(context, &candidate)?;
+            (Some(unit), class)
+        };
+        if let Some(entry) = class
+            .properties
+            .iter()
+            .find(|entry| entry.flags.is_static && entry.name == property)
+        {
+            return Some(NativeStaticPropertyDeclaration {
+                owner_unit: unit,
+                owner_name: class.name.clone(),
+                owner_display_name: class.display_name.clone(),
+                caller_owns_scope: class
+                    .methods
+                    .iter()
+                    .any(|method| method.function.raw() == caller_function),
+                flags: entry.flags,
+                default: entry.default,
+                has_deferred_default: entry.default_class_constant.is_some()
+                    || entry.default_named_constant.is_some()
+                    || entry.default_expr.is_some(),
+                type_: entry.type_.clone(),
+            });
+        }
+        candidate = normalize_class_name(class.parent.as_ref()?);
+    }
+    None
+}
+
+pub(super) fn native_external_method(
+    context: &NativeRequestColdState<'_>,
+    class_name: &str,
+    method: &str,
+) -> Option<(NativeDynamicFunction, php_ir::module::ClassMethodEntry)> {
+    let (mut unit, mut class) =
+        native_external_class_handle(context, class_name).or_else(|| {
+            let local = context
+                .unit
+                .classes
+                .iter()
+                .find(|class| class.name == normalize_class_name(class_name))?;
+            native_external_class_handle(context, local.parent.as_deref()?)
+        })?;
+    loop {
+        if let Some(entry) = class
+            .methods
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(method))
+            .cloned()
+        {
+            return Some((
+                NativeDynamicFunction {
+                    unit,
+                    function: entry.function,
+                },
+                entry,
+            ));
+        }
+        let parent = class.parent.as_deref()?;
+        let normalized_parent = normalize_class_name(parent);
+        let (parent_unit, parent_class) = context
+            .current_dynamic_unit
+            .and_then(|unit| {
+                context
+                    .dynamic_units
+                    .get(unit)?
+                    .compiled
+                    .lookup_unit_class_handle(&normalized_parent)
+                    .map(|class| (unit, class))
+            })
+            .or_else(|| native_external_class_handle(context, parent))?;
+        unit = parent_unit;
+        class = parent_class;
+    }
+}
+
+pub(super) fn create_native_external_object(
+    context: &mut NativeRequestColdState<'_>,
+    class_name: &str,
+    arguments: &[i64],
+    source: &php_ir::Instruction,
+) -> Result<i64, String> {
+    let (unit, class) = native_external_class_handle(context, class_name)
+        .ok_or_else(|| format!("E_PHP_VM_UNKNOWN_CLASS: Class {class_name} not found"))?;
+    if class.flags.is_abstract
+        || class.flags.is_interface
+        || class.flags.is_trait
+        || class.flags.is_enum
+    {
+        return Err(format!(
+            "Cannot instantiate {} {}",
+            class_name, class.display_name
+        ));
+    }
+    native_prepare_runtime_class_constants(context, Some(unit), &class, source)?;
+    let object = new_native_object(context, Some(unit), &class)?;
+    let receiver = context.encode_native_object_owner(object)?;
+    if let Some((constructor, _)) = native_external_method(context, class_name, "__construct") {
+        let mut constructor_arguments = Vec::with_capacity(arguments.len() + 1);
+        constructor_arguments.push(receiver);
+        constructor_arguments.extend_from_slice(arguments);
+        let _ = invoke_native_resolved_external_function(
+            context,
+            constructor,
+            &constructor_arguments,
+            Some(class.name.clone()),
+            context.unit.strict_types,
+        )?;
+    }
+    Ok(receiver)
+}
+
+pub(super) fn native_function_has_implicit_closure_this(function: &php_ir::IrFunction) -> bool {
+    function.implicit_closure_this_local().is_some()
+}
+
+#[cfg(test)]
+pub(super) fn native_backtrace_frame(
+    compiled: &crate::compiled_unit::CompiledUnit,
+    function: php_ir::FunctionId,
+    called_class: Option<Arc<str>>,
+    object: Option<php_runtime::api::ObjectRef>,
+    arguments: request_state::NativeTraceArguments,
+) -> NativeBacktraceFrame {
+    let metadata = NativeFunctionMetadataPtr::from_compiled(compiled, function);
+    native_backtrace_frame_from_metadata(metadata, called_class, object, arguments)
+}
+
+pub(super) fn native_backtrace_frame_from_metadata(
+    metadata: Option<NativeFunctionMetadataPtr>,
+    called_class: Option<Arc<str>>,
+    object: Option<php_runtime::api::ObjectRef>,
+    arguments: request_state::NativeTraceArguments,
+) -> NativeBacktraceFrame {
+    let fixed_argument_count = metadata.as_ref().map_or(0, |metadata| {
+        metadata
+            .params
+            .iter()
+            .position(|parameter| parameter.variadic)
+            .unwrap_or(metadata.params.len())
+            .min(arguments.len()) as u32
+    });
+    let class = metadata.as_ref().and_then(|metadata| {
+        metadata
+            .trace_class
+            .as_ref()
+            .map(|class| called_class.unwrap_or_else(|| Arc::clone(class)))
+    });
+    NativeBacktraceFrame {
+        metadata,
+        class,
+        object,
+        arguments,
+        fixed_argument_count,
+    }
+}
+
+pub(super) fn invoke_native_external_function(
+    context: &mut NativeRequestColdState<'_>,
+    target: NativeDynamicFunction,
+    arguments: &[i64],
+    called_class: Option<String>,
+    strict: bool,
+) -> NativeCallResult {
+    invoke_native_external_function_with_metadata(
+        context,
+        target,
+        arguments,
+        None,
+        called_class,
+        strict,
+    )
+}
+
+pub(super) fn invoke_native_resolved_external_function(
+    context: &mut NativeRequestColdState<'_>,
+    target: NativeDynamicFunction,
+    arguments: &[i64],
+    called_class: Option<String>,
+    strict: bool,
+) -> NativeCallResult {
+    invoke_native_resolved_external_function_with_metadata(
+        context,
+        target,
+        arguments,
+        None,
+        called_class,
+        strict,
+    )
+}
+
+pub(super) fn invoke_native_external_function_with_metadata(
+    context: &mut NativeRequestColdState<'_>,
+    target: NativeDynamicFunction,
+    arguments: &[i64],
+    metadata: Option<&[php_ir::instruction::IrCallArg]>,
+    called_class: Option<String>,
+    strict: bool,
+) -> NativeCallResult {
+    invoke_native_external_function_with_metadata_at_tier(
+        context,
+        target,
+        arguments,
+        metadata,
+        called_class,
+        strict,
+        false,
+    )
+}
+
+pub(super) fn invoke_native_resolved_external_function_with_metadata(
+    context: &mut NativeRequestColdState<'_>,
+    target: NativeDynamicFunction,
+    arguments: &[i64],
+    metadata: Option<&[php_ir::instruction::IrCallArg]>,
+    called_class: Option<String>,
+    strict: bool,
+) -> NativeCallResult {
+    invoke_native_external_function_with_metadata_at_tier(
+        context,
+        target,
+        arguments,
+        metadata,
+        called_class,
+        strict,
+        true,
+    )
+}
+
+pub(super) fn invoke_native_external_function_with_metadata_at_tier(
+    context: &mut NativeRequestColdState<'_>,
+    target: NativeDynamicFunction,
+    arguments: &[i64],
+    metadata: Option<&[php_ir::instruction::IrCallArg]>,
+    called_class: Option<String>,
+    strict: bool,
+    baseline_continuation: bool,
+) -> NativeCallResult {
+    prepare_dynamic_native_entry(context, target.unit, target.function)?;
+    let mut transferred_arguments = transfer_native_external_arguments(context, arguments)?;
+    let execution_target = NativeExecutionTarget {
+        unit: Some(target.unit),
+        function: target.function,
+        called_class: called_class
+            .as_deref()
+            .map(Arc::from)
+            .or_else(|| context.called_classes.last().cloned()),
+        scope_class: context
+            .lexical_scope_classes
+            .last()
+            .map(|scope| Arc::from(scope.as_str())),
+    };
+    let result = context.run_in_native_execution_target(&execution_target, |context| {
+        let result = if baseline_continuation {
+            invoke_native_resolved_function_with_metadata_strict(
+                context,
+                target.function,
+                &transferred_arguments,
+                metadata,
+                strict,
+            )
+        } else {
+            invoke_baseline_bound_function_with_metadata_strict(
+                context,
+                target.function,
+                &transferred_arguments,
+                metadata,
+                strict,
+                false,
+            )
+        };
+        // External callees may mutate a receiver, reference, or array argument
+        // and publish literals from their own IrUnit into that authoritative
+        // ownership graph. Rehome those newly written constants while the
+        // callee unit is still active, before restoring the caller's runtime
+        // view. This is the symmetric return half of argument transfer.
+        context.stabilize_owned_native_values_for_cross_unit(&mut transferred_arguments)?;
+        match result {
+            Ok(encoded) => Ok(context.transfer_external_return(encoded, target.unit)?),
+            Err(NativeCallControl::Exit(encoded)) => {
+                let encoded = context.transfer_external_return(encoded, target.unit)?;
+                Err(NativeCallControl::Exit(encoded))
+            }
+            Err(control) => Err(control),
+        }
+    });
+    let mut release_error = None;
+    for argument in transferred_arguments {
+        if let Err(error) = context.release(argument) {
+            release_error.get_or_insert(error);
+        }
+    }
+    match (result, release_error) {
+        (Err(control), _) => Err(control),
+        (Ok(_), Some(error)) => Err(error.into()),
+        (Ok(value), None) => Ok(value),
+    }
+}
+
+pub(super) fn create_native_external_generator_with_metadata(
+    context: &mut NativeRequestColdState<'_>,
+    target: NativeDynamicFunction,
+    arguments: &[i64],
+    metadata: Option<&[php_ir::instruction::IrCallArg]>,
+    called_class: Option<String>,
+    strict: bool,
+) -> NativeCallResult {
+    prepare_dynamic_native_entry(context, target.unit, target.function)?;
+    let transferred = transfer_native_external_arguments(context, arguments)?;
+    let execution_target = NativeExecutionTarget {
+        unit: Some(target.unit),
+        function: target.function,
+        called_class: called_class
+            .as_deref()
+            .map(Arc::from)
+            .or_else(|| context.called_classes.last().cloned()),
+        scope_class: context
+            .lexical_scope_classes
+            .last()
+            .map(|scope| Arc::from(scope.as_str())),
+    };
+    let result = context.run_in_native_execution_target(&execution_target, |context| {
+        create_baseline_bound_generator_with_metadata_strict(
+            context,
+            target.function,
+            &transferred,
+            metadata,
+            strict,
+        )
+    });
+    let mut release_error = None;
+    for argument in transferred {
+        if let Err(error) = context.release(argument) {
+            release_error.get_or_insert(error);
+        }
+    }
+    match (result, release_error) {
+        (Err(control), _) => Err(control),
+        (Ok(_), Some(error)) => Err(error.into()),
+        (Ok(generator), None) => Ok(generator),
+    }
+}
+
+pub(in crate::vm) fn resume_native_optimizing_exit(
+    context: &mut NativeRequestColdState<'_>,
+    active_artifact: php_jit::JitFunctionHandle,
+    outcome: Result<php_jit::JitI64InvokeOutcome, php_jit::JitInvokeError>,
+) -> Result<php_jit::JitI64InvokeOutcome, php_jit::JitInvokeError> {
+    resume_native_optimizing_exit_with_artifact(context, Some(active_artifact), outcome)
+        .map(|(_, outcome)| outcome)
+}
+
+pub(super) fn native_transition_metadata<'a>(
+    handle: &'a php_jit::JitFunctionHandle,
+    state: &php_jit::JitDeoptState,
+) -> Option<&'a php_jit::JitNativeTransitionMetadata> {
+    handle.region_state_metadata().and_then(|metadata| {
+        metadata.native_transitions.iter().find(|entry| {
+            entry.function.raw() == state.function_id
+                && entry.continuation_id == state.continuation_id
+        })
+    })
+}
+
+pub(super) fn active_artifact_owns_published_transition(
+    context: &NativeRequestColdState<'_>,
+    handle: &php_jit::JitFunctionHandle,
+    state: &php_jit::JitDeoptState,
+) -> bool {
+    let Some(metadata) = handle.region_state_metadata() else {
+        return false;
+    };
+    if metadata.native_version != state.native_version
+        || native_transition_metadata(handle, state).is_none()
+    {
+        return false;
+    }
+    let Some(function_entry) = metadata
+        .function_entries
+        .iter()
+        .find(|entry| entry.function.raw() == state.function_id)
+    else {
+        return false;
+    };
+    context
+        .compiled
+        .prepared_deployment_image()
+        .preferred_function_entries
+        .get(state.function_id as usize)
+        .is_some_and(|entry| {
+            entry.load(std::sync::atomic::Ordering::Acquire) == function_entry.address
+        })
+}
+
+pub(super) fn native_transition_owner_adjustments(
+    source: &php_jit::JitNativeTransitionMetadata,
+    target: &php_jit::JitNativeTransitionMetadata,
+    state: &php_jit::JitDeoptState,
+) -> (Vec<i64>, Vec<i64>) {
+    let source_locals = source
+        .owned_locals
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let target_locals = target
+        .owned_locals
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let source_registers = source
+        .owned_registers
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let target_registers = target
+        .owned_registers
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut retain = Vec::new();
+    let mut release = Vec::new();
+    for local in source_locals.union(&target_locals).copied() {
+        if !state.local_initialized(local) {
+            continue;
+        }
+        let value = state.slots[local.index()];
+        match (
+            source_locals.contains(&local),
+            target_locals.contains(&local),
+        ) {
+            (false, true) => retain.push(value),
+            (true, false) => release.push(value),
+            _ => {}
+        }
+    }
+    for snapshot in 0..php_jit::JIT_DEOPT_MAX_REGISTERS {
+        let initialized = state.initialized_register_mask
+            & 1_u64
+                .checked_shl(u32::try_from(snapshot).unwrap_or(u32::MAX))
+                .unwrap_or(0)
+            != 0;
+        if !initialized {
+            continue;
+        }
+        let register = php_ir::RegId::new(state.register_ids[snapshot]);
+        let value = state.registers[snapshot];
+        match (
+            source_registers.contains(&register),
+            target_registers.contains(&register),
+        ) {
+            (false, true) => retain.push(value),
+            (true, false) => release.push(value),
+            _ => {}
+        }
+    }
+    (retain, release)
+}
+
+pub(super) fn reconcile_native_transition_owners(
+    context: &mut NativeRequestColdState<'_>,
+    source: &php_jit::JitFunctionHandle,
+    target: &php_jit::JitFunctionHandle,
+    state: &php_jit::JitDeoptState,
+) -> Result<(), String> {
+    let source = native_transition_metadata(source, state).ok_or_else(|| {
+        format!(
+            "optimizing transition {}:{} has no source ownership metadata",
+            state.function_id, state.continuation_id
+        )
+    })?;
+    let target = native_transition_metadata(target, state).ok_or_else(|| {
+        format!(
+            "optimizing transition {}:{} has no baseline ownership metadata",
+            state.function_id, state.continuation_id
+        )
+    })?;
+    let (retain, release) = native_transition_owner_adjustments(source, target, state);
+    // Acquire the baseline-only owners first. If the same encoded value moves
+    // between two ownership identities, it can never transiently reach zero.
+    for value in retain {
+        context.retain(value)?;
+    }
+    for value in release {
+        context.release(value)?;
+    }
+    Ok(())
+}
+
+pub(super) fn remap_native_transition_registers(
+    target: &php_jit::JitNativeTransitionMetadata,
+    state: &php_jit::JitDeoptState,
+) -> Result<php_jit::JitDeoptState, String> {
+    let mut remapped = *state;
+    remapped.initialized_register_mask = 0;
+    remapped.register_ids.fill(0);
+    remapped.registers.fill(0);
+    for (target_slot, register) in target.live_registers.iter().copied().enumerate() {
+        let Some(source_slot) = (0..php_jit::JIT_DEOPT_MAX_REGISTERS).find(|source_slot| {
+            state.initialized_register_mask & (1_u64 << source_slot) != 0
+                && state.register_ids[*source_slot] == register.raw()
+        }) else {
+            return Err(format!(
+                "optimizing transition {}:{} did not publish live baseline register {}",
+                state.function_id,
+                state.continuation_id,
+                register.raw()
+            ));
+        };
+        remapped.register_ids[target_slot] = register.raw();
+        remapped.registers[target_slot] = state.registers[source_slot];
+        remapped.initialized_register_mask |= 1_u64 << target_slot;
+    }
+    Ok(remapped)
+}
+
+pub(super) fn resume_native_optimizing_exit_with_artifact(
+    context: &mut NativeRequestColdState<'_>,
+    mut active_artifact: Option<php_jit::JitFunctionHandle>,
+    mut outcome: Result<php_jit::JitI64InvokeOutcome, php_jit::JitInvokeError>,
+) -> Result<
+    (
+        Option<php_jit::JitFunctionHandle>,
+        php_jit::JitI64InvokeOutcome,
+    ),
+    php_jit::JitInvokeError,
+> {
+    loop {
+        let Ok(php_jit::JitI64InvokeOutcome::SideExit { status, state, .. }) = &outcome else {
+            return outcome.map(|outcome| (active_artifact, outcome));
+        };
+        if *status != php_jit::JitCallStatus::RECOMPILE_REQUESTED.0 as i32 {
+            return outcome.map(|outcome| (active_artifact, outcome));
+        }
+        let transition_instruction =
+            context.instruction_for_continuation(state.function_id, state.continuation_id);
+        let mut transition_reason = transition_instruction
+            .as_ref()
+            .map(|instruction| native_optimizing_transition_reason(&instruction.kind))
+            .unwrap_or_else(|| std::borrow::Cow::Borrowed("optimizer_unknown"));
+        if transition_reason.as_ref() == "optimizer_array:IssetDim" {
+            let mut detail = match state.control_reserved {
+                php_jit::JIT_OPTIMIZING_EXIT_ARRAY_NOT_TAGGED => "not_tagged",
+                php_jit::JIT_OPTIMIZING_EXIT_ARRAY_VIEW_MISSING => "view_missing",
+                php_jit::JIT_OPTIMIZING_EXIT_ARRAY_KEY_UNSUPPORTED => "key_unsupported",
+                _ => "unknown",
+            }
+            .to_owned();
+            if state.control_reserved == php_jit::JIT_OPTIMIZING_EXIT_ARRAY_NOT_TAGGED
+                && let Some(instruction) = transition_instruction.as_ref()
+                && let php_ir::InstructionKind::IssetDim { local, .. } = &instruction.kind
+                && state.local_initialized(*local)
+            {
+                detail.push(':');
+                detail.push_str(native_transition_value_kind(state.slots[local.index()]));
+            }
+            transition_reason =
+                std::borrow::Cow::Owned(format!("{}:{detail}", transition_reason.as_ref()));
+        } else if transition_reason.as_ref() == "optimizer_local:LoadLocal"
+            && let Some(instruction) = transition_instruction.as_ref()
+            && let php_ir::InstructionKind::LoadLocal { local, .. } = &instruction.kind
+            && state.local_initialized(*local)
+        {
+            let stored = native_transition_direct_value_kind(context, state.slots[local.index()]);
+            let next = context
+                .instruction_for_continuation(
+                    state.function_id,
+                    state.continuation_id.saturating_add(1),
+                )
+                .map(|instruction| {
+                    let rendered = format!("{:?}", instruction.kind);
+                    rendered
+                        .split_once([' ', '{', '('])
+                        .map_or(rendered.as_str(), |(name, _)| name)
+                        .to_owned()
+                })
+                .unwrap_or_else(|| "terminal".to_owned());
+            transition_reason = std::borrow::Cow::Owned(format!(
+                "{}:{stored}:next_{next}",
+                transition_reason.as_ref()
+            ));
+        } else if transition_reason.as_ref() == "optimizer_array:AssignDim"
+            && let Some(instruction) = transition_instruction.as_ref()
+            && let php_ir::InstructionKind::AssignDim { local, .. } = &instruction.kind
+            && state.local_initialized(*local)
+        {
+            let encoded = state.slots[local.index()];
+            let raw = native_transition_value_kind(encoded);
+            let stored = native_transition_direct_value_kind(context, encoded);
+            let descriptor = php_jit::jit_decode_runtime_value(encoded).map_or_else(
+                || "immediate".to_owned(),
+                |index| {
+                    if index >= php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE {
+                        return context
+                            .direct_value_slots
+                            .get((index - php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE) as usize)
+                            .map_or_else(
+                                || "direct_missing".to_owned(),
+                                |slot| format!("direct_kind_{}_refs_{}", slot.kind, slot.refcount),
+                            );
+                    }
+                    "cold_record".to_owned()
+                },
+            );
+            transition_reason = std::borrow::Cow::Owned(format!(
+                "{}:{raw}:{stored}:{descriptor}",
+                transition_reason.as_ref()
+            ));
+        } else if transition_reason
+            .as_ref()
+            .starts_with("optimizer_call:CallFunction:")
+            && let Some(instruction) = transition_instruction.as_ref()
+            && let php_ir::InstructionKind::CallFunction { args, .. } = &instruction.kind
+        {
+            let values = args
+                .iter()
+                .take(4)
+                .map(|argument| {
+                    let encoded = match argument.value {
+                        php_ir::Operand::Local(local) if state.local_initialized(local) => {
+                            Some(state.slots[local.index()])
+                        }
+                        php_ir::Operand::Register(register) => (0
+                            ..php_jit::JIT_DEOPT_MAX_REGISTERS)
+                            .find(|index| {
+                                state.initialized_register_mask & (1_u64 << index) != 0
+                                    && state.register_ids[*index] == register.raw()
+                            })
+                            .map(|index| state.registers[index]),
+                        php_ir::Operand::Constant(_) | php_ir::Operand::Local(_) => None,
+                    };
+                    encoded.map_or_else(
+                        || "constant_or_unpublished".to_owned(),
+                        |encoded| {
+                            format!(
+                                "{}/{}",
+                                native_transition_value_kind(encoded),
+                                native_transition_direct_value_kind(context, encoded),
+                            )
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            transition_reason = std::borrow::Cow::Owned(format!(
+                "{}:values_{values}:detail_{:#x}",
+                transition_reason.as_ref(),
+                state.control_reserved,
+            ));
+        }
+        let transition_started = context
+            .options
+            .collect_counters
+            .then(std::time::Instant::now);
+        let function = php_ir::FunctionId::new(state.function_id);
+        let replays_store = transition_instruction.as_ref().is_some_and(|instruction| {
+            matches!(instruction.kind, php_ir::InstructionKind::StoreLocal { .. })
+        });
+        let fallback = NativeExecutionTarget {
+            unit: context.current_dynamic_unit,
+            function,
+            called_class: context.called_classes.last().cloned(),
+            scope_class: context
+                .lexical_scope_classes
+                .last()
+                .map(|scope| Arc::from(scope.as_str())),
+        };
+        let target = context
+            .native_execution_target_from_state(state, Some(&fallback))
+            .map_err(|_| php_jit::JitInvokeError::MissingNativeTransition {
+                function: state.function_id,
+                continuation: state.continuation_id,
+            })?;
+        let state = *state;
+        let carried_artifact = active_artifact.clone();
+        let (baseline, resumed) = context
+            .run_in_native_execution_target(&target, |context| -> Result<_, String> {
+                // A direct linked callee can side-exit without returning
+                // through the caller's Rust coordinator. The carried handle
+                // may therefore own the caller graph, and dense unit-local
+                // FunctionIds can make unrelated metadata appear to match.
+                // Match its exact function entry against the runtime-view-
+                // selected unit's preferred publication cell before using
+                // it. This preserves the generation that actually produced
+                // the exit without trusting a coincidental dense ID.
+                let source = if let Some(source) = carried_artifact.as_ref().filter(|source| {
+                    active_artifact_owns_published_transition(context, source, &state)
+                }) {
+                    source.clone()
+                } else {
+                    ensure_native_entry(context, function)?
+                };
+                let source_metadata =
+                    native_transition_metadata(&source, &state).ok_or_else(|| {
+                        format!(
+                            "optimizing transition {}:{} has no active-unit source metadata",
+                            state.function_id, state.continuation_id
+                        )
+                    })?;
+                if source_metadata.native_version != state.native_version {
+                    let error = format!(
+                        "optimizing transition {}:{} source tier {} does not match state tier {}",
+                        state.function_id,
+                        state.continuation_id,
+                        source_metadata.native_version,
+                        state.native_version
+                    );
+                    cold_diagnostics::record_native_helper_failure(context, error.clone());
+                    return Err(error);
+                }
+                let baseline = ensure_native_baseline_entry(context, function)?;
+                if let Err(error) =
+                    reconcile_native_transition_owners(context, &source, &baseline, &state)
+                {
+                    cold_diagnostics::record_native_helper_failure(context, error.clone());
+                    return Err(error);
+                }
+                let Some(target_metadata) = native_transition_metadata(&baseline, &state) else {
+                    let error = format!(
+                        "optimizing transition {}:{} has no reconciled baseline metadata",
+                        state.function_id, state.continuation_id
+                    );
+                    cold_diagnostics::record_native_helper_failure(context, error.clone());
+                    return Err(error);
+                };
+                let baseline_state =
+                    match remap_native_transition_registers(target_metadata, &state) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            cold_diagnostics::record_native_helper_failure(context, error.clone());
+                            return Err(error);
+                        }
+                    };
+                let runtime = context.native_runtime_ptr();
+                context.baseline_transition_store_owner_pending = replays_store;
+                let resumed = baseline.invoke_i64_native_transition_with_unwind_runtime(
+                    &baseline_state,
+                    php_jit::JIT_RUNTIME_ABI_HASH,
+                    runtime,
+                    |types, value| native_catch_matches(context, types, value),
+                );
+                context.baseline_transition_store_owner_pending = false;
+                Ok((baseline, resumed))
+            })
+            .map_err(|_| php_jit::JitInvokeError::MissingNativeTransition {
+                function: state.function_id,
+                continuation: state.continuation_id,
+            })?;
+        outcome = resumed;
+        active_artifact = Some(baseline);
+        if let Some(started) = transition_started {
+            context.record_native_transition(transition_reason.as_ref(), started.elapsed(), 0);
+        }
+    }
+}
+
+pub(super) fn native_transition_value_kind(encoded: i64) -> &'static str {
+    let encoded = encoded as u64;
+    match encoded & php_jit::JIT_VALUE_RUNTIME_KIND_MASK {
+        php_jit::JIT_VALUE_RUNTIME_REFERENCE_TAG => "reference",
+        php_jit::JIT_VALUE_RUNTIME_ARRAY_TAG => "array",
+        php_jit::JIT_VALUE_RUNTIME_OBJECT_TAG => "object",
+        php_jit::JIT_VALUE_RUNTIME_STRING_TAG => "string",
+        php_jit::JIT_VALUE_RUNTIME_FLOAT_TAG => "float",
+        php_jit::JIT_VALUE_RUNTIME_RESOURCE_TAG => "resource",
+        php_jit::JIT_VALUE_RUNTIME_CALLABLE_TAG => "callable",
+        php_jit::JIT_VALUE_RUNTIME_GENERATOR_TAG => "generator",
+        php_jit::JIT_VALUE_RUNTIME_FIBER_TAG => "fiber",
+        php_jit::JIT_VALUE_RUNTIME_ITERATOR_TAG => "iterator",
+        _ if encoded == php_jit::jit_encode_constant(u32::MAX) as u64 => "null",
+        _ if encoded & php_jit::JIT_VALUE_TAG_MASK == php_jit::JIT_VALUE_CONSTANT_TAG => "constant",
+        _ => "immediate",
+    }
+}
+
+pub(super) fn native_transition_direct_value_kind(
+    context: &NativeRequestColdState<'_>,
+    encoded: i64,
+) -> &'static str {
+    if let Some(index) = NativeRequestColdState::direct_value_index(encoded)
+        && let Some(slot) = context
+            .direct_value_slots
+            .get(index)
+            .filter(|slot| slot.refcount != 0)
+    {
+        return match slot.kind {
+            php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE => "prepared_callable",
+            php_jit::JIT_NATIVE_VALUE_VIEW_COLD_GENERATOR => "materialized_generator",
+            php_jit::JIT_NATIVE_VALUE_VIEW_FOREACH_DIRECT => "array_iterator",
+            php_jit::JIT_NATIVE_VALUE_VIEW_COLD_ITERATOR => {
+                context
+                    .cold_iterator(index)
+                    .map_or("missing", |iterator| match iterator {
+                        NativeColdIterator::Array(_) => "array_iterator",
+                        NativeColdIterator::Object(_) => "object_iterator",
+                        NativeColdIterator::Snapshot(_) => "snapshot_iterator",
+                        NativeColdIterator::LiveArray(_) => "live_array_iterator",
+                        NativeColdIterator::User(_) => "iterator",
+                        NativeColdIterator::Generator(_) => "baseline_generator_iterator",
+                    })
+            }
+            _ => native_transition_value_kind(encoded),
+        };
+    }
+    let Some(_) = php_jit::jit_decode_runtime_value(encoded) else {
+        return native_transition_value_kind(encoded);
+    };
+    "missing"
+}
+
+pub(super) fn native_optimizing_transition_reason(
+    kind: &php_ir::InstructionKind,
+) -> std::borrow::Cow<'static, str> {
+    use php_ir::InstructionKind;
+
+    let family = match kind {
+        InstructionKind::LoadLocal { .. }
+        | InstructionKind::StoreLocal { .. }
+        | InstructionKind::Discard { .. }
+        | InstructionKind::IssetLocal { .. }
+        | InstructionKind::EmptyLocal { .. }
+        | InstructionKind::UnsetLocal { .. } => "optimizer_local",
+        InstructionKind::Unary { .. }
+        | InstructionKind::Binary { .. }
+        | InstructionKind::Compare { .. }
+        | InstructionKind::Cast { .. } => "optimizer_scalar",
+        InstructionKind::NewArray { .. }
+        | InstructionKind::ArrayInsert { .. }
+        | InstructionKind::ArraySpread { .. }
+        | InstructionKind::FetchDim { .. }
+        | InstructionKind::AssignDim { .. }
+        | InstructionKind::AppendDim { .. }
+        | InstructionKind::UnsetDim { .. }
+        | InstructionKind::IssetDim { .. }
+        | InstructionKind::EmptyDim { .. } => "optimizer_array",
+        InstructionKind::ForeachInit { .. }
+        | InstructionKind::ForeachInitRef { .. }
+        | InstructionKind::ForeachNext { .. }
+        | InstructionKind::ForeachNextRef { .. }
+        | InstructionKind::ForeachCleanup { .. } => "optimizer_foreach",
+        InstructionKind::FetchProperty { .. }
+        | InstructionKind::AssignProperty { .. }
+        | InstructionKind::FetchDynamicStaticProperty { .. }
+        | InstructionKind::AssignDynamicStaticProperty { .. }
+        | InstructionKind::FetchObjectClassName { .. } => "optimizer_property",
+        InstructionKind::BindReference { .. }
+        | InstructionKind::BindReferenceDim { .. }
+        | InstructionKind::BindReferenceProperty { .. }
+        | InstructionKind::BindReferenceFromProperty { .. }
+        | InstructionKind::BindReferenceFromPropertyDim { .. }
+        | InstructionKind::BindReferencePropertyDim { .. }
+        | InstructionKind::BindReferenceDimFromProperty { .. }
+        | InstructionKind::BindReferenceFromDim { .. }
+        | InstructionKind::BindReferenceFromStaticPropertyDim { .. }
+        | InstructionKind::BindReferenceStaticProperty { .. }
+        | InstructionKind::BindReferenceFromCall { .. }
+        | InstructionKind::BindReferenceFromMethodCall { .. } => "optimizer_reference",
+        InstructionKind::CallFunction { .. }
+        | InstructionKind::CallMethod { .. }
+        | InstructionKind::CallStaticMethod { .. }
+        | InstructionKind::CallClosure { .. }
+        | InstructionKind::CallCallable { .. }
+        | InstructionKind::Pipe { .. }
+        | InstructionKind::NewObject { .. }
+        | InstructionKind::DynamicNewObject { .. } => "optimizer_call",
+        InstructionKind::Include { .. }
+        | InstructionKind::Eval { .. }
+        | InstructionKind::DeclareFunction { .. }
+        | InstructionKind::DeclareClass { .. } => "optimizer_dynamic_code",
+        _ => "optimizer_other",
+    };
+    // This runs only while diagnostic counters are enabled. Preserve the
+    // exact IR opcode, but not its operands, so an aggregate family cannot
+    // hide the next dominant warm transition after an earlier exit is
+    // removed.
+    if let InstructionKind::Binary { op, .. } = kind {
+        return format!("{family}:Binary:{op:?}").into();
+    }
+    if let InstructionKind::CallFunction { name, args, .. } = kind {
+        let named = args
+            .iter()
+            .filter(|argument| argument.name.is_some())
+            .count();
+        let unpacked = args.iter().filter(|argument| argument.unpack).count();
+        return format!(
+            "{family}:CallFunction:{}:argc{}:named{}:unpack{}",
+            name.trim_start_matches('\\').to_ascii_lowercase(),
+            args.len(),
+            named,
+            unpacked,
+        )
+        .into();
+    }
+    let debug = format!("{kind:?}");
+    let end = debug.find([' ', '{', '(']).unwrap_or(debug.len());
+    format!("{family}:{}", &debug[..end]).into()
+}
+
+pub(super) fn native_class_is_a(
+    context: &NativeRequestColdState<'_>,
+    class_name: &str,
+    target: &str,
+) -> bool {
+    let target = normalize_class_name(target);
+    let class_name = normalize_class_name(class_name);
+    if class_name == "arrayiterator" && matches!(target.as_str(), "iterator" | "traversable") {
+        return true;
+    }
+    let mut pending = vec![class_name];
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(candidate) = pending.pop() {
+        if candidate == target {
+            return true;
+        }
+        if !visited.insert(candidate.clone()) {
+            continue;
+        }
+        if let Some(class) = context
+            .unit
+            .classes
+            .iter()
+            .find(|class| class.name == candidate)
+        {
+            if let Some(parent) = &class.parent {
+                pending.push(normalize_class_name(parent));
+            }
+            pending.extend(
+                class
+                    .interfaces
+                    .iter()
+                    .map(|interface| normalize_class_name(interface)),
+            );
+        } else if let Some((_, class)) = native_external_class_ref(context, &candidate) {
+            if let Some(parent) = &class.parent {
+                pending.push(normalize_class_name(parent));
+            }
+            pending.extend(
+                class
+                    .interfaces
+                    .iter()
+                    .map(|interface| normalize_class_name(interface)),
+            );
+        } else if let Some(class) =
+            php_std::ExtensionRegistry::standard_library().enabled_class(&candidate)
+            && let Some(metadata) = class.source_metadata()
+        {
+            if let Some(parent) = metadata.parent {
+                pending.push(normalize_class_name(parent));
+            }
+            pending.extend(
+                metadata
+                    .interfaces
+                    .iter()
+                    .map(|interface| normalize_class_name(interface)),
+            );
+        }
+    }
+    false
+}
+
+pub(super) fn native_method_in_hierarchy(
+    context: &NativeRequestColdState<'_>,
+    class_name: &str,
+    method: &str,
+) -> Option<php_ir::FunctionId> {
+    let mut candidate = normalize_class_name(class_name);
+    loop {
+        let class = context
+            .unit
+            .classes
+            .iter()
+            .find(|class| class.name == candidate)?;
+        if let Some(entry) = class
+            .methods
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(method))
+        {
+            return Some(entry.function);
+        }
+        candidate = normalize_class_name(class.parent.as_ref()?);
+    }
+}
+
+pub(super) fn native_function_is_generator(
+    context: &NativeRequestColdState<'_>,
+    function: php_ir::FunctionId,
+) -> bool {
+    context
+        .unit
+        .functions
+        .get(function.index())
+        .is_some_and(|function| {
+            function.flags.is_generator
+                || function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.instructions)
+                    .any(|instruction| {
+                        matches!(
+                            instruction.kind,
+                            php_ir::InstructionKind::Yield { .. }
+                                | php_ir::InstructionKind::YieldFrom { .. }
+                        )
+                    })
+        })
+}
+
+pub(super) fn native_function_requires_non_reference_trampoline(
+    function: &php_ir::IrFunction,
+    method_scope_sensitive: bool,
+) -> bool {
+    function.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                php_ir::InstructionKind::Yield { .. } | php_ir::InstructionKind::YieldFrom { .. }
+            ) || matches!(
+                &instruction.kind,
+                php_ir::InstructionKind::CallFunction { name, .. }
+                    if name.trim_start_matches('\\').eq_ignore_ascii_case("debug_backtrace")
+            ) || method_scope_sensitive
+                && matches!(
+                    &instruction.kind,
+                    php_ir::InstructionKind::FetchClassConstant {
+                        class_name,
+                        ..
+                    } | php_ir::InstructionKind::CallStaticMethod {
+                        class_name,
+                        ..
+                    } if class_name.eq_ignore_ascii_case("static")
+                )
+        })
+    }) || function.attributes.iter().any(|attribute| {
+        attribute
+            .resolved_name
+            .as_deref()
+            .or(attribute.fallback_name.as_deref())
+            .unwrap_or(&attribute.name)
+            .trim_start_matches('\\')
+            .eq_ignore_ascii_case("deprecated")
+    })
+}
+
+pub(super) fn native_function_exception_routes(
+    function: php_ir::FunctionId,
+    definition: &php_ir::IrFunction,
+) -> Option<php_ir::FunctionId> {
+    definition
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| {
+            matches!(
+                instruction.kind,
+                php_ir::InstructionKind::EnterTry { catch: Some(_), .. }
+                    | php_ir::InstructionKind::EnterTry {
+                        finally: Some(_),
+                        ..
+                    }
+            )
+        })
+        .then_some(function)
+}
+
+pub(super) fn native_calling_class<'a>(
+    context: &'a NativeRequestColdState<'_>,
+    function: u32,
+) -> Option<&'a php_ir::ClassEntry> {
+    context.unit.classes.iter().find(|class| {
+        class
+            .methods
+            .iter()
+            .any(|method| method.function.raw() == function)
+    })
+}
+
+pub(super) fn native_effective_calling_class<'a>(
+    context: &'a NativeRequestColdState<'_>,
+    function: u32,
+) -> Option<&'a php_ir::ClassEntry> {
+    native_calling_class(context, function).or_else(|| {
+        let scope = context.lexical_scope_classes.last()?;
+        let normalized = normalize_class_name(scope);
+        context
+            .unit
+            .classes
+            .iter()
+            .find(|class| class.name == normalized)
+    })
+}
+
+pub(super) fn native_resolve_scoped_class_name(
+    context: &NativeRequestColdState<'_>,
+    class_name: &str,
+    caller_function: u32,
+) -> Result<String, String> {
+    match class_name.to_ascii_lowercase().as_str() {
+        "self" => native_effective_calling_class(context, caller_function)
+            .map(|class| class.display_name.clone())
+            .ok_or_else(|| "Cannot use \"self\" in the global scope".to_owned()),
+        "static" => context
+            .called_classes
+            .last()
+            .map(|class| class.to_string())
+            .or_else(|| {
+                native_effective_calling_class(context, caller_function)
+                    .map(|class| class.display_name.clone())
+            })
+            .ok_or_else(|| "Cannot use \"static\" in the global scope".to_owned()),
+        "parent" => native_effective_calling_class(context, caller_function)
+            .and_then(|class| {
+                class
+                    .parent_display_name
+                    .clone()
+                    .or_else(|| class.parent.clone())
+            })
+            .ok_or_else(|| "Cannot use \"parent\" when no parent scope is active".to_owned()),
+        _ => Ok(class_name.to_owned()),
+    }
+}
+
+pub(super) fn native_method_access_error(
+    context: &NativeRequestColdState<'_>,
+    function: php_ir::FunctionId,
+    caller_function: u32,
+    _late_static_call: bool,
+) -> Option<String> {
+    let (declaring_class, method) = context.unit.classes.iter().find_map(|class| {
+        class
+            .methods
+            .iter()
+            .find(|method| method.function == function)
+            .map(|method| (class, method))
+    })?;
+    if !method.flags.is_private && !method.flags.is_protected {
+        return None;
+    }
+    let caller = native_effective_calling_class(context, caller_function);
+    if method.flags.is_private && caller.is_none_or(|caller| caller.name != declaring_class.name) {
+        if caller.is_none() {
+            return Some(format!(
+                "Call to private method {}::{}() from global scope",
+                declaring_class.display_name, method.name
+            ));
+        }
+        return Some(format!(
+            "Cannot access private method {}::{}()",
+            declaring_class.display_name, method.name
+        ));
+    }
+    if method.flags.is_protected
+        && caller
+            .is_none_or(|caller| !native_class_is_a(context, &caller.name, &declaring_class.name))
+    {
+        return Some(format!(
+            "Cannot access protected method {}::{}()",
+            declaring_class.display_name, method.name
+        ));
+    }
+    None
+}
+
+pub(super) fn native_external_method_access_error(
+    context: &NativeRequestColdState<'_>,
+    target: NativeDynamicFunction,
+    caller_function: u32,
+    _late_static_call: bool,
+) -> Option<String> {
+    let unit = context.dynamic_units.get(target.unit)?.compiled.unit();
+    let (declaring_class, method) = unit.classes.iter().find_map(|class| {
+        class
+            .methods
+            .iter()
+            .find(|method| method.function == target.function)
+            .map(|method| (class, method))
+    })?;
+    if !method.flags.is_private && !method.flags.is_protected {
+        return None;
+    }
+    let caller = native_effective_calling_class(context, caller_function);
+    if method.flags.is_private && caller.is_none_or(|caller| caller.name != declaring_class.name) {
+        if caller.is_none() {
+            return Some(format!(
+                "Call to private method {}::{}() from global scope",
+                declaring_class.display_name, method.name
+            ));
+        }
+        return Some(format!(
+            "Cannot access private method {}::{}()",
+            declaring_class.display_name, method.name
+        ));
+    }
+    if method.flags.is_protected
+        && caller
+            .is_none_or(|caller| !native_class_is_a(context, &caller.name, &declaring_class.name))
+    {
+        return Some(format!(
+            "Cannot access protected method {}::{}()",
+            declaring_class.display_name, method.name
+        ));
+    }
+    None
+}

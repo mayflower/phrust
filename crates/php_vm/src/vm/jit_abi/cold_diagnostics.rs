@@ -182,7 +182,7 @@ pub(super) fn native_argument_count_message(
 /// message encoding to the exact allocator; class/source resolution never
 /// runs in the exception-construction path.
 #[repr(C)]
-pub(super) struct PreparedNativeThrowableSite {
+pub(crate) struct PreparedNativeThrowableSite {
     pub native_view: php_jit::JitNativePreparedExceptionView,
     pub runtime_class: php_runtime::api::ClassEntry,
     pub display_name: String,

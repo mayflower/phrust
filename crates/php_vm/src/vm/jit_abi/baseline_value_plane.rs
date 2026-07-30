@@ -40,46 +40,6 @@ pub(super) struct NativeRegisteredCallbackTransfer {
     pub(super) exception_handlers: Vec<Value>,
 }
 
-#[derive(Clone)]
-pub(super) struct NativeRegisteredAutoloadCallback {
-    pub(super) callable: i64,
-    pub(super) transient_export: bool,
-}
-
-#[derive(Clone)]
-pub(super) enum NativeRegisteredCallbackSource {
-    Cold(php_ir::Instruction),
-    NativeContinuation { function: u32, continuation: u32 },
-}
-
-#[derive(Clone)]
-pub(super) struct NativeRegisteredShutdownCallback {
-    pub(super) callable: i64,
-    pub(super) arguments: Vec<i64>,
-    pub(super) source: NativeRegisteredCallbackSource,
-    pub(super) transient_export: bool,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct NativeRegisteredErrorHandler {
-    pub(super) callback: i64,
-    pub(super) levels: i64,
-}
-
-/// Authoritative request-owned callback roots.
-///
-/// Every handle owns one direct native value. This state is the only active
-/// representation used by autoload, shutdown, diagnostic, and exception
-/// dispatch. Rust `Value` callbacks exist solely in the explicit cold
-/// include/eval transfer record above.
-#[derive(Default)]
-pub(super) struct NativeRegisteredCallbackState {
-    pub(super) autoload_callbacks: Vec<NativeRegisteredAutoloadCallback>,
-    pub(super) shutdown_callbacks: Vec<NativeRegisteredShutdownCallback>,
-    pub(super) error_handlers: Vec<NativeRegisteredErrorHandler>,
-    pub(super) exception_handlers: Vec<i64>,
-}
-
 fn extract_transient_autoload_callbacks(
     callbacks: &mut Vec<NativeRegisteredAutoloadCallback>,
 ) -> Vec<NativeRegisteredAutoloadCallback> {

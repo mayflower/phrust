@@ -13,7 +13,7 @@ use std::sync::Arc;
 /// Appends an already-typed native string without recovering the cold runtime
 /// coordinator or materializing a compatibility graph.
 #[allow(unsafe_code)] // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
-pub(in crate::vm) extern "C" fn jit_native_echo_bytes_abi(
+pub(crate) extern "C" fn jit_native_echo_bytes_abi(
     runtime: *mut NativeRequestFastState,
     bytes: *const u8,
     length: u64,
@@ -43,7 +43,7 @@ pub(in crate::vm) extern "C" fn jit_native_echo_bytes_abi(
 
 /// Formats one SSA-proven PHP float and publishes the result directly in the
 /// authoritative native string arena, without constructing a compatibility graph.
-pub(in crate::vm) extern "C" fn jit_native_float_to_string_abi(
+pub(crate) extern "C" fn jit_native_float_to_string_abi(
     runtime: *mut NativeRequestFastState,
     value: f64,
 ) -> php_jit::JitNativeControlResult {
@@ -71,7 +71,7 @@ pub(in crate::vm) extern "C" fn jit_native_float_to_string_abi(
 /// Generated code supplies the immutable byte range published by the direct
 /// string descriptor. The descriptor remains live for this synchronous call.
 #[allow(unsafe_code)] // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
-pub(in crate::vm) extern "C" fn jit_native_numeric_string_abi(
+pub(crate) extern "C" fn jit_native_numeric_string_abi(
     bytes: *const u8,
     length: u64,
 ) -> php_jit::JitNativeNumericStringResult {
@@ -123,23 +123,19 @@ pub(in crate::vm) extern "C" fn jit_native_numeric_string_abi(
 
 /// Computes PHP `fmod`'s IEEE floating-point remainder without request state,
 /// an operation selector, or compatibility graph conversion.
-pub(in crate::vm) extern "C" fn jit_native_fmod_f64_abi(dividend: f64, divisor: f64) -> f64 {
+pub(crate) extern "C" fn jit_native_fmod_f64_abi(dividend: f64, divisor: f64) -> f64 {
     dividend % divisor
 }
 
 /// Applies PHP's validated rounding mode without request state, compatibility
 /// conversion, or a runtime operation selector.
-pub(in crate::vm) extern "C" fn jit_native_round_f64_abi(
-    value: f64,
-    precision: i64,
-    mode: i64,
-) -> f64 {
+pub(crate) extern "C" fn jit_native_round_f64_abi(value: f64, precision: i64, mode: i64) -> f64 {
     php_runtime::api::native_round_f64(value, precision, mode)
 }
 
 macro_rules! native_unary_math_abi {
     ($name:ident, $method:ident) => {
-        pub(in crate::vm) extern "C" fn $name(value: f64) -> f64 {
+        pub(crate) extern "C" fn $name(value: f64) -> f64 {
             value.$method()
         }
     };
@@ -163,23 +159,23 @@ native_unary_math_abi!(jit_native_sinh_f64_abi, sinh);
 native_unary_math_abi!(jit_native_tan_f64_abi, tan);
 native_unary_math_abi!(jit_native_tanh_f64_abi, tanh);
 
-pub(in crate::vm) extern "C" fn jit_native_atan2_f64_abi(left: f64, right: f64) -> f64 {
+pub(crate) extern "C" fn jit_native_atan2_f64_abi(left: f64, right: f64) -> f64 {
     left.atan2(right)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_deg2rad_f64_abi(value: f64) -> f64 {
+pub(crate) extern "C" fn jit_native_deg2rad_f64_abi(value: f64) -> f64 {
     (value / 180.0) * std::f64::consts::PI
 }
 
-pub(in crate::vm) extern "C" fn jit_native_fpow_f64_abi(base: f64, exponent: f64) -> f64 {
+pub(crate) extern "C" fn jit_native_fpow_f64_abi(base: f64, exponent: f64) -> f64 {
     base.powf(exponent)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_hypot_f64_abi(left: f64, right: f64) -> f64 {
+pub(crate) extern "C" fn jit_native_hypot_f64_abi(left: f64, right: f64) -> f64 {
     left.hypot(right)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_rad2deg_f64_abi(value: f64) -> f64 {
+pub(crate) extern "C" fn jit_native_rad2deg_f64_abi(value: f64) -> f64 {
     (value / std::f64::consts::PI) * 180.0
 }
 
@@ -206,7 +202,7 @@ fn native_exact_comparison_order(
 }
 
 /// Exact strict identity over the authoritative native value graph.
-pub(in crate::vm) extern "C" fn jit_native_identical_abi(
+pub(crate) extern "C" fn jit_native_identical_abi(
     runtime: *mut NativeRequestFastState,
     left: i64,
     right: i64,
@@ -222,7 +218,7 @@ pub(in crate::vm) extern "C" fn jit_native_identical_abi(
 }
 
 /// Exact strict non-identity over the authoritative native value graph.
-pub(in crate::vm) extern "C" fn jit_native_not_identical_abi(
+pub(crate) extern "C" fn jit_native_not_identical_abi(
     runtime: *mut NativeRequestFastState,
     left: i64,
     right: i64,
@@ -239,7 +235,7 @@ pub(in crate::vm) extern "C" fn jit_native_not_identical_abi(
 }
 
 /// Exact loose equality over the authoritative native value graph.
-pub(in crate::vm) extern "C" fn jit_native_equal_abi(
+pub(crate) extern "C" fn jit_native_equal_abi(
     runtime: *mut NativeRequestFastState,
     left: i64,
     right: i64,
@@ -255,7 +251,7 @@ pub(in crate::vm) extern "C" fn jit_native_equal_abi(
 }
 
 /// Exact loose inequality over the authoritative native value graph.
-pub(in crate::vm) extern "C" fn jit_native_not_equal_abi(
+pub(crate) extern "C" fn jit_native_not_equal_abi(
     runtime: *mut NativeRequestFastState,
     left: i64,
     right: i64,
@@ -272,7 +268,7 @@ pub(in crate::vm) extern "C" fn jit_native_not_equal_abi(
 }
 
 /// Exact PHP less-than comparison over the authoritative native value graph.
-pub(in crate::vm) extern "C" fn jit_native_less_abi(
+pub(crate) extern "C" fn jit_native_less_abi(
     runtime: *mut NativeRequestFastState,
     left: i64,
     right: i64,
@@ -287,7 +283,7 @@ pub(in crate::vm) extern "C" fn jit_native_less_abi(
 }
 
 /// Exact PHP less-than-or-equal comparison over the native value graph.
-pub(in crate::vm) extern "C" fn jit_native_less_equal_abi(
+pub(crate) extern "C" fn jit_native_less_equal_abi(
     runtime: *mut NativeRequestFastState,
     left: i64,
     right: i64,
@@ -302,7 +298,7 @@ pub(in crate::vm) extern "C" fn jit_native_less_equal_abi(
 }
 
 /// Exact PHP greater-than comparison over the authoritative native value graph.
-pub(in crate::vm) extern "C" fn jit_native_greater_abi(
+pub(crate) extern "C" fn jit_native_greater_abi(
     runtime: *mut NativeRequestFastState,
     left: i64,
     right: i64,
@@ -317,7 +313,7 @@ pub(in crate::vm) extern "C" fn jit_native_greater_abi(
 }
 
 /// Exact PHP greater-than-or-equal comparison over the native value graph.
-pub(in crate::vm) extern "C" fn jit_native_greater_equal_abi(
+pub(crate) extern "C" fn jit_native_greater_equal_abi(
     runtime: *mut NativeRequestFastState,
     left: i64,
     right: i64,
@@ -332,7 +328,7 @@ pub(in crate::vm) extern "C" fn jit_native_greater_equal_abi(
 }
 
 /// Exact PHP three-way comparison over the authoritative native value graph.
-pub(in crate::vm) extern "C" fn jit_native_spaceship_abi(
+pub(crate) extern "C" fn jit_native_spaceship_abi(
     runtime: *mut NativeRequestFastState,
     left: i64,
     right: i64,
@@ -352,7 +348,7 @@ pub(in crate::vm) extern "C" fn jit_native_spaceship_abi(
 
 /// Returns the already-published class name of one direct object without
 /// decoding a compatibility graph or entering generic property dispatch.
-pub(in crate::vm) extern "C" fn jit_native_object_class_name_abi(
+pub(crate) extern "C" fn jit_native_object_class_name_abi(
     runtime: *mut NativeRequestFastState,
     object: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -383,7 +379,7 @@ pub(in crate::vm) extern "C" fn jit_native_object_class_name_abi(
 /// Acquires one representation-complete callable directly from authoritative
 /// native storage. Unsupported callable shapes request the instruction's one
 /// baseline continuation; no generic operation dispatcher is entered.
-pub(in crate::vm) extern "C" fn jit_native_acquire_callable_abi(
+pub(crate) extern "C" fn jit_native_acquire_callable_abi(
     runtime: *mut NativeRequestFastState,
     value: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -403,7 +399,7 @@ pub(in crate::vm) extern "C" fn jit_native_acquire_callable_abi(
 /// Publishes one compile-time callable from its immutable target/signature
 /// contract. Generated code passes the already-resolved function identity and
 /// flags, so this boundary performs no symbol query or dynamic dispatch.
-pub(in crate::vm) extern "C" fn jit_native_resolve_callable_abi(
+pub(crate) extern "C" fn jit_native_resolve_callable_abi(
     runtime: *mut NativeRequestFastState,
     name: *const u8,
     length: u64,
@@ -544,7 +540,7 @@ fn native_array_count(
 /// Exact `count` over authoritative direct-array entries. Publication admits
 /// only non-recursive direct-array forms to optimizing code; unsupported
 /// modes, compatibility values, and cycles are contract violations here.
-pub(in crate::vm) extern "C" fn jit_native_count_abi(
+pub(crate) extern "C" fn jit_native_count_abi(
     runtime: *mut NativeRequestFastState,
     value: i64,
     mode: i64,
@@ -553,7 +549,7 @@ pub(in crate::vm) extern "C" fn jit_native_count_abi(
 }
 
 /// `sizeof` is a distinct fixed target with the same PHP array semantics.
-pub(in crate::vm) extern "C" fn jit_native_sizeof_abi(
+pub(crate) extern "C" fn jit_native_sizeof_abi(
     runtime: *mut NativeRequestFastState,
     value: i64,
     mode: i64,
@@ -808,7 +804,7 @@ fn native_string_ranges(
     }
 }
 
-pub(in crate::vm) extern "C" fn jit_native_array_union_abi(
+pub(crate) extern "C" fn jit_native_array_union_abi(
     runtime: *mut NativeRequestFastState,
     left: i64,
     right: i64,
@@ -822,7 +818,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_union_abi(
     )
 }
 
-pub(in crate::vm) extern "C" fn jit_native_concat_abi(
+pub(crate) extern "C" fn jit_native_concat_abi(
     runtime: *mut NativeRequestFastState,
     left: i64,
     right: i64,
@@ -900,7 +896,7 @@ fn native_string_bitwise<const OPERATION: u8>(
 
 macro_rules! native_string_bitwise_abi {
     ($name:ident, $operation:literal) => {
-        pub(in crate::vm) extern "C" fn $name(
+        pub(crate) extern "C" fn $name(
             runtime: *mut NativeRequestFastState,
             left: i64,
             right: i64,
@@ -939,7 +935,7 @@ fn native_exact_unary_numeric(
     publish_native_binary_number(fast, result)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_unary_plus_abi(
+pub(crate) extern "C" fn jit_native_unary_plus_abi(
     runtime: *mut NativeRequestFastState,
     source: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -950,7 +946,7 @@ pub(in crate::vm) extern "C" fn jit_native_unary_plus_abi(
     native_exact_unary_numeric(fast, source, false)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_unary_minus_abi(
+pub(crate) extern "C" fn jit_native_unary_minus_abi(
     runtime: *mut NativeRequestFastState,
     source: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -961,7 +957,7 @@ pub(in crate::vm) extern "C" fn jit_native_unary_minus_abi(
     native_exact_unary_numeric(fast, source, true)
 }
 
-pub(in crate::vm) extern "C" fn jit_native_bit_not_abi(
+pub(crate) extern "C" fn jit_native_bit_not_abi(
     runtime: *mut NativeRequestFastState,
     source: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -1111,7 +1107,7 @@ pub(super) fn native_object_vars_entries(
 /// native values. Arrays retain COW identity, objects expose property order
 /// with PHP visibility key encoding, null becomes empty, and every other
 /// admitted value becomes element zero.
-pub(in crate::vm) extern "C" fn jit_native_array_cast_abi(
+pub(crate) extern "C" fn jit_native_array_cast_abi(
     runtime: *mut NativeRequestFastState,
     mut source: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -1233,7 +1229,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_cast_abi(
 /// Exact explicit integer cast for publication-admitted scalar and array
 /// values. Object-like shapes are rejected before optimizer entry; strings
 /// and every float payload use PHP's shared numeric conversion directly.
-pub(in crate::vm) extern "C" fn jit_native_int_cast_abi(
+pub(crate) extern "C" fn jit_native_int_cast_abi(
     runtime: *mut NativeRequestFastState,
     source: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -1266,7 +1262,7 @@ pub(in crate::vm) extern "C" fn jit_native_int_cast_abi(
 /// Exact explicit float cast for publication-admitted scalar and array values.
 /// Object-like shapes are rejected before optimizer entry; native strings use
 /// the shared numeric parser without reconstructing a runtime value.
-pub(in crate::vm) extern "C" fn jit_native_float_cast_abi(
+pub(crate) extern "C" fn jit_native_float_cast_abi(
     runtime: *mut NativeRequestFastState,
     source: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -1302,7 +1298,7 @@ pub(in crate::vm) extern "C" fn jit_native_float_cast_abi(
 /// native values. Arrays and object-like values are assigned to baseline
 /// before optimizer entry because their warning/`__toString` semantics require
 /// the source span and full PHP call machinery.
-pub(in crate::vm) extern "C" fn jit_native_string_cast_abi(
+pub(crate) extern "C" fn jit_native_string_cast_abi(
     runtime: *mut NativeRequestFastState,
     mut source: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -1360,7 +1356,7 @@ pub(in crate::vm) extern "C" fn jit_native_string_cast_abi(
 /// replaying the containing operation would execute PHP-visible callback
 /// effects twice. Admission proves a non-reference scalar return before the
 /// callback is entered; a representation-contract violation is terminal.
-pub(in crate::vm) extern "C" fn jit_native_callback_return_string_abi(
+pub(crate) extern "C" fn jit_native_callback_return_string_abi(
     runtime: *mut NativeRequestFastState,
     source: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -1423,7 +1419,7 @@ fn native_object_cast_stdclass() -> php_runtime::api::ObjectRef {
 /// stdClass properties, null becomes an empty stdClass, and every other
 /// admitted value is stored in the `scalar` property. No compatibility graph is
 /// decoded or encoded on this path.
-pub(in crate::vm) extern "C" fn jit_native_object_cast_abi(
+pub(crate) extern "C" fn jit_native_object_cast_abi(
     runtime: *mut NativeRequestFastState,
     mut source: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -1578,7 +1574,7 @@ pub(in crate::vm) extern "C" fn jit_native_object_cast_abi(
 /// opaque plan pointer was resolved and validated before native execution;
 /// this call performs no class lookup, flag check, or compatibility graph encode.
 #[allow(unsafe_code)] // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
-pub(in crate::vm) extern "C" fn jit_native_prepared_object_new_abi(
+pub(crate) extern "C" fn jit_native_prepared_object_new_abi(
     runtime: *mut NativeRequestFastState,
     prepared: u64,
 ) -> php_jit::JitNativeControlResult {
@@ -1673,7 +1669,7 @@ fn publish_prepared_throwable_trace(
 }
 
 #[allow(unsafe_code)] // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
-pub(in crate::vm) extern "C" fn jit_native_prepared_exception_new_abi(
+pub(crate) extern "C" fn jit_native_prepared_exception_new_abi(
     runtime: *mut NativeRequestFastState,
     prepared: u64,
     message: i64,
@@ -1751,7 +1747,7 @@ pub(in crate::vm) extern "C" fn jit_native_prepared_exception_new_abi(
 /// binding and transferred one owner per capture; this exact handler never
 /// constructs a compatibility graph or enters the generic dynamic-code executor.
 #[allow(unsafe_code)] // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
-pub(in crate::vm) extern "C" fn jit_native_prepared_closure_new_abi(
+pub(crate) extern "C" fn jit_native_prepared_closure_new_abi(
     runtime: *mut NativeRequestFastState,
     prepared: u64,
     captures: *const i64,
@@ -1813,7 +1809,7 @@ pub(in crate::vm) extern "C" fn jit_native_prepared_closure_new_abi(
 
 /// Shallow-clones one direct object whose exact class was proven not to have
 /// `__clone`; no runtime method lookup or compatibility decode occurs here.
-pub(in crate::vm) extern "C" fn jit_native_plain_object_clone_abi(
+pub(crate) extern "C" fn jit_native_plain_object_clone_abi(
     runtime: *mut NativeRequestFastState,
     object: i64,
 ) -> php_jit::JitNativeControlResult {
@@ -1888,7 +1884,7 @@ pub(in crate::vm) extern "C" fn jit_native_plain_object_clone_abi(
 /// Resolves the stable authoritative cell for one undeclared property. A
 /// missing stdClass name reserves an uninitialized tombstone; generated code
 /// performs the complete operation directly on that cell.
-pub(in crate::vm) extern "C" fn jit_native_dynamic_property_slot_abi(
+pub(crate) extern "C" fn jit_native_dynamic_property_slot_abi(
     runtime: *mut NativeRequestFastState,
     object: i64,
     property: i64,
@@ -1908,7 +1904,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_property_slot_abi(
 /// Resolves the stable authoritative cell for a non-mutating dynamic property
 /// test. Missing ordinary names return the request's immutable absence cell;
 /// declared visibility and `__isset` shapes take one baseline continuation.
-pub(in crate::vm) extern "C" fn jit_native_dynamic_property_test_slot_abi(
+pub(crate) extern "C" fn jit_native_dynamic_property_test_slot_abi(
     runtime: *mut NativeRequestFastState,
     object: i64,
     property: i64,

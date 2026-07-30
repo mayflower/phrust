@@ -301,7 +301,7 @@ impl NativeRequestFastState {
     }
 
     #[allow(unsafe_code)] // Safety: the native request owns every published pointer for the synchronous activation.
-    fn active_call_argument(&self, index: usize) -> Option<i64> {
+    pub(super) fn active_call_argument(&self, index: usize) -> Option<i64> {
         let view = self.header.active_runtime_view();
         if index >= usize::try_from(view.active_call_argument_count).ok()? {
             return None;
@@ -713,7 +713,7 @@ impl NativeRequestFastState {
     /// pointer in the runtime view; this path performs only PHP-visible arena
     /// bounds checks and never recovers the cold execution coordinator.
     #[allow(unsafe_code)] // Safety: the native request owns every published pointer for the synchronous activation.
-    fn publish_direct_string_bytes(&mut self, bytes: &[u8]) -> Result<i64, &'static str> {
+    pub(crate) fn publish_direct_string_bytes(&mut self, bytes: &[u8]) -> Result<i64, &'static str> {
         self.publish_direct_string_with(bytes.len(), |output| output.copy_from_slice(bytes))
     }
 
@@ -949,7 +949,7 @@ impl NativeRequestFastState {
     }
 
     #[allow(unsafe_code)] // Safety: the native request owns every published pointer for the synchronous activation.
-    fn direct_slot(&self, encoded: i64) -> Option<(usize, php_jit::JitNativeValueSlot)> {
+    pub(crate) fn direct_slot(&self, encoded: i64) -> Option<(usize, php_jit::JitNativeValueSlot)> {
         let runtime_index = php_jit::jit_decode_runtime_value(encoded)?;
         let index =
             runtime_index.checked_sub(php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE)? as usize;
@@ -992,7 +992,7 @@ impl NativeRequestFastState {
     /// The owner pointer is slot-parallel and is cleared before the slot is
     /// recycled, so exact object operations need no request hash lookup.
     #[allow(unsafe_code)] // Safety: the native request owns every published pointer for the synchronous activation.
-    fn direct_object(&self, encoded: i64) -> Option<&php_runtime::api::ObjectRef> {
+    pub(crate) fn direct_object(&self, encoded: i64) -> Option<&php_runtime::api::ObjectRef> {
         let encoded = self.native_by_value_encoding(encoded)?;
         let (index, slot) = self.direct_slot(encoded)?;
         if slot.kind != php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT {
@@ -2221,7 +2221,7 @@ impl NativeRequestFastState {
     /// array. Other PHP shapes take the instruction's one baseline
     /// continuation.
     #[allow(unsafe_code)] // Safety: callable slots own request-stable boxes for the synchronous acquisition.
-    fn acquire_direct_callable(&mut self, encoded: i64) -> Result<Option<i64>, &'static str> {
+    pub(crate) fn acquire_direct_callable(&mut self, encoded: i64) -> Result<Option<i64>, &'static str> {
         let Some(encoded) = self.exact_callable_value(encoded) else {
             return Ok(None);
         };
@@ -2342,7 +2342,7 @@ impl NativeRequestFastState {
     }
 
     #[allow(unsafe_code)] // Safety: the native request owns every published pointer for the synchronous activation.
-    fn native_string_view(&self, encoded: i64) -> Option<&[u8]> {
+    pub(crate) fn native_string_view(&self, encoded: i64) -> Option<&[u8]> {
         let encoded = self.native_by_value_encoding(encoded)?;
         if let Some((_, slot)) = self.direct_slot(encoded) {
             if slot.kind != php_jit::JIT_NATIVE_VALUE_VIEW_STRING {
@@ -2390,7 +2390,7 @@ impl NativeRequestFastState {
     ///
     /// The encoded owner must remain live for the complete synchronous use of
     /// the returned range.
-    pub(in crate::vm::jit_abi) fn stable_native_string_range(
+    pub(crate) fn stable_native_string_range(
         &self,
         encoded: i64,
     ) -> Option<(*const u8, usize)> {
@@ -2405,7 +2405,7 @@ impl NativeRequestFastState {
     /// The encoded array owner must remain live for the complete synchronous
     /// use of the returned range. Native arena reservations do not relocate
     /// or overwrite a live array range.
-    pub(in crate::vm::jit_abi) fn stable_native_array_range(
+    pub(crate) fn stable_native_array_range(
         &self,
         encoded: i64,
     ) -> Option<(*const php_jit::JitNativeDirectArrayEntry, usize)> {
@@ -2539,13 +2539,13 @@ impl NativeRequestFastState {
         self.write_native_serialized(encoded, output, 0, &mut NativeSerializationTraversal::new())
     }
 
-    fn native_serialize_output_length(&self, encoded: i64) -> Option<usize> {
+    pub(crate) fn native_serialize_output_length(&self, encoded: i64) -> Option<usize> {
         let mut output = NativeDirectByteWriter::counting();
         self.write_native_serialized_root(encoded, &mut output)?;
         Some(output.length)
     }
 
-    fn native_serialize_into(&self, encoded: i64, destination: &mut [u8]) -> bool {
+    pub(crate) fn native_serialize_into(&self, encoded: i64, destination: &mut [u8]) -> bool {
         let mut output = NativeDirectByteWriter::writing(destination);
         self.write_native_serialized_root(encoded, &mut output)
             .is_some()
@@ -3539,7 +3539,7 @@ impl NativeRequestFastState {
     /// This builder form is for producers that create each owned key/value
     /// only after the arena reservation succeeds. A failed item build rolls
     /// back every previously completed entry in reverse ownership order.
-    pub(in crate::vm::jit_abi) fn publish_owned_direct_array_with(
+    pub(crate) fn publish_owned_direct_array_with(
         &mut self,
         length: usize,
         mut build: impl FnMut(
@@ -3936,7 +3936,7 @@ impl NativeRequestFastState {
     }
 
     #[allow(unsafe_code)] // Safety: the native request owns every published pointer for the synchronous activation.
-    fn native_direct_array_entries(
+    pub(crate) fn native_direct_array_entries(
         &self,
         encoded: i64,
     ) -> Option<&[php_jit::JitNativeDirectArrayEntry]> {
@@ -4219,7 +4219,7 @@ impl NativeRequestFastState {
         Some(root)
     }
 
-    fn native_http_build_query(
+    pub(crate) fn native_http_build_query(
         &mut self,
         input: i64,
         numeric_prefix: Option<&[u8]>,
@@ -5011,7 +5011,7 @@ impl NativeRequestFastState {
         self.discard_owned_direct_value(previous).is_ok()
     }
 
-    fn native_session_payload(&self) -> Option<i64> {
+    pub(crate) fn native_session_payload(&self) -> Option<i64> {
         let (_, slot) = self.direct_slot(self.session.global_reference)?;
         (slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR
             && slot.flags == php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION
@@ -5121,7 +5121,7 @@ impl NativeRequestFastState {
     }
 
     #[allow(unsafe_code)] // Safety: the native request owns every published pointer for the synchronous activation.
-    fn native_printf_scalar(
+    pub(crate) fn native_printf_scalar(
         &self,
         encoded: i64,
     ) -> Option<php_runtime::api::NativePrintfScalar<'_>> {

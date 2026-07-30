@@ -1,6 +1,6 @@
 //! Native PHP execution coordinator.
 
-mod jit_abi;
+pub(crate) mod jit_abi;
 mod native_compile_cache;
 mod native_entry;
 mod options;
