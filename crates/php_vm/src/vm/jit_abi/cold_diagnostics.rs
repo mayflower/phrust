@@ -181,7 +181,9 @@ pub(super) fn native_argument_count_message(
 /// site. Generated code forwards only the opaque pointer and the native
 /// message encoding to the exact allocator; class/source resolution never
 /// runs in the exception-construction path.
+#[repr(C)]
 pub(super) struct PreparedNativeThrowableSite {
+    pub native_view: php_jit::JitNativePreparedExceptionView,
     pub runtime_class: php_runtime::api::ClassEntry,
     pub display_name: String,
     pub function_name: String,
@@ -197,6 +199,14 @@ pub(super) fn prepare_native_throwable_site(
     include_function_frame: bool,
     span: php_ir::IrSpan,
 ) -> PreparedNativeThrowableSite {
+    fn string_capacity(length: usize) -> usize {
+        length
+            .max(php_jit::JIT_NATIVE_DIRECT_STRING_MIN_CAPACITY as usize)
+            .checked_next_power_of_two()
+            .filter(|capacity| *capacity <= php_jit::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY)
+            .unwrap_or(php_jit::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY)
+    }
+
     let (runtime_class, display_name) = native_throwable_class(class);
     let file = context
         .unit
@@ -208,7 +218,23 @@ pub(super) fn prepare_native_throwable_site(
             |file| Box::<[u8]>::from(file.path.as_bytes()),
         );
     let line = i64::try_from(native_source_line_for_span(context, span)).unwrap_or(i64::MAX);
+    let fixed_string_bytes = string_capacity(file.len()).saturating_add(
+        include_function_frame
+            .then(|| {
+                string_capacity("function".len())
+                    .saturating_add(string_capacity(function_name.len()))
+                    .saturating_add(string_capacity("args".len()))
+            })
+            .unwrap_or(0),
+    );
     PreparedNativeThrowableSite {
+        native_view: php_jit::JitNativePreparedExceptionView {
+            fixed_string_bytes: u64::try_from(fixed_string_bytes).unwrap_or(u64::MAX),
+            fixed_value_slots: if include_function_frame { 9 } else { 4 },
+            fixed_array_entries: if include_function_frame { 3 } else { 1 },
+            property_slots: 6,
+            include_function_frame: u32::from(include_function_frame),
+        },
         runtime_class,
         display_name,
         function_name: function_name.to_owned(),

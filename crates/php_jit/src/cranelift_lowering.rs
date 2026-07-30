@@ -44,10 +44,41 @@ struct NativeFunctionMetadata {
     native_arity: usize,
     reference_only_trampoline: bool,
     returns_by_reference: bool,
+    return_type: Option<php_ir::IrReturnType>,
     /// The fixed callee owns generated catch/finally resume entries. A direct
     /// caller keeps its activation live and selects one through the immutable
     /// exception-route table when the callee returns `THROW`.
     has_exception_handlers: bool,
+}
+
+fn native_callable_return_type_is_releasable_scalar(type_: &php_ir::IrReturnType) -> bool {
+    use php_ir::IrReturnType as Type;
+    match type_ {
+        Type::Int
+        | Type::Float
+        | Type::String
+        | Type::Bool
+        | Type::Null
+        | Type::False
+        | Type::True
+        | Type::Void
+        | Type::Never => true,
+        Type::Nullable { inner } => native_callable_return_type_is_releasable_scalar(inner),
+        Type::Union { members } => {
+            !members.is_empty()
+                && members
+                    .iter()
+                    .all(native_callable_return_type_is_releasable_scalar)
+        }
+        Type::Array
+        | Type::Callable
+        | Type::Iterable
+        | Type::Object
+        | Type::Mixed
+        | Type::Class { .. }
+        | Type::Intersection { .. }
+        | Type::Dnf { .. } => false,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -500,56 +531,14 @@ struct BaselineNativeOperations {
     execution_poll: Option<NativeHelper>,
 }
 
-const NATIVE_EXACT_BINARY_COUNT: usize = 12;
-
-const fn native_exact_binary_index(operation: RegionBinaryOp) -> usize {
+fn native_string_bitwise_index(operation: RegionBinaryOp) -> usize {
     match operation {
-        RegionBinaryOp::Add => 0,
-        RegionBinaryOp::Sub => 1,
-        RegionBinaryOp::Mul => 2,
-        RegionBinaryOp::Div => 3,
-        RegionBinaryOp::Mod => 4,
-        RegionBinaryOp::Concat => 5,
-        RegionBinaryOp::Pow => 6,
-        RegionBinaryOp::BitAnd => 7,
-        RegionBinaryOp::BitOr => 8,
-        RegionBinaryOp::BitXor => 9,
-        RegionBinaryOp::ShiftLeft => 10,
-        RegionBinaryOp::ShiftRight => 11,
+        RegionBinaryOp::BitAnd => 0,
+        RegionBinaryOp::BitOr => 1,
+        RegionBinaryOp::BitXor => 2,
+        _ => unreachable!("not a string bit operation"),
     }
 }
-
-const fn native_exact_binary_symbol(operation: RegionBinaryOp) -> &'static str {
-    match operation {
-        RegionBinaryOp::Add => "phrust_native_add",
-        RegionBinaryOp::Sub => "phrust_native_subtract",
-        RegionBinaryOp::Mul => "phrust_native_multiply",
-        RegionBinaryOp::Div => "phrust_native_divide",
-        RegionBinaryOp::Mod => "phrust_native_modulo",
-        RegionBinaryOp::Concat => "phrust_native_concat",
-        RegionBinaryOp::Pow => "phrust_native_power",
-        RegionBinaryOp::BitAnd => "phrust_native_bit_and",
-        RegionBinaryOp::BitOr => "phrust_native_bit_or",
-        RegionBinaryOp::BitXor => "phrust_native_bit_xor",
-        RegionBinaryOp::ShiftLeft => "phrust_native_shift_left",
-        RegionBinaryOp::ShiftRight => "phrust_native_shift_right",
-    }
-}
-
-const NATIVE_EXACT_BINARY_OPERATIONS: [RegionBinaryOp; NATIVE_EXACT_BINARY_COUNT] = [
-    RegionBinaryOp::Add,
-    RegionBinaryOp::Sub,
-    RegionBinaryOp::Mul,
-    RegionBinaryOp::Div,
-    RegionBinaryOp::Mod,
-    RegionBinaryOp::Concat,
-    RegionBinaryOp::Pow,
-    RegionBinaryOp::BitAnd,
-    RegionBinaryOp::BitOr,
-    RegionBinaryOp::BitXor,
-    RegionBinaryOp::ShiftLeft,
-    RegionBinaryOp::ShiftRight,
-];
 
 const NATIVE_EXACT_UNARY_COUNT: usize = 3;
 const NATIVE_EXACT_UNARY_OPERATIONS: [RegionUnaryOp; NATIVE_EXACT_UNARY_COUNT] = [
@@ -620,7 +609,9 @@ const fn native_exact_compare_symbol(operation: RegionCompareOpCode) -> &'static
 #[derive(Clone, Copy, Debug)]
 struct NativeOptimizingOperations {
     execution_poll: Option<NativeHelper>,
-    exact_binary: [Option<NativeHelper>; NATIVE_EXACT_BINARY_COUNT],
+    array_union: Option<NativeHelper>,
+    concat: Option<NativeHelper>,
+    string_bitwise: [Option<NativeHelper>; 3],
     exact_unary: [Option<NativeHelper>; NATIVE_EXACT_UNARY_COUNT],
     exact_compare: [Option<NativeHelper>; NATIVE_EXACT_COMPARE_COUNT],
     echo_bytes: Option<NativeHelper>,
@@ -638,7 +629,6 @@ struct NativeOptimizingOperations {
     object_class_name: Option<NativeHelper>,
     acquire_callable: Option<NativeHelper>,
     resolve_callable: Option<NativeHelper>,
-    dynamic_instanceof: Option<NativeHelper>,
     prepared_object_new: Option<NativeHelper>,
     prepared_exception_new: Option<NativeHelper>,
     prepared_closure_new: Option<NativeHelper>,
@@ -711,8 +701,10 @@ impl NativeOptimizingOperations {
         self.execution_poll = self
             .execution_poll
             .map(|helper| helper.with_runtime(runtime));
-        self.exact_binary = self
-            .exact_binary
+        self.array_union = self.array_union.map(|helper| helper.with_runtime(runtime));
+        self.concat = self.concat.map(|helper| helper.with_runtime(runtime));
+        self.string_bitwise = self
+            .string_bitwise
             .map(|helper| helper.map(|helper| helper.with_runtime(runtime)));
         self.exact_unary = self
             .exact_unary
@@ -759,9 +751,6 @@ impl NativeOptimizingOperations {
             .map(|helper| helper.with_runtime(runtime));
         self.resolve_callable = self
             .resolve_callable
-            .map(|helper| helper.with_runtime(runtime));
-        self.dynamic_instanceof = self
-            .dynamic_instanceof
             .map(|helper| helper.with_runtime(runtime));
         self.prepared_object_new = self
             .prepared_object_new
@@ -6888,47 +6877,28 @@ fn lower_optimizing_exact_unary_runtime_builtin(
     Ok(value)
 }
 
-/// Calls one fixed binary native target.
-///
-/// Unlike the legacy bounded exact-builtin adapter, this boundary has no
-/// argument-count word and no padded argument slots. The operation family and
-/// arity are fixed when the optimizing artifact is compiled.
-fn lower_optimizing_exact_binary_runtime_builtin(
-    module: &mut JITModule,
-    builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
-    left: ir::Value,
-    right: ir::Value,
-    transition: NativeOptimizingTransition<'_>,
-) -> Result<ir::Value, CraneliftLoweringError> {
-    let helper = helper.ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_EXACT_BINARY_BUILTIN",
-            "prepared binary runtime builtin has no fixed native handler",
+// Expand each fixed two-argument target at its family callsite. This keeps the
+// declared target direct while avoiding a shared binary control adapter in
+// optimizing source and emitted artifacts.
+macro_rules! emit_fixed_two_argument_control {
+    (
+        $module:expr,
+        $builder:expr,
+        $helper:expr,
+        $left:expr,
+        $right:expr,
+        $transition:expr
+        $(,)?
+    ) => {
+        emit_exact_native_control_value!(
+            $module,
+            $builder,
+            $helper,
+            &[$left, $right],
+            $transition,
+            "prepared two-argument runtime builtin has no fixed native handler",
         )
-    })?;
-    let call = call_native_helper(module, builder, helper, &[left, right]);
-    let control = builder.inst_results(call)[0];
-    let value = builder.inst_results(call)[1];
-    let status = builder.ins().ireduce(types::I32, control);
-    let detail = builder.ins().ushr_imm(control, 32);
-    let detail = builder.ins().ireduce(types::I32, detail);
-    let returned = builder.create_block();
-    let control_exit = builder.create_block();
-    let is_return = builder.ins().icmp_imm(
-        IntCC::Equal,
-        status,
-        i64::from(crate::JitCallStatus::RETURN.0),
-    );
-    builder
-        .ins()
-        .brif(is_return, returned, &[], control_exit, &[]);
-
-    builder.switch_to_block(control_exit);
-    transition.emit_control(builder, status, detail, value)?;
-
-    builder.switch_to_block(returned);
-    Ok(value)
+    };
 }
 
 /// Calls one fixed ternary native target without a count word or padded tail.
@@ -12029,7 +11999,7 @@ fn lower_optimizing_recursive_array_fold(
     };
     let start = usize::from(matches!(operation, StableRecursiveArrayBuiltin::Replace));
     for right in arrays.iter().copied().skip(start) {
-        accumulator = lower_optimizing_exact_binary_runtime_builtin(
+        accumulator = emit_fixed_two_argument_control!(
             module,
             builder,
             helper,
@@ -16658,6 +16628,35 @@ fn lower_optimizing_authoritative_integer(
     builder.block_params(merge)[0]
 }
 
+fn lower_optimizing_integer_value(
+    builder: &mut FunctionBuilder<'_>,
+    encoded: ir::Value,
+    operand: RegionOperand,
+    constants: &[IrConstant],
+    deopt_out: ir::Value,
+) -> ir::Value {
+    match operand {
+        RegionOperand::I64(value) => builder.ins().iconst(types::I64, value),
+        RegionOperand::Constant(index) => match constants.get(index as usize) {
+            Some(IrConstant::Int(value)) => builder.ins().iconst(types::I64, *value),
+            Some(IrConstant::String(_) | IrConstant::StringBytes(_)) => {
+                match fixed_numeric_string_value(constants, operand) {
+                    Some(php_runtime::experimental::numeric_string::NumericStringValue::Int(
+                        value,
+                    )) => builder.ins().iconst(types::I64, value),
+                    _ => lower_optimizing_authoritative_integer(builder, encoded, deopt_out),
+                }
+            }
+            _ => lower_optimizing_authoritative_integer(builder, encoded, deopt_out),
+        },
+        RegionOperand::Register(_)
+        | RegionOperand::Local(_)
+        | RegionOperand::LinkedConstant { .. } => {
+            lower_optimizing_authoritative_integer(builder, encoded, deopt_out)
+        }
+    }
+}
+
 fn lower_optimizing_unbox_integer(
     builder: &mut FunctionBuilder<'_>,
     encoded: ir::Value,
@@ -16806,7 +16805,7 @@ fn lower_optimizing_encode_int(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lower_optimizing_float_cast(
+fn lower_optimizing_float_value(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     encoded: ir::Value,
@@ -16822,6 +16821,26 @@ fn lower_optimizing_float_cast(
                 RegionOperand::I64(value) => builder.ins().iconst(types::I64, value),
                 RegionOperand::Constant(index) => match constants.get(index as usize) {
                     Some(IrConstant::Int(value)) => builder.ins().iconst(types::I64, *value),
+                    Some(IrConstant::String(_) | IrConstant::StringBytes(_))
+                        if matches!(
+                            fixed_numeric_string_value(constants, operand),
+                            Some(
+                                php_runtime::experimental::numeric_string::NumericStringValue::Int(
+                                    _
+                                )
+                            )
+                        ) =>
+                    {
+                        let Some(
+                            php_runtime::experimental::numeric_string::NumericStringValue::Int(
+                                value,
+                            ),
+                        ) = fixed_numeric_string_value(constants, operand)
+                        else {
+                            unreachable!("guarded fixed integer string");
+                        };
+                        builder.ins().iconst(types::I64, value)
+                    }
                     _ => {
                         let encoded =
                             lower_optimizing_reference_scalar(builder, encoded, false, transition)?;
@@ -16846,6 +16865,23 @@ fn lower_optimizing_float_cast(
                     Some(IrConstant::Float(value)) => builder.ins().f64const(
                         cranelift_codegen::ir::immediates::Ieee64::with_float(*value),
                     ),
+                    Some(IrConstant::String(_) | IrConstant::StringBytes(_))
+                        if fixed_numeric_string_value(constants, operand).is_some() =>
+                    {
+                        let value = match fixed_numeric_string_value(constants, operand)
+                            .expect("guarded fixed numeric string")
+                        {
+                            php_runtime::experimental::numeric_string::NumericStringValue::Int(
+                                value,
+                            ) => value as f64,
+                            php_runtime::experimental::numeric_string::NumericStringValue::Float(
+                                value,
+                            ) => value,
+                        };
+                        builder
+                            .ins()
+                            .f64const(cranelift_codegen::ir::immediates::Ieee64::with_float(value))
+                    }
                     _ => {
                         let encoded =
                             lower_optimizing_reference_scalar(builder, encoded, false, transition)?;
@@ -16918,7 +16954,222 @@ fn lower_optimizing_float_cast(
             ));
         }
     };
+    Ok(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_optimizing_float_cast(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    encoded: ir::Value,
+    operand: RegionOperand,
+    constants: &[IrConstant],
+    fact: crate::region_ir::SsaValueFact,
+    numeric_string: Option<NativeHelper>,
+    transition: NativeOptimizingTransition<'_>,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    let value = lower_optimizing_float_value(
+        module,
+        builder,
+        encoded,
+        operand,
+        constants,
+        fact,
+        numeric_string,
+        transition,
+    )?;
     lower_optimizing_encode_float(builder, value, transition)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_optimizing_power(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    lhs_encoded: ir::Value,
+    rhs_encoded: ir::Value,
+    lhs_operand: RegionOperand,
+    rhs_operand: RegionOperand,
+    constants: &[IrConstant],
+    lhs_fact: crate::region_ir::SsaValueFact,
+    rhs_fact: crate::region_ir::SsaValueFact,
+    fpow: Option<NativeHelper>,
+    numeric_string: Option<NativeHelper>,
+    transition: NativeOptimizingTransition<'_>,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    let fpow = fpow.ok_or_else(|| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_BINARY_POWER_PUBLICATION",
+            "numeric power has no fixed pure native target",
+        )
+    })?;
+    let both_integer = lhs_fact.class == SsaValueClass::Int && rhs_fact.class == SsaValueClass::Int;
+    if !both_integer {
+        let lhs = lower_optimizing_float_value(
+            module,
+            builder,
+            lhs_encoded,
+            lhs_operand,
+            constants,
+            lhs_fact,
+            numeric_string,
+            transition,
+        )?;
+        let rhs = lower_optimizing_float_value(
+            module,
+            builder,
+            rhs_encoded,
+            rhs_operand,
+            constants,
+            rhs_fact,
+            numeric_string,
+            transition,
+        )?;
+        let call = call_native_pure_handler(module, builder, fpow, &[lhs, rhs]);
+        let result = builder.inst_results(call)[0];
+        return lower_optimizing_encode_float(builder, result, transition);
+    }
+
+    let lhs = lower_optimizing_integer_value(
+        builder,
+        lhs_encoded,
+        lhs_operand,
+        constants,
+        transition.deopt_out,
+    );
+    let rhs = lower_optimizing_integer_value(
+        builder,
+        rhs_encoded,
+        rhs_operand,
+        constants,
+        transition.deopt_out,
+    );
+    let integer_loop = builder.create_block();
+    let multiply_accumulator = builder.create_block();
+    let advance = builder.create_block();
+    let square_base = builder.create_block();
+    let integer_result = builder.create_block();
+    let floating_result = builder.create_block();
+    let merge = builder.create_block();
+    for block in [integer_loop, advance] {
+        builder.append_block_param(block, types::I64);
+        builder.append_block_param(block, types::I64);
+        builder.append_block_param(block, types::I64);
+    }
+    builder.append_block_param(multiply_accumulator, types::I64);
+    builder.append_block_param(multiply_accumulator, types::I64);
+    builder.append_block_param(multiply_accumulator, types::I64);
+    builder.append_block_param(square_base, types::I64);
+    builder.append_block_param(square_base, types::I64);
+    builder.append_block_param(square_base, types::I64);
+    builder.append_block_param(integer_result, types::I64);
+    builder.append_block_param(merge, types::I64);
+
+    // Preserve PHP's integer-power lane exactly: the exponent must fit the
+    // checked-u32 implementation and every multiply must remain in i64.
+    // Every other numeric result takes the fixed pure-f64 target, never a
+    // control-result or baseline adapter.
+    let non_negative = builder
+        .ins()
+        .icmp_imm(IntCC::SignedGreaterThanOrEqual, rhs, 0);
+    let bounded = builder
+        .ins()
+        .icmp_imm(IntCC::UnsignedLessThanOrEqual, rhs, i64::from(u32::MAX));
+    let integer_candidate = builder.ins().band(non_negative, bounded);
+    let one = builder.ins().iconst(types::I64, 1);
+    builder.ins().brif(
+        integer_candidate,
+        integer_loop,
+        &[lhs.into(), rhs.into(), one.into()],
+        floating_result,
+        &[],
+    );
+
+    builder.switch_to_block(integer_loop);
+    let base = builder.block_params(integer_loop)[0];
+    let exponent = builder.block_params(integer_loop)[1];
+    let accumulator = builder.block_params(integer_loop)[2];
+    let done = builder.ins().icmp_imm(IntCC::Equal, exponent, 0);
+    let odd = builder.ins().band_imm(exponent, 1);
+    let odd = builder.ins().icmp_imm(IntCC::NotEqual, odd, 0);
+    let continue_power = builder.create_block();
+    builder.append_block_param(continue_power, types::I64);
+    builder.append_block_param(continue_power, types::I64);
+    builder.append_block_param(continue_power, types::I64);
+    builder.ins().brif(
+        done,
+        integer_result,
+        &[accumulator.into()],
+        continue_power,
+        &[base.into(), exponent.into(), accumulator.into()],
+    );
+
+    builder.switch_to_block(continue_power);
+    let base = builder.block_params(continue_power)[0];
+    let exponent = builder.block_params(continue_power)[1];
+    let accumulator = builder.block_params(continue_power)[2];
+    builder.ins().brif(
+        odd,
+        multiply_accumulator,
+        &[base.into(), exponent.into(), accumulator.into()],
+        advance,
+        &[base.into(), exponent.into(), accumulator.into()],
+    );
+
+    builder.switch_to_block(multiply_accumulator);
+    let base = builder.block_params(multiply_accumulator)[0];
+    let exponent = builder.block_params(multiply_accumulator)[1];
+    let accumulator = builder.block_params(multiply_accumulator)[2];
+    let (accumulator, overflow) = builder.ins().smul_overflow(accumulator, base);
+    builder.ins().brif(
+        overflow,
+        floating_result,
+        &[],
+        advance,
+        &[base.into(), exponent.into(), accumulator.into()],
+    );
+
+    builder.switch_to_block(advance);
+    let base = builder.block_params(advance)[0];
+    let exponent = builder.block_params(advance)[1];
+    let accumulator = builder.block_params(advance)[2];
+    let exponent = builder.ins().ushr_imm(exponent, 1);
+    let done = builder.ins().icmp_imm(IntCC::Equal, exponent, 0);
+    builder.ins().brif(
+        done,
+        integer_result,
+        &[accumulator.into()],
+        square_base,
+        &[base.into(), exponent.into(), accumulator.into()],
+    );
+
+    builder.switch_to_block(square_base);
+    let base = builder.block_params(square_base)[0];
+    let exponent = builder.block_params(square_base)[1];
+    let accumulator = builder.block_params(square_base)[2];
+    let (base, overflow) = builder.ins().smul_overflow(base, base);
+    builder.ins().brif(
+        overflow,
+        floating_result,
+        &[],
+        integer_loop,
+        &[base.into(), exponent.into(), accumulator.into()],
+    );
+
+    builder.switch_to_block(integer_result);
+    let result = builder.block_params(integer_result)[0];
+    let result = lower_optimizing_admit_integer_result(builder, result, transition)?;
+    builder.ins().jump(merge, &[result.into()]);
+
+    builder.switch_to_block(floating_result);
+    let lhs = builder.ins().fcvt_from_sint(types::F64, lhs);
+    let rhs = builder.ins().fcvt_from_sint(types::F64, rhs);
+    let call = call_native_pure_handler(module, builder, fpow, &[lhs, rhs]);
+    let result = builder.inst_results(call)[0];
+    let result = lower_optimizing_encode_float(builder, result, transition)?;
+    builder.ins().jump(merge, &[result.into()]);
+
+    builder.switch_to_block(merge);
+    Ok(builder.block_params(merge)[0])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -19054,6 +19305,50 @@ fn lowering_operand_fact(
     value_flow.operand_fact(constants, operand)
 }
 
+fn fixed_numeric_operand_fact(
+    value_flow: &ExecutableValueFlow,
+    constants: &[IrConstant],
+    operand: RegionOperand,
+) -> Option<SsaValueFact> {
+    let fact = lowering_operand_fact(value_flow, constants, operand);
+    if fact.certainty != crate::region_ir::SsaCertainty::Unknown
+        && matches!(fact.class, SsaValueClass::Int | SsaValueClass::Float)
+    {
+        return Some(fact);
+    }
+    use php_runtime::experimental::numeric_string::NumericStringValue;
+    match fixed_numeric_string_value(constants, operand)? {
+        NumericStringValue::Int(value) => Some(
+            SsaValueFact::exact(SsaValueClass::Int, SsaOwnership::ImmortalConstant)
+                .with_integer_range(crate::region_ir::SsaIntegerRange::exact(value)),
+        ),
+        NumericStringValue::Float(_) => Some(SsaValueFact::exact(
+            SsaValueClass::Float,
+            SsaOwnership::ImmortalConstant,
+        )),
+    }
+}
+
+fn fixed_numeric_string_value(
+    constants: &[IrConstant],
+    operand: RegionOperand,
+) -> Option<php_runtime::experimental::numeric_string::NumericStringValue> {
+    let bytes = match operand {
+        RegionOperand::Constant(index) => match constants.get(index as usize)? {
+            IrConstant::String(value) => value.as_bytes(),
+            IrConstant::StringBytes(value) => value.as_slice(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    use php_runtime::experimental::numeric_string::{NumericStringKind, classify};
+    let classified = classify(bytes);
+    match (classified.kind, classified.value) {
+        (NumericStringKind::IntString | NumericStringKind::FloatString, Some(value)) => Some(value),
+        _ => None,
+    }
+}
+
 fn lower_array_key_operand(
     builder: &mut FunctionBuilder<'_>,
     locals: &NativeLocalMap,
@@ -20717,6 +21012,8 @@ fn lower_optimizing_region_instruction(
     transition_live_registers: &[RegId],
     total_native_array_call: bool,
     total_native_array_instruction: bool,
+    total_native_binary_instruction: bool,
+    total_native_scalar_control_instruction: bool,
     fresh_native_array_instruction: bool,
     total_native_local_load: bool,
     total_request_local_store: bool,
@@ -21589,24 +21886,252 @@ fn lower_optimizing_region_instruction(
             define_local_variable(builder, locals, *local, root)?;
         }
         RegionInstructionKind::Binary { dst, op, lhs, rhs } => {
-            emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
+            if !total_native_binary_instruction {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_BINARY_PUBLICATION",
+                    format!(
+                        "binary operation at continuation {} reached optimizing lowering without a total publication plan",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let lhs_operand = *lhs;
+            let rhs_operand = *rhs;
+            let lhs_fact = lowering_operand_fact(value_flow, constants, lhs_operand);
+            let rhs_fact = lowering_operand_fact(value_flow, constants, rhs_operand);
             let lhs = lower_prepared_native_call_operand(
                 builder, locals, registers, constants, *lhs, transition,
             )?;
             let rhs = lower_prepared_native_call_operand(
                 builder, locals, registers, constants, *rhs, transition,
             )?;
-            let value = emit_exact_native_control_value!(
-                module,
-                builder,
-                optimizing_operations.exact_binary[native_exact_binary_index(*op)],
-                &[lhs, rhs],
-                transition,
-                "exact native binary-operation handler was not declared",
-            )?;
+            let both_integer =
+                lhs_fact.class == SsaValueClass::Int && rhs_fact.class == SsaValueClass::Int;
+            let has_float =
+                lhs_fact.class == SsaValueClass::Float || rhs_fact.class == SsaValueClass::Float;
+            let value = if both_integer
+                && matches!(
+                    op,
+                    RegionBinaryOp::Add
+                        | RegionBinaryOp::Sub
+                        | RegionBinaryOp::Mul
+                        | RegionBinaryOp::Mod
+                        | RegionBinaryOp::BitAnd
+                        | RegionBinaryOp::BitOr
+                        | RegionBinaryOp::BitXor
+                        | RegionBinaryOp::ShiftLeft
+                        | RegionBinaryOp::ShiftRight
+                ) {
+                emitted_class = crate::JitProductionLoweringClass::DirectClif;
+                let lhs =
+                    lower_optimizing_authoritative_integer(builder, lhs, transition.deopt_out);
+                let rhs =
+                    lower_optimizing_authoritative_integer(builder, rhs, transition.deopt_out);
+                let raw = match op {
+                    RegionBinaryOp::Add => builder.ins().iadd(lhs, rhs),
+                    RegionBinaryOp::Sub => builder.ins().isub(lhs, rhs),
+                    RegionBinaryOp::Mul => builder.ins().imul(lhs, rhs),
+                    RegionBinaryOp::BitAnd => builder.ins().band(lhs, rhs),
+                    RegionBinaryOp::BitOr => builder.ins().bor(lhs, rhs),
+                    RegionBinaryOp::BitXor => builder.ins().bxor(lhs, rhs),
+                    RegionBinaryOp::ShiftLeft => {
+                        let wide = builder
+                            .ins()
+                            .icmp_imm(IntCC::SignedGreaterThanOrEqual, rhs, 64);
+                        let masked = builder.ins().band_imm(rhs, 63);
+                        let shifted = builder.ins().ishl(lhs, masked);
+                        let zero = builder.ins().iconst(types::I64, 0);
+                        builder.ins().select(wide, zero, shifted)
+                    }
+                    RegionBinaryOp::ShiftRight => {
+                        let wide = builder
+                            .ins()
+                            .icmp_imm(IntCC::SignedGreaterThanOrEqual, rhs, 64);
+                        let masked = builder.ins().band_imm(rhs, 63);
+                        let shifted = builder.ins().sshr(lhs, masked);
+                        let sign = builder.ins().sshr_imm(lhs, 63);
+                        builder.ins().select(wide, sign, shifted)
+                    }
+                    RegionBinaryOp::Mod => {
+                        // `MIN % -1` is defined as zero by PHP but traps in a
+                        // machine signed remainder. Keep that semantic case
+                        // inside the total arithmetic lowering.
+                        let minimum = builder.ins().icmp_imm(IntCC::Equal, lhs, i64::MIN);
+                        let negative_one = builder.ins().icmp_imm(IntCC::Equal, rhs, -1);
+                        let exceptional = builder.ins().band(minimum, negative_one);
+                        let ordinary = builder.create_block();
+                        let exceptional_block = builder.create_block();
+                        let merge = builder.create_block();
+                        builder.append_block_param(merge, types::I64);
+                        builder
+                            .ins()
+                            .brif(exceptional, exceptional_block, &[], ordinary, &[]);
+                        builder.switch_to_block(exceptional_block);
+                        let zero = builder.ins().iconst(types::I64, 0);
+                        builder.ins().jump(merge, &[zero.into()]);
+                        builder.switch_to_block(ordinary);
+                        let remainder = builder.ins().srem(lhs, rhs);
+                        builder.ins().jump(merge, &[remainder.into()]);
+                        builder.switch_to_block(merge);
+                        builder.block_params(merge)[0]
+                    }
+                    RegionBinaryOp::Div | RegionBinaryOp::Concat | RegionBinaryOp::Pow => {
+                        unreachable!("publication selected an integer direct operation")
+                    }
+                };
+                lower_optimizing_admit_integer_result(builder, raw, transition)?
+            } else if both_integer && *op == RegionBinaryOp::Div {
+                emitted_class = crate::JitProductionLoweringClass::DirectClif;
+                let lhs =
+                    lower_optimizing_authoritative_integer(builder, lhs, transition.deopt_out);
+                let rhs =
+                    lower_optimizing_authoritative_integer(builder, rhs, transition.deopt_out);
+                let minimum = builder.ins().icmp_imm(IntCC::Equal, lhs, i64::MIN);
+                let negative_one = builder.ins().icmp_imm(IntCC::Equal, rhs, -1);
+                let quotient_overflows = builder.ins().band(minimum, negative_one);
+                let inspect_remainder = builder.create_block();
+                let integer_result = builder.create_block();
+                let float_result = builder.create_block();
+                let merge = builder.create_block();
+                builder.append_block_param(integer_result, types::I64);
+                builder.append_block_param(merge, types::I64);
+                builder.ins().brif(
+                    quotient_overflows,
+                    float_result,
+                    &[],
+                    inspect_remainder,
+                    &[],
+                );
+                builder.switch_to_block(inspect_remainder);
+                let remainder = builder.ins().srem(lhs, rhs);
+                let exact = builder.ins().icmp_imm(IntCC::Equal, remainder, 0);
+                builder
+                    .ins()
+                    .brif(exact, integer_result, &[lhs.into()], float_result, &[]);
+                builder.switch_to_block(integer_result);
+                let dividend = builder.block_params(integer_result)[0];
+                let quotient = builder.ins().sdiv(dividend, rhs);
+                let quotient =
+                    lower_optimizing_admit_integer_result(builder, quotient, transition)?;
+                builder.ins().jump(merge, &[quotient.into()]);
+                builder.switch_to_block(float_result);
+                let lhs = builder.ins().fcvt_from_sint(types::F64, lhs);
+                let rhs = builder.ins().fcvt_from_sint(types::F64, rhs);
+                let quotient = builder.ins().fdiv(lhs, rhs);
+                let quotient = lower_optimizing_encode_float(builder, quotient, transition)?;
+                builder.ins().jump(merge, &[quotient.into()]);
+                builder.switch_to_block(merge);
+                builder.block_params(merge)[0]
+            } else if *op == RegionBinaryOp::Pow
+                && matches!(lhs_fact.class, SsaValueClass::Int | SsaValueClass::Float)
+                && matches!(rhs_fact.class, SsaValueClass::Int | SsaValueClass::Float)
+            {
+                emitted_class = crate::JitProductionLoweringClass::DirectClif;
+                lower_optimizing_power(
+                    module,
+                    builder,
+                    lhs,
+                    rhs,
+                    lhs_operand,
+                    rhs_operand,
+                    constants,
+                    lhs_fact,
+                    rhs_fact,
+                    optimizing_operations.pure_math[StablePureMathBuiltin::Fpow.index()],
+                    optimizing_operations.numeric_string,
+                    transition,
+                )?
+            } else if has_float
+                && matches!(
+                    op,
+                    RegionBinaryOp::Add
+                        | RegionBinaryOp::Sub
+                        | RegionBinaryOp::Mul
+                        | RegionBinaryOp::Div
+                )
+            {
+                emitted_class = crate::JitProductionLoweringClass::DirectClif;
+                let lhs = lower_optimizing_float_value(
+                    module,
+                    builder,
+                    lhs,
+                    lhs_operand,
+                    constants,
+                    lhs_fact,
+                    optimizing_operations.numeric_string,
+                    transition,
+                )?;
+                let rhs = lower_optimizing_float_value(
+                    module,
+                    builder,
+                    rhs,
+                    rhs_operand,
+                    constants,
+                    rhs_fact,
+                    optimizing_operations.numeric_string,
+                    transition,
+                )?;
+                let raw = match op {
+                    RegionBinaryOp::Add => builder.ins().fadd(lhs, rhs),
+                    RegionBinaryOp::Sub => builder.ins().fsub(lhs, rhs),
+                    RegionBinaryOp::Mul => builder.ins().fmul(lhs, rhs),
+                    RegionBinaryOp::Div => builder.ins().fdiv(lhs, rhs),
+                    _ => unreachable!("publication selected a floating arithmetic operation"),
+                };
+                lower_optimizing_encode_float(builder, raw, transition)?
+            } else {
+                emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
+                let helper = if *op == RegionBinaryOp::Add
+                    && lhs_fact.class == SsaValueClass::ArrayHandle
+                    && rhs_fact.class == SsaValueClass::ArrayHandle
+                {
+                    optimizing_operations.array_union
+                } else if *op == RegionBinaryOp::Concat {
+                    optimizing_operations.concat
+                } else if matches!(
+                    op,
+                    RegionBinaryOp::BitAnd | RegionBinaryOp::BitOr | RegionBinaryOp::BitXor
+                ) && lhs_fact.class == SsaValueClass::StringHandle
+                    && rhs_fact.class == SsaValueClass::StringHandle
+                {
+                    optimizing_operations.string_bitwise[native_string_bitwise_index(*op)]
+                } else {
+                    None
+                }
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_BINARY_PUBLICATION",
+                        "total representation-heavy binary target was not declared",
+                    )
+                })?;
+                let call = call_native_helper(module, builder, helper, &[lhs, rhs]);
+                let control = builder.inst_results(call)[0];
+                let value = builder.inst_results(call)[1];
+                let status = builder.ins().ireduce(types::I32, control);
+                let detail = builder.ins().ushr_imm(control, 32);
+                let detail = builder.ins().ireduce(types::I32, detail);
+                let returned = builder.create_block();
+                let control_exit = builder.create_block();
+                let is_return = builder.ins().icmp_imm(
+                    IntCC::Equal,
+                    status,
+                    i64::from(crate::JitCallStatus::RETURN.0),
+                );
+                builder
+                    .ins()
+                    .brif(is_return, returned, &[], control_exit, &[]);
+                builder.switch_to_block(control_exit);
+                transition.emit_control(builder, status, detail, value)?;
+                builder.switch_to_block(returned);
+                value
+            };
             define_region_register(builder, register_variables, registers, *dst, value)?;
         }
         RegionInstructionKind::Unary { dst, op, src } => {
+            debug_assert!(
+                total_native_scalar_control_instruction,
+                "optimizing unary lowering requires a publication-total operand plan"
+            );
             let src = lower_prepared_native_call_operand(
                 builder, locals, registers, constants, *src, transition,
             )?;
@@ -21631,6 +22156,10 @@ fn lower_optimizing_region_instruction(
             define_region_register(builder, register_variables, registers, *dst, value)?;
         }
         RegionInstructionKind::Compare { dst, op, lhs, rhs } => {
+            debug_assert!(
+                total_native_scalar_control_instruction,
+                "optimizing comparison lowering requires a publication-total operand plan"
+            );
             let lhs_value = lower_prepared_native_call_operand(
                 builder, locals, registers, constants, *lhs, transition,
             )?;
@@ -21649,6 +22178,10 @@ fn lower_optimizing_region_instruction(
             define_region_register(builder, register_variables, registers, *dst, value)?;
         }
         RegionInstructionKind::Cast { dst, op, src } => {
+            debug_assert!(
+                total_native_scalar_control_instruction,
+                "optimizing cast lowering requires a publication-total operand plan"
+            );
             let value = lower_prepared_native_call_operand(
                 builder, locals, registers, constants, *src, transition,
             )?;
@@ -24874,17 +25407,16 @@ fn lower_optimizing_region_instruction(
                     crate::region_ir::RegionSemanticOp::DynamicInstanceOf { object, target, .. },
             } = &call.target
             {
-                emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
+                emitted_class = crate::JitProductionLoweringClass::DirectNativeData;
                 let object = lower_region_operand(builder, locals, registers, *object)?;
-                let target = lower_region_operand(builder, locals, registers, *target)?;
-                let value = emit_exact_native_control_value!(
-                    module,
+                let _ = target;
+                let value = lower_total_native_static_instanceof(
                     builder,
-                    optimizing_operations.dynamic_instanceof,
-                    &[object, target],
-                    transition,
-                    "exact native dynamic-instanceof handler was not declared",
-                )?;
+                    object,
+                    function,
+                    instruction.continuation_id,
+                    transition.deopt_out,
+                );
                 define_optimizing_call_result(
                     builder,
                     register_variables,
@@ -24970,13 +25502,63 @@ fn lower_optimizing_region_instruction(
             } = &call.target
             {
                 emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
+                let normalized = name.trim_start_matches('\\');
+                let (target_id, target) = function_params
+                    .iter()
+                    .find(|(_, target)| {
+                        target
+                            .name
+                            .trim_start_matches('\\')
+                            .eq_ignore_ascii_case(normalized)
+                    })
+                    .ok_or_else(|| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_CALLABLE_TARGET_PUBLICATION",
+                            format!("published callable target {name} is unavailable"),
+                        )
+                    })?;
+                let mut flags = 0_u32;
+                if target
+                    .params
+                    .first()
+                    .is_some_and(|parameter| parameter.by_ref)
+                {
+                    flags |= crate::JIT_NATIVE_PREPARED_CALLABLE_FIRST_PARAMETER_BY_REFERENCE;
+                }
+                if matches!(target.return_type.as_ref(), Some(php_ir::IrReturnType::Int)) {
+                    flags |= crate::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_INT;
+                }
+                if matches!(
+                    target.return_type.as_ref(),
+                    Some(php_ir::IrReturnType::String)
+                ) {
+                    flags |= crate::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_STRING;
+                }
+                if target
+                    .return_type
+                    .as_ref()
+                    .is_some_and(native_callable_return_type_is_releasable_scalar)
+                {
+                    flags |= crate::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_RELEASABLE_SCALAR;
+                }
                 let (name, length) =
                     lower_optimizing_static_bytes(module, builder, name.as_bytes())?;
+                let function_id = builder.ins().iconst(types::I64, i64::from(target_id.raw()));
+                let visible_arity = builder.ins().iconst(
+                    types::I64,
+                    i64::try_from(target.params.len()).map_err(|_| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_CALLABLE_SIGNATURE_PUBLICATION",
+                            "published callable arity does not fit i64",
+                        )
+                    })?,
+                );
+                let flags = builder.ins().iconst(types::I64, i64::from(flags));
                 let callable = emit_exact_native_control_value!(
                     module,
                     builder,
                     optimizing_operations.resolve_callable,
-                    &[name, length],
+                    &[name, length, function_id, visible_arity, flags],
                     transition,
                     "exact native callable-resolution handler was not declared",
                 )?;
@@ -25869,7 +26451,7 @@ fn lower_optimizing_region_instruction(
                     types::I64,
                     crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                 );
-                let result = lower_optimizing_exact_binary_runtime_builtin(
+                let result = emit_fixed_two_argument_control!(
                     module,
                     builder,
                     optimizing_operations.exact_symbol_query[builtin.index()],
@@ -25920,7 +26502,7 @@ fn lower_optimizing_region_instruction(
                             module, builder, helper, transition,
                         )?
                     }
-                    StablePcreBuiltin::Quote => lower_optimizing_exact_binary_runtime_builtin(
+                    StablePcreBuiltin::Quote => emit_fixed_two_argument_control!(
                         module,
                         builder,
                         helper,
@@ -26037,7 +26619,7 @@ fn lower_optimizing_region_instruction(
                         )?
                     }
                     StableFormatBuiltin::Vsprintf | StableFormatBuiltin::Vprintf => {
-                        lower_optimizing_exact_binary_runtime_builtin(
+                        emit_fixed_two_argument_control!(
                             module,
                             builder,
                             helper,
@@ -26094,7 +26676,7 @@ fn lower_optimizing_region_instruction(
                         arguments[0],
                         transition,
                     )?,
-                    StableHashBuiltin::HashEquals => lower_optimizing_exact_binary_runtime_builtin(
+                    StableHashBuiltin::HashEquals => emit_fixed_two_argument_control!(
                         module,
                         builder,
                         helper,
@@ -26103,7 +26685,7 @@ fn lower_optimizing_region_instruction(
                         transition,
                     )?,
                     StableHashBuiltin::Md5 | StableHashBuiltin::Sha1 => {
-                        lower_optimizing_exact_binary_runtime_builtin(
+                        emit_fixed_two_argument_control!(
                             module,
                             builder,
                             helper,
@@ -26168,7 +26750,7 @@ fn lower_optimizing_region_instruction(
                             types::I64,
                             crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                         );
-                        lower_optimizing_exact_binary_runtime_builtin(
+                        emit_fixed_two_argument_control!(
                             module,
                             builder,
                             helper,
@@ -26177,16 +26759,14 @@ fn lower_optimizing_region_instruction(
                             transition,
                         )?
                     }
-                    StableByteCodecBuiltin::AddCSlashes => {
-                        lower_optimizing_exact_binary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments[1],
-                            transition,
-                        )?
-                    }
+                    StableByteCodecBuiltin::AddCSlashes => emit_fixed_two_argument_control!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments[1],
+                        transition,
+                    )?,
                     StableByteCodecBuiltin::Base64Encode
                     | StableByteCodecBuiltin::Bin2Hex
                     | StableByteCodecBuiltin::Hex2Bin
@@ -26237,7 +26817,7 @@ fn lower_optimizing_region_instruction(
                     StableStringSearchCompareBuiltin::StrPBrk
                     | StableStringSearchCompareBuiltin::StrNatCmp
                     | StableStringSearchCompareBuiltin::StrNatCaseCmp => {
-                        lower_optimizing_exact_binary_runtime_builtin(
+                        emit_fixed_two_argument_control!(
                             module,
                             builder,
                             helper,
@@ -26298,16 +26878,14 @@ fn lower_optimizing_region_instruction(
                 let result = match builtin {
                     StableStringRewriteBuiltin::UcWords
                     | StableStringRewriteBuiltin::StripTags
-                    | StableStringRewriteBuiltin::StrSplit => {
-                        lower_optimizing_exact_binary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments.get(1).copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
+                    | StableStringRewriteBuiltin::StrSplit => emit_fixed_two_argument_control!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments.get(1).copied().unwrap_or(missing),
+                        transition,
+                    )?,
                     StableStringRewriteBuiltin::StrTr
                     | StableStringRewriteBuiltin::VersionCompare => {
                         lower_optimizing_exact_ternary_runtime_builtin(
@@ -26380,16 +26958,14 @@ fn lower_optimizing_region_instruction(
                             transition,
                         )?
                     }
-                    StableHtmlCodecBuiltin::SpecialCharsDecode => {
-                        lower_optimizing_exact_binary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments.get(1).copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
+                    StableHtmlCodecBuiltin::SpecialCharsDecode => emit_fixed_two_argument_control!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments.get(1).copied().unwrap_or(missing),
+                        transition,
+                    )?,
                 };
                 define_optimizing_call_result(
                     builder,
@@ -26430,26 +27006,22 @@ fn lower_optimizing_region_instruction(
                     crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                 );
                 let result = match builtin {
-                    StableUrlQueryBuiltin::ParseUrl => {
-                        lower_optimizing_exact_binary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments.get(1).copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
-                    StableUrlQueryBuiltin::ParseStr => {
-                        lower_optimizing_exact_binary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments[1],
-                            transition,
-                        )?
-                    }
+                    StableUrlQueryBuiltin::ParseUrl => emit_fixed_two_argument_control!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments.get(1).copied().unwrap_or(missing),
+                        transition,
+                    )?,
+                    StableUrlQueryBuiltin::ParseStr => emit_fixed_two_argument_control!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments[1],
+                        transition,
+                    )?,
                     StableUrlQueryBuiltin::HttpBuildQuery => {
                         lower_optimizing_exact_quaternary_runtime_builtin(
                             module,
@@ -26540,7 +27112,7 @@ fn lower_optimizing_region_instruction(
                             types::I64,
                             crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                         );
-                        lower_optimizing_exact_binary_runtime_builtin(
+                        emit_fixed_two_argument_control!(
                             module,
                             builder,
                             helper,
@@ -26615,7 +27187,7 @@ fn lower_optimizing_region_instruction(
                     types::I64,
                     crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                 );
-                let result = lower_optimizing_exact_binary_runtime_builtin(
+                let result = emit_fixed_two_argument_control!(
                     module,
                     builder,
                     optimizing_operations.exact_array_sort[builtin.index()],
@@ -26730,7 +27302,7 @@ fn lower_optimizing_region_instruction(
                     types::I64,
                     crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                 );
-                let result = lower_optimizing_exact_binary_runtime_builtin(
+                let result = emit_fixed_two_argument_control!(
                     module,
                     builder,
                     optimizing_operations.exact_callback_handler[builtin.index()],
@@ -26851,7 +27423,7 @@ fn lower_optimizing_region_instruction(
                             types::I64,
                             crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                         );
-                        lower_optimizing_exact_binary_runtime_builtin(
+                        emit_fixed_two_argument_control!(
                             module,
                             builder,
                             helper,
@@ -26933,16 +27505,14 @@ fn lower_optimizing_region_instruction(
                     | StableMbstringBuiltin::Lcfirst
                     | StableMbstringBuiltin::Ord
                     | StableMbstringBuiltin::Chr
-                    | StableMbstringBuiltin::ParseStr => {
-                        lower_optimizing_exact_binary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments.first().copied().unwrap_or(missing),
-                            arguments.get(1).copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
+                    | StableMbstringBuiltin::ParseStr => emit_fixed_two_argument_control!(
+                        module,
+                        builder,
+                        helper,
+                        arguments.first().copied().unwrap_or(missing),
+                        arguments.get(1).copied().unwrap_or(missing),
+                        transition,
+                    )?,
                     StableMbstringBuiltin::DetectEncoding
                     | StableMbstringBuiltin::ConvertEncoding
                     | StableMbstringBuiltin::SubstrCount
@@ -27018,7 +27588,7 @@ fn lower_optimizing_region_instruction(
                         arguments.first().copied().unwrap_or(missing),
                         transition,
                     )?,
-                    StableBcmathBuiltin::Sqrt => lower_optimizing_exact_binary_runtime_builtin(
+                    StableBcmathBuiltin::Sqrt => emit_fixed_two_argument_control!(
                         module,
                         builder,
                         helper,
@@ -27093,7 +27663,7 @@ fn lower_optimizing_region_instruction(
                             transition,
                         )?
                     }
-                    StableFilterBuiltin::HasVar => lower_optimizing_exact_binary_runtime_builtin(
+                    StableFilterBuiltin::HasVar => emit_fixed_two_argument_control!(
                         module,
                         builder,
                         helper,
@@ -27296,7 +27866,7 @@ fn lower_optimizing_region_instruction(
                 let target = lower_region_operand(builder, locals, registers, operand)?;
                 let target = lower_optimizing_reference_scalar(builder, target, false, transition)?;
                 let caller_function = builder.ins().iconst(types::I64, i64::from(function.raw()));
-                let result = lower_optimizing_exact_binary_runtime_builtin(
+                let result = emit_fixed_two_argument_control!(
                     module,
                     builder,
                     optimizing_operations.exact_class_metadata[builtin.index()],
@@ -27340,16 +27910,14 @@ fn lower_optimizing_region_instruction(
                             transition,
                         )?
                     }
-                    StableClassLineageBuiltin::Implements => {
-                        lower_optimizing_exact_binary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments.get(1).copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
+                    StableClassLineageBuiltin::Implements => emit_fixed_two_argument_control!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments.get(1).copied().unwrap_or(missing),
+                        transition,
+                    )?,
                     StableClassLineageBuiltin::IsSubclassOf | StableClassLineageBuiltin::IsA => {
                         lower_optimizing_exact_ternary_runtime_builtin(
                             module,
@@ -27516,7 +28084,7 @@ fn lower_optimizing_region_instruction(
                 let type_name = lower_region_operand(builder, locals, registers, type_name)?;
                 let type_name =
                     lower_optimizing_reference_scalar(builder, type_name, false, transition)?;
-                let result = lower_optimizing_exact_binary_runtime_builtin(
+                let result = emit_fixed_two_argument_control!(
                     module,
                     builder,
                     optimizing_operations.exact_settype,
@@ -27569,26 +28137,22 @@ fn lower_optimizing_region_instruction(
                             transition,
                         )?
                     }
-                    StableConfigurationBuiltin::IniSet => {
-                        lower_optimizing_exact_binary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments[1],
-                            transition,
-                        )?
-                    }
-                    StableConfigurationBuiltin::IniGetAll => {
-                        lower_optimizing_exact_binary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments.first().copied().unwrap_or(missing),
-                            arguments.get(1).copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
+                    StableConfigurationBuiltin::IniSet => emit_fixed_two_argument_control!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments[1],
+                        transition,
+                    )?,
+                    StableConfigurationBuiltin::IniGetAll => emit_fixed_two_argument_control!(
+                        module,
+                        builder,
+                        helper,
+                        arguments.first().copied().unwrap_or(missing),
+                        arguments.get(1).copied().unwrap_or(missing),
+                        transition,
+                    )?,
                 };
                 define_optimizing_call_result(
                     builder,
@@ -27751,16 +28315,14 @@ fn lower_optimizing_region_instruction(
                     }
                     StableDateBuiltin::Date
                     | StableDateBuiltin::Gmdate
-                    | StableDateBuiltin::Strtotime => {
-                        lower_optimizing_exact_binary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments.get(1).copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
+                    | StableDateBuiltin::Strtotime => emit_fixed_two_argument_control!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments.get(1).copied().unwrap_or(missing),
+                        transition,
+                    )?,
                     StableDateBuiltin::Checkdate => lower_optimizing_exact_ternary_runtime_builtin(
                         module,
                         builder,
@@ -27835,18 +28397,16 @@ fn lower_optimizing_region_instruction(
                             transition,
                         )?
                     }
-                    StableRandomBuiltin::RandomInt => {
-                        lower_optimizing_exact_binary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments[1],
-                            transition,
-                        )?
-                    }
+                    StableRandomBuiltin::RandomInt => emit_fixed_two_argument_control!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments[1],
+                        transition,
+                    )?,
                     StableRandomBuiltin::Rand | StableRandomBuiltin::MtRand => {
-                        lower_optimizing_exact_binary_runtime_builtin(
+                        emit_fixed_two_argument_control!(
                             module,
                             builder,
                             helper,
@@ -27855,16 +28415,14 @@ fn lower_optimizing_region_instruction(
                             transition,
                         )?
                     }
-                    StableRandomBuiltin::ArrayRand => {
-                        lower_optimizing_exact_binary_runtime_builtin(
-                            module,
-                            builder,
-                            helper,
-                            arguments[0],
-                            arguments.get(1).copied().unwrap_or(missing),
-                            transition,
-                        )?
-                    }
+                    StableRandomBuiltin::ArrayRand => emit_fixed_two_argument_control!(
+                        module,
+                        builder,
+                        helper,
+                        arguments[0],
+                        arguments.get(1).copied().unwrap_or(missing),
+                        transition,
+                    )?,
                 };
                 define_optimizing_call_result(
                     builder,
@@ -27918,7 +28476,7 @@ fn lower_optimizing_region_instruction(
                             types::I64,
                             crate::jit_encode_constant(crate::JIT_VALUE_ARGUMENT_MISSING),
                         );
-                        lower_optimizing_exact_binary_runtime_builtin(
+                        emit_fixed_two_argument_control!(
                             module,
                             builder,
                             helper,
@@ -28261,7 +28819,7 @@ fn lower_optimizing_region_instruction(
                     | StableCompressionCodecBuiltin::GzUncompress
                     | StableCompressionCodecBuiltin::GzInflate
                     | StableCompressionCodecBuiltin::ZlibDecode => {
-                        lower_optimizing_exact_binary_runtime_builtin(
+                        emit_fixed_two_argument_control!(
                             module,
                             builder,
                             helper,
@@ -28386,7 +28944,7 @@ fn lower_optimizing_region_instruction(
                     | StablePathBuiltin::StreamContextSetOptions
                     | StablePathBuiltin::Chmod
                     | StablePathBuiltin::Symlink
-                    | StablePathBuiltin::Tempnam => lower_optimizing_exact_binary_runtime_builtin(
+                    | StablePathBuiltin::Tempnam => emit_fixed_two_argument_control!(
                         module,
                         builder,
                         helper,
@@ -28575,7 +29133,7 @@ fn lower_optimizing_region_instruction(
                             base_operand,
                             transition,
                         )?;
-                        lower_optimizing_exact_binary_runtime_builtin(
+                        emit_fixed_two_argument_control!(
                             module,
                             builder,
                             optimizing_operations.exact_intval_base,
@@ -28695,28 +29253,52 @@ fn lower_optimizing_region_instruction(
                     StableNumericOperatorBuiltin::IntDiv => {
                         crate::JitProductionLoweringClass::DirectClif
                     }
-                    StableNumericOperatorBuiltin::Pow | StableNumericOperatorBuiltin::Round => {
+                    StableNumericOperatorBuiltin::Pow => {
+                        crate::JitProductionLoweringClass::DirectClif
+                    }
+                    StableNumericOperatorBuiltin::Round => {
                         crate::JitProductionLoweringClass::CompiledNativeCall
                     }
                 };
+                let mut operands = Vec::with_capacity(call.args.len());
                 let mut arguments = Vec::with_capacity(call.args.len());
                 for index in 0..call.args.len() {
                     let operand = direct_builtin_argument(index)
                         .expect("numeric operator arguments were checked above");
+                    operands.push(operand);
                     arguments.push(lower_prepared_native_call_operand(
                         builder, locals, registers, constants, operand, transition,
                     )?);
                 }
                 let result = match operation {
-                    StableNumericOperatorBuiltin::Pow => emit_exact_native_control_value!(
-                        module,
-                        builder,
-                        optimizing_operations.exact_binary
-                            [native_exact_binary_index(RegionBinaryOp::Pow)],
-                        &arguments,
-                        transition,
-                        "exact native power handler was not declared",
-                    )?,
+                    StableNumericOperatorBuiltin::Pow => {
+                        lower_optimizing_power(
+                            module,
+                            builder,
+                            arguments[0],
+                            arguments[1],
+                            operands[0],
+                            operands[1],
+                            constants,
+                            fixed_numeric_operand_fact(value_flow, constants, operands[0])
+                                .ok_or_else(|| {
+                                    CraneliftLoweringError::new(
+                                        "JIT_CRANELIFT_REJECT_POWER_TYPE",
+                                        "pow left operand lost its publication-time numeric fact",
+                                    )
+                                })?,
+                            fixed_numeric_operand_fact(value_flow, constants, operands[1])
+                                .ok_or_else(|| {
+                                    CraneliftLoweringError::new(
+                                        "JIT_CRANELIFT_REJECT_POWER_TYPE",
+                                        "pow right operand lost its publication-time numeric fact",
+                                    )
+                                })?,
+                            optimizing_operations.pure_math[StablePureMathBuiltin::Fpow.index()],
+                            optimizing_operations.numeric_string,
+                            transition,
+                        )?
+                    }
                     StableNumericOperatorBuiltin::IntDiv => {
                         lower_optimizing_intdiv(builder, arguments[0], arguments[1], transition)?
                     }

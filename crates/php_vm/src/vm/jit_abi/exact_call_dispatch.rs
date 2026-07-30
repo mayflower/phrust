@@ -712,13 +712,13 @@ fn native_memory_usage_result(
 ) -> php_jit::JitNativeControlResult {
     let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
     if real_usage != missing && exact_native_boolean_flag(fast, real_usage).is_none() {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     }
     let bytes = fast
         .native_output_buffer()
         .map_or(0_i64, |output| output.len().try_into().unwrap_or(i64::MAX));
     fast.publish_direct_int(bytes.max(0)).map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_runtime_error(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -877,13 +877,13 @@ pub(in crate::vm) extern "C" fn jit_native_get_resource_id_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Ok(id) = i64::try_from(resource.id().get()) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     fast.publish_direct_int(id).map_or_else(
-        |_| exact_query_baseline(),
+        |_| exact_query_runtime_error(),
         php_jit::JitNativeControlResult::returning,
     )
 }
@@ -895,12 +895,12 @@ pub(in crate::vm) extern "C" fn jit_native_get_resource_type_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(resource) = fast.native_resource_view(argument_0) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let resource_type = resource.resource_type();
     fast.publish_direct_string_bytes(resource_type.as_bytes())
         .map_or_else(
-            |_| exact_query_baseline(),
+            |_| exact_query_runtime_error(),
             php_jit::JitNativeControlResult::returning,
         )
 }

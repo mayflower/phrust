@@ -72,7 +72,7 @@ pub use semantic_ops::{
     RegionSemanticOperationId,
 };
 pub use ssa::{
-    ExecutableSsaGraph, SsaCertainty, SsaOwnership, SsaValueClass, SsaValueFact,
+    ExecutableSsaGraph, SsaCertainty, SsaIntegerRange, SsaOwnership, SsaValueClass, SsaValueFact,
     build_executable_ssa,
 };
 pub use value_flow::{

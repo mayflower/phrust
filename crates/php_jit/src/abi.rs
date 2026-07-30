@@ -77,7 +77,10 @@ pub const JIT_NATIVE_VALUE_VIEW_MATERIALIZED_GENERATOR: u32 = 18;
 /// resource ID and `aux` owns one boxed `ResourceRef` until final release.
 pub const JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE: u32 = 19;
 /// Layout/meaning version for a direct resource value slot.
-pub const JIT_NATIVE_DIRECT_RESOURCE_ABI_VERSION: u32 = 1;
+/// Resource descriptors publish their maximum PHP-visible type-name length in
+/// `JitNativeValueSlot::reserved` so optimizing entry plans can reserve string
+/// capacity without borrowing the Rust capability.
+pub const JIT_NATIVE_DIRECT_RESOURCE_ABI_VERSION: u32 = 2;
 /// Request-owned native marker for the special `$GLOBALS` symbol table.
 /// Its contents live in the authoritative global reference slots; the marker
 /// exists only as an exact baseline-continuation operand.
@@ -104,8 +107,12 @@ pub const JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_VERSION: u32 = 1;
 pub const JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_MASK: u32 = 0x0000_ffff;
 pub const JIT_NATIVE_OBJECT_COUNTABLE: u32 = 1 << 16;
 pub const JIT_NATIVE_OBJECT_TRAVERSABLE: u32 = 1 << 17;
+/// Exact `stdClass` layout: it has no declared-property visibility or magic
+/// accessor semantics, and missing dynamic names may reserve stable native
+/// tombstones before optimizing entry.
+pub const JIT_NATIVE_OBJECT_STDCLASS: u32 = 1 << 18;
 pub const JIT_NATIVE_OBJECT_TYPE_FLAGS: u32 =
-    JIT_NATIVE_OBJECT_COUNTABLE | JIT_NATIVE_OBJECT_TRAVERSABLE;
+    JIT_NATIVE_OBJECT_COUNTABLE | JIT_NATIVE_OBJECT_TRAVERSABLE | JIT_NATIVE_OBJECT_STDCLASS;
 
 #[must_use]
 pub const fn jit_native_object_property_view_is_published(flags: u32) -> bool {
@@ -307,6 +314,27 @@ pub struct JitNativePreparedCallableView {
     pub class_length: u32,
     /// Visible arity when `JIT_NATIVE_PREPARED_CALLABLE_FIXED_BINDING` is set.
     pub reserved: u32,
+}
+
+/// Publication-time resource contract for one prepared throwable allocator.
+///
+/// The VM owns the adjacent Rust class/source metadata, but generated entry
+/// code reads only this stable prefix to reserve native arenas before the
+/// optimizing region is selected.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitNativePreparedExceptionView {
+    /// Exact sum of power-of-two capacities for immutable file/frame strings.
+    pub fixed_string_bytes: u64,
+    /// Fixed direct-value descriptors excluding the dynamically copied
+    /// message, which is accounted by the operand publication plan.
+    pub fixed_value_slots: u32,
+    /// Fixed direct-array entries excluding the active argument snapshot.
+    pub fixed_array_entries: u32,
+    /// Number of authoritative throwable property cells installed atomically.
+    pub property_slots: u32,
+    /// Nonzero when the trace contains the current function/argument frame.
+    pub include_function_frame: u32,
 }
 
 /// One mutable key/value cell in a direct native array.

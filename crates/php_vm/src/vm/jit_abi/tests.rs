@@ -1180,7 +1180,7 @@ fn dynamic_property_slot_resolver_reserves_one_stable_stdclass_tombstone() {
 }
 
 #[test]
-fn dynamic_property_test_slot_keeps_magic_and_declared_visibility_in_baseline() {
+fn dynamic_property_test_slot_rejects_unpublished_magic_and_visibility_shapes() {
     let magic_class = php_runtime::api::ClassEntry {
         name: "magic_box".to_owned().into(),
         parent: None,
@@ -1329,19 +1329,13 @@ fn dynamic_property_test_slot_keeps_magic_and_declared_visibility_in_baseline() 
         magic_value,
         missing_value,
     );
-    assert_eq!(
-        magic_result.status,
-        php_jit::JitCallStatus::RECOMPILE_REQUESTED
-    );
+    assert_eq!(magic_result.status, php_jit::JitCallStatus::ABI_MISMATCH);
     let declared_result = super::exact_runtime_ops::jit_native_dynamic_property_test_slot_abi(
         std::ptr::from_mut(&mut fast_state),
         declared_value,
         known_value,
     );
-    assert_eq!(
-        declared_result.status,
-        php_jit::JitCallStatus::RECOMPILE_REQUESTED
-    );
+    assert_eq!(declared_result.status, php_jit::JitCallStatus::ABI_MISMATCH);
     let ordinary_missing = super::exact_runtime_ops::jit_native_dynamic_property_test_slot_abi(
         std::ptr::from_mut(&mut fast_state),
         declared_value,
@@ -2697,19 +2691,13 @@ fn exact_count_family_traverses_only_authoritative_direct_arrays() {
     assert_eq!(recursive.value, 5);
 
     let invalid_mode = super::exact_runtime_ops::jit_native_count_abi(runtime, array(0), 2);
-    assert_eq!(
-        invalid_mode.status,
-        php_jit::JitCallStatus::RECOMPILE_REQUESTED
-    );
+    assert_eq!(invalid_mode.status, php_jit::JitCallStatus::ABI_MISMATCH);
     let scalar = super::exact_runtime_ops::jit_native_count_abi(runtime, 42, missing);
-    assert_eq!(scalar.status, php_jit::JitCallStatus::RECOMPILE_REQUESTED);
+    assert_eq!(scalar.status, php_jit::JitCallStatus::ABI_MISMATCH);
 
     nested_entries[0].value = array(0);
     let recursive_cycle = super::exact_runtime_ops::jit_native_count_abi(runtime, array(0), 1);
-    assert_eq!(
-        recursive_cycle.status,
-        php_jit::JitCallStatus::RECOMPILE_REQUESTED
-    );
+    assert_eq!(recursive_cycle.status, php_jit::JitCallStatus::ABI_MISMATCH);
 }
 
 #[test]
@@ -3546,10 +3534,7 @@ fn exact_native_object_comparison_uses_identity_and_authoritative_slots() {
 
     let cold_dynamic =
         super::exact_runtime_ops::jit_native_equal_abi(runtime, object_value(0), object_value(4));
-    assert_eq!(
-        cold_dynamic.status,
-        php_jit::JitCallStatus::RECOMPILE_REQUESTED
-    );
+    assert_eq!(cold_dynamic.status, php_jit::JitCallStatus::ABI_MISMATCH);
 }
 
 #[test]
@@ -3820,5 +3805,75 @@ fn common_and_exact_native_sources_cannot_import_the_rust_value_plane() {
                 "{name} imported forbidden Rust value-plane symbol {symbol}"
             );
         }
+    }
+
+    let exact_runtime = include_str!("exact_runtime_ops.rs");
+    for deleted in [
+        "native_compound_comparison_baseline",
+        "native_object_cast_baseline",
+        "native_array_cast_baseline",
+        "native_int_cast_baseline",
+        "native_float_cast_baseline",
+        "native_string_cast_baseline",
+        "native_unary_baseline",
+        "native_array_count_baseline",
+    ] {
+        assert!(
+            !exact_runtime.contains(deleted),
+            "exact runtime retained deleted warm fallback {deleted}"
+        );
+    }
+
+    let exact_calls = include_str!("exact_call_dispatch.rs");
+    for (function, next_function) in [
+        (
+            "fn native_memory_usage_result",
+            "pub(in crate::vm) extern \"C\" fn jit_native_memory_get_usage_abi",
+        ),
+        (
+            "fn jit_native_get_resource_id_abi",
+            "pub(in crate::vm) extern \"C\" fn jit_native_get_resource_type_abi",
+        ),
+        (
+            "fn jit_native_get_resource_type_abi",
+            "pub(in crate::vm) extern \"C\" fn jit_native_get_resources_abi",
+        ),
+    ] {
+        let body = exact_calls
+            .split_once(function)
+            .and_then(|(_, suffix)| suffix.split_once(next_function))
+            .map(|(body, _)| body)
+            .expect("selected exact fixed-builtin family remains in source");
+        assert!(
+            !body.contains("exact_query_baseline"),
+            "{function} retained an exact-query warm fallback"
+        );
+    }
+
+    let scalar_families = include_str!("exact_call_dispatch/scalar_and_filter_families.rs");
+    for (family, next_family) in [
+        ("fn exact_class_kind_exists", "fn exact_member_exists"),
+        (
+            "fn exact_member_exists",
+            "macro_rules! exact_symbol_query_abi",
+        ),
+        (
+            "exact_symbol_query_abi!(jit_native_defined_abi",
+            "pub(in crate::vm) extern \"C\" fn jit_native_constant_abi",
+        ),
+        (
+            "exact_symbol_query_abi!(jit_native_function_exists_abi",
+            "exact_symbol_query_abi!(jit_native_class_exists_abi",
+        ),
+    ] {
+        let body = scalar_families
+            .split_once(family)
+            .and_then(|(_, suffix)| suffix.split_once(next_family))
+            .map(|(body, _)| body)
+            .expect("selected symbol-capability family remains in source");
+        assert!(
+            !body.contains("exact_query_baseline"),
+            "{family} retained an exact-query warm fallback"
+        );
     }
 }

@@ -243,29 +243,26 @@ pub(super) use exact_call_dispatch::{
 };
 pub(super) use exact_runtime_ops::{
     jit_native_acos_f64_abi, jit_native_acosh_f64_abi, jit_native_acquire_callable_abi,
-    jit_native_add_abi, jit_native_array_cast_abi, jit_native_asin_f64_abi,
+    jit_native_array_cast_abi, jit_native_array_union_abi, jit_native_asin_f64_abi,
     jit_native_asinh_f64_abi, jit_native_atan_f64_abi, jit_native_atan2_f64_abi,
     jit_native_atanh_f64_abi, jit_native_bit_and_abi, jit_native_bit_not_abi,
     jit_native_bit_or_abi, jit_native_bit_xor_abi, jit_native_callback_return_string_abi,
     jit_native_concat_abi, jit_native_cos_f64_abi, jit_native_cosh_f64_abi, jit_native_count_abi,
-    jit_native_deg2rad_f64_abi, jit_native_divide_abi, jit_native_dynamic_instanceof_abi,
-    jit_native_dynamic_property_slot_abi, jit_native_dynamic_property_test_slot_abi,
-    jit_native_echo_bytes_abi, jit_native_equal_abi, jit_native_exp_f64_abi,
-    jit_native_expm1_f64_abi, jit_native_float_cast_abi, jit_native_float_to_string_abi,
-    jit_native_fmod_f64_abi, jit_native_fpow_f64_abi, jit_native_greater_abi,
-    jit_native_greater_equal_abi, jit_native_hypot_f64_abi, jit_native_identical_abi,
-    jit_native_int_cast_abi, jit_native_less_abi, jit_native_less_equal_abi,
-    jit_native_log_f64_abi, jit_native_log1p_f64_abi, jit_native_log10_f64_abi,
-    jit_native_modulo_abi, jit_native_multiply_abi, jit_native_not_equal_abi,
-    jit_native_not_identical_abi, jit_native_numeric_string_abi, jit_native_object_cast_abi,
-    jit_native_object_class_name_abi, jit_native_plain_object_clone_abi, jit_native_power_abi,
-    jit_native_prepared_closure_new_abi, jit_native_prepared_exception_new_abi,
-    jit_native_prepared_object_new_abi, jit_native_rad2deg_f64_abi,
-    jit_native_resolve_callable_abi, jit_native_round_f64_abi, jit_native_shift_left_abi,
-    jit_native_shift_right_abi, jit_native_sin_f64_abi, jit_native_sinh_f64_abi,
-    jit_native_sizeof_abi, jit_native_spaceship_abi, jit_native_string_cast_abi,
-    jit_native_subtract_abi, jit_native_tan_f64_abi, jit_native_tanh_f64_abi,
-    jit_native_unary_minus_abi, jit_native_unary_plus_abi,
+    jit_native_deg2rad_f64_abi, jit_native_dynamic_property_slot_abi,
+    jit_native_dynamic_property_test_slot_abi, jit_native_echo_bytes_abi, jit_native_equal_abi,
+    jit_native_exp_f64_abi, jit_native_expm1_f64_abi, jit_native_float_cast_abi,
+    jit_native_float_to_string_abi, jit_native_fmod_f64_abi, jit_native_fpow_f64_abi,
+    jit_native_greater_abi, jit_native_greater_equal_abi, jit_native_hypot_f64_abi,
+    jit_native_identical_abi, jit_native_int_cast_abi, jit_native_less_abi,
+    jit_native_less_equal_abi, jit_native_log_f64_abi, jit_native_log1p_f64_abi,
+    jit_native_log10_f64_abi, jit_native_not_equal_abi, jit_native_not_identical_abi,
+    jit_native_numeric_string_abi, jit_native_object_cast_abi, jit_native_object_class_name_abi,
+    jit_native_plain_object_clone_abi, jit_native_prepared_closure_new_abi,
+    jit_native_prepared_exception_new_abi, jit_native_prepared_object_new_abi,
+    jit_native_rad2deg_f64_abi, jit_native_resolve_callable_abi, jit_native_round_f64_abi,
+    jit_native_sin_f64_abi, jit_native_sinh_f64_abi, jit_native_sizeof_abi,
+    jit_native_spaceship_abi, jit_native_string_cast_abi, jit_native_tan_f64_abi,
+    jit_native_tanh_f64_abi, jit_native_unary_minus_abi, jit_native_unary_plus_abi,
 };
 use request_state::{
     NativeBacktraceFrame, NativeFunctionNameScope, NativeLastError,
@@ -3509,15 +3506,45 @@ impl<'a> NativeRequestColdState<'a> {
     /// an exact boolean result. A class loaded later has a new unknown layout
     /// and therefore takes the site's single baseline continuation.
     fn prepare_trusted_instanceof_plans(&mut self) {
+        fn published_target(
+            constants: &[php_ir::IrConstant],
+            constant_registers: &std::collections::BTreeMap<php_ir::RegId, php_ir::ConstId>,
+            instruction: &php_ir::Instruction,
+        ) -> Option<String> {
+            match &instruction.kind {
+                php_ir::InstructionKind::InstanceOf { class_name, .. }
+                    if !class_name.eq_ignore_ascii_case("static") =>
+                {
+                    Some(class_name.clone())
+                }
+                php_ir::InstructionKind::DynamicInstanceOf { target, .. } => {
+                    let target = match target {
+                        php_ir::Operand::Constant(target) => *target,
+                        php_ir::Operand::Register(target) => *constant_registers.get(target)?,
+                        php_ir::Operand::Local(_) => return None,
+                    };
+                    match constants.get(target.index()) {
+                        Some(php_ir::IrConstant::String(target)) if !target.is_empty() => {
+                            Some(target.clone())
+                        }
+                        Some(php_ir::IrConstant::StringBytes(target)) if !target.is_empty() => {
+                            std::str::from_utf8(target).ok().map(str::to_owned)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
         let published_functions = self.published_native_functions();
         let has_instanceof_site = published_functions.iter().any(|function| {
             self.prepared_continuation_instructions(*function)
                 .is_some_and(|instructions| {
                     instructions.iter().flatten().any(|instruction| {
                         matches!(
-                            &instruction.kind,
-                            php_ir::InstructionKind::InstanceOf { class_name, .. }
-                                if !class_name.eq_ignore_ascii_case("static")
+                            instruction.kind,
+                            php_ir::InstructionKind::InstanceOf { .. }
+                                | php_ir::InstructionKind::DynamicInstanceOf { .. }
                         )
                     })
                 })
@@ -3599,24 +3626,33 @@ impl<'a> NativeRequestColdState<'a> {
                 continue;
             };
             let caller_function = function.raw();
+            let constant_registers = instructions
+                .iter()
+                .flatten()
+                .filter_map(|instruction| match instruction.kind {
+                    php_ir::InstructionKind::LoadConst { dst, constant } => Some((dst, constant)),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
             for (continuation, instruction) in instructions.iter().enumerate() {
                 let Some(instruction) = instruction.as_ref() else {
                     continue;
                 };
-                let php_ir::InstructionKind::InstanceOf { class_name, .. } = &instruction.kind
+                let Some(class_name) =
+                    published_target(&self.unit.constants, &constant_registers, instruction)
                 else {
                     continue;
                 };
-                if class_name.eq_ignore_ascii_case("static") {
-                    continue;
-                }
                 let Ok(target) =
-                    native_resolve_scoped_class_name(self, class_name, caller_function)
+                    native_resolve_scoped_class_name(self, &class_name, caller_function)
                 else {
                     continue;
                 };
                 let target = normalize_class_name(&target);
-                if self.class_aliases.contains_key(&target) || !known_names.contains(&target) {
+                if self.class_aliases.contains_key(&target)
+                    || (!known_names.contains(&target)
+                        && !native_internal_class_is_available(&target))
+                {
                     continue;
                 }
 
@@ -5459,6 +5495,9 @@ impl<'a> NativeRequestColdState<'a> {
         resource: php_runtime::api::ResourceRef,
     ) -> Result<i64, String> {
         let resource_id = resource.id().get();
+        let resource_type_length = resource.resource_type().len().max("Unknown".len());
+        let resource_type_length = u32::try_from(resource_type_length)
+            .map_err(|_| "direct native resource type name exceeds the descriptor".to_owned())?;
         if let Some(index) = self.direct_resource_handles.get(&resource_id).copied() {
             let slot = self
                 .direct_value_slots
@@ -5472,6 +5511,7 @@ impl<'a> NativeRequestColdState<'a> {
                 .ok_or_else(|| {
                     "direct native resource identity points at a dead slot".to_owned()
                 })?;
+            slot.reserved = slot.reserved.max(resource_type_length);
             slot.refcount = slot
                 .refcount
                 .checked_add(1)
@@ -5497,9 +5537,9 @@ impl<'a> NativeRequestColdState<'a> {
             refcount: 2,
             kind: php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE,
             flags: php_jit::JIT_NATIVE_DIRECT_RESOURCE_ABI_VERSION,
+            reserved: resource_type_length,
             payload: resource_id,
             aux: owner as usize as u64,
-            ..php_jit::JitNativeValueSlot::default()
         };
         self.direct_resource_handles.insert(
             resource_id,

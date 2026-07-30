@@ -1117,6 +1117,7 @@ fn property_assignment_borrows_implicit_method_receiver() {
             class: SsaValueClass::MixedHandle,
             certainty: SsaCertainty::Unknown,
             ownership: SsaOwnership::Borrowed,
+            integer_range: None,
         }
     );
     assert_eq!(flow.register_fact(receiver), flow.local_fact(this));

@@ -1135,6 +1135,9 @@ impl NativeRequestFastState {
         resource: php_runtime::api::ResourceRef,
     ) -> Result<i64, &'static str> {
         let resource_id = resource.id().get();
+        let resource_type_length = resource.resource_type().len().max("Unknown".len());
+        let resource_type_length = u32::try_from(resource_type_length)
+            .map_err(|_| "direct resource type name exceeds the native descriptor")?;
         let handles = unsafe { self.direct_resource_handles.as_mut() }
             .ok_or("direct resource identity table is unavailable")?;
         if let Some(index) = handles.get(&resource_id).copied() {
@@ -1148,6 +1151,7 @@ impl NativeRequestFastState {
             {
                 return Err("direct resource identity points at a dead slot");
             }
+            slot.reserved = slot.reserved.max(resource_type_length);
             slot.refcount = slot
                 .refcount
                 .checked_add(1)
@@ -1175,7 +1179,7 @@ impl NativeRequestFastState {
                 refcount: 2,
                 kind: php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE,
                 flags: php_jit::JIT_NATIVE_DIRECT_RESOURCE_ABI_VERSION,
-                reserved: 0,
+                reserved: resource_type_length,
                 payload: resource_id,
                 aux: owner as usize as u64,
             };
@@ -2318,62 +2322,18 @@ impl NativeRequestFastState {
         self.publish_prepared_callable_owned(owner).map(Some)
     }
 
-    /// Resolves one immutable IR function-name descriptor against the live
-    /// request symbol capability and publishes the resulting callable record
-    /// directly. The name bytes are borrowed from generated code for this
-    /// synchronous call, so resolving a callable creates no temporary native
-    /// string owner that could be stranded by a baseline continuation.
-    fn resolve_direct_function_callable(
+    /// Publishes one callable whose target and signature were fixed before
+    /// optimizer entry. This allocation performs no symbol lookup or dynamic
+    /// dispatch; the supplied plan is the complete callable contract.
+    fn publish_fixed_function_callable(
         &mut self,
         name: &[u8],
-    ) -> Result<Option<i64>, &'static str> {
-        let Ok(name) = std::str::from_utf8(name) else {
-            return Ok(None);
-        };
-        let normalized = name.trim_start_matches('\\').to_ascii_lowercase();
-        let fallback = normalized.rsplit_once('\\').map(|(_, basename)| basename);
-        let exists = self.symbol_query.function_exists(&normalized)
-            || fallback.is_some_and(|fallback| self.symbol_query.function_exists(fallback));
-        if !exists {
-            return Ok(None);
-        }
-        let resolved_function = self.symbol_query.same_unit_callable_plan(name);
+        plan: NativeFixedCallablePlan,
+    ) -> Result<i64, &'static str> {
         self.publish_prepared_callable_owned(NativePreparedCallableOwner::user_function(
-            Box::from(name.as_bytes()),
-            resolved_function,
+            Box::from(name),
+            Some(plan),
         ))
-        .map(Some)
-    }
-
-    /// Implements dynamic `instanceof` over authoritative direct values and
-    /// the exact symbol capability. Invalid target shapes and incompletely
-    /// published ancestry request one baseline continuation before producing
-    /// any PHP-visible effect.
-    fn direct_dynamic_instanceof(&self, object: i64, target: i64) -> Option<bool> {
-        let target = if let Some(bytes) = self.native_string_view(target) {
-            std::str::from_utf8(bytes).ok()?.to_owned()
-        } else if let Some(object) = self.native_query_object(target) {
-            object.class_name()
-        } else {
-            return None;
-        };
-        let object = self.exact_callable_value(object)?;
-        if let Some(object) = self.native_query_object(object) {
-            return native_internal_instanceof(&object.class_name(), &target)
-                .or_else(|| self.symbol_query.class_is_a(&object.class_name(), &target));
-        }
-        let kind = object as u64 & php_jit::JIT_VALUE_RUNTIME_KIND_MASK;
-        match kind {
-            php_jit::JIT_VALUE_RUNTIME_CALLABLE_TAG => {
-                Some(normalize_class_name(&target) == "closure")
-            }
-            php_jit::JIT_VALUE_RUNTIME_FIBER_TAG => Some(normalize_class_name(&target) == "fiber"),
-            php_jit::JIT_VALUE_RUNTIME_GENERATOR_TAG => Some(matches!(
-                normalize_class_name(&target).as_str(),
-                "generator" | "iterator" | "traversable"
-            )),
-            _ => Some(false),
-        }
     }
 
     #[allow(unsafe_code)] // Safety: the native request owns every published pointer for the synchronous activation.
@@ -6269,7 +6229,9 @@ impl NativeRequestFastState {
         let object_id = object.id();
         let object_type_flags = u32::from(object.is_native_countable())
             * php_jit::JIT_NATIVE_OBJECT_COUNTABLE
-            | u32::from(object.is_native_traversable()) * php_jit::JIT_NATIVE_OBJECT_TRAVERSABLE;
+            | u32::from(object.is_native_traversable()) * php_jit::JIT_NATIVE_OBJECT_TRAVERSABLE
+            | u32::from(object.class_name().eq_ignore_ascii_case("stdClass"))
+                * php_jit::JIT_NATIVE_OBJECT_STDCLASS;
         let owner = Box::into_raw(Box::new(object));
         let view = self.header.active_runtime_view();
         let slots = view.direct_value_slots as usize as *mut php_jit::JitNativeValueSlot;

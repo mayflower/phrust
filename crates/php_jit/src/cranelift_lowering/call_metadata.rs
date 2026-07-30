@@ -1027,8 +1027,8 @@ pub(super) fn stable_builtin_extrema(target: &RegionCallTarget) -> Option<Stable
 }
 
 /// Scalar conversion and type-name consumers that can stay on the same native
-/// value representation as casts and tag tests. Optional or reference-mutating
-/// forms deliberately remain on their one baseline continuation.
+/// value representation as casts and tag tests. Publication rejects optional
+/// or reference-mutating forms before an optimizing region is entered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StableScalarConsumerBuiltin {
     BoolVal,
@@ -3199,7 +3199,7 @@ pub(super) fn stable_builtin_array_shape(
 
 /// Callback-free array sorts over authoritative direct entries. Each
 /// operation has a fixed ABI; comparison mode remains a PHP-visible argument
-/// and unsupported modes take one baseline continuation.
+/// and unsupported modes are rejected before optimizer entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StableArraySortBuiltin {
     Asort,

@@ -14,6 +14,14 @@ fn exact_query_baseline() -> php_jit::JitNativeControlResult {
     )
 }
 
+fn exact_query_contract_violation() -> php_jit::JitNativeControlResult {
+    php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::ABI_MISMATCH, 0, 0)
+}
+
+fn exact_query_runtime_error() -> php_jit::JitNativeControlResult {
+    php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::RUNTIME_ERROR, 0, 0)
+}
+
 fn exact_query_class_name(fast: &NativeRequestFastState, encoded: i64) -> Option<String> {
     fast.native_string_view(encoded)
         .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
@@ -33,10 +41,10 @@ fn exact_class_kind_exists<const KIND: u8>(
     arguments: [i64; 2],
 ) -> php_jit::JitNativeControlResult {
     let Some(name) = exact_query_class_name(fast, arguments[0]) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(autoload) = exact_query_autoload(fast, arguments[1]) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let normalized_name = normalize_class_name(&name);
     let matches_kind = |class: &php_ir::ClassEntry| match KIND {
@@ -83,10 +91,9 @@ fn exact_class_kind_exists<const KIND: u8>(
     if exists || !autoload {
         exact_query_return_bool(exists)
     } else {
-        // Autoload can invoke arbitrary PHP. Leave the exact handler before
-        // any callback-visible effect and resume this operation once in its
-        // baseline continuation.
-        exact_query_baseline()
+        // Publication admits class-kind queries only with autoload disabled.
+        // Reaching this edge means the compiled argument contract was broken.
+        exact_query_contract_violation()
     }
 }
 
@@ -100,10 +107,10 @@ fn exact_member_exists<const METHOD: bool>(
     } else if let Some(name) = exact_query_class_name(fast, arguments[0]) {
         (Arc::<str>::from(name), None)
     } else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let Some(member) = exact_query_class_name(fast, arguments[1]) else {
-        return exact_query_baseline();
+        return exact_query_contract_violation();
     };
     let exists = (!METHOD
         && object
@@ -193,7 +200,7 @@ exact_symbol_query_abi!(jit_native_defined_abi, fast, symbols, arguments, {
     if let Some(name) = exact_query_class_name(fast, arguments[0]) {
         exact_query_return_bool(symbols.constant_exists(&name))
     } else {
-        exact_query_baseline()
+        exact_query_contract_violation()
     }
 });
 
@@ -264,7 +271,7 @@ exact_symbol_query_abi!(jit_native_function_exists_abi, fast, symbols, arguments
     if let Some(name) = exact_query_class_name(fast, arguments[0]) {
         exact_query_return_bool(symbols.function_exists(&name))
     } else {
-        exact_query_baseline()
+        exact_query_contract_violation()
     }
 });
 exact_symbol_query_abi!(jit_native_class_exists_abi, fast, symbols, arguments, {

@@ -7,8 +7,8 @@ use php_ir::{IrConstant, IrReturnType, LocalId, RegId};
 use super::{
     RegionBinaryOp, RegionCallResult, RegionCallTarget, RegionCastOp, RegionGraph,
     RegionInstructionKind, RegionNativeControl, RegionNativeDynamicCode, RegionNativeSuspend,
-    RegionOperand, RegionSemanticOp, RegionTerminator, RegionUnaryOp, SsaOwnership, SsaValueClass,
-    SsaValueFact, ssa::ExecutableSsaGraph,
+    RegionOperand, RegionSemanticOp, RegionTerminator, RegionUnaryOp, SsaIntegerRange,
+    SsaOwnership, SsaValueClass, SsaValueFact, ssa::ExecutableSsaGraph,
 };
 
 /// Storage selected for a PHP local before Cranelift lowering.
@@ -100,8 +100,9 @@ impl ExecutableValueFlow {
         match operand {
             RegionOperand::Register(register) => self.register_fact(register),
             RegionOperand::Local(local) => self.local_fact(local),
-            RegionOperand::I64(_) => {
+            RegionOperand::I64(value) => {
                 SsaValueFact::exact(SsaValueClass::Int, SsaOwnership::ImmortalConstant)
+                    .with_integer_range(SsaIntegerRange::exact(value))
             }
             RegionOperand::Constant(index) => constants
                 .get(index as usize)
@@ -619,6 +620,7 @@ pub fn analyze_baseline_value_ownership(region: &RegionGraph) -> ExecutableValue
                     class: SsaValueClass::MixedHandle,
                     certainty: super::SsaCertainty::Unknown,
                     ownership: SsaOwnership::Borrowed,
+                    integer_range: None,
                 },
             )
         })
@@ -640,6 +642,7 @@ pub fn analyze_baseline_value_ownership(region: &RegionGraph) -> ExecutableValue
                             // does not know the PHP value class.
                             SsaOwnership::Owned
                         },
+                        integer_range: None,
                     },
                 );
                 continue;
@@ -696,6 +699,7 @@ pub fn analyze_baseline_value_ownership(region: &RegionGraph) -> ExecutableValue
                 class: SsaValueClass::MixedHandle,
                 certainty: super::SsaCertainty::Unknown,
                 ownership: SsaOwnership::Owned,
+                integer_range: None,
             });
     }
 
@@ -1536,6 +1540,7 @@ fn initial_fact_for_local(
                 class: SsaValueClass::MixedHandle,
                 certainty: super::SsaCertainty::Unknown,
                 ownership: SsaOwnership::Borrowed,
+                integer_range: None,
             },
             type_fact,
         );
@@ -1550,6 +1555,7 @@ fn initial_fact_for_local(
             class: SsaValueClass::MixedHandle,
             certainty: super::SsaCertainty::Unknown,
             ownership: SsaOwnership::Borrowed,
+            integer_range: None,
         };
     }
     SsaValueFact::exact(SsaValueClass::Uninitialized, SsaOwnership::ImmortalConstant)
@@ -1567,8 +1573,9 @@ fn operand_fact(
             .copied()
             .unwrap_or(SsaValueFact::UNKNOWN),
         RegionOperand::Local(local) => locals.get(&local).copied().unwrap_or(SsaValueFact::UNKNOWN),
-        RegionOperand::I64(_) => {
+        RegionOperand::I64(value) => {
             SsaValueFact::exact(SsaValueClass::Int, SsaOwnership::ImmortalConstant)
+                .with_integer_range(SsaIntegerRange::exact(value))
         }
         RegionOperand::Constant(index) => constants
             .get(index as usize)
@@ -1614,6 +1621,7 @@ fn instruction_result_fact(
                 class: SsaValueClass::MixedHandle,
                 certainty: super::SsaCertainty::Unknown,
                 ownership: SsaOwnership::Owned,
+                integer_range: None,
             };
             let both_arrays =
                 lhs.class == SsaValueClass::ArrayHandle && rhs.class == SsaValueClass::ArrayHandle;
@@ -1643,11 +1651,21 @@ fn instruction_result_fact(
                     RegionBinaryOp::Add | RegionBinaryOp::Sub | RegionBinaryOp::Mul
                         if both_integer =>
                     {
-                        owned_dynamic
+                        let range = match (*op, lhs.integer_range, rhs.integer_range) {
+                            (RegionBinaryOp::Add, Some(lhs), Some(rhs)) => lhs.checked_add(rhs),
+                            (RegionBinaryOp::Sub, Some(lhs), Some(rhs)) => lhs.checked_sub(rhs),
+                            (RegionBinaryOp::Mul, Some(lhs), Some(rhs)) => lhs.checked_mul(rhs),
+                            _ => None,
+                        };
+                        range.map_or(owned_dynamic, |range| {
+                            SsaValueFact::known(SsaValueClass::Int, SsaOwnership::Owned)
+                                .with_integer_range(range)
+                        })
                     }
-                    RegionBinaryOp::Div => {
+                    RegionBinaryOp::Div if has_float => {
                         SsaValueFact::known(SsaValueClass::Float, SsaOwnership::Owned)
                     }
+                    RegionBinaryOp::Div => owned_dynamic,
                     RegionBinaryOp::Concat => {
                         SsaValueFact::known(SsaValueClass::StringHandle, SsaOwnership::Owned)
                     }
@@ -1698,7 +1716,12 @@ fn instruction_result_fact(
             ..
         } => Some((
             *dst,
-            SsaValueFact::known(SsaValueClass::Int, SsaOwnership::Owned),
+            SsaValueFact::known(SsaValueClass::Int, SsaOwnership::Owned).with_integer_range(
+                SsaIntegerRange {
+                    minimum: -1,
+                    maximum: 1,
+                },
+            ),
         )),
         RegionInstructionKind::Compare { dst, .. }
         | RegionInstructionKind::IssetDim { dst, .. }
@@ -1759,8 +1782,10 @@ fn instruction_result_fact(
         RegionInstructionKind::NativeCall(call) => match call.result {
             RegionCallResult::Register(dst) => {
                 let class = match &call.target {
-                    RegionCallTarget::Function { .. }
-                    | RegionCallTarget::Method { .. }
+                    RegionCallTarget::Function { name, .. } => {
+                        fixed_function_result_fact(name).unwrap_or(SsaValueFact::UNKNOWN)
+                    }
+                    RegionCallTarget::Method { .. }
                     | RegionCallTarget::StaticMethod { .. }
                     | RegionCallTarget::Closure { .. }
                     | RegionCallTarget::Callable { .. }
@@ -1819,7 +1844,33 @@ fn constant_fact(constant: &IrConstant) -> SsaValueFact {
             return SsaValueFact::UNKNOWN;
         }
     };
-    SsaValueFact::exact(class, SsaOwnership::ImmortalConstant)
+    let fact = SsaValueFact::exact(class, SsaOwnership::ImmortalConstant);
+    match constant {
+        IrConstant::Int(value) => fact.with_integer_range(SsaIntegerRange::exact(*value)),
+        _ => fact,
+    }
+}
+
+fn fixed_function_result_fact(name: &str) -> Option<SsaValueFact> {
+    let normalized = name.trim_start_matches('\\');
+    if normalized.contains('\\') {
+        return None;
+    }
+    let name = normalized.to_ascii_lowercase();
+    let integer = |minimum, maximum| {
+        SsaValueFact::known(SsaValueClass::Int, SsaOwnership::Owned)
+            .with_integer_range(SsaIntegerRange { minimum, maximum })
+    };
+    match name.as_str() {
+        // The byte-compare ABIs return a C-compatible signed comparison
+        // result. Keeping the complete i32 range remains conservative while
+        // proving that short reduction trees cannot overflow a PHP integer.
+        "strcmp" | "strcasecmp" | "strncmp" | "strncasecmp" | "strnatcmp" | "strnatcasecmp"
+        | "substr_compare" => Some(integer(i64::from(i32::MIN), i64::from(i32::MAX))),
+        "ord" => Some(integer(0, 255)),
+        "strlen" | "mb_strlen" | "count" | "sizeof" => Some(integer(0, i64::MAX)),
+        _ => None,
+    }
 }
 
 fn reserved_constant_fact(index: u32) -> SsaValueFact {
@@ -1863,14 +1914,19 @@ fn join_facts(left: SsaValueFact, right: SsaValueFact) -> SsaValueFact {
     if left.class != right.class {
         return SsaValueFact::UNKNOWN;
     }
-    SsaValueFact::known(
+    let mut joined = SsaValueFact::known(
         left.class,
         if left.ownership == right.ownership {
             left.ownership
         } else {
             SsaOwnership::Unknown
         },
-    )
+    );
+    joined.integer_range = match (left.integer_range, right.integer_range) {
+        (Some(left), Some(right)) => Some(left.union(right)),
+        _ => None,
+    };
+    joined
 }
 
 #[cfg(test)]
@@ -2882,6 +2938,7 @@ mod tests {
                 class: SsaValueClass::MixedHandle,
                 certainty: crate::region_ir::SsaCertainty::Unknown,
                 ownership: SsaOwnership::Owned,
+                integer_range: None,
             }
         );
     }

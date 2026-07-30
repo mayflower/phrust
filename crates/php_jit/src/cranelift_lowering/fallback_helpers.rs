@@ -61,7 +61,7 @@ pub(super) extern "C" fn test_baseline_binary_fallback(
     0
 }
 
-pub(super) extern "C" fn test_native_exact_binary_fallback(
+pub(super) extern "C" fn test_total_representation_binary_fallback(
     _runtime: *mut std::ffi::c_void,
     _lhs: i64,
     _rhs: i64,

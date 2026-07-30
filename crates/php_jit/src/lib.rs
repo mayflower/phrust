@@ -48,8 +48,9 @@ pub use abi::{
     JIT_NATIVE_NUMERIC_STRING_INT, JIT_NATIVE_NUMERIC_STRING_LEADING_FLOAT,
     JIT_NATIVE_NUMERIC_STRING_LEADING_INT, JIT_NATIVE_NUMERIC_STRING_NON_NUMERIC,
     JIT_NATIVE_OBJECT_COUNTABLE, JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_MASK,
-    JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_VERSION, JIT_NATIVE_OBJECT_TRAVERSABLE,
-    JIT_NATIVE_OBJECT_TYPE_FLAGS, JIT_NATIVE_PREPARED_CALLABLE_ABI_VERSION,
+    JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_VERSION, JIT_NATIVE_OBJECT_STDCLASS,
+    JIT_NATIVE_OBJECT_TRAVERSABLE, JIT_NATIVE_OBJECT_TYPE_FLAGS,
+    JIT_NATIVE_PREPARED_CALLABLE_ABI_VERSION,
     JIT_NATIVE_PREPARED_CALLABLE_FIRST_PARAMETER_BY_REFERENCE,
     JIT_NATIVE_PREPARED_CALLABLE_FIXED_BINDING, JIT_NATIVE_PREPARED_CALLABLE_HAS_RECEIVER,
     JIT_NATIVE_PREPARED_CALLABLE_HAS_SCOPE, JIT_NATIVE_PREPARED_CALLABLE_RETURNS_INT,
@@ -103,18 +104,18 @@ pub use abi::{
     JitNativeGeneratorState, JitNativeIndirectionEntry, JitNativeInstanceOfEntry,
     JitNativeInstanceOfPlan, JitNativeLinkedFunction, JitNativeNumericStringResult,
     JitNativePcMetadata, JitNativePreparedCallableView, JitNativePreparedClassPlan,
-    JitNativePreparedClosureView, JitNativeReferenceArrayEntry, JitNativeReferenceArrayView,
-    JitNativeReferenceScalarView, JitNativeRequestLocalSlot, JitNativeResumeInputKind,
-    JitNativeRootEntry, JitNativeRootKind, JitNativeRuntimeView, JitNativeRuntimeViewGuard,
-    JitNativeStaticPropertySlot, JitNativeSuspendKind, JitNativeSuspensionGenerationPolicy,
-    JitNativeTransitionState, JitNativeTrustedConstantSlot, JitNativeTrustedGlobalReferenceSlot,
-    JitNativeTrustedLiteralSlot, JitNativeTrustedPropertySlot, JitNativeTrustedStaticLocalSlot,
-    JitNativeTrustedStaticPropertySlot, JitNativeValueSlot, JitOpaqueHandle, JitOpaqueValueKind,
-    JitRegionResult, JitRuntimeCallout, JitRuntimeCalloutResult, JitSideExit, JitVmContextHandle,
-    SideExitReason, activate_native_runtime_view, jit_native_direct_array_cursor,
-    jit_native_direct_array_flags, jit_native_direct_string_capacity,
-    jit_native_direct_string_reserved, jit_native_instanceof_index,
-    jit_native_object_property_view_is_published,
+    JitNativePreparedClosureView, JitNativePreparedExceptionView, JitNativeReferenceArrayEntry,
+    JitNativeReferenceArrayView, JitNativeReferenceScalarView, JitNativeRequestLocalSlot,
+    JitNativeResumeInputKind, JitNativeRootEntry, JitNativeRootKind, JitNativeRuntimeView,
+    JitNativeRuntimeViewGuard, JitNativeStaticPropertySlot, JitNativeSuspendKind,
+    JitNativeSuspensionGenerationPolicy, JitNativeTransitionState, JitNativeTrustedConstantSlot,
+    JitNativeTrustedGlobalReferenceSlot, JitNativeTrustedLiteralSlot, JitNativeTrustedPropertySlot,
+    JitNativeTrustedStaticLocalSlot, JitNativeTrustedStaticPropertySlot, JitNativeValueSlot,
+    JitOpaqueHandle, JitOpaqueValueKind, JitRegionResult, JitRuntimeCallout,
+    JitRuntimeCalloutResult, JitSideExit, JitVmContextHandle, SideExitReason,
+    activate_native_runtime_view, jit_native_direct_array_cursor, jit_native_direct_array_flags,
+    jit_native_direct_string_capacity, jit_native_direct_string_reserved,
+    jit_native_instanceof_index, jit_native_object_property_view_is_published,
 };
 pub use backend::{NativeCompileOutcome, NativeCompileRequest, NativeCompilerApi};
 pub use code_manager::{
@@ -364,11 +365,14 @@ pub struct JitRuntimeHelperAddresses {
     pub native_exact_unary: [usize; 3],
     /// Baseline-only typed PHP binary compatibility operation.
     pub baseline_binary: usize,
-    /// Exact authoritative native binary-operation family. Every entry has a
-    /// fixed symbol; generated optimizing code never passes an operation ID.
-    /// Order: add, subtract, multiply, divide, modulo, concat, power,
-    /// bit-and, bit-or, bit-xor, shift-left, shift-right.
-    pub native_binary: [usize; 12],
+    /// Total representation-heavy array union over publication-admitted
+    /// authoritative direct arrays.
+    pub native_array_union: usize,
+    /// Total concatenation over publication-admitted native scalar/string
+    /// encodings.
+    pub native_concat: usize,
+    /// Total native string bit operations. Order: and, or, xor.
+    pub native_string_bitwise: [usize; 3],
     /// Baseline-only typed PHP comparison compatibility operation.
     pub baseline_compare: usize,
     /// Exact authoritative native comparison family. Every entry has a fixed
@@ -520,9 +524,6 @@ pub struct JitRuntimeHelperAddresses {
     /// Exact resolution of one immutable function-name descriptor through the
     /// live request symbol capability.
     pub native_resolve_callable: usize,
-    /// Exact dynamic `instanceof` over authoritative object/target values and
-    /// published class ancestry.
-    pub native_dynamic_instanceof: usize,
     /// Exact allocation from a request-published immutable class plan.
     pub native_prepared_object_new: usize,
     /// Exact internal throwable allocation from immutable continuation

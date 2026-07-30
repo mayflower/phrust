@@ -3,9 +3,9 @@
 //! These fixed ABIs expose no cold coordinator or compatibility value plane.
 
 use super::{
-    NativeComparisonTraversal, NativeComparisonValue, NativePreparedClosure,
-    NativeRequestFastState, PreparedNativeRuntimeClass, PreparedNativeThrowableSite,
-    native_reference_state,
+    NativeComparisonTraversal, NativeComparisonValue, NativeFixedCallablePlan,
+    NativePreparedClosure, NativeRequestFastState, PreparedNativeRuntimeClass,
+    PreparedNativeThrowableSite, native_reference_state,
 };
 use std::fmt::{self, Write};
 use std::sync::Arc;
@@ -183,12 +183,8 @@ pub(in crate::vm) extern "C" fn jit_native_rad2deg_f64_abi(value: f64) -> f64 {
     (value / std::f64::consts::PI) * 180.0
 }
 
-fn native_compound_comparison_baseline() -> php_jit::JitNativeControlResult {
-    php_jit::JitNativeControlResult::control(
-        php_jit::JitCallStatus::RECOMPILE_REQUESTED,
-        0,
-        php_jit::jit_encode_constant(u32::MAX),
-    )
+fn native_runtime_contract_violation() -> php_jit::JitNativeControlResult {
+    php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::ABI_MISMATCH, 0, 0)
 }
 
 fn native_compound_comparison_bool(value: bool) -> php_jit::JitNativeControlResult {
@@ -220,7 +216,7 @@ pub(in crate::vm) extern "C" fn jit_native_identical_abi(
     let fast = unsafe { &*runtime };
     fast.native_values_identical(left, right, &mut NativeComparisonTraversal::default())
         .map_or_else(
-            native_compound_comparison_baseline,
+            native_runtime_contract_violation,
             native_compound_comparison_bool,
         )
 }
@@ -237,7 +233,7 @@ pub(in crate::vm) extern "C" fn jit_native_not_identical_abi(
     fast.native_values_identical(left, right, &mut NativeComparisonTraversal::default())
         .map(|identical| !identical)
         .map_or_else(
-            native_compound_comparison_baseline,
+            native_runtime_contract_violation,
             native_compound_comparison_bool,
         )
 }
@@ -253,7 +249,7 @@ pub(in crate::vm) extern "C" fn jit_native_equal_abi(
     let fast = unsafe { &*runtime };
     fast.native_values_equal(left, right, &mut NativeComparisonTraversal::default())
         .map_or_else(
-            native_compound_comparison_baseline,
+            native_runtime_contract_violation,
             native_compound_comparison_bool,
         )
 }
@@ -270,7 +266,7 @@ pub(in crate::vm) extern "C" fn jit_native_not_equal_abi(
     fast.native_values_equal(left, right, &mut NativeComparisonTraversal::default())
         .map(|equal| !equal)
         .map_or_else(
-            native_compound_comparison_baseline,
+            native_runtime_contract_violation,
             native_compound_comparison_bool,
         )
 }
@@ -285,7 +281,7 @@ pub(in crate::vm) extern "C" fn jit_native_less_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &*runtime };
     let Some((ordering, unordered)) = native_exact_comparison_order(fast, left, right) else {
-        return native_compound_comparison_baseline();
+        return native_runtime_contract_violation();
     };
     native_compound_comparison_bool(!unordered && ordering.is_lt())
 }
@@ -300,7 +296,7 @@ pub(in crate::vm) extern "C" fn jit_native_less_equal_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &*runtime };
     let Some((ordering, unordered)) = native_exact_comparison_order(fast, left, right) else {
-        return native_compound_comparison_baseline();
+        return native_runtime_contract_violation();
     };
     native_compound_comparison_bool(!unordered && !ordering.is_gt())
 }
@@ -315,7 +311,7 @@ pub(in crate::vm) extern "C" fn jit_native_greater_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &*runtime };
     let Some((ordering, unordered)) = native_exact_comparison_order(fast, left, right) else {
-        return native_compound_comparison_baseline();
+        return native_runtime_contract_violation();
     };
     native_compound_comparison_bool(!unordered && ordering.is_gt())
 }
@@ -330,7 +326,7 @@ pub(in crate::vm) extern "C" fn jit_native_greater_equal_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &*runtime };
     let Some((ordering, unordered)) = native_exact_comparison_order(fast, left, right) else {
-        return native_compound_comparison_baseline();
+        return native_runtime_contract_violation();
     };
     native_compound_comparison_bool(!unordered && !ordering.is_lt())
 }
@@ -345,7 +341,7 @@ pub(in crate::vm) extern "C" fn jit_native_spaceship_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &*runtime };
     let Some((ordering, _)) = native_exact_comparison_order(fast, left, right) else {
-        return native_compound_comparison_baseline();
+        return native_runtime_contract_violation();
     };
     php_jit::JitNativeControlResult::returning(match ordering {
         std::cmp::Ordering::Less => -1,
@@ -397,33 +393,41 @@ pub(in crate::vm) extern "C" fn jit_native_acquire_callable_abi(
     #[allow(unsafe_code)]
     match (unsafe { &mut *runtime }).acquire_direct_callable(value) {
         Ok(Some(callable)) => php_jit::JitNativeControlResult::returning(callable),
-        Ok(None) => php_jit::JitNativeControlResult::control(
-            php_jit::JitCallStatus::RECOMPILE_REQUESTED,
-            0,
-            0,
-        ),
+        Ok(None) => native_runtime_contract_violation(),
         Err(_) => {
             php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::RUNTIME_ERROR, 0, 0)
         }
     }
 }
 
-/// Resolves one compile-time function-name descriptor through the exact live
-/// symbol capability. Generated code passes immutable bytes directly, so this
-/// boundary neither constructs a Rust `Value` nor allocates a temporary native
-/// string whose ownership would have to survive a continuation.
+/// Publishes one compile-time callable from its immutable target/signature
+/// contract. Generated code passes the already-resolved function identity and
+/// flags, so this boundary performs no symbol query or dynamic dispatch.
 pub(in crate::vm) extern "C" fn jit_native_resolve_callable_abi(
     runtime: *mut NativeRequestFastState,
     name: *const u8,
     length: u64,
+    function_id: u64,
+    visible_arity: u64,
+    flags: u64,
 ) -> php_jit::JitNativeControlResult {
     let Ok(length) = usize::try_from(length) else {
-        return php_jit::JitNativeControlResult::control(
-            php_jit::JitCallStatus::RECOMPILE_REQUESTED,
-            0,
-            0,
-        );
+        return native_runtime_contract_violation();
     };
+    let (Ok(function_id), Ok(visible_arity), Ok(flags)) = (
+        u32::try_from(function_id),
+        u32::try_from(visible_arity),
+        u32::try_from(flags),
+    ) else {
+        return native_runtime_contract_violation();
+    };
+    let allowed_flags = php_jit::JIT_NATIVE_PREPARED_CALLABLE_FIRST_PARAMETER_BY_REFERENCE
+        | php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_INT
+        | php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_STRING
+        | php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_RELEASABLE_SCALAR;
+    if flags & !allowed_flags != 0 {
+        return native_runtime_contract_violation();
+    }
     if name.is_null() && length != 0 {
         return php_jit::JitNativeControlResult::control(
             php_jit::JitCallStatus::ABI_MISMATCH,
@@ -439,76 +443,31 @@ pub(in crate::vm) extern "C" fn jit_native_resolve_callable_abi(
     let name = unsafe { std::slice::from_raw_parts(name, length) };
     // SAFETY: the generated entry receives the request-stable fast state.
     #[allow(unsafe_code)]
-    match (unsafe { &mut *runtime }).resolve_direct_function_callable(name) {
-        Ok(Some(callable)) => php_jit::JitNativeControlResult::returning(callable),
-        Ok(None) => php_jit::JitNativeControlResult::control(
-            php_jit::JitCallStatus::RECOMPILE_REQUESTED,
-            0,
-            0,
-        ),
+    match (unsafe { &mut *runtime }).publish_fixed_function_callable(
+        name,
+        NativeFixedCallablePlan {
+            function: php_ir::FunctionId::new(function_id),
+            visible_arity,
+            has_receiver: false,
+            first_parameter_by_reference: flags
+                & php_jit::JIT_NATIVE_PREPARED_CALLABLE_FIRST_PARAMETER_BY_REFERENCE
+                != 0,
+            returns_int: flags & php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_INT != 0,
+            returns_string: flags & php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_STRING != 0,
+            returns_releasable_scalar: flags
+                & php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_RELEASABLE_SCALAR
+                != 0,
+        },
+    ) {
+        Ok(callable) => php_jit::JitNativeControlResult::returning(callable),
         Err(_) => {
             php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::RUNTIME_ERROR, 0, 0)
         }
     }
 }
 
-/// Evaluates a dynamic class-name/object `instanceof` target directly against
-/// authoritative native values and published ancestry metadata.
-pub(in crate::vm) extern "C" fn jit_native_dynamic_instanceof_abi(
-    runtime: *mut NativeRequestFastState,
-    object: i64,
-    target: i64,
-) -> php_jit::JitNativeControlResult {
-    // SAFETY: generated code passes the request-stable fast state and two
-    // synchronous borrowed native encodings.
-    // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
-    #[allow(unsafe_code)]
-    match (unsafe { &*runtime }).direct_dynamic_instanceof(object, target) {
-        Some(result) => {
-            php_jit::JitNativeControlResult::returning(php_jit::jit_encode_constant(if result {
-                php_jit::JIT_VALUE_TRUE
-            } else {
-                php_jit::JIT_VALUE_FALSE
-            }))
-        }
-        None => php_jit::JitNativeControlResult::control(
-            php_jit::JitCallStatus::RECOMPILE_REQUESTED,
-            0,
-            0,
-        ),
-    }
-}
-
-fn native_object_cast_baseline() -> php_jit::JitNativeControlResult {
-    php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::RECOMPILE_REQUESTED, 0, 0)
-}
-
-fn native_array_cast_baseline() -> php_jit::JitNativeControlResult {
-    php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::RECOMPILE_REQUESTED, 0, 0)
-}
-
-fn native_int_cast_baseline() -> php_jit::JitNativeControlResult {
-    php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::RECOMPILE_REQUESTED, 0, 0)
-}
-
-fn native_float_cast_baseline() -> php_jit::JitNativeControlResult {
-    php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::RECOMPILE_REQUESTED, 0, 0)
-}
-
-fn native_string_cast_baseline() -> php_jit::JitNativeControlResult {
-    php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::RECOMPILE_REQUESTED, 0, 0)
-}
-
-fn native_binary_baseline() -> php_jit::JitNativeControlResult {
-    php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::RECOMPILE_REQUESTED, 0, 0)
-}
-
 fn native_binary_runtime_error() -> php_jit::JitNativeControlResult {
     php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::RUNTIME_ERROR, 0, 0)
-}
-
-fn native_array_count_baseline() -> php_jit::JitNativeControlResult {
-    php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::RECOMPILE_REQUESTED, 0, 0)
 }
 
 fn count_native_array_entries(
@@ -535,9 +494,8 @@ fn count_native_array_entries(
                 )?)?;
             }
             Some(_) => {}
-            // An opaque compatibility value might itself be an array. Take
-            // the one baseline continuation instead of silently treating it
-            // as a scalar.
+            // Publication admits only authoritative direct-array graphs.
+            // An opaque value here is an engine contract violation.
             None => return None,
         }
     }
@@ -558,13 +516,13 @@ fn native_array_count(
         match fast.native_comparison_value(mode) {
             Some(NativeComparisonValue::Int(0)) => false,
             Some(NativeComparisonValue::Int(1)) => true,
-            _ => return native_array_count_baseline(),
+            _ => return native_runtime_contract_violation(),
         }
     };
     let Some(NativeComparisonValue::Array { identity, entries }) =
         fast.native_comparison_value(value)
     else {
-        return native_array_count_baseline();
+        return native_runtime_contract_violation();
     };
     let count = if recursive {
         let mut active = [0; 64];
@@ -573,7 +531,7 @@ fn native_array_count(
         Some(entries.len())
     };
     let Some(count) = count.and_then(|count| i64::try_from(count).ok()) else {
-        return native_array_count_baseline();
+        return native_runtime_contract_violation();
     };
     match fast.publish_direct_int(count) {
         Ok(value) => php_jit::JitNativeControlResult::returning(value),
@@ -583,9 +541,9 @@ fn native_array_count(
     }
 }
 
-/// Exact `count` over authoritative direct-array entries. Unsupported modes,
-/// compatibility arrays, Countable objects, and recursive cycles transition
-/// once to baseline before any observable effect.
+/// Exact `count` over authoritative direct-array entries. Publication admits
+/// only non-recursive direct-array forms to optimizing code; unsupported
+/// modes, compatibility values, and cycles are contract violations here.
 pub(in crate::vm) extern "C" fn jit_native_count_abi(
     runtime: *mut NativeRequestFastState,
     value: i64,
@@ -610,13 +568,6 @@ enum NativeBinaryNumber {
 }
 
 impl NativeBinaryNumber {
-    fn float(self) -> f64 {
-        match self {
-            Self::Int(value) => value as f64,
-            Self::Float(value) => value,
-        }
-    }
-
     fn exact_integer(self) -> Option<i64> {
         match self {
             Self::Int(value) => Some(value),
@@ -674,33 +625,6 @@ fn publish_native_binary_number(
     )
 }
 
-fn native_binary_numeric_operands(
-    fast: &NativeRequestFastState,
-    left: i64,
-    right: i64,
-) -> Option<(NativeBinaryNumber, NativeBinaryNumber)> {
-    Some((
-        native_binary_number(fast.native_comparison_value(left)?)?,
-        native_binary_number(fast.native_comparison_value(right)?)?,
-    ))
-}
-
-#[derive(Clone, Copy)]
-enum NativeExactBinary {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-    Concat,
-    Pow,
-    BitAnd,
-    BitOr,
-    BitXor,
-    ShiftLeft,
-    ShiftRight,
-}
-
 fn native_binary_array_key_equal(fast: &NativeRequestFastState, left: i64, right: i64) -> bool {
     match (
         fast.native_comparison_value(left),
@@ -720,9 +644,13 @@ fn native_binary_array_union(
     fast: &mut NativeRequestFastState,
     left: i64,
     right: i64,
-) -> Option<Result<i64, &'static str>> {
-    let (left_entries, left_length) = fast.stable_native_array_range(left)?;
-    let (right_entries, right_length) = fast.stable_native_array_range(right)?;
+) -> Result<i64, &'static str> {
+    let (left_entries, left_length) = fast
+        .stable_native_array_range(left)
+        .ok_or("array-union left operand escaped its publication plan")?;
+    let (right_entries, right_length) = fast
+        .stable_native_array_range(right)
+        .ok_or("array-union right operand escaped its publication plan")?;
     let entry_at = |entries: *const php_jit::JitNativeDirectArrayEntry, index: usize| {
         // SAFETY: both operand owners remain live throughout this
         // synchronous binary operation and native arena reservations do
@@ -747,32 +675,30 @@ fn native_binary_array_union(
         })
         .count();
     let Some(output_length) = left_length.checked_add(appended) else {
-        return Some(Err("native binary array union length overflow"));
+        return Err("native binary array union length overflow");
     };
-    Some(
-        fast.publish_owned_direct_array_with(output_length, |fast, output_index| {
-            let entry = if output_index < left_length {
-                entry_at(left_entries, output_index)
-            } else {
-                let appended_index = output_index - left_length;
-                let source_index = (0..right_length)
-                    .filter(|&right_index| {
-                        let key = entry_at(right_entries, right_index).key;
-                        !key_in_range(fast, left_entries, left_length, key)
-                            && !key_in_range(fast, right_entries, right_index, key)
-                    })
-                    .nth(appended_index)
-                    .ok_or("native binary array union lost an appended entry")?;
-                entry_at(right_entries, source_index)
-            };
-            fast.retain_direct_encoded(entry.key)?;
-            if let Err(error) = fast.retain_direct_encoded(entry.value) {
-                fast.rollback_direct_retain(entry.key);
-                return Err(error);
-            }
-            Ok(entry)
-        }),
-    )
+    fast.publish_owned_direct_array_with(output_length, |fast, output_index| {
+        let entry = if output_index < left_length {
+            entry_at(left_entries, output_index)
+        } else {
+            let appended_index = output_index - left_length;
+            let source_index = (0..right_length)
+                .filter(|&right_index| {
+                    let key = entry_at(right_entries, right_index).key;
+                    !key_in_range(fast, left_entries, left_length, key)
+                        && !key_in_range(fast, right_entries, right_index, key)
+                })
+                .nth(appended_index)
+                .ok_or("native binary array union lost an appended entry")?;
+            entry_at(right_entries, source_index)
+        };
+        fast.retain_direct_encoded(entry.key)?;
+        if let Err(error) = fast.retain_direct_encoded(entry.value) {
+            fast.rollback_direct_retain(entry.key);
+            return Err(error);
+        }
+        Ok(entry)
+    })
 }
 
 struct NativeInlineString {
@@ -882,218 +808,113 @@ fn native_string_ranges(
     }
 }
 
-fn native_exact_binary(
-    fast: &mut NativeRequestFastState,
-    operation: NativeExactBinary,
+pub(in crate::vm) extern "C" fn jit_native_array_union_abi(
+    runtime: *mut NativeRequestFastState,
     left: i64,
     right: i64,
 ) -> php_jit::JitNativeControlResult {
-    if matches!(operation, NativeExactBinary::Add) {
-        if let Some(result) = native_binary_array_union(fast, left, right) {
-            return result.map_or_else(
-                |_| native_binary_runtime_error(),
-                php_jit::JitNativeControlResult::returning,
-            );
-        }
-        let either_array = matches!(
-            fast.native_comparison_value(left),
-            Some(NativeComparisonValue::Array { .. })
-        ) || matches!(
-            fast.native_comparison_value(right),
-            Some(NativeComparisonValue::Array { .. })
-        );
-        if either_array {
-            return native_binary_baseline();
-        }
-    }
-
-    if matches!(operation, NativeExactBinary::Concat) {
-        let Some(left) = NativeConcatPart::from_value(fast, left) else {
-            return native_binary_baseline();
-        };
-        let Some(right) = NativeConcatPart::from_value(fast, right) else {
-            return native_binary_baseline();
-        };
-        let Some(length) = left.len().checked_add(right.len()) else {
-            return native_binary_runtime_error();
-        };
-        return fast
-            .publish_direct_string_with(length, |output| {
-                let (left_output, right_output) = output.split_at_mut(left.len());
-                left.copy_to(left_output);
-                right.copy_to(right_output);
-            })
-            .map_or_else(
-                |_| native_binary_runtime_error(),
-                php_jit::JitNativeControlResult::returning,
-            );
-    }
-
-    if matches!(
-        operation,
-        NativeExactBinary::BitAnd | NativeExactBinary::BitOr | NativeExactBinary::BitXor
-    ) && let Some(((left_bytes, left_length), (right_bytes, right_length))) =
-        native_string_ranges(fast, left, right)
-    {
-        let common = left_length.min(right_length);
-        let output_length = if matches!(operation, NativeExactBinary::BitOr) {
-            left_length.max(right_length)
-        } else {
-            common
-        };
-        return fast
-            .publish_direct_string_with(output_length, |output| {
-                // SAFETY: the source slots are live for this exact call and the
-                // stable arena never relocates them while reserving the result.
-                #[allow(unsafe_code)]
-                let (left, right) = unsafe {
-                    (
-                        std::slice::from_raw_parts(left_bytes, left_length),
-                        std::slice::from_raw_parts(right_bytes, right_length),
-                    )
-                };
-                for (output, (left, right)) in
-                    output[..common].iter_mut().zip(left.iter().zip(right))
-                {
-                    *output = match operation {
-                        NativeExactBinary::BitAnd => left & right,
-                        NativeExactBinary::BitOr => left | right,
-                        NativeExactBinary::BitXor => left ^ right,
-                        _ => unreachable!(),
-                    };
-                }
-                if matches!(operation, NativeExactBinary::BitOr) {
-                    output[common..].copy_from_slice(if left.len() > common {
-                        &left[common..]
-                    } else {
-                        &right[common..]
-                    });
-                }
-            })
-            .map_or_else(
-                |_| native_binary_runtime_error(),
-                php_jit::JitNativeControlResult::returning,
-            );
-    }
-
-    let Some((left, right)) = native_binary_numeric_operands(fast, left, right) else {
-        return native_binary_baseline();
-    };
-    let result = match operation {
-        NativeExactBinary::Add | NativeExactBinary::Sub | NativeExactBinary::Mul => {
-            if let (NativeBinaryNumber::Int(left), NativeBinaryNumber::Int(right)) = (left, right) {
-                let integer = match operation {
-                    NativeExactBinary::Add => left.checked_add(right),
-                    NativeExactBinary::Sub => left.checked_sub(right),
-                    NativeExactBinary::Mul => left.checked_mul(right),
-                    _ => unreachable!(),
-                };
-                integer.map_or_else(
-                    || {
-                        NativeBinaryNumber::Float(match operation {
-                            NativeExactBinary::Add => left as f64 + right as f64,
-                            NativeExactBinary::Sub => left as f64 - right as f64,
-                            NativeExactBinary::Mul => left as f64 * right as f64,
-                            _ => unreachable!(),
-                        })
-                    },
-                    NativeBinaryNumber::Int,
-                )
-            } else {
-                NativeBinaryNumber::Float(match operation {
-                    NativeExactBinary::Add => left.float() + right.float(),
-                    NativeExactBinary::Sub => left.float() - right.float(),
-                    NativeExactBinary::Mul => left.float() * right.float(),
-                    _ => unreachable!(),
-                })
-            }
-        }
-        NativeExactBinary::Div => {
-            if right.float() == 0.0 {
-                return native_binary_baseline();
-            }
-            if let (NativeBinaryNumber::Int(left), NativeBinaryNumber::Int(right)) = (left, right)
-                && !(left == i64::MIN && right == -1)
-                && left % right == 0
-            {
-                NativeBinaryNumber::Int(left / right)
-            } else {
-                NativeBinaryNumber::Float(left.float() / right.float())
-            }
-        }
-        NativeExactBinary::Pow => {
-            if let (NativeBinaryNumber::Int(base), NativeBinaryNumber::Int(exponent)) =
-                (left, right)
-                && let Ok(exponent) = u32::try_from(exponent)
-                && let Some(value) = base.checked_pow(exponent)
-            {
-                NativeBinaryNumber::Int(value)
-            } else {
-                NativeBinaryNumber::Float(left.float().powf(right.float()))
-            }
-        }
-        NativeExactBinary::Mod
-        | NativeExactBinary::BitAnd
-        | NativeExactBinary::BitOr
-        | NativeExactBinary::BitXor
-        | NativeExactBinary::ShiftLeft
-        | NativeExactBinary::ShiftRight => {
-            let Some(left) = left.exact_integer() else {
-                return native_binary_baseline();
-            };
-            let Some(right) = right.exact_integer() else {
-                return native_binary_baseline();
-            };
-            let value = match operation {
-                NativeExactBinary::Mod if right == 0 => return native_binary_baseline(),
-                NativeExactBinary::Mod if left == i64::MIN && right == -1 => 0,
-                NativeExactBinary::Mod => left % right,
-                NativeExactBinary::BitAnd => left & right,
-                NativeExactBinary::BitOr => left | right,
-                NativeExactBinary::BitXor => left ^ right,
-                NativeExactBinary::ShiftLeft if right < 0 => return native_binary_baseline(),
-                NativeExactBinary::ShiftLeft if right >= 64 => 0,
-                NativeExactBinary::ShiftLeft => left.wrapping_shl(right as u32),
-                NativeExactBinary::ShiftRight if right < 0 => return native_binary_baseline(),
-                NativeExactBinary::ShiftRight if right >= 64 => left >> 63,
-                NativeExactBinary::ShiftRight => left >> right,
-                _ => unreachable!(),
-            };
-            NativeBinaryNumber::Int(value)
-        }
-        NativeExactBinary::Concat => unreachable!(),
-    };
-    publish_native_binary_number(fast, result)
+    // SAFETY: publication proved two live direct arrays and reserved the
+    // complete result capacity before the optimizing entry was selected.
+    #[allow(unsafe_code)]
+    native_binary_array_union(unsafe { &mut *runtime }, left, right).map_or_else(
+        |_| native_binary_runtime_error(),
+        php_jit::JitNativeControlResult::returning,
+    )
 }
 
-macro_rules! exact_native_binary_abi {
-    ($name:ident, $operation:ident) => {
+pub(in crate::vm) extern "C" fn jit_native_concat_abi(
+    runtime: *mut NativeRequestFastState,
+    left: i64,
+    right: i64,
+) -> php_jit::JitNativeControlResult {
+    // SAFETY: generated code supplies the active request state.
+    #[allow(unsafe_code)]
+    let fast = unsafe { &mut *runtime };
+    let Some(left) = NativeConcatPart::from_value(fast, left) else {
+        return native_binary_runtime_error();
+    };
+    let Some(right) = NativeConcatPart::from_value(fast, right) else {
+        return native_binary_runtime_error();
+    };
+    let Some(length) = left.len().checked_add(right.len()) else {
+        return native_binary_runtime_error();
+    };
+    fast.publish_direct_string_with(length, |output| {
+        let (left_output, right_output) = output.split_at_mut(left.len());
+        left.copy_to(left_output);
+        right.copy_to(right_output);
+    })
+    .map_or_else(
+        |_| native_binary_runtime_error(),
+        php_jit::JitNativeControlResult::returning,
+    )
+}
+
+fn native_string_bitwise<const OPERATION: u8>(
+    fast: &mut NativeRequestFastState,
+    left: i64,
+    right: i64,
+) -> php_jit::JitNativeControlResult {
+    let Some(((left_bytes, left_length), (right_bytes, right_length))) =
+        native_string_ranges(fast, left, right)
+    else {
+        return native_binary_runtime_error();
+    };
+    let common = left_length.min(right_length);
+    let output_length = if OPERATION == 1 {
+        left_length.max(right_length)
+    } else {
+        common
+    };
+    fast.publish_direct_string_with(output_length, |output| {
+        // SAFETY: publication keeps both stable source owners live for this
+        // synchronous total native call.
+        #[allow(unsafe_code)]
+        let (left, right) = unsafe {
+            (
+                std::slice::from_raw_parts(left_bytes, left_length),
+                std::slice::from_raw_parts(right_bytes, right_length),
+            )
+        };
+        for (output, (left, right)) in output[..common].iter_mut().zip(left.iter().zip(right)) {
+            *output = match OPERATION {
+                0 => left & right,
+                1 => left | right,
+                2 => left ^ right,
+                _ => unreachable!("fixed string-bit operation"),
+            };
+        }
+        if OPERATION == 1 {
+            output[common..].copy_from_slice(if left.len() > common {
+                &left[common..]
+            } else {
+                &right[common..]
+            });
+        }
+    })
+    .map_or_else(
+        |_| native_binary_runtime_error(),
+        php_jit::JitNativeControlResult::returning,
+    )
+}
+
+macro_rules! native_string_bitwise_abi {
+    ($name:ident, $operation:literal) => {
         pub(in crate::vm) extern "C" fn $name(
             runtime: *mut NativeRequestFastState,
             left: i64,
             right: i64,
         ) -> php_jit::JitNativeControlResult {
-            // SAFETY: generated code supplies the live request prefix and the
-            // fixed exact call is synchronous with the native arenas.
+            // SAFETY: generated code supplies the active request state.
             #[allow(unsafe_code)]
-            let fast = unsafe { &mut *runtime };
-            native_exact_binary(fast, NativeExactBinary::$operation, left, right)
+            native_string_bitwise::<$operation>(unsafe { &mut *runtime }, left, right)
         }
     };
 }
 
-exact_native_binary_abi!(jit_native_add_abi, Add);
-exact_native_binary_abi!(jit_native_subtract_abi, Sub);
-exact_native_binary_abi!(jit_native_multiply_abi, Mul);
-exact_native_binary_abi!(jit_native_divide_abi, Div);
-exact_native_binary_abi!(jit_native_modulo_abi, Mod);
-exact_native_binary_abi!(jit_native_concat_abi, Concat);
-exact_native_binary_abi!(jit_native_power_abi, Pow);
-exact_native_binary_abi!(jit_native_bit_and_abi, BitAnd);
-exact_native_binary_abi!(jit_native_bit_or_abi, BitOr);
-exact_native_binary_abi!(jit_native_bit_xor_abi, BitXor);
-exact_native_binary_abi!(jit_native_shift_left_abi, ShiftLeft);
-exact_native_binary_abi!(jit_native_shift_right_abi, ShiftRight);
+native_string_bitwise_abi!(jit_native_bit_and_abi, 0);
+native_string_bitwise_abi!(jit_native_bit_or_abi, 1);
+native_string_bitwise_abi!(jit_native_bit_xor_abi, 2);
 
 fn native_exact_unary_numeric(
     fast: &mut NativeRequestFastState,
@@ -1104,7 +925,7 @@ fn native_exact_unary_numeric(
         .native_comparison_value(source)
         .and_then(native_binary_number)
     else {
-        return native_binary_baseline();
+        return native_runtime_contract_violation();
     };
     let result = if negate {
         match value {
@@ -1171,7 +992,7 @@ pub(in crate::vm) extern "C" fn jit_native_bit_not_abi(
         ),
         Some(NativeComparisonValue::Float(value)) => {
             let Some(value) = NativeBinaryNumber::Float(value).exact_integer() else {
-                return native_binary_baseline();
+                return native_runtime_contract_violation();
             };
             fast.publish_direct_int(!value).map_or_else(
                 |_| native_binary_runtime_error(),
@@ -1186,7 +1007,7 @@ pub(in crate::vm) extern "C" fn jit_native_bit_not_abi(
             | NativeComparisonValue::Resource(_)
             | NativeComparisonValue::OpaqueIdentity(_),
         )
-        | None => native_binary_baseline(),
+        | None => native_runtime_contract_violation(),
     }
 }
 
@@ -1314,7 +1135,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_cast_abi(
             php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR
                 | php_jit::JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR
         ) {
-            return native_array_cast_baseline();
+            return native_runtime_contract_violation();
         }
         break;
     }
@@ -1333,7 +1154,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_cast_abi(
         Some(NativeComparisonValue::Null) => ArrayCastSource::Empty,
         Some(NativeComparisonValue::Object(object)) => {
             let Some(layout_id) = object.layout_id else {
-                return native_array_cast_baseline();
+                return native_runtime_contract_violation();
             };
             ArrayCastSource::Object {
                 owner: object.owner.clone(),
@@ -1347,7 +1168,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_cast_abi(
                     | php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_GENERATOR,
                 ) => ArrayCastSource::Empty,
                 Some(php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE) => ArrayCastSource::Scalar,
-                _ => return native_array_cast_baseline(),
+                _ => return native_runtime_contract_violation(),
             }
         }
         Some(
@@ -1357,7 +1178,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_cast_abi(
             | NativeComparisonValue::String(_)
             | NativeComparisonValue::Resource(_),
         ) => ArrayCastSource::Scalar,
-        None => return native_array_cast_baseline(),
+        None => return native_runtime_contract_violation(),
     };
 
     let result = match source_kind {
@@ -1396,7 +1217,7 @@ pub(in crate::vm) extern "C" fn jit_native_array_cast_abi(
                         .collect::<Vec<_>>()
                 },
             ) else {
-                return native_array_cast_baseline();
+                return native_runtime_contract_violation();
             };
             publish_native_array_cast_entries(fast, properties)
         }
@@ -1409,9 +1230,9 @@ pub(in crate::vm) extern "C" fn jit_native_array_cast_abi(
     }
 }
 
-/// Exact explicit integer cast for authoritative scalar and array values.
-/// Object-like shapes take their one baseline continuation; strings and every
-/// float payload use PHP's shared numeric conversion directly.
+/// Exact explicit integer cast for publication-admitted scalar and array
+/// values. Object-like shapes are rejected before optimizer entry; strings
+/// and every float payload use PHP's shared numeric conversion directly.
 pub(in crate::vm) extern "C" fn jit_native_int_cast_abi(
     runtime: *mut NativeRequestFastState,
     source: i64,
@@ -1432,7 +1253,7 @@ pub(in crate::vm) extern "C" fn jit_native_int_cast_abi(
         Some(NativeComparisonValue::Array { entries, .. }) => i64::from(!entries.is_empty()),
         Some(NativeComparisonValue::Resource(value)) => value as i64,
         Some(NativeComparisonValue::Object(_) | NativeComparisonValue::OpaqueIdentity(_))
-        | None => return native_int_cast_baseline(),
+        | None => return native_runtime_contract_violation(),
     };
     match fast.publish_direct_int(value) {
         Ok(value) => php_jit::JitNativeControlResult::returning(value),
@@ -1442,8 +1263,8 @@ pub(in crate::vm) extern "C" fn jit_native_int_cast_abi(
     }
 }
 
-/// Exact explicit float cast for authoritative scalar and array values.
-/// Object-like shapes retain their baseline continuation; native strings use
+/// Exact explicit float cast for publication-admitted scalar and array values.
+/// Object-like shapes are rejected before optimizer entry; native strings use
 /// the shared numeric parser without reconstructing a runtime value.
 pub(in crate::vm) extern "C" fn jit_native_float_cast_abi(
     runtime: *mut NativeRequestFastState,
@@ -1467,7 +1288,7 @@ pub(in crate::vm) extern "C" fn jit_native_float_cast_abi(
         }
         Some(NativeComparisonValue::Resource(value)) => value as f64,
         Some(NativeComparisonValue::Object(_) | NativeComparisonValue::OpaqueIdentity(_))
-        | None => return native_float_cast_baseline(),
+        | None => return native_runtime_contract_violation(),
     };
     match fast.publish_direct_float(value) {
         Ok(value) => php_jit::JitNativeControlResult::returning(value),
@@ -1478,9 +1299,9 @@ pub(in crate::vm) extern "C" fn jit_native_float_cast_abi(
 }
 
 /// Implements PHP's scalar `(string)` conversion family over authoritative
-/// native values. Arrays and object-like values take the cast instruction's
-/// one baseline continuation because their warning/`__toString` semantics
-/// require the source span and full PHP call machinery.
+/// native values. Arrays and object-like values are assigned to baseline
+/// before optimizer entry because their warning/`__toString` semantics require
+/// the source span and full PHP call machinery.
 pub(in crate::vm) extern "C" fn jit_native_string_cast_abi(
     runtime: *mut NativeRequestFastState,
     mut source: i64,
@@ -1505,7 +1326,7 @@ pub(in crate::vm) extern "C" fn jit_native_string_cast_abi(
             php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR
                 | php_jit::JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR
         ) {
-            return native_string_cast_baseline();
+            return native_runtime_contract_violation();
         }
         break;
     }
@@ -1522,7 +1343,7 @@ pub(in crate::vm) extern "C" fn jit_native_string_cast_abi(
             };
         }
         Some(NativeConcatPart::Inline(rendered)) => rendered,
-        None => return native_string_cast_baseline(),
+        None => return native_runtime_contract_violation(),
     };
     match fast.publish_direct_string_with(rendered.length, |output| {
         output.copy_from_slice(rendered.as_bytes());
@@ -1629,7 +1450,7 @@ pub(in crate::vm) extern "C" fn jit_native_object_cast_abi(
             php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR
                 | php_jit::JIT_NATIVE_VALUE_VIEW_REFERENCE_SCALAR
         ) {
-            return native_object_cast_baseline();
+            return native_runtime_contract_violation();
         }
         break;
     }
@@ -1650,9 +1471,11 @@ pub(in crate::vm) extern "C" fn jit_native_object_cast_abi(
         match fast.native_comparison_value(source) {
             Some(NativeComparisonValue::Object(_)) => ObjectCastSource::Identity,
             Some(NativeComparisonValue::Null) => ObjectCastSource::Empty,
-            Some(NativeComparisonValue::Array { .. }) => return native_object_cast_baseline(),
+            Some(NativeComparisonValue::Array { .. }) => {
+                return native_runtime_contract_violation();
+            }
             Some(NativeComparisonValue::Float(value)) if value.is_nan() => {
-                return native_object_cast_baseline();
+                return native_runtime_contract_violation();
             }
             Some(
                 NativeComparisonValue::Bool(_)
@@ -1662,7 +1485,7 @@ pub(in crate::vm) extern "C" fn jit_native_object_cast_abi(
                 | NativeComparisonValue::OpaqueIdentity(_)
                 | NativeComparisonValue::Resource(_),
             ) => ObjectCastSource::Scalar,
-            None => return native_object_cast_baseline(),
+            None => return native_runtime_contract_violation(),
         }
     };
 
@@ -1697,10 +1520,10 @@ pub(in crate::vm) extern "C" fn jit_native_object_cast_abi(
                     Some(NativeComparisonValue::String(key)) => {
                         String::from_utf8_lossy(key).into_owned()
                     }
-                    _ => return native_object_cast_baseline(),
+                    _ => return native_runtime_contract_violation(),
                 };
                 if !names.insert(name.clone()) {
-                    return native_object_cast_baseline();
+                    return native_runtime_contract_violation();
                 }
                 properties.push((name, entry.value));
             }
@@ -1869,13 +1692,7 @@ pub(in crate::vm) extern "C" fn jit_native_prepared_exception_new_abi(
             php_runtime::api::NativePrintfScalar::Bool(false)
             | php_runtime::api::NativePrintfScalar::Null,
         ) => Vec::new(),
-        None => {
-            return php_jit::JitNativeControlResult::control(
-                php_jit::JitCallStatus::RECOMPILE_REQUESTED,
-                0,
-                0,
-            );
-        }
+        None => return native_runtime_contract_violation(),
     };
 
     let mut owned = Vec::with_capacity(4);
@@ -2002,7 +1819,7 @@ pub(in crate::vm) extern "C" fn jit_native_plain_object_clone_abi(
 ) -> php_jit::JitNativeControlResult {
     enum PlainCloneOutcome {
         Returned(i64),
-        Baseline,
+        ContractViolation,
         Error,
     }
 
@@ -2019,10 +1836,10 @@ pub(in crate::vm) extern "C" fn jit_native_plain_object_clone_abi(
             return PlainCloneOutcome::Error;
         };
         if !php_jit::jit_native_object_property_view_is_published(descriptor.flags) {
-            return PlainCloneOutcome::Baseline;
+            return PlainCloneOutcome::ContractViolation;
         }
         let Some((slots, dynamic)) = object.clone_native_property_slots(descriptor.payload) else {
-            return PlainCloneOutcome::Baseline;
+            return PlainCloneOutcome::ContractViolation;
         };
         let mut retained = Vec::new();
         for slot in slots.iter().filter(|slot| slot.initialized != 0).chain(
@@ -2061,11 +1878,7 @@ pub(in crate::vm) extern "C" fn jit_native_plain_object_clone_abi(
     })();
     match outcome {
         PlainCloneOutcome::Returned(value) => php_jit::JitNativeControlResult::returning(value),
-        PlainCloneOutcome::Baseline => php_jit::JitNativeControlResult::control(
-            php_jit::JitCallStatus::RECOMPILE_REQUESTED,
-            0,
-            0,
-        ),
+        PlainCloneOutcome::ContractViolation => native_runtime_contract_violation(),
         PlainCloneOutcome::Error => {
             php_jit::JitNativeControlResult::control(php_jit::JitCallStatus::RUNTIME_ERROR, 0, 0)
         }
@@ -2084,18 +1897,10 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_property_slot_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(property) = fast.exact_dynamic_property_name(property) else {
-        return php_jit::JitNativeControlResult::control(
-            php_jit::JitCallStatus::RECOMPILE_REQUESTED,
-            0,
-            0,
-        );
+        return native_runtime_contract_violation();
     };
     let Some(slot) = fast.exact_dynamic_property_slot_location(object, property) else {
-        return php_jit::JitNativeControlResult::control(
-            php_jit::JitCallStatus::RECOMPILE_REQUESTED,
-            0,
-            0,
-        );
+        return native_runtime_contract_violation();
     };
     php_jit::JitNativeControlResult::returning(slot as usize as i64)
 }
@@ -2112,11 +1917,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_property_test_slot_abi(
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
     let Some(property) = fast.exact_dynamic_property_name(property) else {
-        return php_jit::JitNativeControlResult::control(
-            php_jit::JitCallStatus::RECOMPILE_REQUESTED,
-            0,
-            0,
-        );
+        return native_runtime_contract_violation();
     };
     let property_pointer = property.as_ptr();
     let property_length = property.len();
@@ -2129,11 +1930,7 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_property_test_slot_abi(
         ))
     };
     let Some(slot) = fast.exact_dynamic_property_test_slot_location(object, property) else {
-        return php_jit::JitNativeControlResult::control(
-            php_jit::JitCallStatus::RECOMPILE_REQUESTED,
-            0,
-            0,
-        );
+        return native_runtime_contract_violation();
     };
     php_jit::JitNativeControlResult::returning(slot as usize as i64)
 }

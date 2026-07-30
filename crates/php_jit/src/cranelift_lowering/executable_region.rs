@@ -89,8 +89,29 @@ struct NativeEntryObjectLayoutRequirement {
 
 #[derive(Clone, Copy, Debug)]
 struct NativeEntryInstanceofRequirement {
-    parameter_index: usize,
+    parameter_index: Option<usize>,
     continuation_id: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeEntryCallableRequirement {
+    parameter_index: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeEntryCloneRequirement {
+    parameter_index: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeEntryDynamicPropertyRequirement {
+    parameter_index: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeEntryExceptionRequirement {
+    continuation_id: u32,
+    include_function_frame: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -113,12 +134,23 @@ struct NativeEntryStringRequirement {
     allocation_multiplier: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct NativeEntryResourceTypeRequirement {
+    parameter_index: usize,
+}
+
 #[derive(Clone, Debug)]
 struct NativeEntryIntegerRequirement {
     parameter_index: usize,
     minimum: i64,
     maximum: i64,
     forbidden_values: Vec<i64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeEntryFloatRequirement {
+    parameter_index: usize,
+    forbid_zero: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +179,8 @@ struct NativeOptimizingAdmission {
     total_array_calls: BTreeSet<u32>,
     total_fixed_builtin_calls: BTreeSet<u32>,
     total_array_instructions: BTreeSet<u32>,
+    total_binary_instructions: BTreeSet<u32>,
+    total_scalar_control_instructions: BTreeSet<u32>,
     fresh_array_instructions: BTreeSet<u32>,
     total_local_loads: BTreeSet<u32>,
     total_request_local_stores: BTreeSet<u32>,
@@ -166,9 +200,15 @@ struct NativeOptimizingAdmission {
     static_property_requirements: Vec<NativeEntryStaticPropertyRequirement>,
     object_layout_requirements: Vec<NativeEntryObjectLayoutRequirement>,
     instanceof_requirements: Vec<NativeEntryInstanceofRequirement>,
+    callable_requirements: Vec<NativeEntryCallableRequirement>,
+    clone_requirements: Vec<NativeEntryCloneRequirement>,
+    dynamic_property_requirements: Vec<NativeEntryDynamicPropertyRequirement>,
+    exception_requirements: Vec<NativeEntryExceptionRequirement>,
     value_class_requirements: Vec<NativeEntryValueClassRequirement>,
     string_requirements: Vec<NativeEntryStringRequirement>,
+    resource_type_requirements: Vec<NativeEntryResourceTypeRequirement>,
     integer_requirements: Vec<NativeEntryIntegerRequirement>,
+    float_requirements: Vec<NativeEntryFloatRequirement>,
     trusted_constant_requirements: BTreeSet<u32>,
     trusted_static_local_requirements: BTreeSet<u32>,
     equal_array_length_groups: Vec<Vec<NativeEntryArraySource>>,
@@ -190,6 +230,15 @@ impl NativeOptimizingAdmission {
 
     fn array_instruction_is_total(&self, continuation_id: u32) -> bool {
         self.total_array_instructions.contains(&continuation_id)
+    }
+
+    fn binary_instruction_is_total(&self, continuation_id: u32) -> bool {
+        self.total_binary_instructions.contains(&continuation_id)
+    }
+
+    fn scalar_control_instruction_is_total(&self, continuation_id: u32) -> bool {
+        self.total_scalar_control_instructions
+            .contains(&continuation_id)
     }
 
     fn array_instruction_is_fresh(&self, continuation_id: u32) -> bool {
@@ -431,6 +480,23 @@ fn publication_integer_operand(
     }
 }
 
+fn publication_bool_operand(
+    constants: &[IrConstant],
+    definitions: &BTreeMap<RegId, RegionOperand>,
+    operand: RegionOperand,
+) -> Option<bool> {
+    match publication_root_operand(operand, definitions) {
+        RegionOperand::Constant(index)
+        | RegionOperand::LinkedConstant {
+            constant: index, ..
+        } => match constants.get(index as usize) {
+            Some(IrConstant::Bool(value)) => Some(*value),
+            _ => None,
+        },
+        RegionOperand::Register(_) | RegionOperand::Local(_) | RegionOperand::I64(_) => None,
+    }
+}
+
 fn publication_string_length(
     constants: &[IrConstant],
     definitions: &BTreeMap<RegId, RegionOperand>,
@@ -443,6 +509,24 @@ fn publication_string_length(
         } => match constants.get(index as usize) {
             Some(IrConstant::String(value)) => Some(value.len()),
             Some(IrConstant::StringBytes(value)) => Some(value.len()),
+            _ => None,
+        },
+        RegionOperand::Register(_) | RegionOperand::Local(_) | RegionOperand::I64(_) => None,
+    }
+}
+
+fn publication_utf8_string<'a>(
+    constants: &'a [IrConstant],
+    definitions: &BTreeMap<RegId, RegionOperand>,
+    operand: RegionOperand,
+) -> Option<&'a str> {
+    match publication_root_operand(operand, definitions) {
+        RegionOperand::Constant(index)
+        | RegionOperand::LinkedConstant {
+            constant: index, ..
+        } => match constants.get(index as usize)? {
+            IrConstant::String(value) => Some(value.as_str()),
+            IrConstant::StringBytes(value) => std::str::from_utf8(value).ok(),
             _ => None,
         },
         RegionOperand::Register(_) | RegionOperand::Local(_) | RegionOperand::I64(_) => None,
@@ -941,7 +1025,26 @@ fn optimizing_admission_for_region(
                         ..
                     })
             );
+            let planned_publication_total_query = matches!(
+                &instruction.kind,
+                RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_type_predicate(&call.target).is_some()
+                        || stable_builtin_length(&call.target).is_some()
+                        || matches!(
+                            stable_builtin_array_aggregate(&call.target),
+                            Some(
+                                StableArrayAggregateBuiltin::Count
+                                    | StableArrayAggregateBuiltin::SizeOf
+                            )
+                        ) && (call.args.len() == 1
+                            || call.args.len() == 2
+                                && direct_fixed_builtin_operand(call, 1).is_some_and(|mode| {
+                                    lowering_operand_fact(value_flow, constants, mode).integer_range
+                                        == Some(crate::region_ir::SsaIntegerRange::exact(0))
+                                }))
+            );
             external_effect_seen |= !planned_lvalue_effect
+                && !planned_publication_total_query
                 && matches!(
                     instruction.kind,
                     RegionInstructionKind::NativeCall(_)
@@ -1018,6 +1121,258 @@ fn optimizing_admission_for_region(
     let mut fresh_insert_counts = BTreeMap::<RegId, usize>::new();
     let mut fresh_spread_targets = BTreeSet::<RegId>::new();
     for instruction in region.blocks.iter().flat_map(|block| &block.instructions) {
+        if let RegionInstructionKind::Binary { dst, op, lhs, rhs } = instruction.kind {
+            let lhs_fact = lowering_operand_fact(value_flow, constants, lhs);
+            let rhs_fact = lowering_operand_fact(value_flow, constants, rhs);
+            let result_fact = value_flow.register_fact(dst);
+            let known = |fact: crate::region_ir::SsaValueFact, class| {
+                fact.certainty != crate::region_ir::SsaCertainty::Unknown && fact.class == class
+            };
+            let numeric = |fact: crate::region_ir::SsaValueFact| {
+                fact.certainty != crate::region_ir::SsaCertainty::Unknown
+                    && matches!(fact.class, SsaValueClass::Int | SsaValueClass::Float)
+            };
+            let continuation = instruction.continuation_id;
+            match op {
+                RegionBinaryOp::Add
+                    if known(lhs_fact, SsaValueClass::ArrayHandle)
+                        && known(rhs_fact, SsaValueClass::ArrayHandle) =>
+                {
+                    for operand in [lhs, rhs] {
+                        let source = publication_entry_array_source(
+                            region,
+                            &definitions,
+                            &parameter_indices,
+                            &by_ref_parameters,
+                            operand,
+                            continuation,
+                            "array union",
+                        )?;
+                        let requirement = admission.array_requirements.entry(source).or_default();
+                        // The union owns one new stable array and retains every
+                        // admitted key/value at most once. Reserving one
+                        // projection for each source covers the capacity of
+                        // their combined upper bound.
+                        requirement.projection_allocations =
+                            requirement.projection_allocations.saturating_add(1);
+                        requirement.require_supported_keys = true;
+                        requirement.require_plain_values = true;
+                    }
+                    entry_dependent_continuations.insert(continuation);
+                }
+                RegionBinaryOp::Add | RegionBinaryOp::Sub | RegionBinaryOp::Mul
+                    if known(lhs_fact, SsaValueClass::Int)
+                        && known(rhs_fact, SsaValueClass::Int)
+                        && result_fact.integer_range.is_some() => {}
+                RegionBinaryOp::Add | RegionBinaryOp::Sub | RegionBinaryOp::Mul
+                    if numeric(lhs_fact)
+                        && numeric(rhs_fact)
+                        && matches!(
+                            (lhs_fact.class, rhs_fact.class),
+                            (SsaValueClass::Float, _) | (_, SsaValueClass::Float)
+                        ) => {}
+                RegionBinaryOp::Div if numeric(lhs_fact) && numeric(rhs_fact) => {
+                    match rhs_fact.class {
+                        SsaValueClass::Int => {
+                            if !rhs_fact
+                                .integer_range
+                                .is_some_and(|range| range.excludes(0))
+                            {
+                                admit_publication_integer(
+                                    &mut admission,
+                                    value_flow,
+                                    constants,
+                                    &definitions,
+                                    &parameter_indices,
+                                    rhs,
+                                    i64::MIN,
+                                    i64::MAX,
+                                    &[0],
+                                    continuation,
+                                    "division",
+                                )?;
+                                entry_dependent_continuations.insert(continuation);
+                            }
+                        }
+                        SsaValueClass::Float => {
+                            let fixed = match publication_root_operand(rhs, &definitions) {
+                                RegionOperand::Constant(index)
+                                | RegionOperand::LinkedConstant {
+                                    constant: index, ..
+                                } => match constants.get(index as usize) {
+                                    Some(IrConstant::Float(value)) => Some(*value),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            if fixed == Some(0.0) {
+                                return Err(CraneliftLoweringError::new(
+                                    "JIT_CRANELIFT_REJECT_BINARY_DIVISOR_PUBLICATION",
+                                    format!(
+                                        "division at continuation {continuation} has a zero floating divisor"
+                                    ),
+                                ));
+                            }
+                            if fixed.is_none() {
+                                let parameter_index = admit_publication_scalar_class(
+                                    &mut admission,
+                                    value_flow,
+                                    constants,
+                                    &definitions,
+                                    &parameter_indices,
+                                    rhs,
+                                    SsaValueClass::Float,
+                                    continuation,
+                                    "division",
+                                )?
+                                .ok_or_else(|| {
+                                    CraneliftLoweringError::new(
+                                        "JIT_CRANELIFT_REJECT_BINARY_DIVISOR_PUBLICATION",
+                                        format!(
+                                            "division at continuation {continuation} has no entry-rooted floating divisor"
+                                        ),
+                                    )
+                                })?;
+                                admission
+                                    .float_requirements
+                                    .push(NativeEntryFloatRequirement {
+                                        parameter_index,
+                                        forbid_zero: true,
+                                    });
+                                entry_dependent_continuations.insert(continuation);
+                            }
+                        }
+                        _ => unreachable!("numeric divisor class"),
+                    }
+                }
+                RegionBinaryOp::Mod
+                    if known(lhs_fact, SsaValueClass::Int)
+                        && known(rhs_fact, SsaValueClass::Int) =>
+                {
+                    if !rhs_fact
+                        .integer_range
+                        .is_some_and(|range| range.excludes(0))
+                    {
+                        admit_publication_integer(
+                            &mut admission,
+                            value_flow,
+                            constants,
+                            &definitions,
+                            &parameter_indices,
+                            rhs,
+                            i64::MIN,
+                            i64::MAX,
+                            &[0],
+                            continuation,
+                            "modulo",
+                        )?;
+                        entry_dependent_continuations.insert(continuation);
+                    }
+                }
+                RegionBinaryOp::ShiftLeft | RegionBinaryOp::ShiftRight
+                    if known(lhs_fact, SsaValueClass::Int)
+                        && known(rhs_fact, SsaValueClass::Int) =>
+                {
+                    if !rhs_fact
+                        .integer_range
+                        .is_some_and(|range| range.minimum >= 0)
+                    {
+                        admit_publication_integer(
+                            &mut admission,
+                            value_flow,
+                            constants,
+                            &definitions,
+                            &parameter_indices,
+                            rhs,
+                            0,
+                            i64::MAX,
+                            &[],
+                            continuation,
+                            "shift",
+                        )?;
+                        entry_dependent_continuations.insert(continuation);
+                    }
+                }
+                RegionBinaryOp::BitAnd | RegionBinaryOp::BitOr | RegionBinaryOp::BitXor
+                    if known(lhs_fact, SsaValueClass::Int)
+                        && known(rhs_fact, SsaValueClass::Int) => {}
+                RegionBinaryOp::BitAnd | RegionBinaryOp::BitOr | RegionBinaryOp::BitXor
+                    if known(lhs_fact, SsaValueClass::StringHandle)
+                        && known(rhs_fact, SsaValueClass::StringHandle) =>
+                {
+                    for operand in [lhs, rhs] {
+                        admit_publication_string(
+                            &mut admission,
+                            value_flow,
+                            constants,
+                            &definitions,
+                            &parameter_indices,
+                            operand,
+                            0,
+                            1,
+                            continuation,
+                            "string bit operation",
+                        )?;
+                    }
+                    entry_dependent_continuations.insert(continuation);
+                }
+                RegionBinaryOp::Concat => {
+                    for (operand, fact) in [(lhs, lhs_fact), (rhs, rhs_fact)] {
+                        match fact.class {
+                            SsaValueClass::StringHandle
+                                if fact.certainty != crate::region_ir::SsaCertainty::Unknown =>
+                            {
+                                admit_publication_string(
+                                    &mut admission,
+                                    value_flow,
+                                    constants,
+                                    &definitions,
+                                    &parameter_indices,
+                                    operand,
+                                    0,
+                                    1,
+                                    continuation,
+                                    "concatenation",
+                                )?;
+                                entry_dependent_continuations.insert(continuation);
+                            }
+                            SsaValueClass::Null
+                            | SsaValueClass::Bool
+                            | SsaValueClass::Int
+                            | SsaValueClass::Float
+                            | SsaValueClass::ResourceHandle
+                                if fact.certainty != crate::region_ir::SsaCertainty::Unknown =>
+                            {
+                                // Integer, float, and resource formatting is
+                                // bounded by the fixed native scalar buffers.
+                                admission.fixed_string_bytes =
+                                    admission.fixed_string_bytes.saturating_add(
+                                        php_runtime::api::PHP_FLOAT_STRING_BUFFER_CAPACITY,
+                                    );
+                            }
+                            _ => {
+                                return Err(CraneliftLoweringError::new(
+                                    "JIT_CRANELIFT_REJECT_BINARY_CONCAT_PUBLICATION",
+                                    format!(
+                                        "concatenation at continuation {continuation} has no total scalar/string publication plan"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+                RegionBinaryOp::Pow if numeric(lhs_fact) && numeric(rhs_fact) => {}
+                _ => {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_BINARY_PUBLICATION",
+                        format!(
+                            "binary {op:?} at continuation {continuation} has no total native type/shape plan"
+                        ),
+                    ));
+                }
+            }
+            admission.total_binary_instructions.insert(continuation);
+        }
         if let RegionInstructionKind::Echo { src } = instruction.kind {
             let fact = lowering_operand_fact(value_flow, constants, src);
             if fact.certainty == crate::region_ir::SsaCertainty::Unknown
@@ -1050,42 +1405,188 @@ fn optimizing_admission_for_region(
                 entry_dependent_continuations.insert(instruction.continuation_id);
             }
         }
-        if let RegionInstructionKind::Cast {
-            op: RegionCastOp::Float,
-            src,
-            ..
-        } = instruction.kind
-        {
-            let fact = lowering_operand_fact(value_flow, constants, src);
-            if fact.certainty == crate::region_ir::SsaCertainty::Unknown
-                || !matches!(
-                    fact.class,
-                    SsaValueClass::Int
-                        | SsaValueClass::Float
-                        | SsaValueClass::StringHandle
-                        | SsaValueClass::Bool
-                        | SsaValueClass::Null
-                )
-            {
-                return Err(CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_FLOAT_CAST_PUBLICATION",
-                    format!(
-                        "float cast at continuation {} has no total scalar input class",
+        match instruction.kind {
+            RegionInstructionKind::Compare { lhs, rhs, .. } => {
+                for operand in [lhs, rhs] {
+                    let fact = lowering_operand_fact(value_flow, constants, operand);
+                    if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                        || !matches!(
+                            fact.class,
+                            SsaValueClass::Null
+                                | SsaValueClass::Bool
+                                | SsaValueClass::Int
+                                | SsaValueClass::Float
+                                | SsaValueClass::StringHandle
+                                | SsaValueClass::ResourceHandle
+                        )
+                    {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_COMPARE_PUBLICATION",
+                            format!(
+                                "comparison at continuation {} has no total scalar/resource operand plan",
+                                instruction.continuation_id,
+                            ),
+                        ));
+                    }
+                    let guarded = admit_publication_scalar_class(
+                        &mut admission,
+                        value_flow,
+                        constants,
+                        &definitions,
+                        &parameter_indices,
+                        operand,
+                        fact.class,
                         instruction.continuation_id,
-                    ),
-                ));
-            }
-            if let Some(NativeEntryArraySource::Parameter(parameter_index)) =
-                entry_array_source(src, &definitions, &parameter_indices)
-            {
+                        "comparison",
+                    )?;
+                    entry_dependent_continuations
+                        .extend(guarded.map(|_| instruction.continuation_id));
+                }
                 admission
-                    .value_class_requirements
-                    .push(NativeEntryValueClassRequirement {
-                        parameter_index,
-                        class: fact.class,
-                    });
-                entry_dependent_continuations.insert(instruction.continuation_id);
+                    .total_scalar_control_instructions
+                    .insert(instruction.continuation_id);
             }
+            RegionInstructionKind::Unary { op, src, .. } => {
+                let fact = lowering_operand_fact(value_flow, constants, src);
+                let admitted = match op {
+                    RegionUnaryOp::Plus | RegionUnaryOp::Minus => {
+                        matches!(fact.class, SsaValueClass::Int | SsaValueClass::Float)
+                    }
+                    RegionUnaryOp::BitNot => {
+                        matches!(fact.class, SsaValueClass::Int | SsaValueClass::StringHandle)
+                    }
+                    RegionUnaryOp::Not => !matches!(
+                        fact.class,
+                        SsaValueClass::Uninitialized
+                            | SsaValueClass::ReferenceHandle
+                            | SsaValueClass::MixedHandle
+                    ),
+                };
+                if fact.certainty == crate::region_ir::SsaCertainty::Unknown || !admitted {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_UNARY_PUBLICATION",
+                        format!(
+                            "unary {op:?} at continuation {} has no total native operand plan",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                if op == RegionUnaryOp::BitNot && fact.class == SsaValueClass::StringHandle {
+                    admit_publication_string(
+                        &mut admission,
+                        value_flow,
+                        constants,
+                        &definitions,
+                        &parameter_indices,
+                        src,
+                        0,
+                        1,
+                        instruction.continuation_id,
+                        "string bit-not",
+                    )?;
+                    entry_dependent_continuations.insert(instruction.continuation_id);
+                } else {
+                    let guarded = admit_publication_scalar_class(
+                        &mut admission,
+                        value_flow,
+                        constants,
+                        &definitions,
+                        &parameter_indices,
+                        src,
+                        fact.class,
+                        instruction.continuation_id,
+                        "unary operation",
+                    )?;
+                    entry_dependent_continuations
+                        .extend(guarded.map(|_| instruction.continuation_id));
+                }
+                admission
+                    .total_scalar_control_instructions
+                    .insert(instruction.continuation_id);
+            }
+            RegionInstructionKind::Cast { op, src, .. } => {
+                let fact = lowering_operand_fact(value_flow, constants, src);
+                let admitted = match op {
+                    RegionCastOp::Bool => !matches!(
+                        fact.class,
+                        SsaValueClass::Uninitialized
+                            | SsaValueClass::ReferenceHandle
+                            | SsaValueClass::MixedHandle
+                    ),
+                    RegionCastOp::Int | RegionCastOp::Float => matches!(
+                        fact.class,
+                        SsaValueClass::Null
+                            | SsaValueClass::Bool
+                            | SsaValueClass::Int
+                            | SsaValueClass::Float
+                            | SsaValueClass::StringHandle
+                            | SsaValueClass::ArrayHandle
+                            | SsaValueClass::ResourceHandle
+                    ),
+                    RegionCastOp::String => matches!(
+                        fact.class,
+                        SsaValueClass::Null
+                            | SsaValueClass::Bool
+                            | SsaValueClass::Int
+                            | SsaValueClass::Float
+                            | SsaValueClass::StringHandle
+                            | SsaValueClass::ResourceHandle
+                    ),
+                    RegionCastOp::Array => matches!(
+                        fact.class,
+                        SsaValueClass::Null
+                            | SsaValueClass::Bool
+                            | SsaValueClass::Int
+                            | SsaValueClass::Float
+                            | SsaValueClass::StringHandle
+                            | SsaValueClass::ArrayHandle
+                            | SsaValueClass::ResourceHandle
+                    ),
+                    // Object conversion allocates and may expose array/property
+                    // visibility. Until that full object publication plan is
+                    // available, only the identity-preserving form enters the
+                    // optimizing region.
+                    RegionCastOp::Object => fact.class == SsaValueClass::ObjectHandle,
+                    RegionCastOp::Void => true,
+                };
+                if fact.certainty == crate::region_ir::SsaCertainty::Unknown || !admitted {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_CAST_PUBLICATION",
+                        format!(
+                            "cast {op:?} at continuation {} has no total native operand plan",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                if op == RegionCastOp::Array && fact.class != SsaValueClass::ArrayHandle {
+                    admission.fixed_array_entries = admission
+                        .fixed_array_entries
+                        .saturating_add(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize);
+                    admission.fixed_value_allocations =
+                        admission.fixed_value_allocations.saturating_add(1);
+                }
+                if op == RegionCastOp::String && fact.class != SsaValueClass::StringHandle {
+                    admission.fixed_string_bytes = admission
+                        .fixed_string_bytes
+                        .saturating_add(php_runtime::api::PHP_FLOAT_STRING_BUFFER_CAPACITY);
+                }
+                let guarded = admit_publication_scalar_class(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    src,
+                    fact.class,
+                    instruction.continuation_id,
+                    "cast",
+                )?;
+                entry_dependent_continuations.extend(guarded.map(|_| instruction.continuation_id));
+                admission
+                    .total_scalar_control_instructions
+                    .insert(instruction.continuation_id);
+            }
+            _ => {}
         }
         if let RegionInstructionKind::UnsetLocal { local } = instruction.kind {
             let storage = value_flow.local_storage(local);
@@ -3107,6 +3608,116 @@ fn optimizing_admission_for_region(
             }
             _ => {}
         }
+        if let RegionInstructionKind::NativeControl(RegionNativeControl::MakeException {
+            message,
+            ..
+        }) = &instruction.kind
+        {
+            if let Some(message) = message {
+                let fact = lowering_operand_fact(value_flow, constants, *message);
+                if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                    || !matches!(
+                        fact.class,
+                        SsaValueClass::Null
+                            | SsaValueClass::Bool
+                            | SsaValueClass::Int
+                            | SsaValueClass::Float
+                            | SsaValueClass::StringHandle
+                    )
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_EXCEPTION_MESSAGE_PUBLICATION",
+                        format!(
+                            "exception message at continuation {} has no total scalar/string publication plan",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                if fact.class == SsaValueClass::StringHandle {
+                    let guarded = admit_publication_string(
+                        &mut admission,
+                        value_flow,
+                        constants,
+                        &definitions,
+                        &parameter_indices,
+                        *message,
+                        0,
+                        1,
+                        instruction.continuation_id,
+                        "exception message",
+                    )?;
+                    entry_dependent_continuations
+                        .extend(guarded.map(|_| instruction.continuation_id));
+                } else {
+                    admission.fixed_string_bytes = admission.fixed_string_bytes.saturating_add(
+                        publication_string_capacity(
+                            php_runtime::api::PHP_FLOAT_STRING_BUFFER_CAPACITY,
+                        )
+                        .unwrap_or(php_runtime::api::PHP_FLOAT_STRING_BUFFER_CAPACITY),
+                    );
+                }
+            } else {
+                admission.fixed_string_bytes = admission
+                    .fixed_string_bytes
+                    .saturating_add(crate::JIT_NATIVE_DIRECT_STRING_MIN_CAPACITY as usize);
+            }
+            admission
+                .exception_requirements
+                .push(NativeEntryExceptionRequirement {
+                    continuation_id: instruction.continuation_id,
+                    include_function_frame: !region.flags.is_top_level,
+                });
+        }
+        if let RegionInstructionKind::CloneObject { object, plain, .. } = &instruction.kind {
+            if !plain {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_CLONE_PUBLICATION",
+                    format!(
+                        "clone at continuation {} has no publication proof excluding __clone",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let fact = lowering_operand_fact(value_flow, constants, *object);
+            if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                || fact.class != SsaValueClass::ObjectHandle
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_CLONE_OBJECT_SHAPE",
+                    format!(
+                        "clone at continuation {} has no published direct-object shape",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            if let Some(parameter_index) =
+                publication_entry_parameter(*object, &definitions, &parameter_indices)
+            {
+                if by_ref_parameters.contains(&region.parameter_locals[parameter_index]) {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_CLONE_REFERENCE",
+                        "plain clone source is a by-reference parameter",
+                    ));
+                }
+                admission
+                    .value_class_requirements
+                    .push(NativeEntryValueClassRequirement {
+                        parameter_index,
+                        class: SsaValueClass::ObjectHandle,
+                    });
+                if !admission
+                    .clone_requirements
+                    .iter()
+                    .any(|requirement| requirement.parameter_index == parameter_index)
+                {
+                    admission
+                        .clone_requirements
+                        .push(NativeEntryCloneRequirement { parameter_index });
+                }
+                entry_dependent_continuations.insert(instruction.continuation_id);
+            }
+            admission.fixed_value_allocations = admission.fixed_value_allocations.saturating_add(1);
+        }
         let RegionInstructionKind::NativeCall(call) = &instruction.kind else {
             continue;
         };
@@ -3181,10 +3792,289 @@ fn optimizing_admission_for_region(
             admission
                 .instanceof_requirements
                 .push(NativeEntryInstanceofRequirement {
-                    parameter_index,
+                    parameter_index: Some(parameter_index),
                     continuation_id: instruction.continuation_id,
                 });
             entry_dependent_continuations.insert(instruction.continuation_id);
+        }
+        if let RegionCallTarget::Semantic {
+            operation: RegionSemanticOp::DynamicInstanceOf { object, target, .. },
+        } = &call.target
+        {
+            let target_name = publication_utf8_string(constants, &definitions, *target)
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DYNAMIC_INSTANCEOF_TARGET",
+                        format!(
+                            "dynamic instanceof at continuation {} has no fixed UTF-8 target class",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+            if target_name.trim_start_matches('\\').is_empty() {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_DYNAMIC_INSTANCEOF_TARGET",
+                    "dynamic instanceof target class is empty",
+                ));
+            }
+            let parameter_index =
+                publication_entry_parameter(*object, &definitions, &parameter_indices);
+            if parameter_index.is_some_and(|parameter_index| {
+                by_ref_parameters.contains(&region.parameter_locals[parameter_index])
+            }) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_DYNAMIC_INSTANCEOF_REFERENCE",
+                    "dynamic instanceof object is a by-reference parameter",
+                ));
+            }
+            let _ = admit_publication_scalar_class(
+                &mut admission,
+                value_flow,
+                constants,
+                &definitions,
+                &parameter_indices,
+                *object,
+                SsaValueClass::ObjectHandle,
+                instruction.continuation_id,
+                "dynamic instanceof object",
+            )?;
+            admission
+                .instanceof_requirements
+                .push(NativeEntryInstanceofRequirement {
+                    parameter_index,
+                    continuation_id: instruction.continuation_id,
+                });
+            if parameter_index.is_some() {
+                entry_dependent_continuations.insert(instruction.continuation_id);
+            }
+        }
+        if let RegionCallTarget::Semantic {
+            operation: RegionSemanticOp::ResolveCallable { callable, .. },
+        } = &call.target
+        {
+            let php_ir::instruction::CallableKind::FunctionName { name } = callable else {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_CALLABLE_KIND_PUBLICATION",
+                    format!(
+                        "callable resolution at continuation {} is not a fixed function name",
+                        instruction.continuation_id,
+                    ),
+                ));
+            };
+            let normalized = name.trim_start_matches('\\').to_ascii_lowercase();
+            let target = function_params.iter().find(|(_, target)| {
+                target
+                    .name
+                    .trim_start_matches('\\')
+                    .eq_ignore_ascii_case(&normalized)
+            });
+            let Some((_, target)) = target else {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_CALLABLE_TARGET_PUBLICATION",
+                    format!(
+                        "callable {name} at continuation {} has no same-unit published target",
+                        instruction.continuation_id,
+                    ),
+                ));
+            };
+            if target.requires_trampoline
+                || target.reference_only_trampoline
+                || target.returns_by_reference
+                || target.native_arity > u32::MAX as usize
+                || target.params.len() > u32::MAX as usize
+                || name.len() > u32::MAX as usize
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_CALLABLE_SIGNATURE_PUBLICATION",
+                    format!(
+                        "callable {name} at continuation {} has no fixed direct native signature",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            admission.fixed_value_allocations = admission.fixed_value_allocations.saturating_add(1);
+        }
+        if let RegionCallTarget::Semantic {
+            operation: RegionSemanticOp::AcquireCallable { value, .. },
+        } = &call.target
+        {
+            let NativeEntryArraySource::Parameter(parameter_index) =
+                entry_array_source(*value, &definitions, &parameter_indices).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_CALLABLE_SHAPE_PUBLICATION",
+                        format!(
+                            "callable acquisition at continuation {} is not rooted at an entry callable",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?
+            else {
+                unreachable!("callable acquisition operands are parameters")
+            };
+            if by_ref_parameters.contains(&region.parameter_locals[parameter_index]) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_CALLABLE_REFERENCE_PUBLICATION",
+                    "callable acquisition receives a by-reference parameter",
+                ));
+            }
+            admit_publication_scalar_class(
+                &mut admission,
+                value_flow,
+                constants,
+                &definitions,
+                &parameter_indices,
+                *value,
+                SsaValueClass::CallableHandle,
+                instruction.continuation_id,
+                "callable acquisition",
+            )?;
+            if !admission
+                .callable_requirements
+                .iter()
+                .any(|requirement| requirement.parameter_index == parameter_index)
+            {
+                admission
+                    .callable_requirements
+                    .push(NativeEntryCallableRequirement { parameter_index });
+            }
+            entry_dependent_continuations.insert(instruction.continuation_id);
+        }
+        if let RegionCallTarget::Semantic { operation } = &call.target {
+            let dynamic_property = match operation {
+                RegionSemanticOp::PropertyFetch {
+                    object,
+                    property: RegionPropertyName::Dynamic(property),
+                    ..
+                }
+                | RegionSemanticOp::PropertyUnset {
+                    object,
+                    property: RegionPropertyName::Dynamic(property),
+                    ..
+                } => Some((*object, *property, None, false)),
+                RegionSemanticOp::PropertyAssign {
+                    object,
+                    property: RegionPropertyName::Dynamic(property),
+                    value,
+                    ..
+                } => Some((*object, *property, Some(*value), false)),
+                RegionSemanticOp::PropertyIsset {
+                    object,
+                    property: RegionPropertyName::Dynamic(property),
+                    ..
+                }
+                | RegionSemanticOp::PropertyEmpty {
+                    object,
+                    property: RegionPropertyName::Dynamic(property),
+                    ..
+                } => Some((*object, *property, None, true)),
+                RegionSemanticOp::PropertyDimAssign {
+                    property: RegionPropertyName::Dynamic(_),
+                    ..
+                }
+                | RegionSemanticOp::PropertyDimUnset {
+                    property: RegionPropertyName::Dynamic(_),
+                    ..
+                }
+                | RegionSemanticOp::PropertyDimIsset {
+                    property: RegionPropertyName::Dynamic(_),
+                    ..
+                }
+                | RegionSemanticOp::PropertyDimEmpty {
+                    property: RegionPropertyName::Dynamic(_),
+                    ..
+                } => {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DYNAMIC_PROPERTY_DIM_PUBLICATION",
+                        format!(
+                            "dynamic property dimension at continuation {} has no total slot plan",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                _ => None,
+            };
+            if let Some((object, property, assigned, test)) = dynamic_property {
+                let property_name = publication_utf8_string(constants, &definitions, property)
+                    .ok_or_else(|| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_DYNAMIC_PROPERTY_NAME_PUBLICATION",
+                            format!(
+                                "dynamic property at continuation {} has no fixed UTF-8 name",
+                                instruction.continuation_id,
+                            ),
+                        )
+                    })?;
+                if property_name.is_empty() {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DYNAMIC_PROPERTY_NAME_PUBLICATION",
+                        "dynamic property name is empty",
+                    ));
+                }
+                let NativeEntryArraySource::Parameter(parameter_index) = entry_array_source(
+                    object,
+                    &definitions,
+                    &parameter_indices,
+                )
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DYNAMIC_PROPERTY_OBJECT_PUBLICATION",
+                        format!(
+                            "dynamic property at continuation {} is not rooted at an entry object",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?
+                else {
+                    unreachable!("dynamic property objects are parameters")
+                };
+                if by_ref_parameters.contains(&region.parameter_locals[parameter_index]) {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DYNAMIC_PROPERTY_REFERENCE_PUBLICATION",
+                        "dynamic property object is a by-reference parameter",
+                    ));
+                }
+                admit_publication_scalar_class(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    object,
+                    SsaValueClass::ObjectHandle,
+                    instruction.continuation_id,
+                    "dynamic property object",
+                )?;
+                if let Some(value) = assigned {
+                    let fact = lowering_operand_fact(value_flow, constants, value);
+                    if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                        || fact.class == SsaValueClass::ReferenceHandle
+                    {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_DYNAMIC_PROPERTY_OWNERSHIP",
+                            format!(
+                                "dynamic property assignment at continuation {} has no total ownership plan",
+                                instruction.continuation_id,
+                            ),
+                        ));
+                    }
+                }
+                if !admission
+                    .dynamic_property_requirements
+                    .iter()
+                    .any(|requirement| requirement.parameter_index == parameter_index)
+                {
+                    admission
+                        .dynamic_property_requirements
+                        .push(NativeEntryDynamicPropertyRequirement { parameter_index });
+                }
+                if test {
+                    // `isset`/`empty` may use the immutable absence cell; no
+                    // insertion capacity is consumed.
+                } else {
+                    admission.fixed_lvalue_insertions =
+                        admission.fixed_lvalue_insertions.saturating_add(1);
+                }
+            }
         }
         if let RegionCallTarget::Semantic {
             operation:
@@ -3553,6 +4443,289 @@ fn optimizing_admission_for_region(
                 .total_array_calls
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
+        }
+        if stable_builtin_type_predicate(&call.target).is_some() {
+            let operand = (call.args.len() == 1)
+                .then(|| direct_fixed_builtin_operand(call, 0))
+                .flatten()
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_TYPE_PREDICATE_PUBLICATION",
+                        "type predicate requires one direct positional operand",
+                    )
+                })?;
+            let fact = lowering_operand_fact(value_flow, constants, operand);
+            if fact.certainty != crate::region_ir::SsaCertainty::Unknown {
+                let guarded = admit_publication_scalar_class(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    operand,
+                    fact.class,
+                    instruction.continuation_id,
+                    "type predicate",
+                )?;
+                entry_dependent_continuations.extend(guarded.map(|_| instruction.continuation_id));
+            }
+            admission
+                .total_fixed_builtin_calls
+                .insert(instruction.continuation_id);
+            continue;
+        }
+        if stable_builtin_length(&call.target).is_some() {
+            let operand = (call.args.len() == 1)
+                .then(|| direct_fixed_builtin_operand(call, 0))
+                .flatten()
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_LENGTH_PUBLICATION",
+                        "strlen requires one direct positional operand",
+                    )
+                })?;
+            let guarded = admit_publication_scalar_class(
+                &mut admission,
+                value_flow,
+                constants,
+                &definitions,
+                &parameter_indices,
+                operand,
+                SsaValueClass::StringHandle,
+                instruction.continuation_id,
+                "strlen",
+            )?;
+            entry_dependent_continuations.extend(guarded.map(|_| instruction.continuation_id));
+            admission
+                .total_fixed_builtin_calls
+                .insert(instruction.continuation_id);
+            continue;
+        }
+        if let Some(operation) = stable_builtin_symbol_query(&call.target) {
+            if matches!(
+                operation,
+                StableSymbolQueryBuiltin::Define | StableSymbolQueryBuiltin::Constant
+            ) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_SYMBOL_MUTATION_PUBLICATION",
+                    format!(
+                        "{operation:?} at continuation {} depends on mutable symbol state or source-aware failure",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            if !operation.accepts_arity(call.args.len()) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_SYMBOL_QUERY_ARITY",
+                    "symbol query has an unsupported argument count",
+                ));
+            }
+            let arguments = (0..call.args.len())
+                .map(|index| {
+                    direct_fixed_builtin_operand(call, index).ok_or_else(|| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_SYMBOL_QUERY_ARGUMENT_FRAME",
+                            "symbol query arguments are not direct positional values",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            match operation {
+                StableSymbolQueryBuiltin::Defined | StableSymbolQueryBuiltin::FunctionExists => {
+                    admit_publication_scalar_class(
+                        &mut admission,
+                        value_flow,
+                        constants,
+                        &definitions,
+                        &parameter_indices,
+                        arguments[0],
+                        SsaValueClass::StringHandle,
+                        instruction.continuation_id,
+                        "symbol query name",
+                    )?;
+                }
+                StableSymbolQueryBuiltin::ClassExists
+                | StableSymbolQueryBuiltin::InterfaceExists
+                | StableSymbolQueryBuiltin::TraitExists
+                | StableSymbolQueryBuiltin::EnumExists => {
+                    admit_publication_scalar_class(
+                        &mut admission,
+                        value_flow,
+                        constants,
+                        &definitions,
+                        &parameter_indices,
+                        arguments[0],
+                        SsaValueClass::StringHandle,
+                        instruction.continuation_id,
+                        "class-kind query name",
+                    )?;
+                    if arguments.len() != 2
+                        || publication_bool_operand(constants, &definitions, arguments[1])
+                            != Some(false)
+                    {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_SYMBOL_QUERY_AUTOLOAD",
+                            format!(
+                                "class-kind query at continuation {} must publish autoload=false before optimizer entry",
+                                instruction.continuation_id,
+                            ),
+                        ));
+                    }
+                }
+                StableSymbolQueryBuiltin::MethodExists
+                | StableSymbolQueryBuiltin::PropertyExists => {
+                    let owner = lowering_operand_fact(value_flow, constants, arguments[0]);
+                    if owner.certainty == crate::region_ir::SsaCertainty::Unknown
+                        || !matches!(
+                            owner.class,
+                            SsaValueClass::ObjectHandle | SsaValueClass::StringHandle
+                        )
+                    {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_MEMBER_QUERY_OWNER",
+                            "member query owner is not a published object or class-name string",
+                        ));
+                    }
+                    admit_publication_scalar_class(
+                        &mut admission,
+                        value_flow,
+                        constants,
+                        &definitions,
+                        &parameter_indices,
+                        arguments[0],
+                        owner.class,
+                        instruction.continuation_id,
+                        "member query owner",
+                    )?;
+                    admit_publication_scalar_class(
+                        &mut admission,
+                        value_flow,
+                        constants,
+                        &definitions,
+                        &parameter_indices,
+                        arguments[1],
+                        SsaValueClass::StringHandle,
+                        instruction.continuation_id,
+                        "member query name",
+                    )?;
+                }
+                StableSymbolQueryBuiltin::Define | StableSymbolQueryBuiltin::Constant => {
+                    unreachable!("symbol mutation/value lookup was rejected above")
+                }
+            }
+            admission
+                .total_fixed_builtin_calls
+                .insert(instruction.continuation_id);
+            continue;
+        }
+        if let Some(operation) = stable_builtin_resource_query(&call.target) {
+            match operation {
+                StableResourceQueryBuiltin::Id | StableResourceQueryBuiltin::Type => {
+                    let operand = (call.args.len() == 1)
+                        .then(|| direct_fixed_builtin_operand(call, 0))
+                        .flatten()
+                        .ok_or_else(|| {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_RESOURCE_QUERY_PUBLICATION",
+                                "resource id/type query requires one direct positional resource",
+                            )
+                        })?;
+                    let fact = lowering_operand_fact(value_flow, constants, operand);
+                    let guarded = if fact.certainty != crate::region_ir::SsaCertainty::Unknown {
+                        admit_publication_scalar_class(
+                            &mut admission,
+                            value_flow,
+                            constants,
+                            &definitions,
+                            &parameter_indices,
+                            operand,
+                            SsaValueClass::ResourceHandle,
+                            instruction.continuation_id,
+                            "resource query",
+                        )?
+                    } else {
+                        let parameter_index =
+                            publication_entry_parameter(operand, &definitions, &parameter_indices)
+                                .ok_or_else(|| {
+                                    CraneliftLoweringError::new(
+                                        "JIT_CRANELIFT_REJECT_RESOURCE_QUERY_PUBLICATION",
+                                        format!(
+                                            "resource query at continuation {} has no entry-rooted resource operand",
+                                            instruction.continuation_id,
+                                        ),
+                                    )
+                                })?;
+                        admission
+                            .value_class_requirements
+                            .push(NativeEntryValueClassRequirement {
+                                parameter_index,
+                                class: SsaValueClass::ResourceHandle,
+                            });
+                        Some(parameter_index)
+                    };
+                    entry_dependent_continuations
+                        .extend(guarded.map(|_| instruction.continuation_id));
+                    if operation == StableResourceQueryBuiltin::Type {
+                        let parameter_index = guarded.ok_or_else(|| {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_RESOURCE_TYPE_PUBLICATION",
+                                format!(
+                                    "resource type query at continuation {} is not rooted at an entry resource kind",
+                                    instruction.continuation_id,
+                                ),
+                            )
+                        })?;
+                        admission
+                            .resource_type_requirements
+                            .push(NativeEntryResourceTypeRequirement { parameter_index });
+                    }
+                    admission
+                        .total_fixed_builtin_calls
+                        .insert(instruction.continuation_id);
+                    continue;
+                }
+                StableResourceQueryBuiltin::All => {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_RESOURCE_INVENTORY_PUBLICATION",
+                        format!(
+                            "get_resources at continuation {} depends on an unbounded live resource inventory",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+            }
+        }
+        if let Some(operation) = stable_builtin_memory_query(&call.target) {
+            if !operation.accepts_arity(call.args.len()) {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_MEMORY_QUERY_ARITY",
+                    "memory query has an unsupported argument count",
+                ));
+            }
+            if !call.args.is_empty() {
+                let operand = direct_fixed_builtin_operand(call, 0).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_MEMORY_QUERY_ARGUMENT",
+                        "memory query flag is not a direct positional boolean",
+                    )
+                })?;
+                let guarded = admit_publication_scalar_class(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    operand,
+                    SsaValueClass::Bool,
+                    instruction.continuation_id,
+                    "memory query flag",
+                )?;
+                entry_dependent_continuations.extend(guarded.map(|_| instruction.continuation_id));
+            }
+            admission
+                .total_fixed_builtin_calls
+                .insert(instruction.continuation_id);
             continue;
         }
         if stable_builtin_ord(&call.target) {
@@ -4085,6 +5258,19 @@ fn optimizing_admission_for_region(
         let direct_arguments = (0..call.args.len())
             .map(|index| direct_fixed_builtin_operand(call, index))
             .collect::<Option<Vec<_>>>();
+        if (stable_builtin_scalar_consumer(&call.target).is_some()
+            || stable_builtin_ctype(&call.target).is_some()
+            || stable_builtin_is_numeric(&call.target))
+            && direct_arguments.is_none()
+        {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_FIXED_SCALAR_ARGUMENT_FRAME",
+                format!(
+                    "fixed scalar builtin at continuation {} is not a direct positional argument frame",
+                    instruction.continuation_id,
+                ),
+            ));
+        }
         if let Some(arguments) = direct_arguments.as_ref() {
             let continuation = instruction.continuation_id;
             macro_rules! admit_known_scalar {
@@ -4139,6 +5325,161 @@ fn optimizing_admission_for_region(
                 }
                 admit_known_scalar!(arguments[0], "type-name")?;
                 admission.fixed_string_bytes = admission.fixed_string_bytes.saturating_add(16);
+            }
+
+            if let Some(operation) = stable_builtin_scalar_consumer(&call.target)
+                && !matches!(
+                    operation,
+                    StableScalarConsumerBuiltin::GetType
+                        | StableScalarConsumerBuiltin::GetDebugType
+                )
+            {
+                let valid_arity = arguments.len() == 1
+                    || operation == StableScalarConsumerBuiltin::IntVal && arguments.len() == 2;
+                if !valid_arity {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_SCALAR_CONSUMER_ARITY",
+                        "fixed scalar conversion has an unsupported argument count",
+                    ));
+                }
+                let source = arguments[0];
+                let fact = lowering_operand_fact(value_flow, constants, source);
+                let admitted = match operation {
+                    StableScalarConsumerBuiltin::BoolVal => !matches!(
+                        fact.class,
+                        SsaValueClass::Uninitialized
+                            | SsaValueClass::ReferenceHandle
+                            | SsaValueClass::MixedHandle
+                    ),
+                    StableScalarConsumerBuiltin::IntVal | StableScalarConsumerBuiltin::FloatVal => {
+                        matches!(
+                            fact.class,
+                            SsaValueClass::Null
+                                | SsaValueClass::Bool
+                                | SsaValueClass::Int
+                                | SsaValueClass::Float
+                                | SsaValueClass::StringHandle
+                                | SsaValueClass::ArrayHandle
+                                | SsaValueClass::ResourceHandle
+                        )
+                    }
+                    StableScalarConsumerBuiltin::StrVal => matches!(
+                        fact.class,
+                        SsaValueClass::Null
+                            | SsaValueClass::Bool
+                            | SsaValueClass::Int
+                            | SsaValueClass::Float
+                            | SsaValueClass::StringHandle
+                            | SsaValueClass::ResourceHandle
+                    ),
+                    StableScalarConsumerBuiltin::GetType
+                    | StableScalarConsumerBuiltin::GetDebugType => unreachable!(),
+                };
+                if fact.certainty == crate::region_ir::SsaCertainty::Unknown || !admitted {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_SCALAR_CONSUMER_PUBLICATION",
+                        format!(
+                            "fixed scalar conversion at continuation {continuation} has no total source class"
+                        ),
+                    ));
+                }
+                admit_publication_scalar_class(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    source,
+                    fact.class,
+                    continuation,
+                    "fixed scalar conversion",
+                )?;
+                if let Some(&base) = arguments.get(1) {
+                    admit_publication_integer(
+                        &mut admission,
+                        value_flow,
+                        constants,
+                        &definitions,
+                        &parameter_indices,
+                        base,
+                        2,
+                        36,
+                        &[],
+                        continuation,
+                        "intval base",
+                    )?;
+                }
+                if operation == StableScalarConsumerBuiltin::StrVal
+                    && fact.class != SsaValueClass::StringHandle
+                {
+                    admission.fixed_string_bytes = admission
+                        .fixed_string_bytes
+                        .saturating_add(php_runtime::api::PHP_FLOAT_STRING_BUFFER_CAPACITY);
+                }
+                admission.total_fixed_builtin_calls.insert(continuation);
+            }
+
+            if stable_builtin_is_numeric(&call.target) {
+                if arguments.len() != 1 {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_IS_NUMERIC_ARITY",
+                        "is_numeric requires one direct positional operand",
+                    ));
+                }
+                let fact = lowering_operand_fact(value_flow, constants, arguments[0]);
+                if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                    || !matches!(
+                        fact.class,
+                        SsaValueClass::Int | SsaValueClass::Float | SsaValueClass::StringHandle
+                    )
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_IS_NUMERIC_PUBLICATION",
+                        "is_numeric has no publication-total numeric/string operand",
+                    ));
+                }
+                admit_publication_scalar_class(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    arguments[0],
+                    fact.class,
+                    continuation,
+                    "is_numeric",
+                )?;
+                admission.total_fixed_builtin_calls.insert(continuation);
+            }
+
+            if stable_builtin_ctype(&call.target).is_some() {
+                if arguments.len() != 1 {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_CTYPE_ARITY",
+                        "ctype predicate requires one direct positional operand",
+                    ));
+                }
+                let fact = lowering_operand_fact(value_flow, constants, arguments[0]);
+                if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                    || !matches!(fact.class, SsaValueClass::Int | SsaValueClass::StringHandle)
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_CTYPE_PUBLICATION",
+                        "ctype predicate has no publication-total integer/string operand",
+                    ));
+                }
+                admit_publication_scalar_class(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    arguments[0],
+                    fact.class,
+                    continuation,
+                    "ctype predicate",
+                )?;
+                admission.total_fixed_builtin_calls.insert(continuation);
             }
 
             if let Some(operation) = stable_builtin_numeric_operator(&call.target) {
@@ -4222,7 +5563,34 @@ fn optimizing_admission_for_region(
                             )?;
                         }
                     }
-                    StableNumericOperatorBuiltin::Pow => {}
+                    StableNumericOperatorBuiltin::Pow => {
+                        for operand in arguments {
+                            let root = publication_root_operand(*operand, &definitions);
+                            let fact = fixed_numeric_operand_fact(value_flow, constants, root)
+                                .ok_or_else(|| {
+                                    CraneliftLoweringError::new(
+                                        "JIT_CRANELIFT_REJECT_POWER_TYPE",
+                                        format!(
+                                            "pow operand {operand:?} has no exact publication-time numeric form"
+                                        ),
+                                    )
+                                })?;
+                            let original = lowering_operand_fact(value_flow, constants, root);
+                            if matches!(original.class, SsaValueClass::Int | SsaValueClass::Float) {
+                                admit_publication_scalar_class(
+                                    &mut admission,
+                                    value_flow,
+                                    constants,
+                                    &definitions,
+                                    &parameter_indices,
+                                    *operand,
+                                    fact.class,
+                                    continuation,
+                                    "pow",
+                                )?;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -5313,10 +6681,25 @@ fn optimizing_admission_for_region(
         let projection = stable_builtin_array_projection(&call.target).is_some();
         let read_only_pointer =
             stable_builtin_array_pointer(&call.target) == Some(StableArrayPointerBuiltin::Key);
-        let direct_count = matches!(
+        let count_family = matches!(
             stable_builtin_array_aggregate(&call.target),
             Some(StableArrayAggregateBuiltin::Count | StableArrayAggregateBuiltin::SizeOf)
-        ) && call.args.len() == 1;
+        );
+        let direct_count = count_family
+            && (call.args.len() == 1
+                || call.args.len() == 2
+                    && direct_fixed_builtin_operand(call, 1).is_some_and(|mode| {
+                        publication_integer_operand(constants, &definitions, mode) == Some(0)
+                    }));
+        if count_family && !direct_count {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_COUNT_PUBLICATION",
+                format!(
+                    "count/sizeof at continuation {} has no publication-total non-recursive mode",
+                    instruction.continuation_id,
+                ),
+            ));
+        }
         if !projection
             && stable_builtin_array_edge_key(&call.target).is_none()
             && !stable_builtin_array_is_list(&call.target)
@@ -5325,18 +6708,20 @@ fn optimizing_admission_for_region(
         {
             continue;
         }
-        if call.args.len() != 1
-            || call.args[0].name.is_some()
-            || call.args[0].unpack
-            || call.args[0].by_ref_local.is_some()
-            || call.args[0].by_ref_dim.is_some()
-            || call.args[0].by_ref_property.is_some()
-            || call.args[0].by_ref_property_dim.is_some()
+        if !(call.args.len() == 1 || direct_count && call.args.len() == 2)
+            || call.args.iter().any(|argument| {
+                argument.name.is_some()
+                    || argument.unpack
+                    || argument.by_ref_local.is_some()
+                    || argument.by_ref_dim.is_some()
+                    || argument.by_ref_property.is_some()
+                    || argument.by_ref_property_dim.is_some()
+            })
         {
             return Err(CraneliftLoweringError::new(
                 "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_ARITY_SHAPE",
                 format!(
-                    "array operation at continuation {} is not one positional by-value argument",
+                    "array operation at continuation {} has no total positional by-value argument frame",
                     instruction.continuation_id
                 ),
             ));
@@ -7265,18 +8650,28 @@ pub(super) fn compile_region_graph_native(
     let needs_exact_array_aggregate: [bool; StableArrayAggregateBuiltin::COUNT] =
         std::array::from_fn(|index| {
             !baseline_helper_imports
-                && regions.values().any(|region| {
+                && regions.iter().any(|(function, region)| {
+                    let value_flow = &value_flows[function];
                     region_contains(region, |kind| {
                         matches!(kind, RegionInstructionKind::NativeCall(call)
-                            if stable_builtin_array_aggregate(&call.target)
-                                .is_some_and(|builtin| builtin.index() == index)
-                                && !(matches!(
-                                    stable_builtin_array_aggregate(&call.target),
-                                    Some(
-                                        StableArrayAggregateBuiltin::Count
-                                            | StableArrayAggregateBuiltin::SizeOf
-                                    )
-                                ) && call.args.len() == 1))
+                        if stable_builtin_array_aggregate(&call.target)
+                            .is_some_and(|builtin| builtin.index() == index)
+                            && !(matches!(
+                                stable_builtin_array_aggregate(&call.target),
+                                Some(
+                                    StableArrayAggregateBuiltin::Count
+                                        | StableArrayAggregateBuiltin::SizeOf
+                                )
+                            ) && (call.args.len() == 1
+                                || call.args.len() == 2
+                                    && direct_fixed_builtin_operand(call, 1).is_some_and(
+                                        |mode| value_flow
+                                            .operand_fact(&unit.constants, mode)
+                                            .integer_range
+                                            == Some(
+                                                crate::region_ir::SsaIntegerRange::exact(0),
+                                            ),
+                                    ))))
                     })
                 })
         });
@@ -7698,6 +9093,22 @@ pub(super) fn compile_region_graph_native(
             !baseline_helper_imports
                 && regions.values().any(|region| {
                     region_contains(region, |kind| {
+                        if index == StablePureMathBuiltin::Fpow.index()
+                            && (matches!(
+                                kind,
+                                RegionInstructionKind::Binary {
+                                    op: RegionBinaryOp::Pow,
+                                    ..
+                                }
+                            ) || matches!(
+                                kind,
+                                RegionInstructionKind::NativeCall(call)
+                                    if stable_builtin_numeric_operator(&call.target)
+                                        == Some(StableNumericOperatorBuiltin::Pow)
+                            ))
+                        {
+                            return true;
+                        }
                         let RegionInstructionKind::NativeCall(call) = kind else {
                             return false;
                         };
@@ -7815,23 +9226,58 @@ pub(super) fn compile_region_graph_native(
                 matches!(kind, RegionInstructionKind::Binary { .. })
             })
         });
-    let mut needs_exact_binary = [false; NATIVE_EXACT_BINARY_COUNT];
-    for operation in NATIVE_EXACT_BINARY_OPERATIONS {
-        needs_exact_binary[native_exact_binary_index(operation)] = regions.values().any(|region| {
+    let needs_array_union = !baseline_helper_imports
+        && regions.iter().any(|(function, region)| {
+            let value_flow = &value_flows[function];
+            region_contains(region, |kind| {
+                let RegionInstructionKind::Binary {
+                    op: RegionBinaryOp::Add,
+                    lhs,
+                    rhs,
+                    ..
+                } = kind
+                else {
+                    return false;
+                };
+                [*lhs, *rhs].into_iter().all(|operand| {
+                    let fact = value_flow.operand_fact(&unit.constants, operand);
+                    fact.certainty != crate::region_ir::SsaCertainty::Unknown
+                        && fact.class == SsaValueClass::ArrayHandle
+                })
+            })
+        });
+    let needs_concat = !baseline_helper_imports
+        && regions.values().any(|region| {
             region_contains(region, |kind| {
                 matches!(
                     kind,
-                    RegionInstructionKind::Binary { op, .. } if *op == operation
-                ) || operation == RegionBinaryOp::Pow
-                    && matches!(
-                        kind,
-                        RegionInstructionKind::NativeCall(call)
-                            if stable_builtin_numeric_operator(&call.target)
-                                == Some(StableNumericOperatorBuiltin::Pow)
-                    )
+                    RegionInstructionKind::Binary {
+                        op: RegionBinaryOp::Concat,
+                        ..
+                    }
+                )
             })
         });
-    }
+    let needs_string_bitwise: [bool; 3] = std::array::from_fn(|index| {
+        !baseline_helper_imports
+            && regions.iter().any(|(function, region)| {
+                let value_flow = &value_flows[function];
+                region_contains(region, |kind| {
+                    let RegionInstructionKind::Binary { op, lhs, rhs, .. } = kind else {
+                        return false;
+                    };
+                    matches!(
+                        op,
+                        RegionBinaryOp::BitAnd | RegionBinaryOp::BitOr | RegionBinaryOp::BitXor
+                    ) && native_string_bitwise_index(*op) == index
+                        && [*lhs, *rhs].into_iter().all(|operand| {
+                            let fact = value_flow.operand_fact(&unit.constants, operand);
+                            fact.certainty != crate::region_ir::SsaCertainty::Unknown
+                                && fact.class == SsaValueClass::StringHandle
+                        })
+                })
+            })
+    });
     let needs_compare = regions.values().any(|region| {
         region_contains(region, |kind| {
             matches!(
@@ -7963,6 +9409,11 @@ pub(super) fn compile_region_graph_native(
                     op: RegionCastOp::Int,
                     ..
                 }
+            ) || matches!(
+                kind,
+                RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_scalar_consumer(&call.target)
+                        == Some(StableScalarConsumerBuiltin::IntVal)
             )
         })
     });
@@ -7974,12 +9425,16 @@ pub(super) fn compile_region_graph_native(
                     op: RegionCastOp::Float,
                     ..
                 }
+            ) || matches!(
+                kind,
+                RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_scalar_consumer(&call.target)
+                        == Some(StableScalarConsumerBuiltin::FloatVal)
             )
         })
     });
     let needs_string_cast = call_scalar_helper_needs.string_cast
-        || regions.iter().any(|(function, region)| {
-            let value_flow = &value_flows[function];
+        || regions.values().any(|region| {
             region_contains(region, |kind| {
                 matches!(
                     kind,
@@ -7994,11 +9449,6 @@ pub(super) fn compile_region_graph_native(
                             == Some(StableScalarConsumerBuiltin::StrVal)
                             && call.args.len() == 1
                             && direct_fixed_builtin_operand(call, 0).is_some()
-                            && !optimizing_strval_uses_float_handler(
-                                call,
-                                value_flow,
-                                &unit.constants,
-                            )
                 )
             })
         });
@@ -8079,20 +9529,6 @@ pub(super) fn compile_region_graph_native(
                                 callable: php_ir::instruction::CallableKind::FunctionName { .. },
                                 ..
                             }
-                        },
-                        ..
-                    })
-                )
-            })
-        });
-    let needs_dynamic_instanceof = !baseline_helper_imports
-        && regions.values().any(|region| {
-            region_contains(region, |kind| {
-                matches!(
-                    kind,
-                    RegionInstructionKind::NativeCall(RegionNativeCall {
-                        target: RegionCallTarget::Semantic {
-                            operation: RegionSemanticOp::DynamicInstanceOf { .. }
                         },
                         ..
                     })
@@ -8452,9 +9888,6 @@ pub(super) fn compile_region_graph_native(
     let needs_unary = baseline_helper_imports && needs_unary;
     if baseline_helper_imports {
         needs_exact_unary.fill(false);
-    }
-    if baseline_helper_imports {
-        needs_exact_binary.fill(false);
     }
     if baseline_helper_imports {
         needs_exact_compare.fill(false);
@@ -9712,16 +11145,40 @@ pub(super) fn compile_region_graph_native(
             imports.push((symbol.to_owned(), address));
         }
     }
-    for operation in NATIVE_EXACT_BINARY_OPERATIONS {
-        let index = native_exact_binary_index(operation);
-        if !needs_exact_binary[index] {
+    for (needed, configured, symbol) in [
+        (
+            needs_array_union,
+            runtime_helpers.native_array_union,
+            "phrust_native_array_union",
+        ),
+        (
+            needs_concat,
+            runtime_helpers.native_concat,
+            "phrust_native_concat",
+        ),
+        (
+            needs_string_bitwise[0],
+            runtime_helpers.native_string_bitwise[0],
+            "phrust_native_bit_and",
+        ),
+        (
+            needs_string_bitwise[1],
+            runtime_helpers.native_string_bitwise[1],
+            "phrust_native_bit_or",
+        ),
+        (
+            needs_string_bitwise[2],
+            runtime_helpers.native_string_bitwise[2],
+            "phrust_native_bit_xor",
+        ),
+    ] {
+        if !needed {
             continue;
         }
-        let configured = runtime_helpers.native_binary[index];
         imports.push((
-            native_exact_binary_symbol(operation).to_owned(),
+            symbol.to_owned(),
             if configured == 0 {
-                test_native_exact_binary_fallback as *const () as usize
+                test_total_representation_binary_fallback as *const () as usize
             } else {
                 configured
             },
@@ -9898,16 +11355,6 @@ pub(super) fn compile_region_graph_native(
                 test_native_object_class_name_fallback as *const () as usize
             } else {
                 runtime_helpers.native_resolve_callable
-            },
-        ));
-    }
-    if needs_dynamic_instanceof {
-        imports.push((
-            "phrust_native_dynamic_instanceof".to_owned(),
-            if runtime_helpers.native_dynamic_instanceof == 0 {
-                test_native_object_class_name_fallback as *const () as usize
-            } else {
-                runtime_helpers.native_dynamic_instanceof
             },
         ));
     }
@@ -11302,15 +12749,35 @@ pub(super) fn compile_region_graph_native(
                     helper_address(builtin.symbol()),
                 )?);
             }
-            let mut exact_binary = [None; NATIVE_EXACT_BINARY_COUNT];
-            for operation in NATIVE_EXACT_BINARY_OPERATIONS {
-                let index = native_exact_binary_index(operation);
-                exact_binary[index] = declare_native_control_handler(
+            let array_union = declare_native_control_handler(
+                module,
+                needs_array_union,
+                "phrust_native_array_union",
+                2,
+                || helper_address("phrust_native_array_union"),
+            )?;
+            let concat = declare_native_control_handler(
+                module,
+                needs_concat,
+                "phrust_native_concat",
+                2,
+                || helper_address("phrust_native_concat"),
+            )?;
+            let mut string_bitwise = [None; 3];
+            for (index, symbol) in [
+                "phrust_native_bit_and",
+                "phrust_native_bit_or",
+                "phrust_native_bit_xor",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                string_bitwise[index] = declare_native_control_handler(
                     module,
-                    needs_exact_binary[index],
-                    native_exact_binary_symbol(operation),
+                    needs_string_bitwise[index],
+                    symbol,
                     2,
-                    || helper_address(native_exact_binary_symbol(operation)),
+                    || helper_address(symbol),
                 )?;
             }
             let mut exact_unary = [None; NATIVE_EXACT_UNARY_COUNT];
@@ -11491,15 +12958,8 @@ pub(super) fn compile_region_graph_native(
                 module,
                 needs_resolve_callable,
                 "phrust_native_resolve_callable",
-                2,
+                5,
                 || helper_address("phrust_native_resolve_callable"),
-            )?;
-            let dynamic_instanceof = declare_native_control_handler(
-                module,
-                needs_dynamic_instanceof,
-                "phrust_native_dynamic_instanceof",
-                2,
-                || helper_address("phrust_native_dynamic_instanceof"),
             )?;
             let prepared_object_new = if needs_prepared_object_new {
                 let mut signature = module.make_signature();
@@ -12046,7 +13506,9 @@ pub(super) fn compile_region_graph_native(
                 NativeTierOperations::Optimizing {
                     operations: NativeOptimizingOperations {
                         execution_poll: native_operations.execution_poll,
-                        exact_binary,
+                        array_union,
+                        concat,
+                        string_bitwise,
                         exact_unary,
                         exact_compare,
                         echo_bytes,
@@ -12064,7 +13526,6 @@ pub(super) fn compile_region_graph_native(
                         object_class_name,
                         acquire_callable,
                         resolve_callable,
-                        dynamic_instanceof,
                         prepared_object_new,
                         prepared_exception_new,
                         prepared_closure_new,
@@ -12195,6 +13656,7 @@ pub(super) fn compile_region_graph_native(
                                 || function.returns_by_ref)
                                 && !ir_function_requires_non_reference_trampoline(function),
                             returns_by_reference: function.returns_by_ref,
+                            return_type: function.return_type.clone(),
                             has_exception_handlers: ir_function_has_exception_handler(function),
                         },
                     ))
@@ -12216,6 +13678,7 @@ pub(super) fn compile_region_graph_native(
                             || ir_function.returns_by_ref)
                             && !ir_function_requires_non_reference_trampoline(ir_function),
                         returns_by_reference: ir_function.returns_by_ref,
+                        return_type: ir_function.return_type.clone(),
                         has_exception_handlers: !region.exception_regions.is_empty(),
                     },
                 )
@@ -12971,18 +14434,11 @@ pub(super) fn compile_region_graph_native(
                                     | "phrust_native_float_cast"
                                     | "phrust_native_string_cast"
                                     | "phrust_native_callback_return_string"
-                                    | "phrust_native_add"
-                                    | "phrust_native_subtract"
-                                    | "phrust_native_multiply"
-                                    | "phrust_native_divide"
-                                    | "phrust_native_modulo"
+                                    | "phrust_native_array_union"
                                     | "phrust_native_concat"
-                                    | "phrust_native_power"
                                     | "phrust_native_bit_and"
                                     | "phrust_native_bit_or"
                                     | "phrust_native_bit_xor"
-                                    | "phrust_native_shift_left"
-                                    | "phrust_native_shift_right"
                                     | "phrust_native_unary_plus"
                                     | "phrust_native_unary_minus"
                                     | "phrust_native_bit_not"
@@ -13000,7 +14456,6 @@ pub(super) fn compile_region_graph_native(
                                     | "phrust_native_acquire_callable"
                                     | "phrust_native_is_callable"
                                     | "phrust_native_resolve_callable"
-                                    | "phrust_native_dynamic_instanceof"
                                     | "phrust_native_prepared_object_new"
                                     | "phrust_native_prepared_exception_new"
                                     | "phrust_native_prepared_closure_new"
@@ -15223,11 +16678,57 @@ fn emit_optimizing_entry_instanceof(
     rejected: ir::Block,
 ) -> Result<(), CraneliftLoweringError> {
     let pointer_type = builder.func.dfg.value_type(deopt_out);
+    let Some(parameter_index) = requirement.parameter_index else {
+        let view = lower_active_runtime_view(builder, deopt_out);
+        let offsets = builder.ins().load(
+            pointer_type,
+            MemFlagsData::new(),
+            view,
+            std::mem::offset_of!(
+                crate::JitNativeRuntimeView,
+                trusted_property_function_offsets,
+            ) as i32,
+        );
+        let plans = builder.ins().load(
+            pointer_type,
+            MemFlagsData::new(),
+            view,
+            std::mem::offset_of!(crate::JitNativeRuntimeView, trusted_instanceof_plans) as i32,
+        );
+        let function_entry = builder.ins().iadd_imm(
+            offsets,
+            i64::try_from(function.index().saturating_mul(4)).unwrap_or(i64::MAX),
+        );
+        let plan_base = builder
+            .ins()
+            .load(types::I32, MemFlagsData::new(), function_entry, 0);
+        let plan_index = builder
+            .ins()
+            .iadd_imm(plan_base, i64::from(requirement.continuation_id));
+        let wide_plan_index = builder.ins().uextend(pointer_type, plan_index);
+        let plan_offset = builder.ins().ishl_imm(wide_plan_index, 4);
+        let plan = builder.ins().iadd(plans, plan_offset);
+        let state = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            plan,
+            std::mem::offset_of!(crate::JitNativeInstanceOfPlan, state) as i32,
+        );
+        let published = builder.ins().icmp_imm(
+            IntCC::Equal,
+            state,
+            i64::from(crate::JIT_NATIVE_INSTANCEOF_PLAN_PUBLISHED),
+        );
+        let accepted = builder.create_block();
+        builder.ins().brif(published, accepted, &[], rejected, &[]);
+        builder.switch_to_block(accepted);
+        return Ok(());
+    };
     let object = builder.ins().load(
         types::I64,
         MemFlagsData::new(),
         arguments,
-        i32::try_from(requirement.parameter_index.saturating_mul(8)).map_err(|_| {
+        i32::try_from(parameter_index.saturating_mul(8)).map_err(|_| {
             CraneliftLoweringError::new(
                 "JIT_CRANELIFT_REJECT_INSTANCEOF_OFFSET",
                 "instanceof parameter offset does not fit the native ABI",
@@ -15391,6 +16892,385 @@ fn emit_optimizing_entry_instanceof(
     Ok(())
 }
 
+fn emit_optimizing_entry_object_flags(
+    builder: &mut FunctionBuilder<'_>,
+    arguments: ir::Value,
+    deopt_out: ir::Value,
+    parameter_index: usize,
+    required_flags: u32,
+    rejected: ir::Block,
+    family: &str,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    let object = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        arguments,
+        i32::try_from(parameter_index.saturating_mul(8)).map_err(|_| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_OBJECT_REQUIREMENT_OFFSET",
+                format!("{family} parameter offset does not fit the native ABI"),
+            )
+        })?,
+    );
+    let tagged = lower_value_has_tag(builder, object, crate::JIT_VALUE_RUNTIME_OBJECT_TAG);
+    let index = builder.ins().ireduce(types::I32, object);
+    let direct = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        index,
+        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+    );
+    let inspect = builder.create_block();
+    let shape = builder.ins().band(tagged, direct);
+    builder.ins().brif(shape, inspect, &[], rejected, &[]);
+    builder.switch_to_block(inspect);
+    let slot = lower_optimizing_slot_address(builder, object, deopt_out);
+    let kind = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+    );
+    let flags = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+    );
+    let kind_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        kind,
+        i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT),
+    );
+    let abi = builder.ins().band_imm(
+        flags,
+        i64::from(crate::JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_MASK),
+    );
+    let abi_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        abi,
+        i64::from(crate::JIT_NATIVE_OBJECT_PROPERTY_VIEW_ABI_VERSION),
+    );
+    let published = builder.ins().band(kind_ok, abi_ok);
+    let required = builder.ins().band_imm(flags, i64::from(required_flags));
+    let required = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, required, i64::from(required_flags));
+    let admitted = builder.ins().band(published, required);
+    let next = builder.create_block();
+    builder.ins().brif(admitted, next, &[], rejected, &[]);
+    builder.switch_to_block(next);
+    Ok(flags)
+}
+
+fn emit_optimizing_entry_callable(
+    builder: &mut FunctionBuilder<'_>,
+    arguments: ir::Value,
+    deopt_out: ir::Value,
+    requirement: NativeEntryCallableRequirement,
+    rejected: ir::Block,
+) -> Result<(), CraneliftLoweringError> {
+    let pointer_type = builder.func.dfg.value_type(deopt_out);
+    let callable = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        arguments,
+        i32::try_from(requirement.parameter_index.saturating_mul(8)).map_err(|_| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_CALLABLE_REQUIREMENT_OFFSET",
+                "callable parameter offset does not fit the native ABI",
+            )
+        })?,
+    );
+    let tagged = lower_value_has_tag(builder, callable, crate::JIT_VALUE_RUNTIME_CALLABLE_TAG);
+    let index = builder.ins().ireduce(types::I32, callable);
+    let direct = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        index,
+        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+    );
+    let inspect = builder.create_block();
+    let shape = builder.ins().band(tagged, direct);
+    builder.ins().brif(shape, inspect, &[], rejected, &[]);
+    builder.switch_to_block(inspect);
+    let slot = lower_optimizing_slot_address(builder, callable, deopt_out);
+    let kind = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+    );
+    let abi = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+    );
+    let view = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, aux) as i32,
+    );
+    let kind_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        kind,
+        i64::from(crate::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE),
+    );
+    let abi_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        abi,
+        i64::from(crate::JIT_NATIVE_PREPARED_CALLABLE_ABI_VERSION),
+    );
+    let has_view = builder.ins().icmp_imm(IntCC::NotEqual, view, 0);
+    let descriptor_ok = builder.ins().band(kind_ok, abi_ok);
+    let descriptor_ok = builder.ins().band(descriptor_ok, has_view);
+    let inspect_view = builder.create_block();
+    builder
+        .ins()
+        .brif(descriptor_ok, inspect_view, &[], rejected, &[]);
+    builder.switch_to_block(inspect_view);
+
+    let callable_kind = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativePreparedCallableView, kind) as i32,
+    );
+    let flags = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativePreparedCallableView, flags) as i32,
+    );
+    let function_id = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativePreparedCallableView, function_id) as i32,
+    );
+    let captures = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativePreparedCallableView, captures) as i32,
+    );
+    let capture_count = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativePreparedCallableView, capture_count) as i32,
+    );
+    let receiver = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativePreparedCallableView, receiver) as i32,
+    );
+    let implicit_this = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativePreparedCallableView, implicit_this) as i32,
+    );
+    let name_bytes = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativePreparedCallableView, name_bytes) as i32,
+    );
+    let name_length = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativePreparedCallableView, name_length) as i32,
+    );
+    let method_bytes = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativePreparedCallableView, method_bytes) as i32,
+    );
+    let method_length = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativePreparedCallableView, method_length) as i32,
+    );
+    let class_bytes = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativePreparedCallableView, class_bytes) as i32,
+    );
+    let class_length = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativePreparedCallableView, class_length) as i32,
+    );
+    let fixed = builder.ins().band_imm(
+        flags,
+        i64::from(crate::JIT_NATIVE_PREPARED_CALLABLE_FIXED_BINDING),
+    );
+    let fixed = builder.ins().icmp_imm(IntCC::NotEqual, fixed, 0);
+    let target = builder
+        .ins()
+        .icmp_imm(IntCC::NotEqual, function_id, i64::from(u32::MAX));
+    let user = builder.ins().icmp_imm(
+        IntCC::Equal,
+        callable_kind,
+        i64::from(crate::JIT_NATIVE_CALLABLE_KIND_USER_FUNCTION),
+    );
+    let closure = builder.ins().icmp_imm(
+        IntCC::Equal,
+        callable_kind,
+        i64::from(crate::JIT_NATIVE_CALLABLE_KIND_CLOSURE),
+    );
+    let bound_object = builder.ins().icmp_imm(
+        IntCC::Equal,
+        callable_kind,
+        i64::from(crate::JIT_NATIVE_CALLABLE_KIND_BOUND_OBJECT_METHOD),
+    );
+    let bound_class = builder.ins().icmp_imm(
+        IntCC::Equal,
+        callable_kind,
+        i64::from(crate::JIT_NATIVE_CALLABLE_KIND_BOUND_CLASS_METHOD),
+    );
+    let callable_kind_ok = builder.ins().bor(user, closure);
+    let callable_kind_ok = builder.ins().bor(callable_kind_ok, bound_object);
+    let callable_kind_ok = builder.ins().bor(callable_kind_ok, bound_class);
+    let allowed_flags = crate::JIT_NATIVE_PREPARED_CLOSURE_HAS_IMPLICIT_THIS
+        | crate::JIT_NATIVE_PREPARED_CALLABLE_HAS_SCOPE
+        | crate::JIT_NATIVE_PREPARED_CALLABLE_FIXED_BINDING
+        | crate::JIT_NATIVE_PREPARED_CALLABLE_HAS_RECEIVER
+        | crate::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_INT
+        | crate::JIT_NATIVE_PREPARED_CALLABLE_FIRST_PARAMETER_BY_REFERENCE
+        | crate::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_RELEASABLE_SCALAR
+        | crate::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_STRING;
+    let unknown_flags = builder.ins().band_imm(flags, i64::from(!allowed_flags));
+    let flags_known = builder.ins().icmp_imm(IntCC::Equal, unknown_flags, 0);
+    let no_captures = builder.ins().icmp_imm(IntCC::Equal, capture_count, 0);
+    let captures_present = builder.ins().icmp_imm(IntCC::NotEqual, captures, 0);
+    let closure_capture_shape = builder.ins().bor(no_captures, captures_present);
+    let no_capture_pointer = builder.ins().icmp_imm(IntCC::Equal, captures, 0);
+    let nonclosure_capture_shape = builder.ins().band(no_captures, no_capture_pointer);
+    let capture_shape =
+        builder
+            .ins()
+            .select(closure, closure_capture_shape, nonclosure_capture_shape);
+    let receiver_tag = lower_value_has_tag(builder, receiver, crate::JIT_VALUE_RUNTIME_OBJECT_TAG);
+    let receiver_index = builder.ins().ireduce(types::I32, receiver);
+    let receiver_direct = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        receiver_index,
+        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+    );
+    let receiver_shape = builder.ins().band(receiver_tag, receiver_direct);
+    let has_receiver = builder.ins().band_imm(
+        flags,
+        i64::from(crate::JIT_NATIVE_PREPARED_CALLABLE_HAS_RECEIVER),
+    );
+    let has_receiver = builder.ins().icmp_imm(IntCC::NotEqual, has_receiver, 0);
+    let bound_receiver_shape = builder.ins().band(has_receiver, receiver_shape);
+    let no_receiver = builder.ins().icmp_imm(IntCC::Equal, has_receiver, 0);
+    let receiver_shape = builder
+        .ins()
+        .select(bound_object, bound_receiver_shape, no_receiver);
+    let has_implicit_this = builder.ins().band_imm(
+        flags,
+        i64::from(crate::JIT_NATIVE_PREPARED_CLOSURE_HAS_IMPLICIT_THIS),
+    );
+    let has_implicit_this = builder
+        .ins()
+        .icmp_imm(IntCC::NotEqual, has_implicit_this, 0);
+    let implicit_tag =
+        lower_value_has_tag(builder, implicit_this, crate::JIT_VALUE_RUNTIME_OBJECT_TAG);
+    let implicit_index = builder.ins().ireduce(types::I32, implicit_this);
+    let implicit_direct = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        implicit_index,
+        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+    );
+    let implicit_object = builder.ins().band(implicit_tag, implicit_direct);
+    let no_implicit_this = builder.ins().icmp_imm(IntCC::Equal, implicit_this, 0);
+    let closure_implicit_shape =
+        builder
+            .ins()
+            .select(has_implicit_this, implicit_object, no_implicit_this);
+    let nonclosure_implicit_shape = no_implicit_this;
+    let implicit_shape =
+        builder
+            .ins()
+            .select(closure, closure_implicit_shape, nonclosure_implicit_shape);
+    let name_present = builder.ins().icmp_imm(IntCC::NotEqual, name_bytes, 0);
+    let name_nonempty = builder.ins().icmp_imm(IntCC::NotEqual, name_length, 0);
+    let user_name_shape = builder.ins().band(name_present, name_nonempty);
+    let method_present = builder.ins().icmp_imm(IntCC::NotEqual, method_bytes, 0);
+    let method_nonempty = builder.ins().icmp_imm(IntCC::NotEqual, method_length, 0);
+    let method_shape = builder.ins().band(method_present, method_nonempty);
+    let user_or_closure = builder.ins().bor(user, closure);
+    let name_shape = builder.ins().select(user, user_name_shape, method_shape);
+    let name_shape = builder.ins().select(closure, flags_known, name_shape);
+    let class_present = builder.ins().icmp_imm(IntCC::NotEqual, class_bytes, 0);
+    let class_nonempty = builder.ins().icmp_imm(IntCC::NotEqual, class_length, 0);
+    let bound_class_shape = builder.ins().band(class_present, class_nonempty);
+    let class_not_required = builder.ins().iconst(types::I8, 1);
+    let class_shape = builder
+        .ins()
+        .select(bound_class, bound_class_shape, class_not_required);
+    let named_kind = builder.ins().bor(user_or_closure, bound_object);
+    let named_kind = builder.ins().bor(named_kind, bound_class);
+    let name_shape = builder.ins().band(named_kind, name_shape);
+    let admitted = builder.ins().band(fixed, target);
+    let admitted = builder.ins().band(admitted, callable_kind_ok);
+    let admitted = builder.ins().band(admitted, flags_known);
+    let admitted = builder.ins().band(admitted, capture_shape);
+    let admitted = builder.ins().band(admitted, receiver_shape);
+    let admitted = builder.ins().band(admitted, implicit_shape);
+    let admitted = builder.ins().band(admitted, name_shape);
+    let admitted = builder.ins().band(admitted, class_shape);
+    let accepted = builder.create_block();
+    builder.ins().brif(admitted, accepted, &[], rejected, &[]);
+    builder.switch_to_block(accepted);
+    let scan = builder.create_block();
+    let inspect_capture = builder.create_block();
+    let captures_accepted = builder.create_block();
+    builder.append_block_param(scan, types::I32);
+    let zero = builder.ins().iconst(types::I32, 0);
+    builder.ins().jump(scan, &[zero.into()]);
+    builder.switch_to_block(scan);
+    let capture_index = builder.block_params(scan)[0];
+    let captures_complete = builder.ins().icmp(
+        IntCC::UnsignedGreaterThanOrEqual,
+        capture_index,
+        capture_count,
+    );
+    builder.ins().brif(
+        captures_complete,
+        captures_accepted,
+        &[],
+        inspect_capture,
+        &[],
+    );
+    builder.switch_to_block(inspect_capture);
+    let wide_capture_index = builder.ins().uextend(pointer_type, capture_index);
+    let capture_offset = builder.ins().ishl_imm(wide_capture_index, 3);
+    let capture_pointer = builder.ins().iadd(captures, capture_offset);
+    let capture = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), capture_pointer, 0);
+    let authoritative = lower_optimizing_call_value_is_authoritative(builder, capture);
+    let next_capture = builder.create_block();
+    builder
+        .ins()
+        .brif(authoritative, next_capture, &[], rejected, &[]);
+    builder.switch_to_block(next_capture);
+    let capture_index = builder.ins().iadd_imm(capture_index, 1);
+    builder.ins().jump(scan, &[capture_index.into()]);
+    builder.switch_to_block(captures_accepted);
+    Ok(())
+}
+
 fn emit_optimizing_entry_admission(
     builder: &mut FunctionBuilder<'_>,
     admission: &NativeOptimizingAdmission,
@@ -15410,9 +17290,15 @@ fn emit_optimizing_entry_admission(
         && admission.static_property_requirements.is_empty()
         && admission.object_layout_requirements.is_empty()
         && admission.instanceof_requirements.is_empty()
+        && admission.callable_requirements.is_empty()
+        && admission.clone_requirements.is_empty()
+        && admission.dynamic_property_requirements.is_empty()
+        && admission.exception_requirements.is_empty()
         && admission.value_class_requirements.is_empty()
         && admission.string_requirements.is_empty()
+        && admission.resource_type_requirements.is_empty()
         && admission.integer_requirements.is_empty()
+        && admission.float_requirements.is_empty()
         && admission.trusted_constant_requirements.is_empty()
         && admission.trusted_static_local_requirements.is_empty()
         && admission.fixed_value_allocations == 0
@@ -15508,6 +17394,31 @@ fn emit_optimizing_entry_admission(
             .brif(accepted_layout, next, &[], rejected, &[]);
         builder.switch_to_block(next);
     }
+    for requirement in admission.callable_requirements.iter().copied() {
+        emit_optimizing_entry_callable(builder, arguments, deopt_out, requirement, rejected)?;
+    }
+    for requirement in admission.clone_requirements.iter().copied() {
+        let _ = emit_optimizing_entry_object_flags(
+            builder,
+            arguments,
+            deopt_out,
+            requirement.parameter_index,
+            0,
+            rejected,
+            "plain clone",
+        )?;
+    }
+    for requirement in admission.dynamic_property_requirements.iter().copied() {
+        let _ = emit_optimizing_entry_object_flags(
+            builder,
+            arguments,
+            deopt_out,
+            requirement.parameter_index,
+            crate::JIT_NATIVE_OBJECT_STDCLASS,
+            rejected,
+            "dynamic property",
+        )?;
+    }
     for requirement in &admission.value_class_requirements {
         let value = builder.ins().load(
             types::I64,
@@ -15520,6 +17431,34 @@ fn emit_optimizing_entry_admission(
                 )
             })?,
         );
+        let direct_kind = |builder: &mut FunctionBuilder<'_>, tag: u64, expected_kind: u32| {
+            let runtime = lower_is_runtime_handle(builder, value);
+            let tag_matches = lower_value_has_tag(builder, value, tag);
+            let index = builder.ins().ireduce(types::I32, value);
+            let direct = builder.ins().icmp_imm(
+                IntCC::UnsignedGreaterThanOrEqual,
+                index,
+                i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+            );
+            let admitted = builder.ins().band(runtime, tag_matches);
+            let admitted = builder.ins().band(admitted, direct);
+            let safe = builder.ins().iconst(
+                types::I64,
+                (tag | u64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE)) as i64,
+            );
+            let safe = builder.ins().select(admitted, value, safe);
+            let slot = lower_optimizing_slot_address(builder, safe, deopt_out);
+            let kind = builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                slot,
+                std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+            );
+            let kind_ok = builder
+                .ins()
+                .icmp_imm(IntCC::Equal, kind, i64::from(expected_kind));
+            builder.ins().band(admitted, kind_ok)
+        };
         let admitted = match requirement.class {
             SsaValueClass::Int => lower_optimizing_integer_candidate(builder, value, deopt_out).0,
             SsaValueClass::StringHandle => {
@@ -15575,7 +17514,44 @@ fn emit_optimizing_entry_admission(
                 );
                 builder.ins().band(direct_float, kind_ok)
             }
-            _ => unreachable!("only scalar echo value classes are admitted"),
+            SsaValueClass::ArrayHandle => direct_kind(
+                builder,
+                crate::JIT_VALUE_RUNTIME_ARRAY_TAG,
+                crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY,
+            ),
+            SsaValueClass::ObjectHandle => direct_kind(
+                builder,
+                crate::JIT_VALUE_RUNTIME_OBJECT_TAG,
+                crate::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT,
+            ),
+            SsaValueClass::CallableHandle => direct_kind(
+                builder,
+                crate::JIT_VALUE_RUNTIME_CALLABLE_TAG,
+                crate::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE,
+            ),
+            SsaValueClass::ResourceHandle => direct_kind(
+                builder,
+                crate::JIT_VALUE_RUNTIME_RESOURCE_TAG,
+                crate::JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE,
+            ),
+            SsaValueClass::GeneratorHandle => direct_kind(
+                builder,
+                crate::JIT_VALUE_RUNTIME_GENERATOR_TAG,
+                crate::JIT_NATIVE_VALUE_VIEW_DIRECT_GENERATOR,
+            ),
+            SsaValueClass::FiberHandle => direct_kind(
+                builder,
+                crate::JIT_VALUE_RUNTIME_FIBER_TAG,
+                crate::JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER,
+            ),
+            SsaValueClass::Uninitialized => builder.ins().icmp_imm(
+                IntCC::Equal,
+                value,
+                crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED),
+            ),
+            SsaValueClass::ReferenceHandle | SsaValueClass::MixedHandle => {
+                unreachable!("reference/mixed entry classes require a dedicated publication plan")
+            }
         };
         let next = builder.create_block();
         builder.ins().brif(admitted, next, &[], rejected, &[]);
@@ -15612,6 +17588,38 @@ fn emit_optimizing_entry_admission(
         builder.ins().brif(admitted, next, &[], rejected, &[]);
         builder.switch_to_block(next);
     }
+    for requirement in &admission.float_requirements {
+        let encoded = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            arguments,
+            i32::try_from(requirement.parameter_index.saturating_mul(8)).map_err(|_| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_FLOAT_REQUIREMENT_OFFSET",
+                    "float-requirement parameter offset does not fit the native ABI",
+                )
+            })?,
+        );
+        let slot = lower_optimizing_slot_address(builder, encoded, deopt_out);
+        let bits = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+        );
+        let value = builder.ins().bitcast(types::F64, MemFlagsData::new(), bits);
+        let admitted = if requirement.forbid_zero {
+            let zero = builder
+                .ins()
+                .f64const(cranelift_codegen::ir::immediates::Ieee64::with_bits(0));
+            builder.ins().fcmp(FloatCC::NotEqual, value, zero)
+        } else {
+            builder.ins().iconst(types::I8, 1)
+        };
+        let next = builder.create_block();
+        builder.ins().brif(admitted, next, &[], rejected, &[]);
+        builder.switch_to_block(next);
+    }
     let mut required_string_bytes = builder.ins().iconst(
         types::I64,
         i64::try_from(admission.fixed_string_bytes).map_err(|_| {
@@ -15621,6 +17629,93 @@ fn emit_optimizing_entry_admission(
             )
         })?,
     );
+    for requirement in admission.exception_requirements.iter().copied() {
+        let prepared = lower_optimizing_prepared_exception_pointer(
+            builder,
+            function,
+            requirement.continuation_id,
+            deopt_out,
+        );
+        let published = builder.ins().icmp_imm(IntCC::NotEqual, prepared, 0);
+        let inspect = builder.create_block();
+        builder.ins().brif(published, inspect, &[], rejected, &[]);
+        builder.switch_to_block(inspect);
+        let property_slots = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            prepared,
+            std::mem::offset_of!(crate::JitNativePreparedExceptionView, property_slots) as i32,
+        );
+        let include_function_frame = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            prepared,
+            std::mem::offset_of!(
+                crate::JitNativePreparedExceptionView,
+                include_function_frame
+            ) as i32,
+        );
+        let property_shape = builder.ins().icmp_imm(IntCC::Equal, property_slots, 6);
+        let frame_shape = builder.ins().icmp_imm(
+            IntCC::Equal,
+            include_function_frame,
+            i64::from(u32::from(requirement.include_function_frame)),
+        );
+        let plan_shape = builder.ins().band(property_shape, frame_shape);
+        let accepted_plan = builder.create_block();
+        builder
+            .ins()
+            .brif(plan_shape, accepted_plan, &[], rejected, &[]);
+        builder.switch_to_block(accepted_plan);
+        let fixed = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            prepared,
+            std::mem::offset_of!(crate::JitNativePreparedExceptionView, fixed_string_bytes) as i32,
+        );
+        required_string_bytes = builder.ins().iadd(required_string_bytes, fixed);
+    }
+    for requirement in admission.resource_type_requirements.iter().copied() {
+        let value = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            arguments,
+            i32::try_from(requirement.parameter_index.saturating_mul(8)).map_err(|_| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_RESOURCE_TYPE_OFFSET",
+                    "resource-type parameter offset does not fit the native ABI",
+                )
+            })?,
+        );
+        let slot = lower_optimizing_slot_address(builder, value, deopt_out);
+        let length = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, reserved) as i32,
+        );
+        let length = builder.ins().uextend(types::I64, length);
+        let within_limit = builder.ins().icmp_imm(
+            IntCC::UnsignedLessThanOrEqual,
+            length,
+            crate::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY as i64,
+        );
+        let next = builder.create_block();
+        builder.ins().brif(within_limit, next, &[], rejected, &[]);
+        builder.switch_to_block(next);
+        let minimum = builder.ins().iconst(
+            types::I64,
+            i64::from(crate::JIT_NATIVE_DIRECT_STRING_MIN_CAPACITY),
+        );
+        let adjusted = builder.ins().umax(length, minimum);
+        let below = builder.ins().iadd_imm(adjusted, -1);
+        let leading = builder.ins().clz(below);
+        let bit_width = builder.ins().iconst(types::I64, 64);
+        let width = builder.ins().isub(bit_width, leading);
+        let one = builder.ins().iconst(types::I64, 1);
+        let capacity = builder.ins().ishl(one, width);
+        required_string_bytes = builder.ins().iadd(required_string_bytes, capacity);
+    }
     for requirement in admission.string_requirements.iter().copied() {
         let value = builder.ins().load(
             types::I64,
@@ -15986,6 +18081,7 @@ fn emit_optimizing_entry_admission(
         && admission.fixed_value_allocations == 0
         && admission.fixed_array_entries == 0
         && admission.fixed_string_bytes == 0
+        && admission.exception_requirements.is_empty()
         && admission
             .string_requirements
             .iter()
@@ -16025,6 +18121,43 @@ fn emit_optimizing_entry_admission(
             )
         })?,
     );
+    for requirement in admission.exception_requirements.iter().copied() {
+        let prepared = lower_optimizing_prepared_exception_pointer(
+            builder,
+            function,
+            requirement.continuation_id,
+            deopt_out,
+        );
+        let fixed_values = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            prepared,
+            std::mem::offset_of!(crate::JitNativePreparedExceptionView, fixed_value_slots) as i32,
+        );
+        let fixed_values = builder.ins().uextend(types::I64, fixed_values);
+        required_values = builder.ins().iadd(required_values, fixed_values);
+        let fixed_entries = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            prepared,
+            std::mem::offset_of!(crate::JitNativePreparedExceptionView, fixed_array_entries) as i32,
+        );
+        let fixed_entries = builder.ins().uextend(types::I64, fixed_entries);
+        required_entries = builder.ins().iadd(required_entries, fixed_entries);
+        if requirement.include_function_frame {
+            let view = lower_active_runtime_view(builder, deopt_out);
+            let argument_count = builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                view,
+                std::mem::offset_of!(crate::JitNativeRuntimeView, active_call_argument_count)
+                    as i32,
+            );
+            let argument_count = builder.ins().uextend(types::I64, argument_count);
+            let argument_capacity = lower_optimizing_direct_array_capacity(builder, argument_count);
+            required_entries = builder.ins().iadd(required_entries, argument_capacity);
+        }
+    }
     let mut admitted_array_lengths = BTreeMap::new();
     for (source, requirement) in &admission.array_requirements {
         let inspect = builder.create_block();
@@ -16635,6 +18768,7 @@ fn emit_optimizing_entry_admission(
     let requires_resource_budget = fixed_value_allocations != 0
         || admission.fixed_array_entries != 0
         || admission.fixed_string_bytes != 0
+        || !admission.exception_requirements.is_empty()
         || admission
             .string_requirements
             .iter()
@@ -16677,6 +18811,7 @@ fn emit_optimizing_entry_admission(
         crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY as i64,
     );
     let requires_array_entries = admission.fixed_array_entries != 0
+        || !admission.exception_requirements.is_empty()
         || admission.array_requirements.values().any(|requirement| {
             requirement.projection_allocations != 0
                 || requirement.spread_allocations != 0
@@ -16704,6 +18839,7 @@ fn emit_optimizing_entry_admission(
         builder.ins().iconst(types::I8, 1)
     };
     let requires_string_bytes = admission.fixed_string_bytes != 0
+        || !admission.exception_requirements.is_empty()
         || admission
             .string_requirements
             .iter()
@@ -16773,13 +18909,17 @@ fn define_region_graph_function(
     preflight_only: bool,
 ) -> Result<DefinedRegionFunction, CraneliftLoweringError> {
     let pointer_type = module.target_config().pointer_type();
-    let optimizing_admission = optimizing_admission_for_region(
-        region,
-        constants,
-        value_flow,
-        function_params,
-        external_function_signatures,
-    )?;
+    let optimizing_admission = if region.compile_metadata.tier == NativeCompilerTier::Optimizing {
+        optimizing_admission_for_region(
+            region,
+            constants,
+            value_flow,
+            function_params,
+            external_function_signatures,
+        )?
+    } else {
+        NativeOptimizingAdmission::default()
+    };
     let mut maximum_temporary_cache_entries = 0_usize;
     let mut production_lowering = Vec::new();
     ctx.func.signature = if fragment.is_some() && !inline_fragment_entry {
@@ -18055,6 +20195,10 @@ fn define_region_graph_function(
                                     .fixed_builtin_call_is_total(instruction.continuation_id),
                             optimizing_admission
                                 .array_instruction_is_total(instruction.continuation_id),
+                            optimizing_admission
+                                .binary_instruction_is_total(instruction.continuation_id),
+                            optimizing_admission
+                                .scalar_control_instruction_is_total(instruction.continuation_id),
                             optimizing_admission
                                 .array_instruction_is_fresh(instruction.continuation_id),
                             optimizing_admission.local_load_is_total(instruction.continuation_id),

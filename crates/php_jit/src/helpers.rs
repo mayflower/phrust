@@ -6,7 +6,7 @@ pub use php_runtime::api::JitHelperId;
 
 /// Stable ABI fingerprint for the helper-symbol registry. Bumped whenever the
 /// registry's symbol set or any helper ABI changes.
-pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4820_0000_0076;
+pub const JIT_HELPER_REGISTRY_ABI_HASH: u64 = 0x08c1_4820_0000_0077;
 
 /// Helper argument kind.
 #[repr(u32)]
@@ -1968,48 +1968,12 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
     },
     JitHelperSymbol {
         id: JitHelperId(214),
-        name: "phrust_native_add",
+        name: "phrust_native_array_union",
         args: NATIVE_OP_2_ARGS,
         returns: JitHelperReturnKind::ControlResult,
         can_throw: true,
         has_side_effects: true,
-        description: "exact authoritative native addition",
-    },
-    JitHelperSymbol {
-        id: JitHelperId(215),
-        name: "phrust_native_subtract",
-        args: NATIVE_OP_2_ARGS,
-        returns: JitHelperReturnKind::ControlResult,
-        can_throw: true,
-        has_side_effects: true,
-        description: "exact authoritative native subtraction",
-    },
-    JitHelperSymbol {
-        id: JitHelperId(216),
-        name: "phrust_native_multiply",
-        args: NATIVE_OP_2_ARGS,
-        returns: JitHelperReturnKind::ControlResult,
-        can_throw: true,
-        has_side_effects: true,
-        description: "exact authoritative native multiplication",
-    },
-    JitHelperSymbol {
-        id: JitHelperId(217),
-        name: "phrust_native_divide",
-        args: NATIVE_OP_2_ARGS,
-        returns: JitHelperReturnKind::ControlResult,
-        can_throw: true,
-        has_side_effects: true,
-        description: "exact authoritative native division",
-    },
-    JitHelperSymbol {
-        id: JitHelperId(218),
-        name: "phrust_native_modulo",
-        args: NATIVE_OP_2_ARGS,
-        returns: JitHelperReturnKind::ControlResult,
-        can_throw: true,
-        has_side_effects: true,
-        description: "exact authoritative native modulo",
+        description: "total publication-admitted authoritative array union",
     },
     JitHelperSymbol {
         id: JitHelperId(219),
@@ -2019,15 +1983,6 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         can_throw: true,
         has_side_effects: true,
         description: "exact authoritative native concatenation",
-    },
-    JitHelperSymbol {
-        id: JitHelperId(220),
-        name: "phrust_native_power",
-        args: NATIVE_OP_2_ARGS,
-        returns: JitHelperReturnKind::ControlResult,
-        can_throw: true,
-        has_side_effects: true,
-        description: "exact authoritative native exponentiation",
     },
     JitHelperSymbol {
         id: JitHelperId(221),
@@ -2055,24 +2010,6 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
         can_throw: true,
         has_side_effects: true,
         description: "exact authoritative native bitwise xor",
-    },
-    JitHelperSymbol {
-        id: JitHelperId(224),
-        name: "phrust_native_shift_left",
-        args: NATIVE_OP_2_ARGS,
-        returns: JitHelperReturnKind::ControlResult,
-        can_throw: true,
-        has_side_effects: true,
-        description: "exact authoritative native left shift",
-    },
-    JitHelperSymbol {
-        id: JitHelperId(225),
-        name: "phrust_native_shift_right",
-        args: NATIVE_OP_2_ARGS,
-        returns: JitHelperReturnKind::ControlResult,
-        can_throw: true,
-        has_side_effects: true,
-        description: "exact authoritative native right shift",
     },
     JitHelperSymbol {
         id: JitHelperId(226),
@@ -2430,7 +2367,6 @@ pub const JIT_HELPER_SYMBOLS: &[JitHelperSymbol] = &[
     exact_control_helper!(291, "phrust_native_dechex"),
     exact_control_helper!(292, "phrust_native_decoct"),
     exact_unary_f64_helper!(293, "phrust_native_deg2rad_f64"),
-    exact_control_helper!(294, "phrust_native_dynamic_instanceof"),
     exact_void_helper!(295, "phrust_native_echo_bytes"),
     exact_unary_f64_helper!(296, "phrust_native_exp_f64"),
     exact_unary_f64_helper!(297, "phrust_native_expm1_f64"),
@@ -2971,18 +2907,11 @@ pub fn resolve_helper_address(
         "phrust_native_unary_minus" => Some(runtime.native_exact_unary[1]),
         "phrust_native_bit_not" => Some(runtime.native_exact_unary[2]),
         "phrust_baseline_native_binary" => Some(runtime.baseline_binary),
-        "phrust_native_add" => Some(runtime.native_binary[0]),
-        "phrust_native_subtract" => Some(runtime.native_binary[1]),
-        "phrust_native_multiply" => Some(runtime.native_binary[2]),
-        "phrust_native_divide" => Some(runtime.native_binary[3]),
-        "phrust_native_modulo" => Some(runtime.native_binary[4]),
-        "phrust_native_concat" => Some(runtime.native_binary[5]),
-        "phrust_native_power" => Some(runtime.native_binary[6]),
-        "phrust_native_bit_and" => Some(runtime.native_binary[7]),
-        "phrust_native_bit_or" => Some(runtime.native_binary[8]),
-        "phrust_native_bit_xor" => Some(runtime.native_binary[9]),
-        "phrust_native_shift_left" => Some(runtime.native_binary[10]),
-        "phrust_native_shift_right" => Some(runtime.native_binary[11]),
+        "phrust_native_array_union" => Some(runtime.native_array_union),
+        "phrust_native_concat" => Some(runtime.native_concat),
+        "phrust_native_bit_and" => Some(runtime.native_string_bitwise[0]),
+        "phrust_native_bit_or" => Some(runtime.native_string_bitwise[1]),
+        "phrust_native_bit_xor" => Some(runtime.native_string_bitwise[2]),
         "phrust_native_equal" => Some(runtime.native_exact_compare[0]),
         "phrust_native_not_equal" => Some(runtime.native_exact_compare[1]),
         "phrust_native_identical" => Some(runtime.native_exact_compare[2]),
@@ -3056,7 +2985,6 @@ pub fn resolve_helper_address(
             Some(runtime.native_register_shutdown_function)
         }
         "phrust_native_resolve_callable" => Some(runtime.native_resolve_callable),
-        "phrust_native_dynamic_instanceof" => Some(runtime.native_dynamic_instanceof),
         "phrust_native_prepared_object_new" => Some(runtime.native_prepared_object_new),
         "phrust_native_prepared_closure_new" => Some(runtime.native_prepared_closure_new),
         "phrust_native_plain_object_clone" => Some(runtime.native_plain_object_clone),
@@ -3204,7 +3132,6 @@ mod tests {
             native_object_class_name: 500,
             native_acquire_callable: 501,
             native_resolve_callable: 502,
-            native_dynamic_instanceof: 503,
             native_prepared_object_new: 504,
             native_prepared_closure_new: 505,
             native_plain_object_clone: 506,
@@ -3234,7 +3161,6 @@ mod tests {
         assert_eq!(resolved("phrust_native_acquire_callable"), 501);
         assert_eq!(resolved("phrust_native_is_callable"), 507);
         assert_eq!(resolved("phrust_native_resolve_callable"), 502);
-        assert_eq!(resolved("phrust_native_dynamic_instanceof"), 503);
         assert_eq!(resolved("phrust_native_prepared_object_new"), 504);
         assert_eq!(resolved("phrust_native_prepared_closure_new"), 505);
         assert_eq!(resolved("phrust_native_plain_object_clone"), 506);
