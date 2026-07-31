@@ -4,8 +4,9 @@ fn lower_optimizing_terminator_reference_local(
     builder: &mut FunctionBuilder<'_>,
     local: ir::Value,
     deopt_out: ir::Value,
+    proof: NativeReferencePayloadProof,
 ) -> ir::Value {
-    lower_optimizing_admitted_reference_scalar(builder, local, deopt_out)
+    lower_optimizing_admitted_reference_scalar(builder, local, deopt_out, proof)
 }
 
 fn lower_terminator_storage_value(
@@ -192,12 +193,18 @@ fn lower_optimizing_condition(
     constants: &[IrConstant],
     value_flow: &ExecutableValueFlow,
     deopt_out: ir::Value,
+    reference_payload_proof: NativeReferencePayloadProof,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     let value = lower_region_operand(builder, locals, registers, condition)?;
     let value = if let RegionOperand::Local(local) = condition
         && value_flow.local_storage(local).is_reference_slot()
     {
-        lower_optimizing_terminator_reference_local(builder, value, deopt_out)
+        lower_optimizing_terminator_reference_local(
+            builder,
+            value,
+            deopt_out,
+            reference_payload_proof,
+        )
     } else {
         value
     };
@@ -673,13 +680,21 @@ pub(super) fn lower_optimizing_region_terminator(
     value_release_commit: ir::FuncRef,
     return_plan: Option<NativeOptimizingReturnPlan>,
     return_reference_prebound: bool,
+    reference_payload_proof: NativeReferencePayloadProof,
     terminator: &RegionTerminator,
     constants: &[IrConstant],
     value_flow: &ExecutableValueFlow,
 ) -> Result<EmittedOptimizingInstruction, CraneliftLoweringError> {
     let direct_condition = |builder: &mut FunctionBuilder<'_>, condition: RegionOperand| {
         lower_optimizing_condition(
-            builder, condition, locals, registers, constants, value_flow, deopt_out,
+            builder,
+            condition,
+            locals,
+            registers,
+            constants,
+            value_flow,
+            deopt_out,
+            reference_payload_proof,
         )
     };
     let frame_cleanup_locals = locals
@@ -752,7 +767,12 @@ pub(super) fn lower_optimizing_region_terminator(
             };
             let value = lower_region_operand(builder, locals, registers, operand)?;
             let value = if reference_local {
-                lower_optimizing_terminator_reference_local(builder, value, deopt_out)
+                lower_optimizing_terminator_reference_local(
+                    builder,
+                    value,
+                    deopt_out,
+                    reference_payload_proof,
+                )
             } else {
                 value
             };
@@ -802,8 +822,12 @@ pub(super) fn lower_optimizing_region_terminator(
             let current = use_local_variable(builder, locals, *local)?;
             let value = if return_reference_prebound {
                 if let Some(plan) = return_plan {
-                    let payload =
-                        lower_optimizing_terminator_reference_local(builder, current, deopt_out);
+                    let payload = lower_optimizing_terminator_reference_local(
+                        builder,
+                        current,
+                        deopt_out,
+                        reference_payload_proof,
+                    );
                     let replacement =
                         lower_total_optimizing_return_plan(builder, payload, plan, deopt_out);
                     lower_total_optimizing_reference_writeback(
@@ -865,7 +889,12 @@ pub(super) fn lower_optimizing_region_terminator(
                 .transpose()?
                 .unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
             let value = if reference_local {
-                let value = lower_optimizing_terminator_reference_local(builder, value, deopt_out);
+                let value = lower_optimizing_terminator_reference_local(
+                    builder,
+                    value,
+                    deopt_out,
+                    reference_payload_proof,
+                );
                 lower_optimizing_retain(builder, value, deopt_out);
                 value
             } else {

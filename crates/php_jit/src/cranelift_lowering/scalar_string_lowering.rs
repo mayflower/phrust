@@ -2146,7 +2146,12 @@ fn lower_optimizing_implode(
         entry,
         std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
     );
-    let value = lower_optimizing_admitted_reference_scalar(builder, value, transition.deopt_out);
+    let value = lower_optimizing_admitted_reference_scalar(
+        builder,
+        value,
+        transition.deopt_out,
+        transition.reference_payload_proof,
+    );
     let (_, value_length, _) =
         lower_native_string_key_descriptor(builder, value, transition.deopt_out);
     let first = builder.ins().icmp_imm(IntCC::Equal, index, 0);
@@ -2271,7 +2276,12 @@ fn lower_optimizing_implode(
         entry,
         std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
     );
-    let value = lower_optimizing_admitted_reference_scalar(builder, value, transition.deopt_out);
+    let value = lower_optimizing_admitted_reference_scalar(
+        builder,
+        value,
+        transition.deopt_out,
+        transition.reference_payload_proof,
+    );
     let (_, value_length, value_bytes) =
         lower_native_string_key_descriptor(builder, value, transition.deopt_out);
     builder.ins().jump(

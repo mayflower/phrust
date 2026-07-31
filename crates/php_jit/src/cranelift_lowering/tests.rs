@@ -10934,6 +10934,171 @@ fn optimizing_reference_array_load_retains_authoritative_direct_owner_without_he
 }
 
 #[test]
+fn optimizing_array_argument_rejects_incomplete_reference_payload_before_entry() {
+    let mut builder = IrBuilder::new(UnitId::new(4_271));
+    let file = builder.add_file("optimizing-array-reference-publication.php");
+    let span = IrSpan::new(file, 0, 1);
+    let function = builder.start_function(
+        "optimizing_array_reference_publication",
+        FunctionFlags::default(),
+        span,
+    );
+    let array = typed_array_param(&mut builder, function, "array");
+    let block = builder.append_block(function);
+    let zero = builder.intern_constant(IrConstant::Int(0));
+    let fetched = builder.alloc_register(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::FetchDim {
+            dst: fetched,
+            array: Operand::Local(array),
+            key: Operand::Constant(zero),
+            quiet: false,
+            mode: php_ir::instruction::DimFetchMode::Read,
+        },
+        span,
+    );
+    builder.terminate_return(function, block, Some(Operand::Register(fetched)), span);
+    let unit = builder.finish();
+
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.optimizing.array-reference-publication")
+            .with_opt_level(2),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_array_fetch: forbidden_cached_array_fetch as *const () as usize,
+            native_value_release: forbidden_release as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("array reference publication handle");
+    assert_optimizing_artifact(&handle);
+
+    let reference = crate::jit_encode_typed_runtime_value(
+        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 1,
+        crate::JIT_VALUE_RUNTIME_REFERENCE_TAG,
+    );
+    let mut entries = [crate::JitNativeDirectArrayEntry {
+        key: 0,
+        value: reference,
+    }];
+    let mut direct_slots = [
+        crate::JitNativeValueSlot {
+            refcount: 1,
+            kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY,
+            flags: crate::jit_native_direct_array_flags(None),
+            reserved: 1,
+            payload: 1,
+            aux: entries.as_mut_ptr() as usize as u64,
+        },
+        crate::JitNativeValueSlot {
+            refcount: 1,
+            kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR,
+            flags: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION,
+            reserved: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED,
+            payload: 0,
+            aux: 0,
+        },
+        crate::JitNativeValueSlot {
+            refcount: 1,
+            kind: crate::JIT_NATIVE_VALUE_VIEW_MATERIALIZED_GENERATOR,
+            flags: crate::JIT_NATIVE_DIRECT_GENERATOR_ABI_VERSION,
+            ..crate::JitNativeValueSlot::default()
+        },
+    ];
+    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
+        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
+        direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
+        ..crate::JitNativeRuntimeView::default()
+    });
+    let array = crate::jit_encode_typed_runtime_value(
+        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
+        crate::JIT_VALUE_RUNTIME_ARRAY_TAG,
+    );
+
+    let rejected = handle
+        .invoke_i64_with_deopt(&[array], JIT_RUNTIME_ABI_HASH)
+        .expect("incomplete reference payload must leave before optimizer entry");
+    let crate::JitI64InvokeOutcome::SideExit { status, .. } = rejected else {
+        panic!("incomplete array reference payload entered optimizing execution");
+    };
+    assert_eq!(status, crate::JitCallStatus::ABI_MISMATCH.0 as i32);
+
+    for invalid_payload in [
+        crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED),
+        reference,
+        crate::jit_encode_typed_runtime_value(
+            crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 2,
+            crate::JIT_VALUE_RUNTIME_GENERATOR_TAG,
+        ),
+    ] {
+        direct_slots[1].payload = invalid_payload as u64;
+        let rejected = handle
+            .invoke_i64_with_deopt(&[array], JIT_RUNTIME_ABI_HASH)
+            .expect("unsupported reference payload must leave before optimizer entry");
+        assert!(
+            matches!(
+                rejected,
+                crate::JitI64InvokeOutcome::SideExit { status, .. }
+                    if status == crate::JitCallStatus::ABI_MISMATCH.0 as i32
+            ),
+            "unsupported payload {invalid_payload:#x} entered optimizing execution"
+        );
+    }
+
+    direct_slots[1].payload = 73;
+    direct_slots[1].refcount = 0;
+    let dead = handle
+        .invoke_i64_with_deopt(&[array], JIT_RUNTIME_ABI_HASH)
+        .expect("dead reference must leave before optimizer entry");
+    assert!(matches!(
+        dead,
+        crate::JitI64InvokeOutcome::SideExit { status, .. }
+            if status == crate::JitCallStatus::ABI_MISMATCH.0 as i32
+    ));
+
+    direct_slots[1].refcount = 1;
+    direct_slots[1].kind = crate::JIT_NATIVE_VALUE_VIEW_DIRECT_INT;
+    let incompatible = handle
+        .invoke_i64_with_deopt(&[array], JIT_RUNTIME_ABI_HASH)
+        .expect("tag-incompatible reference must leave before optimizer entry");
+    assert!(matches!(
+        incompatible,
+        crate::JitI64InvokeOutcome::SideExit { status, .. }
+            if status == crate::JitCallStatus::ABI_MISMATCH.0 as i32
+    ));
+
+    direct_slots[1] = crate::JitNativeValueSlot {
+        refcount: 1,
+        kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR,
+        flags: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION,
+        reserved: crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED,
+        payload: 73,
+        aux: 0,
+    };
+    std::hint::black_box(&direct_slots);
+    assert_eq!(
+        handle
+            .invoke_i64(&[array], JIT_RUNTIME_ABI_HASH)
+            .expect("published array reference payload"),
+        73
+    );
+
+    entries[0].value = 0;
+    std::hint::black_box(&entries);
+    assert_eq!(
+        handle
+            .invoke_i64(&[array], JIT_RUNTIME_ABI_HASH)
+            .expect("ordinary integer zero array entry"),
+        0
+    );
+}
+
+#[test]
 fn optimizing_owned_handle_moves_into_plain_local_without_refcount_pair() {
     SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
     let mut builder = IrBuilder::new(UnitId::new(4_207));

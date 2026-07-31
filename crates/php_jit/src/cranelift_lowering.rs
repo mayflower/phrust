@@ -1889,7 +1889,7 @@ fn lower_baseline_bind_packed_arguments(
             .load(types::I64, MemFlagsData::new(), arguments, offset);
         let parameter_ready = builder.create_block();
         if parameter.by_ref {
-            let payload = lower_optimizing_admitted_reference_scalar(builder, original, deopt_out);
+            let payload = lower_direct_reference_payload_unchecked(builder, original, deopt_out);
             if let Some(native_match) = lower_optimizing_type_guard(
                 builder,
                 payload,
@@ -3781,7 +3781,14 @@ struct NativeOptimizingTransition<'a> {
     live_values: &'a [(RegId, ir::Value)],
     native_version: u32,
     value_release_commit: ir::FuncRef,
+    reference_payload_proof: NativeReferencePayloadProof,
 }
+
+/// Compile-time witness that every value capable of carrying a direct
+/// reference into this optimizing region passed the total native publication
+/// admission. The constructor remains private to the admission module.
+#[derive(Clone, Copy)]
+struct NativeReferencePayloadProof(());
 
 impl NativeOptimizingTransition<'_> {
     fn emit_exact_throw(
@@ -5641,25 +5648,6 @@ fn lower_optimizing_retain_if(
     builder.switch_to_block(done);
 }
 
-/// Tests the one representation invariant required by compiled-to-compiled
-/// calls: an operand is immediate/unit-local or indexes the authoritative
-/// direct arena. Old request-value handles are rejected before the callee
-/// observes any binding effect.
-fn lower_optimizing_call_value_is_authoritative(
-    builder: &mut FunctionBuilder<'_>,
-    value: ir::Value,
-) -> ir::Value {
-    let runtime = lower_is_runtime_handle(builder, value);
-    let immediate = builder.ins().icmp_imm(IntCC::Equal, runtime, 0);
-    let index = builder.ins().ireduce(types::I32, value);
-    let direct = builder.ins().icmp_imm(
-        IntCC::UnsignedGreaterThanOrEqual,
-        index,
-        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
-    );
-    builder.ins().bor(immediate, direct)
-}
-
 /// Release an owner that was retained immediately before a compiled call.
 /// The source SSA/local owner remains live, so every runtime handle is known
 /// to be shared and this post-call cleanup cannot require a cold last-owner
@@ -5798,11 +5786,10 @@ fn lower_optimizing_admit_variadic_unpack_tail(
     Ok(())
 }
 
-/// Dereference a value whose direct-reference representation was admitted by
-/// `lower_optimizing_admit_variadic_unpack_tail`. PHP execution is
-/// single-threaded across this call boundary, so the representation cannot
-/// change between the admission and copy passes.
-fn lower_optimizing_admitted_reference_scalar(
+/// Shared direct CLIF used by baseline argument binding and by the witnessed
+/// optimizing wrapper below. Optimizing consumers cannot call it indirectly:
+/// they must carry `NativeReferencePayloadProof` through the wrapper.
+fn lower_direct_reference_payload_unchecked(
     builder: &mut FunctionBuilder<'_>,
     value: ir::Value,
     deopt_out: ir::Value,
@@ -5829,6 +5816,15 @@ fn lower_optimizing_admitted_reference_scalar(
 
     builder.switch_to_block(merge);
     builder.block_params(merge)[0]
+}
+
+fn lower_optimizing_admitted_reference_scalar(
+    builder: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    deopt_out: ir::Value,
+    _proof: NativeReferencePayloadProof,
+) -> ir::Value {
+    lower_direct_reference_payload_unchecked(builder, value, deopt_out)
 }
 
 // architecture: direct CLIF variadic-array constructor boundary
@@ -5910,7 +5906,12 @@ fn lower_optimizing_pack_variadic_unpack_arguments(
     let value = if source_by_reference {
         value
     } else {
-        lower_optimizing_admitted_reference_scalar(builder, value, transition.deopt_out)
+        lower_optimizing_admitted_reference_scalar(
+            builder,
+            value,
+            transition.deopt_out,
+            transition.reference_payload_proof,
+        )
     };
     lower_optimizing_retain(builder, value, transition.deopt_out);
     let output_index = builder.ins().iadd(prefix_count, index);
@@ -7151,8 +7152,12 @@ fn lower_optimizing_reference_scalar(
     // native re-entry. Rechecking kind, ABI version, and publication state on
     // every read recreated a warm validation/fallback path in virtually every
     // optimizing consumer.
-    let value =
-        lower_optimizing_admitted_reference_scalar(builder, reference, transition.deopt_out);
+    let value = lower_optimizing_admitted_reference_scalar(
+        builder,
+        reference,
+        transition.deopt_out,
+        transition.reference_payload_proof,
+    );
     if retain_value {
         lower_optimizing_retain(builder, value, transition.deopt_out);
     }
@@ -7179,7 +7184,12 @@ fn lower_optimizing_dereference_owned_value(
     builder.ins().brif(reference, dereference, &[], plain, &[]);
 
     builder.switch_to_block(dereference);
-    let payload = lower_optimizing_admitted_reference_scalar(builder, owned, transition.deopt_out);
+    let payload = lower_optimizing_admitted_reference_scalar(
+        builder,
+        owned,
+        transition.deopt_out,
+        transition.reference_payload_proof,
+    );
     lower_optimizing_retain(builder, payload, transition.deopt_out);
     lower_optimizing_release_call_owner(builder, owned, transition.deopt_out);
     builder.ins().jump(merge, &[payload.into()]);
@@ -7438,8 +7448,12 @@ fn lower_optimizing_total_request_reference_store(
     let slot = lower_optimizing_slot_address(builder, current, transition.deopt_out);
     let replacement_reference =
         lower_value_has_tag(builder, replacement, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
-    let replacement =
-        lower_optimizing_admitted_reference_scalar(builder, replacement, transition.deopt_out);
+    let replacement = lower_optimizing_admitted_reference_scalar(
+        builder,
+        replacement,
+        transition.deopt_out,
+        transition.reference_payload_proof,
+    );
     let previous = builder.ins().load(
         types::I64,
         MemFlagsData::new(),
@@ -13611,8 +13625,9 @@ fn lower_optimizing_direct_array_candidate(
     builder: &mut FunctionBuilder<'_>,
     value: ir::Value,
     deopt_out: ir::Value,
+    proof: NativeReferencePayloadProof,
 ) -> (ir::Value, ir::Value) {
-    let payload = lower_optimizing_admitted_reference_scalar(builder, value, deopt_out);
+    let payload = lower_optimizing_admitted_reference_scalar(builder, value, deopt_out, proof);
     let array_tag = lower_value_has_tag(builder, payload, crate::JIT_VALUE_RUNTIME_ARRAY_TAG);
     let index = builder.ins().ireduce(types::I32, payload);
     let direct_index = builder.ins().icmp_imm(
@@ -13903,7 +13918,12 @@ fn lower_optimizing_array_walk_recursive_callback(
         entry,
         std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
     );
-    let (child, child_value) = lower_optimizing_direct_array_candidate(builder, value, deopt_out);
+    let (child, child_value) = lower_optimizing_direct_array_candidate(
+        builder,
+        value,
+        deopt_out,
+        transition.reference_payload_proof,
+    );
     builder.ins().brif(
         child,
         inspect_child,
@@ -14185,7 +14205,12 @@ fn lower_optimizing_array_walk_recursive_callback(
         entry,
         std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
     );
-    let (child, child_value) = lower_optimizing_direct_array_candidate(builder, value, deopt_out);
+    let (child, child_value) = lower_optimizing_direct_array_candidate(
+        builder,
+        value,
+        deopt_out,
+        transition.reference_payload_proof,
+    );
     builder.ins().brif(
         child,
         transform_child,
@@ -14322,7 +14347,12 @@ fn lower_optimizing_array_walk_recursive_callback(
         entry,
         std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
     );
-    let (child, child_value) = lower_optimizing_direct_array_candidate(builder, value, deopt_out);
+    let (child, child_value) = lower_optimizing_direct_array_candidate(
+        builder,
+        value,
+        deopt_out,
+        transition.reference_payload_proof,
+    );
     builder.ins().brif(
         child,
         walk_child,
@@ -20294,7 +20324,12 @@ fn lower_optimizing_pack_dynamic_unpack_arguments(
         source,
         std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
     );
-    let value = lower_optimizing_admitted_reference_scalar(builder, value, transition.deopt_out);
+    let value = lower_optimizing_admitted_reference_scalar(
+        builder,
+        value,
+        transition.deopt_out,
+        transition.reference_payload_proof,
+    );
     lower_optimizing_retain(builder, value, transition.deopt_out);
     let packed_index = builder.ins().iadd(prepared.hidden_argument_count, index);
     let byte_offset = builder.ins().ishl_imm(packed_index, 3);
@@ -20585,6 +20620,7 @@ fn lower_optimizing_region_instruction(
     total_native_local_load: bool,
     total_request_local_store: bool,
     total_return_reference_store: bool,
+    reference_payload_proof: NativeReferencePayloadProof,
     constants: &[IrConstant],
     value_flow: &ExecutableValueFlow,
     inline_constants: &BTreeMap<FunctionId, BoundedInlineValue>,
@@ -20629,6 +20665,7 @@ fn lower_optimizing_region_instruction(
         live_values: &transition_live_values,
         native_version,
         value_release_commit,
+        reference_payload_proof,
     };
     // Integer array keys use the encoded native value domain just like array
     // values. Keep every optimizing key producer on the same publication
@@ -22233,6 +22270,7 @@ fn lower_optimizing_region_instruction(
                     builder,
                     root_owner,
                     transition.deopt_out,
+                    transition.reference_payload_proof,
                 )
             } else {
                 root_owner
@@ -22294,6 +22332,7 @@ fn lower_optimizing_region_instruction(
                     builder,
                     root_owner,
                     transition.deopt_out,
+                    transition.reference_payload_proof,
                 )
             } else {
                 root_owner

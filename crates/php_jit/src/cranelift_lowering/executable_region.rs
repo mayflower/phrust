@@ -16,6 +16,7 @@ struct NativeEntryArrayRequirement {
     value_allocations_per_entry: usize,
     require_supported_keys: bool,
     require_plain_values: bool,
+    require_total_values: bool,
     require_key_values: bool,
     require_string_values: bool,
     require_scalar_values: bool,
@@ -346,7 +347,7 @@ struct NativeOptimizingAdmission {
     initialized_globals: BTreeSet<u32>,
     releasable_globals: BTreeSet<u32>,
     plain_globals: BTreeSet<u32>,
-    reference_source_parameters: BTreeSet<usize>,
+    total_value_parameters: BTreeSet<usize>,
     by_ref_array_parameters: BTreeSet<usize>,
     by_ref_array_instructions: BTreeSet<u32>,
     property_requirements: Vec<NativeEntryPropertyRequirement>,
@@ -370,9 +371,15 @@ struct NativeOptimizingAdmission {
     fixed_string_bytes: usize,
     fixed_lvalue_insertions: usize,
     require_non_fiber_scope: bool,
+    reference_payloads_are_total: bool,
 }
 
 impl NativeOptimizingAdmission {
+    fn reference_payload_proof(&self) -> Option<NativeReferencePayloadProof> {
+        self.reference_payloads_are_total
+            .then_some(NativeReferencePayloadProof(()))
+    }
+
     fn array_call_is_total(&self, continuation_id: u32) -> bool {
         self.total_array_calls.contains(&continuation_id)
     }
@@ -1179,6 +1186,7 @@ fn optimizing_admission_for_region(
     // made immediate-only regions depend on allocator state and concealed
     // missing family plans behind an arbitrary warm-path budget.
     let mut admission = NativeOptimizingAdmission::default();
+    admission.total_value_parameters = (0..region.parameter_locals.len()).collect();
     let parameter_indices = region
         .parameter_locals
         .iter()
@@ -1709,32 +1717,6 @@ fn optimizing_admission_for_region(
                 );
         }
     }
-    admission.reference_source_parameters = region
-        .blocks
-        .iter()
-        .flat_map(|block| &block.instructions)
-        .filter_map(|instruction| match &instruction.kind {
-            RegionInstructionKind::BindReference { source, .. }
-            | RegionInstructionKind::BindReferenceIntoDim { source, .. }
-            | RegionInstructionKind::BindReferenceProperty { source, .. }
-            | RegionInstructionKind::BindReferenceIntoPropertyDim { source, .. } => {
-                parameter_indices.get(source).copied()
-            }
-            RegionInstructionKind::NativeCall(RegionNativeCall {
-                target:
-                    RegionCallTarget::Semantic {
-                        operation:
-                            RegionSemanticOp::StaticPropertyReference {
-                                target,
-                                bind_source_into_property: true,
-                                ..
-                            },
-                    },
-                ..
-            }) => parameter_indices.get(target).copied(),
-            _ => None,
-        })
-        .collect();
     admission.total_reference_locals = region
         .blocks
         .iter()
@@ -8811,6 +8793,10 @@ fn optimizing_admission_for_region(
         )
         .map(NativeEntryArrayMutationRequirement::additional_entries)
         .sum();
+    for requirement in admission.array_requirements.values_mut() {
+        requirement.require_total_values = true;
+    }
+    admission.reference_payloads_are_total = true;
     Ok(admission)
 }
 
@@ -17674,13 +17660,15 @@ fn lower_entry_array_source(
                 continuation_id,
                 deopt_out,
             );
+            emit_optimizing_entry_total_native_value(builder, reference, deopt_out, rejected);
             let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
-            Ok(builder.ins().load(
+            let value = builder.ins().load(
                 types::I64,
                 MemFlagsData::new(),
                 slot,
                 std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
-            ))
+            );
+            Ok(value)
         }
     }
 }
@@ -17821,6 +17809,7 @@ fn emit_optimizing_entry_array_probe_paths(
             let found_block = builder.create_block();
             builder.ins().brif(found, found_block, &[], path_done, &[]);
             builder.switch_to_block(found_block);
+            emit_optimizing_entry_total_native_value(builder, value, deopt_out, rejected);
             if index + 1 < path.keys.len() {
                 let (_, child_length, child_entries) =
                     emit_optimizing_entry_direct_array_descriptor(
@@ -17830,16 +17819,11 @@ fn emit_optimizing_entry_array_probe_paths(
                 entries = child_entries;
             } else {
                 if path.leaf == NativeEntryArrayProbeLeaf::PlainValue {
-                    let authoritative =
-                        lower_optimizing_call_value_is_authoritative(builder, value);
                     let reference =
                         lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
                     let plain = builder.ins().icmp_imm(IntCC::Equal, reference, 0);
-                    let admitted = builder.ins().band(authoritative, plain);
                     let value_ready = builder.create_block();
-                    builder
-                        .ins()
-                        .brif(admitted, value_ready, &[], rejected, &[]);
+                    builder.ins().brif(plain, value_ready, &[], rejected, &[]);
                     builder.switch_to_block(value_ready);
                 }
                 builder.ins().jump(path_done, &[]);
@@ -18152,10 +18136,10 @@ fn emit_optimizing_entry_property_slot(
         property_slot,
         std::mem::offset_of!(php_runtime::api::NativeDeclaredPropertySlot, value) as i32,
     );
+    emit_optimizing_entry_total_native_value(builder, value, deopt_out, rejected);
     let initialized = builder.ins().icmp_imm(IntCC::NotEqual, initialized, 0);
     let reference = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
     let plain = builder.ins().icmp_imm(IntCC::Equal, reference, 0);
-    let authoritative = lower_optimizing_call_value_is_authoritative(builder, value);
     let reference_shape = if requirement.require_reference {
         reference
     } else if requirement.allow_reference {
@@ -18163,7 +18147,7 @@ fn emit_optimizing_entry_property_slot(
     } else {
         plain
     };
-    let mut value_ok = builder.ins().band(reference_shape, authoritative);
+    let mut value_ok = reference_shape;
     if requirement.readable {
         let uninitialized = builder.ins().icmp_imm(
             IntCC::Equal,
@@ -18349,7 +18333,7 @@ fn emit_optimizing_entry_static_property(
         slot,
         std::mem::offset_of!(crate::JitNativeStaticPropertySlot, value) as i32,
     );
-    let authoritative = lower_optimizing_call_value_is_authoritative(builder, value);
+    emit_optimizing_entry_total_native_value(builder, value, deopt_out, rejected);
     let reference = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
     let plain = builder.ins().icmp_imm(IntCC::Equal, reference, 0);
     let reference_shape = if requirement.require_reference {
@@ -18359,7 +18343,7 @@ fn emit_optimizing_entry_static_property(
     } else {
         plain
     };
-    let mut admitted = builder.ins().band(authoritative, reference_shape);
+    let mut admitted = reference_shape;
     if requirement.readable {
         admitted = builder.ins().band(admitted, initialized);
     }
@@ -19001,16 +18985,285 @@ fn emit_optimizing_entry_callable(
     let capture = builder
         .ins()
         .load(types::I64, MemFlagsData::new(), capture_pointer, 0);
-    let authoritative = lower_optimizing_call_value_is_authoritative(builder, capture);
-    let next_capture = builder.create_block();
-    builder
-        .ins()
-        .brif(authoritative, next_capture, &[], rejected, &[]);
-    builder.switch_to_block(next_capture);
+    emit_optimizing_entry_total_native_value(builder, capture, deopt_out, rejected);
     let capture_index = builder.ins().iadd_imm(capture_index, 1);
     builder.ins().jump(scan, &[capture_index.into()]);
     builder.switch_to_block(captures_accepted);
     Ok(())
+}
+
+/// Proves that `value` and every direct-reference payload reachable from it
+/// are complete native descriptors. This guard is emitted once in the entry
+/// publication region; optimizing operations consume the resulting compile-
+/// time witness and never reconstruct a local slow path.
+fn emit_optimizing_entry_total_native_value(
+    builder: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    deopt_out: ir::Value,
+    rejected: ir::Block,
+) {
+    const MAX_REFERENCE_DEPTH: i64 = 16;
+
+    let inspect = builder.create_block();
+    builder.append_block_param(inspect, types::I64);
+    builder.append_block_param(inspect, types::I32);
+    let inspect_immediate = builder.create_block();
+    let inspect_index = builder.create_block();
+    let inspect_slot = builder.create_block();
+    let inspect_reference = builder.create_block();
+    let inspect_terminal = builder.create_block();
+    builder.append_block_param(inspect_terminal, types::I8);
+    let accepted = builder.create_block();
+
+    let zero_depth = builder.ins().iconst(types::I32, 0);
+    builder
+        .ins()
+        .jump(inspect, &[value.into(), zero_depth.into()]);
+
+    builder.switch_to_block(inspect);
+    let current = builder.block_params(inspect)[0];
+    let depth = builder.block_params(inspect)[1];
+    let exhausted = builder
+        .ins()
+        .icmp_imm(IntCC::UnsignedGreaterThan, depth, MAX_REFERENCE_DEPTH);
+    let classify = builder.create_block();
+    builder.ins().brif(exhausted, rejected, &[], classify, &[]);
+
+    builder.switch_to_block(classify);
+    let runtime = lower_is_runtime_handle(builder, current);
+    builder
+        .ins()
+        .brif(runtime, inspect_index, &[], inspect_immediate, &[]);
+
+    builder.switch_to_block(inspect_immediate);
+    let constant = lower_value_has_namespace_tag(builder, current, crate::JIT_VALUE_CONSTANT_TAG);
+    let ordinary = builder.ins().icmp_imm(IntCC::Equal, constant, 0);
+    let nonzero = builder.ins().icmp_imm(IntCC::NotEqual, current, 0);
+    let root_value = builder.ins().icmp_imm(IntCC::Equal, depth, 0);
+    let initialized_immediate = builder.ins().bor(nonzero, root_value);
+    let ordinary = builder.ins().band(ordinary, initialized_immediate);
+    let null = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, current, crate::jit_encode_constant(u32::MAX));
+    let false_value = builder.ins().icmp_imm(
+        IntCC::Equal,
+        current,
+        crate::jit_encode_constant(crate::JIT_VALUE_FALSE),
+    );
+    let true_value = builder.ins().icmp_imm(
+        IntCC::Equal,
+        current,
+        crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
+    );
+    let singleton = builder.ins().bor(null, false_value);
+    let singleton = builder.ins().bor(singleton, true_value);
+    let immediate_total = builder.ins().bor(ordinary, singleton);
+    builder
+        .ins()
+        .brif(immediate_total, accepted, &[], rejected, &[]);
+
+    builder.switch_to_block(inspect_index);
+    let index = builder.ins().ireduce(types::I32, current);
+    let at_or_above_base = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        index,
+        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+    );
+    let below_end = builder.ins().icmp_imm(
+        IntCC::UnsignedLessThan,
+        index,
+        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE)
+            + i64::try_from(crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY).unwrap_or(i64::MAX),
+    );
+    let direct = builder.ins().band(at_or_above_base, below_end);
+    builder.ins().brif(direct, inspect_slot, &[], rejected, &[]);
+
+    builder.switch_to_block(inspect_slot);
+    let slot = lower_optimizing_slot_address(builder, current, deopt_out);
+    let refcount = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, refcount) as i32,
+    );
+    let live = builder.ins().icmp_imm(IntCC::NotEqual, refcount, 0);
+    let reference = lower_value_has_tag(builder, current, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
+    let live_reference = builder.ins().band(live, reference);
+    builder.ins().brif(
+        live_reference,
+        inspect_reference,
+        &[],
+        inspect_terminal,
+        &[live.into()],
+    );
+
+    builder.switch_to_block(inspect_reference);
+    let kind = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+    );
+    let flags = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+    );
+    let reserved = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, reserved) as i32,
+    );
+    let payload = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+    );
+    let kind_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        kind,
+        i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR),
+    );
+    let abi_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        flags,
+        i64::from(crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION),
+    );
+    let state = builder.ins().band_imm(
+        reserved,
+        i64::from(!crate::JIT_NATIVE_REFERENCE_TYPED_PROPERTY_GUARD),
+    );
+    let state_ok = builder.ins().icmp_imm(
+        IntCC::Equal,
+        state,
+        i64::from(crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED),
+    );
+    let reference_total = builder.ins().band(kind_ok, abi_ok);
+    let reference_total = builder.ins().band(reference_total, state_ok);
+    let next_depth = builder.ins().iadd_imm(depth, 1);
+    builder.ins().brif(
+        reference_total,
+        inspect,
+        &[payload.into(), next_depth.into()],
+        rejected,
+        &[],
+    );
+
+    builder.switch_to_block(inspect_terminal);
+    let live = builder.block_params(inspect_terminal)[0];
+    let kind = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+    );
+    let flags = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+    );
+    let aux = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, aux) as i32,
+    );
+    let aux_ok = builder.ins().icmp_imm(IntCC::NotEqual, aux, 0);
+    let mut terminal_total = builder.ins().iconst(types::I8, 0);
+    let terminal_shapes = [
+        (
+            crate::JIT_VALUE_RUNTIME_TAG,
+            crate::JIT_NATIVE_VALUE_VIEW_DIRECT_INT,
+            Some(crate::JIT_NATIVE_DIRECT_INT_ABI_VERSION),
+            false,
+        ),
+        (
+            crate::JIT_VALUE_RUNTIME_ARRAY_TAG,
+            crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY,
+            None,
+            true,
+        ),
+        (
+            crate::JIT_VALUE_RUNTIME_OBJECT_TAG,
+            crate::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT,
+            None,
+            false,
+        ),
+        (
+            crate::JIT_VALUE_RUNTIME_STRING_TAG,
+            crate::JIT_NATIVE_VALUE_VIEW_STRING,
+            Some(crate::JIT_NATIVE_STRING_VIEW_ABI_VERSION),
+            true,
+        ),
+        (
+            crate::JIT_VALUE_RUNTIME_FLOAT_TAG,
+            crate::JIT_NATIVE_VALUE_VIEW_FLOAT,
+            None,
+            false,
+        ),
+        (
+            crate::JIT_VALUE_RUNTIME_RESOURCE_TAG,
+            crate::JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE,
+            Some(crate::JIT_NATIVE_DIRECT_RESOURCE_ABI_VERSION),
+            true,
+        ),
+        (
+            crate::JIT_VALUE_RUNTIME_CALLABLE_TAG,
+            crate::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE,
+            Some(crate::JIT_NATIVE_PREPARED_CALLABLE_ABI_VERSION),
+            true,
+        ),
+        (
+            crate::JIT_VALUE_RUNTIME_GENERATOR_TAG,
+            crate::JIT_NATIVE_VALUE_VIEW_DIRECT_GENERATOR,
+            Some(crate::JIT_NATIVE_DIRECT_GENERATOR_ABI_VERSION),
+            true,
+        ),
+        (
+            crate::JIT_VALUE_RUNTIME_FIBER_TAG,
+            crate::JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER,
+            Some(crate::JIT_NATIVE_DIRECT_FIBER_ABI_VERSION),
+            true,
+        ),
+    ];
+    for (tag, expected_kind, expected_abi, requires_aux) in terminal_shapes {
+        let tagged = lower_value_has_tag(builder, current, tag);
+        let kind_ok = builder
+            .ins()
+            .icmp_imm(IntCC::Equal, kind, i64::from(expected_kind));
+        let mut shape = builder.ins().band(tagged, kind_ok);
+        if tag == crate::JIT_VALUE_RUNTIME_ARRAY_TAG {
+            let version = builder.ins().band_imm(
+                flags,
+                i64::from(crate::JIT_NATIVE_DIRECT_ARRAY_FLAGS_VERSION_MASK),
+            );
+            let abi_ok = builder.ins().icmp_imm(
+                IntCC::Equal,
+                version,
+                i64::from(crate::JIT_NATIVE_DIRECT_ARRAY_ABI_VERSION),
+            );
+            shape = builder.ins().band(shape, abi_ok);
+        } else if let Some(expected_abi) = expected_abi {
+            let abi_ok = builder
+                .ins()
+                .icmp_imm(IntCC::Equal, flags, i64::from(expected_abi));
+            shape = builder.ins().band(shape, abi_ok);
+        }
+        if requires_aux {
+            shape = builder.ins().band(shape, aux_ok);
+        }
+        terminal_total = builder.ins().bor(terminal_total, shape);
+    }
+    terminal_total = builder.ins().band(terminal_total, live);
+    builder
+        .ins()
+        .brif(terminal_total, accepted, &[], rejected, &[]);
+
+    builder.switch_to_block(accepted);
 }
 
 fn emit_optimizing_entry_admission(
@@ -19027,7 +19280,7 @@ fn emit_optimizing_entry_admission(
         && admission.initialized_globals.is_empty()
         && admission.releasable_globals.is_empty()
         && admission.plain_globals.is_empty()
-        && admission.reference_source_parameters.is_empty()
+        && admission.total_value_parameters.is_empty()
         && admission.property_requirements.is_empty()
         && admission.static_property_requirements.is_empty()
         && admission.object_layout_requirements.is_empty()
@@ -19054,6 +19307,15 @@ fn emit_optimizing_entry_admission(
     let rejected = builder.create_block();
     builder.set_cold_block(rejected);
     let pointer_type = builder.func.dfg.value_type(deopt_out);
+    for parameter_index in admission.total_value_parameters.iter().copied() {
+        let value = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            arguments,
+            i32::try_from(parameter_index.saturating_mul(8)).unwrap_or(i32::MAX),
+        );
+        emit_optimizing_entry_total_native_value(builder, value, deopt_out, rejected);
+    }
     if admission.require_non_fiber_scope {
         let view = lower_active_runtime_view(builder, deopt_out);
         let scope = builder.ins().load(
@@ -19679,6 +19941,7 @@ fn emit_optimizing_entry_admission(
     }
     for local in admission.initialized_request_locals.iter().copied() {
         let reference = lower_trusted_request_local_reference(builder, deopt_out, function, local);
+        emit_optimizing_entry_total_native_value(builder, reference, deopt_out, rejected);
         let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
         let payload = builder.ins().load(
             types::I64,
@@ -19702,6 +19965,7 @@ fn emit_optimizing_entry_admission(
             continuation_id,
             deopt_out,
         );
+        emit_optimizing_entry_total_native_value(builder, reference, deopt_out, rejected);
         let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
         let payload = builder.ins().load(
             types::I64,
@@ -19725,6 +19989,7 @@ fn emit_optimizing_entry_admission(
             continuation_id,
             deopt_out,
         );
+        emit_optimizing_entry_total_native_value(builder, reference, deopt_out, rejected);
         let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
         let payload = builder.ins().load(
             types::I64,
@@ -19732,34 +19997,16 @@ fn emit_optimizing_entry_admission(
             slot,
             std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
         );
-        let authoritative = lower_optimizing_call_value_is_authoritative(builder, payload);
         let reference =
             lower_value_has_tag(builder, payload, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
         let plain = builder.ins().icmp_imm(IntCC::Equal, reference, 0);
-        let admitted = builder.ins().band(authoritative, plain);
         let next = builder.create_block();
-        builder.ins().brif(admitted, next, &[], rejected, &[]);
-        builder.switch_to_block(next);
-    }
-    for parameter_index in admission.reference_source_parameters.iter().copied() {
-        let value = builder.ins().load(
-            types::I64,
-            MemFlagsData::new(),
-            arguments,
-            i32::try_from(parameter_index.saturating_mul(8)).map_err(|_| {
-                CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_REFERENCE_SOURCE_OFFSET",
-                    "reference source parameter offset does not fit the native ABI",
-                )
-            })?,
-        );
-        let authoritative = lower_optimizing_call_value_is_authoritative(builder, value);
-        let next = builder.create_block();
-        builder.ins().brif(authoritative, next, &[], rejected, &[]);
+        builder.ins().brif(plain, next, &[], rejected, &[]);
         builder.switch_to_block(next);
     }
     for local in admission.releasable_request_locals.iter().copied() {
         let reference = lower_trusted_request_local_reference(builder, deopt_out, function, local);
+        emit_optimizing_entry_total_native_value(builder, reference, deopt_out, rejected);
         let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
         let payload = builder.ins().load(
             types::I64,
@@ -19792,6 +20039,7 @@ fn emit_optimizing_entry_admission(
             continuation_id,
             deopt_out,
         );
+        emit_optimizing_entry_total_native_value(builder, reference, deopt_out, rejected);
         let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
         let payload = builder.ins().load(
             types::I64,
@@ -20075,7 +20323,8 @@ fn emit_optimizing_entry_admission(
             builder.ins().brif(admitted, next, &[], rejected, &[]);
             builder.switch_to_block(next);
         }
-        if requirement.require_supported_keys
+        if requirement.require_total_values
+            || requirement.require_supported_keys
             || requirement.require_plain_values
             || requirement.require_key_values
             || requirement.require_string_values
@@ -20111,11 +20360,11 @@ fn emit_optimizing_entry_admission(
                 entry,
                 std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
             );
-            let authoritative = lower_optimizing_call_value_is_authoritative(builder, value);
+            emit_optimizing_entry_total_native_value(builder, value, deopt_out, rejected);
             let reference =
                 lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
             let plain = builder.ins().icmp_imm(IntCC::Equal, reference, 0);
-            let mut admitted = authoritative;
+            let mut admitted = builder.ins().iconst(types::I8, 1);
             if requirement.require_plain_values {
                 admitted = builder.ins().band(admitted, plain);
             }
@@ -20315,7 +20564,6 @@ fn emit_optimizing_entry_admission(
                     entry,
                     std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
                 );
-                let authoritative = lower_optimizing_call_value_is_authoritative(builder, value);
                 let reference =
                     lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
                 let reference_shape = if *by_reference {
@@ -20323,7 +20571,7 @@ fn emit_optimizing_entry_admission(
                 } else {
                     builder.ins().icmp_imm(IntCC::Equal, reference, 0)
                 };
-                let mut admitted = builder.ins().band(integer_key, authoritative);
+                let mut admitted = integer_key;
                 admitted = builder.ins().band(admitted, reference_shape);
                 if let Some(type_) = type_ {
                     let typed = lower_optimizing_type_guard(builder, value, type_, deopt_out)
@@ -20367,7 +20615,6 @@ fn emit_optimizing_entry_admission(
                 entry,
                 std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
             );
-            let authoritative = lower_optimizing_call_value_is_authoritative(builder, value);
             let reference =
                 lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
             let reference_shape = if unpack.tail_by_reference {
@@ -20375,7 +20622,7 @@ fn emit_optimizing_entry_admission(
             } else {
                 builder.ins().icmp_imm(IntCC::Equal, reference, 0)
             };
-            let mut admitted = builder.ins().band(integer_key, authoritative);
+            let mut admitted = integer_key;
             admitted = builder.ins().band(admitted, reference_shape);
             if let Some(type_) = unpack.tail_type.as_ref() {
                 let typed = lower_optimizing_type_guard(builder, value, type_, deopt_out)
@@ -21226,16 +21473,6 @@ fn define_region_graph_function(
         }
         if matches!(tier_operations, NativeTierOperations::Optimizing { .. })
             && (fragment.is_none() || inline_fragment_entry)
-            && (!optimizing_admission.array_requirements.is_empty()
-                || !optimizing_admission.initialized_request_locals.is_empty()
-                || !optimizing_admission.releasable_request_locals.is_empty()
-                || !optimizing_admission.initialized_globals.is_empty()
-                || !optimizing_admission.releasable_globals.is_empty()
-                || !optimizing_admission.plain_globals.is_empty()
-                || !optimizing_admission.property_requirements.is_empty()
-                || optimizing_admission.fixed_value_allocations != 0
-                || optimizing_admission.fixed_array_entries != 0
-                || optimizing_admission.require_non_fiber_scope)
         {
             let admission = builder.create_block();
             let bind_parameters = builder.create_block();
@@ -22038,6 +22275,12 @@ fn define_region_graph_function(
                                 .request_local_store_is_total(instruction.continuation_id),
                             optimizing_admission
                                 .return_reference_store_is_total(instruction.continuation_id),
+                            optimizing_admission.reference_payload_proof().ok_or_else(|| {
+                                CraneliftLoweringError::new(
+                                    "JIT_CRANELIFT_REFERENCE_PAYLOAD_PUBLICATION",
+                                    "optimizing lowering requires total reference payload publication",
+                                )
+                            })?,
                             constants,
                             value_flow,
                             inline_constants,
@@ -22180,6 +22423,12 @@ fn define_region_graph_function(
                             }
                             _ => false,
                         },
+                        optimizing_admission.reference_payload_proof().ok_or_else(|| {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REFERENCE_PAYLOAD_PUBLICATION",
+                                "optimizing terminator requires total reference payload publication",
+                            )
+                        })?,
                         &region_block.terminator,
                         constants,
                         value_flow,
