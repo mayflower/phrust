@@ -30533,6 +30533,9 @@ fn lower_baseline_region_instruction(
             array,
             keys,
         } => {
+            let globals_proxy_local = function_local_names
+                .get(array.index())
+                .is_some_and(|name| name == "GLOBALS");
             let current = use_local_variable(builder, locals, *array)?;
             let root = lower_native_local_fetch(
                 module,
@@ -30652,17 +30655,24 @@ fn lower_baseline_region_instruction(
                     deopt_out,
                 )?;
             }
-            let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
-            let local_value = builder.ins().iconst(types::I64, i64::from(array.raw()));
-            let stored = lower_native_value_operation(
-                module,
-                builder,
-                native_operations.local_store,
-                native_local_store_operation(function_is_top_level, function_local_names, *array)
-                    | crate::JIT_LOCAL_STORE_MOVE_INPUT,
-                &[current, updated, function_value, local_value],
-                result_out,
-            )?;
+            let stored = if globals_proxy_local {
+                current
+            } else {
+                let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
+                let local_value = builder.ins().iconst(types::I64, i64::from(array.raw()));
+                lower_native_value_operation(
+                    module,
+                    builder,
+                    native_operations.local_store,
+                    native_local_store_operation(
+                        function_is_top_level,
+                        function_local_names,
+                        *array,
+                    ) | crate::JIT_LOCAL_STORE_MOVE_INPUT,
+                    &[current, updated, function_value, local_value],
+                    result_out,
+                )?
+            };
             define_local_variable(builder, locals, *array, stored)?;
             define_local_variable(builder, locals, *target, reference)?;
             publish_native_reference_local(
@@ -33062,6 +33072,9 @@ fn lower_baseline_region_instruction(
             value,
         } => {
             let value_operand = *value;
+            let globals_proxy_local = function_local_names
+                .get(local.index())
+                .is_some_and(|name| name == "GLOBALS");
             // Dimension writes may raise a catchable TypeError (for example
             // when a string is indexed with a string key). Publish the
             // current continuation before entering the helper so native
@@ -33206,7 +33219,11 @@ fn lower_baseline_region_instruction(
                     result_out,
                 )?;
             }
-            let stored = if direct_array_local || local_array_write {
+            let stored = if globals_proxy_local {
+                // The proxy insert already mutated the canonical request
+                // symbol. Keep the frame's stable proxy owner.
+                current
+            } else if direct_array_local || local_array_write {
                 updated
             } else {
                 let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
@@ -33235,6 +33252,9 @@ fn lower_baseline_region_instruction(
         } => {
             let value_operand = *value;
             let current = use_local_variable(builder, locals, *local)?;
+            let globals_proxy_local = function_local_names
+                .get(local.index())
+                .is_some_and(|name| name == "GLOBALS");
             let local_fact = value_flow.local_fact(*local);
             let direct_array_local = value_flow.local_storage(*local).is_promoted()
                 && local_fact.certainty != crate::region_ir::SsaCertainty::Unknown
@@ -33350,7 +33370,9 @@ fn lower_baseline_region_instruction(
                     result_out,
                 )?;
             }
-            let stored = if direct_array_local || local_array_write {
+            let stored = if globals_proxy_local {
+                current
+            } else if direct_array_local || local_array_write {
                 updated
             } else {
                 let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
@@ -33468,6 +33490,9 @@ fn lower_baseline_region_instruction(
         }
         RegionInstructionKind::UnsetDim { local, keys } => {
             let current = use_local_variable(builder, locals, *local)?;
+            let globals_proxy_local = function_local_names
+                .get(local.index())
+                .is_some_and(|name| name == "GLOBALS");
             let root = lower_native_local_fetch(
                 module,
                 builder,
@@ -33519,17 +33544,24 @@ fn lower_baseline_region_instruction(
                     result_out,
                 )?;
             }
-            let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
-            let local_value = builder.ins().iconst(types::I64, i64::from(local.raw()));
-            let stored = lower_native_value_operation(
-                module,
-                builder,
-                native_operations.local_store,
-                native_local_store_operation(function_is_top_level, function_local_names, *local)
-                    | crate::JIT_LOCAL_STORE_MOVE_INPUT,
-                &[current, updated, function_value, local_value],
-                result_out,
-            )?;
+            let stored = if globals_proxy_local {
+                current
+            } else {
+                let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
+                let local_value = builder.ins().iconst(types::I64, i64::from(local.raw()));
+                lower_native_value_operation(
+                    module,
+                    builder,
+                    native_operations.local_store,
+                    native_local_store_operation(
+                        function_is_top_level,
+                        function_local_names,
+                        *local,
+                    ) | crate::JIT_LOCAL_STORE_MOVE_INPUT,
+                    &[current, updated, function_value, local_value],
+                    result_out,
+                )?
+            };
             define_local_variable(builder, locals, *local, stored)?;
             if let Some(global_name) = instruction.native_global_name.as_deref() {
                 // `unset($GLOBALS["name"])` replaces the symbol-table

@@ -718,8 +718,15 @@ pub(super) fn execute_native_property_instruction(
             if let Some(declaration) = &declaration {
                 let entry = &declaration.entry;
                 if !native_instance_property_writable(context, declaration, caller_function) {
+                    let visibility = if entry.flags.is_private || entry.flags.set_is_private {
+                        "private "
+                    } else if entry.flags.is_protected || entry.flags.set_is_protected {
+                        "protected "
+                    } else {
+                        ""
+                    };
                     return Some(Err(format!(
-                        "E_PHP_THROW:Error:Cannot access property {}::${property}",
+                        "E_PHP_THROW:Error:Cannot access {visibility}property {}::${property}",
                         declaration.owner.display_name
                     )));
                 }
@@ -763,8 +770,16 @@ pub(super) fn execute_native_property_instruction(
         InstructionKind::UnsetProperty { .. } | InstructionKind::UnsetDynamicProperty { .. } => {
             if let Some(declaration) = &declaration {
                 if !native_instance_property_writable(context, declaration, caller_function) {
+                    let flags = declaration.entry.flags;
+                    let visibility = if flags.is_private || flags.set_is_private {
+                        "private "
+                    } else if flags.is_protected || flags.set_is_protected {
+                        "protected "
+                    } else {
+                        ""
+                    };
                     return Some(Err(format!(
-                        "E_PHP_THROW:Error:Cannot access property {}::${property}",
+                        "E_PHP_THROW:Error:Cannot access {visibility}property {}::${property}",
                         declaration.owner.display_name
                     )));
                 }

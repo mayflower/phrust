@@ -619,13 +619,16 @@ pub(super) fn native_instance_property_writable(
     declaration: &NativeInstancePropertyDeclaration,
     caller_function: u32,
 ) -> bool {
-    if !declaration.entry.flags.set_is_private && !declaration.entry.flags.set_is_protected {
+    let private = declaration.entry.flags.is_private || declaration.entry.flags.set_is_private;
+    let protected =
+        declaration.entry.flags.is_protected || declaration.entry.flags.set_is_protected;
+    if !private && !protected {
         return true;
     }
     let Some(caller) = native_effective_calling_class(context, caller_function) else {
         return false;
     };
-    if declaration.entry.flags.set_is_private {
+    if private {
         caller.name == declaration.owner.name
     } else {
         native_class_is_a(context, &caller.name, &declaration.owner.name)
@@ -888,6 +891,16 @@ pub(super) fn invoke_native_external_function_with_metadata_at_tier(
     baseline_continuation: bool,
 ) -> NativeCallResult {
     prepare_dynamic_native_entry(context, target.unit, target.function)?;
+    let baseline_continuation = baseline_continuation
+        || context
+            .dynamic_units
+            .get(target.unit)
+            .is_none_or(|package| {
+                !super::cold_dynamic_units::dynamic_function_property_plans_total(
+                    package,
+                    target.function,
+                )
+            });
     let mut transferred_arguments = transfer_native_external_arguments(context, arguments)?;
     let execution_target = NativeExecutionTarget {
         unit: Some(target.unit),

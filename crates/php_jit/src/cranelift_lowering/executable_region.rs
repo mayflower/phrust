@@ -1206,6 +1206,25 @@ fn optimizing_admission_for_region(
             _ => None,
         })
         .collect::<BTreeMap<_, _>>();
+    let bound_global_continuations = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| {
+            let RegionInstructionKind::NativeCall(RegionNativeCall {
+                result: RegionCallResult::ReferenceLocal(local),
+                target:
+                    RegionCallTarget::Semantic {
+                        operation: RegionSemanticOp::BindGlobal { .. },
+                    },
+                ..
+            }) = &instruction.kind
+            else {
+                return None;
+            };
+            Some((*local, instruction.continuation_id))
+        })
+        .collect::<BTreeMap<_, _>>();
     let published_call_result_facts = region
         .blocks
         .iter()
@@ -3353,7 +3372,16 @@ fn optimizing_admission_for_region(
             admission
                 .total_request_local_stores
                 .insert(instruction.continuation_id);
-            admission.releasable_request_locals.insert(local);
+            if let Some(global_continuation) = bound_global_continuations.get(&local).copied() {
+                // `global $name` installs the canonical trusted reference
+                // before this store. Its prior payload must be admitted
+                // through that global plan, not through the entry request-
+                // local slot, which is intentionally still unpublished for
+                // a cross-unit callee.
+                admission.releasable_globals.insert(global_continuation);
+            } else {
+                admission.releasable_request_locals.insert(local);
+            }
         }
         if let RegionInstructionKind::LoadLocal {
             local,
@@ -3362,7 +3390,28 @@ fn optimizing_admission_for_region(
         } = instruction.kind
         {
             let storage = value_flow.local_storage(local);
-            if storage == crate::region_ir::LocalStorageClass::SsaPlain {
+            let handler_exception_local = region
+                .exception_regions
+                .iter()
+                .any(|handler| handler.exception_local == Some(local));
+            if let Some(global_continuation) = bound_global_continuations.get(&local).copied() {
+                // The in-region BindGlobal publishes the canonical reference
+                // before this load. Validate its payload through the trusted
+                // global continuation instead of requiring a pre-existing
+                // request-local entry slot for this cross-unit frame.
+                admission
+                    .total_local_loads
+                    .insert(instruction.continuation_id);
+                admission.initialized_globals.insert(global_continuation);
+            } else if handler_exception_local {
+                // Catch binding publishes the authoritative throwable before
+                // entering the handler block. At top level this local is
+                // otherwise classified as request-global storage, but it must
+                // not become an initial-entry initialization requirement.
+                admission
+                    .total_local_loads
+                    .insert(instruction.continuation_id);
+            } else if storage == crate::region_ir::LocalStorageClass::SsaPlain {
                 admission
                     .total_local_loads
                     .insert(instruction.continuation_id);
@@ -3385,12 +3434,7 @@ fn optimizing_admission_for_region(
                     .total_local_loads
                     .insert(instruction.continuation_id);
                 admission.initialized_request_locals.insert(local);
-            } else if instruction.live_locals.contains(&local)
-                || region
-                    .exception_regions
-                    .iter()
-                    .any(|handler| handler.exception_local == Some(local))
-            {
+            } else if instruction.live_locals.contains(&local) {
                 admission
                     .total_local_loads
                     .insert(instruction.continuation_id);

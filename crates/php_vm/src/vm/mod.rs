@@ -1848,11 +1848,14 @@ impl Vm {
                 {
                     VmResult::success(std::mem::take(&mut context.output), None)
                 }
-                Ok(php_jit::JitI64InvokeOutcome::SideExit { status, .. }) => {
+                Ok(php_jit::JitI64InvokeOutcome::SideExit { status, state, .. }) => {
                     VmResult::runtime_error(
                         std::mem::take(&mut context.output),
                         context.diagnostic.take(),
-                        format!("native entry returned status {status}"),
+                        format!(
+                            "native entry returned status {status} at function {} continuation {}",
+                            state.function_id, state.continuation_id,
+                        ),
                     )
                 }
                 Err(error) => VmResult::compile_error(

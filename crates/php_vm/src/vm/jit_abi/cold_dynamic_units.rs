@@ -463,6 +463,18 @@ pub(super) fn ensure_native_entry(
     context: &mut NativeRequestColdState<'_>,
     function: php_ir::FunctionId,
 ) -> Result<php_jit::JitFunctionHandle, String> {
+    if let Some(unit) = context.current_dynamic_unit
+        && context
+            .dynamic_units
+            .get(unit)
+            .is_some_and(|package| !dynamic_function_property_plans_total(package, function))
+    {
+        // This cold invocation boundary is the last point before region
+        // entry. A function whose concrete property layout was not published
+        // must select its baseline-native body here, never enter an
+        // optimizing artifact with an empty slot contract.
+        return ensure_native_baseline_entry(context, function);
+    }
     let external_signatures =
         visible_external_function_signatures(context, &context.compiled, function);
 
@@ -627,6 +639,7 @@ pub(super) fn prepare_dynamic_native_entry(
         &baseline_options,
         &external_signatures,
     )?;
+    let baseline_handle = handle.clone();
     publish_dynamic_unit_entry(&compiled, function, &handle);
     // A changed external signature invalidates the preferred target as well
     // as the baseline entry. Publish the freshly validated baseline into both
@@ -730,11 +743,77 @@ pub(super) fn prepare_dynamic_native_entry(
     } else {
         context.with_active_dynamic_unit(unit, None, |_| ())?;
     }
+    let property_plans_total = context
+        .dynamic_units
+        .get(unit)
+        .is_some_and(|package| dynamic_function_property_plans_total(package, function));
+    if !property_plans_total {
+        // A generic cross-unit parameter can reach a property instruction
+        // before its concrete receiver class is known. Keep the immutable
+        // baseline entry selected for that call shape instead of admitting
+        // the optimizing body and discovering an empty property plan in its
+        // entry guard. A later publication with a complete layout/slot plan
+        // can select an optimizing entry normally.
+        if let Some(address) = baseline_handle.native_entry_address()
+            && let Some(cell) = compiled
+                .prepared_deployment_image()
+                .preferred_function_entries
+                .get(function.index())
+        {
+            cell.store(address, std::sync::atomic::Ordering::Release);
+        }
+        if active_unit {
+            std::sync::Arc::make_mut(&mut context.native_entries)
+                .insert(function, baseline_handle.clone());
+        } else if let Some(package) = context.dynamic_units.get_mut(unit) {
+            std::sync::Arc::make_mut(&mut package.native_entries).insert(function, baseline_handle);
+        }
+    }
     // Only this published caller can expose its outgoing immutable links.
     // Recursing through caller-scoped publication computes the newly
     // reachable graph without restarting a whole-request scan per target.
     prepare_linked_function_entries_for_caller(context, unit, function)?;
     Ok(())
+}
+
+pub(super) fn dynamic_function_property_plans_total(
+    package: &NativeDynamicUnit,
+    function: php_ir::FunctionId,
+) -> bool {
+    let Some(instructions) = package
+        .compiled
+        .prepared_continuation_instructions(function)
+    else {
+        return false;
+    };
+    let Some(base) = package
+        .runtime_state
+        .trusted_property_function_offsets
+        .get(function.index())
+        .copied()
+        .and_then(|base| usize::try_from(base).ok())
+    else {
+        return false;
+    };
+    instructions
+        .iter()
+        .enumerate()
+        .all(|(continuation, instruction)| {
+            let expected = match instruction.as_deref().map(|instruction| &instruction.kind) {
+                Some(php_ir::InstructionKind::FetchProperty { .. }) => {
+                    php_jit::JIT_NATIVE_TRUSTED_PROPERTY_SLOT_PUBLISHED
+                }
+                Some(php_ir::InstructionKind::AssignProperty { .. }) => {
+                    php_jit::JIT_NATIVE_TRUSTED_PROPERTY_SLOT_WRITABLE
+                }
+                _ => return true,
+            };
+            package
+                .runtime_state
+                .trusted_property_slots
+                .get(base.saturating_add(continuation))
+                .is_some_and(|plan| plan.state == expected)
+        })
 }
 
 pub(super) fn visible_external_function_signatures(
@@ -1217,7 +1296,7 @@ fn prepare_linked_function_entries_for_caller(
             }
         }
     }
-    for (unit, function) in targets {
+    for (unit, function) in targets.iter().copied() {
         let (unpublished, completed_optimizer) = context
             .dynamic_units
             .get(unit)
@@ -1244,6 +1323,12 @@ fn prepare_linked_function_entries_for_caller(
             prepare_dynamic_native_entry(context, unit, function)?;
         }
     }
+    let linked_property_plans_total = targets.iter().all(|(unit, function)| {
+        context
+            .dynamic_units
+            .get(*unit)
+            .is_some_and(|package| dynamic_function_property_plans_total(package, *function))
+    });
     let compiled = context
         .dynamic_units
         .get(caller_unit)
@@ -1252,7 +1337,22 @@ fn prepare_linked_function_entries_for_caller(
         .clone();
     let external_signatures =
         visible_external_function_signatures(context, &compiled, caller_function);
-    if !external_signatures.is_empty()
+    if !linked_property_plans_total {
+        let deployment = compiled.prepared_deployment_image();
+        if let (Some(preferred), Some(baseline)) = (
+            deployment
+                .preferred_function_entries
+                .get(caller_function.index()),
+            deployment
+                .native_function_entries
+                .get(caller_function.index()),
+        ) {
+            let baseline = baseline.load(std::sync::atomic::Ordering::Acquire);
+            if baseline != 0 {
+                preferred.store(baseline, std::sync::atomic::Ordering::Release);
+            }
+        }
+    } else if !external_signatures.is_empty()
         && context.options.native_optimization == super::super::NativeOptimizationPolicy::Optimizing
         && context.worker_state.has_compiled_optimizing_function(
             &compiled,
@@ -1376,6 +1476,16 @@ fn linked_function_record(
     let target = prepared_external_call_target(context, call)?;
     let target_unit = context.dynamic_units.get(target.unit())?;
     if target_unit.published_runtime_view.abi_version != php_jit::JIT_RUNTIME_ABI_VERSION {
+        return None;
+    }
+    if let Some(function) = target.function()
+        && !dynamic_function_property_plans_total(target_unit, function.function)
+    {
+        // A direct linked entry is published only when every property access
+        // in the target has a concrete layout/slot plan. Leaving this record
+        // unresolved routes the call through the caller's one pre-region
+        // baseline boundary; it must not call a baseline ABI with an
+        // optimizing property contract and fail inside the callee.
         return None;
     }
     let (preferred_entry, baseline_entry) = target.function().map_or(Some((0, 0)), |function| {

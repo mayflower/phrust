@@ -162,13 +162,16 @@ impl<'a> NativeRequestColdState<'a> {
     pub(super) fn encode_live_array_iterator(
         &mut self,
         source: i64,
-        global: Option<String>,
+        _global: Option<String>,
     ) -> Result<i64, String> {
         self.retain(source)?;
         match self.publish_cold_iterator(NativeColdIterator::LiveArray(Box::new(
             NativeLiveArrayIteratorState {
                 source,
-                global,
+                // `source` is the authoritative native array/reference owner.
+                // A materialized top-level-global mirror can still contain
+                // the pre-publication payload and must not drive this walk.
+                global: None,
                 index: 0,
             },
         ))) {
