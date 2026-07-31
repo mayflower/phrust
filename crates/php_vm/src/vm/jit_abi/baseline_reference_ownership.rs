@@ -7,6 +7,100 @@
 use super::*;
 use php_runtime::api::Value;
 
+pub(super) fn direct_reference_payload_is_total(
+    direct_value_slots: &[php_jit::JitNativeValueSlot],
+    mut encoded: i64,
+) -> bool {
+    let mut visited = [usize::MAX; 16];
+    let mut visited_count = 0_usize;
+
+    loop {
+        if let Some(constant) = php_jit::jit_decode_constant(encoded) {
+            return matches!(
+                constant,
+                u32::MAX | php_jit::JIT_VALUE_FALSE | php_jit::JIT_VALUE_TRUE
+            );
+        }
+        let Some(tag) = php_jit::jit_runtime_value_tag(encoded) else {
+            // Zero is also the demand-zero payload of a descriptor whose
+            // recursive publication has not completed. Without a separate
+            // initialized bit it cannot be admitted as a proven integer zero.
+            return encoded != 0;
+        };
+        let Some(index) = NativeRequestColdState::direct_value_index(encoded) else {
+            return false;
+        };
+        let Some(slot) = direct_value_slots
+            .get(index)
+            .copied()
+            .filter(|slot| slot.refcount != 0)
+        else {
+            return false;
+        };
+
+        if tag == php_jit::JIT_VALUE_RUNTIME_REFERENCE_TAG {
+            if slot.kind != php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR
+                || slot.flags != php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION
+                || native_reference_state(slot.reserved)
+                    != php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED
+                || visited_count == visited.len()
+                || visited[..visited_count].contains(&index)
+            {
+                return false;
+            }
+            visited[visited_count] = index;
+            visited_count += 1;
+            encoded = slot.payload as i64;
+            continue;
+        }
+
+        return match tag {
+            php_jit::JIT_VALUE_RUNTIME_TAG => {
+                slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_INT
+                    && slot.flags == php_jit::JIT_NATIVE_DIRECT_INT_ABI_VERSION
+            }
+            php_jit::JIT_VALUE_RUNTIME_ARRAY_TAG => {
+                slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY
+                    && slot.flags & php_jit::JIT_NATIVE_DIRECT_ARRAY_FLAGS_VERSION_MASK
+                        == php_jit::JIT_NATIVE_DIRECT_ARRAY_ABI_VERSION
+                    && slot.aux != 0
+            }
+            php_jit::JIT_VALUE_RUNTIME_OBJECT_TAG => {
+                slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_OBJECT
+            }
+            php_jit::JIT_VALUE_RUNTIME_STRING_TAG => {
+                slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_STRING
+                    && slot.flags == php_jit::JIT_NATIVE_STRING_VIEW_ABI_VERSION
+                    && slot.aux != 0
+            }
+            php_jit::JIT_VALUE_RUNTIME_FLOAT_TAG => {
+                slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_FLOAT
+            }
+            php_jit::JIT_VALUE_RUNTIME_RESOURCE_TAG => {
+                slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_RESOURCE
+                    && slot.flags == php_jit::JIT_NATIVE_DIRECT_RESOURCE_ABI_VERSION
+                    && slot.aux != 0
+            }
+            php_jit::JIT_VALUE_RUNTIME_CALLABLE_TAG => {
+                slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_PREPARED_CALLABLE
+                    && slot.flags == php_jit::JIT_NATIVE_PREPARED_CALLABLE_ABI_VERSION
+                    && slot.aux != 0
+            }
+            php_jit::JIT_VALUE_RUNTIME_GENERATOR_TAG => {
+                slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_GENERATOR
+                    && slot.flags == php_jit::JIT_NATIVE_DIRECT_GENERATOR_ABI_VERSION
+                    && slot.aux != 0
+            }
+            php_jit::JIT_VALUE_RUNTIME_FIBER_TAG => {
+                slot.kind == php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_FIBER
+                    && slot.flags == php_jit::JIT_NATIVE_DIRECT_FIBER_ABI_VERSION
+                    && slot.aux != 0
+            }
+            _ => false,
+        };
+    }
+}
+
 impl<'a> NativeRequestColdState<'a> {
     /// Replaces an authoritative direct-reference payload. `replacement` is
     /// moved into the reference slot; the previous payload owner is released.
@@ -603,6 +697,12 @@ impl<'a> NativeRequestColdState<'a> {
         let Some(reference_identity) = self.native_reference_identity(encoded) else {
             return Err("native global binding reference handle has no reference cell".to_owned());
         };
+        let payload_facts = if direct_reference_payload_is_total(&self.direct_value_slots, encoded)
+        {
+            php_jit::JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_PAYLOAD_TOTAL
+        } else {
+            0
+        };
         let Some(base) = self
             .trusted_property_function_offsets
             .get(function as usize)
@@ -622,6 +722,7 @@ impl<'a> NativeRequestColdState<'a> {
         if previous.state == php_jit::JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_PUBLISHED
             && previous.encoded == encoded
             && previous.reference_identity == reference_identity
+            && previous.reserved == payload_facts
             && self
                 .trusted_global_reference_names
                 .get(&index)
@@ -638,7 +739,7 @@ impl<'a> NativeRequestColdState<'a> {
             encoded,
             reference_identity,
             state: php_jit::JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_PUBLISHED,
-            reserved: 0,
+            reserved: payload_facts,
             reserved_wide: 0,
         };
         self.trusted_global_reference_names

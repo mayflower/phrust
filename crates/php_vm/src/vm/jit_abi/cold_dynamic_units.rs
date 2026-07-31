@@ -871,6 +871,7 @@ fn trusted_global_reference_plan_is_total(
     plan: &php_jit::JitNativeTrustedGlobalReferenceSlot,
 ) -> bool {
     plan.state == php_jit::JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_PUBLISHED
+        && plan.reserved & php_jit::JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_PAYLOAD_TOTAL != 0
         && plan.reference_identity != 0
         && plan.encoded as u64 & php_jit::JIT_VALUE_RUNTIME_KIND_MASK
             == php_jit::JIT_VALUE_RUNTIME_REFERENCE_TAG

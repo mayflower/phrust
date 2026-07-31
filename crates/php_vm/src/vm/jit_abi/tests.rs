@@ -238,6 +238,13 @@ fn dynamic_optimizer_rejects_unpublished_global_reference_plans() {
         };
 
     assert!(
+        !super::cold_dynamic_units::dynamic_function_global_plans_total(&package, entry),
+        "an outer reference without a total payload fact must reject optimizer entry"
+    );
+
+    package.runtime_state.trusted_global_reference_slots[base + continuation].reserved =
+        php_jit::JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_PAYLOAD_TOTAL;
+    assert!(
         super::cold_dynamic_units::dynamic_function_global_plans_total(&package, entry),
         "a complete direct-reference plan admits optimizer entry"
     );
@@ -253,6 +260,77 @@ fn dynamic_optimizer_rejects_unpublished_global_reference_plans() {
             .load(std::sync::atomic::Ordering::Acquire),
         0x1000,
         "global identity changes must select baseline before region entry"
+    );
+}
+
+#[test]
+fn direct_reference_publication_rejects_uninitialized_and_unsupported_payloads() {
+    let direct = |index| {
+        php_jit::jit_encode_typed_runtime_value(
+            php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + index,
+            php_jit::JIT_VALUE_RUNTIME_REFERENCE_TAG,
+        )
+    };
+    let mut slots = vec![php_jit::JitNativeValueSlot::default(); 3];
+    slots[0] = php_jit::JitNativeValueSlot {
+        refcount: 1,
+        kind: php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR,
+        flags: php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION,
+        reserved: php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED,
+        ..php_jit::JitNativeValueSlot::default()
+    };
+
+    assert!(
+        !super::baseline_reference_ownership::direct_reference_payload_is_total(&slots, direct(0)),
+        "a zero payload must not be interpreted as a direct runtime handle"
+    );
+
+    slots[0].payload = php_jit::jit_encode_constant(php_jit::JIT_VALUE_UNINITIALIZED) as u64;
+    assert!(
+        !super::baseline_reference_ownership::direct_reference_payload_is_total(&slots, direct(0)),
+        "an uninitialized reference payload must remain in baseline"
+    );
+
+    slots[0].payload = 42;
+    assert!(
+        super::baseline_reference_ownership::direct_reference_payload_is_total(&slots, direct(0)),
+        "a nonzero immediate integer payload is total"
+    );
+
+    slots[0].payload = php_jit::jit_encode_typed_runtime_value(
+        php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 1,
+        php_jit::JIT_VALUE_RUNTIME_STRING_TAG,
+    ) as u64;
+    slots[1] = php_jit::JitNativeValueSlot {
+        refcount: 1,
+        kind: php_jit::JIT_NATIVE_VALUE_VIEW_ARRAY,
+        flags: php_jit::JIT_NATIVE_STRING_VIEW_ABI_VERSION,
+        aux: 1,
+        ..php_jit::JitNativeValueSlot::default()
+    };
+    assert!(
+        !super::baseline_reference_ownership::direct_reference_payload_is_total(&slots, direct(0)),
+        "a runtime tag and direct descriptor kind mismatch must remain in baseline"
+    );
+
+    slots[1].kind = php_jit::JIT_NATIVE_VALUE_VIEW_STRING;
+    assert!(
+        super::baseline_reference_ownership::direct_reference_payload_is_total(&slots, direct(0)),
+        "a live direct string payload is total"
+    );
+
+    slots[1] = php_jit::JitNativeValueSlot {
+        refcount: 1,
+        kind: php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR,
+        flags: php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION,
+        reserved: php_jit::JIT_NATIVE_REFERENCE_SCALAR_VIEW_PUBLISHED,
+        payload: direct(0) as u64,
+        ..php_jit::JitNativeValueSlot::default()
+    };
+    slots[0].payload = direct(1) as u64;
+    assert!(
+        !super::baseline_reference_ownership::direct_reference_payload_is_total(&slots, direct(0)),
+        "cyclic direct-reference payloads must remain in baseline"
     );
 }
 

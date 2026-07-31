@@ -414,6 +414,10 @@ unsafe impl php_runtime::api::NativeZeroed for JitNativeTrustedGlobalReferenceSl
 
 pub const JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_EMPTY: u32 = 0;
 pub const JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_PUBLISHED: u32 = 1;
+/// Publication proved that the direct reference chain ends in a total native
+/// payload. Optimizing entry must reject plans without this fact rather than
+/// discovering an uninitialized or compatibility-only value after entry.
+pub const JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_PAYLOAD_TOTAL: u32 = 1;
 
 /// One immutable exact-class result in a prepared static `instanceof` table.
 /// Layout id zero is the empty-bucket sentinel; object layout ids start at one.
