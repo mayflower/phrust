@@ -171,6 +171,92 @@ fn repeated_native_metadata_publication_keeps_current_exception_routes() {
 }
 
 #[test]
+fn dynamic_optimizer_rejects_unpublished_global_reference_plans() {
+    use php_ir::builder::IrBuilder;
+    use php_ir::{FunctionFlags, InstructionKind, IrSpan, UnitId};
+
+    let mut builder = IrBuilder::new(UnitId::new(9_965));
+    let file = builder.add_file("native-global-publication-contract.php");
+    let span = IrSpan::new(file, 0, 16);
+    let entry = builder.start_function("main", FunctionFlags::default(), span);
+    let global = builder.intern_local(entry, "published_global");
+    let block = builder.append_block(entry);
+    builder.emit(
+        entry,
+        block,
+        InstructionKind::BindGlobal {
+            local: global,
+            name: "published_global".to_owned(),
+        },
+        span,
+    );
+    builder.terminate_return(entry, block, None, span);
+    builder.set_entry(entry);
+
+    let compiled = crate::compiled_unit::CompiledUnit::new(builder.finish());
+    let runtime_state = super::NativeUnitRuntimeState::for_compiled(&compiled);
+    let mut package = super::NativeDynamicUnit {
+        compiled,
+        cross_unit_global_names: std::sync::Arc::from([]),
+        native_entries: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        native_entry_signature_hashes: std::collections::BTreeMap::new(),
+        native_entry_signature_epochs: std::collections::BTreeMap::new(),
+        runtime_state,
+        linked_functions: Box::new([]),
+        published_runtime_view: Box::default(),
+    };
+
+    assert!(
+        !super::cold_dynamic_units::dynamic_function_global_plans_total(&package, entry),
+        "an empty publication slot must reject optimizer entry"
+    );
+
+    let instructions = package
+        .compiled
+        .prepared_continuation_instructions(entry)
+        .expect("global binding has continuation metadata");
+    let continuation = instructions
+        .iter()
+        .position(|instruction| {
+            matches!(
+                instruction.as_deref().map(|instruction| &instruction.kind),
+                Some(InstructionKind::BindGlobal { .. })
+            )
+        })
+        .expect("global binding continuation exists");
+    let base = package.runtime_state.trusted_property_function_offsets[entry.index()] as usize;
+    package.runtime_state.trusted_global_reference_slots[base + continuation] =
+        php_jit::JitNativeTrustedGlobalReferenceSlot {
+            encoded: php_jit::jit_encode_typed_runtime_value(
+                php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
+                php_jit::JIT_VALUE_RUNTIME_REFERENCE_TAG,
+            ),
+            reference_identity: 1,
+            state: php_jit::JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_PUBLISHED,
+            reserved: 0,
+            reserved_wide: 0,
+        };
+
+    assert!(
+        super::cold_dynamic_units::dynamic_function_global_plans_total(&package, entry),
+        "a complete direct-reference plan admits optimizer entry"
+    );
+
+    let deployment = package.compiled.prepared_deployment_image();
+    deployment.native_function_entries[entry.index()]
+        .store(0x1000, std::sync::atomic::Ordering::Release);
+    deployment.preferred_function_entries[entry.index()]
+        .store(0x2000, std::sync::atomic::Ordering::Release);
+    super::cold_dynamic_units::select_baseline_for_global_plan_functions(&package);
+    assert_eq!(
+        deployment.preferred_function_entries[entry.index()]
+            .load(std::sync::atomic::Ordering::Acquire),
+        0x1000,
+        "global identity changes must select baseline before region entry"
+    );
+}
+
+#[test]
 fn exact_execution_poll_uses_only_published_deadline_capability() {
     use php_ir::builder::IrBuilder;
     use php_ir::{FunctionFlags, IrSpan, UnitId};

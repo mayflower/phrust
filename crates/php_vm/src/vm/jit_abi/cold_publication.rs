@@ -896,7 +896,7 @@ pub(super) fn invoke_native_external_function_with_metadata_at_tier(
             .dynamic_units
             .get(target.unit)
             .is_none_or(|package| {
-                !super::cold_dynamic_units::dynamic_function_property_plans_total(
+                !super::cold_dynamic_units::dynamic_function_publication_plans_total(
                     package,
                     target.function,
                 )

@@ -546,6 +546,14 @@ impl<'a> NativeRequestColdState<'a> {
             }
             self.with_active_dynamic_unit(unit, None, |_| ())?;
         }
+        // Rebinding or unsetting a global can change the value shape observed
+        // by a function whose optimizer admission was compiled against the
+        // preceding canonical reference. Select its already-published
+        // baseline entry at this cold mutation boundary; generated code never
+        // validates the global identity or shape per invocation.
+        for package in &self.dynamic_units {
+            super::cold_dynamic_units::select_baseline_for_global_plan_functions(package);
+        }
         Ok(())
     }
 

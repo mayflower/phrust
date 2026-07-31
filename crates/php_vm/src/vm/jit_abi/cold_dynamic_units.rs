@@ -467,12 +467,12 @@ pub(super) fn ensure_native_entry(
         && context
             .dynamic_units
             .get(unit)
-            .is_some_and(|package| !dynamic_function_property_plans_total(package, function))
+            .is_some_and(|package| !dynamic_function_publication_plans_total(package, function))
     {
         // This cold invocation boundary is the last point before region
-        // entry. A function whose concrete property layout was not published
-        // must select its baseline-native body here, never enter an
-        // optimizing artifact with an empty slot contract.
+        // entry. A function whose concrete property or global-reference plan
+        // was not published must select its baseline-native body here, never
+        // enter an optimizing artifact with an empty slot contract.
         return ensure_native_baseline_entry(context, function);
     }
     let external_signatures =
@@ -743,16 +743,16 @@ pub(super) fn prepare_dynamic_native_entry(
     } else {
         context.with_active_dynamic_unit(unit, None, |_| ())?;
     }
-    let property_plans_total = context
+    let publication_plans_total = context
         .dynamic_units
         .get(unit)
-        .is_some_and(|package| dynamic_function_property_plans_total(package, function));
-    if !property_plans_total {
+        .is_some_and(|package| dynamic_function_publication_plans_total(package, function));
+    if !publication_plans_total {
         // A generic cross-unit parameter can reach a property instruction
-        // before its concrete receiver class is known. Keep the immutable
-        // baseline entry selected for that call shape instead of admitting
-        // the optimizing body and discovering an empty property plan in its
-        // entry guard. A later publication with a complete layout/slot plan
+        // before its concrete receiver class is known, and late global
+        // publication can leave a binding slot unresolved. Keep the immutable
+        // baseline entry selected instead of admitting an optimizing body
+        // with an empty publication contract. A later complete publication
         // can select an optimizing entry normally.
         if let Some(address) = baseline_handle.native_entry_address()
             && let Some(cell) = compiled
@@ -830,6 +830,106 @@ pub(super) fn dynamic_function_property_plans_total(
                 .get(base.saturating_add(continuation))
                 .is_some_and(|plan| plan.state == expected)
         })
+}
+
+fn dynamic_function_global_plan_indices(
+    package: &NativeDynamicUnit,
+    function: php_ir::FunctionId,
+) -> Option<Vec<usize>> {
+    let Some(instructions) = package
+        .compiled
+        .prepared_continuation_instructions(function)
+    else {
+        return None;
+    };
+    let dimension_sites = package.compiled.prepared_native_global_sites(function);
+    let base = package
+        .runtime_state
+        .trusted_property_function_offsets
+        .get(function.index())
+        .copied()
+        .and_then(|base| usize::try_from(base).ok())?;
+    Some(
+        instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(continuation, instruction)| {
+                (matches!(
+                    instruction.as_deref().map(|instruction| &instruction.kind),
+                    Some(php_ir::InstructionKind::BindGlobal { .. })
+                ) || dimension_sites
+                    .as_deref()
+                    .and_then(|sites| sites.get(continuation))
+                    .is_some_and(Option::is_some))
+                .then(|| base.saturating_add(continuation))
+            })
+            .collect(),
+    )
+}
+
+fn trusted_global_reference_plan_is_total(
+    plan: &php_jit::JitNativeTrustedGlobalReferenceSlot,
+) -> bool {
+    plan.state == php_jit::JIT_NATIVE_TRUSTED_GLOBAL_REFERENCE_PUBLISHED
+        && plan.reference_identity != 0
+        && plan.encoded as u64 & php_jit::JIT_VALUE_RUNTIME_KIND_MASK
+            == php_jit::JIT_VALUE_RUNTIME_REFERENCE_TAG
+        && php_jit::jit_decode_runtime_value(plan.encoded)
+            .is_some_and(|index| index >= php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE)
+}
+
+pub(super) fn dynamic_function_global_plans_total(
+    package: &NativeDynamicUnit,
+    function: php_ir::FunctionId,
+) -> bool {
+    dynamic_function_global_plan_indices(package, function).is_some_and(|indices| {
+        indices.iter().all(|index| {
+            package
+                .runtime_state
+                .trusted_global_reference_slots
+                .get(*index)
+                .is_some_and(trusted_global_reference_plan_is_total)
+        })
+    })
+}
+
+pub(super) fn select_baseline_for_global_plan_functions(package: &NativeDynamicUnit) {
+    let deployment = package.compiled.prepared_deployment_image();
+    for function in 0..package.compiled.unit().functions.len() {
+        let function = php_ir::FunctionId::new(u32::try_from(function).unwrap_or(u32::MAX));
+        let Some(indices) = dynamic_function_global_plan_indices(package, function) else {
+            continue;
+        };
+        if indices.is_empty()
+            || !indices.iter().all(|index| {
+                package
+                    .runtime_state
+                    .trusted_global_reference_slots
+                    .get(*index)
+                    .is_some_and(trusted_global_reference_plan_is_total)
+            })
+        {
+            continue;
+        }
+        let baseline = deployment
+            .native_function_entries
+            .get(function.index())
+            .map(|entry| entry.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(0);
+        if baseline != 0
+            && let Some(preferred) = deployment.preferred_function_entries.get(function.index())
+        {
+            preferred.store(baseline, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+pub(super) fn dynamic_function_publication_plans_total(
+    package: &NativeDynamicUnit,
+    function: php_ir::FunctionId,
+) -> bool {
+    dynamic_function_property_plans_total(package, function)
+        && dynamic_function_global_plans_total(package, function)
 }
 
 pub(super) fn visible_external_function_signatures(
@@ -1339,11 +1439,11 @@ fn prepare_linked_function_entries_for_caller(
             prepare_dynamic_native_entry(context, unit, function)?;
         }
     }
-    let linked_property_plans_total = targets.iter().all(|(unit, function)| {
+    let linked_publication_plans_total = targets.iter().all(|(unit, function)| {
         context
             .dynamic_units
             .get(*unit)
-            .is_some_and(|package| dynamic_function_property_plans_total(package, *function))
+            .is_some_and(|package| dynamic_function_publication_plans_total(package, *function))
     });
     let compiled = context
         .dynamic_units
@@ -1353,7 +1453,7 @@ fn prepare_linked_function_entries_for_caller(
         .clone();
     let external_signatures =
         visible_external_function_signatures(context, &compiled, caller_function);
-    if !linked_property_plans_total {
+    if !linked_publication_plans_total {
         let deployment = compiled.prepared_deployment_image();
         if let (Some(preferred), Some(baseline)) = (
             deployment
@@ -1495,13 +1595,13 @@ fn linked_function_record(
         return None;
     }
     if let Some(function) = target.function()
-        && !dynamic_function_property_plans_total(target_unit, function.function)
+        && !dynamic_function_publication_plans_total(target_unit, function.function)
     {
-        // A direct linked entry is published only when every property access
-        // in the target has a concrete layout/slot plan. Leaving this record
-        // unresolved routes the call through the caller's one pre-region
-        // baseline boundary; it must not call a baseline ABI with an
-        // optimizing property contract and fail inside the callee.
+        // A direct linked entry is published only when every property and
+        // global-reference access in the target has a concrete plan. Leaving
+        // this record unresolved routes the call through the caller's one
+        // pre-region baseline boundary; it must not enter a callee with an
+        // incomplete optimizing publication contract.
         return None;
     }
     let (preferred_entry, baseline_entry) = target.function().map_or(Some((0, 0)), |function| {
