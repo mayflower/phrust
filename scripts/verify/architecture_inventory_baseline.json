@@ -142,16 +142,16 @@
       "max_lines": 9561
     },
     "crates/php_jit/src/cranelift_lowering.rs": {
-      "max_bytes": 1438016,
-      "max_lines": 35032
+      "max_bytes": 1444651,
+      "max_lines": 35191
     },
     "crates/php_jit/src/cranelift_lowering/call_metadata.rs": {
       "max_bytes": 179098,
       "max_lines": 5335
     },
     "crates/php_jit/src/cranelift_lowering/executable_region.rs": {
-      "max_bytes": 955915,
-      "max_lines": 21622
+      "max_bytes": 1026038,
+      "max_lines": 23130
     },
     "crates/php_jit/src/region_ir/executable.rs": {
       "max_bytes": 378934,
@@ -170,8 +170,8 @@
       "max_lines": 6107
     },
     "crates/php_vm/src/vm/jit_abi/cold_request_state.rs": {
-      "max_bytes": 328171,
-      "max_lines": 7447
+      "max_bytes": 328226,
+      "max_lines": 7448
     },
     "crates/php_vm/src/vm/jit_abi/native/exact_call_dispatch.rs": {
       "max_bytes": 252838,
