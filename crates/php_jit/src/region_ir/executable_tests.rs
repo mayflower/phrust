@@ -875,6 +875,7 @@ fn published_external_parent_prepares_local_object_family() {
         native_arity: 0,
         requires_non_reference_trampoline: false,
         returns_by_reference: false,
+        return_type: None,
         exception_routes: None,
     };
     let metadata = CompileMetadata {
@@ -924,6 +925,7 @@ fn published_external_parent_prepares_local_object_family() {
             native_arity: 2,
             requires_non_reference_trampoline: false,
             returns_by_reference: false,
+            return_type: None,
             exception_routes: None,
         }],
     )
@@ -3898,6 +3900,7 @@ fn published_external_static_method_stays_linked_across_callback_families() {
         native_arity: 1,
         requires_non_reference_trampoline: false,
         returns_by_reference: false,
+        return_type: None,
         exception_routes: None,
     };
     let region = BaselineRegionBuilder::build_with_external_function_signatures(
@@ -4163,6 +4166,7 @@ fn exact_external_instance_callback_carries_receiver_without_callable_array() {
             native_arity: 0,
             requires_non_reference_trampoline: false,
             returns_by_reference: false,
+            return_type: None,
             exception_routes: None,
         },
         crate::JitExternalFunctionSignature {
@@ -4188,6 +4192,7 @@ fn exact_external_instance_callback_carries_receiver_without_callable_array() {
             native_arity: 2,
             requires_non_reference_trampoline: false,
             returns_by_reference: false,
+            return_type: None,
             exception_routes: None,
         },
     ];
@@ -4333,6 +4338,7 @@ fn optimizing_linked_reference_return_uses_published_native_signature() {
             native_arity: 1,
             requires_non_reference_trampoline: false,
             returns_by_reference: true,
+            return_type: None,
             exception_routes: None,
         }],
     )

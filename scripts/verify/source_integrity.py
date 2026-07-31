@@ -239,7 +239,13 @@ def check_vm_module_wiring() -> None:
     for relative, snippets in VM_SUBMODULE_FORBIDDEN_SNIPPETS.items():
         forbid_snippets(relative, read_required(relative), snippets)
 
-    declared_modules = set(re.findall(r"^mod\s+([A-Za-z0-9_]+);", vm_mod, re.MULTILINE))
+    declared_modules = set(
+        re.findall(
+            r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+);",
+            vm_mod,
+            re.MULTILINE,
+        )
+    )
     sibling_modules = {
         path.stem
         for path in (ROOT / "crates/php_vm/src/vm").glob("*.rs")

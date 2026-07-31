@@ -5935,7 +5935,6 @@ where
                     "E_PHP_RUNTIME_PRINTF_LENGTH",
                     format!("builtin {name} formatted output is too large"),
                 )
-                .into()
             })?;
             continue;
         }
@@ -5950,7 +5949,6 @@ where
                     "E_PHP_RUNTIME_PRINTF_LENGTH",
                     format!("builtin {name} formatted output is too large"),
                 )
-                .into()
             })?;
             format_index += 1;
             continue;
@@ -5979,7 +5977,6 @@ where
                 "E_PHP_RUNTIME_PRINTF_LENGTH",
                 format!("builtin {name} formatted output is too large"),
             )
-            .into()
         })?;
     }
 

@@ -5963,12 +5963,13 @@ fn native_url_query_parsers_preserve_typed_structure() {
             ) -> Result<(), E>,
         ) -> Result<Option<Self::Output>, E> {
             let mut values: Vec<Native> = Vec::new();
-            let mut push = |_: &mut Self, value| {
-                values.push(value);
-                Some(())
-            };
-            build(self, &mut push)?;
-            drop(push);
+            {
+                let mut push = |_: &mut Self, value| {
+                    values.push(value);
+                    Some(())
+                };
+                build(self, &mut push)?;
+            }
             Ok(Some(Native::Array(values)))
         }
 
@@ -5980,19 +5981,20 @@ fn native_url_query_parsers_preserve_typed_structure() {
             ) -> Result<(), E>,
         ) -> Result<Option<Self::Output>, E> {
             let mut values: Vec<(Vec<u8>, Native)> = Vec::new();
-            let mut push = |_: &mut Self, key: &[u8], value| {
-                if let Some((_, previous)) = values
-                    .iter_mut()
-                    .find(|(existing, _)| existing.as_slice() == key)
-                {
-                    *previous = value;
-                } else {
-                    values.push((key.to_vec(), value));
-                }
-                Some(())
-            };
-            build(self, &mut push)?;
-            drop(push);
+            {
+                let mut push = |_: &mut Self, key: &[u8], value| {
+                    if let Some((_, previous)) = values
+                        .iter_mut()
+                        .find(|(existing, _)| existing.as_slice() == key)
+                    {
+                        *previous = value;
+                    } else {
+                        values.push((key.to_vec(), value));
+                    }
+                    Some(())
+                };
+                build(self, &mut push)?;
+            }
             Ok(Some(Native::Object(values)))
         }
 

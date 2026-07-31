@@ -1712,9 +1712,7 @@ fn execute_native_array_walk(
             array.insert(key.clone(), cell.get());
         }
         root.set(Value::Array(array.clone()));
-        if let Err(error) = invoked {
-            return Err(error);
-        }
+        invoked?;
     }
     root.set(Value::Array(array));
     context.encode_baseline_value(Value::Bool(true))
@@ -1779,7 +1777,7 @@ fn walk_native_array_recursive(
                 if reference.gc_refcount_estimate() <= 4 {
                     array.insert(key, reference.get());
                 }
-                let _ = invoked?;
+                invoked?;
             }
         }
     }

@@ -180,7 +180,7 @@ fn normalized_native_hash_algorithm<'a>(
     buffer: &'a mut [u8; 16],
 ) -> Option<&'a str> {
     let mut length = 0;
-    for byte in algorithm.iter().copied() {
+    for &byte in algorithm {
         let slot = buffer.get_mut(length)?;
         *slot = byte.to_ascii_lowercase();
         length += 1;

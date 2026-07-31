@@ -104,8 +104,8 @@ fn publish_dynamic_unit_entry(
             if let Some(cell) = deployment.native_function_entries.get(function.index()) {
                 cell.store(address, std::sync::atomic::Ordering::Release);
             }
-            if let Some(cell) = deployment.preferred_function_entries.get(function.index()) {
-                if cell
+            if let Some(cell) = deployment.preferred_function_entries.get(function.index())
+                && cell
                     .compare_exchange(
                         0,
                         address,
@@ -113,9 +113,8 @@ fn publish_dynamic_unit_entry(
                         std::sync::atomic::Ordering::Acquire,
                     )
                     .is_ok()
-                {
-                    compiled.publish_preferred_function_metadata(function, handle);
-                }
+            {
+                compiled.publish_preferred_function_metadata(function, handle);
             }
         }
     }
@@ -311,6 +310,32 @@ pub(super) fn register_native_dynamic_unit(
     // operation-local resolver transition merely to initialize table
     // addresses.
     context.with_active_dynamic_unit(unit, None, |_| ())?;
+    // A previous request may have completed background optimization after
+    // releasing its request-local unit map. This declaration is the next
+    // safe publication boundary: adopt every completed product before any
+    // caller link is frozen for the new request.
+    let published_function_count = context
+        .dynamic_units
+        .get(unit)
+        .map_or(0, |package| package.compiled.unit().functions.len());
+    for index in 0..published_function_count {
+        let function = php_ir::FunctionId::new(
+            u32::try_from(index)
+                .map_err(|_| "dynamic function index exceeds the native ABI".to_owned())?,
+        );
+        let completed_optimizer = context.dynamic_units.get(unit).is_some_and(|package| {
+            let external_signatures =
+                visible_external_function_signatures(context, &package.compiled, function);
+            context.worker_state.has_compiled_optimizing_function(
+                &package.compiled,
+                function,
+                &external_signatures,
+            )
+        });
+        if completed_optimizer {
+            prepare_dynamic_native_entry(context, unit, function)?;
+        }
+    }
     prepare_linked_function_entries(context)?;
     prepare_resolved_external_callers(context, &published_function_names, &published_class_names)?;
     refresh_linked_function_records(context);
@@ -566,16 +591,24 @@ pub(super) fn prepare_dynamic_native_entry(
     } else {
         package.native_entries.contains_key(&function)
     };
+    let compiled = package.compiled.clone();
+    let external_signatures = visible_external_function_signatures(context, &compiled, function);
+    let completed_optimizer = wants_optimizing
+        && context.worker_state.has_compiled_optimizing_function(
+            &compiled,
+            function,
+            &external_signatures,
+        );
     if package.native_entry_signature_epochs.get(&function) == Some(&signature_epoch)
         && has_native_entry
+        && !completed_optimizer
     {
         return Ok(());
     }
-    let compiled = package.compiled.clone();
-    let external_signatures = visible_external_function_signatures(context, &compiled, function);
     let signature_hash = super::super::external_function_signatures_hash(&external_signatures);
     if package.native_entry_signature_hashes.get(&function) == Some(&signature_hash)
         && has_native_entry
+        && !completed_optimizer
     {
         context
             .dynamic_units
@@ -617,9 +650,24 @@ pub(super) fn prepare_dynamic_native_entry(
         // present; otherwise the ensuing baseline invocation records the
         // entry and schedules the normal background upgrade. A persistent
         // miss is load-only here and never compiles in the request.
-        context
-            .worker_state
-            .resolved_native_function(&compiled, function, context.options, &external_signatures)
+        completed_optimizer
+            .then(|| {
+                context.worker_state.resolve_native_function(
+                    &compiled,
+                    function,
+                    context.options,
+                    &external_signatures,
+                )
+            })
+            .transpose()?
+            .or_else(|| {
+                context.worker_state.resolved_native_function(
+                    &compiled,
+                    function,
+                    context.options,
+                    &external_signatures,
+                )
+            })
             .or_else(|| {
                 context
                     .worker_state
@@ -998,6 +1046,7 @@ pub(super) fn collect_visible_external_function_signatures(
                     native_arity: 0,
                     requires_non_reference_trampoline: false,
                     returns_by_reference: false,
+                    return_type: None,
                     exception_routes: None,
                 };
             }
@@ -1012,6 +1061,7 @@ pub(super) fn collect_visible_external_function_signatures(
                     native_arity: 0,
                     requires_non_reference_trampoline: false,
                     returns_by_reference: false,
+                    return_type: None,
                     exception_routes: None,
                 };
             };
@@ -1061,6 +1111,7 @@ pub(super) fn collect_visible_external_function_signatures(
                         method_entry.is_some(),
                     ),
                 returns_by_reference: function.returns_by_ref,
+                return_type: function.return_type.clone(),
                 exception_routes: native_function_exception_routes(
                     target
                         .as_ref()
@@ -1167,18 +1218,29 @@ fn prepare_linked_function_entries_for_caller(
         }
     }
     for (unit, function) in targets {
-        let unpublished = context
+        let (unpublished, completed_optimizer) = context
             .dynamic_units
             .get(unit)
-            .and_then(|package| {
-                package
+            .map(|package| {
+                let unpublished = package
                     .compiled
                     .prepared_deployment_image()
                     .native_function_entries
                     .get(function.index())
+                    .is_none_or(|entry| entry.load(std::sync::atomic::Ordering::Acquire) == 0);
+                let external_signatures =
+                    visible_external_function_signatures(context, &package.compiled, function);
+                let completed_optimizer = context.options.native_optimization
+                    == super::super::NativeOptimizationPolicy::Optimizing
+                    && context.worker_state.has_compiled_optimizing_function(
+                        &package.compiled,
+                        function,
+                        &external_signatures,
+                    );
+                (unpublished, completed_optimizer)
             })
-            .is_none_or(|entry| entry.load(std::sync::atomic::Ordering::Acquire) == 0);
-        if unpublished {
+            .unwrap_or((true, false));
+        if unpublished || completed_optimizer {
             prepare_dynamic_native_entry(context, unit, function)?;
         }
     }

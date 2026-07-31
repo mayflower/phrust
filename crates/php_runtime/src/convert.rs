@@ -129,10 +129,10 @@ pub fn float_to_php_string(value: f64) -> String {
 /// The returned range borrows `output` and contains the same bytes as
 /// [`float_to_php_string`]. The fixed capacity covers the longest finite
 /// fixed-point `f64`, including its sign.
-pub fn float_to_php_string_bytes<'a>(
+pub fn float_to_php_string_bytes(
     value: f64,
-    output: &'a mut [u8; PHP_FLOAT_STRING_BUFFER_CAPACITY],
-) -> &'a [u8] {
+    output: &mut [u8; PHP_FLOAT_STRING_BUFFER_CAPACITY],
+) -> &[u8] {
     let length =
         render_float_to_php_bytes(value, output).expect("PHP float buffer capacity is sufficient");
     &output[..length]

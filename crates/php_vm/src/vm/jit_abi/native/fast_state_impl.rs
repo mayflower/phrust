@@ -75,6 +75,8 @@ impl NativeHttpQueryTraversal {
     }
 }
 
+// architecture: fixed stack storage avoids a heap allocation in scalar conversion
+#[allow(clippy::large_enum_variant)]
 enum NativeScalarBytes<'a> {
     Empty,
     Static(&'static [u8]),
@@ -266,7 +268,7 @@ impl NativeSerializationTraversal {
     }
 }
 
-fn native_i64_ascii<'a>(value: i64, buffer: &'a mut [u8; 20]) -> &'a [u8] {
+fn native_i64_ascii(value: i64, buffer: &mut [u8; 20]) -> &[u8] {
     let negative = value < 0;
     let mut magnitude = value.unsigned_abs();
     let mut cursor = buffer.len();
@@ -1813,7 +1815,7 @@ impl NativeRequestFastState {
     #[allow(unsafe_code)]
     fn exact_set_error_handler(&mut self, callback: i64, levels: i64) -> Option<i64> {
         let callback = self.native_by_value_encoding(callback)?;
-        if self.direct_callable_is_valid(callback, false)? != true {
+        if !self.direct_callable_is_valid(callback, false)? {
             return None;
         }
         let missing = php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING);
@@ -1868,7 +1870,7 @@ impl NativeRequestFastState {
     #[allow(unsafe_code)]
     fn exact_set_exception_handler(&mut self, callback: i64) -> Option<i64> {
         let callback = self.native_by_value_encoding(callback)?;
-        if self.direct_callable_is_valid(callback, false)? != true {
+        if !self.direct_callable_is_valid(callback, false)? {
             return None;
         }
         let state = unsafe { self.callback_handlers.as_ref()? };
@@ -2002,7 +2004,7 @@ impl NativeRequestFastState {
     #[allow(unsafe_code)]
     fn exact_register_autoload_callback(&mut self, callback: i64, prepend: bool) -> Option<i64> {
         let callback = self.native_by_value_encoding(callback)?;
-        if self.direct_callable_is_valid(callback, false)? != true {
+        if !self.direct_callable_is_valid(callback, false)? {
             return None;
         }
         self.retain_direct_encoded(callback).ok()?;
@@ -2094,7 +2096,7 @@ impl NativeRequestFastState {
         }
         let (&callback, arguments) = arguments.split_first()?;
         let callback = self.native_by_value_encoding(callback)?;
-        if self.direct_callable_is_valid(callback, false)? != true {
+        if !self.direct_callable_is_valid(callback, false)? {
             return None;
         }
         let mut retained = Vec::with_capacity(arguments.len() + 1);
@@ -6227,11 +6229,12 @@ impl NativeRequestFastState {
         let layout_id = object.class_layout_epoch();
         let native_slots = object.native_declared_slots_view(layout_id);
         let object_id = object.id();
-        let object_type_flags = u32::from(object.is_native_countable())
-            * php_jit::JIT_NATIVE_OBJECT_COUNTABLE
-            | u32::from(object.is_native_traversable()) * php_jit::JIT_NATIVE_OBJECT_TRAVERSABLE
-            | u32::from(object.class_name().eq_ignore_ascii_case("stdClass"))
-                * php_jit::JIT_NATIVE_OBJECT_STDCLASS;
+        let object_type_flags = (u32::from(object.is_native_countable())
+            * php_jit::JIT_NATIVE_OBJECT_COUNTABLE)
+            | (u32::from(object.is_native_traversable())
+                * php_jit::JIT_NATIVE_OBJECT_TRAVERSABLE)
+            | (u32::from(object.class_name().eq_ignore_ascii_case("stdClass"))
+                * php_jit::JIT_NATIVE_OBJECT_STDCLASS);
         let owner = Box::into_raw(Box::new(object));
         let view = self.header.active_runtime_view();
         let slots = view.direct_value_slots as usize as *mut php_jit::JitNativeValueSlot;

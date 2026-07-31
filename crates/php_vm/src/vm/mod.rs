@@ -438,6 +438,31 @@ impl VmWorkerState {
         } else {
             self.native_compiles.get_or_compile(key, compile)
         }?;
+        if !background
+            && options.native_optimization == NativeOptimizationPolicy::Optimizing
+            && compiled.0.iter().any(|record| {
+                matches!(
+                    &record.result.status,
+                    php_jit::JitCompileStatus::Rejected { reason }
+                        if reason.starts_with("JIT_CRANELIFT_REJECT_")
+                )
+            })
+        {
+            // Publication has proved that this function cannot enter an
+            // optimizing region. Select its separately keyed baseline product
+            // once, before invocation; never publish baseline code under the
+            // optimizing cache identity.
+            let mut baseline_options = options.clone();
+            baseline_options.native_optimization = NativeOptimizationPolicy::Baseline;
+            baseline_options.tiering.enabled = false;
+            return self.compile_native_with_priority(
+                unit,
+                function,
+                &baseline_options,
+                external_signatures,
+                false,
+            );
+        }
         if std::env::var_os("PHRUST_NATIVE_COMPILE_FUNCTION_LOG").is_some()
             && compiled.1.compiled()
             && let Some(record) = compiled.0.first()
@@ -910,12 +935,15 @@ impl VmWorkerState {
         function: php_ir::FunctionId,
         external_signatures: &[php_jit::JitExternalFunctionSignature],
     ) -> bool {
-        self.native_compiles.contains(native_compile_cache_key(
+        let linked_external_signatures =
+            linked_external_function_signatures(unit, function, external_signatures);
+        let key = native_compile_cache_key(
             unit,
             function,
             NativeOptimizationPolicy::Optimizing.opt_level(),
-            external_signatures,
-        ))
+            &linked_external_signatures,
+        );
+        self.native_compiles.contains(key)
     }
 
     fn resolved_native_function(
@@ -1263,8 +1291,8 @@ impl Vm {
             if let Some(baseline) = deployment.native_function_entries.get(entry.index()) {
                 baseline.store(address, std::sync::atomic::Ordering::Release);
             }
-            if let Some(preferred) = deployment.preferred_function_entries.get(entry.index()) {
-                if preferred
+            if let Some(preferred) = deployment.preferred_function_entries.get(entry.index())
+                && preferred
                     .compare_exchange(
                         0,
                         address,
@@ -1272,9 +1300,8 @@ impl Vm {
                         std::sync::atomic::Ordering::Acquire,
                     )
                     .is_ok()
-                {
-                    unit.publish_preferred_function_metadata(entry, &handle);
-                }
+            {
+                unit.publish_preferred_function_metadata(entry, &handle);
             }
         }
         1
@@ -2016,6 +2043,7 @@ fn linked_external_function_signatures(
                     native_arity: 0,
                     requires_non_reference_trampoline: false,
                     returns_by_reference: false,
+                    return_type: None,
                     exception_routes: None,
                 })
         })

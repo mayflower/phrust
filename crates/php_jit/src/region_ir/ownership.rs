@@ -175,11 +175,29 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
                     | "phrust_native_file_exists"
                     | "phrust_native_is_file"
                     | "phrust_native_is_dir"
+                    | "phrust_native_is_link"
                     | "phrust_native_is_readable"
                     | "phrust_native_is_writable"
+                    | "phrust_native_fileperms"
+                    | "phrust_native_fileowner"
+                    | "phrust_native_filegroup"
+                    | "phrust_native_filetype"
+                    | "phrust_native_disk_free_space"
+                    | "phrust_native_disk_total_space"
+                    | "phrust_native_pathinfo"
+                    | "phrust_native_stat"
+                    | "phrust_native_lstat"
+                    | "phrust_native_file"
+                    | "phrust_native_glob"
                     | "phrust_native_filesize"
                     | "phrust_native_filemtime"
                     | "phrust_native_file_get_contents"
+                    | "phrust_native_file_put_contents"
+                    | "phrust_native_rename"
+                    | "phrust_native_unlink"
+                    | "phrust_native_mkdir"
+                    | "phrust_native_rmdir"
+                    | "phrust_native_touch"
                     | "phrust_native_fopen"
                     | "phrust_native_fwrite"
                     | "phrust_native_fclose"
@@ -216,6 +234,10 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         | "phrust_native_numeric_string" => Some(none(NONE)),
         "phrust_baseline_native_unary"
         | "phrust_baseline_native_cast"
+        | "phrust_native_unary_plus"
+        | "phrust_native_unary_minus"
+        | "phrust_native_bit_not"
+        | "phrust_native_callback_return_string"
         | "phrust_native_type_predicate"
         | "phrust_native_stable_length"
         | "phrust_native_local_fetch"
@@ -230,6 +252,22 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         | "phrust_native_constant_fetch" => Some(owned(BORROW_1, true)),
         "phrust_baseline_native_binary"
         | "phrust_baseline_native_compare"
+        | "phrust_native_count"
+        | "phrust_native_sizeof"
+        | "phrust_native_array_union"
+        | "phrust_native_concat"
+        | "phrust_native_bit_and"
+        | "phrust_native_bit_or"
+        | "phrust_native_bit_xor"
+        | "phrust_native_equal"
+        | "phrust_native_not_equal"
+        | "phrust_native_identical"
+        | "phrust_native_not_identical"
+        | "phrust_native_less"
+        | "phrust_native_less_equal"
+        | "phrust_native_greater"
+        | "phrust_native_greater_equal"
+        | "phrust_native_spaceship"
         | "phrust_native_array_fetch"
         | "phrust_native_array_unset"
         | "phrust_native_array_spread"
@@ -255,6 +293,11 @@ pub fn helper_ownership_contract(name: &str) -> Option<HelperOwnershipContract> 
         | "phrust_native_runtime_fatal"
         | "phrust_native_execution_poll" => Some(none(BORROW_1)),
         "phrust_native_foreach_next" | "phrust_native_truthy" => Some(owned(BORROW_1, false)),
+        // Generated scalar-math entries receive raw machine scalars, not
+        // native PHP owners. The remaining generated exact-control registry
+        // uses the uniform six-borrow ABI and returns a new native owner.
+        name if name.ends_with("_f64") => Some(owned(NONE, false)),
+        name if name.starts_with("phrust_native_") => Some(owned(BORROW_6, false)),
         _ => None,
     }
 }

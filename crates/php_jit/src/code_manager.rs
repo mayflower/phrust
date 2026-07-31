@@ -965,8 +965,20 @@ impl CraneliftCodeManager {
                     builder_context,
                 } = &mut *compiler;
                 match module.as_mut() {
-                    Some(module) => compile(module, context, builder_context, &symbol)
-                        .map_err(ManagedCompileError::Compile),
+                    Some(module) => {
+                        match compile(module, context, builder_context, &symbol) {
+                            Ok(compiled) => Ok(compiled),
+                            Err(error) => {
+                                // A publication-time rejection may occur while
+                                // CLIF preflight still owns partial frontend
+                                // state. The immediate baseline retry must
+                                // start from a completely empty scratch pair.
+                                module.clear_context(context);
+                                *builder_context = FunctionBuilderContext::new();
+                                Err(ManagedCompileError::Compile(error))
+                            }
+                        }
+                    }
                     None => Err(ManagedCompileError::Manager(
                         CraneliftCodeManagerError::Poisoned("retired generation"),
                     )),

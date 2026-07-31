@@ -3157,8 +3157,8 @@ impl BaselineRegionBuilder {
                         } else {
                             None
                         };
-                        let planned = planned.or_else(|| {
-                            let runtime_callback =
+                        let planned =
+                            planned.or_else(|| {
                                 if normalized.eq_ignore_ascii_case("preg_replace_callback")
                                     && (3..=6).contains(&args.len())
                                     && args
@@ -3326,9 +3326,8 @@ impl BaselineRegionBuilder {
                                     })
                                 } else {
                                     None
-                                };
-                            runtime_callback
-                        });
+                                }
+                            });
                         if let Some((
                             callback_map_register,
                             construction_ids,

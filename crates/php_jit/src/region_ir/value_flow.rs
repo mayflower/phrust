@@ -82,7 +82,6 @@ impl ExecutableValueFlow {
             .unwrap_or(SsaValueFact::UNKNOWN)
     }
 
-    #[must_use]
     pub fn frame_cleanup_locals(&self) -> impl Iterator<Item = LocalId> + '_ {
         self.frame_cleanup_locals.iter().copied()
     }
@@ -417,6 +416,69 @@ pub fn analyze_executable_value_flow(
         .collect::<BTreeSet<_>>();
     let ssa = super::build_executable_ssa(region, &eligible_locals);
     debug_assert!(ssa.verify(region).is_ok());
+    let has_external_storage_effect = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| {
+            matches!(
+                instruction.kind,
+                RegionInstructionKind::NativeCall(_)
+                    | RegionInstructionKind::ArrayCallback(_)
+                    | RegionInstructionKind::PregCallbackArray(_)
+                    | RegionInstructionKind::NativeDynamicCode(_)
+                    | RegionInstructionKind::NativeSuspend(_)
+                    | RegionInstructionKind::AssignProperty { .. }
+                    | RegionInstructionKind::AssignDim { .. }
+                    | RegionInstructionKind::AppendDim { .. }
+                    | RegionInstructionKind::UnsetDim { .. }
+                    | RegionInstructionKind::BindReference { .. }
+                    | RegionInstructionKind::BindReferenceProperty { .. }
+                    | RegionInstructionKind::BindReferenceFromProperty { .. }
+                    | RegionInstructionKind::BindReferenceIntoPropertyDim { .. }
+                    | RegionInstructionKind::BindReferenceFromPropertyDim { .. }
+                    | RegionInstructionKind::BindReferenceDimFromProperty { .. }
+                    | RegionInstructionKind::BindReferenceDim { .. }
+                    | RegionInstructionKind::BindReferenceIntoDim { .. }
+            )
+        });
+    let stable_request_locals = if has_external_storage_effect {
+        BTreeSet::new()
+    } else {
+        region
+            .blocks
+            .first()
+            .into_iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| match instruction.kind {
+                RegionInstructionKind::StoreLocal { local, .. }
+                | RegionInstructionKind::AssignLocalResult { local, .. }
+                    if local_storage.get(&local) == Some(&LocalStorageClass::RequestGlobal)
+                        && region
+                            .blocks
+                            .iter()
+                            .flat_map(|block| &block.instructions)
+                            .filter(|candidate| {
+                                matches!(
+                                    candidate.kind,
+                                    RegionInstructionKind::StoreLocal {
+                                        local: candidate_local,
+                                        ..
+                                    } | RegionInstructionKind::AssignLocalResult {
+                                        local: candidate_local,
+                                        ..
+                                    } if candidate_local == local
+                                )
+                            })
+                            .count()
+                            == 1 =>
+                {
+                    Some(local)
+                }
+                _ => None,
+            })
+            .collect()
+    };
     let mut local_facts = initial_local_facts(region, &local_storage);
     let mut register_facts = BTreeMap::new();
 
@@ -472,6 +534,7 @@ pub fn analyze_executable_value_flow(
             let fact = if !local_storage
                 .get(&local)
                 .is_some_and(|storage| storage.is_promoted())
+                && !stable_request_locals.contains(&local)
             {
                 // References, request globals, and suspension-backed locals can
                 // change through storage that is not represented by StoreLocal
@@ -1477,9 +1540,9 @@ fn classify_locals(region: &RegionGraph) -> BTreeMap<LocalId, LocalStorageClass>
                 LocalStorageClass::Globals
             } else if name.is_some_and(|name| SUPERGLOBALS.contains(&name)) {
                 LocalStorageClass::Superglobal
-            } else if request_globals.contains(&local) {
-                LocalStorageClass::RequestGlobal
-            } else if region.flags.is_top_level && !compiler_generated {
+            } else if request_globals.contains(&local)
+                || (region.flags.is_top_level && !compiler_generated)
+            {
                 LocalStorageClass::RequestGlobal
             } else if references.contains(&local) {
                 LocalStorageClass::MemoryReference
@@ -1609,8 +1672,35 @@ fn instruction_result_fact(
             Some((*dst, fact))
         }
         RegionInstructionKind::Binary { dst, op, lhs, rhs } => {
-            let lhs = fact(*lhs);
-            let rhs = fact(*rhs);
+            let numeric_fact = |operand: RegionOperand| {
+                let ordinary = fact(operand);
+                if ordinary.certainty != super::SsaCertainty::Unknown
+                    && matches!(ordinary.class, SsaValueClass::Int | SsaValueClass::Float)
+                {
+                    return ordinary;
+                }
+                let RegionOperand::Constant(index) = operand else {
+                    return ordinary;
+                };
+                let bytes = match constants.get(index as usize) {
+                    Some(IrConstant::String(value)) => value.as_bytes(),
+                    Some(IrConstant::StringBytes(value)) => value.as_slice(),
+                    _ => return ordinary,
+                };
+                use php_runtime::experimental::numeric_string::NumericStringValue;
+                match php_runtime::experimental::numeric_string::classify(bytes).value {
+                    Some(NumericStringValue::Int(value)) => {
+                        SsaValueFact::exact(SsaValueClass::Int, SsaOwnership::ImmortalConstant)
+                            .with_integer_range(SsaIntegerRange::exact(value))
+                    }
+                    Some(NumericStringValue::Float(_)) => {
+                        SsaValueFact::exact(SsaValueClass::Float, SsaOwnership::ImmortalConstant)
+                    }
+                    None => ordinary,
+                }
+            };
+            let lhs = numeric_fact(*lhs);
+            let rhs = numeric_fact(*rhs);
             // Every binary producer publishes one independent result owner.
             // Its runtime class can remain dynamic (for example integer
             // overflow becoming a float), but its ownership cannot: no
@@ -1651,16 +1741,27 @@ fn instruction_result_fact(
                     RegionBinaryOp::Add | RegionBinaryOp::Sub | RegionBinaryOp::Mul
                         if both_integer =>
                     {
-                        let range = match (*op, lhs.integer_range, rhs.integer_range) {
-                            (RegionBinaryOp::Add, Some(lhs), Some(rhs)) => lhs.checked_add(rhs),
-                            (RegionBinaryOp::Sub, Some(lhs), Some(rhs)) => lhs.checked_sub(rhs),
-                            (RegionBinaryOp::Mul, Some(lhs), Some(rhs)) => lhs.checked_mul(rhs),
-                            _ => None,
-                        };
-                        range.map_or(owned_dynamic, |range| {
-                            SsaValueFact::known(SsaValueClass::Int, SsaOwnership::Owned)
-                                .with_integer_range(range)
-                        })
+                        match (*op, lhs.integer_range, rhs.integer_range) {
+                            (RegionBinaryOp::Add, Some(lhs), Some(rhs)) => {
+                                lhs.checked_add(rhs).map_or(owned_dynamic, |range| {
+                                    SsaValueFact::known(SsaValueClass::Int, SsaOwnership::Owned)
+                                        .with_integer_range(range)
+                                })
+                            }
+                            (RegionBinaryOp::Sub, Some(lhs), Some(rhs)) => {
+                                lhs.checked_sub(rhs).map_or(owned_dynamic, |range| {
+                                    SsaValueFact::known(SsaValueClass::Int, SsaOwnership::Owned)
+                                        .with_integer_range(range)
+                                })
+                            }
+                            (RegionBinaryOp::Mul, Some(lhs), Some(rhs)) => {
+                                lhs.checked_mul(rhs).map_or(owned_dynamic, |range| {
+                                    SsaValueFact::known(SsaValueClass::Int, SsaOwnership::Owned)
+                                        .with_integer_range(range)
+                                })
+                            }
+                            _ => SsaValueFact::known(SsaValueClass::Int, SsaOwnership::Owned),
+                        }
                     }
                     RegionBinaryOp::Div if has_float => {
                         SsaValueFact::known(SsaValueClass::Float, SsaOwnership::Owned)
@@ -1865,13 +1966,13 @@ fn fixed_function_result_fact(name: &str) -> Option<SsaValueFact> {
         // These fixed builtins have a publication-total boolean ABI. Recording
         // the result class at the producer lets a following branch remain in
         // the optimizing region without a generic truthiness classifier.
-        "array_key_exists" | "key_exists" | "str_contains" | "str_starts_with"
-        | "str_ends_with" | "is_null" | "is_bool" | "is_int" | "is_integer" | "is_long"
-        | "is_float" | "is_double" | "is_real" | "is_string" | "is_array" | "is_object"
-        | "is_resource" | "is_scalar" | "is_numeric" | "is_countable" | "is_iterable"
-        | "ctype_alnum" | "ctype_alpha" | "ctype_cntrl" | "ctype_digit" | "ctype_graph"
-        | "ctype_lower" | "ctype_print" | "ctype_punct" | "ctype_space" | "ctype_upper"
-        | "ctype_xdigit" => Some(SsaValueFact::known(
+        "array_key_exists" | "key_exists" | "array_is_list" | "in_array" | "str_contains"
+        | "str_starts_with" | "str_ends_with" | "is_null" | "is_bool" | "is_int" | "is_integer"
+        | "is_long" | "is_float" | "is_double" | "is_real" | "is_string" | "is_array"
+        | "is_object" | "is_resource" | "is_scalar" | "is_numeric" | "is_countable"
+        | "is_iterable" | "ctype_alnum" | "ctype_alpha" | "ctype_cntrl" | "ctype_digit"
+        | "ctype_graph" | "ctype_lower" | "ctype_print" | "ctype_punct" | "ctype_space"
+        | "ctype_upper" | "ctype_xdigit" => Some(SsaValueFact::known(
             SsaValueClass::Bool,
             SsaOwnership::Owned,
         )),
@@ -1881,7 +1982,22 @@ fn fixed_function_result_fact(name: &str) -> Option<SsaValueFact> {
         "strcmp" | "strcasecmp" | "strncmp" | "strncasecmp" | "strnatcmp" | "strnatcasecmp"
         | "substr_compare" => Some(integer(i64::from(i32::MIN), i64::from(i32::MAX))),
         "ord" => Some(integer(0, 255)),
-        "strlen" | "mb_strlen" | "count" | "sizeof" => Some(integer(0, i64::MAX)),
+        "error_reporting" => Some(integer(i64::from(i32::MIN), i64::from(i32::MAX))),
+        "strlen" | "mb_strlen" | "count" | "sizeof" | "substr_count" => Some(integer(0, i64::MAX)),
+        "strtolower" | "strtoupper" | "ucfirst" | "lcfirst" | "trim" | "ltrim" | "rtrim"
+        | "strrev" | "str_repeat" | "substr" | "chr" | "addslashes" | "stripslashes"
+        | "implode" | "join" | "str_replace" => Some(SsaValueFact::known(
+            SsaValueClass::StringHandle,
+            SsaOwnership::Owned,
+        )),
+        "explode" | "str_split" | "array_slice" | "array_reverse" | "array_merge"
+        | "array_keys" | "array_values" | "array_unique" | "array_map" | "array_filter" => Some(
+            SsaValueFact::known(SsaValueClass::ArrayHandle, SsaOwnership::Owned),
+        ),
+        "current" | "next" | "prev" | "reset" | "end" | "key" | "array_pop" | "array_push"
+        | "array_shift" | "array_unshift" => {
+            Some(SsaValueFact::known(SsaValueClass::Int, SsaOwnership::Owned))
+        }
         _ => None,
     }
 }
@@ -2201,13 +2317,11 @@ mod tests {
         let call = region.blocks[0]
             .instructions
             .iter()
-            .find_map(|instruction| match &instruction.kind {
-                RegionInstructionKind::NativeCall(call)
-                    if call.direct_compiled_unpack_target() == Some(callee) =>
-                {
-                    Some(instruction)
+            .find(|instruction| match &instruction.kind {
+                RegionInstructionKind::NativeCall(call) => {
+                    call.direct_compiled_unpack_target() == Some(callee)
                 }
-                _ => None,
+                _ => false,
             })
             .expect("direct compiled unpack call");
         assert!(flow.consumes_call_operand(call.continuation_id, source));

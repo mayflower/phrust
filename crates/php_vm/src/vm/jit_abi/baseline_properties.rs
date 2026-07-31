@@ -735,28 +735,27 @@ pub(super) fn execute_native_property_instruction(
                         )));
                     }
                 }
-            } else if let Some(class) = &class {
-                if let Some(method) = class
+            } else if let Some(class) = &class
+                && let Some(method) = class
                     .methods
                     .iter()
                     .find(|method| method.name.eq_ignore_ascii_case("__set"))
                     .filter(|method| method.function.raw() != caller_function)
+            {
+                let name = match context
+                    .encode_native_string_owner(PhpString::from_bytes(property.as_bytes().to_vec()))
                 {
-                    let name = match context.encode_native_string_owner(PhpString::from_bytes(
-                        property.as_bytes().to_vec(),
-                    )) {
-                        Ok(name) => name,
-                        Err(error) => return Some(Err(error)),
-                    };
-                    if let Err(error) = invoke_native_method(
-                        context,
-                        method.function,
-                        &[object_encoded, name, arguments[2]],
-                    ) {
-                        return Some(Err(error.into()));
-                    }
-                    return Some(context.encode_baseline_value(value));
+                    Ok(name) => name,
+                    Err(error) => return Some(Err(error)),
+                };
+                if let Err(error) = invoke_native_method(
+                    context,
+                    method.function,
+                    &[object_encoded, name, arguments[2]],
+                ) {
+                    return Some(Err(error.into()));
                 }
+                return Some(context.encode_baseline_value(value));
             }
             object.set_property(property.clone(), value.clone());
             value
@@ -769,26 +768,25 @@ pub(super) fn execute_native_property_instruction(
                         declaration.owner.display_name
                     )));
                 }
-            } else if let Some(class) = &class {
-                if let Some(method) = class
+            } else if let Some(class) = &class
+                && let Some(method) = class
                     .methods
                     .iter()
                     .find(|method| method.name.eq_ignore_ascii_case("__unset"))
                     .filter(|method| method.function.raw() != caller_function)
+            {
+                let name = match context
+                    .encode_native_string_owner(PhpString::from_bytes(property.as_bytes().to_vec()))
                 {
-                    let name = match context.encode_native_string_owner(PhpString::from_bytes(
-                        property.as_bytes().to_vec(),
-                    )) {
-                        Ok(name) => name,
-                        Err(error) => return Some(Err(error)),
-                    };
-                    if let Err(error) =
-                        invoke_native_method(context, method.function, &[object_encoded, name])
-                    {
-                        return Some(Err(error.into()));
-                    }
-                    return Some(context.encode_baseline_value(Value::Null));
+                    Ok(name) => name,
+                    Err(error) => return Some(Err(error)),
+                };
+                if let Err(error) =
+                    invoke_native_method(context, method.function, &[object_encoded, name])
+                {
+                    return Some(Err(error.into()));
                 }
+                return Some(context.encode_baseline_value(Value::Null));
             }
             object.unset_property(&property);
             Value::Null

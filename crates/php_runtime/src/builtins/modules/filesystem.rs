@@ -158,7 +158,7 @@ impl NativePathOutput {
         }
     }
 
-    fn bytes<'a>(self, source: &'a [u8]) -> Option<&'a [u8]> {
+    fn bytes(self, source: &[u8]) -> Option<&[u8]> {
         match self.static_bytes {
             Some(bytes) => Some(bytes),
             None => {

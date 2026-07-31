@@ -792,6 +792,8 @@ pub(crate) struct NativePreparedClosure {
 }
 
 impl NativePreparedClosure {
+    // architecture: immutable publication fields map one-to-one to the native closure view
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         closure: php_runtime::api::ClosurePayload,
         capture_descriptors: Arc<[(String, bool)]>,

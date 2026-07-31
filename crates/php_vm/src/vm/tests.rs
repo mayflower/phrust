@@ -181,6 +181,7 @@ fn background_cross_unit_optimizer_waits_for_foreground_publication_boundary() {
         native_arity: 0,
         requires_non_reference_trampoline: false,
         returns_by_reference: false,
+        return_type: None,
         exception_routes: None,
     }];
     let optimizing = VmOptions {
@@ -255,6 +256,7 @@ fn baseline_publication_replaces_a_stale_external_signature_variant() {
         native_arity: 0,
         requires_non_reference_trampoline: false,
         returns_by_reference: false,
+        return_type: None,
         exception_routes: None,
     };
     let published = php_jit::JitExternalFunctionSignature {
@@ -320,6 +322,7 @@ fn worker_reuses_pre_and_post_declaration_native_abi_variants() {
         native_arity: 0,
         requires_non_reference_trampoline: false,
         returns_by_reference: false,
+        return_type: None,
         exception_routes: None,
     };
     let published = php_jit::JitExternalFunctionSignature {

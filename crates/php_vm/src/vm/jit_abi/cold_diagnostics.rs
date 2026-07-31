@@ -218,15 +218,14 @@ pub(super) fn prepare_native_throwable_site(
             |file| Box::<[u8]>::from(file.path.as_bytes()),
         );
     let line = i64::try_from(native_source_line_for_span(context, span)).unwrap_or(i64::MAX);
-    let fixed_string_bytes = string_capacity(file.len()).saturating_add(
-        include_function_frame
-            .then(|| {
-                string_capacity("function".len())
-                    .saturating_add(string_capacity(function_name.len()))
-                    .saturating_add(string_capacity("args".len()))
-            })
-            .unwrap_or(0),
-    );
+    let frame_string_bytes = if include_function_frame {
+        string_capacity("function".len())
+            .saturating_add(string_capacity(function_name.len()))
+            .saturating_add(string_capacity("args".len()))
+    } else {
+        0
+    };
+    let fixed_string_bytes = string_capacity(file.len()).saturating_add(frame_string_bytes);
     PreparedNativeThrowableSite {
         native_view: php_jit::JitNativePreparedExceptionView {
             fixed_string_bytes: u64::try_from(fixed_string_bytes).unwrap_or(u64::MAX),
@@ -326,8 +325,7 @@ pub(super) fn initialize_native_throwable_parent(
             .ok_or_else(|| format!("{class}::__construct() has no active object receiver"))?;
         let receiver = context.encode_native_object_owner(object)?;
         let default_message = arguments
-            .first()
-            .is_none()
+            .is_empty()
             .then(|| context.encode_native_string_owner(PhpString::from_bytes(Vec::new())))
             .transpose()?;
         let message = arguments

@@ -3447,11 +3447,11 @@ pub(super) fn stable_builtin_callable_query(
 /// generic prepared-builtin dispatcher participates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StableCallbackHandlerBuiltin {
-    SetErrorHandler,
-    RestoreErrorHandler,
-    SetExceptionHandler,
-    RestoreExceptionHandler,
-    GetExceptionHandler,
+    SetError,
+    RestoreError,
+    SetException,
+    RestoreException,
+    GetException,
 }
 
 impl StableCallbackHandlerBuiltin {
@@ -3459,41 +3459,39 @@ impl StableCallbackHandlerBuiltin {
 
     pub(super) const fn index(self) -> usize {
         match self {
-            Self::SetErrorHandler => 0,
-            Self::RestoreErrorHandler => 1,
-            Self::SetExceptionHandler => 2,
-            Self::RestoreExceptionHandler => 3,
-            Self::GetExceptionHandler => 4,
+            Self::SetError => 0,
+            Self::RestoreError => 1,
+            Self::SetException => 2,
+            Self::RestoreException => 3,
+            Self::GetException => 4,
         }
     }
 
     pub(super) const fn symbol(self) -> &'static str {
         match self {
-            Self::SetErrorHandler => "phrust_native_set_error_handler",
-            Self::RestoreErrorHandler => "phrust_native_restore_error_handler",
-            Self::SetExceptionHandler => "phrust_native_set_exception_handler",
-            Self::RestoreExceptionHandler => "phrust_native_restore_exception_handler",
-            Self::GetExceptionHandler => "phrust_native_get_exception_handler",
+            Self::SetError => "phrust_native_set_error_handler",
+            Self::RestoreError => "phrust_native_restore_error_handler",
+            Self::SetException => "phrust_native_set_exception_handler",
+            Self::RestoreException => "phrust_native_restore_exception_handler",
+            Self::GetException => "phrust_native_get_exception_handler",
         }
     }
 
     pub(super) const fn accepts_arity(self, arity: usize) -> bool {
         match self {
-            Self::SetErrorHandler => arity == 1 || arity == 2,
-            Self::SetExceptionHandler => arity == 1,
-            Self::RestoreErrorHandler
-            | Self::RestoreExceptionHandler
-            | Self::GetExceptionHandler => arity == 0,
+            Self::SetError => arity == 1 || arity == 2,
+            Self::SetException => arity == 1,
+            Self::RestoreError | Self::RestoreException | Self::GetException => arity == 0,
         }
     }
 
     pub(super) const fn all() -> [Self; Self::COUNT] {
         [
-            Self::SetErrorHandler,
-            Self::RestoreErrorHandler,
-            Self::SetExceptionHandler,
-            Self::RestoreExceptionHandler,
-            Self::GetExceptionHandler,
+            Self::SetError,
+            Self::RestoreError,
+            Self::SetException,
+            Self::RestoreException,
+            Self::GetException,
         ]
     }
 }
@@ -3509,11 +3507,11 @@ pub(super) fn stable_builtin_callback_handler(
         return None;
     }
     match normalized.to_ascii_lowercase().as_str() {
-        "set_error_handler" => Some(StableCallbackHandlerBuiltin::SetErrorHandler),
-        "restore_error_handler" => Some(StableCallbackHandlerBuiltin::RestoreErrorHandler),
-        "set_exception_handler" => Some(StableCallbackHandlerBuiltin::SetExceptionHandler),
-        "restore_exception_handler" => Some(StableCallbackHandlerBuiltin::RestoreExceptionHandler),
-        "get_exception_handler" => Some(StableCallbackHandlerBuiltin::GetExceptionHandler),
+        "set_error_handler" => Some(StableCallbackHandlerBuiltin::SetError),
+        "restore_error_handler" => Some(StableCallbackHandlerBuiltin::RestoreError),
+        "set_exception_handler" => Some(StableCallbackHandlerBuiltin::SetException),
+        "restore_exception_handler" => Some(StableCallbackHandlerBuiltin::RestoreException),
+        "get_exception_handler" => Some(StableCallbackHandlerBuiltin::GetException),
         _ => None,
     }
 }

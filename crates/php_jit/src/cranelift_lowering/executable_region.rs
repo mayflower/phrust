@@ -19,6 +19,10 @@ struct NativeEntryArrayRequirement {
     require_key_values: bool,
     require_string_values: bool,
     require_scalar_values: bool,
+    require_integer_keys: bool,
+    require_integer_values: bool,
+    integer_minimum: Option<i64>,
+    integer_maximum: Option<i64>,
     minimum_length: usize,
     implode_separator_lengths: Vec<usize>,
     required_integer_keys: BTreeSet<i64>,
@@ -132,6 +136,8 @@ struct NativeEntryStringRequirement {
     minimum_length: usize,
     offset: Option<NativeEntryStringOffset>,
     allocation_multiplier: usize,
+    value_multiplier: usize,
+    array_entry_multiplier: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -142,6 +148,7 @@ struct NativeEntryResourceTypeRequirement {
 #[derive(Clone, Debug)]
 struct NativeEntryIntegerRequirement {
     parameter_index: usize,
+    by_reference: bool,
     minimum: i64,
     maximum: i64,
     forbidden_values: Vec<i64>,
@@ -155,11 +162,25 @@ struct NativeEntryFloatRequirement {
 
 #[derive(Clone, Debug)]
 enum NativeEntryArrayMutationRequirement {
-    Assign { parents: Vec<i64>, key: i64 },
-    Append { parents: Vec<i64> },
-    Unset { parents: Vec<i64>, key: i64 },
-    Reference { parents: Vec<i64>, key: i64 },
-    ReferenceAppend { parents: Vec<i64> },
+    Assign {
+        parents: Vec<i64>,
+        key: i64,
+    },
+    Append {
+        parents: Vec<i64>,
+    },
+    Unset {
+        parents: Vec<i64>,
+        key: i64,
+    },
+    Reference {
+        parents: Vec<i64>,
+        key: i64,
+        allow_shared_root: bool,
+    },
+    ReferenceAppend {
+        parents: Vec<i64>,
+    },
 }
 
 impl NativeEntryArrayMutationRequirement {
@@ -171,6 +192,16 @@ impl NativeEntryArrayMutationRequirement {
             | Self::Reference { .. }
             | Self::ReferenceAppend { .. } => 1,
         }
+    }
+
+    const fn allows_shared_root(&self) -> bool {
+        matches!(
+            self,
+            Self::Reference {
+                allow_shared_root: true,
+                ..
+            }
+        )
     }
 }
 
@@ -298,8 +329,10 @@ struct NativeOptimizingAdmission {
     fixed_builtin_plans: BTreeMap<u32, NativeFixedBuiltinPublicationPlan>,
     total_array_instructions: BTreeSet<u32>,
     total_binary_instructions: BTreeSet<u32>,
+    binary_operand_classes: BTreeMap<u32, (SsaValueClass, SsaValueClass)>,
     total_scalar_control_instructions: BTreeSet<u32>,
     fresh_array_instructions: BTreeSet<u32>,
+    fresh_array_capacities: BTreeMap<u32, u32>,
     total_local_loads: BTreeSet<u32>,
     total_request_local_stores: BTreeSet<u32>,
     total_return_reference_stores: BTreeSet<u32>,
@@ -314,6 +347,8 @@ struct NativeOptimizingAdmission {
     releasable_globals: BTreeSet<u32>,
     plain_globals: BTreeSet<u32>,
     reference_source_parameters: BTreeSet<usize>,
+    by_ref_array_parameters: BTreeSet<usize>,
+    by_ref_array_instructions: BTreeSet<u32>,
     property_requirements: Vec<NativeEntryPropertyRequirement>,
     static_property_requirements: Vec<NativeEntryStaticPropertyRequirement>,
     object_layout_requirements: Vec<NativeEntryObjectLayoutRequirement>,
@@ -353,8 +388,19 @@ impl NativeOptimizingAdmission {
         self.total_array_instructions.contains(&continuation_id)
     }
 
+    fn array_instruction_root_is_by_reference(&self, continuation_id: u32) -> bool {
+        self.by_ref_array_instructions.contains(&continuation_id)
+    }
+
     fn binary_instruction_is_total(&self, continuation_id: u32) -> bool {
         self.total_binary_instructions.contains(&continuation_id)
+    }
+
+    fn binary_instruction_operand_classes(
+        &self,
+        continuation_id: u32,
+    ) -> Option<(SsaValueClass, SsaValueClass)> {
+        self.binary_operand_classes.get(&continuation_id).copied()
     }
 
     fn scalar_control_instruction_is_total(&self, continuation_id: u32) -> bool {
@@ -364,6 +410,10 @@ impl NativeOptimizingAdmission {
 
     fn array_instruction_is_fresh(&self, continuation_id: u32) -> bool {
         self.fresh_array_instructions.contains(&continuation_id)
+    }
+
+    fn fresh_array_capacity(&self, continuation_id: u32) -> Option<u32> {
+        self.fresh_array_capacities.get(&continuation_id).copied()
     }
 
     fn local_load_is_total(&self, continuation_id: u32) -> bool {
@@ -500,6 +550,31 @@ fn publication_return_plan(
     }
 }
 
+fn publication_type_fact(type_: &php_ir::IrReturnType) -> Option<crate::region_ir::SsaValueFact> {
+    use php_ir::IrReturnType as Type;
+
+    let class = match type_ {
+        Type::Null | Type::Void => SsaValueClass::Null,
+        Type::Bool | Type::True | Type::False => SsaValueClass::Bool,
+        Type::Int => SsaValueClass::Int,
+        Type::Float => SsaValueClass::Float,
+        Type::String => SsaValueClass::StringHandle,
+        Type::Array | Type::Iterable => SsaValueClass::ArrayHandle,
+        Type::Object | Type::Class { .. } => SsaValueClass::ObjectHandle,
+        Type::Callable => SsaValueClass::CallableHandle,
+        Type::Mixed
+        | Type::Never
+        | Type::Nullable { .. }
+        | Type::Union { .. }
+        | Type::Intersection { .. }
+        | Type::Dnf { .. } => return None,
+    };
+    Some(crate::region_ir::SsaValueFact::known(
+        class,
+        SsaOwnership::Owned,
+    ))
+}
+
 fn entry_array_source(
     operand: RegionOperand,
     definitions: &BTreeMap<RegId, RegionOperand>,
@@ -567,6 +642,51 @@ fn publication_entry_array_source(
         ));
     }
     Ok(source)
+}
+
+fn publication_array_sources(
+    region: &RegionGraph,
+    definitions: &BTreeMap<RegId, RegionOperand>,
+    parameter_indices: &BTreeMap<LocalId, usize>,
+    by_ref_parameters: &BTreeSet<LocalId>,
+    internal_sources: &BTreeMap<RegId, BTreeSet<NativeEntryArraySource>>,
+    operand: RegionOperand,
+    continuation_id: u32,
+    family: &str,
+    allow_by_reference: bool,
+) -> Result<BTreeSet<NativeEntryArraySource>, CraneliftLoweringError> {
+    let root = publication_root_operand(operand, definitions);
+    let sources = if let Some(source) = entry_array_source(root, definitions, parameter_indices) {
+        BTreeSet::from([source])
+    } else if let RegionOperand::Register(register) = root {
+        internal_sources.get(&register).cloned().ok_or_else(|| {
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_SHAPE",
+                format!(
+                    "{family} at continuation {continuation_id} has no publication-total array producer",
+                ),
+            )
+        })?
+    } else {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_SHAPE",
+            format!("{family} at continuation {continuation_id} is not a published native array",),
+        ));
+    };
+    for source in &sources {
+        if !allow_by_reference
+            && let NativeEntryArraySource::Parameter(index) = *source
+            && by_ref_parameters.contains(&region.parameter_locals[index])
+        {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_REFERENCE",
+                format!(
+                    "{family} at continuation {continuation_id} receives a by-reference entry array",
+                ),
+            ));
+        }
+    }
+    Ok(sources)
 }
 
 fn publication_integer_array_key(constants: &[IrConstant], key: RegionOperand) -> Option<i64> {
@@ -768,8 +888,70 @@ fn admit_publication_string(
             minimum_length,
             offset: None,
             allocation_multiplier,
+            value_multiplier: 0,
+            array_entry_multiplier: 0,
         });
     Ok(Some(parameter_index))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_publication_string_with_internal_source(
+    admission: &mut NativeOptimizingAdmission,
+    internal_sources: &BTreeMap<RegId, usize>,
+    value_flow: &ExecutableValueFlow,
+    constants: &[IrConstant],
+    definitions: &BTreeMap<RegId, RegionOperand>,
+    parameter_indices: &BTreeMap<LocalId, usize>,
+    operand: RegionOperand,
+    minimum_length: usize,
+    allocation_multiplier: usize,
+    continuation_id: u32,
+    family: &str,
+) -> Result<Option<usize>, CraneliftLoweringError> {
+    if let RegionOperand::Register(register) = publication_root_operand(operand, definitions)
+        && let Some(parameter_index) = internal_sources.get(&register).copied()
+    {
+        let fact = lowering_operand_fact(value_flow, constants, operand);
+        if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+            || fact.class != SsaValueClass::StringHandle
+        {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_STRING_PUBLICATION",
+                format!(
+                    "{family} at continuation {continuation_id} lost its native string result fact",
+                ),
+            ));
+        }
+        admission
+            .value_class_requirements
+            .push(NativeEntryValueClassRequirement {
+                parameter_index,
+                class: SsaValueClass::StringHandle,
+            });
+        admission
+            .string_requirements
+            .push(NativeEntryStringRequirement {
+                parameter_index,
+                minimum_length,
+                offset: None,
+                allocation_multiplier,
+                value_multiplier: 0,
+                array_entry_multiplier: 0,
+            });
+        return Ok(Some(parameter_index));
+    }
+    admit_publication_string(
+        admission,
+        value_flow,
+        constants,
+        definitions,
+        parameter_indices,
+        operand,
+        minimum_length,
+        allocation_multiplier,
+        continuation_id,
+        family,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -821,6 +1003,7 @@ fn admit_publication_integer(
         .integer_requirements
         .push(NativeEntryIntegerRequirement {
             parameter_index,
+            by_reference: false,
             minimum,
             maximum,
             forbidden_values: forbidden_values.to_vec(),
@@ -1012,8 +1195,18 @@ fn publish_total_fixed_builtin_plan(
     } else if stable_builtin_callback_neutral_array(&call.target).is_some() {
         NativeExactCallbackPlan::CallbackAndArgumentArray
     } else if stable_builtin_callable_query(&call.target).is_some()
-        || stable_builtin_callback_handler(&call.target).is_some()
-        || stable_builtin_autoload_callback(&call.target).is_some()
+        || matches!(
+            stable_builtin_callback_handler(&call.target),
+            Some(
+                StableCallbackHandlerBuiltin::SetError | StableCallbackHandlerBuiltin::SetException
+            )
+        )
+        || matches!(
+            stable_builtin_autoload_callback(&call.target),
+            Some(
+                StableAutoloadCallbackBuiltin::Register | StableAutoloadCallbackBuiltin::Unregister
+            )
+        )
     {
         NativeExactCallbackPlan::CallableValue
     } else {
@@ -1073,16 +1266,6 @@ fn optimizing_admission_for_region(
     // made immediate-only regions depend on allocator state and concealed
     // missing family plans behind an arbitrary warm-path budget.
     let mut admission = NativeOptimizingAdmission::default();
-    if region
-        .exception_regions
-        .iter()
-        .any(|handler| handler.exception_local.is_some())
-    {
-        return Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_HANDLER_LVALUE_BOUNDARY",
-            "catch-local replacement is not total at optimizing entry",
-        ));
-    }
     let parameter_indices = region
         .parameter_locals
         .iter()
@@ -1105,13 +1288,167 @@ fn optimizing_admission_for_region(
         .iter()
         .flat_map(|block| &block.instructions)
         .filter_map(|instruction| match instruction.kind {
-            RegionInstructionKind::LoadLocal {
-                dst, local, quiet, ..
-            } if !quiet => Some((dst, RegionOperand::Local(local))),
+            RegionInstructionKind::LoadLocal { dst, local, .. } => {
+                Some((dst, RegionOperand::Local(local)))
+            }
             RegionInstructionKind::Move { dst, src } => Some((dst, src)),
             _ => None,
         })
         .collect::<BTreeMap<_, _>>();
+    let published_call_result_facts = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| {
+            let RegionInstructionKind::NativeCall(call) = &instruction.kind else {
+                return None;
+            };
+            let RegionCallResult::Register(result) = call.result else {
+                return None;
+            };
+            let return_type = if let Some(target) = call
+                .direct_compiled_target()
+                .or_else(|| call.direct_compiled_unpack_target())
+            {
+                let metadata = function_params.get(&target)?;
+                (!metadata.returns_by_reference)
+                    .then_some(metadata.return_type.as_ref())
+                    .flatten()
+            } else {
+                let signature = external_function_signatures.iter().find(|signature| {
+                    signature.published
+                        && match &call.target {
+                            RegionCallTarget::Function {
+                                name,
+                                function: None,
+                            } => signature
+                                .name
+                                .trim_start_matches('\\')
+                                .eq_ignore_ascii_case(name.trim_start_matches('\\')),
+                            RegionCallTarget::Method {
+                                function: None,
+                                linked_function: Some(link_index),
+                                ..
+                            } => signature.link_index == *link_index,
+                            _ => false,
+                        }
+                })?;
+                (!signature.returns_by_reference)
+                    .then_some(signature.return_type.as_ref())
+                    .flatten()
+            }?;
+            let fact = publication_type_fact(return_type)?;
+            Some((result, fact))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let publication_operand_fact = |operand: RegionOperand| {
+        if let RegionOperand::Register(register) = operand
+            && let Some(fact) = published_call_result_facts.get(&register).copied()
+        {
+            return fact;
+        }
+        if let RegionOperand::Local(local) = publication_root_operand(operand, &definitions)
+            && let Some(parameter) = region
+                .params
+                .iter()
+                .find(|parameter| parameter.local == local)
+            && let Some(fact) = parameter.type_.as_ref().and_then(publication_type_fact)
+        {
+            return fact;
+        }
+        lowering_operand_fact(value_flow, constants, operand)
+    };
+    let mut internal_array_sources = BTreeMap::<RegId, BTreeSet<NativeEntryArraySource>>::new();
+    for instruction in region.blocks.iter().flat_map(|block| &block.instructions) {
+        match &instruction.kind {
+            RegionInstructionKind::NewArray { dst } => {
+                internal_array_sources.insert(*dst, BTreeSet::new());
+            }
+            RegionInstructionKind::NativeCall(call)
+                if matches!(call.result, RegionCallResult::Register(_)) =>
+            {
+                let RegionCallResult::Register(result) = call.result else {
+                    unreachable!("native call result was matched as a register")
+                };
+                let result_fact =
+                    lowering_operand_fact(value_flow, constants, RegionOperand::Register(result));
+                let known_array_result = stable_builtin_array_constructor(&call.target).is_some()
+                    || stable_builtin_array_shape(&call.target).is_some()
+                    || stable_builtin_array_set(&call.target).is_some()
+                    || stable_builtin_callback_neutral_array(&call.target).is_some()
+                    || stable_builtin_array_slice(&call.target)
+                    || stable_builtin_array_reverse(&call.target)
+                    || stable_builtin_array_merge(&call.target)
+                    || stable_builtin_array_projection(&call.target).is_some()
+                    || stable_builtin_array_splice(&call.target);
+                if !known_array_result
+                    && (result_fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                        || result_fact.class != SsaValueClass::ArrayHandle)
+                {
+                    continue;
+                }
+                let mut sources = BTreeSet::new();
+                let mut complete = true;
+                for operand in call.operands.iter().copied().flatten() {
+                    let fact = lowering_operand_fact(value_flow, constants, operand);
+                    let root = publication_root_operand(operand, &definitions);
+                    let internal = match root {
+                        RegionOperand::Register(register) => {
+                            internal_array_sources.get(&register).cloned()
+                        }
+                        _ => None,
+                    };
+                    if fact.class != SsaValueClass::ArrayHandle && internal.is_none() {
+                        continue;
+                    }
+                    if let Some(source) = entry_array_source(root, &definitions, &parameter_indices)
+                    {
+                        sources.insert(source);
+                    } else if let Some(upstream) = internal {
+                        sources.extend(upstream);
+                    } else {
+                        complete = false;
+                        break;
+                    }
+                }
+                if complete {
+                    internal_array_sources.insert(result, sources);
+                }
+            }
+            RegionInstructionKind::ArrayCallback(call) => {
+                let result_fact = lowering_operand_fact(
+                    value_flow,
+                    constants,
+                    RegionOperand::Register(call.result),
+                );
+                if result_fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                    || result_fact.class != SsaValueClass::ArrayHandle
+                {
+                    continue;
+                }
+                let mut sources = BTreeSet::new();
+                let mut complete = true;
+                for operand in &call.arrays {
+                    let root = publication_root_operand(*operand, &definitions);
+                    if let Some(source) = entry_array_source(root, &definitions, &parameter_indices)
+                    {
+                        sources.insert(source);
+                    } else if let RegionOperand::Register(register) = root
+                        && let Some(upstream) = internal_array_sources.get(&register)
+                    {
+                        sources.extend(upstream.iter().copied());
+                    } else {
+                        complete = false;
+                        break;
+                    }
+                }
+                if complete {
+                    internal_array_sources.insert(call.result, sources);
+                }
+            }
+            _ => {}
+        }
+    }
     let first_local_write = region
         .blocks
         .iter()
@@ -1156,6 +1493,22 @@ fn optimizing_admission_for_region(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
+    let fresh_array_insert_totals = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::ArrayInsert { array, .. }
+                if new_array_registers.contains(&array) =>
+            {
+                Some(array)
+            }
+            _ => None,
+        })
+        .fold(BTreeMap::<RegId, usize>::new(), |mut totals, array| {
+            *totals.entry(array).or_default() += 1;
+            totals
+        });
     let foreach_sources = region
         .blocks
         .iter()
@@ -1316,11 +1669,29 @@ fn optimizing_admission_for_region(
             *counts.entry(local).or_default() += 1;
             counts
         });
+    let mut predecessor_counts = vec![0_usize; region.blocks.len()];
+    let mut control_unstable_blocks = BTreeSet::new();
+    for (source_index, block) in region.blocks.iter().enumerate() {
+        for target in block.terminator.targets() {
+            if let Some(count) = predecessor_counts.get_mut(target.index()) {
+                *count = count.saturating_add(1);
+                if source_index >= target.index() {
+                    control_unstable_blocks.insert(target.index());
+                }
+            }
+        }
+    }
+    control_unstable_blocks.extend(
+        predecessor_counts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, count)| (*count > 1).then_some(index)),
+    );
     let mut unstable_before = BTreeSet::new();
     let mut external_effect_seen = false;
     for (block_index, block) in region.blocks.iter().enumerate() {
         for instruction in &block.instructions {
-            if block_index != 0 || external_effect_seen {
+            if control_unstable_blocks.contains(&block_index) || external_effect_seen {
                 unstable_before.insert(instruction.continuation_id);
             }
             let planned_lvalue_effect = matches!(
@@ -1346,8 +1717,25 @@ fn optimizing_admission_for_region(
             let planned_publication_total_query = matches!(
                 &instruction.kind,
                 RegionInstructionKind::NativeCall(call)
-                    if stable_builtin_type_predicate(&call.target).is_some()
+                    if stable_exact_control_builtin_family(&call.target).is_some()
+                        || stable_builtin_array_constructor(&call.target).is_some()
+                        || stable_builtin_array_shape(&call.target).is_some()
+                        || stable_builtin_array_set(&call.target).is_some()
+                        || stable_builtin_callback_neutral_array(&call.target).is_some()
+                        || stable_builtin_array_slice(&call.target)
+                        || stable_builtin_array_reverse(&call.target)
+                        || stable_builtin_array_merge(&call.target)
+                        || stable_builtin_array_lookup(&call.target).is_some()
+                        || stable_builtin_array_pointer(&call.target).is_some()
+                        || stable_builtin_array_stack(&call.target).is_some()
+                        || stable_builtin_array_splice(&call.target)
+                        || stable_builtin_array_projection(&call.target).is_some()
+                        || stable_builtin_array_edge_key(&call.target).is_some()
+                        || stable_builtin_array_is_list(&call.target)
+                        || stable_builtin_array_key_exists(&call.target)
+                        || stable_builtin_type_predicate(&call.target).is_some()
                         || stable_builtin_length(&call.target).is_some()
+                        || stable_builtin_extrema(&call.target).is_some()
                         || matches!(
                             stable_builtin_array_aggregate(&call.target),
                             Some(
@@ -1361,8 +1749,20 @@ fn optimizing_admission_for_region(
                                         == Some(crate::region_ir::SsaIntegerRange::exact(0))
                                 }))
             );
+            let planned_total_callback = matches!(
+                &instruction.kind,
+                RegionInstructionKind::ArrayCallback(call)
+                    if matches!(call.callback, RegionArrayCallbackTarget::Stable(_))
+            ) || matches!(
+                &instruction.kind,
+                RegionInstructionKind::PregCallbackArray(call)
+                    if call.entries.iter().all(|entry| {
+                        matches!(entry.callback, RegionArrayCallbackTarget::Stable(_))
+                    })
+            );
             external_effect_seen |= !planned_lvalue_effect
                 && !planned_publication_total_query
+                && !planned_total_callback
                 && matches!(
                     instruction.kind,
                     RegionInstructionKind::NativeCall(_)
@@ -1433,15 +1833,82 @@ fn optimizing_admission_for_region(
         })
         .collect();
     let mut admitted_array_fetches = BTreeMap::<RegId, (NativeEntryArraySource, i64)>::new();
+    let mut published_property_array_sources = BTreeMap::<RegId, usize>::new();
     let mut entry_dependent_continuations = BTreeSet::new();
     let mut fresh_insert_modes = BTreeMap::<RegId, bool>::new();
     let mut fresh_insert_keys = BTreeMap::<RegId, BTreeSet<NativeEntryArrayKey>>::new();
     let mut fresh_insert_counts = BTreeMap::<RegId, usize>::new();
     let mut fresh_spread_targets = BTreeSet::<RegId>::new();
+    let mut published_string_sources = BTreeMap::<RegId, usize>::new();
+    let mut published_explode_string_sources = BTreeMap::<RegId, usize>::new();
+    let published_single_byte_strings = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::NativeCall(call) if stable_builtin_chr(&call.target) => {
+                match call.result {
+                    RegionCallResult::Register(result) => Some(result),
+                    RegionCallResult::ReferenceLocal(_) | RegionCallResult::Discard => None,
+                }
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut published_array_stack_lengths = BTreeMap::<NativeEntryArraySource, isize>::new();
+    let single_local_store_facts = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::StoreLocal { local, src } => {
+                Some((local, lowering_operand_fact(value_flow, constants, src)))
+            }
+            _ => None,
+        })
+        .fold(
+            BTreeMap::<LocalId, Option<crate::region_ir::SsaValueFact>>::new(),
+            |mut facts, (local, fact)| {
+                facts
+                    .entry(local)
+                    .and_modify(|existing| *existing = None)
+                    .or_insert(Some(fact));
+                facts
+            },
+        );
+    let mut published_integer_results = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::NativeCall(call)
+                if stable_builtin_array_pointer(&call.target).is_some()
+                    || stable_builtin_array_stack(&call.target).is_some()
+                    || stable_builtin_length(&call.target).is_some()
+                    || matches!(
+                        stable_builtin_array_aggregate(&call.target),
+                        Some(
+                            StableArrayAggregateBuiltin::Count
+                                | StableArrayAggregateBuiltin::SizeOf
+                        )
+                    ) =>
+            {
+                match call.result {
+                    RegionCallResult::Register(result) => Some(result),
+                    RegionCallResult::Discard | RegionCallResult::ReferenceLocal(_) => None,
+                }
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     for instruction in region.blocks.iter().flat_map(|block| &block.instructions) {
         if let RegionInstructionKind::Binary { dst, op, lhs, rhs } = instruction.kind {
-            let lhs_fact = lowering_operand_fact(value_flow, constants, lhs);
-            let rhs_fact = lowering_operand_fact(value_flow, constants, rhs);
+            let lhs_fact = publication_operand_fact(lhs);
+            let rhs_fact = publication_operand_fact(rhs);
+            let lhs_numeric_fact =
+                fixed_numeric_operand_fact(value_flow, constants, lhs).unwrap_or(lhs_fact);
+            let rhs_numeric_fact =
+                fixed_numeric_operand_fact(value_flow, constants, rhs).unwrap_or(rhs_fact);
             let result_fact = value_flow.register_fact(dst);
             let known = |fact: crate::region_ir::SsaValueFact, class| {
                 fact.certainty != crate::region_ir::SsaCertainty::Unknown && fact.class == class
@@ -1471,28 +1938,189 @@ fn optimizing_admission_for_region(
                         // admitted key/value at most once. Reserving one
                         // projection for each source covers the capacity of
                         // their combined upper bound.
-                        requirement.projection_allocations =
-                            requirement.projection_allocations.saturating_add(1);
+                        let _ = requirement;
                         requirement.require_supported_keys = true;
                         requirement.require_plain_values = true;
                     }
                     entry_dependent_continuations.insert(continuation);
                 }
                 RegionBinaryOp::Add | RegionBinaryOp::Sub | RegionBinaryOp::Mul
-                    if known(lhs_fact, SsaValueClass::Int)
-                        && known(rhs_fact, SsaValueClass::Int)
+                    if known(lhs_numeric_fact, SsaValueClass::Int)
+                        && known(rhs_numeric_fact, SsaValueClass::Int)
                         && result_fact.integer_range.is_some() => {}
                 RegionBinaryOp::Add | RegionBinaryOp::Sub | RegionBinaryOp::Mul
-                    if numeric(lhs_fact)
-                        && numeric(rhs_fact)
+                    if known(lhs_numeric_fact, SsaValueClass::Int)
+                        && known(rhs_numeric_fact, SsaValueClass::Int) =>
+                {
+                    let fixed_integer = |operand| {
+                        publication_integer_operand(constants, &definitions, operand).or_else(
+                            || match fixed_numeric_string_value(constants, operand) {
+                                Some(
+                                    php_runtime::experimental::numeric_string::NumericStringValue::Int(
+                                        value,
+                                    ),
+                                ) => Some(value),
+                                _ => None,
+                            },
+                        )
+                    };
+                    let lhs_fixed = fixed_integer(lhs);
+                    let rhs_fixed = fixed_integer(rhs);
+                    let published_integer = |operand| {
+                        matches!(
+                            publication_root_operand(operand, &definitions),
+                            RegionOperand::Register(register)
+                                if published_integer_results.contains(&register)
+                        )
+                    };
+                    let by_reference_integer_parameter = |operand| {
+                        let parameter_index =
+                            publication_entry_parameter(operand, &definitions, &parameter_indices)?;
+                        region
+                            .params
+                            .get(parameter_index)
+                            .is_some_and(|parameter| {
+                                parameter.by_ref
+                                    && parameter.type_.as_ref() == Some(&php_ir::IrReturnType::Int)
+                            })
+                            .then_some(parameter_index)
+                    };
+                    if let (Some(left), Some(right)) = (lhs_fixed, rhs_fixed) {
+                        let total = match op {
+                            RegionBinaryOp::Add => left.checked_add(right),
+                            RegionBinaryOp::Sub => left.checked_sub(right),
+                            RegionBinaryOp::Mul => left.checked_mul(right),
+                            _ => unreachable!("integer arithmetic publication operation"),
+                        };
+                        if total.is_none() {
+                            return Err(CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_BINARY_OVERFLOW_PUBLICATION",
+                                format!(
+                                    "integer arithmetic at continuation {continuation} has a fixed overflowing result",
+                                ),
+                            ));
+                        }
+                    }
+                    let (lhs_minimum, lhs_maximum, rhs_minimum, rhs_maximum) =
+                        match (op, lhs_fixed, rhs_fixed) {
+                            (RegionBinaryOp::Add, Some(left), None) => (
+                                left,
+                                left,
+                                i64::MIN.saturating_sub(left),
+                                i64::MAX.saturating_sub(left),
+                            ),
+                            (RegionBinaryOp::Add, None, Some(right)) => (
+                                i64::MIN.saturating_sub(right),
+                                i64::MAX.saturating_sub(right),
+                                right,
+                                right,
+                            ),
+                            (RegionBinaryOp::Sub, Some(left), None) => (
+                                left,
+                                left,
+                                left.saturating_sub(i64::MAX),
+                                left.saturating_sub(i64::MIN),
+                            ),
+                            (RegionBinaryOp::Sub, None, Some(right)) => (
+                                i64::MIN.saturating_add(right),
+                                i64::MAX.saturating_add(right),
+                                right,
+                                right,
+                            ),
+                            (RegionBinaryOp::Mul, Some(fixed), None)
+                            | (RegionBinaryOp::Mul, None, Some(fixed)) => {
+                                let (minimum, maximum) = if fixed == 0 {
+                                    (i64::MIN, i64::MAX)
+                                } else if fixed == -1 {
+                                    (i64::MIN.saturating_add(1), i64::MAX)
+                                } else if fixed > 0 {
+                                    (i64::MIN / fixed, i64::MAX / fixed)
+                                } else {
+                                    (i64::MAX / fixed, i64::MIN / fixed)
+                                };
+                                if lhs_fixed.is_some() {
+                                    (fixed, fixed, minimum, maximum)
+                                } else {
+                                    (minimum, maximum, fixed, fixed)
+                                }
+                            }
+                            (_, Some(left), Some(right)) => (left, left, right, right),
+                            (RegionBinaryOp::Add | RegionBinaryOp::Sub, None, None) => {
+                                (i64::MIN / 2, i64::MAX / 2, i64::MIN / 2, i64::MAX / 2)
+                            }
+                            (RegionBinaryOp::Mul, None, None) => {
+                                (-3_037_000_499, 3_037_000_499, -3_037_000_499, 3_037_000_499)
+                            }
+                            _ => unreachable!("integer arithmetic publication operation"),
+                        };
+                    if lhs_fixed.is_none() && !published_integer(lhs) {
+                        if let Some(parameter_index) = by_reference_integer_parameter(lhs) {
+                            admission
+                                .integer_requirements
+                                .push(NativeEntryIntegerRequirement {
+                                    parameter_index,
+                                    by_reference: true,
+                                    minimum: lhs_minimum,
+                                    maximum: lhs_maximum,
+                                    forbidden_values: Vec::new(),
+                                });
+                        } else {
+                            admit_publication_integer(
+                                &mut admission,
+                                value_flow,
+                                constants,
+                                &definitions,
+                                &parameter_indices,
+                                lhs,
+                                lhs_minimum,
+                                lhs_maximum,
+                                &[],
+                                continuation,
+                                "integer arithmetic",
+                            )?;
+                        }
+                    }
+                    if rhs_fixed.is_none() && !published_integer(rhs) {
+                        if let Some(parameter_index) = by_reference_integer_parameter(rhs) {
+                            admission
+                                .integer_requirements
+                                .push(NativeEntryIntegerRequirement {
+                                    parameter_index,
+                                    by_reference: true,
+                                    minimum: rhs_minimum,
+                                    maximum: rhs_maximum,
+                                    forbidden_values: Vec::new(),
+                                });
+                        } else {
+                            admit_publication_integer(
+                                &mut admission,
+                                value_flow,
+                                constants,
+                                &definitions,
+                                &parameter_indices,
+                                rhs,
+                                rhs_minimum,
+                                rhs_maximum,
+                                &[],
+                                continuation,
+                                "integer arithmetic",
+                            )?;
+                        }
+                    }
+                    published_integer_results.insert(dst);
+                    entry_dependent_continuations.insert(continuation);
+                }
+                RegionBinaryOp::Add | RegionBinaryOp::Sub | RegionBinaryOp::Mul
+                    if numeric(lhs_numeric_fact)
+                        && numeric(rhs_numeric_fact)
                         && matches!(
-                            (lhs_fact.class, rhs_fact.class),
+                            (lhs_numeric_fact.class, rhs_numeric_fact.class),
                             (SsaValueClass::Float, _) | (_, SsaValueClass::Float)
                         ) => {}
-                RegionBinaryOp::Div if numeric(lhs_fact) && numeric(rhs_fact) => {
-                    match rhs_fact.class {
+                RegionBinaryOp::Div if numeric(lhs_numeric_fact) && numeric(rhs_numeric_fact) => {
+                    match rhs_numeric_fact.class {
                         SsaValueClass::Int => {
-                            if !rhs_fact
+                            if !rhs_numeric_fact
                                 .integer_range
                                 .is_some_and(|range| range.excludes(0))
                             {
@@ -1564,10 +2192,10 @@ fn optimizing_admission_for_region(
                     }
                 }
                 RegionBinaryOp::Mod
-                    if known(lhs_fact, SsaValueClass::Int)
-                        && known(rhs_fact, SsaValueClass::Int) =>
+                    if known(lhs_numeric_fact, SsaValueClass::Int)
+                        && known(rhs_numeric_fact, SsaValueClass::Int) =>
                 {
-                    if !rhs_fact
+                    if !rhs_numeric_fact
                         .integer_range
                         .is_some_and(|range| range.excludes(0))
                     {
@@ -1591,10 +2219,7 @@ fn optimizing_admission_for_region(
                     if known(lhs_fact, SsaValueClass::Int)
                         && known(rhs_fact, SsaValueClass::Int) =>
                 {
-                    if !rhs_fact
-                        .integer_range
-                        .is_some_and(|range| range.minimum >= 0)
-                    {
+                    if rhs_fact.integer_range.is_none_or(|range| range.minimum < 0) {
                         admit_publication_integer(
                             &mut admission,
                             value_flow,
@@ -1679,7 +2304,7 @@ fn optimizing_admission_for_region(
                         }
                     }
                 }
-                RegionBinaryOp::Pow if numeric(lhs_fact) && numeric(rhs_fact) => {}
+                RegionBinaryOp::Pow if numeric(lhs_numeric_fact) && numeric(rhs_numeric_fact) => {}
                 _ => {
                     return Err(CraneliftLoweringError::new(
                         "JIT_CRANELIFT_REJECT_BINARY_PUBLICATION",
@@ -1689,6 +2314,9 @@ fn optimizing_admission_for_region(
                     ));
                 }
             }
+            admission
+                .binary_operand_classes
+                .insert(continuation, (lhs_fact.class, rhs_fact.class));
             admission.total_binary_instructions.insert(continuation);
         }
         if let RegionInstructionKind::Echo { src } = instruction.kind {
@@ -1908,7 +2536,28 @@ fn optimizing_admission_for_region(
         }
         if let RegionInstructionKind::EmptyLocal { local, .. } = instruction.kind {
             let operand = RegionOperand::Local(local);
-            let fact = lowering_operand_fact(value_flow, constants, operand);
+            let stored_operand = region
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .filter_map(|candidate| match candidate.kind {
+                    RegionInstructionKind::StoreLocal {
+                        local: candidate_local,
+                        src,
+                    } if candidate_local == local => Some(src),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let publication_operand = match stored_operand.as_slice() {
+                [source] => *source,
+                _ => operand,
+            };
+            let fact = single_local_store_facts
+                .get(&local)
+                .copied()
+                .flatten()
+                .filter(|fact| fact.certainty != crate::region_ir::SsaCertainty::Unknown)
+                .unwrap_or_else(|| lowering_operand_fact(value_flow, constants, operand));
             if fact.certainty == crate::region_ir::SsaCertainty::Unknown
                 || matches!(
                     fact.class,
@@ -1931,7 +2580,7 @@ fn optimizing_admission_for_region(
                 constants,
                 &definitions,
                 &parameter_indices,
-                operand,
+                publication_operand,
                 fact.class,
                 instruction.continuation_id,
                 "empty-local truthiness",
@@ -1992,7 +2641,7 @@ fn optimizing_admission_for_region(
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
         }
-        if let RegionInstructionKind::NewArray { .. } = instruction.kind {
+        if let RegionInstructionKind::NewArray { dst } = instruction.kind {
             admission
                 .total_array_instructions
                 .insert(instruction.continuation_id);
@@ -2000,9 +2649,24 @@ fn optimizing_admission_for_region(
                 .fresh_array_instructions
                 .insert(instruction.continuation_id);
             admission.fixed_value_allocations = admission.fixed_value_allocations.saturating_add(1);
-            admission.fixed_array_entries = admission
-                .fixed_array_entries
-                .saturating_add(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize);
+            let capacity = fresh_array_insert_totals
+                .get(&dst)
+                .copied()
+                .unwrap_or(0)
+                .max(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
+                .checked_next_power_of_two()
+                .filter(|capacity| *capacity <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY)
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_LITERAL_CAPACITY",
+                        "fresh array exceeds the authoritative native entry arena",
+                    )
+                })?;
+            admission.fresh_array_capacities.insert(
+                instruction.continuation_id,
+                u32::try_from(capacity).expect("native array capacity is bounded by the arena"),
+            );
+            admission.fixed_array_entries = admission.fixed_array_entries.saturating_add(capacity);
         }
         if let RegionInstructionKind::ArrayInsert {
             array,
@@ -2064,6 +2728,7 @@ fn optimizing_admission_for_region(
                 ));
             }
             if let Some(key) = key {
+                let key = publication_root_operand(key, &definitions);
                 let normalized = publication_native_array_key(constants, key).ok_or_else(|| {
                     CraneliftLoweringError::new(
                         "JIT_CRANELIFT_REJECT_ARRAY_LITERAL_KEY",
@@ -2090,7 +2755,7 @@ fn optimizing_admission_for_region(
             }
             let count = fresh_insert_counts.entry(array).or_default();
             *count = count.saturating_add(1);
-            if *count > crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize {
+            if *count > crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY {
                 return Err(CraneliftLoweringError::new(
                     "JIT_CRANELIFT_REJECT_ARRAY_LITERAL_CAPACITY",
                     format!(
@@ -2154,6 +2819,19 @@ fn optimizing_admission_for_region(
             entry_dependent_continuations.insert(instruction.continuation_id);
         }
         if let RegionInstructionKind::ForeachInit { iterator, source } = instruction.kind {
+            let root = publication_root_operand(source, &definitions);
+            if let RegionOperand::Register(register) = root
+                && (new_array_registers.contains(&register)
+                    || internal_array_sources.contains_key(&register))
+            {
+                admission
+                    .total_array_instructions
+                    .insert(instruction.continuation_id);
+                admission.fixed_value_allocations =
+                    admission.fixed_value_allocations.saturating_add(1);
+                debug_assert!(foreach_sources.contains_key(&iterator));
+                continue;
+            }
             let source =
                 entry_array_source(source, &definitions, &parameter_indices).ok_or_else(|| {
                     CraneliftLoweringError::new(
@@ -2526,9 +3204,11 @@ fn optimizing_admission_for_region(
                     ),
                 )
             })?;
+            let by_reference = by_ref_parameters.contains(&local);
             if keys.is_empty()
-                || by_ref_parameters.contains(&local)
-                || value_flow.local_storage(local) != crate::region_ir::LocalStorageClass::SsaPlain
+                || !by_reference
+                    && value_flow.local_storage(local)
+                        != crate::region_ir::LocalStorageClass::SsaPlain
                 || array_local_mutation_counts.get(&local).copied() != Some(1)
             {
                 return Err(CraneliftLoweringError::new(
@@ -2579,6 +3259,9 @@ fn optimizing_admission_for_region(
                     parents: parents.to_vec(),
                     key,
                 });
+            if by_reference {
+                admission.by_ref_array_parameters.insert(source_index);
+            }
             admission
                 .total_array_instructions
                 .insert(instruction.continuation_id);
@@ -2791,7 +3474,12 @@ fn optimizing_admission_for_region(
                     .total_local_loads
                     .insert(instruction.continuation_id);
                 admission.initialized_request_locals.insert(local);
-            } else if instruction.live_locals.contains(&local) {
+            } else if instruction.live_locals.contains(&local)
+                || region
+                    .exception_regions
+                    .iter()
+                    .any(|handler| handler.exception_local == Some(local))
+            {
                 admission
                     .total_local_loads
                     .insert(instruction.continuation_id);
@@ -2816,6 +3504,44 @@ fn optimizing_admission_for_region(
             && instruction.native_global_name.is_none()
         {
             let source = entry_array_source(array, &definitions, &parameter_indices);
+            if source.is_none()
+                && let RegionOperand::Register(register) =
+                    publication_root_operand(array, &definitions)
+                && new_array_registers.contains(&register)
+            {
+                let key = publication_integer_array_key(constants, key).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_DIM_KEY_NORMALIZATION",
+                        format!(
+                            "dimension read at continuation {} has no publication-normalized integer key",
+                            instruction.continuation_id,
+                        ),
+                    )
+                })?;
+                if !quiet
+                    && mode == php_ir::instruction::DimFetchMode::Read
+                    && !(fresh_insert_modes.get(&register) == Some(&true)
+                        && key >= 0
+                        && usize::try_from(key).is_ok_and(|key| {
+                            key < fresh_insert_counts.get(&register).copied().unwrap_or(0)
+                        }))
+                    && !fresh_insert_keys
+                        .get(&register)
+                        .is_some_and(|keys| keys.contains(&NativeEntryArrayKey::Integer(key)))
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_DIM_WARNING_BOUNDARY",
+                        format!(
+                            "dimension read at continuation {} may warn after native entry",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                admission
+                    .total_array_instructions
+                    .insert(instruction.continuation_id);
+                continue;
+            }
             if source.is_none()
                 && let Some(local) = entry_array_root_local(array, &definitions)
                 && new_array_locals.contains(&local)
@@ -2846,6 +3572,34 @@ fn optimizing_admission_for_region(
                 admission
                     .total_array_instructions
                     .insert(instruction.continuation_id);
+                continue;
+            }
+            if source.is_none()
+                && let RegionOperand::Register(register) =
+                    publication_root_operand(array, &definitions)
+                && let Some(requirement_index) =
+                    published_property_array_sources.get(&register).copied()
+            {
+                let normalized_key =
+                    publication_native_array_key(constants, key).ok_or_else(|| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_ARRAY_DIM_KEY_NORMALIZATION",
+                            format!(
+                                "property dimension read at continuation {} has no publication-normalized key",
+                                instruction.continuation_id,
+                            ),
+                        )
+                    })?;
+                admission.property_requirements[requirement_index]
+                    .probe_paths
+                    .push(NativeEntryArrayProbeRequirement {
+                        keys: vec![normalized_key],
+                        leaf: NativeEntryArrayProbeLeaf::PlainValue,
+                    });
+                admission
+                    .total_array_instructions
+                    .insert(instruction.continuation_id);
+                entry_dependent_continuations.insert(instruction.continuation_id);
                 continue;
             }
             let source = source.ok_or_else(|| {
@@ -3051,7 +3805,12 @@ fn optimizing_admission_for_region(
                     if fact.certainty == crate::region_ir::SsaCertainty::Unknown
                         || !matches!(
                             fact.class,
-                            SsaValueClass::Int | SsaValueClass::Bool | SsaValueClass::Null
+                            SsaValueClass::Int
+                                | SsaValueClass::Bool
+                                | SsaValueClass::Null
+                                | SsaValueClass::Float
+                                | SsaValueClass::StringHandle
+                                | SsaValueClass::ArrayHandle
                         )
                     {
                         return Err(CraneliftLoweringError::new(
@@ -3267,6 +4026,7 @@ fn optimizing_admission_for_region(
                 }
                 _ => unreachable!("property requirement kind"),
             };
+            let requirement_index = admission.property_requirements.len();
             admission
                 .property_requirements
                 .push(NativeEntryPropertyRequirement {
@@ -3280,6 +4040,9 @@ fn optimizing_admission_for_region(
                     probe_paths: Vec::new(),
                     mutations: Vec::new(),
                 });
+            if let RegionInstructionKind::FetchProperty { dst, .. } = instruction.kind {
+                published_property_array_sources.insert(dst, requirement_index);
+            }
             entry_dependent_continuations.insert(instruction.continuation_id);
         }
         if let RegionInstructionKind::ArrayCallback(call) = &instruction.kind {
@@ -3300,29 +4063,32 @@ fn optimizing_admission_for_region(
                 | RegionArrayCallbackOperation::All
                 | RegionArrayCallbackOperation::Any
                 | RegionArrayCallbackOperation::Find
-                | RegionArrayCallbackOperation::FindKey => 2,
-                RegionArrayCallbackOperation::Walk => {
-                    2usize.saturating_add(usize::from(call.initial.is_some()))
-                }
-                RegionArrayCallbackOperation::Reduce
+                | RegionArrayCallbackOperation::FindKey
+                | RegionArrayCallbackOperation::Reduce
                 | RegionArrayCallbackOperation::Usort
                 | RegionArrayCallbackOperation::Uasort
-                | RegionArrayCallbackOperation::Uksort
-                | RegionArrayCallbackOperation::WalkRecursive
-                | RegionArrayCallbackOperation::PregReplace => {
-                    return Err(CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_CALLBACK_TOTAL_FAMILY",
-                        format!(
-                            "callback operation at continuation {} has no publication-total native family",
-                            instruction.continuation_id,
-                        ),
-                    ));
+                | RegionArrayCallbackOperation::Uksort => 2,
+                RegionArrayCallbackOperation::Walk
+                | RegionArrayCallbackOperation::WalkRecursive => {
+                    2usize.saturating_add(usize::from(call.initial.is_some()))
                 }
+                RegionArrayCallbackOperation::PregReplace => 1,
             };
+            let mutable_array_family = matches!(
+                call.operation,
+                RegionArrayCallbackOperation::Usort
+                    | RegionArrayCallbackOperation::Uasort
+                    | RegionArrayCallbackOperation::Uksort
+                    | RegionArrayCallbackOperation::Walk
+                    | RegionArrayCallbackOperation::WalkRecursive
+            );
             if callback.receiver.is_some()
                 || callback.closure.is_some()
-                || call.arrays.is_empty()
-                || call.operation != RegionArrayCallbackOperation::Map && call.arrays.len() != 1
+                || call.arrays.is_empty() && !(mutable_array_family && call.mutable_local.is_some())
+                || call.operation != RegionArrayCallbackOperation::Map
+                    && call.arrays.len() != 1
+                    && !mutable_array_family
+                    && call.operation != RegionArrayCallbackOperation::PregReplace
                 || matches!(
                     call.operation,
                     RegionArrayCallbackOperation::FilterValue
@@ -3332,8 +4098,15 @@ fn optimizing_admission_for_region(
                         | RegionArrayCallbackOperation::Any
                         | RegionArrayCallbackOperation::Find
                         | RegionArrayCallbackOperation::FindKey
-                        | RegionArrayCallbackOperation::Walk
+                        | RegionArrayCallbackOperation::Reduce
+                        | RegionArrayCallbackOperation::PregReplace
                 ) && !callback.returns_releasable_scalar
+                || matches!(
+                    call.operation,
+                    RegionArrayCallbackOperation::Usort
+                        | RegionArrayCallbackOperation::Uasort
+                        | RegionArrayCallbackOperation::Uksort
+                ) && !callback.returns_int
             {
                 return Err(CraneliftLoweringError::new(
                     "JIT_CRANELIFT_REJECT_CALLBACK_TOTAL_FAMILY",
@@ -3373,7 +4146,11 @@ fn optimizing_admission_for_region(
                 },
                 0,
                 provided_argument_count,
-                usize::from(call.operation == RegionArrayCallbackOperation::Walk),
+                usize::from(matches!(
+                    call.operation,
+                    RegionArrayCallbackOperation::Walk
+                        | RegionArrayCallbackOperation::WalkRecursive
+                )),
             )
             .ok_or_else(|| {
                 CraneliftLoweringError::new(
@@ -3393,8 +4170,11 @@ fn optimizing_admission_for_region(
                     .enumerate()
                     .any(|(index, parameter)| {
                         (parameter.by_ref
-                            && !(call.operation == RegionArrayCallbackOperation::Walk
-                                && index == 0))
+                            && !(matches!(
+                                call.operation,
+                                RegionArrayCallbackOperation::Walk
+                                    | RegionArrayCallbackOperation::WalkRecursive
+                            ) && index == 0))
                             || parameter
                                 .type_
                                 .as_ref()
@@ -3428,7 +4208,91 @@ fn optimizing_admission_for_region(
                     ),
                 ));
             }
-            for (index, operand) in call.arrays.iter().copied().enumerate() {
+            if call.operation == RegionArrayCallbackOperation::PregReplace {
+                if call.arrays.len() != 4
+                    || publication_string_length(constants, &definitions, call.arrays[0])
+                        .is_none_or(|length| length == 0)
+                {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_PREG_PATTERN_PUBLICATION",
+                        format!(
+                            "preg callback at continuation {} has no fixed nonempty pattern",
+                            instruction.continuation_id,
+                        ),
+                    ));
+                }
+                let subject_parameter = admit_publication_string(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    call.arrays[1],
+                    0,
+                    php_runtime::api::PHP_FLOAT_STRING_BUFFER_CAPACITY,
+                    instruction.continuation_id,
+                    "preg callback subject",
+                )?
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_PREG_SUBJECT_PUBLICATION",
+                        "preg callback subject is not rooted at an entry string",
+                    )
+                })?;
+                if let Some(requirement) = admission
+                    .string_requirements
+                    .iter_mut()
+                    .rev()
+                    .find(|requirement| requirement.parameter_index == subject_parameter)
+                {
+                    requirement.value_multiplier = 4;
+                    requirement.array_entry_multiplier =
+                        crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize;
+                }
+                admit_publication_integer(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    call.arrays[2],
+                    -1,
+                    i64::MAX,
+                    &[0],
+                    instruction.continuation_id,
+                    "preg callback limit",
+                )?;
+                admit_publication_integer(
+                    &mut admission,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    call.arrays[3],
+                    0,
+                    i64::from(u32::MAX),
+                    &[],
+                    instruction.continuation_id,
+                    "preg callback flags",
+                )?;
+                admission.fixed_value_allocations =
+                    admission.fixed_value_allocations.saturating_add(4);
+                admission.require_non_fiber_scope = true;
+                admission
+                    .total_array_instructions
+                    .insert(instruction.continuation_id);
+                entry_dependent_continuations.insert(instruction.continuation_id);
+                continue;
+            }
+            let callback_arrays = if call.arrays.is_empty() {
+                call.mutable_local
+                    .map(RegionOperand::Local)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            } else {
+                call.arrays.clone()
+            };
+            for (index, operand) in callback_arrays.into_iter().enumerate() {
                 let source =
                     entry_array_source(operand, &definitions, &parameter_indices).ok_or_else(|| {
                         CraneliftLoweringError::new(
@@ -3461,7 +4325,12 @@ fn optimizing_admission_for_region(
                     | RegionArrayCallbackOperation::Any
                     | RegionArrayCallbackOperation::Find
                     | RegionArrayCallbackOperation::FindKey
-                    | RegionArrayCallbackOperation::Walk => Some(0),
+                    | RegionArrayCallbackOperation::Walk
+                    | RegionArrayCallbackOperation::WalkRecursive => Some(0),
+                    RegionArrayCallbackOperation::Reduce => Some(1),
+                    RegionArrayCallbackOperation::Usort
+                    | RegionArrayCallbackOperation::Uasort
+                    | RegionArrayCallbackOperation::Uksort => Some(0),
                     RegionArrayCallbackOperation::FilterKey => None,
                     _ => unreachable!("unsupported callback operation was rejected above"),
                 };
@@ -3489,14 +4358,35 @@ fn optimizing_admission_for_region(
                         | RegionArrayCallbackOperation::Find
                         | RegionArrayCallbackOperation::FindKey
                         | RegionArrayCallbackOperation::Walk
+                        | RegionArrayCallbackOperation::WalkRecursive
+                        | RegionArrayCallbackOperation::Usort
+                        | RegionArrayCallbackOperation::Uasort
+                        | RegionArrayCallbackOperation::Uksort
                 ) {
                     requirement.require_supported_keys = true;
                 }
-                if call.operation == RegionArrayCallbackOperation::Walk {
+                if matches!(
+                    call.operation,
+                    RegionArrayCallbackOperation::Walk
+                        | RegionArrayCallbackOperation::WalkRecursive
+                ) {
                     requirement.value_allocations_per_entry =
                         requirement.value_allocations_per_entry.saturating_add(1);
                     requirement.projection_allocations =
                         requirement.projection_allocations.saturating_add(1);
+                }
+                if matches!(
+                    call.operation,
+                    RegionArrayCallbackOperation::Usort
+                        | RegionArrayCallbackOperation::Uasort
+                        | RegionArrayCallbackOperation::Uksort
+                ) {
+                    requirement.projection_allocations =
+                        requirement.projection_allocations.saturating_add(1);
+                    if let Some(type_) = target.params.get(1).and_then(|param| param.type_.as_ref())
+                    {
+                        requirement.all_value_types.push(type_.clone());
+                    }
                 }
             }
             admission.require_non_fiber_scope = true;
@@ -3506,19 +4396,96 @@ fn optimizing_admission_for_region(
             entry_dependent_continuations.insert(instruction.continuation_id);
             continue;
         }
-        if let RegionInstructionKind::PregCallbackArray(call) = &instruction.kind
-            && call
-                .entries
-                .iter()
-                .any(|entry| matches!(entry.callback, RegionArrayCallbackTarget::Runtime(_)))
-        {
-            return Err(CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_PREG_RUNTIME_CALLBACK_PUBLICATION",
-                format!(
-                    "runtime preg callback map at continuation {} is assigned to baseline before region entry",
-                    instruction.continuation_id,
-                ),
-            ));
+        if let RegionInstructionKind::PregCallbackArray(call) = &instruction.kind {
+            if call.entries.is_empty()
+                || call.entries.iter().any(|entry| {
+                    let RegionArrayCallbackTarget::Stable(callback) = &entry.callback else {
+                        return true;
+                    };
+                    let Some(function) = callback.function else {
+                        return true;
+                    };
+                    let Some(target) = function_params.get(&function) else {
+                        return true;
+                    };
+                    callback.receiver.is_some()
+                        || callback.closure.is_some()
+                        || !callback.returns_releasable_scalar
+                        || target.returns_by_reference
+                        || target.params.len() != 1
+                        || target.params[0].by_ref
+                        || target.params[0].variadic
+                        || target.params[0].type_.as_ref() != Some(&php_ir::IrReturnType::Array)
+                        || publication_string_length(constants, &definitions, entry.pattern)
+                            .is_none_or(|length| length == 0)
+                })
+            {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_PREG_RUNTIME_CALLBACK_PUBLICATION",
+                    format!(
+                        "preg callback map at continuation {} has no complete fixed target/pattern plan",
+                        instruction.continuation_id,
+                    ),
+                ));
+            }
+            let subject_parameter = admit_publication_string(
+                &mut admission,
+                value_flow,
+                constants,
+                &definitions,
+                &parameter_indices,
+                call.subject,
+                0,
+                php_runtime::api::PHP_FLOAT_STRING_BUFFER_CAPACITY
+                    .saturating_mul(call.entries.len()),
+                instruction.continuation_id,
+                "preg callback-array subject",
+            )?
+            .ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_PREG_SUBJECT_PUBLICATION",
+                    "preg callback-array subject is not rooted at an entry string",
+                )
+            })?;
+            if let Some(requirement) = admission
+                .string_requirements
+                .iter_mut()
+                .rev()
+                .find(|requirement| requirement.parameter_index == subject_parameter)
+            {
+                requirement.value_multiplier = 4usize.saturating_mul(call.entries.len());
+                requirement.array_entry_multiplier =
+                    (crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
+                        .saturating_mul(call.entries.len());
+            }
+            admit_publication_integer(
+                &mut admission,
+                value_flow,
+                constants,
+                &definitions,
+                &parameter_indices,
+                call.limit,
+                -1,
+                i64::MAX,
+                &[0],
+                instruction.continuation_id,
+                "preg callback-array limit",
+            )?;
+            if call.count_local.is_some() {
+                return Err(CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_PREG_COUNT_LVALUE_PUBLICATION",
+                    "preg callback-array count lvalue is not yet a published direct reference",
+                ));
+            }
+            admission.fixed_value_allocations = admission
+                .fixed_value_allocations
+                .saturating_add(4usize.saturating_mul(call.entries.len()));
+            admission.require_non_fiber_scope = true;
+            admission
+                .total_array_instructions
+                .insert(instruction.continuation_id);
+            entry_dependent_continuations.insert(instruction.continuation_id);
+            continue;
         }
         let immediate_local = |local: LocalId| {
             let fact = lowering_operand_fact(value_flow, constants, RegionOperand::Local(local));
@@ -3570,6 +4537,7 @@ fn optimizing_admission_for_region(
                     Ok(NativeEntryArrayMutationRequirement::Reference {
                         parents: parents.to_vec(),
                         key,
+                        allow_shared_root: false,
                     })
                 }
             };
@@ -3666,9 +4634,10 @@ fn optimizing_admission_for_region(
                         ),
                     )
                 })?;
-                if by_ref_parameters.contains(array)
-                    || value_flow.local_storage(*array)
-                        != crate::region_ir::LocalStorageClass::SsaPlain
+                let by_reference_root = by_ref_parameters.contains(array);
+                if (!by_reference_root
+                    && value_flow.local_storage(*array)
+                        != crate::region_ir::LocalStorageClass::SsaPlain)
                     || match &instruction.kind {
                         RegionInstructionKind::BindReferenceDim { .. } => {
                             !reference_target_local(*target)
@@ -3687,12 +4656,29 @@ fn optimizing_admission_for_region(
                         ),
                     ));
                 }
-                admission
+                if by_reference_root {
+                    admission.by_ref_array_parameters.insert(source_index);
+                    admission
+                        .by_ref_array_instructions
+                        .insert(instruction.continuation_id);
+                }
+                let mut mutation = reference_mutation(keys, false)?;
+                if by_reference_root
+                    && let NativeEntryArrayMutationRequirement::Reference {
+                        allow_shared_root, ..
+                    } = &mut mutation
+                {
+                    *allow_shared_root = true;
+                }
+                let requirement = admission
                     .array_requirements
                     .entry(NativeEntryArraySource::Parameter(source_index))
-                    .or_default()
-                    .mutations
-                    .push(reference_mutation(keys, false)?);
+                    .or_default();
+                if by_reference_root {
+                    requirement.projection_allocations =
+                        requirement.projection_allocations.saturating_add(1);
+                }
+                requirement.mutations.push(mutation);
                 admission.fixed_value_allocations =
                     admission.fixed_value_allocations.saturating_add(1);
                 admission
@@ -4465,11 +5451,7 @@ fn optimizing_admission_for_region(
                 .static_property_requirements
                 .push(NativeEntryStaticPropertyRequirement {
                     continuation_id: instruction.continuation_id,
-                    required_state: if dimension {
-                        crate::JIT_NATIVE_TRUSTED_STATIC_PROPERTY_WRITABLE
-                    } else {
-                        crate::JIT_NATIVE_TRUSTED_STATIC_PROPERTY_WRITABLE
-                    },
+                    required_state: crate::JIT_NATIVE_TRUSTED_STATIC_PROPERTY_WRITABLE,
                     readable: !*bind_source_into_property || dimension,
                     releasable: *bind_source_into_property && !dimension,
                     allow_reference: !dimension,
@@ -4504,7 +5486,12 @@ fn optimizing_admission_for_region(
                     if fact.certainty == crate::region_ir::SsaCertainty::Unknown
                         || !matches!(
                             fact.class,
-                            SsaValueClass::Int | SsaValueClass::Bool | SsaValueClass::Null
+                            SsaValueClass::Int
+                                | SsaValueClass::Bool
+                                | SsaValueClass::Null
+                                | SsaValueClass::Float
+                                | SsaValueClass::StringHandle
+                                | SsaValueClass::ArrayHandle
                         )
                     {
                         return Err(CraneliftLoweringError::new(
@@ -5139,6 +6126,8 @@ fn optimizing_admission_for_region(
                             minimum_length: 1,
                             offset: None,
                             allocation_multiplier: 0,
+                            value_multiplier: 0,
+                            array_entry_multiplier: 0,
                         });
                 }
             }
@@ -5234,22 +6223,22 @@ fn optimizing_admission_for_region(
                 })
                 .transpose()?
                 .unwrap_or(NativeEntryStringOffset::Constant(0));
-            if let Some(haystack_length) = haystack_length {
-                if let NativeEntryStringOffset::Constant(offset) = offset {
-                    let in_range = if offset < 0 {
-                        offset
-                            .checked_neg()
-                            .and_then(|magnitude| usize::try_from(magnitude).ok())
-                            .is_some_and(|magnitude| magnitude <= haystack_length)
-                    } else {
-                        usize::try_from(offset).is_ok_and(|offset| offset <= haystack_length)
-                    };
-                    if !in_range {
-                        return Err(CraneliftLoweringError::new(
-                            "JIT_CRANELIFT_REJECT_STRING_POSITION_OFFSET",
-                            "string position offset is outside the fixed haystack",
-                        ));
-                    }
+            if let Some(haystack_length) = haystack_length
+                && let NativeEntryStringOffset::Constant(offset) = offset
+            {
+                let in_range = if offset < 0 {
+                    offset
+                        .checked_neg()
+                        .and_then(|magnitude| usize::try_from(magnitude).ok())
+                        .is_some_and(|magnitude| magnitude <= haystack_length)
+                } else {
+                    usize::try_from(offset).is_ok_and(|offset| offset <= haystack_length)
+                };
+                if !in_range {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_STRING_POSITION_OFFSET",
+                        "string position offset is outside the fixed haystack",
+                    ));
                 }
             }
             if let Some(parameter_index) = haystack_parameter {
@@ -5266,6 +6255,8 @@ fn optimizing_admission_for_region(
                         minimum_length: 0,
                         offset: Some(offset),
                         allocation_multiplier: 0,
+                        value_multiplier: 0,
+                        array_entry_multiplier: 0,
                     });
             } else if matches!(offset, NativeEntryStringOffset::Parameter(_)) {
                 return Err(CraneliftLoweringError::new(
@@ -5287,6 +6278,8 @@ fn optimizing_admission_for_region(
                         minimum_length: 0,
                         offset: None,
                         allocation_multiplier: 0,
+                        value_multiplier: 0,
+                        array_entry_multiplier: 0,
                     });
             }
             if let NativeEntryStringOffset::Parameter(parameter_index) = offset {
@@ -5489,10 +6482,13 @@ fn optimizing_admission_for_region(
                 ),
             ));
         }
-        let compiled_parameters = call
-            .direct_compiled_target()
-            .and_then(|target| function_params.get(&target))
-            .map(|metadata| metadata.params.as_slice())
+        let compiled_parameters = (stable_exact_control_builtin_family(&call.target).is_none())
+            .then(|| {
+                call.direct_compiled_target()
+                    .and_then(|target| function_params.get(&target))
+                    .map(|metadata| metadata.params.as_slice())
+            })
+            .flatten()
             .or_else(|| {
                 let (name, link_index) = match &call.target {
                     RegionCallTarget::Function {
@@ -5543,7 +6539,106 @@ fn optimizing_admission_for_region(
                         ),
                     ));
                 };
-                let fact = lowering_operand_fact(value_flow, constants, operand);
+                if parameter.by_ref {
+                    // The dedicated lvalue publication plan validates the
+                    // referenced leaf payload and COW/ownership. The operand
+                    // visible here is the reference identity, not a value
+                    // that needs scalar coercion in the caller.
+                    if let Some(target) = call
+                        .args
+                        .get(index)
+                        .and_then(|argument| argument.by_ref_dim.as_ref())
+                    {
+                        let source_index =
+                            parameter_indices.get(&target.local).copied().ok_or_else(|| {
+                                CraneliftLoweringError::new(
+                                    "JIT_CRANELIFT_REJECT_CALL_REFERENCE_DIM_ROOT",
+                                    format!(
+                                        "compiled by-reference argument {index} at continuation {} is not rooted at an entry array",
+                                        instruction.continuation_id,
+                                    ),
+                                )
+                            })?;
+                        let normalized = target
+                            .dims
+                            .iter()
+                            .map(|key| {
+                                let key = match *key {
+                                    php_ir::Operand::Register(register) => {
+                                        RegionOperand::Register(register)
+                                    }
+                                    php_ir::Operand::Local(local) => RegionOperand::Local(local),
+                                    php_ir::Operand::Constant(constant) => RegionOperand::Constant(
+                                        u32::try_from(constant.index()).ok()?,
+                                    ),
+                                };
+                                publication_integer_array_key(constants, key)
+                            })
+                            .collect::<Option<Vec<_>>>()
+                            .ok_or_else(|| {
+                                CraneliftLoweringError::new(
+                                    "JIT_CRANELIFT_REJECT_CALL_REFERENCE_DIM_KEY",
+                                    format!(
+                                        "compiled by-reference argument {index} at continuation {} has an unnormalized dimension",
+                                        instruction.continuation_id,
+                                    ),
+                                )
+                            })?;
+                        let (&key, parents) = normalized.split_last().ok_or_else(|| {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_CALL_REFERENCE_DIM_ARITY",
+                                "compiled by-reference dimension argument has no leaf key",
+                            )
+                        })?;
+                        let requirement = admission
+                            .array_requirements
+                            .entry(NativeEntryArraySource::Parameter(source_index))
+                            .or_default();
+                        // The compiled lvalue binder performs the one COW
+                        // clone when the root is shared. Reserve that complete
+                        // projection here instead of demanding uniqueness or
+                        // scanning unrelated entries in the source array.
+                        requirement.projection_allocations =
+                            requirement.projection_allocations.saturating_add(1);
+                        let mut published_cow_lvalue = false;
+                        for mutation in &mut requirement.mutations {
+                            if let NativeEntryArrayMutationRequirement::Reference {
+                                parents: mutation_parents,
+                                key: mutation_key,
+                                allow_shared_root,
+                            } = mutation
+                                && mutation_parents == parents
+                                && *mutation_key == key
+                            {
+                                *allow_shared_root = true;
+                                published_cow_lvalue = true;
+                            }
+                        }
+                        if !published_cow_lvalue {
+                            return Err(CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_CALL_REFERENCE_DIM_PLAN",
+                                format!(
+                                    "compiled by-reference argument {index} at continuation {} has no published lvalue mutation plan",
+                                    instruction.continuation_id,
+                                ),
+                            ));
+                        }
+                        if let Some(type_) = parameter.type_.as_ref() {
+                            if !parents.is_empty() {
+                                return Err(CraneliftLoweringError::new(
+                                    "JIT_CRANELIFT_REJECT_CALL_REFERENCE_DIM_TYPE_PATH",
+                                    "typed nested by-reference call dimensions require a published nested payload plan",
+                                ));
+                            }
+                            requirement.required_value_types.push((key, type_.clone()));
+                        }
+                        admission.fixed_value_allocations =
+                            admission.fixed_value_allocations.saturating_add(1);
+                        entry_dependent_continuations.insert(instruction.continuation_id);
+                    }
+                    continue;
+                }
+                let fact = publication_operand_fact(operand);
                 if parameter
                     .type_
                     .as_ref()
@@ -5556,9 +6651,6 @@ fn optimizing_admission_for_region(
                             instruction.continuation_id,
                         ),
                     ));
-                }
-                if parameter.by_ref {
-                    continue;
                 }
                 match fact.class {
                     SsaValueClass::Int
@@ -6006,8 +7098,9 @@ fn optimizing_admission_for_region(
                         "substr requires two or three positional operands",
                     ));
                 }
-                admit_publication_string(
+                let source = admit_publication_string_with_internal_source(
                     &mut admission,
+                    &published_string_sources,
                     value_flow,
                     constants,
                     &definitions,
@@ -6018,6 +7111,11 @@ fn optimizing_admission_for_region(
                     continuation,
                     "substr",
                 )?;
+                if let (Some(parameter_index), RegionCallResult::Register(result)) =
+                    (source, call.result)
+                {
+                    published_string_sources.insert(result, parameter_index);
+                }
                 admit_publication_integer(
                     &mut admission,
                     value_flow,
@@ -6067,8 +7165,9 @@ fn optimizing_admission_for_region(
                             "str_repeat count is not a fixed nonnegative integer",
                         )
                     })?;
-                admit_publication_string(
+                let source = admit_publication_string_with_internal_source(
                     &mut admission,
+                    &published_string_sources,
                     value_flow,
                     constants,
                     &definitions,
@@ -6079,6 +7178,11 @@ fn optimizing_admission_for_region(
                     continuation,
                     "str_repeat",
                 )?;
+                if let (Some(parameter_index), RegionCallResult::Register(result)) =
+                    (source, call.result)
+                {
+                    published_string_sources.insert(result, parameter_index);
+                }
             }
 
             if stable_builtin_substr_count(&call.target) {
@@ -6092,8 +7196,9 @@ fn optimizing_admission_for_region(
                     (arguments[0], 0, "substr_count haystack"),
                     (arguments[1], 1, "substr_count needle"),
                 ] {
-                    admit_publication_string(
+                    admit_publication_string_with_internal_source(
                         &mut admission,
+                        &published_string_sources,
                         value_flow,
                         constants,
                         &definitions,
@@ -6154,14 +7259,21 @@ fn optimizing_admission_for_region(
                     ));
                 }
                 let search_length =
-                    publication_string_length(constants, &definitions, arguments[0]).ok_or_else(
-                        || {
+                    publication_string_length(constants, &definitions, arguments[0])
+                        .or_else(|| {
+                            matches!(
+                                publication_root_operand(arguments[0], &definitions),
+                                RegionOperand::Register(register)
+                                    if published_single_byte_strings.contains(&register)
+                            )
+                            .then_some(1)
+                        })
+                        .ok_or_else(|| {
                             CraneliftLoweringError::new(
                                 "JIT_CRANELIFT_REJECT_STR_REPLACE_PUBLICATION",
                                 "str_replace search string is not fixed at publication",
                             )
-                        },
-                    )?;
+                        })?;
                 let replacement_length =
                     publication_string_length(constants, &definitions, arguments[1]).ok_or_else(
                         || {
@@ -6176,8 +7288,9 @@ fn optimizing_admission_for_region(
                 } else {
                     replacement_length.max(1)
                 };
-                admit_publication_string(
+                let source = admit_publication_string_with_internal_source(
                     &mut admission,
+                    &published_string_sources,
                     value_flow,
                     constants,
                     &definitions,
@@ -6188,6 +7301,11 @@ fn optimizing_admission_for_region(
                     continuation,
                     "str_replace subject",
                 )?;
+                if let (Some(parameter_index), RegionCallResult::Register(result)) =
+                    (source, call.result)
+                {
+                    published_string_sources.insert(result, parameter_index);
+                }
             }
 
             if stable_builtin_explode(&call.target) {
@@ -6206,33 +7324,67 @@ fn optimizing_admission_for_region(
                                 "explode delimiter is not a fixed nonempty string",
                             )
                         })?;
-                let input_length = publication_string_length(constants, &definitions, arguments[1])
-                    .ok_or_else(|| {
-                        CraneliftLoweringError::new(
-                            "JIT_CRANELIFT_REJECT_EXPLODE_PUBLICATION",
-                            "explode input is not a fixed string",
-                        )
-                    })?;
-                let pieces = input_length
-                    .checked_div(delimiter_length)
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                admission.fixed_value_allocations = admission
-                    .fixed_value_allocations
-                    .saturating_add(pieces.saturating_add(1));
-                admission.fixed_array_entries = admission.fixed_array_entries.saturating_add(
-                    pieces
-                        .max(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
-                        .next_power_of_two(),
-                );
-                admission.fixed_string_bytes =
-                    admission.fixed_string_bytes.saturating_add(
+                if let Some(input_length) =
+                    publication_string_length(constants, &definitions, arguments[1])
+                {
+                    let pieces = input_length
+                        .checked_div(delimiter_length)
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    admission.fixed_value_allocations = admission
+                        .fixed_value_allocations
+                        .saturating_add(pieces.saturating_add(1));
+                    admission.fixed_array_entries = admission.fixed_array_entries.saturating_add(
+                        pieces
+                            .max(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
+                            .next_power_of_two(),
+                    );
+                    admission.fixed_string_bytes = admission.fixed_string_bytes.saturating_add(
                         input_length
                             .saturating_add(pieces.saturating_mul(
                                 crate::JIT_NATIVE_DIRECT_STRING_MIN_CAPACITY as usize,
                             ))
                             .saturating_mul(2),
                     );
+                } else {
+                    let parameter_index = admit_publication_string_with_internal_source(
+                        &mut admission,
+                        &published_string_sources,
+                        value_flow,
+                        constants,
+                        &definitions,
+                        &parameter_indices,
+                        arguments[1],
+                        0,
+                        crate::JIT_NATIVE_DIRECT_STRING_MIN_CAPACITY as usize + 1,
+                        continuation,
+                        "explode input",
+                    )?
+                    .ok_or_else(|| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_EXPLODE_PUBLICATION",
+                            "explode input is not rooted at a published entry string",
+                        )
+                    })?;
+                    if let Some(requirement) = admission
+                        .string_requirements
+                        .iter_mut()
+                        .rev()
+                        .find(|requirement| requirement.parameter_index == parameter_index)
+                    {
+                        // A nonempty delimiter yields at most input_length + 1
+                        // pieces. One result array plus one string per piece
+                        // needs at most two value slots and fewer than two
+                        // power-of-two array entries per input byte.
+                        requirement.value_multiplier =
+                            requirement.value_multiplier.saturating_add(2);
+                        requirement.array_entry_multiplier =
+                            requirement.array_entry_multiplier.saturating_add(2);
+                    }
+                    if let RegionCallResult::Register(result) = call.result {
+                        published_explode_string_sources.insert(result, parameter_index);
+                    }
+                }
             }
 
             if stable_builtin_implode(&call.target) {
@@ -6243,35 +7395,57 @@ fn optimizing_admission_for_region(
                     ));
                 }
                 let separator_length =
-                    publication_string_length(constants, &definitions, arguments[0]).ok_or_else(
-                        || {
+                    publication_string_length(constants, &definitions, arguments[0])
+                        .or_else(|| {
+                            matches!(
+                                publication_root_operand(arguments[0], &definitions),
+                                RegionOperand::Register(register)
+                                    if published_single_byte_strings.contains(&register)
+                            )
+                            .then_some(1)
+                        })
+                        .ok_or_else(|| {
                             CraneliftLoweringError::new(
                                 "JIT_CRANELIFT_REJECT_IMPLODE_PUBLICATION",
                                 "implode separator is not fixed at publication",
                             )
-                        },
+                        })?;
+                let internal = matches!(
+                    publication_root_operand(arguments[1], &definitions),
+                    RegionOperand::Register(register)
+                        if internal_array_sources.contains_key(&register)
+                );
+                if !internal {
+                    let source = publication_entry_array_source(
+                        region,
+                        &definitions,
+                        &parameter_indices,
+                        &by_ref_parameters,
+                        arguments[1],
+                        continuation,
+                        "implode",
                     )?;
-                let source = publication_entry_array_source(
-                    region,
-                    &definitions,
-                    &parameter_indices,
-                    &by_ref_parameters,
-                    arguments[1],
-                    continuation,
-                    "implode",
-                )?;
-                let requirement = admission.array_requirements.entry(source).or_default();
-                requirement.require_plain_values = true;
-                requirement.require_string_values = true;
-                requirement.implode_separator_lengths.push(separator_length);
-                entry_dependent_continuations.insert(continuation);
+                    let requirement = admission.array_requirements.entry(source).or_default();
+                    requirement.require_plain_values = true;
+                    requirement.require_string_values = true;
+                    requirement.implode_separator_lengths.push(separator_length);
+                    entry_dependent_continuations.insert(continuation);
+                } else if let RegionOperand::Register(array_result) =
+                    publication_root_operand(arguments[1], &definitions)
+                    && let Some(parameter_index) =
+                        published_explode_string_sources.get(&array_result).copied()
+                    && let RegionCallResult::Register(result) = call.result
+                {
+                    published_string_sources.insert(result, parameter_index);
+                }
             }
 
             if let Some(_operation) = stable_builtin_ascii_case(&call.target)
                 && arguments.len() == 1
             {
-                admit_publication_string(
+                let source = admit_publication_string_with_internal_source(
                     &mut admission,
+                    &published_string_sources,
                     value_flow,
                     constants,
                     &definitions,
@@ -6282,12 +7456,18 @@ fn optimizing_admission_for_region(
                     continuation,
                     "ASCII case conversion",
                 )?;
+                if let (Some(parameter_index), RegionCallResult::Register(result)) =
+                    (source, call.result)
+                {
+                    published_string_sources.insert(result, parameter_index);
+                }
             }
             if let Some(_operation) = stable_builtin_string_transform(&call.target)
                 && arguments.len() == 1
             {
-                admit_publication_string(
+                let source = admit_publication_string_with_internal_source(
                     &mut admission,
+                    &published_string_sources,
                     value_flow,
                     constants,
                     &definitions,
@@ -6298,10 +7478,36 @@ fn optimizing_admission_for_region(
                     continuation,
                     "string transform",
                 )?;
+                if let (Some(parameter_index), RegionCallResult::Register(result)) =
+                    (source, call.result)
+                {
+                    published_string_sources.insert(result, parameter_index);
+                }
+            }
+            if stable_builtin_default_trim(&call.target).is_some() && arguments.len() == 1 {
+                let source = admit_publication_string_with_internal_source(
+                    &mut admission,
+                    &published_string_sources,
+                    value_flow,
+                    constants,
+                    &definitions,
+                    &parameter_indices,
+                    arguments[0],
+                    0,
+                    1,
+                    continuation,
+                    "default trim",
+                )?;
+                if let (Some(parameter_index), RegionCallResult::Register(result)) =
+                    (source, call.result)
+                {
+                    published_string_sources.insert(result, parameter_index);
+                }
             }
             if stable_builtin_addslashes(&call.target) && arguments.len() == 1 {
-                admit_publication_string(
+                let source = admit_publication_string_with_internal_source(
                     &mut admission,
+                    &published_string_sources,
                     value_flow,
                     constants,
                     &definitions,
@@ -6312,6 +7518,11 @@ fn optimizing_admission_for_region(
                     continuation,
                     "addslashes",
                 )?;
+                if let (Some(parameter_index), RegionCallResult::Register(result)) =
+                    (source, call.result)
+                {
+                    published_string_sources.insert(result, parameter_index);
+                }
             }
         }
         if let Some(operation) = stable_builtin_array_constructor(&call.target) {
@@ -6352,9 +7563,9 @@ fn optimizing_admission_for_region(
                         ),
                     ));
                 };
-                let count = usize::try_from(count).ok().filter(|count| {
-                    *count <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY as usize
-                });
+                let count = usize::try_from(count)
+                    .ok()
+                    .filter(|count| *count <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY);
                 let Some(count) = count else {
                     return Err(CraneliftLoweringError::new(
                         "JIT_CRANELIFT_REJECT_ARRAY_FILL_RANGE",
@@ -6395,9 +7606,7 @@ fn optimizing_admission_for_region(
                 let capacity = count
                     .max(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
                     .checked_next_power_of_two()
-                    .filter(|capacity| {
-                        *capacity <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY as usize
-                    })
+                    .filter(|capacity| *capacity <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY)
                     .ok_or_else(|| {
                         CraneliftLoweringError::new(
                             "JIT_CRANELIFT_REJECT_ARRAY_FILL_CAPACITY",
@@ -6484,9 +7693,9 @@ fn optimizing_admission_for_region(
                 }
                 let distance = (i128::from(end) - i128::from(start)).abs();
                 let count = distance / i128::from(step) + 1;
-                let count = usize::try_from(count).ok().filter(|count| {
-                    *count <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY as usize
-                });
+                let count = usize::try_from(count)
+                    .ok()
+                    .filter(|count| *count <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY);
                 let Some(count) = count else {
                     return Err(CraneliftLoweringError::new(
                         "JIT_CRANELIFT_REJECT_RANGE_CAPACITY",
@@ -6568,7 +7777,7 @@ fn optimizing_admission_for_region(
                             .max(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
                             .checked_next_power_of_two()
                             .filter(|capacity| {
-                                *capacity <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY as usize
+                                *capacity <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY
                             })
                             .ok_or_else(|| {
                                 CraneliftLoweringError::new(
@@ -6701,30 +7910,34 @@ fn optimizing_admission_for_region(
                 }
             }
             for operand in arrays {
-                let source = publication_entry_array_source(
+                let sources = publication_array_sources(
                     region,
                     &definitions,
                     &parameter_indices,
                     &by_ref_parameters,
+                    &internal_array_sources,
                     *operand,
                     instruction.continuation_id,
                     "callback-neutral array operation",
+                    false,
                 )?;
-                let requirement = admission.array_requirements.entry(source).or_default();
-                requirement.require_plain_values = true;
-                requirement.require_supported_keys = true;
-                requirement.projection_allocations =
-                    requirement.projection_allocations.saturating_add(1);
-                if operation == StableCallbackNeutralArrayBuiltin::MapNull && arrays.len() > 1 {
-                    requirement.value_allocations_per_entry =
-                        requirement.value_allocations_per_entry.saturating_add(1);
-                    requirement.entry_allocations_per_entry =
-                        requirement.entry_allocations_per_entry.saturating_add(
-                            arrays
-                                .len()
-                                .max(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
-                                .next_power_of_two(),
-                        );
+                for source in sources {
+                    let requirement = admission.array_requirements.entry(source).or_default();
+                    requirement.require_plain_values = true;
+                    requirement.require_supported_keys = true;
+                    requirement.projection_allocations =
+                        requirement.projection_allocations.saturating_add(1);
+                    if operation == StableCallbackNeutralArrayBuiltin::MapNull && arrays.len() > 1 {
+                        requirement.value_allocations_per_entry =
+                            requirement.value_allocations_per_entry.saturating_add(1);
+                        requirement.entry_allocations_per_entry =
+                            requirement.entry_allocations_per_entry.saturating_add(
+                                arrays
+                                    .len()
+                                    .max(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
+                                    .next_power_of_two(),
+                            );
+                    }
                 }
             }
             admission
@@ -6785,20 +7998,24 @@ fn optimizing_admission_for_region(
                 }
             }
             for operand in array_operands {
-                let source = publication_entry_array_source(
+                let sources = publication_array_sources(
                     region,
                     &definitions,
                     &parameter_indices,
                     &by_ref_parameters,
+                    &internal_array_sources,
                     *operand,
                     instruction.continuation_id,
                     "array copy operation",
+                    false,
                 )?;
-                let requirement = admission.array_requirements.entry(source).or_default();
-                requirement.require_plain_values = true;
-                requirement.require_supported_keys = true;
-                requirement.projection_allocations =
-                    requirement.projection_allocations.saturating_add(1);
+                for source in sources {
+                    let requirement = admission.array_requirements.entry(source).or_default();
+                    requirement.require_plain_values = true;
+                    requirement.require_supported_keys = true;
+                    requirement.projection_allocations =
+                        requirement.projection_allocations.saturating_add(1);
+                }
             }
             admission
                 .total_array_calls
@@ -6816,19 +8033,23 @@ fn optimizing_admission_for_region(
                         "array lookup is not a two/three-argument positional call",
                     )
                 })?;
-            let source = publication_entry_array_source(
+            let sources = publication_array_sources(
                 region,
                 &definitions,
                 &parameter_indices,
                 &by_ref_parameters,
+                &internal_array_sources,
                 arguments[1],
                 instruction.continuation_id,
                 "array lookup",
+                false,
             )?;
-            let requirement = admission.array_requirements.entry(source).or_default();
-            requirement.require_plain_values = true;
-            requirement.require_supported_keys = true;
-            requirement.require_scalar_values = true;
+            for source in sources {
+                let requirement = admission.array_requirements.entry(source).or_default();
+                requirement.require_plain_values = true;
+                requirement.require_supported_keys = true;
+                requirement.require_scalar_values = true;
+            }
             admission
                 .total_array_calls
                 .insert(instruction.continuation_id);
@@ -6861,26 +8082,59 @@ fn optimizing_admission_for_region(
                     })?;
                 RegionOperand::Local(local)
             };
-            let source = publication_entry_array_source(
-                region,
-                &definitions,
-                &parameter_indices,
-                &by_ref_parameters,
-                operand,
-                instruction.continuation_id,
-                "array pointer operation",
-            )?;
-            let requirement = admission.array_requirements.entry(source).or_default();
-            requirement.require_supported_keys = true;
-            requirement.require_plain_values = true;
-            if !operation.is_read_only() {
-                requirement.projection_allocations =
-                    requirement.projection_allocations.saturating_add(1);
+            let sources = if let RegionOperand::Local(local) = operand
+                && new_array_locals.contains(&local)
+            {
+                BTreeSet::new()
+            } else {
+                publication_array_sources(
+                    region,
+                    &definitions,
+                    &parameter_indices,
+                    &by_ref_parameters,
+                    &internal_array_sources,
+                    operand,
+                    instruction.continuation_id,
+                    "array pointer operation",
+                    true,
+                )?
+            };
+            for source in sources {
+                if let NativeEntryArraySource::Parameter(index) = source
+                    && by_ref_parameters.contains(&region.parameter_locals[index])
+                {
+                    admission.by_ref_array_parameters.insert(index);
+                }
+                let requirement = admission.array_requirements.entry(source).or_default();
+                requirement.require_supported_keys = true;
+                requirement.require_plain_values = true;
+                requirement.require_integer_keys = true;
+                requirement.require_integer_values = true;
+                requirement.minimum_length = requirement.minimum_length.max(2);
+                requirement.integer_minimum = Some(
+                    requirement
+                        .integer_minimum
+                        .unwrap_or(i64::MIN)
+                        .max(i64::MIN / 16),
+                );
+                requirement.integer_maximum = Some(
+                    requirement
+                        .integer_maximum
+                        .unwrap_or(i64::MAX)
+                        .min(i64::MAX / 16),
+                );
+                if !operation.is_read_only() {
+                    requirement.projection_allocations =
+                        requirement.projection_allocations.saturating_add(1);
+                }
             }
             admission
                 .total_array_calls
                 .insert(instruction.continuation_id);
-            entry_dependent_continuations.insert(instruction.continuation_id);
+            if !matches!(operand, RegionOperand::Local(local) if new_array_locals.contains(&local))
+            {
+                entry_dependent_continuations.insert(instruction.continuation_id);
+            }
             continue;
         }
         if let Some(operation) = stable_builtin_array_stack(&call.target) {
@@ -6908,6 +8162,19 @@ fn optimizing_admission_for_region(
                 instruction.continuation_id,
                 "array stack operation",
             )?;
+            let inserted = call.args.len().saturating_sub(1) as isize;
+            let length_delta = published_array_stack_lengths.entry(source).or_default();
+            match operation {
+                StableArrayStackBuiltin::Pop | StableArrayStackBuiltin::Shift => {
+                    let required = 1_isize.saturating_sub(*length_delta).max(1) as usize;
+                    let requirement = admission.array_requirements.entry(source).or_default();
+                    requirement.minimum_length = requirement.minimum_length.max(required);
+                    *length_delta = length_delta.saturating_sub(1);
+                }
+                StableArrayStackBuiltin::Push | StableArrayStackBuiltin::Unshift => {
+                    *length_delta = length_delta.saturating_add(inserted);
+                }
+            }
             if call
                 .args
                 .iter()
@@ -6919,10 +8186,7 @@ fn optimizing_admission_for_region(
                         || direct_fixed_builtin_operand(call, index + 1).is_none_or(|operand| {
                             let fact = lowering_operand_fact(value_flow, constants, operand);
                             fact.certainty == crate::region_ir::SsaCertainty::Unknown
-                                || matches!(
-                                    fact.class,
-                                    SsaValueClass::ReferenceHandle | SsaValueClass::MixedHandle
-                                )
+                                || fact.class != SsaValueClass::Int
                         })
                 })
             {
@@ -6934,6 +8198,20 @@ fn optimizing_admission_for_region(
             let requirement = admission.array_requirements.entry(source).or_default();
             requirement.require_supported_keys = true;
             requirement.require_plain_values = true;
+            requirement.require_integer_keys = true;
+            requirement.require_integer_values = true;
+            requirement.integer_minimum = Some(
+                requirement
+                    .integer_minimum
+                    .unwrap_or(i64::MIN)
+                    .max(i64::MIN / 16),
+            );
+            requirement.integer_maximum = Some(
+                requirement
+                    .integer_maximum
+                    .unwrap_or(i64::MAX)
+                    .min(i64::MAX / 16),
+            );
             requirement.projection_allocations =
                 requirement.projection_allocations.saturating_add(1);
             admission.fixed_array_entries = admission.fixed_array_entries.saturating_add(
@@ -6982,19 +8260,36 @@ fn optimizing_admission_for_region(
                         "array_splice arguments are not direct positional values",
                     )
                 })?;
-            publication_integer_operand(constants, &definitions, arguments[0]).ok_or_else(
-                || {
-                    CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_ARRAY_SPLICE_OFFSET",
-                        "array_splice offset is not fixed at publication",
-                    )
-                },
+            admit_publication_integer(
+                &mut admission,
+                value_flow,
+                constants,
+                &definitions,
+                &parameter_indices,
+                arguments[0],
+                i64::MIN,
+                i64::MAX,
+                &[],
+                instruction.continuation_id,
+                "array_splice offset",
             )?;
             if let Some(length) = arguments.get(1) {
                 let fact = lowering_operand_fact(value_flow, constants, *length);
-                if publication_integer_operand(constants, &definitions, *length).is_none()
-                    && fact.class != SsaValueClass::Null
-                {
+                if fact.class == SsaValueClass::Int {
+                    admit_publication_integer(
+                        &mut admission,
+                        value_flow,
+                        constants,
+                        &definitions,
+                        &parameter_indices,
+                        *length,
+                        i64::MIN,
+                        i64::MAX,
+                        &[],
+                        instruction.continuation_id,
+                        "array_splice length",
+                    )?;
+                } else if fact.class != SsaValueClass::Null {
                     return Err(CraneliftLoweringError::new(
                         "JIT_CRANELIFT_REJECT_ARRAY_SPLICE_LENGTH",
                         "array_splice length is neither fixed integer nor null",
@@ -7089,8 +8384,13 @@ fn optimizing_admission_for_region(
             )
         })?;
         let fact = lowering_operand_fact(value_flow, constants, operand);
-        if fact.certainty == crate::region_ir::SsaCertainty::Unknown
-            || fact.class != SsaValueClass::ArrayHandle
+        let internal_array = match publication_root_operand(operand, &definitions) {
+            RegionOperand::Register(register) => internal_array_sources.contains_key(&register),
+            _ => false,
+        };
+        if !internal_array
+            && (fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                || fact.class != SsaValueClass::ArrayHandle)
         {
             return Err(CraneliftLoweringError::new(
                 "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_TYPE",
@@ -7100,41 +8400,30 @@ fn optimizing_admission_for_region(
                 ),
             ));
         }
-        let source = entry_array_source(operand, &definitions, &parameter_indices).ok_or_else(|| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_SHAPE",
-                format!(
-                    "array operation at continuation {} is not provably available at optimizing entry",
-                    instruction.continuation_id
-                ),
-            )
-        })?;
-        match source {
-            NativeEntryArraySource::Parameter(index) => {
-                let local = region.parameter_locals[index];
-                if by_ref_parameters.contains(&local) {
-                    return Err(CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_REFERENCE",
-                        format!(
-                            "array operation at continuation {} receives a by-reference parameter",
-                            instruction.continuation_id
-                        ),
-                    ));
-                }
-            }
-            NativeEntryArraySource::TrustedGlobal(_) => {
-                unreachable!("operand-rooted array families are parameters")
-            }
-        }
+        let sources = publication_array_sources(
+            region,
+            &definitions,
+            &parameter_indices,
+            &by_ref_parameters,
+            &internal_array_sources,
+            operand,
+            instruction.continuation_id,
+            "array operation",
+            false,
+        )?;
         admission
             .total_array_calls
             .insert(instruction.continuation_id);
-        entry_dependent_continuations.insert(instruction.continuation_id);
-        admission
-            .array_requirements
-            .entry(source)
-            .or_default()
-            .projection_allocations += usize::from(projection);
+        if !sources.is_empty() {
+            entry_dependent_continuations.insert(instruction.continuation_id);
+        }
+        for source in sources {
+            admission
+                .array_requirements
+                .entry(source)
+                .or_default()
+                .projection_allocations += usize::from(projection);
+        }
     }
     if let Some(continuation_id) = entry_dependent_continuations
         .intersection(&unstable_before)
@@ -7180,23 +8469,40 @@ fn optimizing_admission_for_region(
         }
     }
     let cleanup_total_reference_locals = admission.total_reference_locals.clone();
+    let cleanup_total_array_parameters = admission
+        .array_requirements
+        .keys()
+        .filter_map(|source| match source {
+            NativeEntryArraySource::Parameter(index) => {
+                region.parameter_locals.get(*index).copied()
+            }
+            NativeEntryArraySource::TrustedGlobal(_) => None,
+        })
+        .collect::<BTreeSet<_>>();
     let cleanup_local_is_total = |local: LocalId| {
         if !value_flow.releases_local_at_frame_exit(local) {
             return true;
         }
         let storage = value_flow.local_storage(local);
-        let fact = value_flow.local_fact(local);
+        let fact = publication_operand_fact(RegionOperand::Local(local));
         cleanup_total_reference_locals.contains(&local)
             || by_ref_parameters.contains(&local)
-            || storage == crate::region_ir::LocalStorageClass::SsaPlain
-                && fact.certainty != crate::region_ir::SsaCertainty::Unknown
+            || cleanup_total_array_parameters.contains(&local)
+            || fact.certainty != crate::region_ir::SsaCertainty::Unknown
                 && (matches!(
                     fact.class,
-                    SsaValueClass::Float
-                        | SsaValueClass::StringHandle
-                        | SsaValueClass::ArrayHandle
-                        | SsaValueClass::ReferenceHandle
-                ) || new_array_locals.contains(&local))
+                    SsaValueClass::Uninitialized
+                        | SsaValueClass::Null
+                        | SsaValueClass::Bool
+                        | SsaValueClass::Int
+                ) || storage == crate::region_ir::LocalStorageClass::SsaPlain
+                    && matches!(
+                        fact.class,
+                        SsaValueClass::Float
+                            | SsaValueClass::StringHandle
+                            | SsaValueClass::ReferenceHandle
+                    )
+                    || new_array_locals.contains(&local))
     };
     let operand_root_local = |mut operand: RegionOperand| {
         for _ in 0..=definitions.len() {
@@ -7372,12 +8678,27 @@ fn optimizing_admission_for_region(
                 finally: None,
             } => {
                 let return_type_total = region.return_type.as_ref().is_none_or(|return_type| {
-                    optimizing_fact_satisfies_type(
-                        lowering_operand_fact(value_flow, constants, value),
-                        return_type,
-                    ) || matches!(return_type, php_ir::IrReturnType::Array)
-                        && operand_root_local(value)
-                            .is_some_and(|local| new_array_locals.contains(&local))
+                    optimizing_fact_satisfies_type(publication_operand_fact(value), return_type)
+                        || matches!(
+                            (value, return_type),
+                            (RegionOperand::Register(register), php_ir::IrReturnType::Int)
+                                if published_integer_results.contains(&register)
+                        )
+                        || matches!(return_type, php_ir::IrReturnType::Array)
+                            && operand_root_local(value)
+                                .is_some_and(|local| new_array_locals.contains(&local))
+                        || operand_root_local(value).is_some_and(|local| {
+                            local_store_sources.get(&local).is_some_and(|sources| {
+                                matches!(
+                                    sources.as_slice(),
+                                    [(_, source)]
+                                        if optimizing_fact_satisfies_type(
+                                            publication_operand_fact(*source),
+                                            return_type,
+                                        )
+                                )
+                            })
+                        })
                         || admission
                             .return_plans
                             .contains_key(&block.terminator_continuation_id)
@@ -7449,11 +8770,18 @@ fn optimizing_admission_for_region(
             } => false,
         };
         if !total {
+            let non_total_cleanup_locals = block
+                .terminator_live_locals
+                .iter()
+                .copied()
+                .filter(|local| !cleanup_local_is_total(*local))
+                .map(LocalId::raw)
+                .collect::<Vec<_>>();
             return Err(CraneliftLoweringError::new(
                 "JIT_CRANELIFT_REJECT_NON_TOTAL_TERMINATOR_PUBLICATION",
                 format!(
-                    "terminator at continuation {} has no total native return/type/ownership/cleanup plan",
-                    block.terminator_continuation_id,
+                    "terminator at continuation {} has no total native return/type/ownership/cleanup plan; non-total cleanup locals={non_total_cleanup_locals:?}",
+                    block.terminator_continuation_id
                 ),
             ));
         }
@@ -15908,7 +17236,7 @@ fn compile_preflighted_region_function(
 fn define_region_fragment_wrapper(
     module: &mut JITModule,
     ctx: &mut cranelift_codegen::Context,
-    builder_context: &mut FunctionBuilderContext,
+    _builder_context: &mut FunctionBuilderContext,
     region: &RegionGraph,
     func_id: FuncId,
     fragment_functions: &BTreeMap<u32, FuncId>,
@@ -15920,8 +17248,9 @@ fn define_region_fragment_wrapper(
     let pointer_type = module.target_config().pointer_type();
     ctx.func.signature = region_graph_signature(module, region)?;
     ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+    let mut builder_context = FunctionBuilderContext::new();
     {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, builder_context);
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
         let entry = builder.create_block();
         builder.append_block_params_for_function_params(entry);
         builder.switch_to_block(entry);
@@ -16300,19 +17629,75 @@ fn lower_entry_array_source(
     deopt_out: ir::Value,
     function: FunctionId,
     source: NativeEntryArraySource,
+    by_reference: bool,
+    rejected: ir::Block,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     match source {
-        NativeEntryArraySource::Parameter(index) => Ok(builder.ins().load(
-            types::I64,
-            MemFlagsData::new(),
-            arguments,
-            i32::try_from(index.saturating_mul(8)).map_err(|_| {
-                CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_ARRAY_ADMISSION_OFFSET",
-                    "array admission parameter offset does not fit the native ABI",
-                )
-            })?,
-        )),
+        NativeEntryArraySource::Parameter(index) => {
+            let value = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                arguments,
+                i32::try_from(index.saturating_mul(8)).map_err(|_| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_ARRAY_ADMISSION_OFFSET",
+                        "array admission parameter offset does not fit the native ABI",
+                    )
+                })?,
+            );
+            if !by_reference {
+                return Ok(value);
+            }
+            let inspect = builder.create_block();
+            let accepted = builder.create_block();
+            builder.append_block_param(accepted, types::I64);
+            let tagged =
+                lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
+            let encoded_index = builder.ins().ireduce(types::I32, value);
+            let direct_index = builder.ins().icmp_imm(
+                IntCC::UnsignedGreaterThanOrEqual,
+                encoded_index,
+                i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+            );
+            let direct = builder.ins().band(tagged, direct_index);
+            builder.ins().brif(direct, inspect, &[], rejected, &[]);
+            builder.switch_to_block(inspect);
+            let slot = lower_optimizing_slot_address(builder, value, deopt_out);
+            let kind = builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                slot,
+                std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+            );
+            let flags = builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                slot,
+                std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
+            );
+            let payload = builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                slot,
+                std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+            );
+            let direct_reference = builder.ins().icmp_imm(
+                IntCC::Equal,
+                kind,
+                i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR),
+            );
+            let published = builder.ins().icmp_imm(
+                IntCC::Equal,
+                flags,
+                i64::from(crate::JIT_NATIVE_REFERENCE_SCALAR_VIEW_ABI_VERSION),
+            );
+            let admitted = builder.ins().band(direct_reference, published);
+            builder
+                .ins()
+                .brif(admitted, accepted, &[payload.into()], rejected, &[]);
+            builder.switch_to_block(accepted);
+            Ok(builder.block_params(accepted)[0])
+        }
         NativeEntryArraySource::TrustedGlobal(continuation_id) => {
             let reference = lower_trusted_global_reference_at_continuation(
                 builder,
@@ -16506,18 +17891,20 @@ fn emit_optimizing_entry_array_mutations(
     for mutation in mutations {
         let (root_slot, root_length, root_entries) =
             emit_optimizing_entry_direct_array_descriptor(builder, root, deopt_out, rejected);
-        let root_refcount = builder.ins().load(
-            types::I32,
-            MemFlagsData::new(),
-            root_slot,
-            std::mem::offset_of!(crate::JitNativeValueSlot, refcount) as i32,
-        );
-        let root_unique = builder.ins().icmp_imm(IntCC::Equal, root_refcount, 1);
-        let root_ready = builder.create_block();
-        builder
-            .ins()
-            .brif(root_unique, root_ready, &[], rejected, &[]);
-        builder.switch_to_block(root_ready);
+        if !mutation.allows_shared_root() {
+            let root_refcount = builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                root_slot,
+                std::mem::offset_of!(crate::JitNativeValueSlot, refcount) as i32,
+            );
+            let root_unique = builder.ins().icmp_imm(IntCC::Equal, root_refcount, 1);
+            let root_ready = builder.create_block();
+            builder
+                .ins()
+                .brif(root_unique, root_ready, &[], rejected, &[]);
+            builder.switch_to_block(root_ready);
+        }
 
         let parents = match mutation {
             NativeEntryArrayMutationRequirement::Assign { parents, .. }
@@ -16866,9 +18253,33 @@ fn emit_optimizing_entry_property_slot(
         let shared = builder
             .ins()
             .icmp_imm(IntCC::UnsignedGreaterThan, refcount, 1);
+        let kind = builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            value_slot,
+            std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+        );
+        let direct_string = builder.ins().icmp_imm(
+            IntCC::Equal,
+            kind,
+            i64::from(crate::JIT_NATIVE_VALUE_VIEW_STRING),
+        );
+        let direct_array = builder.ins().icmp_imm(
+            IntCC::Equal,
+            kind,
+            i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY),
+        );
+        let direct_float = builder.ins().icmp_imm(
+            IntCC::Equal,
+            kind,
+            i64::from(crate::JIT_NATIVE_VALUE_VIEW_FLOAT),
+        );
+        let direct_releasable = builder.ins().bor(direct_string, direct_array);
+        let direct_releasable = builder.ins().bor(direct_releasable, direct_float);
+        let releasable = builder.ins().bor(shared, direct_releasable);
         builder
             .ins()
-            .brif(shared, accepted, &[property_slot.into()], rejected, &[]);
+            .brif(releasable, accepted, &[property_slot.into()], rejected, &[]);
     } else {
         builder.ins().jump(accepted, &[property_slot.into()]);
     }
@@ -17920,17 +19331,29 @@ fn emit_optimizing_entry_admission(
         builder.switch_to_block(next);
     }
     for requirement in &admission.integer_requirements {
-        let encoded = builder.ins().load(
-            types::I64,
-            MemFlagsData::new(),
-            arguments,
-            i32::try_from(requirement.parameter_index.saturating_mul(8)).map_err(|_| {
-                CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_INTEGER_REQUIREMENT_OFFSET",
-                    "integer-requirement parameter offset does not fit the native ABI",
-                )
-            })?,
-        );
+        let encoded = if requirement.by_reference {
+            lower_entry_array_source(
+                builder,
+                arguments,
+                deopt_out,
+                function,
+                NativeEntryArraySource::Parameter(requirement.parameter_index),
+                true,
+                rejected,
+            )?
+        } else {
+            builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                arguments,
+                i32::try_from(requirement.parameter_index.saturating_mul(8)).map_err(|_| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_INTEGER_REQUIREMENT_OFFSET",
+                        "integer-requirement parameter offset does not fit the native ABI",
+                    )
+                })?,
+            )
+        };
         let (integer, value) = lower_optimizing_integer_candidate(builder, encoded, deopt_out);
         let minimum =
             builder
@@ -17991,6 +19414,8 @@ fn emit_optimizing_entry_admission(
             )
         })?,
     );
+    let mut dynamic_required_values = builder.ins().iconst(types::I64, 0);
+    let mut dynamic_required_entries = builder.ins().iconst(types::I64, 0);
     for requirement in admission.exception_requirements.iter().copied() {
         let prepared = lower_optimizing_prepared_exception_pointer(
             builder,
@@ -18169,6 +19594,22 @@ fn emit_optimizing_entry_admission(
             let one = builder.ins().iconst(types::I64, 1);
             let capacity = builder.ins().ishl(one, width);
             required_string_bytes = builder.ins().iadd(required_string_bytes, capacity);
+        }
+        if requirement.value_multiplier != 0 {
+            let units = builder.ins().iadd_imm(length, 1);
+            let values = builder.ins().imul_imm(
+                units,
+                i64::try_from(requirement.value_multiplier).unwrap_or(i64::MAX),
+            );
+            dynamic_required_values = builder.ins().iadd(dynamic_required_values, values);
+        }
+        if requirement.array_entry_multiplier != 0 {
+            let units = builder.ins().iadd_imm(length, 1);
+            let entries = builder.ins().imul_imm(
+                units,
+                i64::try_from(requirement.array_entry_multiplier).unwrap_or(i64::MAX),
+            );
+            dynamic_required_entries = builder.ins().iadd(dynamic_required_entries, entries);
         }
     }
     for requirement in admission.instanceof_requirements.iter().copied() {
@@ -18451,11 +19892,10 @@ fn emit_optimizing_entry_admission(
     {
         builder.ins().jump(accepted, &[]);
         builder.switch_to_block(rejected);
-        let retry_baseline = builder.ins().iconst(
-            types::I32,
-            i64::from(crate::JitCallStatus::RECOMPILE_REQUESTED.0),
-        );
-        builder.ins().return_(&[retry_baseline]);
+        let contract_violation = builder
+            .ins()
+            .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
+        builder.ins().return_(&[contract_violation]);
         return Ok(());
     }
     let mut required_entries = builder.ins().iconst(
@@ -18467,6 +19907,9 @@ fn emit_optimizing_entry_admission(
             )
         })?,
     );
+    required_entries = builder
+        .ins()
+        .iadd(required_entries, dynamic_required_entries);
     let fixed_value_allocations = admission.fixed_value_allocations.saturating_add(
         admission
             .array_requirements
@@ -18483,6 +19926,7 @@ fn emit_optimizing_entry_admission(
             )
         })?,
     );
+    required_values = builder.ins().iadd(required_values, dynamic_required_values);
     for requirement in admission.exception_requirements.iter().copied() {
         let prepared = lower_optimizing_prepared_exception_pointer(
             builder,
@@ -18528,7 +19972,19 @@ fn emit_optimizing_entry_admission(
         builder.append_block_param(inspect_slot, types::I64);
         builder.append_block_param(source_accepted, types::I64);
         builder.append_block_param(source_accepted, pointer_type);
-        let array = lower_entry_array_source(builder, arguments, deopt_out, function, *source)?;
+        let array = lower_entry_array_source(
+            builder,
+            arguments,
+            deopt_out,
+            function,
+            *source,
+            matches!(
+                source,
+                NativeEntryArraySource::Parameter(index)
+                    if admission.by_ref_array_parameters.contains(index)
+            ),
+            rejected,
+        )?;
         let tagged = lower_value_has_tag(builder, array, crate::JIT_VALUE_RUNTIME_ARRAY_TAG);
         let encoded_index = builder.ins().ireduce(types::I32, array);
         let direct_index = builder.ins().icmp_imm(
@@ -18655,6 +20111,8 @@ fn emit_optimizing_entry_admission(
             || requirement.require_key_values
             || requirement.require_string_values
             || requirement.require_scalar_values
+            || requirement.require_integer_keys
+            || requirement.require_integer_values
             || !requirement.all_value_types.is_empty()
         {
             let scan = builder.create_block();
@@ -18698,6 +20156,25 @@ fn emit_optimizing_entry_admission(
                 let supported = builder.ins().bor(integer, string);
                 admitted = builder.ins().band(admitted, supported);
             }
+            if requirement.require_integer_keys {
+                let (integer, raw) =
+                    lower_native_array_key_integer_candidate(builder, key, deopt_out);
+                admitted = builder.ins().band(admitted, integer);
+                if let Some(minimum) = requirement.integer_minimum {
+                    let bounded =
+                        builder
+                            .ins()
+                            .icmp_imm(IntCC::SignedGreaterThanOrEqual, raw, minimum);
+                    admitted = builder.ins().band(admitted, bounded);
+                }
+                if let Some(maximum) = requirement.integer_maximum {
+                    let bounded =
+                        builder
+                            .ins()
+                            .icmp_imm(IntCC::SignedLessThanOrEqual, raw, maximum);
+                    admitted = builder.ins().band(admitted, bounded);
+                }
+            }
             if requirement.require_key_values {
                 let integer = lower_native_array_key_integer_candidate(builder, value, deopt_out).0;
                 let string = lower_native_string_key_descriptor(builder, value, deopt_out).0;
@@ -18733,6 +20210,24 @@ fn emit_optimizing_entry_admission(
                 let scalar = builder.ins().bor(scalar, false_value);
                 let scalar = builder.ins().bor(scalar, null_value);
                 admitted = builder.ins().band(admitted, scalar);
+            }
+            if requirement.require_integer_values {
+                let (integer, raw) = lower_optimizing_integer_candidate(builder, value, deopt_out);
+                admitted = builder.ins().band(admitted, integer);
+                if let Some(minimum) = requirement.integer_minimum {
+                    let bounded =
+                        builder
+                            .ins()
+                            .icmp_imm(IntCC::SignedGreaterThanOrEqual, raw, minimum);
+                    admitted = builder.ins().band(admitted, bounded);
+                }
+                if let Some(maximum) = requirement.integer_maximum {
+                    let bounded =
+                        builder
+                            .ins()
+                            .icmp_imm(IntCC::SignedLessThanOrEqual, raw, maximum);
+                    admitted = builder.ins().band(admitted, bounded);
+                }
             }
             for type_ in &requirement.all_value_types {
                 let typed = lower_optimizing_type_guard(builder, value, type_, deopt_out)
@@ -18926,16 +20421,18 @@ fn emit_optimizing_entry_admission(
             builder.switch_to_block(finished);
         }
         for mutation in &requirement.mutations {
-            let refcount = builder.ins().load(
-                types::I32,
-                MemFlagsData::new(),
-                slot,
-                std::mem::offset_of!(crate::JitNativeValueSlot, refcount) as i32,
-            );
-            let unique = builder.ins().icmp_imm(IntCC::Equal, refcount, 1);
-            let root_unique = builder.create_block();
-            builder.ins().brif(unique, root_unique, &[], rejected, &[]);
-            builder.switch_to_block(root_unique);
+            if !mutation.allows_shared_root() {
+                let refcount = builder.ins().load(
+                    types::I32,
+                    MemFlagsData::new(),
+                    slot,
+                    std::mem::offset_of!(crate::JitNativeValueSlot, refcount) as i32,
+                );
+                let unique = builder.ins().icmp_imm(IntCC::Equal, refcount, 1);
+                let root_unique = builder.create_block();
+                builder.ins().brif(unique, root_unique, &[], rejected, &[]);
+                builder.switch_to_block(root_unique);
+            }
 
             let parents = match mutation {
                 NativeEntryArrayMutationRequirement::Assign { parents, .. }
@@ -19146,11 +20643,10 @@ fn emit_optimizing_entry_admission(
     if !requires_resource_budget {
         builder.ins().jump(accepted, &[]);
         builder.switch_to_block(rejected);
-        let retry_baseline = builder.ins().iconst(
-            types::I32,
-            i64::from(crate::JitCallStatus::RECOMPILE_REQUESTED.0),
-        );
-        builder.ins().return_(&[retry_baseline]);
+        let contract_violation = builder
+            .ins()
+            .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
+        builder.ins().return_(&[contract_violation]);
         return Ok(());
     }
 
@@ -19240,11 +20736,10 @@ fn emit_optimizing_entry_admission(
         .brif(resources_fit, accepted, &[], rejected, &[]);
 
     builder.switch_to_block(rejected);
-    let retry_baseline = builder.ins().iconst(
-        types::I32,
-        i64::from(crate::JitCallStatus::RECOMPILE_REQUESTED.0),
-    );
-    builder.ins().return_(&[retry_baseline]);
+    let contract_violation = builder
+        .ins()
+        .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
+    builder.ins().return_(&[contract_violation]);
     Ok(())
 }
 
@@ -19252,7 +20747,7 @@ fn emit_optimizing_entry_admission(
 fn define_region_graph_function(
     module: &mut JITModule,
     ctx: &mut cranelift_codegen::Context,
-    builder_context: &mut FunctionBuilderContext,
+    _builder_context: &mut FunctionBuilderContext,
     region: &RegionGraph,
     constants: &[IrConstant],
     value_flow: &ExecutableValueFlow,
@@ -19290,8 +20785,12 @@ fn define_region_graph_function(
         region_graph_signature(module, region)?
     };
     ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+    // A rejected optimizing preflight can return while a builder is still
+    // live. Keep its SSA context invocation-local so the following baseline
+    // compilation cannot inherit partially constructed frontend state.
+    let mut builder_context = FunctionBuilderContext::new();
     {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, builder_context);
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
         let owned_blocks = region
             .blocks
             .iter()
@@ -20064,10 +21563,9 @@ fn define_region_graph_function(
             // caught Error with NULL.
             if let Some(exception_locals) = handler_exception_locals.get(&target) {
                 if matches!(tier_operations, NativeTierOperations::Optimizing { .. }) {
-                    return Err(CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_HANDLER_LVALUE_BOUNDARY",
-                        "optimizing catch-local binding was not rejected during entry admission",
-                    ));
+                    for local in exception_locals {
+                        define_local_variable(&mut builder, &locals, *local, value)?;
+                    }
                 } else {
                     for local in exception_locals {
                         let current = use_local_variable(&mut builder, &locals, *local)?;
@@ -20549,17 +22047,23 @@ fn define_region_graph_function(
                             &mut registers,
                             instruction,
                             transition_live_registers,
-                            optimizing_admission.array_call_is_total(instruction.continuation_id)
-                                || optimizing_admission
-                                    .fixed_builtin_call_is_total(instruction.continuation_id),
+                            optimizing_admission.array_call_is_total(instruction.continuation_id),
+                            optimizing_admission
+                                .fixed_builtin_call_is_total(instruction.continuation_id),
                             optimizing_admission
                                 .array_instruction_is_total(instruction.continuation_id),
+                            optimizing_admission.array_instruction_root_is_by_reference(
+                                instruction.continuation_id,
+                            ),
                             optimizing_admission
                                 .binary_instruction_is_total(instruction.continuation_id),
+                            optimizing_admission
+                                .binary_instruction_operand_classes(instruction.continuation_id),
                             optimizing_admission
                                 .scalar_control_instruction_is_total(instruction.continuation_id),
                             optimizing_admission
                                 .array_instruction_is_fresh(instruction.continuation_id),
+                            optimizing_admission.fresh_array_capacity(instruction.continuation_id),
                             optimizing_admission.local_load_is_total(instruction.continuation_id),
                             optimizing_admission
                                 .request_local_store_is_total(instruction.continuation_id),

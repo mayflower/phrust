@@ -1,11 +1,11 @@
 {
   "diagnostic_string_parsing_allowlist": [
     {
-      "id": "crates/php_vm/src/vm/jit_abi.rs:diagnostic_code_prefix_parse:cbdaba2703e0:1",
+      "id": "crates/php_vm/src/vm/jit_abi/baseline_call_support.rs:diagnostic_code_prefix_parse:cbdaba2703e0:1",
       "reason": "explicit baseline-only conversion from the legacy semantic error envelope into typed NativeCallControl; optimizing exact handlers construct typed control directly"
     },
     {
-      "id": "crates/php_vm/src/vm/jit_abi.rs:diagnostic_code_prefix_parse:836d0b5d1da3:1",
+      "id": "crates/php_vm/src/vm/jit_abi/baseline_call_support.rs:diagnostic_code_prefix_parse:836d0b5d1da3:1",
       "reason": "explicit baseline-only exit conversion in NativeCallControl::from_baseline_error; optimizing exact handlers carry the encoded exit value directly"
     },
     {
@@ -142,44 +142,44 @@
       "max_lines": 9561
     },
     "crates/php_jit/src/cranelift_lowering.rs": {
-      "max_bytes": 1547132,
-      "max_lines": 38997
+      "max_bytes": 1438016,
+      "max_lines": 35032
+    },
+    "crates/php_jit/src/cranelift_lowering/call_metadata.rs": {
+      "max_bytes": 179098,
+      "max_lines": 5335
     },
     "crates/php_jit/src/cranelift_lowering/executable_region.rs": {
-      "max_bytes": 469778,
-      "max_lines": 10936
+      "max_bytes": 955915,
+      "max_lines": 21622
     },
     "crates/php_jit/src/region_ir/executable.rs": {
-      "max_bytes": 345548,
-      "max_lines": 7813
+      "max_bytes": 378934,
+      "max_lines": 8304
     },
     "crates/php_phpt_tools/src/commands/mod.rs": {
       "max_bytes": 186734,
       "max_lines": 5173
     },
     "crates/php_runtime/src/builtins/modules/core.rs": {
-      "max_bytes": 474203,
-      "max_lines": 14439
-    },
-    "crates/php_vm/src/vm/jit_abi.rs": {
-      "max_bytes": 924671,
-      "max_lines": 21500
-    },
-    "crates/php_vm/src/vm/jit_abi/call_dispatch.rs": {
-      "max_bytes": 259619,
-      "max_lines": 6877
-    },
-    "crates/php_vm/src/vm/jit_abi/native_builtins.rs": {
-      "max_bytes": 237378,
-      "max_lines": 5838
+      "max_bytes": 210193,
+      "max_lines": 6518
     },
     "crates/php_vm/src/vm/jit_abi/baseline_runtime_ops.rs": {
-      "max_bytes": 278575,
-      "max_lines": 6653
+      "max_bytes": 260430,
+      "max_lines": 6107
     },
-    "crates/php_vm/src/vm/mod.rs": {
-      "max_bytes": 230198,
-      "max_lines": 5530
+    "crates/php_vm/src/vm/jit_abi/cold_request_state.rs": {
+      "max_bytes": 328171,
+      "max_lines": 7447
+    },
+    "crates/php_vm/src/vm/jit_abi/native/exact_call_dispatch.rs": {
+      "max_bytes": 252838,
+      "max_lines": 6641
+    },
+    "crates/php_vm/src/vm/jit_abi/native/fast_state_impl.rs": {
+      "max_bytes": 270279,
+      "max_lines": 6264
     }
   },
   "module_wide_allowlist": [
@@ -327,11 +327,11 @@
   ],
   "pointer_integer_identity_allowlist": [
     {
-      "id": "crates/php_vm/src/vm/jit_abi.rs:pointer_integer_identity:9beb5d43ba8e:1",
+      "id": "crates/php_vm/src/vm/jit_abi/cold_publication.rs:pointer_integer_identity:9beb5d43ba8e:1",
       "reason": "request-published immutable class-allocation capability forwarded only to its exact native handler; never used as logical identity, hash, or equality"
     },
     {
-      "id": "crates/php_vm/src/vm/jit_abi.rs:pointer_integer_identity:5a3313beaec1:1",
+      "id": "crates/php_vm/src/vm/jit_abi/cold_request_state.rs:pointer_integer_identity:5a3313beaec1:1",
       "reason": "request-published immutable closure-plan capability forwarded only to its exact native handler; never used as logical identity, hash, or equality"
     }
   ],

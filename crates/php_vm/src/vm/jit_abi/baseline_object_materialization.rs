@@ -363,11 +363,11 @@ impl<'a> NativeRequestColdState<'a> {
         let object = self
             .direct_object(index)
             .ok_or_else(|| format!("direct native object {index} has no stable owner"))?;
-        let object_type_flags = u32::from(object.is_native_countable())
-            * php_jit::JIT_NATIVE_OBJECT_COUNTABLE
-            | u32::from(object.is_native_traversable()) * php_jit::JIT_NATIVE_OBJECT_TRAVERSABLE
-            | u32::from(object.class_name().eq_ignore_ascii_case("stdClass"))
-                * php_jit::JIT_NATIVE_OBJECT_STDCLASS;
+        let object_type_flags = (u32::from(object.is_native_countable())
+            * php_jit::JIT_NATIVE_OBJECT_COUNTABLE)
+            | (u32::from(object.is_native_traversable()) * php_jit::JIT_NATIVE_OBJECT_TRAVERSABLE)
+            | (u32::from(object.class_name().eq_ignore_ascii_case("stdClass"))
+                * php_jit::JIT_NATIVE_OBJECT_STDCLASS);
         let layout_id = object.class_layout_epoch();
         if let Some((base, count)) = object.native_declared_slots_view(layout_id) {
             let slot = self

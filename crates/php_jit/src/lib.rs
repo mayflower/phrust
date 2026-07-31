@@ -750,6 +750,8 @@ pub struct JitExternalFunctionSignature {
     pub requires_non_reference_trampoline: bool,
     /// True when the declaration returns a reference.
     pub returns_by_reference: bool,
+    /// Published PHP return type after declaration/default resolution.
+    pub return_type: Option<php_ir::IrReturnType>,
     /// Exact target function whose published native artifact owns catch/finally
     /// resume entries. `None` means the target has no exception handlers (or
     /// is not yet published), so a returned throw continues unwinding.

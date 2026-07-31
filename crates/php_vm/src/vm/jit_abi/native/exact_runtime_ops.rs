@@ -732,6 +732,8 @@ impl Write for NativeInlineString {
     }
 }
 
+// architecture: fixed stack storage avoids a heap allocation in native concat
+#[allow(clippy::large_enum_variant)]
 enum NativeConcatPart {
     /// Raw native arena bytes remain stable for the synchronous exact call.
     Native {
@@ -788,11 +790,13 @@ impl NativeConcatPart {
     }
 }
 
+type NativeStringRange = (*const u8, usize);
+
 fn native_string_ranges(
     fast: &NativeRequestFastState,
     left: i64,
     right: i64,
-) -> Option<((*const u8, usize), (*const u8, usize))> {
+) -> Option<(NativeStringRange, NativeStringRange)> {
     match (
         fast.native_comparison_value(left)?,
         fast.native_comparison_value(right)?,

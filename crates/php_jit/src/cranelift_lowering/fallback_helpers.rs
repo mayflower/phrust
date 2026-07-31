@@ -93,13 +93,20 @@ pub(super) extern "C" fn test_native_compare_fallback(
     if out.is_null() {
         return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
+    let boolean = |condition| {
+        crate::jit_encode_constant(if condition {
+            crate::JIT_VALUE_TRUE
+        } else {
+            crate::JIT_VALUE_FALSE
+        })
+    };
     let value = match op {
-        0 | 2 => i64::from(lhs == rhs),
-        1 | 3 => i64::from(lhs != rhs),
-        4 => i64::from(lhs < rhs),
-        5 => i64::from(lhs <= rhs),
-        6 => i64::from(lhs > rhs),
-        7 => i64::from(lhs >= rhs),
+        0 | 2 => boolean(lhs == rhs),
+        1 | 3 => boolean(lhs != rhs),
+        4 => boolean(lhs < rhs),
+        5 => boolean(lhs <= rhs),
+        6 => boolean(lhs > rhs),
+        7 => boolean(lhs >= rhs),
         8 => match lhs.cmp(&rhs) {
             std::cmp::Ordering::Less => -1,
             std::cmp::Ordering::Equal => 0,

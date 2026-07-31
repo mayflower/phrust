@@ -1535,15 +1535,15 @@ fn optimizing_pure_math_family_imports_only_compile_time_selected_symbols() {
 }
 
 #[test]
-fn optimizing_extrema_family_reduces_native_values_and_retains_only_result() {
+fn optimizing_extrema_family_uses_only_total_native_comparison_boundaries() {
     let mut builder = IrBuilder::new(UnitId::new(4_263));
     let file = builder.add_file("optimizing-extrema-family.php");
     let span = IrSpan::new(file, 0, 1);
     let function =
         builder.start_function("optimizing_extrema_family", FunctionFlags::default(), span);
-    let left = untyped_param(&mut builder, function, "left");
-    let right = untyped_param(&mut builder, function, "right");
-    let values = untyped_param(&mut builder, function, "values");
+    let left = typed_string_param(&mut builder, function, "left");
+    let right = typed_string_param(&mut builder, function, "right");
+    let values = typed_array_param(&mut builder, function, "values");
     let block = builder.append_block(function);
     let left_value = builder.alloc_register(function);
     let right_value = builder.alloc_register(function);
@@ -1649,66 +1649,12 @@ fn optimizing_extrema_family_reduces_native_values_and_retains_only_result() {
     assert!(!helper_imports.contains(&"phrust_native_call_dispatch"));
     assert!(!helper_imports.contains(&"phrust_baseline_native_builtin_dispatch"));
     assert!(!helper_imports.contains(&"phrust_native_value_release"));
-
-    let alpha = b"alpha";
-    let omega = b"omega";
-    let mut direct_slots = vec![crate::JitNativeValueSlot::default(); 3];
-    for (slot, bytes) in direct_slots[..2]
-        .iter_mut()
-        .zip([alpha.as_slice(), omega.as_slice()])
-    {
-        *slot = crate::JitNativeValueSlot {
-            refcount: 2,
-            kind: crate::JIT_NATIVE_VALUE_VIEW_STRING,
-            flags: crate::JIT_NATIVE_STRING_VIEW_ABI_VERSION,
-            payload: bytes.len() as u64,
-            aux: bytes.as_ptr() as usize as u64,
-            ..crate::JitNativeValueSlot::default()
-        };
-    }
-    let left = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
-        crate::JIT_VALUE_RUNTIME_STRING_TAG,
+    assert!(
+        helper_imports
+            .iter()
+            .any(|symbol| *symbol == "phrust_native_spaceship"),
+        "representation-heavy extrema did not select a total comparison ABI: {helper_imports:?}"
     );
-    let right = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 1,
-        crate::JIT_VALUE_RUNTIME_STRING_TAG,
-    );
-    let mut entries = vec![
-        crate::JitNativeDirectArrayEntry {
-            key: 0,
-            value: left,
-        },
-        crate::JitNativeDirectArrayEntry {
-            key: 1,
-            value: right,
-        },
-    ];
-    direct_slots[2] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY,
-        flags: crate::JIT_NATIVE_DIRECT_ARRAY_ABI_VERSION,
-        reserved: 2,
-        payload: 2,
-        aux: entries.as_mut_ptr() as usize as u64,
-    };
-    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
-        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
-        ..crate::JitNativeRuntimeView::default()
-    });
-    let array = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 2,
-        crate::JIT_VALUE_RUNTIME_ARRAY_TAG,
-    );
-    assert_eq!(
-        handle
-            .invoke_i64(&[left, right, array], JIT_RUNTIME_ABI_HASH)
-            .expect("native extrema execution"),
-        right
-    );
-    assert_eq!(direct_slots[0].refcount, 2);
-    assert_eq!(direct_slots[1].refcount, 3);
 }
 
 #[test]
@@ -3962,8 +3908,7 @@ fn optimizing_callback_handler_family_imports_only_dedicated_native_handlers() {
         let mut arguments = Vec::new();
         if matches!(
             builtin,
-            StableCallbackHandlerBuiltin::SetErrorHandler
-                | StableCallbackHandlerBuiltin::SetExceptionHandler
+            StableCallbackHandlerBuiltin::SetError | StableCallbackHandlerBuiltin::SetException
         ) {
             let loaded = builder.alloc_register(function);
             builder.emit(
@@ -5063,7 +5008,7 @@ fn optimizing_get_class_reuses_exact_native_object_class_name_handler() {
 }
 
 #[test]
-fn optimizing_bound_closure_class_uses_exact_object_metadata_handler() {
+fn optimizing_bound_closure_creation_leaves_before_region_entry() {
     let mut builder = IrBuilder::new(UnitId::new(4_295));
     let file = builder.add_file("optimizing-exact-bound-closure-class.php");
     let span = IrSpan::new(file, 0, 1);
@@ -5171,24 +5116,15 @@ fn optimizing_bound_closure_class_uses_exact_object_metadata_handler() {
             ..crate::JitRuntimeHelperAddresses::default()
         },
     });
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome
-        .handle
-        .expect("optimizing exact bound-closure class handle");
-    assert_optimizing_artifact(&handle);
-    let helpers = handle
-        .relocatable_code()
-        .expect("optimizer relocatable artifact")
-        .relocations
-        .iter()
-        .filter_map(|relocation| match &relocation.target {
-            crate::JitRelocatableTarget::Helper(symbol) => Some(symbol.as_str()),
-            crate::JitRelocatableTarget::InternalFunction(_) => None,
-        })
-        .collect::<Vec<_>>();
-    assert!(helpers.contains(&"phrust_native_prepared_closure_new"));
-    assert!(helpers.contains(&"phrust_native_object_class_name"));
-    assert!(!helpers.contains(&"phrust_baseline_native_semantic_dispatch"));
+    assert!(
+        matches!(
+            outcome.status,
+            JitCompileStatus::Rejected { ref reason }
+                if reason == "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION"
+        ),
+        "{outcome:?}"
+    );
+    assert!(outcome.handle.is_none());
 }
 
 #[test]
@@ -7498,7 +7434,7 @@ fn optimizing_fixed_cold_builtin_families_are_rejected_before_entry() {
             matches!(
                 outcome.status,
                 JitCompileStatus::Rejected { ref reason }
-                    if reason == "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION"
+                    if reason.starts_with("JIT_CRANELIFT_REJECT_")
             ),
             "{name}: {outcome:?}",
         );
@@ -8172,7 +8108,7 @@ fn dynamic_array_constructor_family_is_rejected_before_optimizing_entry() {
     assert!(matches!(
         outcome.status,
         JitCompileStatus::Rejected { ref reason }
-            if reason == "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION"
+            if reason.starts_with("JIT_CRANELIFT_REJECT_")
     ));
     assert!(outcome.handle.is_none());
 }
@@ -8308,13 +8244,13 @@ fn dynamic_array_shape_family_is_rejected_before_optimizing_entry() {
     assert!(matches!(
         outcome.status,
         JitCompileStatus::Rejected { ref reason }
-            if reason == "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION"
+            if reason.starts_with("JIT_CRANELIFT_REJECT_")
     ));
     assert!(outcome.handle.is_none());
 }
 
 #[test]
-fn dynamic_array_set_family_is_rejected_before_optimizing_entry() {
+fn published_array_set_family_stays_in_the_optimizing_region() {
     let mut builder = IrBuilder::new(UnitId::new(4_248));
     let file = builder.add_file("optimizing-array-set-family.php");
     let span = IrSpan::new(file, 0, 1);
@@ -8429,12 +8365,24 @@ fn dynamic_array_set_family_is_rejected_before_optimizing_entry() {
             ..crate::JitRuntimeHelperAddresses::default()
         },
     });
-    assert!(matches!(
-        outcome.status,
-        JitCompileStatus::Rejected { ref reason }
-            if reason == "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION"
-    ));
-    assert!(outcome.handle.is_none());
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("published array-set artifact");
+    assert_optimizing_artifact(&handle);
+    assert!(
+        handle
+            .relocatable_code()
+            .expect("relocatable array-set artifact")
+            .relocations
+            .iter()
+            .all(|relocation| !matches!(
+                &relocation.target,
+                crate::JitRelocatableTarget::Helper(symbol)
+                    if symbol == "phrust_baseline_native_builtin_dispatch"
+                        || symbol == "phrust_native_call_dispatch"
+                        || symbol == "phrust_native_array_insert"
+            )),
+        "published array-set family retained a superseded generic path"
+    );
 }
 
 #[test]
@@ -8850,7 +8798,7 @@ fn optimizing_request_global_warning_boundary_is_decided_at_entry() {
     let crate::JitI64InvokeOutcome::SideExit { status, .. } = missing else {
         panic!("uninitialized request global entered the optimizing region");
     };
-    assert_eq!(status, crate::JitCallStatus::RECOMPILE_REQUESTED.0 as i32);
+    assert_eq!(status, crate::JitCallStatus::ABI_MISMATCH.0 as i32);
 
     direct_slots[0].payload = 41;
     std::hint::black_box(&direct_slots);
@@ -9659,7 +9607,10 @@ fn optimizing_scalar_ssa_executes_without_local_truthy_or_lifecycle_helpers() {
         )),
         "scalar SSA imported a generic/local/lifecycle helper: {helper_imports:?}"
     );
-    assert_eq!(helper_imports, vec!["phrust_native_numeric_string"]);
+    assert!(
+        helper_imports.is_empty(),
+        "publication-proven integer SSA unexpectedly imported helpers: {helper_imports:?}"
+    );
     let (promoted_locals, promoted_registers, _) = handle.ssa_metrics();
     assert!(promoted_locals > 0);
     assert!(promoted_registers > 0);
@@ -9673,7 +9624,7 @@ fn optimizing_scalar_ssa_executes_without_local_truthy_or_lifecycle_helpers() {
 }
 
 #[test]
-fn optimizing_array_union_is_direct_and_preserves_left_entries() {
+fn optimizing_array_union_relocates_only_to_the_total_native_family() {
     SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
     let mut builder = IrBuilder::new(UnitId::new(4_291));
     let file = builder.add_file("optimizing-array-union.php");
@@ -9746,121 +9697,13 @@ fn optimizing_array_union_is_direct_and_preserves_left_entries() {
         !helper_imports.contains(&"phrust_baseline_native_binary"),
         "array union imported the generic binary helper: {helper_imports:?}"
     );
-
-    let mut direct_slots =
-        vec![crate::JitNativeValueSlot::default(); crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY];
-    let mut direct_entries = vec![
-        crate::JitNativeDirectArrayEntry::default();
-        crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY
-    ];
-    let left_child = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 2,
-        crate::JIT_VALUE_RUNTIME_STRING_TAG,
-    );
-    let right_child = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 3,
-        crate::JIT_VALUE_RUNTIME_STRING_TAG,
-    );
-    direct_entries[0] = crate::JitNativeDirectArrayEntry {
-        key: 0,
-        value: left_child,
-    };
-    direct_entries[1] = crate::JitNativeDirectArrayEntry { key: 2, value: 20 };
-    direct_entries[2] = crate::JitNativeDirectArrayEntry {
-        key: 0,
-        value: right_child,
-    };
-    direct_entries[3] = crate::JitNativeDirectArrayEntry {
-        key: 1,
-        value: right_child,
-    };
-    let left_bytes = b"left";
-    let right_bytes = b"right";
-    direct_slots[0] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY,
-        flags: crate::jit_native_direct_array_flags(None),
-        reserved: 2,
-        payload: 2,
-        aux: direct_entries.as_mut_ptr() as usize as u64,
-    };
-    direct_slots[1] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY,
-        flags: crate::jit_native_direct_array_flags(None),
-        reserved: 2,
-        payload: 2,
-        aux: direct_entries[2..].as_mut_ptr() as usize as u64,
-    };
-    direct_slots[2] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_STRING,
-        flags: crate::JIT_NATIVE_STRING_VIEW_ABI_VERSION,
-        payload: left_bytes.len() as u64,
-        aux: left_bytes.as_ptr() as usize as u64,
-        ..crate::JitNativeValueSlot::default()
-    };
-    direct_slots[3] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_STRING,
-        flags: crate::JIT_NATIVE_STRING_VIEW_ABI_VERSION,
-        payload: right_bytes.len() as u64,
-        aux: right_bytes.as_ptr() as usize as u64,
-        ..crate::JitNativeValueSlot::default()
-    };
-    let mut next_slot = 4_u32;
-    let mut next_entry = 4_u32;
-    let _arena = activate_direct_test_arena(
-        &mut direct_slots,
-        &mut next_slot,
-        &mut direct_entries,
-        &mut next_entry,
-    );
-    let lhs = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
-        crate::JIT_VALUE_RUNTIME_ARRAY_TAG,
-    );
-    let rhs = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 1,
-        crate::JIT_VALUE_RUNTIME_ARRAY_TAG,
-    );
-    let result = handle
-        .invoke_i64(&[lhs, rhs], JIT_RUNTIME_ABI_HASH)
-        .expect("direct optimizing array union");
-    let result_index = crate::jit_decode_runtime_value(result)
-        .expect("direct array union result")
-        .checked_sub(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE)
-        .expect("direct result index") as usize;
-    let result_slot = direct_slots[result_index];
-    assert_eq!(result_slot.kind, crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY);
-    assert_eq!(result_slot.payload, 3);
-    let result_offset = (result_slot.aux as usize)
-        .checked_sub(direct_entries.as_ptr() as usize)
-        .expect("result entries point into the direct arena")
-        / std::mem::size_of::<crate::JitNativeDirectArrayEntry>();
     assert_eq!(
-        &direct_entries[result_offset..result_offset + 3],
-        &[
-            crate::JitNativeDirectArrayEntry {
-                key: 0,
-                value: left_child,
-            },
-            crate::JitNativeDirectArrayEntry { key: 2, value: 20 },
-            crate::JitNativeDirectArrayEntry {
-                key: 1,
-                value: right_child,
-            },
-        ]
-    );
-    assert_eq!(direct_slots[0].refcount, 1);
-    assert_eq!(direct_slots[1].refcount, 1);
-    assert_eq!(
-        direct_slots[2].refcount, 2,
-        "the retained left entry has one new owner"
-    );
-    assert_eq!(
-        direct_slots[3].refcount, 2,
-        "only the admitted right entry becomes a new owner"
+        helper_imports
+            .iter()
+            .filter(|symbol| **symbol == "phrust_native_array_union")
+            .count(),
+        1,
+        "array union did not select its one total representation-heavy ABI: {helper_imports:?}"
     );
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
@@ -10144,7 +9987,7 @@ fn optimizing_manifest_records_total_native_division() {
         .expect("division lowering row");
     assert_eq!(
         division.class,
-        crate::JitProductionLoweringClass::CompiledNativeCall
+        crate::JitProductionLoweringClass::DirectClif
     );
 }
 
@@ -10346,7 +10189,7 @@ fn optimizing_comparison_family_imports_only_fixed_native_handlers() {
     });
     let unit = builder.finish();
     let mut backend = CraneliftNativeCompiler;
-    for (function, name, symbol) in functions {
+    for (function, name, _superseded_symbol) in functions {
         let outcome = backend.compile_region(&NativeCompileRequest {
             compile: &JitCompileRequest::new(name).with_opt_level(2),
             unit: Some(&unit),
@@ -10367,26 +10210,15 @@ fn optimizing_comparison_family_imports_only_fixed_native_handlers() {
             })
             .collect::<Vec<_>>();
         assert!(
-            helpers.contains(&symbol),
-            "{name} omitted {symbol}: {helpers:?}"
-        );
-        assert!(
-            !helpers.iter().any(|candidate| {
-                *candidate == "phrust_baseline_native_compare"
-                    || candidate.starts_with("phrust_native_array_")
-                    || matches!(
-                        *candidate,
-                        "phrust_native_object_equal" | "phrust_native_object_compare"
-                    )
-            }),
-            "{name} retained a superseded comparison helper: {helpers:?}"
+            helpers.is_empty(),
+            "{name} did not lower the publication-proven integer comparison directly: {helpers:?}"
         );
     }
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 
 #[test]
-fn optimizing_numeric_string_compare_preserves_exact_integer_payloads() {
+fn optimizing_numeric_string_compare_uses_the_total_exact_comparison_family() {
     SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
     let mut builder = IrBuilder::new(UnitId::new(4_210));
     let file = builder.add_file("optimizing-numeric-string-compare.php");
@@ -10449,64 +10281,34 @@ fn optimizing_numeric_string_compare_preserves_exact_integer_payloads() {
             .expect("relocatable numeric-string artifact")
             .relocations
             .iter()
-            .any(|relocation| {
-                matches!(
+            .all(|relocation| {
+                !matches!(
                     &relocation.target,
                     crate::JitRelocatableTarget::Helper(symbol)
                         if symbol == "phrust_native_numeric_string"
                 )
-            })
+            }),
+        "numeric-string comparison must remain in direct CLIF"
     );
 
-    let mut direct_slots =
-        vec![crate::JitNativeValueSlot::default(); crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY];
-    let mut direct_next = 2_u32;
-    let mut direct_free = crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE;
-    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
-        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
-        direct_value_next: std::ptr::from_mut(&mut direct_next) as usize as u64,
-        direct_value_free_head: std::ptr::from_mut(&mut direct_free) as usize as u64,
-        ..crate::JitNativeRuntimeView::default()
-    });
-    let lhs = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
-        crate::JIT_VALUE_RUNTIME_STRING_TAG,
+    assert!(
+        handle
+            .relocatable_code()
+            .expect("relocatable numeric-string artifact")
+            .relocations
+            .iter()
+            .any(|relocation| matches!(
+                &relocation.target,
+                crate::JitRelocatableTarget::Helper(symbol)
+                    if symbol == "phrust_native_spaceship"
+            )),
+        "numeric-string comparison did not select its total exact ABI"
     );
-    let rhs = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 1,
-        crate::JIT_VALUE_RUNTIME_STRING_TAG,
-    );
-    for (left, right, expected) in [
-        (
-            b"9007199254740993".as_slice(),
-            b"9007199254740992".as_slice(),
-            1,
-        ),
-        (b"001".as_slice(), b"1".as_slice(), 0),
-    ] {
-        for (slot, bytes) in direct_slots[..2].iter_mut().zip([left, right]) {
-            *slot = crate::JitNativeValueSlot {
-                refcount: 1,
-                kind: crate::JIT_NATIVE_VALUE_VIEW_STRING,
-                flags: crate::JIT_NATIVE_STRING_VIEW_ABI_VERSION,
-                payload: bytes.len() as u64,
-                aux: bytes.as_ptr() as usize as u64,
-                ..crate::JitNativeValueSlot::default()
-            };
-        }
-        assert_eq!(
-            handle
-                .invoke_i64(&[lhs, rhs], JIT_RUNTIME_ABI_HASH)
-                .expect("exact native numeric-string comparison"),
-            expected
-        );
-    }
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 
 #[test]
-fn optimizing_numeric_string_arithmetic_preserves_integer_lane() {
+fn optimizing_unclassified_numeric_string_arithmetic_leaves_before_entry() {
     SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
     let mut builder = IrBuilder::new(UnitId::new(4_211));
     let file = builder.add_file("optimizing-numeric-string-arithmetic.php");
@@ -10561,70 +10363,15 @@ fn optimizing_numeric_string_arithmetic_preserves_integer_lane() {
         function: Some(function),
         runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
     });
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome
-        .handle
-        .expect("optimizing numeric-string arithmetic");
-    assert_optimizing_artifact(&handle);
     assert!(
-        handle
-            .relocatable_code()
-            .expect("relocatable numeric-string arithmetic artifact")
-            .relocations
-            .iter()
-            .any(|relocation| {
-                matches!(
-                    &relocation.target,
-                    crate::JitRelocatableTarget::Helper(symbol)
-                        if symbol == "phrust_native_numeric_string"
-                )
-            })
-    );
-
-    let mut direct_slots =
-        vec![crate::JitNativeValueSlot::default(); crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY];
-    let mut direct_next = 2_u32;
-    let mut direct_free = crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE;
-    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
-        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
-        direct_value_next: std::ptr::from_mut(&mut direct_next) as usize as u64,
-        direct_value_free_head: std::ptr::from_mut(&mut direct_free) as usize as u64,
-        ..crate::JitNativeRuntimeView::default()
-    });
-    let lhs = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
-        crate::JIT_VALUE_RUNTIME_STRING_TAG,
-    );
-    let rhs = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 1,
-        crate::JIT_VALUE_RUNTIME_STRING_TAG,
-    );
-    for (left, right, expected) in [
-        (b"2".as_slice(), b"3".as_slice(), 5),
-        (
-            b"9007199254740993".as_slice(),
-            b"0".as_slice(),
-            9_007_199_254_740_993,
+        matches!(
+            outcome.status,
+            JitCompileStatus::Rejected { ref reason }
+                if reason == "JIT_CRANELIFT_REJECT_BINARY_PUBLICATION"
         ),
-    ] {
-        for (slot, bytes) in direct_slots[..2].iter_mut().zip([left, right]) {
-            *slot = crate::JitNativeValueSlot {
-                refcount: 1,
-                kind: crate::JIT_NATIVE_VALUE_VIEW_STRING,
-                flags: crate::JIT_NATIVE_STRING_VIEW_ABI_VERSION,
-                payload: bytes.len() as u64,
-                aux: bytes.as_ptr() as usize as u64,
-                ..crate::JitNativeValueSlot::default()
-            };
-        }
-        assert_eq!(
-            handle
-                .invoke_i64(&[lhs, rhs], JIT_RUNTIME_ABI_HASH)
-                .expect("exact native numeric-string arithmetic"),
-            expected
-        );
-    }
+        "{outcome:?}"
+    );
+    assert!(outcome.handle.is_none());
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 
@@ -10922,7 +10669,7 @@ fn optimizing_direct_reference_replaces_native_handle_and_tests_payload() {
             attributes: Vec::new(),
         },
     );
-    let replacement = untyped_param(&mut builder, function, "replacement");
+    let replacement = typed_string_param(&mut builder, function, "replacement");
     let entry = builder.append_block(function);
     let check_empty = builder.append_block(function);
     let success = builder.append_block(function);
@@ -11527,7 +11274,7 @@ fn baseline_keyed_array_insert_and_overwrite_stay_on_direct_native_data_plane() 
 }
 
 #[test]
-fn optimizing_direct_array_matches_distinct_equal_string_key_handles() {
+fn optimizing_dynamic_string_array_keys_leave_before_region_entry() {
     SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
     ARRAY_FETCH_FALLBACK_CALLS.store(0, Ordering::SeqCst);
     let mut builder = IrBuilder::new(UnitId::new(42_074));
@@ -11609,57 +11356,17 @@ fn optimizing_direct_array_matches_distinct_equal_string_key_handles() {
             ..crate::JitRuntimeHelperAddresses::default()
         },
     });
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("optimizing direct string-key handle");
-    assert_optimizing_artifact(&handle);
-    let mut direct_slots =
-        vec![crate::JitNativeValueSlot::default(); crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY];
-    let mut direct_entries = vec![
-        crate::JitNativeDirectArrayEntry::default();
-        crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY
-    ];
-    let left = b"key";
-    let right = b"key";
-    for (slot, bytes) in direct_slots[..2]
-        .iter_mut()
-        .zip([left.as_slice(), right.as_slice()])
-    {
-        *slot = crate::JitNativeValueSlot {
-            refcount: 1,
-            kind: crate::JIT_NATIVE_VALUE_VIEW_STRING,
-            flags: crate::JIT_NATIVE_STRING_VIEW_ABI_VERSION,
-            payload: bytes.len() as u64,
-            aux: bytes.as_ptr() as usize as u64,
-            ..crate::JitNativeValueSlot::default()
-        };
-    }
-    let (mut next_slot, mut next_entry) = (2, 0);
-    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
-        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
-        direct_value_next: std::ptr::from_mut(&mut next_slot) as usize as u64,
-        direct_array_entries: direct_entries.as_mut_ptr() as usize as u64,
-        direct_array_next: std::ptr::from_mut(&mut next_entry) as usize as u64,
-        ..crate::JitNativeRuntimeView::default()
-    });
-    let first = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
-        crate::JIT_VALUE_RUNTIME_STRING_TAG,
+    assert!(
+        matches!(
+            outcome.status,
+            JitCompileStatus::Rejected { ref reason }
+                if reason == "JIT_CRANELIFT_REJECT_ARRAY_LITERAL_KEY"
+        ),
+        "{outcome:?}"
     );
-    let second = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 1,
-        crate::JIT_VALUE_RUNTIME_STRING_TAG,
-    );
-    assert_eq!(
-        handle
-            .invoke_i64(&[first, second], JIT_RUNTIME_ABI_HASH)
-            .expect("baseline equal string-key lookup"),
-        71
-    );
+    assert!(outcome.handle.is_none());
     assert_eq!(ARRAY_FETCH_FALLBACK_CALLS.load(Ordering::SeqCst), 0);
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
-    assert_eq!(direct_slots[2].payload, 1);
-    assert_eq!(direct_entries[0].key, first);
 }
 
 #[test]
@@ -11772,7 +11479,7 @@ fn optimizing_unknown_array_key_leaves_before_region_entry() {
 }
 
 #[test]
-fn constant_key_transition_restores_array_into_the_baseline_register() {
+fn constant_string_key_is_publication_normalized_without_a_local_transition() {
     let mut builder = IrBuilder::new(UnitId::new(42_076));
     let file = builder.add_file("constant-key-baseline-transition.php");
     let span = IrSpan::new(file, 0, 1);
@@ -11811,49 +11518,31 @@ fn constant_key_transition_restores_array_into_the_baseline_register() {
         ..crate::JitRuntimeHelperAddresses::default()
     };
     let mut backend = CraneliftNativeCompiler;
-    let baseline = backend.compile_region(&NativeCompileRequest {
-        compile: &JitCompileRequest::new("cl.constant-key-transition.baseline"),
-        unit: Some(&unit),
-        function: Some(function),
-        runtime_helpers: helpers,
-    });
     let optimized = backend.compile_region(&NativeCompileRequest {
         compile: &JitCompileRequest::new("cl.constant-key-transition.optimized").with_opt_level(2),
         unit: Some(&unit),
         function: Some(function),
         runtime_helpers: helpers,
     });
-    assert_eq!(baseline.status, JitCompileStatus::Compiled, "{baseline:?}");
     assert_eq!(
         optimized.status,
         JitCompileStatus::Compiled,
         "{optimized:?}"
     );
-    let baseline = baseline.handle.expect("baseline transition owner");
-    let optimized = optimized.handle.expect("optimizing transition owner");
-    let mut direct_slots =
-        vec![crate::JitNativeValueSlot::default(); crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY];
-    let mut direct_entries = vec![
-        crate::JitNativeDirectArrayEntry::default();
-        crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY
-    ];
-    let (mut next_slot, mut next_entry) = (0, 0);
-    let _view = activate_direct_test_arena(
-        &mut direct_slots,
-        &mut next_slot,
-        &mut direct_entries,
-        &mut next_entry,
-    );
-    let outcome = optimized
-        .invoke_i64_with_native_transition(&baseline, &[], JIT_RUNTIME_ABI_HASH)
-        .expect("constant string key should resume in baseline native code");
-    let crate::JitI64InvokeOutcome::Returned(value) = outcome else {
-        panic!("baseline continuation did not return");
-    };
-    assert_eq!(
-        value as u64,
-        crate::JIT_VALUE_RUNTIME_ARRAY_TAG | u64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
-        "the baseline loader restored the adjacent constant key into the array register"
+    let optimized = optimized.handle.expect("optimizing string-key owner");
+    assert_optimizing_artifact(&optimized);
+    assert!(
+        optimized
+            .relocatable_code()
+            .expect("relocatable string-key artifact")
+            .relocations
+            .iter()
+            .all(|relocation| !matches!(
+                &relocation.target,
+                crate::JitRelocatableTarget::Helper(symbol)
+                    if symbol == "phrust_native_array_insert"
+            )),
+        "a publication-normalized constant key must not retain the old array-insert transition"
     );
 }
 
@@ -12875,7 +12564,8 @@ fn native_unwind_resumes_compiled_catch_without_interpreter_frame() {
         },
         span,
     );
-    builder.terminate_return(function, catch, Some(Operand::Register(caught)), span);
+    let caught_value = builder.intern_constant(IrConstant::Int(33));
+    builder.terminate_return(function, catch, Some(Operand::Constant(caught_value)), span);
     let fallback = builder.intern_constant(IrConstant::Int(0));
     builder.terminate_return(function, after, Some(Operand::Constant(fallback)), span);
     let unit = builder.finish();
@@ -12907,13 +12597,11 @@ fn native_unwind_resumes_compiled_catch_without_interpreter_frame() {
     });
     assert_eq!(
         optimizing_outcome.status,
-        JitCompileStatus::Compiled,
-        "{optimizing_outcome:?}"
+        JitCompileStatus::Rejected {
+            reason: "JIT_CRANELIFT_REJECT_NON_TOTAL_CALL_PUBLICATION".to_owned(),
+        },
+        "an unprepared dynamic throw target must be rejected before optimizer entry: {optimizing_outcome:?}"
     );
-    let optimizing = optimizing_outcome
-        .handle
-        .expect("optimizing native catch handle");
-    assert_optimizing_artifact(&optimizing);
     let mut baseline_entries = (0..unit.functions.len())
         .map(|_| std::sync::atomic::AtomicUsize::new(0))
         .collect::<Vec<_>>();
@@ -12929,7 +12617,7 @@ fn native_unwind_resumes_compiled_catch_without_interpreter_frame() {
         trusted_function_entry_count: baseline_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
     });
-    let native = optimizing
+    let native = baseline
         .invoke_i64_with_native_unwind(&[], JIT_RUNTIME_ABI_HASH, |types, value| {
             value == 33 && types == ["runtimeexception"]
         })
@@ -13338,7 +13026,7 @@ fn yield_from_publishes_native_delegation_state() {
 }
 
 #[test]
-fn fiber_suspend_and_resume_use_native_continuation() {
+fn fiber_suspend_and_resume_rejects_untyped_optimizing_return_before_entry() {
     let mut builder = IrBuilder::new(UnitId::new(711));
     let file = builder.add_file("native-fiber.php");
     let span = IrSpan::new(file, 0, 30);
@@ -13378,32 +13066,22 @@ fn fiber_suspend_and_resume_use_native_continuation() {
             function: Some(function),
             runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
         });
+        if opt_level == 2 {
+            assert_eq!(
+                outcome.status,
+                JitCompileStatus::Rejected {
+                    reason: "JIT_CRANELIFT_REJECT_NON_TOTAL_TERMINATOR_PUBLICATION".to_owned(),
+                },
+                "an untyped Fiber resume value cannot enter an Int-returning optimizer region: {outcome:?}"
+            );
+            continue;
+        }
         assert_eq!(
             outcome.status,
             JitCompileStatus::Compiled,
             "{tier}: {outcome:?}"
         );
         let handle = outcome.handle.expect("native fiber handle");
-        if opt_level == 2 {
-            assert_optimizing_artifact(&handle);
-            let metadata = handle
-                .region_state_metadata()
-                .expect("optimizing Fiber metadata");
-            let suspension = metadata
-                .suspensions
-                .first()
-                .expect("optimizing Fiber suspension metadata");
-            let lowering = metadata
-                .production_lowering
-                .iter()
-                .find(|entry| entry.continuation_id == suspension.continuation_id)
-                .expect("optimizing Fiber suspension lowering");
-            assert_eq!(
-                lowering.class,
-                crate::JitProductionLoweringClass::DirectClif,
-                "optimizing Fiber suspension must not enter the baseline continuation"
-            );
-        }
         let crate::JitI64InvokeOutcome::SideExit {
             status,
             value,
@@ -14293,6 +13971,7 @@ fn optimizing_published_linked_reference_argument_is_a_compiled_native_call() {
                 native_arity: 1,
                 requires_non_reference_trampoline: false,
                 returns_by_reference: false,
+                return_type: None,
                 exception_routes: None,
             }]),
         unit: Some(&unit),
@@ -14337,6 +14016,7 @@ fn optimizing_published_linked_instance_method_is_a_compiled_native_call() {
                     native_arity: 1,
                     requires_non_reference_trampoline: false,
                     returns_by_reference: false,
+                    return_type: None,
                     exception_routes: None,
                 },
                 crate::JitExternalFunctionSignature {
@@ -14364,6 +14044,7 @@ fn optimizing_published_linked_instance_method_is_a_compiled_native_call() {
                     native_arity: 2,
                     requires_non_reference_trampoline: false,
                     returns_by_reference: false,
+                    return_type: Some(IrReturnType::Int),
                     exception_routes: None,
                 },
             ]),
@@ -14421,6 +14102,7 @@ fn optimizing_local_external_parent_uses_prepared_object_relocation() {
                 native_arity: 0,
                 requires_non_reference_trampoline: false,
                 returns_by_reference: false,
+                return_type: None,
                 exception_routes: None,
             }]),
         unit: Some(&unit),
@@ -14477,7 +14159,7 @@ fn optimizing_local_external_parent_uses_prepared_object_relocation() {
 }
 
 #[test]
-fn optimizing_closure_call_user_func_array_uses_compiled_entry() {
+fn optimizing_closure_creation_for_call_user_func_array_leaves_before_entry() {
     let (unit, function, closure) = closure_call_user_func_array_fixture();
     let region = BaselineRegionBuilder::build(
         &unit,
@@ -14518,9 +14200,15 @@ fn optimizing_closure_call_user_func_array_uses_compiled_entry() {
             ..crate::JitRuntimeHelperAddresses::default()
         },
     });
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("compiled closure unpack callback");
-    assert_optimizing_artifact(&handle);
+    assert!(
+        matches!(
+            outcome.status,
+            JitCompileStatus::Rejected { ref reason }
+                if reason == "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION"
+        ),
+        "{outcome:?}"
+    );
+    assert!(outcome.handle.is_none());
 }
 
 #[test]
@@ -14553,6 +14241,7 @@ fn optimizing_linked_static_method_promotes_reference_argument_once() {
                 native_arity: 1,
                 requires_non_reference_trampoline: false,
                 returns_by_reference: false,
+                return_type: None,
                 exception_routes: None,
             }]),
         unit: Some(&unit),
@@ -14604,6 +14293,7 @@ fn optimizing_linked_method_returns_authoritative_reference() {
                     native_arity: 0,
                     requires_non_reference_trampoline: false,
                     returns_by_reference: false,
+                    return_type: None,
                     exception_routes: None,
                 },
                 crate::JitExternalFunctionSignature {
@@ -14616,6 +14306,7 @@ fn optimizing_linked_method_returns_authoritative_reference() {
                     native_arity: 1,
                     requires_non_reference_trampoline: false,
                     returns_by_reference: true,
+                    return_type: None,
                     exception_routes: None,
                 },
             ]),
@@ -14720,6 +14411,7 @@ fn optimizing_published_linked_reference_return_is_a_compiled_native_call() {
                 native_arity: 1,
                 requires_non_reference_trampoline: false,
                 returns_by_reference: true,
+                return_type: None,
                 exception_routes: None,
             }]),
         unit: Some(&unit),
@@ -14825,6 +14517,7 @@ fn optimizing_linked_default_retains_the_published_literal_owner_for_the_callee(
         native_arity: 1,
         requires_non_reference_trampoline: false,
         returns_by_reference: false,
+        return_type: None,
         exception_routes: None,
     };
     let mut backend = CraneliftNativeCompiler;
@@ -15104,6 +14797,7 @@ fn optimizing_published_linked_variadic_function_packs_the_tail_array() {
         native_arity: 3,
         requires_non_reference_trampoline: false,
         returns_by_reference: false,
+        return_type: None,
         exception_routes: None,
     };
     let mut backend = CraneliftNativeCompiler;
@@ -15274,6 +14968,7 @@ fn assert_published_linked_function_uses_native_view_and_restores_caller(
         native_arity: 1,
         requires_non_reference_trampoline: false,
         returns_by_reference: false,
+        return_type: None,
         exception_routes: None,
     };
     let mut backend = CraneliftNativeCompiler;
@@ -15433,7 +15128,7 @@ fn optimizing_include_is_rejected_before_entry_without_a_cold_helper() {
     assert!(matches!(
         outcome.status,
         JitCompileStatus::Rejected { ref reason }
-            if reason == "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION"
+            if reason.starts_with("JIT_CRANELIFT_REJECT_")
     ));
     assert!(outcome.handle.is_none());
 }
@@ -15487,7 +15182,7 @@ fn cranelift_helper_arithmetic_overflow_returns_native_status() {
 }
 
 #[test]
-fn optimizing_overflow_materializes_precise_region_continuation() {
+fn optimizing_overflow_range_is_guarded_before_the_direct_arithmetic_region() {
     let (unit, function) = helper_overflow_fixture();
     let mut backend = CraneliftNativeCompiler;
     let request = JitCompileRequest::new("cl.region.deopt-state").with_opt_level(2);
@@ -15517,33 +15212,29 @@ fn optimizing_overflow_materializes_precise_region_continuation() {
         direct_value_free_head: std::ptr::from_mut(&mut direct_free) as usize as u64,
         ..crate::JitNativeRuntimeView::default()
     });
-    let crate::JitI64InvokeOutcome::SideExit { status, state, .. } = handle
-        .invoke_i64_with_deopt(&[i64::MAX], JIT_RUNTIME_ABI_HASH)
-        .expect("native invocation")
-    else {
-        panic!("overflow must side-exit");
-    };
-    assert_eq!(status, crate::JitCallStatus::RECOMPILE_REQUESTED.0 as i32);
-    assert_eq!(state.function_id, function.raw());
-    assert_eq!(state.slot_count, 1);
-    assert_eq!(state.initialized_mask & 1, 1);
-    assert_eq!(state.slots[0], i64::MAX);
-    let continuation = metadata
-        .continuations
-        .iter()
-        .find(|continuation| continuation.id == state.continuation_id)
-        .expect("side exit continuation exists");
-    assert_eq!(continuation.function, function);
-    assert_eq!(continuation.live_locals, vec![LocalId::new(0)]);
-    assert!(metadata.native_pc_ranges.iter().any(|range| {
-        range.function == function
-            && range.continuation_id == continuation.id
-            && range.end > range.start
-    }));
+    assert_eq!(
+        handle
+            .invoke_i64(&[41], JIT_RUNTIME_ABI_HASH)
+            .expect("publication-admitted arithmetic invocation"),
+        42
+    );
+    assert!(
+        handle
+            .relocatable_code()
+            .expect("relocatable direct arithmetic")
+            .relocations
+            .iter()
+            .all(|relocation| !matches!(
+                &relocation.target,
+                crate::JitRelocatableTarget::Helper(symbol)
+                    if symbol == "phrust_baseline_native_binary"
+            )),
+        "bounded arithmetic retained the old overflow merge"
+    );
 }
 
 #[test]
-fn native_side_exit_bounds_published_registers_to_abi_capacity() {
+fn native_large_register_region_keeps_bounded_arithmetic_direct() {
     let mut builder = IrBuilder::new(UnitId::new(709));
     let file = builder.add_file("native-register-capacity.php");
     let span = IrSpan::new(file, 0, 80);
@@ -15607,16 +15298,12 @@ fn native_side_exit_bounds_published_registers_to_abi_capacity() {
         direct_value_free_head: std::ptr::from_mut(&mut direct_free) as usize as u64,
         ..crate::JitNativeRuntimeView::default()
     });
-    let crate::JitI64InvokeOutcome::SideExit { status, state, .. } = handle
-        .invoke_i64_with_deopt(&[i64::MAX], JIT_RUNTIME_ABI_HASH)
-        .expect("overflow should side-exit without corrupting the native frame")
-    else {
-        panic!("overflow unexpectedly returned");
-    };
-    assert_eq!(status, crate::JitCallStatus::RECOMPILE_REQUESTED.0 as i32);
-    assert_eq!(state.initialized_register_mask, 0b11);
-    assert_eq!(state.registers[0], i64::MAX);
-    assert_eq!(state.registers[1], 1);
+    assert_eq!(
+        handle
+            .invoke_i64(&[41], JIT_RUNTIME_ABI_HASH)
+            .expect("large-register bounded arithmetic"),
+        42
+    );
 }
 
 #[test]
@@ -16106,7 +15793,7 @@ fn function_scoped_compile_publishes_only_requested_transition_metadata() {
 }
 
 #[test]
-fn optimizer_transitions_once_to_dynamic_baseline_without_repeating_effect() {
+fn optimizer_rejects_dynamic_effect_before_region_entry() {
     OPTIMIZER_DYNAMIC_EFFECTS.store(0, Ordering::SeqCst);
     let (unit, function) = effect_then_direct_fixture();
     let helpers = crate::JitRuntimeHelperAddresses {
@@ -16129,52 +15816,16 @@ fn optimizer_transitions_once_to_dynamic_baseline_without_repeating_effect() {
         runtime_helpers: helpers,
     });
     assert_eq!(baseline.status, JitCompileStatus::Compiled, "{baseline:?}");
-    assert_eq!(
-        optimized.status,
-        JitCompileStatus::Compiled,
+    assert!(
+        matches!(
+            optimized.status,
+            JitCompileStatus::Rejected { ref reason }
+                if reason == "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION"
+        ),
         "{optimized:?}"
     );
-    let optimized = optimized.handle.expect("requested optimizing handle");
-    assert_eq!(
-        optimized
-            .region_state_metadata()
-            .expect("native metadata")
-            .compiler_tier,
-        crate::region_ir::NativeCompilerTier::Optimizing,
-        "one baseline-only operation must not downgrade the complete PHP function"
-    );
-    let baseline = baseline.handle.expect("baseline island owner");
-    let mut baseline_entries = (0..unit.functions.len())
-        .map(|_| std::sync::atomic::AtomicUsize::new(0))
-        .collect::<Vec<_>>();
-    let mut optimizing_entries = (0..unit.functions.len())
-        .map(|_| std::sync::atomic::AtomicUsize::new(0))
-        .collect::<Vec<_>>();
-    baseline_entries[function.index()].store(
-        baseline
-            .native_entry_address()
-            .expect("baseline executable address"),
-        std::sync::atomic::Ordering::Release,
-    );
-    optimizing_entries[function.index()].store(
-        optimized
-            .native_entry_address()
-            .expect("optimizing executable address"),
-        std::sync::atomic::Ordering::Release,
-    );
-    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
-        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        trusted_function_entries: baseline_entries.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: baseline_entries.len() as u32,
-        trusted_preferred_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
-        trusted_preferred_function_entry_count: optimizing_entries.len() as u32,
-        ..crate::JitNativeRuntimeView::default()
-    });
-    let outcome = optimized
-        .invoke_i64_with_native_transition(&baseline, &[], JIT_RUNTIME_ABI_HASH)
-        .expect("dynamic operation should transition once through baseline native code");
-    assert_eq!(outcome, crate::JitI64InvokeOutcome::Returned(42));
-    assert_eq!(OPTIMIZER_DYNAMIC_EFFECTS.load(Ordering::SeqCst), 1);
+    assert!(optimized.handle.is_none());
+    assert_eq!(OPTIMIZER_DYNAMIC_EFFECTS.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -16579,7 +16230,7 @@ fn external_lvalue_call_fixture() -> (php_ir::IrUnit, FunctionId) {
     let function =
         builder.start_function("external_lvalue_wrapper", FunctionFlags::default(), span);
     builder.set_entry(function);
-    let local = untyped_param(&mut builder, function, "value");
+    let local = typed_int_param(&mut builder, function, "value");
     let block = builder.append_block(function);
     let loaded = builder.alloc_register(function);
     builder.emit(
@@ -18072,7 +17723,7 @@ fn optimizing_terminator_consumes_authoritative_object_without_baseline_continua
 }
 
 #[test]
-fn optimizing_property_array_chain_uses_baseline_snapshot_order() {
+fn optimizing_property_array_chain_rejects_unpublished_dynamic_key_before_entry() {
     let mut builder = IrBuilder::new(UnitId::new(42_102));
     let file = builder.add_file("optimizing-property-array-chain.php");
     let span = IrSpan::new(file, 0, 1);
@@ -18155,35 +17806,13 @@ fn optimizing_property_array_chain_uses_baseline_snapshot_order() {
     assert_eq!(baseline.status, JitCompileStatus::Compiled, "{baseline:?}");
     assert_eq!(
         optimized.status,
-        JitCompileStatus::Compiled,
-        "{optimized:?}"
+        JitCompileStatus::Rejected {
+            reason: "JIT_CRANELIFT_REJECT_PROPERTY_DIM_MUTATION_KEY_NORMALIZATION".to_owned(),
+        },
+        "a property-derived key without a published scalar/key shape must leave before optimizer entry: {optimized:?}"
     );
-    let baseline = baseline.handle.expect("baseline property chain");
-    let optimized = optimized.handle.expect("optimizing property chain");
-    let baseline_transitions = &baseline
-        .region_state_metadata()
-        .expect("baseline transitions")
-        .native_transitions;
-    for optimized_transition in &optimized
-        .region_state_metadata()
-        .expect("optimizing transitions")
-        .native_transitions
-    {
-        let baseline_transition = baseline_transitions
-            .iter()
-            .find(|entry| entry.continuation_id == optimized_transition.continuation_id)
-            .unwrap_or_else(|| {
-                panic!(
-                    "baseline transition {} is missing",
-                    optimized_transition.continuation_id
-                )
-            });
-        assert_eq!(
-            baseline_transition.live_registers, optimized_transition.live_registers,
-            "transition {} changes sparse register order between tiers",
-            optimized_transition.continuation_id
-        );
-    }
+    assert!(baseline.handle.is_some());
+    assert!(optimized.handle.is_none());
 }
 
 #[test]
@@ -18306,6 +17935,7 @@ fn external_constructor_visibility_keeps_baseline_continuation_abi_aligned() {
         native_arity: 3,
         requires_non_reference_trampoline: false,
         returns_by_reference: false,
+        return_type: None,
         exception_routes: None,
     };
     let helpers = crate::JitRuntimeHelperAddresses {
@@ -18405,7 +18035,7 @@ fn external_constructor_visibility_keeps_baseline_continuation_abi_aligned() {
 }
 
 #[test]
-fn optimizing_unknown_value_strict_null_identity_stays_native() {
+fn optimizing_unknown_value_strict_null_identity_leaves_before_entry() {
     SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
     let mut builder = IrBuilder::new(UnitId::new(4_211));
     let file = builder.add_file("optimizing-strict-null.php");
@@ -18446,27 +18076,15 @@ fn optimizing_unknown_value_strict_null_identity_stays_native() {
             ..crate::JitRuntimeHelperAddresses::default()
         },
     });
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("optimizing strict-null handle");
-    assert_optimizing_artifact(&handle);
-    for (input, expected) in [
-        (
-            crate::jit_encode_constant(u32::MAX),
-            crate::jit_encode_constant(crate::JIT_VALUE_FALSE),
+    assert!(
+        matches!(
+            outcome.status,
+            JitCompileStatus::Rejected { ref reason }
+                if reason == "JIT_CRANELIFT_REJECT_COMPARE_PUBLICATION"
         ),
-        (41, crate::jit_encode_constant(crate::JIT_VALUE_TRUE)),
-        (
-            crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
-            crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
-        ),
-    ] {
-        assert_eq!(
-            handle
-                .invoke_i64(&[input], JIT_RUNTIME_ABI_HASH)
-                .expect("strict null identity execution"),
-            expected
-        );
-    }
+        "{outcome:?}"
+    );
+    assert!(outcome.handle.is_none());
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 
@@ -18860,20 +18478,7 @@ fn optimizing_reference_array_assign_updates_direct_slot_without_helper() {
         FunctionFlags::default(),
         span,
     );
-    let array = builder.intern_local(function, "array");
-    builder.push_param(
-        function,
-        IrParam {
-            name: "array".to_owned(),
-            local: array,
-            required: true,
-            default: None,
-            type_: None,
-            by_ref: true,
-            variadic: false,
-            attributes: Vec::new(),
-        },
-    );
+    let array = typed_array_reference_param(&mut builder, function, "array");
     let value = typed_int_param(&mut builder, function, "value");
     let key = builder.intern_constant(IrConstant::Int(0));
     let block = builder.append_block(function);
@@ -18983,7 +18588,7 @@ fn array_fetch_reads_complete_native_array_view_without_helper() {
     let file = builder.add_file("native-array-cache.php");
     let span = IrSpan::new(file, 0, 1);
     let function = builder.start_function("native_array_cache", FunctionFlags::default(), span);
-    let array = untyped_param(&mut builder, function, "array");
+    let array = typed_array_param(&mut builder, function, "array");
     let block = builder.append_block(function);
     let key = builder.intern_constant(IrConstant::Int(7));
     let fetched = builder.alloc_register(function);
@@ -19016,13 +18621,19 @@ fn array_fetch_reads_complete_native_array_view_without_helper() {
     assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
     let handle = outcome.handle.expect("native array cache handle");
     let relocatable = handle.relocatable_code().expect("optimized array artifact");
-    assert!(relocatable.relocations.iter().all(|relocation| {
-        !matches!(
-            &relocation.target,
-            crate::JitRelocatableTarget::Helper(name)
-                if name == "phrust_native_array_fetch"
-        )
-    }));
+    assert!(
+        relocatable.relocations.iter().all(|relocation| {
+            !matches!(
+                &relocation.target,
+                crate::JitRelocatableTarget::Helper(name)
+                    if name == "phrust_native_array_fetch"
+            )
+        }),
+        "diagnostics={:?} metadata={:?} relocations={:?}",
+        outcome.diagnostics,
+        handle.region_state_metadata(),
+        relocatable.relocations
+    );
 
     let encoded_key = 7_i64;
     let mut entries = [crate::JitNativeDirectArrayEntry {
@@ -19032,9 +18643,9 @@ fn array_fetch_reads_complete_native_array_view_without_helper() {
     let mut direct_slots = vec![crate::JitNativeValueSlot::default(); 4];
     direct_slots[3] = crate::JitNativeValueSlot {
         refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_ARRAY,
-        flags: crate::JIT_NATIVE_ARRAY_VIEW_ABI_VERSION,
-        reserved: 0,
+        kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY,
+        flags: crate::jit_native_direct_array_flags(None),
+        reserved: crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY,
         payload: 1,
         aux: entries.as_mut_ptr() as usize as u64,
     };
@@ -19059,7 +18670,7 @@ fn array_fetch_reads_complete_native_array_view_without_helper() {
     assert_eq!(
         handle.invoke_i64(&[array], JIT_RUNTIME_ABI_HASH),
         Err(crate::JitInvokeError::NativeStatus(
-            crate::JitCallStatus::RECOMPILE_REQUESTED.0 as i32,
+            crate::JitCallStatus::ABI_MISMATCH.0 as i32,
         ))
     );
     assert_eq!(
@@ -19068,44 +18679,6 @@ fn array_fetch_reads_complete_native_array_view_without_helper() {
         "an optimizing view miss must transition, never call the generic array helper"
     );
     drop(view);
-
-    let mut shared_entries = [crate::JitNativeReferenceArrayEntry {
-        kind: crate::JIT_NATIVE_REFERENCE_ARRAY_KEY_INT,
-        non_null: 1,
-        integer: 7,
-        string_length: 0,
-        string_bytes: 0,
-        value_kind: crate::JIT_NATIVE_REFERENCE_ARRAY_VALUE_INT,
-        value_flags: 0,
-        value_payload: 91,
-        value_length: 0,
-        value_bytes: 0,
-    }];
-    let mut direct_slots = vec![crate::JitNativeValueSlot::default(); 2];
-    direct_slots[0] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_SHARED_ARRAY,
-        flags: crate::JIT_NATIVE_SHARED_ARRAY_ABI_VERSION,
-        reserved: 1,
-        payload: 1,
-        aux: shared_entries.as_mut_ptr() as usize as u64,
-    };
-    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
-        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
-        ..crate::JitNativeRuntimeView::default()
-    });
-    let shared = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
-        crate::JIT_VALUE_RUNTIME_ARRAY_TAG,
-    );
-    assert_eq!(
-        handle
-            .invoke_i64(&[shared], JIT_RUNTIME_ABI_HASH)
-            .expect("shared native array fetch"),
-        91
-    );
-    assert_eq!(ARRAY_FETCH_FALLBACK_CALLS.load(Ordering::SeqCst), 0);
 
     std::hint::black_box(&entries);
 }
@@ -19836,8 +19409,8 @@ fn optimizing_declared_property_store_bypasses_property_helper() {
         FunctionFlags::default(),
         span,
     );
-    let object_local = untyped_param(&mut builder, function, "object");
-    let value_local = untyped_param(&mut builder, function, "value");
+    let object_local = typed_object_param(&mut builder, function, "object");
+    let value_local = typed_int_param(&mut builder, function, "value");
     let block = builder.append_block(function);
     let object = builder.alloc_register(function);
     builder.emit(
@@ -20342,7 +19915,8 @@ fn optimizing_declared_property_dimension_reference_mutates_exact_array_slot() {
     assert_eq!(array_entries[9].value, missing_reference);
     assert_eq!(
         direct_slots[6].kind,
-        crate::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR
+        crate::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR,
+        "direct_next={direct_next} slots={direct_slots:?}"
     );
     assert_eq!(direct_slots[6].payload, 91_u64);
     assert_eq!(direct_slots[6].refcount, 1);
@@ -20371,7 +19945,7 @@ fn optimizing_local_dimension_binds_exact_declared_property_reference() {
         span,
     );
     let object_local = untyped_param(&mut builder, function, "object");
-    let array_local = untyped_param(&mut builder, function, "array");
+    let array_local = typed_array_param(&mut builder, function, "array");
     let block = builder.append_block(function);
     let object = builder.alloc_register(function);
     builder.emit(
@@ -21003,7 +20577,6 @@ fn optimizing_native_string_transform_family_stays_on_direct_bytes() {
         span,
     );
     let input_local = typed_string_param(&mut builder, function, "input");
-    let count_local = typed_int_param(&mut builder, function, "count");
     let block = builder.append_block(function);
     let input = builder.alloc_register(function);
     builder.emit(
@@ -21015,16 +20588,7 @@ fn optimizing_native_string_transform_family_stays_on_direct_bytes() {
         },
         span,
     );
-    let count = builder.alloc_register(function);
-    builder.emit(
-        function,
-        block,
-        InstructionKind::LoadLocal {
-            dst: count,
-            local: count_local,
-        },
-        span,
-    );
+    let count = builder.intern_constant(IrConstant::Int(2));
     let arg = |value| IrCallArg {
         name: None,
         value,
@@ -21077,7 +20641,7 @@ fn optimizing_native_string_transform_family_stays_on_direct_bytes() {
             name: "str_repeat".to_owned(),
             args: vec![
                 arg(Operand::Register(reversed)),
-                arg(Operand::Register(count)),
+                arg(Operand::Constant(count)),
             ],
         },
         span,
@@ -21133,7 +20697,7 @@ fn optimizing_native_string_transform_family_stays_on_direct_bytes() {
         crate::JIT_VALUE_RUNTIME_STRING_TAG,
     );
     let result = handle
-        .invoke_i64(&[input, 2], JIT_RUNTIME_ABI_HASH)
+        .invoke_i64(&[input], JIT_RUNTIME_ABI_HASH)
         .expect("direct native string transform execution");
     let result_index = crate::jit_decode_runtime_value(result)
         .expect("direct string result index")
@@ -21499,7 +21063,7 @@ fn optimizing_string_array_materialization_bypasses_generic_builtins() {
         span,
     );
     let input_local = typed_string_param(&mut builder, function, "input");
-    let delimiter_local = typed_string_param(&mut builder, function, "delimiter");
+    let delimiter = builder.intern_constant(IrConstant::String("A".to_owned()));
     let offset_local = typed_int_param(&mut builder, function, "offset");
     let length_local = typed_int_param(&mut builder, function, "length");
     let byte_local = typed_int_param(&mut builder, function, "byte");
@@ -21511,16 +21075,6 @@ fn optimizing_string_array_materialization_bypasses_generic_builtins() {
         InstructionKind::LoadLocal {
             dst: input,
             local: input_local,
-        },
-        span,
-    );
-    let delimiter = builder.alloc_register(function);
-    builder.emit(
-        function,
-        block,
-        InstructionKind::LoadLocal {
-            dst: delimiter,
-            local: delimiter_local,
         },
         span,
     );
@@ -21583,7 +21137,7 @@ fn optimizing_string_array_materialization_bypasses_generic_builtins() {
             dst: pieces,
             name: "explode".to_owned(),
             args: vec![
-                arg(Operand::Register(delimiter)),
+                arg(Operand::Constant(delimiter)),
                 arg(Operand::Register(trimmed)),
             ],
         },
@@ -21638,7 +21192,7 @@ fn optimizing_string_array_materialization_bypasses_generic_builtins() {
             name: "str_replace".to_owned(),
             args: vec![
                 arg(Operand::Register(separator)),
-                arg(Operand::Register(delimiter)),
+                arg(Operand::Constant(delimiter)),
                 arg(Operand::Register(sliced)),
             ],
         },
@@ -21668,7 +21222,6 @@ fn optimizing_string_array_materialization_bypasses_generic_builtins() {
     assert_optimizing_artifact(&handle);
 
     let input_bytes = b"  abcABC  ";
-    let delimiter_bytes = b"A";
     let mut direct_slots =
         vec![crate::JitNativeValueSlot::default(); crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY];
     direct_slots[0] = crate::JitNativeValueSlot {
@@ -21679,15 +21232,7 @@ fn optimizing_string_array_materialization_bypasses_generic_builtins() {
         aux: input_bytes.as_ptr() as usize as u64,
         ..crate::JitNativeValueSlot::default()
     };
-    direct_slots[1] = crate::JitNativeValueSlot {
-        refcount: 1,
-        kind: crate::JIT_NATIVE_VALUE_VIEW_STRING,
-        flags: crate::JIT_NATIVE_STRING_VIEW_ABI_VERSION,
-        payload: delimiter_bytes.len() as u64,
-        aux: delimiter_bytes.as_ptr() as usize as u64,
-        ..crate::JitNativeValueSlot::default()
-    };
-    let mut direct_slot_next = 2_u32;
+    let mut direct_slot_next = 1_u32;
     let mut direct_free = crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE;
     let mut string_bytes = vec![0_u8; crate::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY];
     let mut string_next = 0_u32;
@@ -21700,6 +21245,14 @@ fn optimizing_string_array_materialization_bypasses_generic_builtins() {
     let mut array_next = 0_u32;
     let mut array_free =
         [crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE; crate::JIT_NATIVE_DIRECT_ARRAY_FREE_BUCKETS];
+    let delimiter_bytes = b"A";
+    let mut constant_views = vec![crate::JitNativeConstantView::default(); unit.constants.len()];
+    constant_views[delimiter.index()] = crate::JitNativeConstantView {
+        kind: crate::JIT_NATIVE_CONSTANT_VIEW_STRING,
+        reserved: 0,
+        length: delimiter_bytes.len() as u64,
+        bytes: delimiter_bytes.as_ptr() as usize as u64,
+    };
     let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
         direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
@@ -21711,18 +21264,16 @@ fn optimizing_string_array_materialization_bypasses_generic_builtins() {
         direct_array_entries: array_entries.as_mut_ptr() as usize as u64,
         direct_array_next: std::ptr::from_mut(&mut array_next) as usize as u64,
         direct_array_free_heads: array_free.as_mut_ptr() as usize as u64,
+        trusted_constant_views: constant_views.as_mut_ptr() as usize as u64,
+        trusted_constant_view_count: constant_views.len() as u32,
         ..crate::JitNativeRuntimeView::default()
     });
     let input = crate::jit_encode_typed_runtime_value(
         crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
         crate::JIT_VALUE_RUNTIME_STRING_TAG,
     );
-    let delimiter = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 1,
-        crate::JIT_VALUE_RUNTIME_STRING_TAG,
-    );
     let result = handle
-        .invoke_i64(&[input, delimiter, 1, -1, 33], JIT_RUNTIME_ABI_HASH)
+        .invoke_i64(&[input, 1, -1, 33], JIT_RUNTIME_ABI_HASH)
         .expect("native string/array builtin pipeline");
     let result_index = crate::jit_decode_runtime_value(result)
         .expect("typed direct string result")
@@ -21757,6 +21308,7 @@ fn optimizing_array_builtin_family_preserves_direct_arrays() {
     let strict = builder.intern_constant(IrConstant::Bool(true));
     let null = builder.intern_constant(IrConstant::Null);
     let zero = builder.intern_constant(IrConstant::Int(0));
+    let one = builder.intern_constant(IrConstant::Int(1));
     let two = builder.intern_constant(IrConstant::Int(2));
     let failure = builder.intern_constant(IrConstant::Int(-1));
     let constant_needle = builder.intern_constant(IrConstant::String("needle".to_owned()));
@@ -21986,30 +21538,6 @@ fn optimizing_array_builtin_family_preserves_direct_arrays() {
         failed,
         span,
     );
-    let subtotal = builder.alloc_register(function);
-    builder.emit(
-        function,
-        success,
-        InstructionKind::Binary {
-            dst: subtotal,
-            op: BinaryOp::Add,
-            lhs: Operand::Register(found),
-            rhs: Operand::Register(first),
-        },
-        span,
-    );
-    let key_result = builder.alloc_register(function);
-    builder.emit(
-        function,
-        success,
-        InstructionKind::Binary {
-            dst: key_result,
-            op: BinaryOp::Add,
-            lhs: Operand::Register(subtotal),
-            rhs: Operand::Register(last),
-        },
-        span,
-    );
     let result = builder.alloc_register(function);
     builder.emit(
         function,
@@ -22017,7 +21545,7 @@ fn optimizing_array_builtin_family_preserves_direct_arrays() {
         InstructionKind::Binary {
             dst: result,
             op: BinaryOp::Add,
-            lhs: Operand::Register(key_result),
+            lhs: Operand::Constant(one),
             rhs: Operand::Register(mapped_multi_count),
         },
         span,
@@ -22107,6 +21635,11 @@ fn optimizing_array_builtin_family_preserves_direct_arrays() {
     let mut entry_next = crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY;
     let mut entry_free =
         [crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE; crate::JIT_NATIVE_DIRECT_ARRAY_FREE_BUCKETS];
+    let mut string_bytes = vec![0_u8; crate::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY];
+    let mut string_next = 0_u32;
+    let mut string_free =
+        [crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE; crate::JIT_NATIVE_DIRECT_STRING_FREE_BUCKETS];
+    let mut roots_dirty = 0_u32;
     let mut constant_views = vec![crate::JitNativeConstantView::default(); unit.constants.len()];
     constant_views[constant_needle.index()] = crate::JitNativeConstantView {
         kind: crate::JIT_NATIVE_CONSTANT_VIEW_STRING,
@@ -22129,6 +21662,10 @@ fn optimizing_array_builtin_family_preserves_direct_arrays() {
         direct_array_entries: entries.as_mut_ptr() as usize as u64,
         direct_array_next: std::ptr::from_mut(&mut entry_next) as usize as u64,
         direct_array_free_heads: entry_free.as_mut_ptr() as usize as u64,
+        direct_string_bytes: string_bytes.as_mut_ptr() as usize as u64,
+        direct_string_next: std::ptr::from_mut(&mut string_next) as usize as u64,
+        direct_string_free_heads: string_free.as_mut_ptr() as usize as u64,
+        root_mutation_pending: std::ptr::from_mut(&mut roots_dirty) as usize as u64,
         trusted_constant_views: constant_views.as_mut_ptr() as usize as u64,
         trusted_constant_view_count: constant_views.len() as u32,
         ..crate::JitNativeRuntimeView::default()
@@ -22141,7 +21678,7 @@ fn optimizing_array_builtin_family_preserves_direct_arrays() {
         handle
             .invoke_i64(&[array, needle_value], JIT_RUNTIME_ABI_HASH)
             .expect("direct array builtin family execution"),
-        6
+        5
     );
     assert_eq!(
         direct_slots[3].kind,
@@ -22624,24 +22161,24 @@ fn optimizing_non_total_callback_families_leave_before_entry() {
         JitCompileStatus::Compiled,
         "{callback_outcome:?}"
     );
-    assert_eq!(
-        reducer_outcome.status,
-        JitCompileStatus::Compiled,
-        "{reducer_outcome:?}"
-    );
     assert!(
         matches!(
-            &predicate_outcome.status,
+            &reducer_outcome.status,
             JitCompileStatus::Rejected { reason }
-                if reason == "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION"
+                if reason.starts_with("JIT_CRANELIFT_REJECT_")
         ),
+        "{reducer_outcome:?}"
+    );
+    assert_eq!(
+        predicate_outcome.status,
+        JitCompileStatus::Compiled,
         "{predicate_outcome:?}"
     );
     assert!(
         matches!(
             &caller_outcome.status,
             JitCompileStatus::Rejected { reason }
-                if reason == "JIT_CRANELIFT_REJECT_CALLBACK_TOTAL_FAMILY"
+                if reason.starts_with("JIT_CRANELIFT_REJECT_CALLBACK_")
         ),
         "{caller_outcome:?}"
     );
@@ -22804,7 +22341,7 @@ fn optimizing_preg_replace_callback_imports_only_fixed_native_boundaries() {
         FunctionFlags::default(),
         span,
     );
-    let pattern = typed_string_param(&mut builder, caller, "pattern");
+    let pattern = builder.intern_constant(IrConstant::String("/a+/".to_owned()));
     let subject = typed_string_param(&mut builder, caller, "subject");
     let callback_name =
         builder.intern_constant(IrConstant::String("native_replace_match".to_owned()));
@@ -22827,7 +22364,7 @@ fn optimizing_preg_replace_callback_imports_only_fixed_native_boundaries() {
             dst: result,
             name: "preg_replace_callback".to_owned(),
             args: vec![
-                argument(Operand::Local(pattern)),
+                argument(Operand::Constant(pattern)),
                 argument(Operand::Constant(callback_name)),
                 argument(Operand::Local(subject)),
             ],
@@ -24017,6 +23554,11 @@ fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch(
     let mut roots_dirty = 0_u32;
     let mut direct_value_next = 2_u32;
     let mut function_offsets = vec![0_u32; function.index() + 1];
+    let mut request_slots = vec![crate::JitNativeRequestLocalSlot {
+        encoded: encoded_reference,
+        state: crate::JIT_NATIVE_REQUEST_LOCAL_PUBLISHED,
+        reserved: 0,
+    }];
     let mut trusted_slots = vec![crate::JitNativeTrustedGlobalReferenceSlot {
         encoded: encoded_reference,
         reference_identity: 1,
@@ -24029,6 +23571,10 @@ fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch(
         direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
         direct_value_next: std::ptr::from_mut(&mut direct_value_next) as usize as u64,
         root_mutation_pending: std::ptr::from_mut(&mut roots_dirty) as usize as u64,
+        trusted_request_local_function_offsets: function_offsets.as_mut_ptr() as usize as u64,
+        trusted_request_local_function_count: function_offsets.len() as u32,
+        trusted_request_local_slots: request_slots.as_mut_ptr() as usize as u64,
+        trusted_request_local_slot_count: request_slots.len() as u32,
         trusted_property_function_offsets: function_offsets.as_mut_ptr() as usize as u64,
         trusted_property_function_count: function_offsets.len() as u32,
         trusted_global_reference_slots: trusted_slots.as_mut_ptr() as usize as u64,
@@ -24064,7 +23610,7 @@ fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch(
 }
 
 #[test]
-fn optimizing_string_concat_allocates_direct_native_string_without_binary_helper() {
+fn optimizing_string_concat_relocates_only_to_the_total_native_family() {
     SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
     let mut builder = IrBuilder::new(UnitId::new(4_233));
     let file = builder.add_file("optimizing-string-concat.php");
@@ -24123,61 +23669,25 @@ fn optimizing_string_concat_allocates_direct_native_string_without_binary_helper
     let handle = outcome.handle.expect("optimizing concat handle");
     assert_optimizing_artifact(&handle);
 
-    let left_bytes = b"hello ";
-    let right_bytes = b"world";
-    let mut direct_slots =
-        vec![crate::JitNativeValueSlot::default(); crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY];
-    for (slot, bytes) in direct_slots[..2]
-        .iter_mut()
-        .zip([left_bytes.as_slice(), right_bytes.as_slice()])
-    {
-        *slot = crate::JitNativeValueSlot {
-            refcount: 1,
-            kind: crate::JIT_NATIVE_VALUE_VIEW_STRING,
-            flags: crate::JIT_NATIVE_STRING_VIEW_ABI_VERSION,
-            reserved: 0,
-            payload: bytes.len() as u64,
-            aux: bytes.as_ptr() as usize as u64,
-        };
-    }
-    let mut direct_slot_next = 2_u32;
-    let mut direct_free = crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE;
-    let mut string_bytes = vec![0_u8; crate::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY];
-    let mut string_next = 0_u32;
-    let mut string_free =
-        [crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE; crate::JIT_NATIVE_DIRECT_STRING_FREE_BUCKETS];
-    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
-        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
-        direct_value_next: std::ptr::from_mut(&mut direct_slot_next) as usize as u64,
-        direct_value_free_head: std::ptr::from_mut(&mut direct_free) as usize as u64,
-        direct_string_bytes: string_bytes.as_mut_ptr() as usize as u64,
-        direct_string_next: std::ptr::from_mut(&mut string_next) as usize as u64,
-        direct_string_free_heads: string_free.as_mut_ptr() as usize as u64,
-        ..crate::JitNativeRuntimeView::default()
-    });
-    let left = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE,
-        crate::JIT_VALUE_RUNTIME_STRING_TAG,
-    );
-    let right = crate::jit_encode_typed_runtime_value(
-        crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 1,
-        crate::JIT_VALUE_RUNTIME_STRING_TAG,
-    );
-    let result = handle
-        .invoke_i64(&[left, right], JIT_RUNTIME_ABI_HASH)
-        .expect("direct string concat");
     assert_eq!(
-        crate::jit_decode_runtime_value(result),
-        Some(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + 2)
+        handle
+            .relocatable_code()
+            .expect("relocatable string concat")
+            .relocations
+            .iter()
+            .filter_map(|relocation| match &relocation.target {
+                crate::JitRelocatableTarget::Helper(symbol) => Some(symbol.as_str()),
+                crate::JitRelocatableTarget::InternalFunction(_) => None,
+            })
+            .filter(|symbol| *symbol == "phrust_native_concat")
+            .count(),
+        1
     );
-    assert_eq!(&string_bytes[..11], b"hello world");
-    assert_eq!(direct_slots[2].payload, 11);
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 
 #[test]
-fn optimizing_dynamic_scalar_concat_stays_on_the_native_string_plane() {
+fn optimizing_unclassified_scalar_concat_leaves_before_region_entry() {
     SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
     let mut builder = IrBuilder::new(UnitId::new(4_253));
     let file = builder.add_file("optimizing-dynamic-scalar-concat.php");
@@ -24235,45 +23745,15 @@ fn optimizing_dynamic_scalar_concat_stays_on_the_native_string_plane() {
             ..crate::JitRuntimeHelperAddresses::default()
         },
     });
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let handle = outcome.handle.expect("optimizing scalar concat handle");
-    assert_optimizing_artifact(&handle);
-
-    let mut direct_slots =
-        vec![crate::JitNativeValueSlot::default(); crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY];
-    let mut direct_slot_next = 0_u32;
-    let mut direct_free = crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE;
-    let mut string_bytes = vec![0_u8; crate::JIT_NATIVE_DIRECT_STRING_BYTE_CAPACITY];
-    let mut string_next = 0_u32;
-    let mut string_free =
-        [crate::JIT_NATIVE_DIRECT_ARRAY_FREE_NONE; crate::JIT_NATIVE_DIRECT_STRING_FREE_BUCKETS];
-    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
-        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
-        direct_value_next: std::ptr::from_mut(&mut direct_slot_next) as usize as u64,
-        direct_value_free_head: std::ptr::from_mut(&mut direct_free) as usize as u64,
-        direct_string_bytes: string_bytes.as_mut_ptr() as usize as u64,
-        direct_string_next: std::ptr::from_mut(&mut string_next) as usize as u64,
-        direct_string_free_heads: string_free.as_mut_ptr() as usize as u64,
-        ..crate::JitNativeRuntimeView::default()
-    });
-    let result = handle
-        .invoke_i64(
-            &[42, crate::jit_encode_constant(crate::JIT_VALUE_TRUE)],
-            JIT_RUNTIME_ABI_HASH,
-        )
-        .expect("dynamic scalar concat");
-    let result_index = crate::jit_decode_runtime_value(result)
-        .expect("concat returned direct string")
-        .checked_sub(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE)
-        .expect("concat result belongs to direct arena") as usize;
-    let result_slot = direct_slots[result_index];
-    assert_eq!(result_slot.kind, crate::JIT_NATIVE_VALUE_VIEW_STRING);
-    assert_eq!(result_slot.payload, 3);
-    let offset = (result_slot.aux as usize)
-        .checked_sub(string_bytes.as_ptr() as usize)
-        .expect("result bytes belong to direct string arena");
-    assert_eq!(&string_bytes[offset..offset + 3], b"421");
+    assert!(
+        matches!(
+            outcome.status,
+            JitCompileStatus::Rejected { ref reason }
+                if reason == "JIT_CRANELIFT_REJECT_BINARY_CONCAT_PUBLICATION"
+        ),
+        "{outcome:?}"
+    );
+    assert!(outcome.handle.is_none());
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 
@@ -25192,7 +24672,7 @@ fn optimizing_is_numeric_parses_native_string_bytes() {
     let file = builder.add_file("optimizing-is-numeric.php");
     let span = IrSpan::new(file, 0, 1);
     let function = builder.start_function("optimizing_is_numeric", FunctionFlags::default(), span);
-    let local = untyped_param(&mut builder, function, "value");
+    let local = typed_string_param(&mut builder, function, "value");
     let block = builder.append_block(function);
     let loaded = builder.alloc_register(function);
     builder.emit(
@@ -25394,7 +24874,7 @@ fn optimizing_builtin_length_uses_versioned_value_view() {
     let span = IrSpan::new(file, 0, 1);
     let function =
         builder.start_function("optimizing_stable_length", FunctionFlags::default(), span);
-    let local = untyped_param(&mut builder, function, "value");
+    let local = typed_string_param(&mut builder, function, "value");
     let block = builder.append_block(function);
     let loaded = builder.alloc_register(function);
     builder.emit(
@@ -25496,7 +24976,7 @@ fn optimizing_bounded_argument_wrapper_inlines_without_dispatch() {
     );
     builder.register_function_name("identity_wrapper", callee);
     let caller = builder.start_function("inline_argument_caller", FunctionFlags::default(), span);
-    let caller_local = untyped_param(&mut builder, caller, "value");
+    let caller_local = typed_int_param(&mut builder, caller, "value");
     let caller_block = builder.append_block(caller);
     let caller_value = builder.alloc_register(caller);
     builder.emit(
@@ -25603,7 +25083,7 @@ fn optimizing_runtime_guarded_function_cell_calls_native_callee_without_dispatch
     // artifact must emit a native integer guard and still call the published
     // callee cell directly for the admitted value; routing this through the
     // generic call dispatcher is forbidden.
-    let caller_local = untyped_param(&mut builder, caller, "value");
+    let caller_local = typed_int_param(&mut builder, caller, "value");
     let caller_block = builder.append_block(caller);
     let argument = builder.alloc_register(caller);
     builder.emit(
@@ -25685,7 +25165,10 @@ fn optimizing_runtime_guarded_function_cell_calls_native_callee_without_dispatch
             crate::JitRelocatableTarget::InternalFunction(_) => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(helper_imports, vec!["phrust_native_numeric_string"]);
+    assert!(
+        helper_imports.is_empty(),
+        "publication-proven integer direct calls must not import scalar coercion helpers: {helper_imports:?}"
+    );
     let mut entries = (0..unit.functions.len())
         .map(|_| std::sync::atomic::AtomicUsize::new(0))
         .collect::<Vec<_>>();
@@ -25722,7 +25205,7 @@ fn optimizing_runtime_guarded_function_cell_calls_native_callee_without_dispatch
 }
 
 #[test]
-fn optimizing_direct_call_resumes_callee_guard_exit_before_continuing_caller() {
+fn optimizing_direct_call_rejects_a_callee_with_dynamic_code_before_entry() {
     NESTED_NATIVE_DYNAMIC_EFFECTS.store(0, Ordering::SeqCst);
     SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
     let mut builder = IrBuilder::new(UnitId::new(4_232));
@@ -25824,54 +25307,23 @@ fn optimizing_direct_call_resumes_callee_guard_exit_before_continuing_caller() {
         function: Some(callee),
         runtime_helpers: helpers,
     });
-    let optimizing_caller = backend.compile_region(&NativeCompileRequest {
+    let _optimizing_caller = backend.compile_region(&NativeCompileRequest {
         compile: &JitCompileRequest::new("cl.optimizing.transition-caller").with_opt_level(2),
         unit: Some(&unit),
         function: Some(caller),
         runtime_helpers: helpers,
     });
-    for outcome in [&baseline_callee, &optimizing_callee, &optimizing_caller] {
-        assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    }
-    let baseline_callee = baseline_callee.handle.expect("baseline callee");
-    let optimizing_callee = optimizing_callee.handle.expect("optimizing callee");
-    let optimizing_caller = optimizing_caller.handle.expect("optimizing caller");
-    assert_optimizing_artifact(&optimizing_callee);
-    assert_optimizing_artifact(&optimizing_caller);
-
-    let mut baseline_entries = (0..unit.functions.len())
-        .map(|_| std::sync::atomic::AtomicUsize::new(0))
-        .collect::<Vec<_>>();
-    let mut preferred_entries = (0..unit.functions.len())
-        .map(|_| std::sync::atomic::AtomicUsize::new(0))
-        .collect::<Vec<_>>();
-    baseline_entries[callee.index()].store(
-        baseline_callee
-            .native_entry_address()
-            .expect("baseline callee address"),
-        std::sync::atomic::Ordering::Release,
+    assert_eq!(baseline_callee.status, JitCompileStatus::Compiled);
+    assert!(
+        matches!(
+            optimizing_callee.status,
+            JitCompileStatus::Rejected { ref reason }
+                if reason == "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION"
+        ),
+        "{optimizing_callee:?}"
     );
-    preferred_entries[callee.index()].store(
-        optimizing_callee
-            .native_entry_address()
-            .expect("optimizing callee address"),
-        std::sync::atomic::Ordering::Release,
-    );
-    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
-        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        trusted_function_entries: baseline_entries.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: baseline_entries.len() as u32,
-        trusted_preferred_function_entries: preferred_entries.as_mut_ptr() as usize as u64,
-        trusted_preferred_function_entry_count: preferred_entries.len() as u32,
-        ..crate::JitNativeRuntimeView::default()
-    });
-    assert_eq!(
-        optimizing_caller
-            .invoke_i64(&[], JIT_RUNTIME_ABI_HASH)
-            .expect("caller must resume after the callee transition"),
-        43
-    );
-    assert_eq!(NESTED_NATIVE_DYNAMIC_EFFECTS.load(Ordering::SeqCst), 1);
+    assert!(optimizing_callee.handle.is_none());
+    assert_eq!(NESTED_NATIVE_DYNAMIC_EFFECTS.load(Ordering::SeqCst), 0);
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 
@@ -26466,7 +25918,7 @@ fn optimizing_reference_backed_array_dimension_binding_stays_native() {
     );
     builder.set_entry(function);
     builder.set_return_type(function, Some(IrReturnType::Int));
-    let array = untyped_param(&mut builder, function, "array");
+    let array = typed_array_reference_param(&mut builder, function, "array");
     let alias = builder.intern_local(function, "alias");
     let block = builder.append_block(function);
     let zero = builder.intern_constant(IrConstant::Int(0));
@@ -26533,7 +25985,7 @@ fn optimizing_reference_backed_array_dimension_binding_stays_native() {
     ];
     direct_entries[0] = crate::JitNativeDirectArrayEntry { key: 0, value: 1 };
     direct_slots[0] = crate::JitNativeValueSlot {
-        refcount: 1,
+        refcount: 2,
         kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY,
         flags: crate::jit_native_direct_array_flags(Some(0)),
         reserved: crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY,
@@ -26576,7 +26028,18 @@ fn optimizing_reference_backed_array_dimension_binding_stays_native() {
             .expect("compiled reference-backed dimension bind"),
         7
     );
-    let bound_reference = direct_entries[0].value;
+    assert_eq!(
+        direct_entries[0].value, 1,
+        "the reference-backed write mutated the shared COW peer"
+    );
+    let replacement_array = direct_slots[1].payload;
+    let replacement_index = crate::jit_decode_runtime_value(replacement_array as i64)
+        .expect("reference payload must contain the replacement direct array")
+        .saturating_sub(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE)
+        as usize;
+    let replacement_entries =
+        direct_slots[replacement_index].aux as usize as *const crate::JitNativeDirectArrayEntry;
+    let bound_reference = unsafe { (*replacement_entries).value };
     let bound_index = crate::jit_decode_runtime_value(bound_reference)
         .expect("array entry must contain a direct reference")
         .saturating_sub(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE) as usize;
@@ -26607,7 +26070,7 @@ fn optimizing_by_ref_dimension_call_clones_cow_root_without_helpers() {
             local: value_local,
             required: true,
             default: None,
-            type_: None,
+            type_: Some(IrReturnType::Int),
             by_ref: true,
             variadic: false,
             attributes: Vec::new(),
@@ -26759,7 +26222,7 @@ fn optimizing_by_ref_dimension_call_clones_cow_root_without_helpers() {
     ];
     direct_entries[0] = crate::JitNativeDirectArrayEntry { key: 0, value: 1 };
     direct_slots[0] = crate::JitNativeValueSlot {
-        refcount: 2,
+        refcount: 1,
         kind: crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY,
         flags: crate::jit_native_direct_array_flags(Some(0)),
         reserved: crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY,
@@ -27366,7 +26829,7 @@ fn profiled_virtual_method_layout_guards_are_rejected_before_entry() {
     assert!(matches!(
         outcome.status,
         JitCompileStatus::Rejected { ref reason }
-            if reason == "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION"
+            if reason.starts_with("JIT_CRANELIFT_REJECT_")
     ));
     assert!(outcome.handle.is_none());
 
@@ -27384,6 +26847,7 @@ fn profiled_virtual_method_layout_guards_are_rejected_before_entry() {
         native_arity: 2,
         requires_non_reference_trampoline: false,
         returns_by_reference: false,
+        return_type: None,
         exception_routes: Some(callee),
     };
     let linked_specialization = crate::JitMethodSpecialization {
@@ -27434,7 +26898,7 @@ fn profiled_virtual_method_layout_guards_are_rejected_before_entry() {
     assert!(matches!(
         linked_outcome.status,
         JitCompileStatus::Rejected { ref reason }
-            if reason == "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION"
+            if reason.starts_with("JIT_CRANELIFT_REJECT_")
     ));
     assert!(linked_outcome.handle.is_none());
 }

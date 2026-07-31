@@ -6869,7 +6869,7 @@ impl<'a> NativeRequestColdState<'a> {
             };
             index
         };
-        let published = (|| {
+        (|| {
             if !self.promote_direct_object_property_slots(index)? {
                 return Ok(());
             }
@@ -6949,8 +6949,7 @@ impl<'a> NativeRequestColdState<'a> {
                 layout_id: object.class_layout_epoch(),
             };
             Ok(())
-        })();
-        published
+        })()
     }
 
     pub(super) fn register_native_execution_scope(
@@ -7416,6 +7415,7 @@ impl<'a> NativeRequestColdState<'a> {
                 function, true,
             ),
             returns_by_reference: false,
+            return_type: function.return_type.clone(),
             exception_routes: native_function_exception_routes(target.function, function),
         };
         let record = php_jit::JitNativeLinkedFunction {

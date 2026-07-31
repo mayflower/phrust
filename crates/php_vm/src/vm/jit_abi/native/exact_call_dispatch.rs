@@ -656,40 +656,41 @@ pub(crate) extern "C" fn jit_native_class_implements_abi(
     };
     let fast_ptr = fast as *mut NativeRequestFastState;
     let symbols = &fast.symbol_query;
-    let mut publish = |name: &[u8]| {
-        let fast = unsafe { &mut *fast_ptr };
-        for index in 0..writer.len() {
-            let entry = writer.get(index)?;
-            let (existing, length) = fast.stable_native_string_range(entry.key)?;
-            let existing = unsafe { std::slice::from_raw_parts(existing, length) };
-            if existing == name {
-                return Some(());
+    let published = {
+        let mut publish = |name: &[u8]| {
+            let fast = unsafe { &mut *fast_ptr };
+            for index in 0..writer.len() {
+                let entry = writer.get(index)?;
+                let (existing, length) = fast.stable_native_string_range(entry.key)?;
+                let existing = unsafe { std::slice::from_raw_parts(existing, length) };
+                if existing == name {
+                    return Some(());
+                }
             }
-        }
-        let value = fast.publish_direct_string_bytes(name).ok()?;
-        if fast.retain_direct_encoded(value).is_err() {
-            let _ = fast.discard_owned_direct_value(value);
-            return None;
-        }
-        if fast
-            .push_owned_direct_array_entry(
-                &mut writer,
-                php_jit::JitNativeDirectArrayEntry { key: value, value },
-            )
-            .is_err()
-        {
-            let _ = fast.discard_owned_direct_value(value);
-            let _ = fast.discard_owned_direct_value(value);
-            return None;
-        }
-        Some(())
+            let value = fast.publish_direct_string_bytes(name).ok()?;
+            if fast.retain_direct_encoded(value).is_err() {
+                let _ = fast.discard_owned_direct_value(value);
+                return None;
+            }
+            if fast
+                .push_owned_direct_array_entry(
+                    &mut writer,
+                    php_jit::JitNativeDirectArrayEntry { key: value, value },
+                )
+                .is_err()
+            {
+                let _ = fast.discard_owned_direct_value(value);
+                let _ = fast.discard_owned_direct_value(value);
+                return None;
+            }
+            Some(())
+        };
+        exact_visit_class_interfaces(symbols, &target.name, 0, &mut publish).is_some()
     };
-    if exact_visit_class_interfaces(symbols, &target.name, 0, &mut publish).is_none() {
-        drop(publish);
+    if !published {
         unsafe { &mut *fast_ptr }.abort_owned_direct_array(writer);
         return exact_query_contract_violation();
     }
-    drop(publish);
     unsafe { &mut *fast_ptr }
         .finish_owned_direct_array(writer)
         .map_or_else(
@@ -1144,27 +1145,28 @@ impl php_runtime::api::NativeStructuredValuePublisher for NativeRequestFastState
         else {
             return Ok(None);
         };
-        let mut push = |fast: &mut Self, value: Self::Output| {
-            let Some(key) = i64::try_from(writer.len()).ok() else {
-                let _ = fast.discard_owned_direct_value(value);
-                return None;
+        let built = {
+            let mut push = |fast: &mut Self, value: Self::Output| {
+                let Some(key) = i64::try_from(writer.len()).ok() else {
+                    let _ = fast.discard_owned_direct_value(value);
+                    return None;
+                };
+                let entry = php_jit::JitNativeDirectArrayEntry { key, value };
+                if fast
+                    .push_owned_direct_array_entry(&mut writer, entry)
+                    .is_err()
+                {
+                    let _ = fast.discard_owned_direct_value(value);
+                    return None;
+                }
+                Some(())
             };
-            let entry = php_jit::JitNativeDirectArrayEntry { key, value };
-            if fast
-                .push_owned_direct_array_entry(&mut writer, entry)
-                .is_err()
-            {
-                let _ = fast.discard_owned_direct_value(value);
-                return None;
-            }
-            Some(())
+            build(self, &mut push)
         };
-        if let Err(error) = build(self, &mut push) {
-            drop(push);
+        if let Err(error) = built {
             self.abort_owned_direct_array(writer);
             return Err(error);
         }
-        drop(push);
         Ok(self.finish_owned_direct_array(writer).ok())
     }
 
@@ -1181,62 +1183,64 @@ impl php_runtime::api::NativeStructuredValuePublisher for NativeRequestFastState
         else {
             return Ok(None);
         };
-        let mut push = |fast: &mut Self, key: &[u8], value: Self::Output| {
-            for index in 0..writer.len() {
-                let Some(entry) = writer.get(index) else {
-                    let _ = fast.discard_owned_direct_value(value);
-                    return None;
-                };
-                let (existing, existing_length) = match fast.stable_native_string_range(entry.key) {
-                    Some(range) => range,
-                    None => {
+        let built = {
+            let mut push = |fast: &mut Self, key: &[u8], value: Self::Output| {
+                for index in 0..writer.len() {
+                    let Some(entry) = writer.get(index) else {
+                        let _ = fast.discard_owned_direct_value(value);
+                        return None;
+                    };
+                    let (existing, existing_length) =
+                        match fast.stable_native_string_range(entry.key) {
+                            Some(range) => range,
+                            None => {
+                                let _ = fast.discard_owned_direct_value(value);
+                                return None;
+                            }
+                        };
+                    // SAFETY: the unpublished key remains owned by `writer`
+                    // for this synchronous comparison.
+                    #[allow(unsafe_code)]
+                    let existing = unsafe { std::slice::from_raw_parts(existing, existing_length) };
+                    if existing == key {
+                        let Some(previous) = writer.replace_owned(
+                            index,
+                            php_jit::JitNativeDirectArrayEntry {
+                                key: entry.key,
+                                value,
+                            },
+                        ) else {
+                            let _ = fast.discard_owned_direct_value(value);
+                            return None;
+                        };
+                        let _ = fast.discard_owned_direct_value(previous.value);
+                        return Some(());
+                    }
+                }
+                let key = match fast.publish_direct_string_bytes(key) {
+                    Ok(key) => key,
+                    Err(_) => {
                         let _ = fast.discard_owned_direct_value(value);
                         return None;
                     }
                 };
-                // SAFETY: the unpublished key remains owned by `writer` for
-                // this synchronous comparison.
-                #[allow(unsafe_code)]
-                let existing = unsafe { std::slice::from_raw_parts(existing, existing_length) };
-                if existing == key {
-                    let Some(previous) = writer.replace_owned(
-                        index,
-                        php_jit::JitNativeDirectArrayEntry {
-                            key: entry.key,
-                            value,
-                        },
-                    ) else {
-                        let _ = fast.discard_owned_direct_value(value);
-                        return None;
-                    };
-                    let _ = fast.discard_owned_direct_value(previous.value);
-                    return Some(());
-                }
-            }
-            let key = match fast.publish_direct_string_bytes(key) {
-                Ok(key) => key,
-                Err(_) => {
+                let entry = php_jit::JitNativeDirectArrayEntry { key, value };
+                if fast
+                    .push_owned_direct_array_entry(&mut writer, entry)
+                    .is_err()
+                {
                     let _ = fast.discard_owned_direct_value(value);
+                    let _ = fast.discard_owned_direct_value(key);
                     return None;
                 }
+                Some(())
             };
-            let entry = php_jit::JitNativeDirectArrayEntry { key, value };
-            if fast
-                .push_owned_direct_array_entry(&mut writer, entry)
-                .is_err()
-            {
-                let _ = fast.discard_owned_direct_value(value);
-                let _ = fast.discard_owned_direct_value(key);
-                return None;
-            }
-            Some(())
+            build(self, &mut push)
         };
-        if let Err(error) = build(self, &mut push) {
-            drop(push);
+        if let Err(error) = built {
             self.abort_owned_direct_array(writer);
             return Err(error);
         }
-        drop(push);
         Ok(self.finish_owned_direct_array(writer).ok())
     }
 
@@ -3165,7 +3169,7 @@ pub(crate) extern "C" fn jit_native_sys_get_temp_dir_abi(
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
     #[allow(unsafe_code)]
     let fast = unsafe { &mut *runtime };
-    fast.publish_direct_string_bytes(&bytes).map_or_else(
+    fast.publish_direct_string_bytes(bytes).map_or_else(
         |_| exact_query_contract_violation(),
         php_jit::JitNativeControlResult::returning,
     )
@@ -3856,13 +3860,12 @@ fn exact_user_constants(
     let dynamic = dynamic_constants
         .into_iter()
         .flat_map(|constants| constants.iter())
-        .filter_map(move |(name, value)| {
-            exact_user_constant_filter_matches(filter, name).then(|| {
-                ExactConstantInventoryEntry::new(
-                    name,
-                    ExactConstantInventorySource::BorrowedEncoded(*value),
-                )
-            })
+        .filter(move |(name, _)| exact_user_constant_filter_matches(filter, name))
+        .map(|(name, value)| {
+            ExactConstantInventoryEntry::new(
+                name,
+                ExactConstantInventorySource::BorrowedEncoded(*value),
+            )
         });
     let ir = compiled
         .into_iter()
@@ -3930,14 +3933,14 @@ fn exact_nth_standard_category(target: usize) -> Option<&'static str> {
 fn exact_standard_category_entries(
     category: &str,
 ) -> impl Iterator<Item = ExactConstantInventoryEntry> + '_ {
-    exact_standard_constants().filter_map(move |(constant, value)| {
-        (php_constant_category(constant.extension()) == category).then(|| {
+    exact_standard_constants()
+        .filter(move |(constant, _)| php_constant_category(constant.extension()) == category)
+        .map(|(constant, value)| {
             ExactConstantInventoryEntry::new(
                 constant.name(),
                 ExactConstantInventorySource::Standard(value),
             )
         })
-    })
 }
 
 fn publish_exact_constant_inventory_entry(
@@ -4268,78 +4271,80 @@ pub(crate) extern "C" fn jit_native_compact_abi(
         return exact_query_contract_violation();
     };
     let fast = fast as *mut NativeRequestFastState;
-    let mut publish_name = |fast: *mut NativeRequestFastState, name: &[u8]| {
-        let fast = unsafe { &mut *fast };
-        let index = (0..local_count).find(|index| {
-            // SAFETY: compiled function metadata is immutable and request-stable.
-            unsafe { (&*local_names.add(*index)).as_bytes() == name }
-        })?;
-        let value = *local_values.get(index)?;
-        let value = if defined_vars {
-            // get_defined_vars() exposes the symbol table and therefore
-            // preserves shared ReferenceCell identity between returned
-            // entries. compact() deliberately copies the dereferenced value.
-            value
+    let published = 'publishing: {
+        let mut publish_name = |fast: *mut NativeRequestFastState, name: &[u8]| {
+            let fast = unsafe { &mut *fast };
+            let index = (0..local_count).find(|index| {
+                // SAFETY: compiled function metadata is immutable and request-stable.
+                unsafe { (&*local_names.add(*index)).as_bytes() == name }
+            })?;
+            let value = *local_values.get(index)?;
+            let value = if defined_vars {
+                // get_defined_vars() exposes the symbol table and therefore
+                // preserves shared ReferenceCell identity between returned
+                // entries. compact() deliberately copies the dereferenced value.
+                value
+            } else {
+                exact_compact_dereference(fast, value)?
+            };
+            if php_jit::jit_decode_constant(value) == Some(php_jit::JIT_VALUE_UNINITIALIZED) {
+                return Some(false);
+            }
+            for index in 0..writer.len() {
+                let entry = writer.get(index)?;
+                let (existing, length) = fast.stable_native_string_range(entry.key)?;
+                // SAFETY: unpublished keys are owned by the stable writer range.
+                let existing = unsafe { std::slice::from_raw_parts(existing, length) };
+                if existing == name {
+                    return Some(true);
+                }
+            }
+            let key = fast.publish_direct_string_bytes(name).ok()?;
+            if fast.retain_direct_encoded(value).is_err() {
+                let _ = fast.discard_owned_direct_value(key);
+                return None;
+            }
+            if fast
+                .push_owned_direct_array_entry(
+                    &mut writer,
+                    php_jit::JitNativeDirectArrayEntry { key, value },
+                )
+                .is_err()
+            {
+                let _ = fast.discard_owned_direct_value(value);
+                let _ = fast.discard_owned_direct_value(key);
+                return None;
+            }
+            Some(true)
+        };
+        if defined_vars {
+            for index in 0..local_count {
+                let name = unsafe { &*local_names.add(index) };
+                if php_ir::is_compiler_generated_local_name(name) {
+                    continue;
+                }
+                if publish_name(fast, name.as_bytes()).is_none() {
+                    break 'publishing false;
+                }
+            }
         } else {
-            exact_compact_dereference(fast, value)?
-        };
-        if php_jit::jit_decode_constant(value) == Some(php_jit::JIT_VALUE_UNINITIALIZED) {
-            return Some(false);
-        }
-        for index in 0..writer.len() {
-            let entry = writer.get(index)?;
-            let (existing, length) = fast.stable_native_string_range(entry.key)?;
-            // SAFETY: unpublished keys are owned by the stable writer range.
-            let existing = unsafe { std::slice::from_raw_parts(existing, length) };
-            if existing == name {
-                return Some(true);
+            let mut publish_compact_name = |fast, name: &[u8]| {
+                publish_name(fast, name).and_then(|published| published.then_some(()))
+            };
+            for argument in compact_arguments {
+                if exact_compact_visit_names(fast, *argument, 0, &mut publish_compact_name)
+                    .is_none()
+                {
+                    break 'publishing false;
+                }
             }
         }
-        let key = fast.publish_direct_string_bytes(name).ok()?;
-        if fast.retain_direct_encoded(value).is_err() {
-            let _ = fast.discard_owned_direct_value(key);
-            return None;
-        }
-        if fast
-            .push_owned_direct_array_entry(
-                &mut writer,
-                php_jit::JitNativeDirectArrayEntry { key, value },
-            )
-            .is_err()
-        {
-            let _ = fast.discard_owned_direct_value(value);
-            let _ = fast.discard_owned_direct_value(key);
-            return None;
-        }
-        Some(true)
+        true
     };
-    if defined_vars {
-        for index in 0..local_count {
-            let name = unsafe { &*local_names.add(index) };
-            if php_ir::is_compiler_generated_local_name(name) {
-                continue;
-            }
-            if publish_name(fast, name.as_bytes()).is_none() {
-                drop(publish_name);
-                unsafe { &mut *fast }.abort_owned_direct_array(writer);
-                return exact_query_contract_violation();
-            }
-        }
-    } else {
-        let mut publish_compact_name = |fast, name: &[u8]| {
-            publish_name(fast, name).and_then(|published| published.then_some(()))
-        };
-        for argument in compact_arguments {
-            if exact_compact_visit_names(fast, *argument, 0, &mut publish_compact_name).is_none() {
-                drop(publish_compact_name);
-                drop(publish_name);
-                unsafe { &mut *fast }.abort_owned_direct_array(writer);
-                return exact_query_contract_violation();
-            }
-        }
-        drop(publish_compact_name);
+    if !published {
+        unsafe { &mut *fast }.abort_owned_direct_array(writer);
+        return exact_query_contract_violation();
     }
-    drop(publish_name);
     unsafe { &mut *fast }
         .finish_owned_direct_array(writer)
         .map_or_else(
