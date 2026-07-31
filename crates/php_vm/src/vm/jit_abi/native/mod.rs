@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 mod capability_impl;
 pub(crate) use capability_impl::native_fixed_callable_plan;
+mod strtr_impl;
 
 pub(super) static NATIVE_TEMPNAM_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);

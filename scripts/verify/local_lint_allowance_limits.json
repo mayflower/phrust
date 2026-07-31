@@ -50,6 +50,9 @@
     },
     "crates/php_vm/src/vm/jit_abi/native/mod.rs": {
       "unsafe_code": 2
+    },
+    "crates/php_vm/src/vm/jit_abi/native/strtr_impl.rs": {
+      "unsafe_code": 1
     }
   },
   "schema_version": 1
