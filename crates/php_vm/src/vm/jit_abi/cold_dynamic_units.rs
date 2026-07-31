@@ -786,6 +786,22 @@ pub(super) fn dynamic_function_property_plans_total(
     else {
         return false;
     };
+    let has_property_access = instructions.iter().any(|instruction| {
+        matches!(
+            instruction.as_deref().map(|instruction| &instruction.kind),
+            Some(
+                php_ir::InstructionKind::FetchProperty { .. }
+                    | php_ir::InstructionKind::AssignProperty { .. }
+            )
+        )
+    });
+    if !has_property_access {
+        // Functions without a property instruction have no property contract
+        // to publish. In particular, do not reject exact leaf calls or
+        // methods reached through a separately published receiver merely
+        // because their continuation table has no property-plan base.
+        return true;
+    }
     let Some(base) = package
         .runtime_state
         .trusted_property_function_offsets
