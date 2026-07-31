@@ -1235,6 +1235,14 @@ fn optimizing_admission_for_region(
             Some((*local, instruction.continuation_id))
         })
         .collect::<BTreeMap<_, _>>();
+    // BindGlobal itself dereferences the trusted reference plan in order to
+    // initialize a missing symbol to null. Therefore the plan must already be
+    // a complete direct reference before the optimizing region starts, even
+    // when no later load/store happens to create another global requirement.
+    // Missing or incomplete plans execute the one baseline continuation.
+    admission
+        .initialized_globals
+        .extend(bound_global_continuations.values().copied());
     let published_call_result_facts = region
         .blocks
         .iter()
@@ -17660,7 +17668,7 @@ fn lower_entry_array_source(
                 continuation_id,
                 deopt_out,
             );
-            emit_optimizing_entry_total_native_value(builder, reference, deopt_out, rejected);
+            emit_optimizing_entry_total_direct_reference(builder, reference, deopt_out, rejected);
             let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
             let value = builder.ins().load(
                 types::I64,
@@ -19266,6 +19274,26 @@ fn emit_optimizing_entry_total_native_value(
     builder.switch_to_block(accepted);
 }
 
+fn emit_optimizing_entry_total_direct_reference(
+    builder: &mut FunctionBuilder<'_>,
+    reference: ir::Value,
+    deopt_out: ir::Value,
+    rejected: ir::Block,
+) {
+    let inspect = builder.create_block();
+    let tagged = lower_value_has_tag(builder, reference, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
+    let index = builder.ins().ireduce(types::I32, reference);
+    let direct = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        index,
+        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
+    );
+    let admitted = builder.ins().band(tagged, direct);
+    builder.ins().brif(admitted, inspect, &[], rejected, &[]);
+    builder.switch_to_block(inspect);
+    emit_optimizing_entry_total_native_value(builder, reference, deopt_out, rejected);
+}
+
 fn emit_optimizing_entry_admission(
     builder: &mut FunctionBuilder<'_>,
     admission: &NativeOptimizingAdmission,
@@ -19941,7 +19969,7 @@ fn emit_optimizing_entry_admission(
     }
     for local in admission.initialized_request_locals.iter().copied() {
         let reference = lower_trusted_request_local_reference(builder, deopt_out, function, local);
-        emit_optimizing_entry_total_native_value(builder, reference, deopt_out, rejected);
+        emit_optimizing_entry_total_direct_reference(builder, reference, deopt_out, rejected);
         let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
         let payload = builder.ins().load(
             types::I64,
@@ -19965,7 +19993,7 @@ fn emit_optimizing_entry_admission(
             continuation_id,
             deopt_out,
         );
-        emit_optimizing_entry_total_native_value(builder, reference, deopt_out, rejected);
+        emit_optimizing_entry_total_direct_reference(builder, reference, deopt_out, rejected);
         let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
         let payload = builder.ins().load(
             types::I64,
@@ -19989,7 +20017,7 @@ fn emit_optimizing_entry_admission(
             continuation_id,
             deopt_out,
         );
-        emit_optimizing_entry_total_native_value(builder, reference, deopt_out, rejected);
+        emit_optimizing_entry_total_direct_reference(builder, reference, deopt_out, rejected);
         let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
         let payload = builder.ins().load(
             types::I64,
@@ -20006,7 +20034,7 @@ fn emit_optimizing_entry_admission(
     }
     for local in admission.releasable_request_locals.iter().copied() {
         let reference = lower_trusted_request_local_reference(builder, deopt_out, function, local);
-        emit_optimizing_entry_total_native_value(builder, reference, deopt_out, rejected);
+        emit_optimizing_entry_total_direct_reference(builder, reference, deopt_out, rejected);
         let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
         let payload = builder.ins().load(
             types::I64,
@@ -20039,7 +20067,7 @@ fn emit_optimizing_entry_admission(
             continuation_id,
             deopt_out,
         );
-        emit_optimizing_entry_total_native_value(builder, reference, deopt_out, rejected);
+        emit_optimizing_entry_total_direct_reference(builder, reference, deopt_out, rejected);
         let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
         let payload = builder.ins().load(
             types::I64,

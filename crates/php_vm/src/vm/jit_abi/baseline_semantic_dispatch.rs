@@ -262,10 +262,7 @@ pub(super) fn execute_native_semantic_operation(
             Some(continuation),
         ),
         Id::BindGlobal => {
-            return Err(
-                "JIT_NATIVE_BIND_GLOBAL_PLAN_MISSING: global binding must use its prepared direct reference plan"
-                    .to_owned(),
-            );
+            execute_baseline_bind_global(context, instruction, caller_function, continuation)
         }
         Id::BoundClosureClass => return execute_bound_closure_class(context, arguments),
         Id::ObjectClassName => None,
@@ -279,6 +276,43 @@ pub(super) fn execute_native_semantic_operation(
             instruction.id.raw()
         )
     })?
+}
+
+fn execute_baseline_bind_global(
+    context: &mut NativeRequestColdState<'_>,
+    instruction: &php_ir::Instruction,
+    _caller_function: u32,
+    _continuation: u32,
+) -> Option<Result<i64, String>> {
+    let php_ir::InstructionKind::BindGlobal { name, .. } = &instruction.kind else {
+        return None;
+    };
+    Some((|| {
+        // Missing globals have a stable native reference identity whose
+        // payload intentionally remains uninitialized until the `global`
+        // statement executes. Such a payload cannot enter optimizing code,
+        // so the baseline continuation performs the one semantic mutation
+        // and republishes the now-total plan for subsequent native entries.
+        let encoded = context.native_request_local_handle(name)?;
+        if context.direct_reference_payload(encoded)
+            == Some(php_jit::jit_encode_constant(
+                php_jit::JIT_VALUE_UNINITIALIZED,
+            ))
+        {
+            let null = php_jit::jit_encode_constant(u32::MAX);
+            if !context.replace_direct_reference_payload_owned(encoded, null)? {
+                return Err(format!(
+                    "JIT_NATIVE_BIND_GLOBAL_REFERENCE_MISSING: ${name} has no authoritative direct reference"
+                ));
+            }
+            context.mark_roots_dirty(RootMutationReason::GlobalOrStatic);
+        }
+        context.prepare_trusted_global_references()?;
+        // The canonical request map and the trusted publication slot retain
+        // their own owners. The destination reference local owns this one.
+        context.retain(encoded)?;
+        Ok(encoded)
+    })())
 }
 
 fn execute_bound_closure_class(

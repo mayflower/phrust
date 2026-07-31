@@ -31373,18 +31373,48 @@ fn lower_baseline_region_instruction(
                     operation,
                     crate::region_ir::RegionSemanticOp::BindGlobal { .. }
                 ) {
-                    lower_cached_bind_global(
+                    let RegionCallResult::ReferenceLocal(destination) = call.result else {
+                        return Err(CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_BIND_GLOBAL_RESULT",
+                            "BindGlobal must publish a reference local",
+                        ));
+                    };
+                    let previous = use_local_variable(builder, locals, destination)?;
+                    let release_previous = instruction.live_locals.contains(&destination)
+                        && value_release_required(value_flow.local_fact(destination));
+                    lower_direct_semantic_call(
                         module,
                         builder,
+                        native_operations.semantic_dispatch,
                         native_operations.value_release,
                         value_flow,
                         locals,
+                        register_variables,
+                        registers,
                         call,
+                        operation.operation_id(),
                         instruction,
+                        transition_live_registers,
+                        streaming_call_exit,
                         result_out,
                         deopt_out,
                         function,
+                        local_count,
+                        native_version,
+                        unit_identity,
+                        pointer_type,
                     )?;
+                    if release_previous {
+                        let _ = lower_guarded_value_release(
+                            module,
+                            builder,
+                            native_operations.value_release,
+                            native_dim_operation(1, function, instruction.continuation_id),
+                            previous,
+                            result_out,
+                            deopt_out,
+                        )?;
+                    }
                     return Ok(());
                 }
                 lower_direct_semantic_call(
@@ -34184,44 +34214,6 @@ fn lower_native_suspension(
         define_region_register(builder, register_variables, registers, register, value)?;
     }
     define_region_register(builder, register_variables, registers, dst, resume_value)?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn lower_cached_bind_global(
-    module: &mut JITModule,
-    builder: &mut FunctionBuilder<'_>,
-    lifecycle: Option<NativeHelper>,
-    value_flow: &ExecutableValueFlow,
-    locals: &NativeLocalMap,
-    call: &RegionNativeCall,
-    instruction: &RegionInstruction,
-    result_out: ir::Value,
-    deopt_out: ir::Value,
-    function: FunctionId,
-) -> Result<(), CraneliftLoweringError> {
-    let RegionCallResult::ReferenceLocal(destination) = call.result else {
-        return Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_BIND_GLOBAL_RESULT",
-            "BindGlobal must publish a reference local",
-        ));
-    };
-    let previous = use_local_variable(builder, locals, destination)?;
-    let release_previous = instruction.live_locals.contains(&destination)
-        && value_release_required(value_flow.local_fact(destination));
-    let encoded = lower_direct_global_binding_value(builder, function, instruction, deopt_out)?;
-    if release_previous {
-        let _ = lower_guarded_value_release(
-            module,
-            builder,
-            lifecycle,
-            native_dim_operation(1, function, instruction.continuation_id),
-            previous,
-            result_out,
-            deopt_out,
-        )?;
-    }
-    define_local_variable(builder, locals, destination, encoded)?;
     Ok(())
 }
 

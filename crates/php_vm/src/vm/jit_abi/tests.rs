@@ -264,6 +264,77 @@ fn dynamic_optimizer_rejects_unpublished_global_reference_plans() {
 }
 
 #[test]
+fn baseline_bind_global_initializes_and_republishes_missing_native_global() {
+    use php_ir::builder::IrBuilder;
+    use php_ir::{FunctionFlags, InstructionKind, IrSpan, UnitId};
+
+    let mut builder = IrBuilder::new(UnitId::new(9_966));
+    let file = builder.add_file("baseline-bind-global-publication.php");
+    let span = IrSpan::new(file, 0, 16);
+    let entry = builder.start_function("main", FunctionFlags::default(), span);
+    let global = builder.intern_local(entry, "late_global");
+    let block = builder.append_block(entry);
+    builder.emit(
+        entry,
+        block,
+        InstructionKind::BindGlobal {
+            local: global,
+            name: "late_global".to_owned(),
+        },
+        span,
+    );
+    builder.terminate_return(entry, block, None, span);
+    builder.set_entry(entry);
+
+    let compiled = crate::compiled_unit::CompiledUnit::new(builder.finish());
+    let instructions = compiled
+        .prepared_continuation_instructions(entry)
+        .expect("global binding has continuation metadata");
+    let (continuation, instruction) = instructions
+        .iter()
+        .enumerate()
+        .find_map(|(continuation, instruction)| {
+            let instruction = instruction.as_ref()?;
+            matches!(instruction.kind, InstructionKind::BindGlobal { .. })
+                .then_some((continuation, instruction.clone()))
+        })
+        .expect("global binding continuation exists");
+    let options = super::super::VmOptions::default();
+    let worker = super::super::VmWorkerState::default();
+    let mut context = super::NativeRequestOwner::new(
+        &compiled,
+        compiled.artifact_identity(),
+        &options,
+        &worker,
+        php_runtime::api::OutputBuffer::new(),
+        std::sync::Arc::new(std::collections::BTreeMap::new()),
+    );
+
+    let encoded = super::baseline_semantic_dispatch::execute_native_semantic_operation(
+        &mut context,
+        php_jit::region_ir::RegionSemanticOperationId::BindGlobal,
+        &instruction,
+        &[],
+        entry.raw(),
+        u32::try_from(continuation).expect("continuation fits native ABI"),
+    )
+    .expect("baseline global binding succeeds");
+    assert_eq!(
+        context.direct_reference_payload(encoded),
+        Some(php_jit::jit_encode_constant(u32::MAX)),
+        "executing global binding initializes a missing symbol to null"
+    );
+    assert!(
+        super::baseline_reference_ownership::direct_reference_payload_is_total(
+            &context.direct_value_slots,
+            encoded,
+        ),
+        "the baseline mutation must leave a total direct-reference payload"
+    );
+    context.release(encoded).expect("release destination owner");
+}
+
+#[test]
 fn direct_reference_publication_rejects_uninitialized_and_unsupported_payloads() {
     let direct = |index| {
         php_jit::jit_encode_typed_runtime_value(

@@ -23689,6 +23689,34 @@ fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch(
             "global binding imported the old semantic dispatcher: {helper_imports:?}"
         );
     }
+    let optimizing_helpers = handle
+        .relocatable_code()
+        .expect("optimizing global-binding relocatable artifact")
+        .relocations
+        .iter()
+        .filter_map(|relocation| match &relocation.target {
+            crate::JitRelocatableTarget::Helper(symbol) => Some(symbol.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !optimizing_helpers.contains(&"phrust_baseline_native_semantic_dispatch"),
+        "optimizing global binding imported baseline dispatch: {optimizing_helpers:?}"
+    );
+    let baseline_helpers = baseline
+        .relocatable_code()
+        .expect("baseline global-binding relocatable artifact")
+        .relocations
+        .iter()
+        .filter_map(|relocation| match &relocation.target {
+            crate::JitRelocatableTarget::Helper(symbol) => Some(symbol.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        baseline_helpers.contains(&"phrust_baseline_native_semantic_dispatch"),
+        "baseline global binding must own its cold compatibility boundary: {baseline_helpers:?}"
+    );
     let metadata = handle
         .region_state_metadata()
         .expect("global-binding lowering metadata");
@@ -23744,31 +23772,40 @@ fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch(
         trusted_global_reference_slot_count: trusted_slots.len() as u32,
         ..crate::JitNativeRuntimeView::default()
     });
+    trusted_slots[0].encoded = 0;
+    let missing_plan = handle
+        .invoke_i64_with_deopt(&[], JIT_RUNTIME_ABI_HASH)
+        .expect("missing global plan must leave before optimizer entry");
+    assert!(matches!(
+        missing_plan,
+        crate::JitI64InvokeOutcome::SideExit { status, .. }
+            if status == crate::JitCallStatus::ABI_MISMATCH.0 as i32
+    ));
+
+    trusted_slots[0].encoded = encoded_reference;
+    let uninitialized = handle
+        .invoke_i64_with_deopt(&[], JIT_RUNTIME_ABI_HASH)
+        .expect("uninitialized global payload must leave before optimizer entry");
+    assert!(matches!(
+        uninitialized,
+        crate::JitI64InvokeOutcome::SideExit { status, .. }
+            if status == crate::JitCallStatus::ABI_MISMATCH.0 as i32
+    ));
+    assert_eq!(
+        direct_slots[1].payload as i64,
+        crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED)
+    );
+    assert_eq!(roots_dirty, 0);
+
+    direct_slots[1].payload = crate::jit_encode_constant(u32::MAX) as u64;
     assert_eq!(
         handle
             .invoke_i64(&[], JIT_RUNTIME_ABI_HASH)
-            .expect("trusted global binding must not side-exit"),
+            .expect("published global binding stays optimizing"),
         crate::jit_encode_constant(u32::MAX)
     );
-    assert_eq!(
-        direct_slots[1].payload as i64,
-        crate::jit_encode_constant(u32::MAX),
-        "executing global binding must initialize a missing global to null"
-    );
-    assert_eq!(roots_dirty, 1);
-    direct_slots[1].payload = crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED) as u64;
-    roots_dirty = 0;
-    assert_eq!(
-        baseline
-            .invoke_i64(&[], JIT_RUNTIME_ABI_HASH)
-            .expect("baseline trusted global binding must stay direct"),
-        crate::jit_encode_constant(u32::MAX)
-    );
-    assert_eq!(
-        direct_slots[1].payload as i64,
-        crate::jit_encode_constant(u32::MAX)
-    );
-    assert_eq!(roots_dirty, 1);
+    assert_eq!(roots_dirty, 0);
+
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 
