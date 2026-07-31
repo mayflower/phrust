@@ -598,96 +598,7 @@ fn entry_array_source(
     None
 }
 
-fn entry_array_root_local(
-    operand: RegionOperand,
-    definitions: &BTreeMap<RegId, RegionOperand>,
-) -> Option<LocalId> {
-    let mut operand = operand;
-    for _ in 0..32 {
-        match operand {
-            RegionOperand::Register(register) => operand = *definitions.get(&register)?,
-            RegionOperand::Local(local) => return Some(local),
-            RegionOperand::Constant(_)
-            | RegionOperand::I64(_)
-            | RegionOperand::LinkedConstant { .. } => return None,
-        }
-    }
-    None
-}
-
-fn publication_entry_array_source(
-    region: &RegionGraph,
-    definitions: &BTreeMap<RegId, RegionOperand>,
-    parameter_indices: &BTreeMap<LocalId, usize>,
-    by_ref_parameters: &BTreeSet<LocalId>,
-    operand: RegionOperand,
-    continuation_id: u32,
-    family: &str,
-) -> Result<NativeEntryArraySource, CraneliftLoweringError> {
-    let source = entry_array_source(operand, definitions, parameter_indices).ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_SHAPE",
-            format!("{family} at continuation {continuation_id} is not rooted at an entry array",),
-        )
-    })?;
-    let NativeEntryArraySource::Parameter(index) = source else {
-        unreachable!("operand-rooted array families are parameters")
-    };
-    if by_ref_parameters.contains(&region.parameter_locals[index]) {
-        return Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_REFERENCE",
-            format!(
-                "{family} at continuation {continuation_id} receives a by-reference entry array",
-            ),
-        ));
-    }
-    Ok(source)
-}
-
-fn publication_array_sources(
-    region: &RegionGraph,
-    definitions: &BTreeMap<RegId, RegionOperand>,
-    parameter_indices: &BTreeMap<LocalId, usize>,
-    by_ref_parameters: &BTreeSet<LocalId>,
-    internal_sources: &BTreeMap<RegId, BTreeSet<NativeEntryArraySource>>,
-    operand: RegionOperand,
-    continuation_id: u32,
-    family: &str,
-    allow_by_reference: bool,
-) -> Result<BTreeSet<NativeEntryArraySource>, CraneliftLoweringError> {
-    let root = publication_root_operand(operand, definitions);
-    let sources = if let Some(source) = entry_array_source(root, definitions, parameter_indices) {
-        BTreeSet::from([source])
-    } else if let RegionOperand::Register(register) = root {
-        internal_sources.get(&register).cloned().ok_or_else(|| {
-            CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_SHAPE",
-                format!(
-                    "{family} at continuation {continuation_id} has no publication-total array producer",
-                ),
-            )
-        })?
-    } else {
-        return Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_SHAPE",
-            format!("{family} at continuation {continuation_id} is not a published native array",),
-        ));
-    };
-    for source in &sources {
-        if !allow_by_reference
-            && let NativeEntryArraySource::Parameter(index) = *source
-            && by_ref_parameters.contains(&region.parameter_locals[index])
-        {
-            return Err(CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_REFERENCE",
-                format!(
-                    "{family} at continuation {continuation_id} receives a by-reference entry array",
-                ),
-            ));
-        }
-    }
-    Ok(sources)
-}
+include!("executable_region/array_source_publication.rs");
 
 fn publication_integer_array_key(constants: &[IrConstant], key: RegionOperand) -> Option<i64> {
     match key {
@@ -3518,16 +3429,18 @@ fn optimizing_admission_for_region(
                         ),
                     )
                 })?;
+                let inserted_by_sequence = fresh_insert_modes.get(&register) == Some(&true)
+                    && key >= 0
+                    && usize::try_from(key).is_ok_and(|key| {
+                        key < fresh_insert_counts.get(&register).copied().unwrap_or(0)
+                    });
+                let inserted_by_key = fresh_insert_keys
+                    .get(&register)
+                    .is_some_and(|keys| keys.contains(&NativeEntryArrayKey::Integer(key)));
                 if !quiet
                     && mode == php_ir::instruction::DimFetchMode::Read
-                    && !(fresh_insert_modes.get(&register) == Some(&true)
-                        && key >= 0
-                        && usize::try_from(key).is_ok_and(|key| {
-                            key < fresh_insert_counts.get(&register).copied().unwrap_or(0)
-                        }))
-                    && !fresh_insert_keys
-                        .get(&register)
-                        .is_some_and(|keys| keys.contains(&NativeEntryArrayKey::Integer(key)))
+                    && !inserted_by_sequence
+                    && !inserted_by_key
                 {
                     return Err(CraneliftLoweringError::new(
                         "JIT_CRANELIFT_REJECT_ARRAY_DIM_WARNING_BOUNDARY",
@@ -7911,11 +7824,13 @@ fn optimizing_admission_for_region(
             }
             for operand in arrays {
                 let sources = publication_array_sources(
-                    region,
-                    &definitions,
-                    &parameter_indices,
-                    &by_ref_parameters,
-                    &internal_array_sources,
+                    PublicationArraySourceContext {
+                        region,
+                        definitions: &definitions,
+                        parameter_indices: &parameter_indices,
+                        by_ref_parameters: &by_ref_parameters,
+                        internal_sources: &internal_array_sources,
+                    },
                     *operand,
                     instruction.continuation_id,
                     "callback-neutral array operation",
@@ -7999,11 +7914,13 @@ fn optimizing_admission_for_region(
             }
             for operand in array_operands {
                 let sources = publication_array_sources(
-                    region,
-                    &definitions,
-                    &parameter_indices,
-                    &by_ref_parameters,
-                    &internal_array_sources,
+                    PublicationArraySourceContext {
+                        region,
+                        definitions: &definitions,
+                        parameter_indices: &parameter_indices,
+                        by_ref_parameters: &by_ref_parameters,
+                        internal_sources: &internal_array_sources,
+                    },
                     *operand,
                     instruction.continuation_id,
                     "array copy operation",
@@ -8034,11 +7951,13 @@ fn optimizing_admission_for_region(
                     )
                 })?;
             let sources = publication_array_sources(
-                region,
-                &definitions,
-                &parameter_indices,
-                &by_ref_parameters,
-                &internal_array_sources,
+                PublicationArraySourceContext {
+                    region,
+                    definitions: &definitions,
+                    parameter_indices: &parameter_indices,
+                    by_ref_parameters: &by_ref_parameters,
+                    internal_sources: &internal_array_sources,
+                },
                 arguments[1],
                 instruction.continuation_id,
                 "array lookup",
@@ -8088,11 +8007,13 @@ fn optimizing_admission_for_region(
                 BTreeSet::new()
             } else {
                 publication_array_sources(
-                    region,
-                    &definitions,
-                    &parameter_indices,
-                    &by_ref_parameters,
-                    &internal_array_sources,
+                    PublicationArraySourceContext {
+                        region,
+                        definitions: &definitions,
+                        parameter_indices: &parameter_indices,
+                        by_ref_parameters: &by_ref_parameters,
+                        internal_sources: &internal_array_sources,
+                    },
                     operand,
                     instruction.continuation_id,
                     "array pointer operation",
@@ -8401,11 +8322,13 @@ fn optimizing_admission_for_region(
             ));
         }
         let sources = publication_array_sources(
-            region,
-            &definitions,
-            &parameter_indices,
-            &by_ref_parameters,
-            &internal_array_sources,
+            PublicationArraySourceContext {
+                region,
+                definitions: &definitions,
+                parameter_indices: &parameter_indices,
+                by_ref_parameters: &by_ref_parameters,
+                internal_sources: &internal_array_sources,
+            },
             operand,
             instruction.continuation_id,
             "array operation",

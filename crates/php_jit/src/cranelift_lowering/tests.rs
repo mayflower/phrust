@@ -1650,9 +1650,7 @@ fn optimizing_extrema_family_uses_only_total_native_comparison_boundaries() {
     assert!(!helper_imports.contains(&"phrust_baseline_native_builtin_dispatch"));
     assert!(!helper_imports.contains(&"phrust_native_value_release"));
     assert!(
-        helper_imports
-            .iter()
-            .any(|symbol| *symbol == "phrust_native_spaceship"),
+        helper_imports.contains(&"phrust_native_spaceship"),
         "representation-heavy extrema did not select a total comparison ABI: {helper_imports:?}"
     );
 }
