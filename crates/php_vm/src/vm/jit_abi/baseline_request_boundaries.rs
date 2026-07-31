@@ -372,6 +372,10 @@ impl<'a> NativeRequestColdState<'a> {
                 }
                 Ok(Value::Array(value))
             }
+            Some(NativeEncodedValueKind::Resource) => Self::direct_value_index(encoded)
+                .and_then(|index| self.direct_resource(index))
+                .map(Value::Resource)
+                .ok_or_else(|| "native dynamic resource constant lost its owner".to_owned()),
             _ => Err("native dynamic constant left the admitted constant plane".to_owned()),
         }
     }
