@@ -4959,6 +4959,35 @@ fn strtok_warns_after_multi_trailing_delimiter_grace_false() {
 }
 
 #[test]
+fn strtr_three_string_form_transforms_in_release_builds() {
+    let mut output = OutputBuffer::new();
+    assert_eq!(
+        call(
+            "strtr",
+            vec![
+                Value::string("Requests"),
+                Value::string("\\"),
+                Value::string("/"),
+            ],
+            &mut output,
+        ),
+        Value::string("Requests")
+    );
+    assert_eq!(
+        call(
+            "strtr",
+            vec![
+                Value::string("Namespace\\Class"),
+                Value::string("\\"),
+                Value::string("/"),
+            ],
+            &mut output,
+        ),
+        Value::string("Namespace/Class")
+    );
+}
+
+#[test]
 fn string_split_replace_case_and_padding_builtins_work() {
     let mut output = OutputBuffer::new();
 

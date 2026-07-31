@@ -618,7 +618,8 @@ pub fn native_strtr_into(subject: &[u8], from: &[u8], to: &[u8], output: &mut [u
 
 fn baseline_strtr(subject: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     let mut output = vec![0; subject.len()];
-    debug_assert!(native_strtr_into(subject, from, to, &mut output));
+    let transformed = native_strtr_into(subject, from, to, &mut output);
+    debug_assert!(transformed);
     output
 }
 
