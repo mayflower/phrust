@@ -2125,7 +2125,7 @@ fn directory_handles_read_rewind_and_close_with_sorted_entries() {
             capabilities.clone(),
             &mut resources,
         ),
-        Value::Bool(true)
+        Value::Null
     );
     assert_eq!(
         call_with_fs_resources(
