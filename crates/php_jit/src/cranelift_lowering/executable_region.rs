@@ -599,6 +599,7 @@ fn entry_array_source(
 }
 
 include!("executable_region/array_source_publication.rs");
+include!("executable_region/publication_boundaries.rs");
 
 fn publication_integer_array_key(constants: &[IrConstant], key: RegionOperand) -> Option<i64> {
     match key {
@@ -1172,6 +1173,7 @@ fn optimizing_admission_for_region(
     if region.compile_metadata.tier != NativeCompilerTier::Optimizing {
         return Ok(NativeOptimizingAdmission::default());
     }
+    reject_unpublished_optimizer_boundaries(region)?;
     // Every allocation is charged by the family classifier that publishes
     // its total output plan below. A graph-wide per-instruction allowance
     // made immediate-only regions depend on allocator state and concealed
