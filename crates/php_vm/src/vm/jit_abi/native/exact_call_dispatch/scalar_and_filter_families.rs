@@ -2005,7 +2005,12 @@ pub(crate) extern "C" fn jit_native_strtr_abi(
     // Safety: the compiled ABI passes the request-owned fast state for this synchronous call.
     let fast = unsafe { &mut *runtime };
     if argument_2 == php_jit::jit_encode_constant(php_jit::JIT_VALUE_ARGUMENT_MISSING) {
-        return exact_query_contract_violation();
+        return fast
+            .publish_direct_strtr_map(argument_0, argument_1)
+            .map_or_else(
+                exact_query_contract_violation,
+                php_jit::JitNativeControlResult::returning,
+            );
     }
     fast.publish_direct_string_transform3(
         argument_0,

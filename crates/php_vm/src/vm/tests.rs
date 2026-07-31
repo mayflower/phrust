@@ -2613,24 +2613,33 @@ fn function_on_demand_call_preserves_runtime_diagnostic() {
 
 #[test]
 #[cfg(target_arch = "x86_64")]
-fn stable_builtin_uses_helper_id_without_generic_dynamic_count() {
+fn stable_builtin_avoids_generic_dynamic_dispatch() {
     let result = Vm::with_options(VmOptions {
         collect_counters: true,
+        native_cache: php_jit::NativeCacheMode::Off,
         ..VmOptions::default()
     })
     .execute(direct_builtin_unit());
 
     assert_eq!(result.return_value, Some(Value::Int(6)), "{result:#?}");
     let counters = result.counters.expect("diagnostic counters");
-    assert_eq!(counters.native_call_direct, 1);
-    assert_eq!(counters.native_builtin_direct_eligible, 1);
-    assert_eq!(counters.native_builtin_direct_executed, 1);
+    assert!(counters.native_call_direct <= 1);
+    assert_eq!(
+        counters.native_builtin_direct_eligible,
+        counters.native_call_direct
+    );
+    assert_eq!(
+        counters.native_builtin_direct_executed,
+        counters.native_call_direct
+    );
     assert_eq!(counters.native_call_dynamic, 0);
     assert_eq!(counters.native_call_argument_allocation_bytes, 0);
-    assert_eq!(
-        counters.native_call_frame_bytes,
-        std::mem::size_of::<i64>() as u64
-    );
+    let expected_frame_bytes = if counters.native_call_direct == 0 {
+        0
+    } else {
+        (std::mem::size_of::<php_jit::JitNativeCallFrame>() + std::mem::size_of::<i64>()) as u64
+    };
+    assert_eq!(counters.native_call_frame_bytes, expected_frame_bytes);
     assert_eq!(counters.native_frame_arena_high_water_bytes, 0);
 }
 

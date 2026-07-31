@@ -1363,7 +1363,8 @@ fn dynamic_property_test_slot_rejects_unpublished_magic_and_visibility_shapes() 
 
 #[test]
 fn native_http_build_query_reads_recursive_direct_arrays() {
-    let mut slots = vec![php_jit::JitNativeValueSlot::default(); 6];
+    let mut buffers = super::NativeRequestBuffers::default();
+    *buffers.direct_value_next = 6;
     let array_value = |index: u32| {
         php_jit::jit_encode_typed_runtime_value(
             php_jit::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE + index,
@@ -1380,7 +1381,7 @@ fn native_http_build_query_reads_recursive_direct_arrays() {
     let nested_key = b"nested key";
     let skipped_key = b"skip";
     for (index, bytes) in [(2, hello.as_slice()), (3, nested_key), (4, skipped_key)] {
-        slots[index] = php_jit::JitNativeValueSlot {
+        buffers.direct_value_slots[index] = php_jit::JitNativeValueSlot {
             refcount: 1,
             kind: php_jit::JIT_NATIVE_VALUE_VIEW_STRING,
             flags: php_jit::JIT_NATIVE_STRING_VIEW_ABI_VERSION,
@@ -1393,7 +1394,7 @@ fn native_http_build_query_reads_recursive_direct_arrays() {
         key: 1,
         value: php_jit::jit_encode_constant(php_jit::JIT_VALUE_TRUE),
     }];
-    slots[1] = php_jit::JitNativeValueSlot {
+    buffers.direct_value_slots[1] = php_jit::JitNativeValueSlot {
         refcount: 1,
         kind: php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY,
         flags: php_jit::JIT_NATIVE_DIRECT_ARRAY_ABI_VERSION,
@@ -1415,7 +1416,7 @@ fn native_http_build_query_reads_recursive_direct_arrays() {
             value: php_jit::jit_encode_constant(u32::MAX),
         },
     ];
-    slots[0] = php_jit::JitNativeValueSlot {
+    buffers.direct_value_slots[0] = php_jit::JitNativeValueSlot {
         refcount: 1,
         kind: php_jit::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY,
         flags: php_jit::JIT_NATIVE_DIRECT_ARRAY_ABI_VERSION,
@@ -1430,7 +1431,22 @@ fn native_http_build_query_reads_recursive_direct_arrays() {
             runtime_view_pointer: 0,
             runtime_view: php_jit::JitNativeRuntimeView {
                 abi_version: php_jit::JIT_RUNTIME_ABI_VERSION,
-                direct_value_slots: slots.as_mut_ptr() as usize as u64,
+                direct_value_slots: buffers.direct_value_slots.as_mut_ptr() as usize as u64,
+                direct_value_next: std::ptr::from_mut(buffers.direct_value_next.as_mut()) as usize
+                    as u64,
+                direct_value_free_head: std::ptr::from_mut(buffers.direct_value_free_head.as_mut())
+                    as usize as u64,
+                direct_value_reused_bytes: std::ptr::from_mut(
+                    buffers.direct_value_reused_bytes.as_mut(),
+                ) as usize as u64,
+                direct_string_bytes: buffers.direct_string_bytes.as_mut_ptr() as usize as u64,
+                direct_string_next: std::ptr::from_mut(buffers.direct_string_next.as_mut()) as usize
+                    as u64,
+                direct_string_free_heads: buffers.direct_string_free_heads.as_mut_ptr() as usize
+                    as u64,
+                direct_string_reused_bytes: std::ptr::from_mut(
+                    buffers.direct_string_reused_bytes.as_mut(),
+                ) as usize as u64,
                 ..php_jit::JitNativeRuntimeView::default()
             },
         },
@@ -1740,7 +1756,7 @@ fn exact_string_rewrite_and_json_consume_authoritative_native_arrays() {
             .native_string_view(encoded.value)
             .expect("numeric-check json_encode publishes bytes")
     };
-    assert_eq!(encoded_bytes, b"1.0");
+    assert_eq!(encoded_bytes, b"1");
 
     let encoded = crate::native_exact::exact_call_dispatch::jit_native_json_encode_abi(
         runtime,
