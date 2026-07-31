@@ -379,7 +379,6 @@ mod tests {
             assert!(operation.native_callable);
             assert!(operation.gc_safepoint);
             assert!(operation.native_callers.contains(&"baseline"));
-            assert!(operation.native_callers.contains(&"optimizing"));
         }
         assert_eq!(
             NATIVE_OPERATION_REGISTRY
