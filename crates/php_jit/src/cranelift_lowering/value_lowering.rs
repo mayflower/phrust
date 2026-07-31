@@ -2,6 +2,38 @@
 
 use super::*;
 
+pub(super) fn native_callable_return_type_is_releasable_scalar(
+    type_: &php_ir::IrReturnType,
+) -> bool {
+    use php_ir::IrReturnType as Type;
+    match type_ {
+        Type::Int
+        | Type::Float
+        | Type::String
+        | Type::Bool
+        | Type::Null
+        | Type::False
+        | Type::True
+        | Type::Void
+        | Type::Never => true,
+        Type::Nullable { inner } => native_callable_return_type_is_releasable_scalar(inner),
+        Type::Union { members } => {
+            !members.is_empty()
+                && members
+                    .iter()
+                    .all(native_callable_return_type_is_releasable_scalar)
+        }
+        Type::Array
+        | Type::Callable
+        | Type::Iterable
+        | Type::Object
+        | Type::Mixed
+        | Type::Class { .. }
+        | Type::Intersection { .. }
+        | Type::Dnf { .. } => false,
+    }
+}
+
 pub(super) fn encode_native_bool(
     builder: &mut FunctionBuilder<'_>,
     condition: ir::Value,

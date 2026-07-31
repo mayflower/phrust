@@ -51,36 +51,6 @@ struct NativeFunctionMetadata {
     has_exception_handlers: bool,
 }
 
-fn native_callable_return_type_is_releasable_scalar(type_: &php_ir::IrReturnType) -> bool {
-    use php_ir::IrReturnType as Type;
-    match type_ {
-        Type::Int
-        | Type::Float
-        | Type::String
-        | Type::Bool
-        | Type::Null
-        | Type::False
-        | Type::True
-        | Type::Void
-        | Type::Never => true,
-        Type::Nullable { inner } => native_callable_return_type_is_releasable_scalar(inner),
-        Type::Union { members } => {
-            !members.is_empty()
-                && members
-                    .iter()
-                    .all(native_callable_return_type_is_releasable_scalar)
-        }
-        Type::Array
-        | Type::Callable
-        | Type::Iterable
-        | Type::Object
-        | Type::Mixed
-        | Type::Class { .. }
-        | Type::Intersection { .. }
-        | Type::Dnf { .. } => false,
-    }
-}
-
 #[derive(Clone, Copy)]
 enum OptimizingCompiledCallAddress {
     Local(FunctionId),
@@ -398,7 +368,10 @@ use fallback_helpers::*;
 use terminators::{
     lower_optimizing_region_terminator, lower_owned_frame_locals, lower_region_terminator,
 };
-use value_lowering::{encode_native_bool, lower_direct_cast, lower_direct_compare, scalar_truthy};
+use value_lowering::{
+    encode_native_bool, lower_direct_cast, lower_direct_compare,
+    native_callable_return_type_is_releasable_scalar, scalar_truthy,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NativeScalarRegionCompileResult {
@@ -30533,9 +30506,6 @@ fn lower_baseline_region_instruction(
             array,
             keys,
         } => {
-            let globals_proxy_local = function_local_names
-                .get(array.index())
-                .is_some_and(|name| name == "GLOBALS");
             let current = use_local_variable(builder, locals, *array)?;
             let root = lower_native_local_fetch(
                 module,
@@ -30655,24 +30625,18 @@ fn lower_baseline_region_instruction(
                     deopt_out,
                 )?;
             }
-            let stored = if globals_proxy_local {
-                current
-            } else {
-                let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
-                let local_value = builder.ins().iconst(types::I64, i64::from(array.raw()));
-                lower_native_value_operation(
-                    module,
-                    builder,
-                    native_operations.local_store,
-                    native_local_store_operation(
-                        function_is_top_level,
-                        function_local_names,
-                        *array,
-                    ) | crate::JIT_LOCAL_STORE_MOVE_INPUT,
-                    &[current, updated, function_value, local_value],
-                    result_out,
-                )?
-            };
+            let stored = lower_baseline_store_local_or_keep_globals_proxy(
+                module,
+                builder,
+                native_operations.local_store,
+                function_is_top_level,
+                function_local_names,
+                function,
+                *array,
+                current,
+                updated,
+                result_out,
+            )?;
             define_local_variable(builder, locals, *array, stored)?;
             define_local_variable(builder, locals, *target, reference)?;
             publish_native_reference_local(
@@ -33072,9 +33036,7 @@ fn lower_baseline_region_instruction(
             value,
         } => {
             let value_operand = *value;
-            let globals_proxy_local = function_local_names
-                .get(local.index())
-                .is_some_and(|name| name == "GLOBALS");
+            let globals_proxy_local = baseline_local_is_globals_proxy(function_local_names, *local);
             // Dimension writes may raise a catchable TypeError (for example
             // when a string is indexed with a string key). Publish the
             // current continuation before entering the helper so native
@@ -33252,9 +33214,7 @@ fn lower_baseline_region_instruction(
         } => {
             let value_operand = *value;
             let current = use_local_variable(builder, locals, *local)?;
-            let globals_proxy_local = function_local_names
-                .get(local.index())
-                .is_some_and(|name| name == "GLOBALS");
+            let globals_proxy_local = baseline_local_is_globals_proxy(function_local_names, *local);
             let local_fact = value_flow.local_fact(*local);
             let direct_array_local = value_flow.local_storage(*local).is_promoted()
                 && local_fact.certainty != crate::region_ir::SsaCertainty::Unknown
@@ -33490,9 +33450,6 @@ fn lower_baseline_region_instruction(
         }
         RegionInstructionKind::UnsetDim { local, keys } => {
             let current = use_local_variable(builder, locals, *local)?;
-            let globals_proxy_local = function_local_names
-                .get(local.index())
-                .is_some_and(|name| name == "GLOBALS");
             let root = lower_native_local_fetch(
                 module,
                 builder,
@@ -33544,24 +33501,18 @@ fn lower_baseline_region_instruction(
                     result_out,
                 )?;
             }
-            let stored = if globals_proxy_local {
-                current
-            } else {
-                let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
-                let local_value = builder.ins().iconst(types::I64, i64::from(local.raw()));
-                lower_native_value_operation(
-                    module,
-                    builder,
-                    native_operations.local_store,
-                    native_local_store_operation(
-                        function_is_top_level,
-                        function_local_names,
-                        *local,
-                    ) | crate::JIT_LOCAL_STORE_MOVE_INPUT,
-                    &[current, updated, function_value, local_value],
-                    result_out,
-                )?
-            };
+            let stored = lower_baseline_store_local_or_keep_globals_proxy(
+                module,
+                builder,
+                native_operations.local_store,
+                function_is_top_level,
+                function_local_names,
+                function,
+                *local,
+                current,
+                updated,
+                result_out,
+            )?;
             define_local_variable(builder, locals, *local, stored)?;
             if let Some(global_name) = instruction.native_global_name.as_deref() {
                 // `unset($GLOBALS["name"])` replaces the symbol-table

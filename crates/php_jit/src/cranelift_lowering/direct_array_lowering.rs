@@ -1,3 +1,40 @@
+fn baseline_local_is_globals_proxy(function_local_names: &[String], local: LocalId) -> bool {
+    function_local_names
+        .get(local.index())
+        .is_some_and(|name| name == "GLOBALS")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_baseline_store_local_or_keep_globals_proxy(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    helper: Option<NativeHelper>,
+    function_is_top_level: bool,
+    function_local_names: &[String],
+    function_id: FunctionId,
+    local: LocalId,
+    current: ir::Value,
+    updated: ir::Value,
+    result_out: ir::Value,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    if baseline_local_is_globals_proxy(function_local_names, local) {
+        return Ok(current);
+    }
+    let function = builder
+        .ins()
+        .iconst(types::I64, i64::from(function_id.raw()));
+    let local_value = builder.ins().iconst(types::I64, i64::from(local.raw()));
+    lower_native_value_operation(
+        module,
+        builder,
+        helper,
+        native_local_store_operation(function_is_top_level, function_local_names, local)
+            | crate::JIT_LOCAL_STORE_MOVE_INPUT,
+        &[current, updated, function, local_value],
+        result_out,
+    )
+}
+
 fn lower_baseline_direct_new_array(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
