@@ -1124,7 +1124,7 @@ real-world-fixtures: _native-cutover-deferred-warning
     scripts/runtime_semantics_diff.py --category real_world --out target/runtime-semantics/real-world
 
 wordpress-blockers: _native-cutover-deferred-warning
-    python3 -m unittest scripts/wordpress/test_smoke_response.py
+    python3 -m unittest scripts/wordpress/test_preflight.py scripts/wordpress/test_smoke_response.py
     cargo build -p php_vm_cli
     scripts/runtime_semantics_diff.py --category wordpress_blockers --out target/runtime-semantics/wordpress-blockers
 
