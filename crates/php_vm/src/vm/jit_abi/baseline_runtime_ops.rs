@@ -331,9 +331,7 @@ fn native_stringable_value(
     }
 }
 
-// SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
-#[allow(unsafe_code)]
-pub(in crate::vm) extern "C" fn jit_baseline_native_binary_abi(
+fn jit_native_binary_impl(
     runtime: *mut NativeRequestFastState,
     op: u32,
     lhs: i64,
@@ -610,6 +608,64 @@ pub(in crate::vm) extern "C" fn jit_baseline_native_binary_abi(
     status
 }
 
+// SAFETY: audited baseline compatibility ABI pointer boundary.
+#[allow(unsafe_code)]
+pub(in crate::vm) extern "C" fn jit_baseline_native_binary_abi(
+    runtime: *mut NativeRequestFastState,
+    op: u32,
+    lhs: i64,
+    rhs: i64,
+    function: i64,
+    continuation: i64,
+    out: *mut i64,
+) -> i32 {
+    jit_native_binary_impl(runtime, op, lhs, rhs, function, continuation, out)
+}
+
+macro_rules! exact_binary_leaf {
+    ($name:ident, $operation:expr) => {
+        // SAFETY: audited exact native ABI pointer boundary.
+        #[allow(unsafe_code)]
+        pub(in crate::vm) extern "C" fn $name(
+            runtime: *mut NativeRequestFastState,
+            lhs: i64,
+            rhs: i64,
+            transition_state: *const php_jit::JitDeoptState,
+            out: *mut i64,
+        ) -> i32 {
+            let (function, continuation) = native_source_coordinates(transition_state);
+            jit_native_binary_impl(runtime, $operation, lhs, rhs, function, continuation, out)
+        }
+    };
+}
+
+fn native_source_coordinates(state: *const php_jit::JitDeoptState) -> (i64, i64) {
+    // SAFETY: exact generated leaves receive their caller-owned transition
+    // record, whose source fields are populated immediately before the call.
+    #[allow(unsafe_code)]
+    unsafe {
+        state.as_ref().map_or((-1, -1), |state| {
+            (
+                i64::from(state.function_id),
+                i64::from(state.continuation_id),
+            )
+        })
+    }
+}
+
+exact_binary_leaf!(jit_native_add_abi, 0);
+exact_binary_leaf!(jit_native_subtract_abi, 1);
+exact_binary_leaf!(jit_native_multiply_abi, 2);
+exact_binary_leaf!(jit_native_divide_abi, 3);
+exact_binary_leaf!(jit_native_modulo_abi, 4);
+exact_binary_leaf!(jit_native_concatenate_abi, 5);
+exact_binary_leaf!(jit_native_power_abi, 6);
+exact_binary_leaf!(jit_native_bitwise_and_abi, 7);
+exact_binary_leaf!(jit_native_bitwise_or_abi, 8);
+exact_binary_leaf!(jit_native_bitwise_xor_abi, 9);
+exact_binary_leaf!(jit_native_shift_left_abi, 10);
+exact_binary_leaf!(jit_native_shift_right_abi, 11);
+
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(in crate::vm) extern "C" fn jit_baseline_native_compare_abi(
@@ -661,9 +717,7 @@ pub(in crate::vm) extern "C" fn jit_baseline_native_compare_abi(
     .unwrap_or(php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32)
 }
 
-// SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
-#[allow(unsafe_code)]
-pub(in crate::vm) extern "C" fn jit_baseline_native_cast_abi(
+fn jit_native_cast_impl(
     runtime: *mut NativeRequestFastState,
     op: u32,
     src: i64,
@@ -795,6 +849,58 @@ pub(in crate::vm) extern "C" fn jit_baseline_native_cast_abi(
     .unwrap_or(php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32)
 }
 
+// SAFETY: audited baseline compatibility ABI pointer boundary.
+#[allow(unsafe_code)]
+pub(in crate::vm) extern "C" fn jit_baseline_native_cast_abi(
+    runtime: *mut NativeRequestFastState,
+    op: u32,
+    src: i64,
+    out: *mut i64,
+) -> i32 {
+    jit_native_cast_impl(runtime, op, src, out)
+}
+
+fn exact_cast_operation(operation: u32, state: *const php_jit::JitDeoptState) -> u32 {
+    let (function, continuation) = native_source_coordinates(state);
+    let (Ok(function), Ok(continuation)) = (u32::try_from(function), u32::try_from(continuation))
+    else {
+        return operation;
+    };
+    if function <= 0x03ff && continuation <= 0x03_ffff {
+        0x8000_0000 | operation | (function << 3) | (continuation << 13)
+    } else {
+        operation
+    }
+}
+
+macro_rules! exact_cast_leaf {
+    ($name:ident, $operation:expr) => {
+        // SAFETY: audited exact native ABI pointer boundary.
+        #[allow(unsafe_code)]
+        pub(in crate::vm) extern "C" fn $name(
+            runtime: *mut NativeRequestFastState,
+            src: i64,
+            transition_state: *const php_jit::JitDeoptState,
+            out: *mut i64,
+        ) -> i32 {
+            jit_native_cast_impl(
+                runtime,
+                exact_cast_operation($operation, transition_state),
+                src,
+                out,
+            )
+        }
+    };
+}
+
+exact_cast_leaf!(jit_native_cast_bool_abi, 0);
+exact_cast_leaf!(jit_native_cast_int_abi, 1);
+exact_cast_leaf!(jit_native_cast_float_abi, 2);
+exact_cast_leaf!(jit_native_cast_string_abi, 3);
+exact_cast_leaf!(jit_native_cast_array_abi, 4);
+exact_cast_leaf!(jit_native_cast_object_abi, 5);
+exact_cast_leaf!(jit_native_cast_void_abi, 6);
+
 pub(in crate::vm) extern "C" fn jit_native_echo_abi(
     runtime: *mut NativeRequestFastState,
     src: i64,
@@ -834,6 +940,47 @@ pub(in crate::vm) extern "C" fn jit_native_echo_abi(
 }
 
 pub(in crate::vm) extern "C" fn jit_native_local_fetch_abi(
+    runtime: *mut NativeRequestFastState,
+    quiet: u32,
+    value: i64,
+    function: i64,
+    local: i64,
+    file: i64,
+    start: i64,
+    out: *mut i64,
+) -> i32 {
+    jit_native_local_fetch_impl(runtime, quiet, value, function, local, file, start, out)
+}
+
+macro_rules! exact_local_fetch {
+    ($name:ident, $flags:expr) => {
+        pub(in crate::vm) extern "C" fn $name(
+            runtime: *mut NativeRequestFastState,
+            value: i64,
+            function: i64,
+            local: i64,
+            file: i64,
+            start: i64,
+            out: *mut i64,
+        ) -> i32 {
+            jit_native_local_fetch_impl(runtime, $flags, value, function, local, file, start, out)
+        }
+    };
+}
+
+exact_local_fetch!(jit_native_scoped_local_read_abi, 0);
+exact_local_fetch!(jit_native_scoped_local_quiet_read_abi, 1);
+exact_local_fetch!(
+    jit_native_plain_local_read_abi,
+    php_jit::JIT_LOCAL_FETCH_PLAIN_LOCAL
+);
+exact_local_fetch!(
+    jit_native_plain_local_quiet_read_abi,
+    php_jit::JIT_LOCAL_FETCH_PLAIN_LOCAL | 1
+);
+
+#[allow(clippy::too_many_arguments)]
+fn jit_native_local_fetch_impl(
     runtime: *mut NativeRequestFastState,
     quiet: u32,
     value: i64,
@@ -1220,6 +1367,47 @@ fn write_native_local_store_throw(
 }
 
 pub(in crate::vm) extern "C" fn jit_native_local_store_abi(
+    runtime: *mut NativeRequestFastState,
+    op: u32,
+    current: i64,
+    value: i64,
+    function: i64,
+    local: i64,
+    out: *mut i64,
+) -> i32 {
+    jit_native_local_store_impl(runtime, op, current, value, function, local, out)
+}
+
+macro_rules! exact_local_store {
+    ($name:ident, $flags:expr) => {
+        pub(in crate::vm) extern "C" fn $name(
+            runtime: *mut NativeRequestFastState,
+            current: i64,
+            value: i64,
+            function: i64,
+            local: i64,
+            out: *mut i64,
+        ) -> i32 {
+            jit_native_local_store_impl(runtime, $flags, current, value, function, local, out)
+        }
+    };
+}
+
+exact_local_store!(jit_native_scoped_local_copy_abi, 0);
+exact_local_store!(
+    jit_native_plain_local_copy_abi,
+    php_jit::JIT_LOCAL_STORE_PLAIN_LOCAL
+);
+exact_local_store!(
+    jit_native_scoped_local_move_abi,
+    php_jit::JIT_LOCAL_STORE_MOVE_INPUT
+);
+exact_local_store!(
+    jit_native_plain_local_move_abi,
+    php_jit::JIT_LOCAL_STORE_PLAIN_LOCAL | php_jit::JIT_LOCAL_STORE_MOVE_INPUT
+);
+
+fn jit_native_local_store_impl(
     runtime: *mut NativeRequestFastState,
     op: u32,
     current: i64,
@@ -1727,6 +1915,39 @@ fn native_array_element_reference(
 }
 
 pub(in crate::vm) extern "C" fn jit_native_reference_bind_abi(
+    runtime: *mut NativeRequestFastState,
+    op: u32,
+    encoded: i64,
+    key: i64,
+    reserved: i64,
+    out: *mut i64,
+) -> i32 {
+    jit_native_reference_bind_impl(runtime, op, encoded, key, reserved, out)
+}
+
+macro_rules! exact_reference {
+    ($name:ident, $operation:expr) => {
+        pub(in crate::vm) extern "C" fn $name(
+            runtime: *mut NativeRequestFastState,
+            encoded: i64,
+            key: i64,
+            reserved: i64,
+            out: *mut i64,
+        ) -> i32 {
+            jit_native_reference_bind_impl(runtime, $operation, encoded, key, reserved, out)
+        }
+    };
+}
+
+exact_reference!(jit_native_reference_create_abi, 0);
+exact_reference!(jit_native_reference_array_element_abi, 1);
+exact_reference!(jit_native_reference_property_element_abi, 2);
+exact_reference!(jit_native_reference_property_abi, 3);
+exact_reference!(jit_native_reference_publish_local_abi, 4);
+exact_reference!(jit_native_reference_call_argument_abi, 6);
+exact_reference!(jit_native_reference_unpublish_local_abi, 7);
+
+fn jit_native_reference_bind_impl(
     runtime: *mut NativeRequestFastState,
     op: u32,
     encoded: i64,
@@ -2747,6 +2968,25 @@ pub(in crate::vm) extern "C" fn jit_native_array_insert_local_abi(
     record_unexplained_array_insert_failure(runtime, status, append, array, key, value);
     status
 }
+
+macro_rules! exact_array_insert {
+    ($name:ident, $local:expr, $append:expr) => {
+        pub(in crate::vm) extern "C" fn $name(
+            runtime: *mut NativeRequestFastState,
+            array: i64,
+            key: i64,
+            value: i64,
+            out: *mut i64,
+        ) -> i32 {
+            jit_native_array_insert_impl(runtime, $local, $append, array, key, value, out)
+        }
+    };
+}
+
+exact_array_insert!(jit_native_array_update_abi, false, 0);
+exact_array_insert!(jit_native_array_append_abi, false, 1);
+exact_array_insert!(jit_native_local_array_update_abi, true, 0);
+exact_array_insert!(jit_native_local_array_append_abi, true, 1);
 
 fn record_unexplained_array_insert_failure(
     runtime: *mut NativeRequestFastState,
@@ -4687,6 +4927,33 @@ fn record_native_missing_array_key(
 }
 
 pub(in crate::vm) extern "C" fn jit_native_array_fetch_abi(
+    runtime: *mut NativeRequestFastState,
+    quiet: u32,
+    array: i64,
+    key: i64,
+    out: *mut i64,
+) -> i32 {
+    jit_native_array_fetch_impl(runtime, quiet, array, key, out)
+}
+
+macro_rules! exact_array_fetch {
+    ($name:ident, $quiet:expr) => {
+        pub(in crate::vm) extern "C" fn $name(
+            runtime: *mut NativeRequestFastState,
+            array: i64,
+            key: i64,
+            out: *mut i64,
+        ) -> i32 {
+            jit_native_array_fetch_impl(runtime, $quiet, array, key, out)
+        }
+    };
+}
+
+exact_array_fetch!(jit_native_array_read_abi, 0);
+exact_array_fetch!(jit_native_array_quiet_read_abi, 1);
+exact_array_fetch!(jit_native_array_key_exists_abi, 2);
+
+fn jit_native_array_fetch_impl(
     runtime: *mut NativeRequestFastState,
     quiet: u32,
     array: i64,

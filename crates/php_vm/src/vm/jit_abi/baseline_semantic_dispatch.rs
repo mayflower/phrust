@@ -73,6 +73,422 @@ pub(in crate::vm) extern "C" fn jit_baseline_native_semantic_dispatch_diagnostic
     }
 }
 
+macro_rules! exact_semantic_outcome {
+    ($context:ident, $instruction:ident, $operands:ident, $function:ident, $continuation:ident, static_property) => {
+        execute_native_static_property($context, $instruction, $operands, $function)
+    };
+    ($context:ident, $instruction:ident, $operands:ident, $function:ident, $continuation:ident, class_constant) => {
+        execute_exact_class_constant($context, $instruction, $function, $continuation)
+    };
+    ($context:ident, $instruction:ident, $operands:ident, $function:ident, $continuation:ident, object_class_name) => {
+        None
+    };
+    ($context:ident, $instruction:ident, $operands:ident, $function:ident, $continuation:ident, instance_of) => {
+        execute_baseline_instanceof($context, $instruction, $operands)
+    };
+    ($context:ident, $instruction:ident, $operands:ident, $function:ident, $continuation:ident, resolve_callable) => {
+        execute_baseline_resolve_callable($context, $instruction)
+    };
+    ($context:ident, $instruction:ident, $operands:ident, $function:ident, $continuation:ident, acquire_callable) => {
+        execute_baseline_acquire_callable($context, $instruction, $operands)
+    };
+    ($context:ident, $instruction:ident, $operands:ident, $function:ident, $continuation:ident, property) => {
+        execute_native_property_instruction(
+            $context,
+            $instruction,
+            $operands,
+            $function,
+            Some($continuation),
+        )
+    };
+    ($context:ident, $instruction:ident, $operands:ident, $function:ident, $continuation:ident, bind_global) => {
+        execute_baseline_bind_global($context, $instruction, $function, $continuation)
+    };
+    ($context:ident, $instruction:ident, $operands:ident, $function:ident, $continuation:ident, bound_closure_class) => {
+        Some(execute_bound_closure_class($context, $operands))
+    };
+}
+
+macro_rules! exact_semantic_leaf {
+    ($production:ident, $diagnostic:ident, $helper:literal, $handler:ident) => {
+        #[allow(unsafe_code)]
+        #[allow(unused_variables)]
+        pub(in crate::vm) extern "C" fn $production(
+            runtime: *mut NativeRequestFastState,
+            operands: *const i64,
+            operand_count: u32,
+            transition_state: *mut php_jit::JitDeoptState,
+            out: *mut php_jit::JitCallResult,
+        ) -> i32 {
+            unsafe {
+                jit_native_exact_semantic_leaf(
+                    runtime,
+                    operands,
+                    operand_count,
+                    transition_state,
+                    out,
+                    $helper,
+                    |context, instruction, operands, function, continuation| {
+                        exact_semantic_outcome!(
+                            context,
+                            instruction,
+                            operands,
+                            function,
+                            continuation,
+                            $handler
+                        )
+                    },
+                )
+            }
+        }
+
+        #[allow(unsafe_code)]
+        #[allow(unused_variables)]
+        pub(in crate::vm) extern "C" fn $diagnostic(
+            runtime: *mut NativeRequestFastState,
+            operands: *const i64,
+            operand_count: u32,
+            transition_state: *mut php_jit::JitDeoptState,
+            out: *mut php_jit::JitCallResult,
+        ) -> i32 {
+            unsafe {
+                jit_native_exact_semantic_leaf_diagnostic(
+                    runtime,
+                    operands,
+                    operand_count,
+                    transition_state,
+                    out,
+                    $helper,
+                    |context, instruction, operands, function, continuation| {
+                        exact_semantic_outcome!(
+                            context,
+                            instruction,
+                            operands,
+                            function,
+                            continuation,
+                            $handler
+                        )
+                    },
+                )
+            }
+        }
+    };
+}
+
+exact_semantic_leaf!(
+    jit_native_static_property_fetch_abi,
+    jit_native_static_property_fetch_diagnostic_abi,
+    "semantic_static_property_fetch",
+    static_property
+);
+exact_semantic_leaf!(
+    jit_native_static_property_assign_abi,
+    jit_native_static_property_assign_diagnostic_abi,
+    "semantic_static_property_assign",
+    static_property
+);
+exact_semantic_leaf!(
+    jit_native_static_property_isset_abi,
+    jit_native_static_property_isset_diagnostic_abi,
+    "semantic_static_property_isset",
+    static_property
+);
+exact_semantic_leaf!(
+    jit_native_static_property_empty_abi,
+    jit_native_static_property_empty_diagnostic_abi,
+    "semantic_static_property_empty",
+    static_property
+);
+exact_semantic_leaf!(
+    jit_native_static_property_dim_isset_abi,
+    jit_native_static_property_dim_isset_diagnostic_abi,
+    "semantic_static_property_dim_isset",
+    static_property
+);
+exact_semantic_leaf!(
+    jit_native_static_property_dim_empty_abi,
+    jit_native_static_property_dim_empty_diagnostic_abi,
+    "semantic_static_property_dim_empty",
+    static_property
+);
+exact_semantic_leaf!(
+    jit_native_static_property_dim_unset_abi,
+    jit_native_static_property_dim_unset_diagnostic_abi,
+    "semantic_static_property_dim_unset",
+    static_property
+);
+exact_semantic_leaf!(
+    jit_native_static_property_reference_abi,
+    jit_native_static_property_reference_diagnostic_abi,
+    "semantic_static_property_reference",
+    static_property
+);
+exact_semantic_leaf!(
+    jit_native_class_constant_fetch_abi,
+    jit_native_class_constant_fetch_diagnostic_abi,
+    "semantic_class_constant",
+    class_constant
+);
+exact_semantic_leaf!(
+    jit_native_object_class_name_semantic_abi,
+    jit_native_object_class_name_semantic_diagnostic_abi,
+    "semantic_object_class_name",
+    object_class_name
+);
+exact_semantic_leaf!(
+    jit_native_instanceof_abi,
+    jit_native_instanceof_diagnostic_abi,
+    "semantic_instanceof",
+    instance_of
+);
+exact_semantic_leaf!(
+    jit_native_dynamic_instanceof_abi,
+    jit_native_dynamic_instanceof_diagnostic_abi,
+    "semantic_dynamic_instanceof",
+    instance_of
+);
+exact_semantic_leaf!(
+    jit_native_resolve_callable_semantic_abi,
+    jit_native_resolve_callable_semantic_diagnostic_abi,
+    "semantic_resolve_callable",
+    resolve_callable
+);
+exact_semantic_leaf!(
+    jit_native_acquire_callable_semantic_abi,
+    jit_native_acquire_callable_semantic_diagnostic_abi,
+    "semantic_acquire_callable",
+    acquire_callable
+);
+exact_semantic_leaf!(
+    jit_native_property_fetch_semantic_abi,
+    jit_native_property_fetch_semantic_diagnostic_abi,
+    "semantic_property_fetch",
+    property
+);
+exact_semantic_leaf!(
+    jit_native_property_assign_semantic_abi,
+    jit_native_property_assign_semantic_diagnostic_abi,
+    "semantic_property_assign",
+    property
+);
+exact_semantic_leaf!(
+    jit_native_property_isset_abi,
+    jit_native_property_isset_diagnostic_abi,
+    "semantic_property_isset",
+    property
+);
+exact_semantic_leaf!(
+    jit_native_property_empty_abi,
+    jit_native_property_empty_diagnostic_abi,
+    "semantic_property_empty",
+    property
+);
+exact_semantic_leaf!(
+    jit_native_property_unset_abi,
+    jit_native_property_unset_diagnostic_abi,
+    "semantic_property_unset",
+    property
+);
+exact_semantic_leaf!(
+    jit_native_property_dim_assign_abi,
+    jit_native_property_dim_assign_diagnostic_abi,
+    "semantic_property_dim_assign",
+    property
+);
+exact_semantic_leaf!(
+    jit_native_property_dim_isset_abi,
+    jit_native_property_dim_isset_diagnostic_abi,
+    "semantic_property_dim_isset",
+    property
+);
+exact_semantic_leaf!(
+    jit_native_property_dim_empty_abi,
+    jit_native_property_dim_empty_diagnostic_abi,
+    "semantic_property_dim_empty",
+    property
+);
+exact_semantic_leaf!(
+    jit_native_property_dim_unset_abi,
+    jit_native_property_dim_unset_diagnostic_abi,
+    "semantic_property_dim_unset",
+    property
+);
+exact_semantic_leaf!(
+    jit_native_bind_global_abi,
+    jit_native_bind_global_diagnostic_abi,
+    "semantic_bind_global",
+    bind_global
+);
+exact_semantic_leaf!(
+    jit_native_bound_closure_class_abi,
+    jit_native_bound_closure_class_diagnostic_abi,
+    "semantic_bound_closure_class",
+    bound_closure_class
+);
+
+#[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn jit_native_exact_semantic_leaf<F>(
+    runtime: *mut NativeRequestFastState,
+    operands: *const i64,
+    operand_count: u32,
+    transition_state: *mut php_jit::JitDeoptState,
+    out: *mut php_jit::JitCallResult,
+    helper_id: &'static str,
+    execute: F,
+) -> i32
+where
+    F: for<'a> FnOnce(
+        &mut NativeRequestColdState<'a>,
+        &php_ir::Instruction,
+        &[i64],
+        u32,
+        u32,
+    ) -> Option<Result<i64, String>>,
+{
+    debug_assert!(!runtime.is_null());
+    debug_assert!(!out.is_null());
+    debug_assert!(operand_count == 0 || !operands.is_null());
+    let Some(state) = (unsafe { transition_state.as_ref() }) else {
+        return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
+    };
+    let function = state.function_id;
+    let continuation = state.continuation_id;
+    let operands = if operand_count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(operands, operand_count as usize) }
+    };
+    let dispatched = with_baseline_native_context_for(runtime, helper_id, |context| {
+        let descriptor = unsafe {
+            &*context
+                .prepared_native_callsite(function, continuation)
+                .unwrap_unchecked()
+        };
+        debug_assert!(matches!(
+            descriptor.kind,
+            crate::compiled_unit::NativeCallSiteKind::Semantic
+        ));
+        let instruction = descriptor.semantic_instruction();
+        let outcome = execute(context, instruction, operands, function, continuation)
+            .unwrap_or_else(|| {
+                Err(format!(
+                    "JIT_NATIVE_SEMANTIC_SOURCE_MISMATCH: service={helper_id} function={function} instruction={}",
+                    instruction.id.raw()
+                ))
+            });
+        (
+            outcome.map_err(NativeCallControl::from_baseline_error),
+            descriptor.span,
+        )
+    });
+    let (outcome, callsite_span) =
+        dispatched.map_or((None, None), |(outcome, span)| (Some(outcome), Some(span)));
+    super::baseline_call_dispatch::finish_native_dispatch_outcome(
+        runtime,
+        outcome,
+        callsite_span,
+        transition_state,
+        out,
+    )
+}
+
+#[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn jit_native_exact_semantic_leaf_diagnostic<F>(
+    runtime: *mut NativeRequestFastState,
+    operands: *const i64,
+    operand_count: u32,
+    transition_state: *mut php_jit::JitDeoptState,
+    out: *mut php_jit::JitCallResult,
+    helper_id: &'static str,
+    execute: F,
+) -> i32
+where
+    F: for<'a> FnOnce(
+        &mut NativeRequestColdState<'a>,
+        &php_ir::Instruction,
+        &[i64],
+        u32,
+        u32,
+    ) -> Option<Result<i64, String>>,
+{
+    debug_assert!(!runtime.is_null());
+    debug_assert!(!out.is_null());
+    debug_assert!(operand_count == 0 || !operands.is_null());
+    let Some(state) = (unsafe { transition_state.as_ref() }) else {
+        return php_jit::JitCallStatus::ABI_MISMATCH.0 as i32;
+    };
+    let function = state.function_id;
+    let continuation = state.continuation_id;
+    let operands = if operand_count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(operands, operand_count as usize) }
+    };
+    let dispatched = with_baseline_native_context_for(runtime, helper_id, |context| {
+        let descriptor = unsafe {
+            &*context
+                .prepared_native_callsite(function, continuation)
+                .unwrap_unchecked()
+        };
+        debug_assert!(matches!(
+            descriptor.kind,
+            crate::compiled_unit::NativeCallSiteKind::Semantic
+        ));
+        context.enter_runtime_helper(helper_id);
+        let instruction = descriptor.semantic_instruction();
+        let outcome = execute(context, instruction, operands, function, continuation)
+            .unwrap_or_else(|| {
+                Err(format!(
+                    "JIT_NATIVE_SEMANTIC_SOURCE_MISMATCH: service={helper_id} function={function} instruction={}",
+                    instruction.id.raw()
+                ))
+            });
+        context.exit_runtime_helper(helper_id);
+        (
+            outcome.map_err(NativeCallControl::from_baseline_error),
+            descriptor.span,
+        )
+    });
+    let (outcome, callsite_span) =
+        dispatched.map_or((None, None), |(outcome, span)| (Some(outcome), Some(span)));
+    super::baseline_call_dispatch::finish_native_dispatch_outcome(
+        runtime,
+        outcome,
+        callsite_span,
+        transition_state,
+        out,
+    )
+}
+
+fn execute_exact_class_constant(
+    context: &mut NativeRequestColdState<'_>,
+    instruction: &php_ir::Instruction,
+    caller_function: u32,
+    continuation: u32,
+) -> Option<Result<i64, String>> {
+    let outcome = execute_baseline_class_constant(context, instruction, caller_function);
+    if let (
+        php_ir::InstructionKind::FetchClassConstant {
+            class_name,
+            constant,
+            ..
+        },
+        Some(Ok(encoded)),
+    ) = (&instruction.kind, &outcome)
+        && baseline_class_constant_result_is_cacheable(
+            context,
+            caller_function,
+            class_name,
+            constant,
+        )
+    {
+        let _ = context.publish_trusted_constant_fetch(caller_function, continuation, *encoded);
+    }
+    outcome
+}
+
 #[allow(unsafe_code)] // Safety: the active cold request owns the raw VM state for this synchronous continuation.
 #[allow(clippy::too_many_arguments)]
 unsafe fn jit_baseline_native_semantic_dispatch_impl<const DIAGNOSTIC: bool>(

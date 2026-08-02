@@ -2530,6 +2530,108 @@ fn runtime_helper_addresses(diagnostic: bool) -> php_jit::JitRuntimeHelperAddres
             jit_baseline_native_semantic_dispatch_abi,
             jit_baseline_native_semantic_dispatch_diagnostic_abi
         ),
+        native_exact_semantic: [
+            helper_address!(
+                jit_abi::jit_native_static_property_fetch_abi,
+                jit_abi::jit_native_static_property_fetch_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_static_property_assign_abi,
+                jit_abi::jit_native_static_property_assign_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_static_property_isset_abi,
+                jit_abi::jit_native_static_property_isset_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_static_property_empty_abi,
+                jit_abi::jit_native_static_property_empty_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_static_property_dim_isset_abi,
+                jit_abi::jit_native_static_property_dim_isset_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_static_property_dim_empty_abi,
+                jit_abi::jit_native_static_property_dim_empty_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_static_property_dim_unset_abi,
+                jit_abi::jit_native_static_property_dim_unset_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_static_property_reference_abi,
+                jit_abi::jit_native_static_property_reference_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_class_constant_fetch_abi,
+                jit_abi::jit_native_class_constant_fetch_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_object_class_name_semantic_abi,
+                jit_abi::jit_native_object_class_name_semantic_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_instanceof_abi,
+                jit_abi::jit_native_instanceof_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_dynamic_instanceof_abi,
+                jit_abi::jit_native_dynamic_instanceof_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_resolve_callable_semantic_abi,
+                jit_abi::jit_native_resolve_callable_semantic_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_acquire_callable_semantic_abi,
+                jit_abi::jit_native_acquire_callable_semantic_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_property_fetch_semantic_abi,
+                jit_abi::jit_native_property_fetch_semantic_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_property_assign_semantic_abi,
+                jit_abi::jit_native_property_assign_semantic_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_property_isset_abi,
+                jit_abi::jit_native_property_isset_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_property_empty_abi,
+                jit_abi::jit_native_property_empty_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_property_unset_abi,
+                jit_abi::jit_native_property_unset_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_property_dim_assign_abi,
+                jit_abi::jit_native_property_dim_assign_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_property_dim_isset_abi,
+                jit_abi::jit_native_property_dim_isset_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_property_dim_empty_abi,
+                jit_abi::jit_native_property_dim_empty_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_property_dim_unset_abi,
+                jit_abi::jit_native_property_dim_unset_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_bind_global_abi,
+                jit_abi::jit_native_bind_global_diagnostic_abi
+            ),
+            helper_address!(
+                jit_abi::jit_native_bound_closure_class_abi,
+                jit_abi::jit_native_bound_closure_class_diagnostic_abi
+            ),
+        ],
         native_function_resolve: helper_address!(
             jit_native_function_resolve_abi,
             jit_abi::jit_native_function_resolve_diagnostic_abi
@@ -2554,6 +2656,20 @@ fn runtime_helper_addresses(diagnostic: bool) -> php_jit::JitRuntimeHelperAddres
             jit_native_unary_plus_abi as *const () as usize,
             jit_native_unary_minus_abi as *const () as usize,
             jit_native_bit_not_abi as *const () as usize,
+        ],
+        native_exact_binary: [
+            jit_abi::jit_native_add_abi as *const () as usize,
+            jit_abi::jit_native_subtract_abi as *const () as usize,
+            jit_abi::jit_native_multiply_abi as *const () as usize,
+            jit_abi::jit_native_divide_abi as *const () as usize,
+            jit_abi::jit_native_modulo_abi as *const () as usize,
+            jit_abi::jit_native_concatenate_abi as *const () as usize,
+            jit_abi::jit_native_power_abi as *const () as usize,
+            jit_abi::jit_native_bitwise_and_abi as *const () as usize,
+            jit_abi::jit_native_bitwise_or_abi as *const () as usize,
+            jit_abi::jit_native_bitwise_xor_abi as *const () as usize,
+            jit_abi::jit_native_shift_left_abi as *const () as usize,
+            jit_abi::jit_native_shift_right_abi as *const () as usize,
         ],
         baseline_binary: helper_address!(
             jit_baseline_native_binary_abi,
@@ -2580,6 +2696,50 @@ fn runtime_helper_addresses(diagnostic: bool) -> php_jit::JitRuntimeHelperAddres
             jit_native_greater_abi as *const () as usize,
             jit_native_greater_equal_abi as *const () as usize,
             jit_native_spaceship_abi as *const () as usize,
+        ],
+        native_exact_local_fetch: [
+            jit_abi::jit_native_scoped_local_read_abi as *const () as usize,
+            jit_abi::jit_native_scoped_local_quiet_read_abi as *const () as usize,
+            jit_abi::jit_native_plain_local_read_abi as *const () as usize,
+            jit_abi::jit_native_plain_local_quiet_read_abi as *const () as usize,
+        ],
+        native_exact_local_store: [
+            jit_abi::jit_native_scoped_local_copy_abi as *const () as usize,
+            jit_abi::jit_native_plain_local_copy_abi as *const () as usize,
+            jit_abi::jit_native_scoped_local_move_abi as *const () as usize,
+            jit_abi::jit_native_plain_local_move_abi as *const () as usize,
+        ],
+        native_exact_reference: [
+            jit_abi::jit_native_reference_create_abi as *const () as usize,
+            jit_abi::jit_native_reference_array_element_abi as *const () as usize,
+            jit_abi::jit_native_reference_property_element_abi as *const () as usize,
+            jit_abi::jit_native_reference_property_abi as *const () as usize,
+            jit_abi::jit_native_reference_publish_local_abi as *const () as usize,
+            0,
+            jit_abi::jit_native_reference_call_argument_abi as *const () as usize,
+            jit_abi::jit_native_reference_unpublish_local_abi as *const () as usize,
+        ],
+        native_exact_array_fetch: [
+            jit_abi::jit_native_array_read_abi as *const () as usize,
+            jit_abi::jit_native_array_quiet_read_abi as *const () as usize,
+            jit_abi::jit_native_array_key_exists_abi as *const () as usize,
+        ],
+        native_exact_array_insert: [
+            jit_abi::jit_native_array_update_abi as *const () as usize,
+            jit_abi::jit_native_array_append_abi as *const () as usize,
+        ],
+        native_exact_array_insert_local: [
+            jit_abi::jit_native_local_array_update_abi as *const () as usize,
+            jit_abi::jit_native_local_array_append_abi as *const () as usize,
+        ],
+        native_exact_cast: [
+            jit_abi::jit_native_cast_bool_abi as *const () as usize,
+            jit_abi::jit_native_cast_int_abi as *const () as usize,
+            jit_abi::jit_native_cast_float_abi as *const () as usize,
+            jit_abi::jit_native_cast_string_abi as *const () as usize,
+            jit_abi::jit_native_cast_array_abi as *const () as usize,
+            jit_abi::jit_native_cast_object_abi as *const () as usize,
+            jit_abi::jit_native_cast_void_abi as *const () as usize,
         ],
         baseline_cast: helper_address!(
             jit_baseline_native_cast_abi,

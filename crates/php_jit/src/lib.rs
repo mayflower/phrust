@@ -351,8 +351,12 @@ pub struct JitRuntimeHelperAddresses {
     pub native_stream_copy_to_stream: usize,
     /// Exact request-local output-buffer state and native-string handlers.
     pub native_output_buffer: [usize; 8],
-    /// Baseline-only typed PHP semantic compatibility dispatcher.
+    /// Cold baseline compatibility dispatcher. Generated artifacts never
+    /// import this operation-selector ABI.
     pub baseline_semantic_dispatch: usize,
+    /// Exact semantic leaves in `RegionSemanticOperationId::all()` order.
+    /// Every address has a fixed symbol and carries no operation selector.
+    pub native_exact_semantic: [usize; 25],
     /// Resolves or compiles one statically known PHP callee without invoking it.
     pub native_function_resolve: usize,
     /// Allocates bounded request-local native call-frame storage.
@@ -366,6 +370,8 @@ pub struct JitRuntimeHelperAddresses {
     /// Exact authoritative native unary family. Fixed order: unary plus,
     /// unary minus, bitwise not. Logical not remains direct CLIF.
     pub native_exact_unary: [usize; 3],
+    /// Exact Generic/Optimizing binary leaves in RegionBinaryOp order.
+    pub native_exact_binary: [usize; 12],
     /// Baseline-only typed PHP binary compatibility operation.
     pub baseline_binary: usize,
     /// Total representation-heavy array union over publication-admitted
@@ -383,6 +389,23 @@ pub struct JitRuntimeHelperAddresses {
     /// Order: equal, not-equal, identical, not-identical, less, less-equal,
     /// greater, greater-equal, spaceship.
     pub native_exact_compare: [usize; 9],
+    /// Exact Generic cast leaves in RegionCastOp order.
+    pub native_exact_cast: [usize; 7],
+    /// Exact local-read leaves: scoped read, scoped quiet read, plain read,
+    /// plain quiet read. Operation flags never cross the ABI.
+    pub native_exact_local_fetch: [usize; 4],
+    /// Exact local-write leaves: scoped copy, plain copy, scoped move, plain
+    /// move. Operation flags never cross the ABI.
+    pub native_exact_local_store: [usize; 4],
+    /// Exact reference services in the former operation order. Slot five is
+    /// reserved and is never imported.
+    pub native_exact_reference: [usize; 8],
+    /// Exact array reads: ordinary read, quiet read, and key-existence probe.
+    pub native_exact_array_fetch: [usize; 3],
+    /// Exact array mutations: keyed update and append, with a separate pair
+    /// for a consumed local root.
+    pub native_exact_array_insert: [usize; 2],
+    pub native_exact_array_insert_local: [usize; 2],
     /// Baseline-only typed PHP cast compatibility operation.
     pub baseline_cast: usize,
     /// Typed PHP echo operation.

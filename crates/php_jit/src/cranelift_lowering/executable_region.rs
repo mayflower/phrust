@@ -9958,6 +9958,22 @@ fn declare_baseline_value_operation(
     declare_native_helper(module, symbol, &signature, address)
 }
 
+fn declare_exact_value_operation(
+    module: &mut JITModule,
+    symbol: &str,
+    arity: u8,
+    address: usize,
+) -> Result<NativeHelper, CraneliftLoweringError> {
+    let pointer_type = module.target_config().pointer_type();
+    let mut signature = module.make_signature();
+    for _ in 0..arity {
+        signature.params.push(AbiParam::new(types::I64));
+    }
+    signature.params.push(AbiParam::new(pointer_type));
+    signature.returns.push(AbiParam::new(types::I32));
+    declare_native_helper(module, symbol, &signature, address)
+}
+
 fn declare_native_helper(
     module: &mut JITModule,
     symbol: &str,
@@ -10203,6 +10219,7 @@ pub(super) fn compile_region_graph_native(
                 RegionInstructionKind::NativeCall(call)
                     if call.direct_compiled_target().is_none()
                         && !matches!(call.target, RegionCallTarget::Semantic { .. })
+                        && baseline_builtin_helper_id(&call.target).is_none()
                         && !is_direct_linked_call(call)
             )
         }) || region
@@ -10214,6 +10231,7 @@ pub(super) fn compile_region_graph_native(
                     kind,
                     RegionInstructionKind::NativeCall(call)
                         if !matches!(call.target, RegionCallTarget::Semantic { .. })
+                            && baseline_builtin_helper_id(&call.target).is_none()
                             && (matches!(call.result, RegionCallResult::ReferenceLocal(_))
                             || call.args.iter().any(|argument| {
                                 argument.name.is_some() || argument.unpack
@@ -10224,6 +10242,12 @@ pub(super) fn compile_region_graph_native(
                 )
             })
     });
+    // Exact services are tier-shared.  Shadow the tier flag while collecting
+    // their fixed-symbol requirements so Generic and Optimizing publish the
+    // same concrete builtin dependency graph.  Restore the real tier flag
+    // before collecting Generic compatibility services below.
+    let generic_helper_imports = baseline_helper_imports;
+    let baseline_helper_imports = false;
     let needs_exact_symbol_query: [bool; StableSymbolQueryBuiltin::COUNT] =
         std::array::from_fn(|index| {
             !baseline_helper_imports
@@ -10823,17 +10847,23 @@ pub(super) fn compile_region_graph_native(
                     })
                 })
         });
-    let needs_semantic_dispatch = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(kind, RegionInstructionKind::NativeCall(call)
-                if matches!(call.target, RegionCallTarget::Semantic { .. }))
-        })
-    });
+    let needs_exact_semantic: [bool; RegionSemanticOperationId::COUNT] =
+        std::array::from_fn(|index| {
+            regions.values().any(|region| {
+                region_contains(region, |kind| {
+                    matches!(kind, RegionInstructionKind::NativeCall(call)
+                        if matches!(&call.target, RegionCallTarget::Semantic { operation }
+                            if operation.operation_id().index() == index))
+                })
+            })
+        });
     let needs_frame_arena = runtime_helpers.native_frame_alloc != 0
         && runtime_helpers.native_frame_release != 0
         && regions.values().any(|region| {
             region_contains(region, |kind| {
-                matches!(kind, RegionInstructionKind::NativeCall(_))
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if baseline_builtin_helper_id(&call.target).is_none()
+                        && !matches!(call.target, RegionCallTarget::Semantic { .. }))
             })
         });
     if baseline_helper_imports
@@ -10845,15 +10875,6 @@ pub(super) fn compile_region_graph_native(
             "dynamic or complex call requires the typed native dispatch trampoline",
         ));
     }
-    if baseline_helper_imports
-        && needs_semantic_dispatch
-        && runtime_helpers.baseline_semantic_dispatch == 0
-    {
-        return Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_NATIVE_SEMANTIC_DISPATCH",
-            "typed semantic operation requires the direct semantic dispatcher",
-        ));
-    }
     let needs_dynamic_code = regions.values().any(RegionGraph::has_native_dynamic_code);
     if baseline_helper_imports && needs_dynamic_code && runtime_helpers.native_dynamic_code == 0 {
         return Err(CraneliftLoweringError::new(
@@ -10862,19 +10883,8 @@ pub(super) fn compile_region_graph_native(
         ));
     }
     let baseline_call_symbol = BASELINE_NATIVE_CALL_DISPATCH_SYMBOL.to_owned();
-    let baseline_semantic_dispatch_symbol = BASELINE_NATIVE_SEMANTIC_DISPATCH_SYMBOL.to_owned();
     let native_function_resolve_symbol = NATIVE_FUNCTION_RESOLVE_SYMBOL.to_owned();
     let native_dynamic_code_symbol = NATIVE_DYNAMIC_CODE_SYMBOL.to_owned();
-    let needs_unary = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(
-                kind,
-                RegionInstructionKind::Unary { .. }
-                    | RegionInstructionKind::EmptyDim { .. }
-                    | RegionInstructionKind::EmptyLocal { .. }
-            )
-        })
-    });
     let mut needs_exact_unary = [false; NATIVE_EXACT_UNARY_COUNT];
     for operation in NATIVE_EXACT_UNARY_OPERATIONS {
         needs_exact_unary[native_exact_unary_index(operation)] = regions.values().any(|region| {
@@ -10903,12 +10913,15 @@ pub(super) fn compile_region_graph_native(
                 })
             });
     }
-    let needs_baseline_binary = baseline_helper_imports
-        && regions.values().any(|region| {
-            region_contains(region, |kind| {
-                matches!(kind, RegionInstructionKind::Binary { .. })
+    let needs_exact_binary: [bool; 12] = std::array::from_fn(|index| {
+        generic_helper_imports
+            && regions.values().any(|region| {
+                region_contains(region, |kind| {
+                    matches!(kind, RegionInstructionKind::Binary { op, .. }
+                    if *op == NATIVE_EXACT_BINARY_OPERATIONS[index])
+                })
             })
-        });
+    });
     let needs_array_union = !baseline_helper_imports
         && regions.iter().any(|(function, region)| {
             let value_flow = &value_flows[function];
@@ -10971,15 +10984,14 @@ pub(super) fn compile_region_graph_native(
             )
         })
     });
-    let needs_cast = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(
-                kind,
-                RegionInstructionKind::Cast { .. }
-                    | RegionInstructionKind::EmptyDim { .. }
-                    | RegionInstructionKind::EmptyLocal { .. }
-            )
-        })
+    let needs_exact_cast: [bool; 7] = std::array::from_fn(|index| {
+        generic_helper_imports
+            && regions.values().any(|region| {
+                region_contains(region, |kind| {
+                    matches!(kind, RegionInstructionKind::Cast { op, .. }
+                        if *op == NATIVE_EXACT_CAST_OPERATIONS[index])
+                })
+            })
     });
     let needs_float_to_string = regions.iter().any(|(function, region)| {
         let value_flow = &value_flows[function];
@@ -11500,28 +11512,6 @@ pub(super) fn compile_region_graph_native(
             matches!(kind, RegionInstructionKind::FetchConst { .. })
         })
     });
-    let needs_truthy = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(
-                kind,
-                RegionInstructionKind::Unary {
-                    op: crate::region_ir::RegionUnaryOp::Not,
-                    ..
-                } | RegionInstructionKind::Cast {
-                    op: crate::region_ir::RegionCastOp::Bool,
-                    ..
-                } | RegionInstructionKind::EmptyDim { .. }
-                    | RegionInstructionKind::EmptyLocal { .. }
-            )
-        }) || region.blocks.iter().any(|block| {
-            matches!(
-                block.terminator,
-                RegionTerminator::JumpIfFalse { .. }
-                    | RegionTerminator::JumpIfTrue { .. }
-                    | RegionTerminator::JumpIf { .. }
-            )
-        })
-    });
     let needs_type_predicate = regions.values().any(|region| {
         region_contains(region, |kind| {
             matches!(
@@ -11554,33 +11544,15 @@ pub(super) fn compile_region_graph_native(
     let needs_execution_poll = regions
         .values()
         .any(|region| !region.osr_entries().is_empty());
+    let baseline_helper_imports = generic_helper_imports;
     // Shadow every generic-runtime requirement with the tier capability.  In
     // particular, the optimizing closure below never declares a helper and
     // therefore cannot smuggle one into code through an unused wrapper.
     let needs_call_trampoline = baseline_helper_imports && needs_call_trampoline;
     let needs_function_resolver = baseline_helper_imports && needs_function_resolver;
-    let needs_semantic_dispatch = baseline_helper_imports && needs_semantic_dispatch;
     let needs_frame_arena = baseline_helper_imports && needs_frame_arena;
     let needs_dynamic_code = baseline_helper_imports && needs_dynamic_code;
-    let needs_unary = baseline_helper_imports && needs_unary;
-    if baseline_helper_imports {
-        needs_exact_unary.fill(false);
-    }
-    if baseline_helper_imports {
-        needs_exact_compare.fill(false);
-    }
-    let needs_compare = baseline_helper_imports && needs_compare;
-    let needs_float_to_string = !baseline_helper_imports && needs_float_to_string;
-    let needs_numeric_string = !baseline_helper_imports && needs_numeric_string;
-    let needs_fmod_f64 = !baseline_helper_imports && needs_fmod_f64;
-    let needs_round_f64 = !baseline_helper_imports && needs_round_f64;
-    let needs_array_cast = !baseline_helper_imports && needs_array_cast;
-    let needs_int_cast = !baseline_helper_imports && needs_int_cast;
-    let needs_float_cast = !baseline_helper_imports && needs_float_cast;
-    let needs_string_cast = !baseline_helper_imports && needs_string_cast;
-    let needs_object_cast = !baseline_helper_imports && needs_object_cast;
-    let needs_object_class_name = !baseline_helper_imports && needs_object_class_name;
-    let needs_cast = baseline_helper_imports && needs_cast;
+    let _needs_compare = needs_compare;
     let needs_direct_echo = !baseline_helper_imports && needs_echo;
     let needs_echo = baseline_helper_imports && needs_echo;
     let needs_local_fetch = baseline_helper_imports && needs_local_fetch;
@@ -11611,7 +11583,6 @@ pub(super) fn compile_region_graph_native(
     let needs_foreach_next = baseline_helper_imports && needs_foreach_next;
     let needs_foreach_cleanup = baseline_helper_imports && needs_foreach_cleanup;
     let needs_constant_fetch = baseline_helper_imports && needs_constant_fetch;
-    let needs_truthy = baseline_helper_imports && needs_truthy;
     let needs_type_predicate = baseline_helper_imports && needs_type_predicate;
     let needs_stable_length = baseline_helper_imports && needs_stable_length;
     let needs_runtime_fatal = baseline_helper_imports && needs_runtime_fatal;
@@ -12578,10 +12549,18 @@ pub(super) fn compile_region_graph_native(
         }
         imports.push((builtin.symbol().to_owned(), address));
     }
-    if baseline_helper_imports && needs_semantic_dispatch {
+    for operation in RegionSemanticOperationId::all() {
+        if !baseline_helper_imports || !needs_exact_semantic[operation.index()] {
+            continue;
+        }
+        let configured = runtime_helpers.native_exact_semantic[operation.index()];
         imports.push((
-            baseline_semantic_dispatch_symbol.clone(),
-            runtime_helpers.baseline_semantic_dispatch,
+            operation.exact_symbol().to_owned(),
+            if configured == 0 {
+                test_native_exact_semantic_fallback as *const () as usize
+            } else {
+                configured
+            },
         ));
     }
     if baseline_helper_imports && needs_function_resolver {
@@ -12608,58 +12587,16 @@ pub(super) fn compile_region_graph_native(
     }
     for (needed, configured, fallback, symbol) in [
         (
-            needs_unary,
-            runtime_helpers.baseline_unary,
-            test_native_unary_fallback as *const () as usize,
-            "phrust_baseline_native_unary",
-        ),
-        (
-            needs_baseline_binary,
-            runtime_helpers.baseline_binary,
-            test_baseline_binary_fallback as *const () as usize,
-            "phrust_baseline_native_binary",
-        ),
-        (
-            needs_compare,
-            runtime_helpers.baseline_compare,
-            test_native_compare_fallback as *const () as usize,
-            "phrust_baseline_native_compare",
-        ),
-        (
-            needs_cast,
-            runtime_helpers.baseline_cast,
-            test_native_cast_fallback as *const () as usize,
-            "phrust_baseline_native_cast",
-        ),
-        (
             needs_echo,
             runtime_helpers.native_echo,
             test_native_echo_fallback as *const () as usize,
             "phrust_native_echo",
         ),
         (
-            needs_local_fetch,
-            runtime_helpers.native_local_fetch,
-            test_native_local_fetch_fallback as *const () as usize,
-            "phrust_native_local_fetch",
-        ),
-        (
-            needs_local_store,
-            runtime_helpers.native_local_store,
-            test_native_local_store_fallback as *const () as usize,
-            "phrust_native_local_store",
-        ),
-        (
             needs_value_release,
             runtime_helpers.native_value_release,
             test_native_value_release_fallback as *const () as usize,
             "phrust_native_value_release",
-        ),
-        (
-            needs_reference_bind,
-            runtime_helpers.native_reference_bind,
-            test_native_reference_bind_fallback as *const () as usize,
-            "phrust_native_reference_bind",
         ),
         (
             needs_argument_check,
@@ -12716,24 +12653,6 @@ pub(super) fn compile_region_graph_native(
             "phrust_native_object_clone_with",
         ),
         (
-            needs_array_insert,
-            runtime_helpers.native_array_insert,
-            test_native_array_insert_fallback as *const () as usize,
-            "phrust_native_array_insert",
-        ),
-        (
-            needs_array_insert,
-            runtime_helpers.native_array_insert_local,
-            test_native_array_insert_fallback as *const () as usize,
-            "phrust_native_array_insert_local",
-        ),
-        (
-            needs_array_fetch,
-            runtime_helpers.native_array_fetch,
-            test_native_array_fetch_fallback as *const () as usize,
-            "phrust_native_array_fetch",
-        ),
-        (
             needs_array_unset,
             runtime_helpers.native_array_unset,
             test_native_array_unset_fallback as *const () as usize,
@@ -12770,12 +12689,6 @@ pub(super) fn compile_region_graph_native(
             "phrust_native_constant_fetch",
         ),
         (
-            needs_truthy,
-            runtime_helpers.native_truthy,
-            test_native_truthy_fallback as *const () as usize,
-            "phrust_native_truthy",
-        ),
-        (
             needs_type_predicate,
             runtime_helpers.native_type_predicate,
             test_native_type_predicate_fallback as *const () as usize,
@@ -12807,6 +12720,82 @@ pub(super) fn compile_region_graph_native(
                 configured
             };
             imports.push((symbol.to_owned(), address));
+        }
+    }
+    if needs_local_fetch {
+        for (index, symbol) in NATIVE_EXACT_LOCAL_FETCH_SYMBOLS.into_iter().enumerate() {
+            imports.push((
+                symbol.to_owned(),
+                if runtime_helpers.native_exact_local_fetch[index] == 0 {
+                    test_native_exact_local_fetch_fallback as *const () as usize
+                } else {
+                    runtime_helpers.native_exact_local_fetch[index]
+                },
+            ));
+        }
+    }
+    if needs_local_store {
+        for (index, symbol) in NATIVE_EXACT_LOCAL_STORE_SYMBOLS.into_iter().enumerate() {
+            imports.push((
+                symbol.to_owned(),
+                if runtime_helpers.native_exact_local_store[index] == 0 {
+                    test_native_exact_local_store_fallback as *const () as usize
+                } else {
+                    runtime_helpers.native_exact_local_store[index]
+                },
+            ));
+        }
+    }
+    if needs_reference_bind {
+        for (index, symbol) in NATIVE_EXACT_REFERENCE_SYMBOLS.into_iter().enumerate() {
+            if index == 5 {
+                continue;
+            }
+            imports.push((
+                symbol.to_owned(),
+                if runtime_helpers.native_exact_reference[index] == 0 {
+                    test_native_exact_reference_fallback as *const () as usize
+                } else {
+                    runtime_helpers.native_exact_reference[index]
+                },
+            ));
+        }
+    }
+    if needs_array_fetch {
+        for (index, symbol) in NATIVE_EXACT_ARRAY_FETCH_SYMBOLS.into_iter().enumerate() {
+            imports.push((
+                symbol.to_owned(),
+                if runtime_helpers.native_exact_array_fetch[index] == 0 {
+                    test_native_exact_array_fetch_fallback as *const () as usize
+                } else {
+                    runtime_helpers.native_exact_array_fetch[index]
+                },
+            ));
+        }
+    }
+    if needs_array_insert {
+        for (index, symbol) in NATIVE_EXACT_ARRAY_INSERT_SYMBOLS.into_iter().enumerate() {
+            imports.push((
+                symbol.to_owned(),
+                if runtime_helpers.native_exact_array_insert[index] == 0 {
+                    test_native_exact_array_insert_fallback as *const () as usize
+                } else {
+                    runtime_helpers.native_exact_array_insert[index]
+                },
+            ));
+        }
+        for (index, symbol) in NATIVE_EXACT_ARRAY_INSERT_LOCAL_SYMBOLS
+            .into_iter()
+            .enumerate()
+        {
+            imports.push((
+                symbol.to_owned(),
+                if runtime_helpers.native_exact_array_insert_local[index] == 0 {
+                    test_native_exact_array_insert_fallback as *const () as usize
+                } else {
+                    runtime_helpers.native_exact_array_insert_local[index]
+                },
+            ));
         }
     }
     for (needed, configured, symbol) in [
@@ -12858,6 +12847,57 @@ pub(super) fn compile_region_graph_native(
             native_exact_unary_symbol(operation).to_owned(),
             if configured == 0 {
                 test_native_exact_unary_fallback as *const () as usize
+            } else {
+                configured
+            },
+        ));
+    }
+    for (index, symbol) in NATIVE_EXACT_BINARY_SYMBOLS.into_iter().enumerate() {
+        if !needs_exact_binary[index] {
+            continue;
+        }
+        let configured = runtime_helpers.native_exact_binary[index];
+        let fallback = [
+            test_native_exact_add_fallback as *const () as usize,
+            test_native_exact_subtract_fallback as *const () as usize,
+            test_native_exact_multiply_fallback as *const () as usize,
+            test_native_exact_divide_fallback as *const () as usize,
+            test_native_exact_modulo_fallback as *const () as usize,
+            test_native_exact_concatenate_fallback as *const () as usize,
+            test_native_exact_power_fallback as *const () as usize,
+            test_native_exact_bitwise_and_fallback as *const () as usize,
+            test_native_exact_bitwise_or_fallback as *const () as usize,
+            test_native_exact_bitwise_xor_fallback as *const () as usize,
+            test_native_exact_shift_left_fallback as *const () as usize,
+            test_native_exact_shift_right_fallback as *const () as usize,
+        ][index];
+        imports.push((
+            symbol.to_owned(),
+            if configured == 0 {
+                fallback
+            } else {
+                configured
+            },
+        ));
+    }
+    for (index, symbol) in NATIVE_EXACT_CAST_SYMBOLS.into_iter().enumerate() {
+        if !needs_exact_cast[index] {
+            continue;
+        }
+        let configured = runtime_helpers.native_exact_cast[index];
+        let fallback = [
+            test_native_exact_bool_cast_fallback as *const () as usize,
+            test_native_exact_int_cast_fallback as *const () as usize,
+            test_native_exact_float_cast_fallback as *const () as usize,
+            test_native_exact_string_cast_fallback as *const () as usize,
+            test_native_exact_array_cast_fallback as *const () as usize,
+            test_native_exact_object_cast_fallback as *const () as usize,
+            test_native_exact_void_cast_fallback as *const () as usize,
+        ][index];
+        imports.push((
+            symbol.to_owned(),
+            if configured == 0 {
+                fallback
             } else {
                 configured
             },
@@ -14451,6 +14491,7 @@ pub(super) fn compile_region_graph_native(
                     || helper_address(native_exact_unary_symbol(operation)),
                 )?;
             }
+            native_operations.exact_unary = exact_unary;
             let mut exact_compare = [None; NATIVE_EXACT_COMPARE_COUNT];
             for operation in NATIVE_EXACT_COMPARE_OPERATIONS {
                 let index = native_exact_compare_index(operation);
@@ -14462,6 +14503,7 @@ pub(super) fn compile_region_graph_native(
                     || helper_address(native_exact_compare_symbol(operation)),
                 )?;
             }
+            native_operations.exact_compare = exact_compare;
             let echo_bytes = if needs_direct_echo {
                 let mut bytes_signature = module.make_signature();
                 bytes_signature.params.push(AbiParam::new(pointer_type));
@@ -14694,22 +14736,21 @@ pub(super) fn compile_region_graph_native(
                 2,
                 || helper_address("phrust_native_dynamic_property_test_slot"),
             )?;
-            if needs_semantic_dispatch {
+            for operation in RegionSemanticOperationId::all() {
+                if !baseline_helper_imports || !needs_exact_semantic[operation.index()] {
+                    continue;
+                }
                 let mut signature = module.make_signature();
-                signature.params.push(AbiParam::new(types::I64));
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(types::I32));
                 signature.params.push(AbiParam::new(pointer_type));
                 signature.params.push(AbiParam::new(types::I32));
                 signature.params.push(AbiParam::new(pointer_type));
                 signature.params.push(AbiParam::new(pointer_type));
                 signature.returns.push(AbiParam::new(types::I32));
-                native_operations.semantic_dispatch = Some(declare_native_helper(
+                native_operations.exact_semantic[operation.index()] = Some(declare_native_helper(
                     module,
-                    &baseline_semantic_dispatch_symbol,
+                    operation.exact_symbol(),
                     &signature,
-                    helper_address(&baseline_semantic_dispatch_symbol),
+                    helper_address(operation.exact_symbol()),
                 )?);
             }
             if needs_function_resolver {
@@ -14747,37 +14788,25 @@ pub(super) fn compile_region_graph_native(
                     helper_address("phrust_native_frame_release"),
                 )?);
             }
-            if needs_unary {
-                native_operations.unary = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_baseline_native_unary",
-                    1,
-                    helper_address("phrust_baseline_native_unary"),
-                )?);
+            for (index, symbol) in NATIVE_EXACT_BINARY_SYMBOLS.into_iter().enumerate() {
+                if needs_exact_binary[index] {
+                    native_operations.exact_binary.0[index] = Some(declare_exact_value_operation(
+                        module,
+                        symbol,
+                        3,
+                        helper_address(symbol),
+                    )?);
+                }
             }
-            if needs_baseline_binary {
-                native_operations.baseline_binary = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_baseline_native_binary",
-                    4,
-                    helper_address("phrust_baseline_native_binary"),
-                )?);
-            }
-            if needs_compare {
-                native_operations.compare = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_baseline_native_compare",
-                    2,
-                    helper_address("phrust_baseline_native_compare"),
-                )?);
-            }
-            if needs_cast {
-                native_operations.cast = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_baseline_native_cast",
-                    1,
-                    helper_address("phrust_baseline_native_cast"),
-                )?);
+            for (index, symbol) in NATIVE_EXACT_CAST_SYMBOLS.into_iter().enumerate() {
+                if needs_exact_cast[index] {
+                    native_operations.exact_cast.0[index] = Some(declare_exact_value_operation(
+                        module,
+                        symbol,
+                        2,
+                        helper_address(symbol),
+                    )?);
+                }
             }
             if needs_echo {
                 let mut signature = module.make_signature();
@@ -14791,20 +14820,24 @@ pub(super) fn compile_region_graph_native(
                 )?);
             }
             if needs_local_fetch {
-                native_operations.local_fetch = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_local_fetch",
-                    5,
-                    helper_address("phrust_native_local_fetch"),
-                )?);
+                for (index, symbol) in NATIVE_EXACT_LOCAL_FETCH_SYMBOLS.into_iter().enumerate() {
+                    native_operations.local_fetch[index] = Some(declare_exact_value_operation(
+                        module,
+                        symbol,
+                        5,
+                        helper_address(symbol),
+                    )?);
+                }
             }
             if needs_local_store {
-                native_operations.local_store = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_local_store",
-                    4,
-                    helper_address("phrust_native_local_store"),
-                )?);
+                for (index, symbol) in NATIVE_EXACT_LOCAL_STORE_SYMBOLS.into_iter().enumerate() {
+                    native_operations.local_store[index] = Some(declare_exact_value_operation(
+                        module,
+                        symbol,
+                        4,
+                        helper_address(symbol),
+                    )?);
+                }
             }
             if needs_value_release {
                 let mut signature = module.make_signature();
@@ -14818,12 +14851,17 @@ pub(super) fn compile_region_graph_native(
                 )?);
             }
             if needs_reference_bind {
-                native_operations.reference_bind = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_reference_bind",
-                    3,
-                    helper_address("phrust_native_reference_bind"),
-                )?);
+                for (index, symbol) in NATIVE_EXACT_REFERENCE_SYMBOLS.into_iter().enumerate() {
+                    if index == 5 {
+                        continue;
+                    }
+                    native_operations.reference_bind[index] = Some(declare_exact_value_operation(
+                        module,
+                        symbol,
+                        3,
+                        helper_address(symbol),
+                    )?);
+                }
             }
             if needs_argument_check {
                 native_operations.argument_check = Some(declare_baseline_value_operation(
@@ -14898,26 +14936,32 @@ pub(super) fn compile_region_graph_native(
                 )?);
             }
             if needs_array_insert {
-                native_operations.array_insert = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_array_insert",
-                    3,
-                    helper_address("phrust_native_array_insert"),
-                )?);
-                native_operations.array_insert_local = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_array_insert_local",
-                    3,
-                    helper_address("phrust_native_array_insert_local"),
-                )?);
+                for (index, symbol) in NATIVE_EXACT_ARRAY_INSERT_SYMBOLS.into_iter().enumerate() {
+                    native_operations.array_insert.0[index] = Some(declare_exact_value_operation(
+                        module,
+                        symbol,
+                        3,
+                        helper_address(symbol),
+                    )?);
+                }
+                for (index, symbol) in NATIVE_EXACT_ARRAY_INSERT_LOCAL_SYMBOLS
+                    .into_iter()
+                    .enumerate()
+                {
+                    native_operations.array_insert_local.0[index] = Some(
+                        declare_exact_value_operation(module, symbol, 3, helper_address(symbol))?,
+                    );
+                }
             }
             if needs_array_fetch {
-                native_operations.array_fetch = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_array_fetch",
-                    2,
-                    helper_address("phrust_native_array_fetch"),
-                )?);
+                for (index, symbol) in NATIVE_EXACT_ARRAY_FETCH_SYMBOLS.into_iter().enumerate() {
+                    native_operations.array_fetch.0[index] = Some(declare_exact_value_operation(
+                        module,
+                        symbol,
+                        2,
+                        helper_address(symbol),
+                    )?);
+                }
             }
             if needs_array_unset {
                 native_operations.array_unset = Some(declare_baseline_value_operation(
@@ -14975,18 +15019,6 @@ pub(super) fn compile_region_graph_native(
                     "phrust_native_constant_fetch",
                     2,
                     helper_address("phrust_native_constant_fetch"),
-                )?);
-            }
-            if needs_truthy {
-                let mut signature = module.make_signature();
-                signature.params.push(AbiParam::new(types::I64));
-                signature.params.push(AbiParam::new(pointer_type));
-                signature.returns.push(AbiParam::new(types::I32));
-                native_operations.truthy = Some(declare_native_helper(
-                    module,
-                    "phrust_native_truthy",
-                    &signature,
-                    helper_address("phrust_native_truthy"),
                 )?);
             }
             if needs_type_predicate {
@@ -15052,7 +15084,143 @@ pub(super) fn compile_region_graph_native(
                 )
             })?;
             let mut next_synthetic = synthetic_base;
+            macro_rules! exact_operations {
+                ($array_ensure_unique:expr, $array_ensure_unique_symbol:expr,
+                 $array_child_entry:expr, $array_child_entry_symbol:expr,
+                 $value_release_commit:expr, $value_release_commit_symbol:expr) => {
+                    NativeOptimizingOperations {
+                        execution_poll: native_operations.execution_poll,
+                        array_union,
+                        concat,
+                        string_bitwise,
+                        exact_unary,
+                        exact_compare,
+                        echo_bytes,
+                        float_to_string,
+                        numeric_string,
+                        fmod_f64,
+                        round_f64,
+                        pure_math,
+                        array_cast,
+                        int_cast,
+                        float_cast,
+                        string_cast,
+                        callback_return_string,
+                        object_cast,
+                        object_class_name,
+                        acquire_callable,
+                        resolve_callable,
+                        prepared_object_new,
+                        prepared_exception_new,
+                        prepared_closure_new,
+                        plain_object_clone,
+                        dynamic_property_slot,
+                        dynamic_property_test_slot,
+                        exact_symbol_query,
+                        exact_pcre,
+                        preg_callback_plan,
+                        preg_callback_assemble,
+                        exact_json,
+                        exact_format,
+                        exact_hash,
+                        exact_byte_codec,
+                        exact_string_search_compare,
+                        exact_string_rewrite,
+                        exact_html_codec,
+                        exact_url_query,
+                        exact_array_aggregate,
+                        exact_recursive_array,
+                        exact_array_sort,
+                        exact_array_multisort,
+                        exact_object_identity,
+                        exact_callable_query,
+                        exact_callback_handler,
+                        exact_autoload_callback,
+                        exact_shutdown_callback,
+                        exact_serialization,
+                        exact_tokenizer,
+                        exact_mbstring,
+                        exact_bcmath,
+                        exact_filter,
+                        exact_session,
+                        exact_object_vars,
+                        exact_class_metadata,
+                        exact_class_lineage,
+                        exact_extension_query,
+                        exact_memory_query,
+                        exact_gc,
+                        exact_resource_query,
+                        exact_error_state,
+                        exact_settype,
+                        exact_configuration,
+                        exact_http_response,
+                        exact_cookie,
+                        exact_clock,
+                        exact_date,
+                        exact_random,
+                        exact_request_query,
+                        exact_declaration_inventory,
+                        exact_constant_inventory,
+                        exact_compact,
+                        exact_frame_introspection,
+                        exact_base_conversion,
+                        exact_intval_base,
+                        exact_network_address,
+                        exact_compression_codec,
+                        exact_path,
+                        exact_output_buffer,
+                        array_ensure_unique: $array_ensure_unique,
+                        array_ensure_unique_symbol: $array_ensure_unique_symbol,
+                        array_child_entry: $array_child_entry,
+                        array_child_entry_symbol: $array_child_entry_symbol,
+                        value_release_commit: $value_release_commit,
+                        value_release_commit_symbol: $value_release_commit_symbol,
+                    }
+                };
+            }
             let tier_operations = if baseline_helper_imports {
+                let array_ensure_unique_symbol = FunctionId::new(next_synthetic);
+                next_synthetic = next_synthetic.checked_add(1).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_FRAGMENT_SYMBOL_LIMIT",
+                        "native exact-operation symbol id overflowed",
+                    )
+                })?;
+                let symbol = format!("{name}.native.array_ensure_unique");
+                let array_ensure_unique = module
+                    .declare_function(
+                        &symbol,
+                        Linkage::Local,
+                        &direct_array_ensure_unique_signature(module),
+                    )
+                    .map_err(|error| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_DECLARE",
+                            format!("failed to declare {symbol}: {error}"),
+                        )
+                    })?;
+                functions.insert(array_ensure_unique_symbol, array_ensure_unique);
+                let array_child_entry_symbol = FunctionId::new(next_synthetic);
+                next_synthetic = next_synthetic.checked_add(1).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_FRAGMENT_SYMBOL_LIMIT",
+                        "native exact-operation symbol id overflowed",
+                    )
+                })?;
+                let symbol = format!("{name}.native.array_child_entry");
+                let array_child_entry = module
+                    .declare_function(
+                        &symbol,
+                        Linkage::Local,
+                        &direct_array_child_entry_signature(module),
+                    )
+                    .map_err(|error| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_DECLARE",
+                            format!("failed to declare {symbol}: {error}"),
+                        )
+                    })?;
+                functions.insert(array_child_entry_symbol, array_child_entry);
                 let value_release_commit_symbol = FunctionId::new(next_synthetic);
                 next_synthetic = next_synthetic.checked_add(1).ok_or_else(|| {
                     CraneliftLoweringError::new(
@@ -15075,8 +15243,15 @@ pub(super) fn compile_region_graph_native(
                     call: native_call_helper,
                     dynamic_code: native_dynamic_code_helper,
                     operations: native_operations,
+                    exact_operations: exact_operations!(
+                        array_ensure_unique,
+                        array_ensure_unique_symbol,
+                        array_child_entry,
+                        array_child_entry_symbol,
+                        value_release_commit,
+                        value_release_commit_symbol
+                    ),
                     value_release_commit,
-                    value_release_commit_symbol,
                 }
             } else {
                 let array_ensure_unique_symbol = FunctionId::new(next_synthetic);
@@ -15858,20 +16033,49 @@ pub(super) fn compile_region_graph_native(
                         }
                     }
                     NativeTierOperations::Generic {
-                        value_release_commit,
-                        value_release_commit_symbol,
+                        exact_operations: operations,
                         ..
-                    } if referenced.contains(&value_release_commit_symbol) => {
-                        let defined = define_direct_value_release_commit_function(
-                            module,
-                            codegen_context,
-                            builder_context,
-                            value_release_commit,
-                            value_release_commit_symbol,
-                        )?;
-                        let _ = append_defined(value_release_commit_symbol, 0, 0, defined)?;
+                    } => {
+                        if referenced.contains(&operations.array_ensure_unique_symbol) {
+                            let defined = define_direct_array_ensure_unique_function(
+                                module,
+                                codegen_context,
+                                builder_context,
+                                operations.array_ensure_unique,
+                            )?;
+                            let _ = append_defined(
+                                operations.array_ensure_unique_symbol,
+                                0,
+                                0,
+                                defined,
+                            )?;
+                        }
+                        if referenced.contains(&operations.array_child_entry_symbol) {
+                            let defined = define_direct_array_child_entry_function(
+                                module,
+                                codegen_context,
+                                builder_context,
+                                operations.array_child_entry,
+                            )?;
+                            let _ =
+                                append_defined(operations.array_child_entry_symbol, 0, 0, defined)?;
+                        }
+                        if referenced.contains(&operations.value_release_commit_symbol) {
+                            let defined = define_direct_value_release_commit_function(
+                                module,
+                                codegen_context,
+                                builder_context,
+                                operations.value_release_commit,
+                                operations.value_release_commit_symbol,
+                            )?;
+                            let _ = append_defined(
+                                operations.value_release_commit_symbol,
+                                0,
+                                0,
+                                defined,
+                            )?;
+                        }
                     }
-                    NativeTierOperations::Generic { .. } => {}
                 }
             }
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -21243,11 +21447,13 @@ fn define_region_graph_function(
             mut generic_operations,
             generic_value_release_commit,
             execution_poll,
+            generic_exact_operations,
         ) = match tier_operations {
             NativeTierOperations::Generic {
                 call,
                 dynamic_code,
                 operations,
+                exact_operations,
                 value_release_commit,
                 ..
             } => {
@@ -21263,6 +21469,7 @@ fn define_region_graph_function(
                     Some(operations),
                     Some(module.declare_func_in_func(value_release_commit, builder.func)),
                     operations.execution_poll,
+                    Some(exact_operations.with_runtime(runtime)),
                 )
             }
             NativeTierOperations::Optimizing { .. } => {
@@ -21282,6 +21489,7 @@ fn define_region_graph_function(
                                 block: terminal_exit,
                             })
                         }),
+                    None,
                 )
             }
         };
@@ -21294,27 +21502,22 @@ fn define_region_graph_function(
             native_operations.value_release = native_operations
                 .value_release
                 .map(NativeHelper::with_inline_runtime_view);
-            native_operations.compare = native_operations
-                .compare
-                .map(NativeHelper::with_inline_runtime_view);
             native_operations.local_fetch = native_operations
                 .local_fetch
-                .map(NativeHelper::with_inline_runtime_view);
+                .map(|helper| helper.map(NativeHelper::with_inline_runtime_view));
             native_operations.local_store = native_operations
                 .local_store
-                .map(NativeHelper::with_inline_runtime_view);
-            native_operations.truthy = native_operations
-                .truthy
-                .map(NativeHelper::with_inline_runtime_view);
+                .map(|helper| helper.map(NativeHelper::with_inline_runtime_view));
             native_operations.type_predicate = native_operations
                 .type_predicate
                 .map(NativeHelper::with_inline_runtime_view);
             native_operations.stable_length = native_operations
                 .stable_length
                 .map(NativeHelper::with_inline_runtime_view);
-            native_operations.array_fetch = native_operations
+            native_operations.array_fetch.0 = native_operations
                 .array_fetch
-                .map(NativeHelper::with_inline_runtime_view);
+                .0
+                .map(|helper| helper.map(NativeHelper::with_inline_runtime_view));
             native_operations.foreach_next = native_operations
                 .foreach_next
                 .map(NativeHelper::with_inline_runtime_view);
@@ -21826,15 +22029,15 @@ fn define_region_graph_function(
                             .ins()
                             .iconst(types::I64, i64::from(region.function.raw()));
                         let local_value = builder.ins().iconst(types::I64, i64::from(local.raw()));
-                        let stored = lower_native_value_operation(
+                        let stored = lower_exact_native_value_operation(
                             module,
                             &mut builder,
                             generic_operations
                                 .expect("Generic catch binding requires Generic operations")
-                                .local_store,
-                            crate::JIT_LOCAL_STORE_MOVE_INPUT,
+                                .local_store[2],
                             &[current, value, function, local_value],
                             result_out,
+                            "local store",
                         )?;
                         define_local_variable(&mut builder, &locals, *local, stored)?;
                     }
@@ -22342,6 +22545,85 @@ fn define_region_graph_function(
                             native_version,
                             unit_identity,
                             operations.with_runtime(runtime),
+                        )
+                        .map(|emitted| {
+                            production_lowering.push(crate::JitProductionLoweringMetadata {
+                                function: region.function,
+                                continuation_id: instruction.continuation_id,
+                                operation: crate::region_ir::generic_instruction_lowering(
+                                    &instruction.source_kind,
+                                )
+                                .variant
+                                .to_owned(),
+                                class: emitted.class,
+                            });
+                        })
+                    }
+                    NativeTierOperations::Generic { .. }
+                        if matches!(&instruction.kind,
+                            RegionInstructionKind::NativeCall(call)
+                                if baseline_builtin_helper_id(&call.target).is_some())
+                            || matches!(&instruction.kind,
+                                RegionInstructionKind::ArrayCallback(_)
+                                    | RegionInstructionKind::PregCallbackArray(_)) =>
+                    {
+                        lower_optimizing_region_instruction(
+                            module,
+                            &mut builder,
+                            &register_variables,
+                            &suspension_blocks,
+                            &blocks,
+                            &locals,
+                            &mut registers,
+                            instruction,
+                            transition_live_registers,
+                            true,
+                            true,
+                            optimizing_admission
+                                .array_instruction_is_total(instruction.continuation_id),
+                            optimizing_admission.array_instruction_root_is_by_reference(
+                                instruction.continuation_id,
+                            ),
+                            optimizing_admission
+                                .binary_instruction_is_total(instruction.continuation_id),
+                            optimizing_admission.binary_instruction_operand_classes(
+                                instruction.continuation_id,
+                            ),
+                            optimizing_admission
+                                .scalar_control_instruction_is_total(instruction.continuation_id),
+                            optimizing_admission
+                                .array_instruction_is_fresh(instruction.continuation_id),
+                            optimizing_admission.fresh_array_capacity(
+                                instruction.continuation_id,
+                            ),
+                            optimizing_admission.local_load_is_total(
+                                instruction.continuation_id,
+                            ),
+                            optimizing_admission.request_local_store_is_total(
+                                instruction.continuation_id,
+                            ),
+                            optimizing_admission.return_reference_store_is_total(
+                                instruction.continuation_id,
+                            ),
+                            NativeReferencePayloadProof(()),
+                            constants,
+                            value_flow,
+                            inline_constants,
+                            function_params,
+                            external_function_signatures,
+                            runtime,
+                            result_out,
+                            deopt_out,
+                            resume_state,
+                            pending_status,
+                            pending_value,
+                            region.function,
+                            region.local_count,
+                            region.flags.is_top_level,
+                            native_version,
+                            unit_identity,
+                            generic_exact_operations
+                                .expect("Generic fixed builtin requires exact operations"),
                         )
                         .map(|emitted| {
                             production_lowering.push(crate::JitProductionLoweringMetadata {

@@ -250,18 +250,34 @@ use baseline_root_index::{
 };
 pub(super) use baseline_runtime_ops::{
     jit_baseline_native_binary_abi, jit_baseline_native_cast_abi, jit_baseline_native_compare_abi,
-    jit_baseline_native_unary_abi, jit_native_argument_check_abi, jit_native_array_fetch_abi,
-    jit_native_array_insert_abi, jit_native_array_insert_local_abi, jit_native_array_new_abi,
-    jit_native_array_spread_abi, jit_native_array_unset_abi, jit_native_constant_fetch_abi,
+    jit_baseline_native_unary_abi, jit_native_add_abi, jit_native_argument_check_abi,
+    jit_native_array_append_abi, jit_native_array_fetch_abi, jit_native_array_insert_abi,
+    jit_native_array_insert_local_abi, jit_native_array_key_exists_abi, jit_native_array_new_abi,
+    jit_native_array_quiet_read_abi, jit_native_array_read_abi, jit_native_array_spread_abi,
+    jit_native_array_unset_abi, jit_native_array_update_abi, jit_native_bitwise_and_abi,
+    jit_native_bitwise_or_abi, jit_native_bitwise_xor_abi, jit_native_cast_array_abi,
+    jit_native_cast_bool_abi, jit_native_cast_float_abi, jit_native_cast_int_abi,
+    jit_native_cast_object_abi, jit_native_cast_string_abi, jit_native_cast_void_abi,
+    jit_native_concatenate_abi, jit_native_constant_fetch_abi, jit_native_divide_abi,
     jit_native_echo_abi, jit_native_exception_new_abi, jit_native_execution_poll_abi,
     jit_native_foreach_cleanup_abi, jit_native_foreach_init_abi, jit_native_foreach_next_abi,
-    jit_native_local_fetch_abi, jit_native_local_store_abi, jit_native_object_clone_abi,
-    jit_native_object_clone_with_abi, jit_native_object_new_abi, jit_native_property_assign_abi,
-    jit_native_property_fetch_abi, jit_native_reference_bind_abi, jit_native_return_check_abi,
-    jit_native_runtime_fatal_abi, jit_native_stable_length_abi, jit_native_string_predicate_abi,
+    jit_native_local_array_append_abi, jit_native_local_array_update_abi,
+    jit_native_local_fetch_abi, jit_native_local_store_abi, jit_native_modulo_abi,
+    jit_native_multiply_abi, jit_native_object_clone_abi, jit_native_object_clone_with_abi,
+    jit_native_object_new_abi, jit_native_plain_local_copy_abi, jit_native_plain_local_move_abi,
+    jit_native_plain_local_quiet_read_abi, jit_native_plain_local_read_abi, jit_native_power_abi,
+    jit_native_property_assign_abi, jit_native_property_fetch_abi,
+    jit_native_reference_array_element_abi, jit_native_reference_bind_abi,
+    jit_native_reference_call_argument_abi, jit_native_reference_create_abi,
+    jit_native_reference_property_abi, jit_native_reference_property_element_abi,
+    jit_native_reference_publish_local_abi, jit_native_reference_unpublish_local_abi,
+    jit_native_return_check_abi, jit_native_runtime_fatal_abi, jit_native_scoped_local_copy_abi,
+    jit_native_scoped_local_move_abi, jit_native_scoped_local_quiet_read_abi,
+    jit_native_scoped_local_read_abi, jit_native_shift_left_abi, jit_native_shift_right_abi,
+    jit_native_stable_length_abi, jit_native_string_predicate_abi, jit_native_subtract_abi,
     jit_native_truthy_abi, jit_native_type_predicate_abi, jit_native_value_release_abi,
 };
-use baseline_semantic_dispatch::*;
+pub(in crate::vm) use baseline_semantic_dispatch::*;
 pub(super) use baseline_semantic_dispatch::{
     jit_baseline_native_semantic_dispatch_abi, jit_baseline_native_semantic_dispatch_diagnostic_abi,
 };

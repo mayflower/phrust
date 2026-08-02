@@ -2780,28 +2780,25 @@ impl GenericRegionBuilder {
                         }
                     }
                     InstructionKind::CallFunction { dst, name, args }
-                        if runtime_metadata.tier == NativeCompilerTier::Optimizing
-                            && {
-                                let normalized = name.trim_start_matches('\\');
-                                normalized.eq_ignore_ascii_case("array_map")
-                                    || normalized.eq_ignore_ascii_case("array_filter")
-                                    || normalized.eq_ignore_ascii_case("array_reduce")
-                                    || normalized.eq_ignore_ascii_case("array_all")
-                                    || normalized.eq_ignore_ascii_case("array_any")
-                                    || normalized.eq_ignore_ascii_case("array_find")
-                                    || normalized.eq_ignore_ascii_case("array_find_key")
-                                    || normalized.eq_ignore_ascii_case("usort")
-                                    || normalized.eq_ignore_ascii_case("uasort")
-                                    || normalized.eq_ignore_ascii_case("uksort")
-                                    || normalized.eq_ignore_ascii_case("array_walk")
-                                    || normalized.eq_ignore_ascii_case("array_walk_recursive")
-                                    || normalized.eq_ignore_ascii_case("preg_replace_callback")
-                                    || normalized
-                                        .eq_ignore_ascii_case("preg_replace_callback_array")
-                            }
-                            && args
-                                .iter()
-                                .all(|argument| argument.name.is_none() && !argument.unpack) =>
+                        if {
+                            let normalized = name.trim_start_matches('\\');
+                            normalized.eq_ignore_ascii_case("array_map")
+                                || normalized.eq_ignore_ascii_case("array_filter")
+                                || normalized.eq_ignore_ascii_case("array_reduce")
+                                || normalized.eq_ignore_ascii_case("array_all")
+                                || normalized.eq_ignore_ascii_case("array_any")
+                                || normalized.eq_ignore_ascii_case("array_find")
+                                || normalized.eq_ignore_ascii_case("array_find_key")
+                                || normalized.eq_ignore_ascii_case("usort")
+                                || normalized.eq_ignore_ascii_case("uasort")
+                                || normalized.eq_ignore_ascii_case("uksort")
+                                || normalized.eq_ignore_ascii_case("array_walk")
+                                || normalized.eq_ignore_ascii_case("array_walk_recursive")
+                                || normalized.eq_ignore_ascii_case("preg_replace_callback")
+                                || normalized.eq_ignore_ascii_case("preg_replace_callback_array")
+                        } && args
+                            .iter()
+                            .all(|argument| argument.name.is_none() && !argument.unpack) =>
                     {
                         let normalized = name.trim_start_matches('\\');
                         let planned_preg_callback_array =

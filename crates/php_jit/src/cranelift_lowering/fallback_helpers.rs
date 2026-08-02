@@ -1,29 +1,3 @@
-// SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
-#[allow(unsafe_code)]
-pub(super) extern "C" fn test_native_unary_fallback(
-    _runtime: *mut std::ffi::c_void,
-    op: u32,
-    src: i64,
-    out: *mut i64,
-) -> i32 {
-    if out.is_null() {
-        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
-    }
-    let value = match op {
-        0 => src,
-        1 => match src.checked_neg() {
-            Some(value) => value,
-            None => return crate::JitCallStatus::RUNTIME_ERROR.0 as i32,
-        },
-        2 => i64::from(src == 0),
-        3 => !src,
-        _ => return crate::JitCallStatus::ABI_MISMATCH.0 as i32,
-    };
-    // SAFETY: Cranelift owns this synchronous stack output slot.
-    unsafe { out.write(value) };
-    0
-}
-
 pub(super) extern "C" fn test_native_exact_unary_fallback(
     _runtime: *mut std::ffi::c_void,
     _source: i64,
@@ -31,17 +5,7 @@ pub(super) extern "C" fn test_native_exact_unary_fallback(
     crate::JitNativeControlResult::control(crate::JitCallStatus::RUNTIME_ERROR, 0, 0)
 }
 
-// SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
-#[allow(unsafe_code)]
-pub(super) extern "C" fn test_baseline_binary_fallback(
-    _runtime: *mut std::ffi::c_void,
-    op: u32,
-    lhs: i64,
-    rhs: i64,
-    _function: i64,
-    _continuation: i64,
-    out: *mut i64,
-) -> i32 {
+fn test_native_exact_binary_impl(op: u32, lhs: i64, rhs: i64, out: *mut i64) -> i32 {
     if out.is_null() {
         return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
@@ -57,9 +21,39 @@ pub(super) extern "C" fn test_baseline_binary_fallback(
         return crate::JitCallStatus::RECOMPILE_REQUESTED.0 as i32;
     };
     // SAFETY: Cranelift owns this synchronous stack output slot.
-    unsafe { out.write(value) };
+    #[allow(unsafe_code)]
+    unsafe {
+        out.write(value);
+    }
     0
 }
+
+macro_rules! exact_binary_fallback {
+    ($name:ident, $operation:expr) => {
+        pub(super) extern "C" fn $name(
+            _runtime: *mut std::ffi::c_void,
+            lhs: i64,
+            rhs: i64,
+            _transition_state: *const crate::JitDeoptState,
+            out: *mut i64,
+        ) -> i32 {
+            test_native_exact_binary_impl($operation, lhs, rhs, out)
+        }
+    };
+}
+
+exact_binary_fallback!(test_native_exact_add_fallback, 0);
+exact_binary_fallback!(test_native_exact_subtract_fallback, 1);
+exact_binary_fallback!(test_native_exact_multiply_fallback, 2);
+exact_binary_fallback!(test_native_exact_divide_fallback, 3);
+exact_binary_fallback!(test_native_exact_modulo_fallback, 4);
+exact_binary_fallback!(test_native_exact_concatenate_fallback, 5);
+exact_binary_fallback!(test_native_exact_power_fallback, 6);
+exact_binary_fallback!(test_native_exact_bitwise_and_fallback, 7);
+exact_binary_fallback!(test_native_exact_bitwise_or_fallback, 8);
+exact_binary_fallback!(test_native_exact_bitwise_xor_fallback, 9);
+exact_binary_fallback!(test_native_exact_shift_left_fallback, 10);
+exact_binary_fallback!(test_native_exact_shift_right_fallback, 11);
 
 pub(super) extern "C" fn test_total_representation_binary_fallback(
     _runtime: *mut std::ffi::c_void,
@@ -67,6 +61,93 @@ pub(super) extern "C" fn test_total_representation_binary_fallback(
     _rhs: i64,
 ) -> crate::JitNativeControlResult {
     crate::JitNativeControlResult::control(crate::JitCallStatus::RUNTIME_ERROR, 0, 0)
+}
+
+pub(super) extern "C" fn test_native_exact_semantic_fallback(
+    _runtime: *mut std::ffi::c_void,
+    _operands: *const i64,
+    _operand_count: u32,
+    _transition_state: *mut crate::JitDeoptState,
+    _out: *mut crate::JitCallResult,
+) -> i32 {
+    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
+}
+
+#[allow(unsafe_code)]
+pub(super) extern "C" fn test_native_exact_local_fetch_fallback(
+    _runtime: *mut std::ffi::c_void,
+    value: i64,
+    _function: i64,
+    _local: i64,
+    _file: i64,
+    _start: i64,
+    out: *mut i64,
+) -> i32 {
+    if out.is_null() {
+        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
+    }
+    unsafe { out.write(value) };
+    0
+}
+
+#[allow(unsafe_code)]
+pub(super) extern "C" fn test_native_exact_local_store_fallback(
+    _runtime: *mut std::ffi::c_void,
+    _current: i64,
+    value: i64,
+    _function: i64,
+    _local: i64,
+    out: *mut i64,
+) -> i32 {
+    if out.is_null() {
+        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
+    }
+    unsafe { out.write(value) };
+    0
+}
+
+#[allow(unsafe_code)]
+pub(super) extern "C" fn test_native_exact_reference_fallback(
+    _runtime: *mut std::ffi::c_void,
+    encoded: i64,
+    _key: i64,
+    _reserved: i64,
+    out: *mut i64,
+) -> i32 {
+    if out.is_null() {
+        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
+    }
+    unsafe { out.write(encoded) };
+    0
+}
+
+#[allow(unsafe_code)]
+pub(super) extern "C" fn test_native_exact_array_fetch_fallback(
+    _runtime: *mut std::ffi::c_void,
+    _array: i64,
+    _key: i64,
+    out: *mut i64,
+) -> i32 {
+    if out.is_null() {
+        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
+    }
+    unsafe { out.write(crate::jit_encode_constant(u32::MAX)) };
+    0
+}
+
+#[allow(unsafe_code)]
+pub(super) extern "C" fn test_native_exact_array_insert_fallback(
+    _runtime: *mut std::ffi::c_void,
+    array: i64,
+    _key: i64,
+    _value: i64,
+    out: *mut i64,
+) -> i32 {
+    if out.is_null() {
+        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
+    }
+    unsafe { out.write(array) };
+    0
 }
 
 pub(super) extern "C" fn test_native_exact_compare_fallback(
@@ -81,52 +162,7 @@ pub(super) extern "C" fn test_native_exact_compare_fallback(
     )
 }
 
-// SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
-#[allow(unsafe_code)]
-pub(super) extern "C" fn test_native_compare_fallback(
-    _runtime: *mut std::ffi::c_void,
-    op: u32,
-    lhs: i64,
-    rhs: i64,
-    out: *mut i64,
-) -> i32 {
-    if out.is_null() {
-        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
-    }
-    let boolean = |condition| {
-        crate::jit_encode_constant(if condition {
-            crate::JIT_VALUE_TRUE
-        } else {
-            crate::JIT_VALUE_FALSE
-        })
-    };
-    let value = match op {
-        0 | 2 => boolean(lhs == rhs),
-        1 | 3 => boolean(lhs != rhs),
-        4 => boolean(lhs < rhs),
-        5 => boolean(lhs <= rhs),
-        6 => boolean(lhs > rhs),
-        7 => boolean(lhs >= rhs),
-        8 => match lhs.cmp(&rhs) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => 1,
-        },
-        _ => return crate::JitCallStatus::ABI_MISMATCH.0 as i32,
-    };
-    // SAFETY: Cranelift owns this synchronous stack output slot.
-    unsafe { out.write(value) };
-    0
-}
-
-// SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
-#[allow(unsafe_code)]
-pub(super) extern "C" fn test_native_cast_fallback(
-    _runtime: *mut std::ffi::c_void,
-    op: u32,
-    src: i64,
-    out: *mut i64,
-) -> i32 {
+fn test_native_exact_cast_impl(op: u32, src: i64, out: *mut i64) -> i32 {
     if out.is_null() {
         return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
     }
@@ -136,9 +172,33 @@ pub(super) extern "C" fn test_native_cast_fallback(
         _ => return crate::JitCallStatus::RUNTIME_ERROR.0 as i32,
     };
     // SAFETY: Cranelift owns this synchronous stack output slot.
-    unsafe { out.write(value) };
+    #[allow(unsafe_code)]
+    unsafe {
+        out.write(value);
+    }
     0
 }
+
+macro_rules! exact_cast_fallback {
+    ($name:ident, $operation:expr) => {
+        pub(super) extern "C" fn $name(
+            _runtime: *mut std::ffi::c_void,
+            src: i64,
+            _transition_state: *const crate::JitDeoptState,
+            out: *mut i64,
+        ) -> i32 {
+            test_native_exact_cast_impl($operation, src, out)
+        }
+    };
+}
+
+exact_cast_fallback!(test_native_exact_bool_cast_fallback, 0);
+exact_cast_fallback!(test_native_exact_int_cast_fallback, 1);
+exact_cast_fallback!(test_native_exact_float_cast_fallback, 2);
+exact_cast_fallback!(test_native_exact_string_cast_fallback, 3);
+exact_cast_fallback!(test_native_exact_array_cast_fallback, 4);
+exact_cast_fallback!(test_native_exact_object_cast_fallback, 5);
+exact_cast_fallback!(test_native_exact_void_cast_fallback, 6);
 
 pub(super) extern "C" fn test_native_echo_fallback(
     _runtime: *mut std::ffi::c_void,
@@ -373,25 +433,6 @@ pub(super) extern "C" fn test_native_plain_object_clone_fallback(
     crate::JitNativeControlResult::control(crate::JitCallStatus::RUNTIME_ERROR, 0, 0)
 }
 
-pub(super) extern "C" fn test_native_local_fetch_fallback(
-    _runtime: *mut std::ffi::c_void,
-    _op: u32,
-    value: i64,
-    _function: i64,
-    _local: i64,
-    _file: i64,
-    _start: i64,
-    out: *mut i64,
-) -> i32 {
-    if out.is_null() {
-        crate::JitCallStatus::RUNTIME_ERROR.0 as i32
-    } else {
-        // SAFETY: Cranelift owns this synchronous stack output slot.
-        unsafe { out.write(value) };
-        0
-    }
-}
-
 pub(super) extern "C" fn test_native_exception_new_fallback(
     _runtime: *mut std::ffi::c_void,
     _op: u32,
@@ -409,48 +450,11 @@ pub(super) extern "C" fn test_native_exception_new_fallback(
     }
 }
 
-// SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
-#[allow(unsafe_code)]
-pub(super) extern "C" fn test_native_local_store_fallback(
-    _runtime: *mut std::ffi::c_void,
-    _op: u32,
-    _current: i64,
-    value: i64,
-    _function: i64,
-    _local: i64,
-    out: *mut i64,
-) -> i32 {
-    if !out.is_null() {
-        unsafe { out.write(value) };
-        0
-    } else {
-        crate::JitCallStatus::RUNTIME_ERROR.0 as i32
-    }
-}
-
 pub(super) extern "C" fn test_native_value_release_fallback(
     _runtime: *mut std::ffi::c_void,
     _value: i64,
 ) -> i32 {
     0
-}
-
-// SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
-#[allow(unsafe_code)]
-pub(super) extern "C" fn test_native_reference_bind_fallback(
-    _runtime: *mut std::ffi::c_void,
-    _op: u32,
-    value: i64,
-    _key: i64,
-    _reserved: i64,
-    out: *mut i64,
-) -> i32 {
-    if !out.is_null() {
-        unsafe { out.write(value) };
-        0
-    } else {
-        crate::JitCallStatus::RUNTIME_ERROR.0 as i32
-    }
 }
 
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
@@ -562,31 +566,6 @@ pub(super) extern "C" fn test_native_object_clone_with_fallback(
     }
 }
 
-pub(super) extern "C" fn test_native_array_insert_fallback(
-    _runtime: *mut std::ffi::c_void,
-    _op: u32,
-    _array: i64,
-    _key: i64,
-    _value: i64,
-    _out: *mut i64,
-) -> i32 {
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
-}
-
-pub(super) extern "C" fn test_native_array_fetch_fallback(
-    _runtime: *mut std::ffi::c_void,
-    _op: u32,
-    _array: i64,
-    _key: i64,
-    out: *mut i64,
-) -> i32 {
-    if !out.is_null() {
-        // SAFETY: test fallback follows the baseline value-helper ABI.
-        unsafe { out.write(crate::jit_encode_constant(u32::MAX)) };
-    }
-    crate::JitCallStatus::RUNTIME_ERROR.0 as i32
-}
-
 pub(super) extern "C" fn test_native_array_unset_fallback(
     _runtime: *mut std::ffi::c_void,
     _op: u32,
@@ -644,21 +623,6 @@ pub(super) extern "C" fn test_native_constant_fetch_fallback(
     _out: *mut i64,
 ) -> i32 {
     crate::JitCallStatus::RUNTIME_ERROR.0 as i32
-}
-
-// SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
-#[allow(unsafe_code)]
-pub(super) extern "C" fn test_native_truthy_fallback(
-    _runtime: *mut std::ffi::c_void,
-    src: i64,
-    out: *mut i64,
-) -> i32 {
-    if out.is_null() {
-        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
-    }
-    // SAFETY: Cranelift owns this synchronous stack output slot.
-    unsafe { out.write(i64::from(src != 0)) };
-    0
 }
 
 pub(super) extern "C" fn test_native_type_predicate_fallback(

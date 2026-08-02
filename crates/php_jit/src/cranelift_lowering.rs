@@ -6,8 +6,9 @@ use crate::region_ir::{
     RegionArrayCallbackOperation, RegionArrayCallbackTarget, RegionBinaryOp, RegionCallResult,
     RegionCallTarget, RegionCastOp, RegionCompareOpCode, RegionGraph, RegionInstruction,
     RegionInstructionKind, RegionNativeCall, RegionNativeControl, RegionNativeDynamicCode,
-    RegionNativeSuspend, RegionOperand, RegionStableCallback, RegionTerminator, RegionUnaryOp,
-    SsaOwnership, SsaValueClass, SsaValueFact, value_copy_requires_retain, value_release_required,
+    RegionNativeSuspend, RegionOperand, RegionSemanticOperationId, RegionStableCallback,
+    RegionTerminator, RegionUnaryOp, SsaOwnership, SsaValueClass, SsaValueFact,
+    value_copy_requires_retain, value_release_required,
 };
 use crate::{
     CraneliftCodeKey, CraneliftCompilerIdentity, JIT_RUNTIME_ABI_HASH, JitCompileRequest,
@@ -464,19 +465,19 @@ enum NativeDirectCallee {
 #[derive(Clone, Copy, Debug, Default)]
 struct GenericNativeOperations {
     runtime: Option<ir::Value>,
-    semantic_dispatch: Option<NativeHelper>,
+    exact_semantic: [Option<NativeHelper>; RegionSemanticOperationId::COUNT],
     function_resolve: Option<NativeHelper>,
     frame_alloc: Option<NativeHelper>,
     frame_release: Option<NativeHelper>,
-    unary: Option<NativeHelper>,
-    baseline_binary: Option<NativeHelper>,
-    compare: Option<NativeHelper>,
-    cast: Option<NativeHelper>,
+    exact_unary: [Option<NativeHelper>; NATIVE_EXACT_UNARY_COUNT],
+    exact_binary: NativeExactBinaryOperations,
+    exact_compare: [Option<NativeHelper>; NATIVE_EXACT_COMPARE_COUNT],
+    exact_cast: NativeExactCastOperations,
     echo: Option<NativeHelper>,
-    local_fetch: Option<NativeHelper>,
-    local_store: Option<NativeHelper>,
+    local_fetch: [Option<NativeHelper>; 4],
+    local_store: [Option<NativeHelper>; 4],
     value_release: Option<NativeHelper>,
-    reference_bind: Option<NativeHelper>,
+    reference_bind: [Option<NativeHelper>; 8],
     argument_check: Option<NativeHelper>,
     return_check: Option<NativeHelper>,
     exception_new: Option<NativeHelper>,
@@ -486,21 +487,114 @@ struct GenericNativeOperations {
     property_assign: Option<NativeHelper>,
     object_clone: Option<NativeHelper>,
     object_clone_with: Option<NativeHelper>,
-    array_insert: Option<NativeHelper>,
-    array_insert_local: Option<NativeHelper>,
-    array_fetch: Option<NativeHelper>,
+    array_insert: NativeExactArrayInsertOperations,
+    array_insert_local: NativeExactArrayInsertOperations,
+    array_fetch: NativeExactArrayFetchOperations,
     array_unset: Option<NativeHelper>,
     array_spread: Option<NativeHelper>,
     foreach_init: Option<NativeHelper>,
     foreach_next: Option<NativeHelper>,
     foreach_cleanup: Option<NativeHelper>,
     constant_fetch: Option<NativeHelper>,
-    truthy: Option<NativeHelper>,
     type_predicate: Option<NativeHelper>,
     stable_length: Option<NativeHelper>,
     runtime_fatal: Option<NativeHelper>,
     execution_poll: Option<NativeHelper>,
 }
+
+type NativeExactLocalOperations = [Option<NativeHelper>; 4];
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NativeExactArrayFetchOperations([Option<NativeHelper>; 3]);
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NativeExactArrayInsertOperations([Option<NativeHelper>; 2]);
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NativeExactBinaryOperations([Option<NativeHelper>; 12]);
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NativeExactCastOperations([Option<NativeHelper>; 7]);
+
+const NATIVE_EXACT_LOCAL_FETCH_SYMBOLS: [&str; 4] = [
+    "phrust_native_scoped_local_read",
+    "phrust_native_scoped_local_quiet_read",
+    "phrust_native_plain_local_read",
+    "phrust_native_plain_local_quiet_read",
+];
+const NATIVE_EXACT_LOCAL_STORE_SYMBOLS: [&str; 4] = [
+    "phrust_native_scoped_local_copy",
+    "phrust_native_plain_local_copy",
+    "phrust_native_scoped_local_move",
+    "phrust_native_plain_local_move",
+];
+const NATIVE_EXACT_REFERENCE_SYMBOLS: [&str; 8] = [
+    "phrust_native_reference_create",
+    "phrust_native_reference_array_element",
+    "phrust_native_reference_property_element",
+    "phrust_native_reference_property",
+    "phrust_native_reference_publish_local",
+    "phrust_unreachable_reference_operation",
+    "phrust_native_reference_call_argument",
+    "phrust_native_reference_unpublish_local",
+];
+const NATIVE_EXACT_ARRAY_FETCH_SYMBOLS: [&str; 3] = [
+    "phrust_native_array_read",
+    "phrust_native_array_quiet_read",
+    "phrust_native_array_key_exists",
+];
+const NATIVE_EXACT_ARRAY_INSERT_SYMBOLS: [&str; 2] =
+    ["phrust_native_array_update", "phrust_native_array_append"];
+const NATIVE_EXACT_ARRAY_INSERT_LOCAL_SYMBOLS: [&str; 2] = [
+    "phrust_native_local_array_update",
+    "phrust_native_local_array_append",
+];
+const NATIVE_EXACT_BINARY_SYMBOLS: [&str; 12] = [
+    "phrust_native_add",
+    "phrust_native_subtract",
+    "phrust_native_multiply",
+    "phrust_native_divide",
+    "phrust_native_modulo",
+    "phrust_native_concatenate",
+    "phrust_native_power",
+    "phrust_native_bitwise_and",
+    "phrust_native_bitwise_or",
+    "phrust_native_bitwise_xor",
+    "phrust_native_shift_left",
+    "phrust_native_shift_right",
+];
+const NATIVE_EXACT_BINARY_OPERATIONS: [RegionBinaryOp; 12] = [
+    RegionBinaryOp::Add,
+    RegionBinaryOp::Sub,
+    RegionBinaryOp::Mul,
+    RegionBinaryOp::Div,
+    RegionBinaryOp::Mod,
+    RegionBinaryOp::Concat,
+    RegionBinaryOp::Pow,
+    RegionBinaryOp::BitAnd,
+    RegionBinaryOp::BitOr,
+    RegionBinaryOp::BitXor,
+    RegionBinaryOp::ShiftLeft,
+    RegionBinaryOp::ShiftRight,
+];
+const NATIVE_EXACT_CAST_SYMBOLS: [&str; 7] = [
+    "phrust_native_cast_bool",
+    "phrust_native_cast_int",
+    "phrust_native_cast_float",
+    "phrust_native_cast_string",
+    "phrust_native_cast_array",
+    "phrust_native_cast_object",
+    "phrust_native_cast_void",
+];
+const NATIVE_EXACT_CAST_OPERATIONS: [RegionCastOp; 7] = [
+    RegionCastOp::Bool,
+    RegionCastOp::Int,
+    RegionCastOp::Float,
+    RegionCastOp::String,
+    RegionCastOp::Array,
+    RegionCastOp::Object,
+    RegionCastOp::Void,
+];
 
 fn native_string_bitwise_index(operation: RegionBinaryOp) -> usize {
     match operation {
@@ -914,8 +1008,8 @@ enum NativeTierOperations {
         call: Option<NativeHelper>,
         dynamic_code: Option<NativeHelper>,
         operations: GenericNativeOperations,
+        exact_operations: NativeOptimizingOperations,
         value_release_commit: FuncId,
-        value_release_commit_symbol: FunctionId,
     },
     Optimizing {
         operations: NativeOptimizingOperations,
@@ -925,25 +1019,55 @@ enum NativeTierOperations {
 impl GenericNativeOperations {
     fn with_runtime(mut self, runtime: ir::Value) -> Self {
         self.runtime = Some(runtime);
+        self.exact_semantic = self
+            .exact_semantic
+            .map(|helper| helper.map(|helper| helper.with_runtime(runtime)));
+        self.exact_compare = self
+            .exact_compare
+            .map(|helper| helper.map(|helper| helper.with_runtime(runtime)));
+        self.exact_unary = self
+            .exact_unary
+            .map(|helper| helper.map(|helper| helper.with_runtime(runtime)));
+        self.exact_binary.0 = self
+            .exact_binary
+            .0
+            .map(|helper| helper.map(|helper| helper.with_runtime(runtime)));
+        self.exact_cast.0 = self
+            .exact_cast
+            .0
+            .map(|helper| helper.map(|helper| helper.with_runtime(runtime)));
+        self.local_fetch = self
+            .local_fetch
+            .map(|helper| helper.map(|helper| helper.with_runtime(runtime)));
+        self.local_store = self
+            .local_store
+            .map(|helper| helper.map(|helper| helper.with_runtime(runtime)));
+        self.reference_bind = self
+            .reference_bind
+            .map(|helper| helper.map(|helper| helper.with_runtime(runtime)));
+        self.array_fetch.0 = self
+            .array_fetch
+            .0
+            .map(|helper| helper.map(|helper| helper.with_runtime(runtime)));
+        self.array_insert.0 = self
+            .array_insert
+            .0
+            .map(|helper| helper.map(|helper| helper.with_runtime(runtime)));
+        self.array_insert_local.0 = self
+            .array_insert_local
+            .0
+            .map(|helper| helper.map(|helper| helper.with_runtime(runtime)));
         macro_rules! bind {
             ($($field:ident),+ $(,)?) => {
                 $(self.$field = self.$field.map(|helper| helper.with_runtime(runtime));)+
             };
         }
         bind!(
-            semantic_dispatch,
             function_resolve,
             frame_alloc,
             frame_release,
-            unary,
-            baseline_binary,
-            compare,
-            cast,
             echo,
-            local_fetch,
-            local_store,
             value_release,
-            reference_bind,
             argument_check,
             return_check,
             exception_new,
@@ -953,16 +1077,12 @@ impl GenericNativeOperations {
             property_assign,
             object_clone,
             object_clone_with,
-            array_insert,
-            array_insert_local,
-            array_fetch,
             array_unset,
             array_spread,
             foreach_init,
             foreach_next,
             foreach_cleanup,
             constant_fetch,
-            truthy,
             type_predicate,
             stable_length,
             runtime_fatal,
@@ -972,25 +1092,49 @@ impl GenericNativeOperations {
     }
 
     fn with_terminal_exit(mut self, terminal_exit: NativeTerminalExit) -> Self {
+        self.exact_unary = self
+            .exact_unary
+            .map(|helper| helper.map(|helper| helper.with_terminal_exit(terminal_exit)));
+        self.exact_binary.0 = self
+            .exact_binary
+            .0
+            .map(|helper| helper.map(|helper| helper.with_terminal_exit(terminal_exit)));
+        self.exact_cast.0 = self
+            .exact_cast
+            .0
+            .map(|helper| helper.map(|helper| helper.with_terminal_exit(terminal_exit)));
+        self.local_fetch = self
+            .local_fetch
+            .map(|helper| helper.map(|helper| helper.with_terminal_exit(terminal_exit)));
+        self.local_store = self
+            .local_store
+            .map(|helper| helper.map(|helper| helper.with_terminal_exit(terminal_exit)));
+        self.reference_bind = self
+            .reference_bind
+            .map(|helper| helper.map(|helper| helper.with_terminal_exit(terminal_exit)));
+        self.array_fetch.0 = self
+            .array_fetch
+            .0
+            .map(|helper| helper.map(|helper| helper.with_terminal_exit(terminal_exit)));
+        self.array_insert.0 = self
+            .array_insert
+            .0
+            .map(|helper| helper.map(|helper| helper.with_terminal_exit(terminal_exit)));
+        self.array_insert_local.0 = self
+            .array_insert_local
+            .0
+            .map(|helper| helper.map(|helper| helper.with_terminal_exit(terminal_exit)));
         macro_rules! bind {
             ($($field:ident),+ $(,)?) => {
                 $(self.$field = self.$field.map(|helper| helper.with_terminal_exit(terminal_exit));)+
             };
         }
         bind!(
-            semantic_dispatch,
             function_resolve,
             frame_alloc,
             frame_release,
-            unary,
-            baseline_binary,
-            compare,
-            cast,
             echo,
-            local_fetch,
-            local_store,
             value_release,
-            reference_bind,
             argument_check,
             return_check,
             exception_new,
@@ -1000,16 +1144,12 @@ impl GenericNativeOperations {
             property_assign,
             object_clone,
             object_clone_with,
-            array_insert,
-            array_insert_local,
-            array_fetch,
             array_unset,
             array_spread,
             foreach_init,
             foreach_next,
             foreach_cleanup,
             constant_fetch,
-            truthy,
             type_predicate,
             stable_length,
             runtime_fatal,
@@ -1047,6 +1187,38 @@ fn call_native_pure_handler(
     );
     let callee = module.declare_func_in_func(helper.function, builder.func);
     builder.ins().call(callee, arguments)
+}
+
+fn lower_generic_exact_runtime_value(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    helper: Option<NativeHelper>,
+    arguments: &[ir::Value],
+    result_out: ir::Value,
+    missing: &'static str,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    let helper = helper.ok_or_else(|| {
+        CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_NATIVE_OPERATION", missing)
+    })?;
+    let call = call_native_helper(module, builder, helper, arguments);
+    let control = builder.inst_results(call)[0];
+    let value = builder.inst_results(call)[1];
+    let status = builder.ins().ireduce(types::I32, control);
+    let returned = builder.create_block();
+    let propagate = builder.create_block();
+    let is_return = builder.ins().icmp_imm(
+        IntCC::Equal,
+        status,
+        i64::from(crate::JitCallStatus::RETURN.0),
+    );
+    builder.ins().brif(is_return, returned, &[], propagate, &[]);
+    builder.switch_to_block(propagate);
+    builder
+        .ins()
+        .store(MemFlagsData::new(), value, result_out, 0);
+    return_native_php_control(builder, status, result_out);
+    builder.switch_to_block(returned);
+    Ok(value)
 }
 
 fn native_php_entry_signature(module: &JITModule) -> Signature {
@@ -1199,7 +1371,6 @@ fn native_helper_import_symbol(base: &str, address: usize) -> String {
 }
 
 const BASELINE_NATIVE_CALL_DISPATCH_SYMBOL: &str = "phrust_baseline_native_call_dispatch";
-const BASELINE_NATIVE_SEMANTIC_DISPATCH_SYMBOL: &str = "phrust_baseline_native_semantic_dispatch";
 const NATIVE_FUNCTION_RESOLVE_SYMBOL: &str = "phrust_jit_native_function_resolve";
 const NATIVE_DYNAMIC_CODE_SYMBOL: &str = "phrust_jit_native_dynamic_code";
 
@@ -3070,23 +3241,137 @@ fn publish_native_register_values(
     Ok(())
 }
 
-fn lower_native_value_operation(
+trait NativeValueOperationHelper: Copy {
+    fn select(self, opcode: u32) -> (Option<NativeHelper>, bool);
+}
+
+impl NativeValueOperationHelper for Option<NativeHelper> {
+    fn select(self, _opcode: u32) -> (Option<NativeHelper>, bool) {
+        (self, true)
+    }
+}
+
+impl NativeValueOperationHelper for [Option<NativeHelper>; 8] {
+    fn select(self, opcode: u32) -> (Option<NativeHelper>, bool) {
+        let operation = if opcode & 0x8000_0000 != 0 {
+            opcode & 1
+        } else {
+            opcode
+        };
+        (
+            usize::try_from(operation)
+                .ok()
+                .and_then(|index| self.get(index).copied().flatten()),
+            false,
+        )
+    }
+}
+
+fn native_dimension_operation_index(opcode: u32) -> usize {
+    let operation = if opcode & 0x8000_0000 != 0 {
+        opcode & 1
+    } else {
+        opcode
+    };
+    usize::try_from(operation).unwrap_or(usize::MAX)
+}
+
+impl NativeValueOperationHelper for NativeExactArrayFetchOperations {
+    fn select(self, opcode: u32) -> (Option<NativeHelper>, bool) {
+        (
+            self.0
+                .get(native_dimension_operation_index(opcode))
+                .copied()
+                .flatten(),
+            false,
+        )
+    }
+}
+
+impl NativeValueOperationHelper for NativeExactArrayInsertOperations {
+    fn select(self, opcode: u32) -> (Option<NativeHelper>, bool) {
+        (
+            self.0
+                .get(native_dimension_operation_index(opcode))
+                .copied()
+                .flatten(),
+            false,
+        )
+    }
+}
+
+impl NativeValueOperationHelper for NativeExactBinaryOperations {
+    fn select(self, opcode: u32) -> (Option<NativeHelper>, bool) {
+        (
+            usize::try_from(opcode)
+                .ok()
+                .and_then(|index| self.0.get(index).copied().flatten()),
+            false,
+        )
+    }
+}
+
+impl NativeValueOperationHelper for NativeExactCastOperations {
+    fn select(self, opcode: u32) -> (Option<NativeHelper>, bool) {
+        let operation = if opcode & 0x8000_0000 != 0 {
+            opcode & 0x7
+        } else {
+            opcode
+        };
+        (
+            usize::try_from(operation)
+                .ok()
+                .and_then(|index| self.0.get(index).copied().flatten()),
+            false,
+        )
+    }
+}
+
+fn lower_native_value_operation<H: NativeValueOperationHelper>(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
+    helper: H,
     opcode: u32,
     operands: &[ir::Value],
     result_out: ir::Value,
 ) -> Result<ir::Value, CraneliftLoweringError> {
+    let (helper, pass_opcode) = helper.select(opcode);
     let helper = helper.ok_or_else(|| {
         CraneliftLoweringError::new(
             "JIT_CRANELIFT_REJECT_NATIVE_OPERATION",
             format!("native value operation {opcode} has no declared helper"),
         )
     })?;
-    let opcode = builder.ins().iconst(types::I32, i64::from(opcode));
-    let mut args = Vec::with_capacity(operands.len() + 2);
-    args.push(opcode);
+    let mut args = Vec::with_capacity(operands.len() + usize::from(pass_opcode) + 1);
+    if pass_opcode {
+        args.push(builder.ins().iconst(types::I32, i64::from(opcode)));
+    }
+    args.extend_from_slice(operands);
+    args.push(result_out);
+    let call = call_native_helper(module, builder, helper, &args);
+    let status = builder.inst_results(call)[0];
+    let value = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), result_out, 0);
+    require_native_value_operation_ok(builder, status, helper.terminal_exit()?, value)?;
+    Ok(value)
+}
+
+fn lower_exact_native_value_operation(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    helper: Option<NativeHelper>,
+    operands: &[ir::Value],
+    result_out: ir::Value,
+    service: &'static str,
+) -> Result<ir::Value, CraneliftLoweringError> {
+    let helper = helper.ok_or_else(|| {
+        CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_NATIVE_OPERATION",
+            format!("exact native {service} service has no declared helper"),
+        )
+    })?;
+    let mut args = Vec::with_capacity(operands.len() + 1);
     args.extend_from_slice(operands);
     args.push(result_out);
     let call = call_native_helper(module, builder, helper, &args);
@@ -3208,10 +3493,10 @@ fn lower_native_return_check_with_frame_cleanup(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lower_native_value_operation_with_state(
+fn lower_native_value_operation_with_state<H: NativeValueOperationHelper>(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
+    helper: H,
     opcode: u32,
     operands: &[ir::Value],
     result_out: ir::Value,
@@ -3226,15 +3511,17 @@ fn lower_native_value_operation_with_state(
     cleanup_helper: Option<NativeHelper>,
     cleanup_values: &[ir::Value],
 ) -> Result<ir::Value, CraneliftLoweringError> {
+    let (helper, pass_opcode) = helper.select(opcode);
     let helper = helper.ok_or_else(|| {
         CraneliftLoweringError::new(
             "JIT_CRANELIFT_REJECT_NATIVE_OPERATION",
             format!("native value operation {opcode} has no declared helper"),
         )
     })?;
-    let opcode = builder.ins().iconst(types::I32, i64::from(opcode));
-    let mut args = Vec::with_capacity(operands.len() + 2);
-    args.push(opcode);
+    let mut args = Vec::with_capacity(operands.len() + usize::from(pass_opcode) + 1);
+    if pass_opcode {
+        args.push(builder.ins().iconst(types::I32, i64::from(opcode)));
+    }
     args.extend_from_slice(operands);
     args.push(result_out);
     let call = call_native_helper(module, builder, helper, &args);
@@ -3279,21 +3566,21 @@ fn lower_native_value_operation_with_state(
 fn publish_native_reference_local(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
+    helper: [Option<NativeHelper>; 8],
     value: ir::Value,
     function: FunctionId,
     local: LocalId,
     result_out: ir::Value,
 ) -> Result<(), CraneliftLoweringError> {
-    let Some(helper) = helper else {
+    if helper[4].is_none() {
         return Ok(());
-    };
+    }
     let function = builder.ins().iconst(types::I64, i64::from(function.raw()));
     let local = builder.ins().iconst(types::I64, i64::from(local.raw()));
     let _ = lower_native_value_operation(
         module,
         builder,
-        Some(helper),
+        helper,
         4,
         &[value, function, local],
         result_out,
@@ -3304,7 +3591,7 @@ fn publish_native_reference_local(
 fn lower_guarded_reference_binding(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
+    helper: [Option<NativeHelper>; 8],
     value: ir::Value,
     result_out: ir::Value,
 ) -> Result<ir::Value, CraneliftLoweringError> {
@@ -3335,7 +3622,7 @@ fn lower_guarded_reference_binding(
 fn lower_direct_reference_argument(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
+    helper: [Option<NativeHelper>; 8],
     locals: &NativeLocalMap,
     registers: &NativeRegisterMap,
     argument: &php_ir::instruction::IrCallArg,
@@ -3380,7 +3667,11 @@ fn lower_direct_reference_argument(
             publish_native_reference_local(
                 module,
                 builder,
-                publish_reference_locals.then_some(helper).flatten(),
+                if publish_reference_locals {
+                    helper
+                } else {
+                    [None; 8]
+                },
                 candidate,
                 function,
                 local,
@@ -3401,7 +3692,11 @@ fn lower_direct_reference_argument(
         publish_native_reference_local(
             module,
             builder,
-            publish_reference_locals.then_some(helper).flatten(),
+            if publish_reference_locals {
+                helper
+            } else {
+                [None; 8]
+            },
             reference,
             function,
             local,
@@ -3427,7 +3722,11 @@ fn lower_direct_reference_argument(
         publish_native_reference_local(
             module,
             builder,
-            publish_reference_locals.then_some(helper).flatten(),
+            if publish_reference_locals {
+                helper
+            } else {
+                [None; 8]
+            },
             root,
             function,
             target.local,
@@ -3509,7 +3808,7 @@ fn lower_direct_reference_argument(
 fn lower_generic_native_binary_operation(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
+    helpers: NativeExactBinaryOperations,
     opcode: u32,
     lhs: ir::Value,
     rhs: ir::Value,
@@ -3523,23 +3822,31 @@ fn lower_generic_native_binary_operation(
     live_registers: &[RegId],
     native_version: u32,
 ) -> Result<ir::Value, CraneliftLoweringError> {
+    let (helper, pass_opcode) = helpers.select(opcode);
+    debug_assert!(!pass_opcode, "exact binary leaf must not receive an opcode");
     let helper = helper.ok_or_else(|| {
         CraneliftLoweringError::new(
             "JIT_CRANELIFT_REJECT_NATIVE_OPERATION",
             format!("native binary operation {opcode} has no declared helper"),
         )
     })?;
-    let opcode = builder.ins().iconst(types::I32, i64::from(opcode));
-    let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
+    let function_value = builder.ins().iconst(types::I32, i64::from(function.raw()));
     let continuation = builder
         .ins()
-        .iconst(types::I64, i64::from(instruction.continuation_id));
-    let call = call_native_helper(
-        module,
-        builder,
-        helper,
-        &[opcode, lhs, rhs, function_value, continuation, result_out],
+        .iconst(types::I32, i64::from(instruction.continuation_id));
+    builder.ins().store(
+        MemFlagsData::new(),
+        function_value,
+        deopt_out,
+        std::mem::offset_of!(crate::JitDeoptState, function_id) as i32,
     );
+    builder.ins().store(
+        MemFlagsData::new(),
+        continuation,
+        deopt_out,
+        std::mem::offset_of!(crate::JitDeoptState, continuation_id) as i32,
+    );
+    let call = call_native_helper(module, builder, helper, &[lhs, rhs, deopt_out, result_out]);
     let status = builder.inst_results(call)[0];
     let value = builder
         .ins()
@@ -3915,7 +4222,7 @@ pub(super) struct EmittedOptimizingInstruction {
 #[derive(Clone, Copy)]
 enum NativeGenericArrayWriteFallback<'a> {
     Generic {
-        helper: Option<NativeHelper>,
+        helper: NativeExactArrayInsertOperations,
         lifecycle: Option<NativeHelper>,
         operation: u32,
         function: FunctionId,
@@ -7745,6 +8052,66 @@ fn lower_optimizing_authoritative_truthy(
     let result = builder.ins().select(is_string, string_truthy, non_empty);
     let result = builder.ins().select(is_float, float_truthy, result);
     builder.ins().jump(merge, &[result.into()]);
+
+    builder.switch_to_block(merge);
+    builder.block_params(merge)[0]
+}
+
+/// Dereference a published scalar reference directly from the authoritative
+/// native value plane. ABI/layout validity is a publication invariant; no
+/// per-invocation selector or compatibility helper participates.
+fn lower_published_reference_payload(
+    builder: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    deopt_out: ir::Value,
+) -> ir::Value {
+    let inspect = builder.create_block();
+    let indirect = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+
+    let is_reference = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
+    builder
+        .ins()
+        .brif(is_reference, inspect, &[], merge, &[value.into()]);
+
+    builder.switch_to_block(inspect);
+    let slot = lower_optimizing_slot_address(builder, value, deopt_out);
+    let kind = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
+    );
+    let payload = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slot,
+        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
+    );
+    let direct = builder.ins().icmp_imm(
+        IntCC::Equal,
+        kind,
+        i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_REFERENCE_SCALAR),
+    );
+    builder
+        .ins()
+        .brif(direct, merge, &[payload.into()], indirect, &[]);
+
+    builder.switch_to_block(indirect);
+    let pointer_type = builder.func.dfg.value_type(deopt_out);
+    let view = if pointer_type == types::I64 {
+        payload
+    } else {
+        builder.ins().ireduce(pointer_type, payload)
+    };
+    let encoded = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        view,
+        std::mem::offset_of!(crate::JitNativeReferenceScalarView, encoded) as i32,
+    );
+    builder.ins().jump(merge, &[encoded.into()]);
 
     builder.switch_to_block(merge);
     builder.block_params(merge)[0]
@@ -17807,7 +18174,7 @@ fn lower_total_native_cow_array_dimension_reference(
 fn lower_generic_array_fetch(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
+    helper: NativeExactArrayFetchOperations,
     lifecycle: Option<NativeHelper>,
     operation: u32,
     array: ir::Value,
@@ -17836,7 +18203,7 @@ fn lower_generic_array_fetch(
 fn lower_generic_array_fetch_inner(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
+    helper: NativeExactArrayFetchOperations,
     lifecycle: Option<NativeHelper>,
     operation: u32,
     array: ir::Value,
@@ -17846,7 +18213,11 @@ fn lower_generic_array_fetch_inner(
     result_out: ir::Value,
     deopt_out: ir::Value,
 ) -> Result<ir::Value, CraneliftLoweringError> {
-    if !helper.is_some_and(|helper| helper.inline_runtime_view) {
+    if !helper
+        .select(operation)
+        .0
+        .is_some_and(|helper| helper.inline_runtime_view)
+    {
         return lower_native_value_operation(
             module,
             builder,
@@ -18360,7 +18731,7 @@ fn lower_guarded_value_release(
 fn lower_guarded_native_local_store(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    local_store: Option<NativeHelper>,
+    local_store: NativeExactLocalOperations,
     lifecycle: Option<NativeHelper>,
     current: ir::Value,
     value: ir::Value,
@@ -18373,7 +18744,10 @@ fn lower_guarded_native_local_store(
     result_out: ir::Value,
     deopt_out: ir::Value,
 ) -> Result<ir::Value, CraneliftLoweringError> {
-    if local_store.is_some_and(|helper| !helper.inline_runtime_view)
+    if local_store
+        .iter()
+        .flatten()
+        .any(|helper| !helper.inline_runtime_view)
         || operation & crate::JIT_LOCAL_STORE_PLAIN_LOCAL == 0
     {
         let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
@@ -18383,13 +18757,15 @@ fn lower_guarded_native_local_store(
         } else {
             operation
         };
-        return lower_native_value_operation(
+        let index = usize::from(operation & crate::JIT_LOCAL_STORE_PLAIN_LOCAL != 0)
+            | (usize::from(move_input) << 1);
+        return lower_exact_native_value_operation(
             module,
             builder,
-            local_store,
-            operation,
+            local_store[index],
             &[current, value, function_value, local_value],
             result_out,
+            "local store",
         );
     }
     let direct = builder.create_block();
@@ -18439,13 +18815,15 @@ fn lower_guarded_native_local_store(
     } else {
         operation
     };
-    let stored = lower_native_value_operation(
+    let index = usize::from(operation & crate::JIT_LOCAL_STORE_PLAIN_LOCAL != 0)
+        | (usize::from(move_input) << 1);
+    let stored = lower_exact_native_value_operation(
         module,
         builder,
-        local_store,
-        operation,
+        local_store[index],
         &[current, value, function_value, local_value],
         result_out,
+        "local store",
     )?;
     builder.ins().jump(merge, &[stored.into()]);
 
@@ -18457,7 +18835,7 @@ fn lower_guarded_native_local_store(
 fn lower_guarded_native_local_fetch(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
+    helper: NativeExactLocalOperations,
     lifecycle: Option<NativeHelper>,
     value: ir::Value,
     borrowed: bool,
@@ -18469,7 +18847,12 @@ fn lower_guarded_native_local_fetch(
     result_out: ir::Value,
     deopt_out: ir::Value,
 ) -> Result<ir::Value, CraneliftLoweringError> {
-    if helper.is_some_and(|helper| !helper.inline_runtime_view) || !method_local_fast_path {
+    if helper
+        .iter()
+        .flatten()
+        .any(|helper| !helper.inline_runtime_view)
+        || !method_local_fast_path
+    {
         return lower_native_local_fetch(
             module,
             builder,
@@ -18711,7 +19094,7 @@ fn lower_guarded_native_local_fetch(
 fn lower_generic_by_value_array_operand(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    local_fetch: Option<NativeHelper>,
+    local_fetch: NativeExactLocalOperations,
     lifecycle: Option<NativeHelper>,
     operand: RegionOperand,
     value: ir::Value,
@@ -18750,7 +19133,7 @@ fn lower_generic_by_value_array_operand(
 fn lower_guarded_reference_dimension_load(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
+    helper: NativeExactLocalOperations,
     lifecycle: Option<NativeHelper>,
     value: ir::Value,
     quiet: bool,
@@ -18800,7 +19183,7 @@ fn lower_guarded_reference_dimension_load(
 fn lower_native_local_fetch(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
+    helper: NativeExactLocalOperations,
     value: ir::Value,
     quiet: bool,
     method_local_fast_path: bool,
@@ -18813,18 +19196,14 @@ fn lower_native_local_fetch(
     let local = builder.ins().iconst(types::I64, i64::from(local.raw()));
     let file = builder.ins().iconst(types::I64, i64::from(span.file.raw()));
     let start = builder.ins().iconst(types::I64, i64::from(span.start));
-    lower_native_value_operation(
+    let index = usize::from(quiet) | (usize::from(method_local_fast_path) << 1);
+    lower_exact_native_value_operation(
         module,
         builder,
-        helper,
-        u32::from(quiet)
-            | if method_local_fast_path {
-                crate::JIT_LOCAL_FETCH_PLAIN_LOCAL
-            } else {
-                0
-            },
+        helper[index],
         &[value, function, local, file, start],
         result_out,
+        "local fetch",
     )
 }
 
@@ -18862,13 +19241,9 @@ fn native_local_store_operation(
     }
 }
 
-const fn native_unary_opcode(op: RegionUnaryOp) -> u32 {
-    match op {
-        RegionUnaryOp::Plus => 0,
-        RegionUnaryOp::Minus => 1,
-        RegionUnaryOp::Not => 2,
-        RegionUnaryOp::BitNot => 3,
-    }
+fn native_exact_local_store_index(operation: u32) -> usize {
+    usize::from(operation & crate::JIT_LOCAL_STORE_PLAIN_LOCAL != 0)
+        | (usize::from(operation & crate::JIT_LOCAL_STORE_MOVE_INPUT != 0) << 1)
 }
 
 const fn baseline_binary_opcode(op: RegionBinaryOp) -> u32 {
@@ -18885,20 +19260,6 @@ const fn baseline_binary_opcode(op: RegionBinaryOp) -> u32 {
         RegionBinaryOp::BitXor => 9,
         RegionBinaryOp::ShiftLeft => 10,
         RegionBinaryOp::ShiftRight => 11,
-    }
-}
-
-const fn native_compare_opcode(op: RegionCompareOpCode) -> u32 {
-    match op {
-        RegionCompareOpCode::Equal => 0,
-        RegionCompareOpCode::NotEqual => 1,
-        RegionCompareOpCode::Identical => 2,
-        RegionCompareOpCode::NotIdentical => 3,
-        RegionCompareOpCode::Less => 4,
-        RegionCompareOpCode::LessEqual => 5,
-        RegionCompareOpCode::Greater => 6,
-        RegionCompareOpCode::GreaterEqual => 7,
-        RegionCompareOpCode::Spaceship => 8,
     }
 }
 
@@ -30283,9 +30644,11 @@ fn lower_generic_region_instruction(
     unit_identity: u64,
     pointer_type: ir::Type,
 ) -> Result<(), CraneliftLoweringError> {
-    let native_reference_publish = function_is_top_level
-        .then_some(native_operations.reference_bind)
-        .flatten();
+    let native_reference_publish = if function_is_top_level {
+        native_operations.reference_bind
+    } else {
+        [None; 8]
+    };
     match &instruction.kind {
         RegionInstructionKind::Nop => {}
         RegionInstructionKind::Move { dst, src } => {
@@ -30453,10 +30816,7 @@ fn lower_generic_region_instruction(
             } else {
                 let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
                 let local_value = builder.ins().iconst(types::I64, i64::from(local.raw()));
-                lower_native_value_operation(
-                    module,
-                    builder,
-                    native_operations.local_store,
+                let operation =
                     native_local_store_operation(
                         function_is_top_level,
                         function_local_names,
@@ -30465,9 +30825,14 @@ fn lower_generic_region_instruction(
                         crate::JIT_LOCAL_STORE_MOVE_INPUT
                     } else {
                         0
-                    },
+                    };
+                lower_exact_native_value_operation(
+                    module,
+                    builder,
+                    native_operations.local_store[native_exact_local_store_index(operation)],
                     &[current, src, function_value, local_value],
                     result_out,
+                    "local store",
                 )?
             };
             define_local_variable(builder, locals, *local, cl_value)?;
@@ -30519,17 +30884,18 @@ fn lower_generic_region_instruction(
             } else {
                 let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
                 let local_value = builder.ins().iconst(types::I64, i64::from(local.raw()));
-                lower_native_value_operation(
+                let operation = native_local_store_operation(
+                    function_is_top_level,
+                    function_local_names,
+                    *local,
+                );
+                lower_exact_native_value_operation(
                     module,
                     builder,
-                    native_operations.local_store,
-                    native_local_store_operation(
-                        function_is_top_level,
-                        function_local_names,
-                        *local,
-                    ),
+                    native_operations.local_store[native_exact_local_store_index(operation)],
                     &[current, value, function_value, local_value],
                     result_out,
+                    "local store",
                 )?
             };
             define_local_variable(builder, locals, *local, stored)?;
@@ -31244,11 +31610,13 @@ fn lower_generic_region_instruction(
             let rhs_operand = *rhs;
             let lhs = lower_region_operand(builder, locals, registers, lhs_operand)?;
             let rhs = lower_region_operand(builder, locals, registers, rhs_operand)?;
-            let cl_value = if native_operations.baseline_binary.is_some() {
+            let cl_value = if native_operations.exact_binary.0[baseline_binary_opcode(*op) as usize]
+                .is_some()
+            {
                 lower_generic_native_binary_operation(
                     module,
                     builder,
-                    native_operations.baseline_binary,
+                    native_operations.exact_binary,
                     baseline_binary_opcode(*op),
                     lhs,
                     rhs,
@@ -31274,15 +31642,6 @@ fn lower_generic_region_instruction(
             let src_operand = *src;
             let src = lower_region_operand(builder, locals, registers, src_operand)?;
             let fact = lowering_operand_fact(value_flow, constants, src_operand);
-            let unary_operation =
-                if function.raw() <= 0x03ff && instruction.continuation_id <= 0x07_ffff {
-                    0x8000_0000
-                        | native_unary_opcode(*op)
-                        | (function.raw() << 2)
-                        | (instruction.continuation_id << 12)
-                } else {
-                    native_unary_opcode(*op)
-                };
             let direct = if fact.certainty != crate::region_ir::SsaCertainty::Unknown {
                 match (*op, fact.class) {
                     (RegionUnaryOp::Not, class) => {
@@ -31300,28 +31659,17 @@ fn lower_generic_region_instruction(
             let value = if let Some(value) = direct {
                 value
             } else if *op == RegionUnaryOp::Not {
-                let truthy = terminators::lower_generic_unknown_condition(
-                    module,
-                    builder,
-                    native_operations.truthy.ok_or_else(|| {
-                        CraneliftLoweringError::new(
-                            "JIT_CRANELIFT_REJECT_NATIVE_OPERATION",
-                            "native unary truthiness helper was not declared",
-                        )
-                    })?,
-                    src,
-                    deopt_out,
-                )?;
+                let truthy = terminators::lower_generic_unknown_condition(builder, src, deopt_out);
                 let inverted = builder.ins().bxor_imm(truthy, 1);
                 encode_native_bool(builder, inverted)
             } else {
-                lower_native_value_operation(
+                lower_generic_exact_runtime_value(
                     module,
                     builder,
-                    native_operations.unary,
-                    unary_operation,
+                    native_operations.exact_unary[native_exact_unary_index(*op)],
                     &[src],
                     result_out,
+                    "exact native unary handler was not declared",
                 )?
             };
             define_region_register(builder, register_variables, registers, *dst, value)?;
@@ -31441,14 +31789,13 @@ fn lower_generic_region_instruction(
                     lower_direct_semantic_call(
                         module,
                         builder,
-                        native_operations.semantic_dispatch,
+                        native_operations.exact_semantic[operation.operation_id().index()],
                         native_operations.value_release,
                         value_flow,
                         locals,
                         register_variables,
                         registers,
                         call,
-                        operation.operation_id(),
                         instruction,
                         transition_live_registers,
                         streaming_call_exit,
@@ -31457,7 +31804,6 @@ fn lower_generic_region_instruction(
                         function,
                         local_count,
                         native_version,
-                        unit_identity,
                         pointer_type,
                     )?;
                     if release_previous {
@@ -31476,14 +31822,13 @@ fn lower_generic_region_instruction(
                 lower_direct_semantic_call(
                     module,
                     builder,
-                    native_operations.semantic_dispatch,
+                    native_operations.exact_semantic[operation.operation_id().index()],
                     native_operations.value_release,
                     value_flow,
                     locals,
                     register_variables,
                     registers,
                     call,
-                    operation.operation_id(),
                     instruction,
                     transition_live_registers,
                     streaming_call_exit,
@@ -31492,7 +31837,6 @@ fn lower_generic_region_instruction(
                     function,
                     local_count,
                     native_version,
-                    unit_identity,
                     pointer_type,
                 )?;
                 return Ok(());
@@ -32622,22 +32966,15 @@ fn lower_generic_region_instruction(
                 .flatten();
             let cl_value = if let Some(value) = direct {
                 value
-            } else if matches!(
-                op,
-                RegionCompareOpCode::Identical | RegionCompareOpCode::NotIdentical
-            ) || native_operations.compare.is_some()
-            {
-                lower_native_value_operation(
+            } else {
+                lower_generic_exact_runtime_value(
                     module,
                     builder,
-                    native_operations.compare,
-                    native_compare_opcode(*op),
+                    native_operations.exact_compare[native_exact_compare_index(*op)],
                     &[lhs, rhs],
                     result_out,
+                    "exact native comparison handler was not declared",
                 )?
-            } else {
-                let compared = builder.ins().icmp(region_compare_intcc(*op), lhs, rhs);
-                builder.ins().uextend(types::I64, compared)
             };
             define_region_register(builder, register_variables, registers, *dst, cl_value)?;
         }
@@ -32645,27 +32982,34 @@ fn lower_generic_region_instruction(
             let src_operand = *src;
             let src = lower_region_operand(builder, locals, registers, src_operand)?;
             let fact = lowering_operand_fact(value_flow, constants, src_operand);
-            let cast_operation =
-                if function.raw() <= 0x03ff && instruction.continuation_id <= 0x03_ffff {
-                    0x8000_0000
-                        | native_cast_opcode(*op)
-                        | (function.raw() << 3)
-                        | (instruction.continuation_id << 13)
-                } else {
-                    native_cast_opcode(*op)
-                };
             let direct = (fact.certainty != crate::region_ir::SsaCertainty::Unknown)
                 .then(|| lower_direct_cast(builder, *op, src, fact.class))
                 .flatten();
             let value = if let Some(value) = direct {
                 value
             } else {
+                let function_value = builder.ins().iconst(types::I32, i64::from(function.raw()));
+                let continuation = builder
+                    .ins()
+                    .iconst(types::I32, i64::from(instruction.continuation_id));
+                builder.ins().store(
+                    MemFlagsData::new(),
+                    function_value,
+                    deopt_out,
+                    std::mem::offset_of!(crate::JitDeoptState, function_id) as i32,
+                );
+                builder.ins().store(
+                    MemFlagsData::new(),
+                    continuation,
+                    deopt_out,
+                    std::mem::offset_of!(crate::JitDeoptState, continuation_id) as i32,
+                );
                 lower_native_value_operation(
                     module,
                     builder,
-                    native_operations.cast,
-                    cast_operation,
-                    &[src],
+                    native_operations.exact_cast,
+                    native_cast_opcode(*op),
+                    &[src, deopt_out],
                     result_out,
                 )?
             };
@@ -33302,17 +33646,18 @@ fn lower_generic_region_instruction(
             } else {
                 let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
                 let local_value = builder.ins().iconst(types::I64, i64::from(local.raw()));
-                lower_native_value_operation(
+                let operation = native_local_store_operation(
+                    function_is_top_level,
+                    function_local_names,
+                    *local,
+                ) | crate::JIT_LOCAL_STORE_MOVE_INPUT;
+                lower_exact_native_value_operation(
                     module,
                     builder,
-                    native_operations.local_store,
-                    native_local_store_operation(
-                        function_is_top_level,
-                        function_local_names,
-                        *local,
-                    ) | crate::JIT_LOCAL_STORE_MOVE_INPUT,
+                    native_operations.local_store[native_exact_local_store_index(operation)],
                     &[current, updated, function_value, local_value],
                     result_out,
+                    "local store",
                 )?
             };
             define_local_variable(builder, locals, *local, stored)?;
@@ -33449,17 +33794,18 @@ fn lower_generic_region_instruction(
             } else {
                 let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
                 let local_value = builder.ins().iconst(types::I64, i64::from(local.raw()));
-                lower_native_value_operation(
+                let operation = native_local_store_operation(
+                    function_is_top_level,
+                    function_local_names,
+                    *local,
+                ) | crate::JIT_LOCAL_STORE_MOVE_INPUT;
+                lower_exact_native_value_operation(
                     module,
                     builder,
-                    native_operations.local_store,
-                    native_local_store_operation(
-                        function_is_top_level,
-                        function_local_names,
-                        *local,
-                    ) | crate::JIT_LOCAL_STORE_MOVE_INPUT,
+                    native_operations.local_store[native_exact_local_store_index(operation)],
                     &[current, updated, function_value, local_value],
                     result_out,
+                    "local store",
                 )?
             };
             define_local_variable(builder, locals, *local, stored)?;
@@ -33500,13 +33846,14 @@ fn lower_generic_region_instruction(
             let null = builder
                 .ins()
                 .iconst(types::I64, crate::jit_encode_constant(u32::MAX));
-            let result = lower_native_value_operation(
+            let result = lower_generic_exact_runtime_value(
                 module,
                 builder,
-                native_operations.compare,
-                native_compare_opcode(RegionCompareOpCode::NotIdentical),
+                native_operations.exact_compare
+                    [native_exact_compare_index(RegionCompareOpCode::NotIdentical)],
                 &[value, null],
                 result_out,
+                "exact native non-identity handler was not declared",
             )?;
             define_region_register(builder, register_variables, registers, *dst, result)?;
         }
@@ -33542,22 +33889,9 @@ fn lower_generic_region_instruction(
                     deopt_out,
                 )?;
             }
-            let truthy = lower_native_value_operation(
-                module,
-                builder,
-                native_operations.cast,
-                native_cast_opcode(RegionCastOp::Bool),
-                &[value],
-                result_out,
-            )?;
-            let result = lower_native_value_operation(
-                module,
-                builder,
-                native_operations.unary,
-                native_unary_opcode(RegionUnaryOp::Not),
-                &[truthy],
-                result_out,
-            )?;
+            let truthy = terminators::lower_generic_unknown_condition(builder, value, deopt_out);
+            let inverted = builder.ins().bxor_imm(truthy, 1);
+            let result = encode_native_bool(builder, inverted);
             define_region_register(builder, register_variables, registers, *dst, result)?;
         }
         RegionInstructionKind::UnsetDim { local, keys } => {
@@ -33713,18 +34047,7 @@ fn lower_generic_region_instruction(
                 result_out,
                 deopt_out,
             )?;
-            let truthy = terminators::lower_generic_unknown_condition(
-                module,
-                builder,
-                native_operations.truthy.ok_or_else(|| {
-                    CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_NATIVE_OPERATION",
-                        "native empty truthiness helper was not declared",
-                    )
-                })?,
-                value,
-                deopt_out,
-            )?;
+            let truthy = terminators::lower_generic_unknown_condition(builder, value, deopt_out);
             let empty = builder.ins().bxor_imm(truthy, 1);
             let result = encode_native_bool(builder, empty);
             define_region_register(builder, register_variables, registers, *dst, result)?;
@@ -33736,13 +34059,13 @@ fn lower_generic_region_instruction(
                 crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED),
             );
             define_local_variable(builder, locals, *local, uninitialized)?;
-            if let Some(helper) = native_operations.reference_bind {
+            if native_operations.reference_bind[7].is_some() {
                 let function_value = builder.ins().iconst(types::I64, i64::from(function.raw()));
                 let local_value = builder.ins().iconst(types::I64, i64::from(local.raw()));
                 let _ = lower_native_value_operation(
                     module,
                     builder,
-                    Some(helper),
+                    native_operations.reference_bind,
                     7,
                     &[uninitialized, function_value, local_value],
                     result_out,
@@ -34461,7 +34784,6 @@ fn lower_direct_semantic_call(
     register_variables: &NativeRegisterMap,
     registers: &mut NativeRegisterMap,
     call: &RegionNativeCall,
-    operation: crate::region_ir::RegionSemanticOperationId,
     instruction: &RegionInstruction,
     transition_live_registers: &[RegId],
     streaming_call_exit: Option<NativeStreamingCallExit>,
@@ -34470,13 +34792,12 @@ fn lower_direct_semantic_call(
     function: FunctionId,
     local_count: u32,
     native_version: u32,
-    unit_identity: u64,
     pointer_type: ir::Type,
 ) -> Result<(), CraneliftLoweringError> {
     let helper = semantic_helper.ok_or_else(|| {
         CraneliftLoweringError::new(
             "JIT_CRANELIFT_REJECT_NATIVE_SEMANTIC_DISPATCH",
-            "typed semantic operation has no direct dispatcher",
+            "typed semantic operation has no exact native leaf",
         )
     })?;
     let operand_count = call.operands.len();
@@ -34530,11 +34851,21 @@ fn lower_direct_semantic_call(
     ));
     let out_ptr = builder.ins().stack_addr(pointer_type, out_slot, 0);
     let function_id = builder.ins().iconst(types::I32, i64::from(function.raw()));
-    let unit_identity = builder.ins().iconst(types::I64, unit_identity as i64);
     let continuation = builder
         .ins()
         .iconst(types::I32, i64::from(instruction.continuation_id));
-    let operation_id = builder.ins().iconst(types::I32, i64::from(operation.raw()));
+    builder.ins().store(
+        MemFlagsData::new(),
+        function_id,
+        deopt_out,
+        std::mem::offset_of!(crate::JitDeoptState, function_id) as i32,
+    );
+    builder.ins().store(
+        MemFlagsData::new(),
+        continuation,
+        deopt_out,
+        std::mem::offset_of!(crate::JitDeoptState, continuation_id) as i32,
+    );
     let operand_count = builder
         .ins()
         .iconst(types::I32, i64::try_from(operand_count).unwrap_or(i64::MAX));
@@ -34542,16 +34873,7 @@ fn lower_direct_semantic_call(
         module,
         builder,
         helper,
-        &[
-            unit_identity,
-            function_id,
-            continuation,
-            operation_id,
-            operands_ptr,
-            operand_count,
-            deopt_out,
-            out_ptr,
-        ],
+        &[operands_ptr, operand_count, deopt_out, out_ptr],
     );
     let status = builder.inst_results(helper_call)[0];
     let ok = builder.create_block();
@@ -34646,7 +34968,7 @@ fn lower_native_call_trampoline(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     native_call_helper: Option<NativeHelper>,
-    native_reference_bind_helper: Option<NativeHelper>,
+    native_reference_bind_helper: [Option<NativeHelper>; 8],
     native_value_release_helper: Option<NativeHelper>,
     value_flow: &ExecutableValueFlow,
     locals: &NativeLocalMap,
@@ -34672,20 +34994,13 @@ fn lower_native_call_trampoline(
             "native call site has no typed dispatch trampoline",
         )
     })?;
-    let direct_builtin_helper = baseline_builtin_helper_id(&call.target);
-    let compact_builtin_arguments = direct_builtin_helper.is_some()
-        && call.argument_operand_offset == 0
-        && call.operands.len() == call.args.len()
-        && call.args.iter().enumerate().all(|(index, argument)| {
-            argument.name.is_none()
-                && !argument.unpack
-                && !call.argument_requires_reference_binding(index)
-        });
-    let argument_size = if compact_builtin_arguments {
-        std::mem::size_of::<i64>()
-    } else {
-        std::mem::size_of::<crate::JitNativeCallArgument>()
-    };
+    if baseline_builtin_helper_id(&call.target).is_some() {
+        return Err(CraneliftLoweringError::new(
+            "JIT_CRANELIFT_REJECT_FIXED_BUILTIN_DISPATCH",
+            "fixed builtin reached the dynamic PHP call spine",
+        ));
+    }
+    let argument_size = std::mem::size_of::<crate::JitNativeCallArgument>();
     // Direct-call regions append scalar defaults to `operands` so compiled
     // callees can receive a complete fixed-arity frame. Once a call falls
     // back to the runtime binder, however, those defaults must be bound by
@@ -34856,12 +35171,6 @@ fn lower_native_call_trampoline(
                 }
             }
             let payload = lowered.unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
-            if compact_builtin_arguments {
-                builder
-                    .ins()
-                    .store(MemFlagsData::new(), payload, pointer, base);
-                continue;
-            }
             builder
                 .ins()
                 .store(MemFlagsData::new(), payload, pointer, base);
@@ -34983,11 +35292,10 @@ fn lower_native_call_trampoline(
         std::mem::offset_of!(crate::JitNativeCallFrame, argument_count),
         u32::try_from(argument_count).unwrap_or(u32::MAX),
     );
-    let direct_external = direct_builtin_helper.is_none()
-        && matches!(&call.target, RegionCallTarget::Function { name, function: None }
-        if function_params.values().any(|metadata| {
-            metadata.name.trim_start_matches('\\').eq_ignore_ascii_case(name.trim_start_matches('\\'))
-        }));
+    let direct_external = matches!(&call.target, RegionCallTarget::Function { name, function: None }
+    if function_params.values().any(|metadata| {
+        metadata.name.trim_start_matches('\\').eq_ignore_ascii_case(name.trim_start_matches('\\'))
+    }));
     let frame_flags = if call.caller_strict_types {
         crate::JitNativeCallFrame::FLAG_STRICT_TYPES
     } else {
@@ -34996,16 +35304,8 @@ fn lower_native_call_trampoline(
         crate::JitNativeCallFrame::FLAG_RETURN_REFERENCE
     } else {
         0
-    } | if direct_builtin_helper.is_some() {
-        crate::JitNativeCallFrame::FLAG_DIRECT_BUILTIN
-    } else {
-        0
     } | if direct_external {
         crate::JitNativeCallFrame::FLAG_DIRECT_EXTERNAL
-    } else {
-        0
-    } | if compact_builtin_arguments {
-        crate::JitNativeCallFrame::FLAG_COMPACT_ARGUMENTS
     } else {
         0
     };
@@ -35057,7 +35357,7 @@ fn lower_native_call_trampoline(
     store_i32(
         builder,
         target_offset + std::mem::offset_of!(crate::JitNativeCallTarget, function_id),
-        direct_builtin_helper.unwrap_or(target_function),
+        target_function,
     );
 
     let out_size = std::mem::size_of::<crate::JitCallResult>() as u32;

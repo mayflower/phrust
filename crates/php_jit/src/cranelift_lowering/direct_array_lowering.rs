@@ -8,7 +8,7 @@ fn baseline_local_is_globals_proxy(function_local_names: &[String], local: Local
 fn lower_generic_store_local_or_keep_globals_proxy(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    helper: Option<NativeHelper>,
+    helper: NativeExactLocalOperations,
     function_is_top_level: bool,
     function_local_names: &[String],
     function_id: FunctionId,
@@ -24,14 +24,16 @@ fn lower_generic_store_local_or_keep_globals_proxy(
         .ins()
         .iconst(types::I64, i64::from(function_id.raw()));
     let local_value = builder.ins().iconst(types::I64, i64::from(local.raw()));
-    lower_native_value_operation(
+    let operation =
+        native_local_store_operation(function_is_top_level, function_local_names, local);
+    let index = usize::from(operation & crate::JIT_LOCAL_STORE_PLAIN_LOCAL != 0) | 2;
+    lower_exact_native_value_operation(
         module,
         builder,
-        helper,
-        native_local_store_operation(function_is_top_level, function_local_names, local)
-            | crate::JIT_LOCAL_STORE_MOVE_INPUT,
+        helper[index],
         &[current, updated, function, local_value],
         result_out,
+        "local store",
     )
 }
 
@@ -265,9 +267,7 @@ fn lower_total_fresh_array_insert(
     let (integer, raw_key) = lower_native_array_key_integer_candidate(builder, key, deopt_out);
     let update_state = builder.create_block();
     let done = builder.create_block();
-    builder
-        .ins()
-        .brif(integer, update_state, &[], done, &[]);
+    builder.ins().brif(integer, update_state, &[], done, &[]);
     builder.switch_to_block(update_state);
     let state = lower_direct_array_state_address(builder, array, deopt_out);
     let current = builder.ins().load(
@@ -880,8 +880,7 @@ fn lower_direct_array_insert(
     // single typed continuation. String literals are already published native
     // values here, so the continuation never sees a unit-local encoding.
     let key_runtime = lower_is_runtime_handle(builder, key);
-    let key_constant =
-        lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
+    let key_constant = lower_value_has_namespace_tag(builder, key, crate::JIT_VALUE_CONSTANT_TAG);
     let immediate = builder.ins().icmp_imm(IntCC::Equal, key_runtime, 0);
     let supported_key = builder.ins().band_not(immediate, key_constant);
     let _ = constant_string_key;
@@ -1066,12 +1065,8 @@ fn lower_total_fresh_array_spread(
     builder.ins().brif(finished, done, &[], insert, &[]);
 
     builder.switch_to_block(insert);
-    let entry = lower_optimizing_direct_array_entry_address(
-        builder,
-        source_entries,
-        index,
-        pointer_type,
-    );
+    let entry =
+        lower_optimizing_direct_array_entry_address(builder, source_entries, index, pointer_type);
     let source_key = builder.ins().load(
         types::I64,
         MemFlagsData::new(),

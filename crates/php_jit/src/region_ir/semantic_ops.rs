@@ -42,6 +42,75 @@ pub enum RegionSemanticOperationId {
 }
 
 impl RegionSemanticOperationId {
+    pub const COUNT: usize = 25;
+
+    #[must_use]
+    pub const fn all() -> [Self; Self::COUNT] {
+        [
+            Self::StaticPropertyFetch,
+            Self::StaticPropertyAssign,
+            Self::StaticPropertyIsset,
+            Self::StaticPropertyEmpty,
+            Self::StaticPropertyDimIsset,
+            Self::StaticPropertyDimEmpty,
+            Self::StaticPropertyDimUnset,
+            Self::StaticPropertyReference,
+            Self::ClassConstantFetch,
+            Self::ObjectClassName,
+            Self::InstanceOf,
+            Self::DynamicInstanceOf,
+            Self::ResolveCallable,
+            Self::AcquireCallable,
+            Self::PropertyFetch,
+            Self::PropertyAssign,
+            Self::PropertyIsset,
+            Self::PropertyEmpty,
+            Self::PropertyUnset,
+            Self::PropertyDimAssign,
+            Self::PropertyDimIsset,
+            Self::PropertyDimEmpty,
+            Self::PropertyDimUnset,
+            Self::BindGlobal,
+            Self::BoundClosureClass,
+        ]
+    }
+
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize - 1
+    }
+
+    #[must_use]
+    pub const fn exact_symbol(self) -> &'static str {
+        match self {
+            Self::StaticPropertyFetch => "phrust_native_static_property_fetch",
+            Self::StaticPropertyAssign => "phrust_native_static_property_assign",
+            Self::StaticPropertyIsset => "phrust_native_static_property_isset",
+            Self::StaticPropertyEmpty => "phrust_native_static_property_empty",
+            Self::StaticPropertyDimIsset => "phrust_native_static_property_dim_isset",
+            Self::StaticPropertyDimEmpty => "phrust_native_static_property_dim_empty",
+            Self::StaticPropertyDimUnset => "phrust_native_static_property_dim_unset",
+            Self::StaticPropertyReference => "phrust_native_static_property_reference",
+            Self::ClassConstantFetch => "phrust_native_class_constant_fetch",
+            Self::ObjectClassName => "phrust_native_object_class_name_semantic",
+            Self::InstanceOf => "phrust_native_instanceof",
+            Self::DynamicInstanceOf => "phrust_native_dynamic_instanceof",
+            Self::ResolveCallable => "phrust_native_resolve_callable_semantic",
+            Self::AcquireCallable => "phrust_native_acquire_callable_semantic",
+            Self::PropertyFetch => "phrust_native_property_fetch_semantic",
+            Self::PropertyAssign => "phrust_native_property_assign_semantic",
+            Self::PropertyIsset => "phrust_native_property_isset",
+            Self::PropertyEmpty => "phrust_native_property_empty",
+            Self::PropertyUnset => "phrust_native_property_unset",
+            Self::PropertyDimAssign => "phrust_native_property_dim_assign",
+            Self::PropertyDimIsset => "phrust_native_property_dim_isset",
+            Self::PropertyDimEmpty => "phrust_native_property_dim_empty",
+            Self::PropertyDimUnset => "phrust_native_property_dim_unset",
+            Self::BindGlobal => "phrust_native_bind_global",
+            Self::BoundClosureClass => "phrust_native_bound_closure_class",
+        }
+    }
+
     #[must_use]
     pub const fn raw(self) -> u32 {
         self as u32

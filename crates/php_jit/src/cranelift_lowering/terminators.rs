@@ -310,7 +310,7 @@ fn lower_optimizing_condition(
 
 #[allow(clippy::too_many_arguments)]
 fn lower_region_condition(
-    module: &mut JITModule,
+    _module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     locals: &NativeLocalMap,
     registers: &NativeRegisterMap,
@@ -338,43 +338,20 @@ fn lower_region_condition(
         }
         _ => {}
     }
-    if let Some(helper) = native_operations.truthy {
-        lower_generic_unknown_condition(module, builder, helper, value, deopt_out)
-    } else if builder.func.dfg.value_type(value) == types::I64 {
-        Ok(builder.ins().icmp_imm(IntCC::NotEqual, value, 0))
-    } else {
-        Ok(value)
-    }
+    let _ = native_operations;
+    Ok(lower_generic_unknown_condition(builder, value, deopt_out))
 }
 
-/// Resolve the stable null/bool/int lanes without crossing the runtime ABI.
-/// Runtime handles and opaque constant-pool handles retain the typed helper
-/// slow path.
+/// Resolve every published native value kind without crossing the runtime ABI.
+/// Reference cells are dereferenced from the authoritative slot/view before
+/// the generated kind dispatch computes PHP truthiness.
 pub(super) fn lower_generic_unknown_condition(
-    module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    helper: NativeHelper,
     value: ir::Value,
     deopt_out: ir::Value,
-) -> Result<ir::Value, CraneliftLoweringError> {
-    if !helper.inline_runtime_view {
-        let slot =
-            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
-        let out = builder
-            .ins()
-            .stack_addr(module.target_config().pointer_type(), slot, 0);
-        let call = call_native_helper(module, builder, helper, &[value, out]);
-        require_native_operation_ok(
-            builder,
-            builder.inst_results(call)[0],
-            helper.terminal_exit()?,
-        )?;
-        let truthy = builder.ins().stack_load(types::I64, slot, 0);
-        return Ok(builder.ins().icmp_imm(IntCC::NotEqual, truthy, 0));
-    }
-    Ok(lower_optimizing_authoritative_truthy(
-        builder, value, deopt_out,
-    ))
+) -> ir::Value {
+    let value = lower_published_reference_payload(builder, value, deopt_out);
+    lower_optimizing_authoritative_truthy(builder, value, deopt_out)
 }
 
 #[allow(clippy::too_many_arguments)]
