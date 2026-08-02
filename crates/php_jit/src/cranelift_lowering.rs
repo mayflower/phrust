@@ -19269,9 +19269,7 @@ fn optimizing_stable_callback_target<'a>(
         .map(|signature| OptimizingCompiledCallTarget {
             address: OptimizingCompiledCallAddress::Linked(signature.link_index),
             params: &signature.native_params,
-            requires_trampoline: signature.requires_non_reference_trampoline
-                || signature.params.iter().any(|parameter| parameter.by_ref)
-                || signature.returns_by_reference,
+            requires_trampoline: signature.requires_non_reference_trampoline,
             arity: signature.native_arity as usize,
             reference_only_trampoline: !signature.requires_non_reference_trampoline
                 && (signature.params.iter().any(|parameter| parameter.by_ref)
@@ -23628,9 +23626,7 @@ fn lower_optimizing_region_instruction(
                         .map(|signature| OptimizingCompiledCallTarget {
                             address: OptimizingCompiledCallAddress::Linked(signature.link_index),
                             params: &signature.native_params,
-                            requires_trampoline: signature.requires_non_reference_trampoline
-                                || signature.params.iter().any(|parameter| parameter.by_ref)
-                                || signature.returns_by_reference,
+                            requires_trampoline: signature.requires_non_reference_trampoline,
                             arity: signature.native_arity as usize,
                             reference_only_trampoline: !signature.requires_non_reference_trampoline
                                 && (signature.params.iter().any(|parameter| parameter.by_ref)
@@ -31457,13 +31453,7 @@ fn lower_generic_region_instruction(
             }
             let direct_target = call
                 .direct_compiled_target()
-                .filter(|_| {
-                    !matches!(call.result, RegionCallResult::ReferenceLocal(_))
-                        && call
-                            .args
-                            .iter()
-                            .all(|argument| argument.name.is_none() && !argument.unpack)
-                })
+                .filter(|_| call.args.iter().all(|argument| !argument.unpack))
                 .filter(|target| {
                     function_params
                         .get(target)

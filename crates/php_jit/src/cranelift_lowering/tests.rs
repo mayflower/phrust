@@ -14755,6 +14755,49 @@ fn optimizing_same_unit_method_binds_reference_argument_and_return_directly() {
 }
 
 #[test]
+fn by_reference_parameter_and_return_compile_in_both_generated_tiers() {
+    let (unit, _caller, callee) = same_unit_reference_return_method_call_fixture();
+    for (opt_level, expected_tier) in [
+        (0, NativeCompilerTier::Generic),
+        (2, NativeCompilerTier::Optimizing),
+    ] {
+        let mut backend = CraneliftNativeCompiler;
+        let outcome = backend.compile_region(&NativeCompileRequest {
+            compile: &JitCompileRequest::new(format!("cl.reference-entry.{opt_level}"))
+                .with_opt_level(opt_level),
+            unit: Some(&unit),
+            function: Some(callee),
+            runtime_helpers: crate::JitRuntimeHelperAddresses {
+                native_value_release: passthrough_release as *const () as usize,
+                ..crate::JitRuntimeHelperAddresses::default()
+            },
+        });
+        assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+        let handle = outcome.handle.expect("reference entry");
+        assert_eq!(
+            handle.region_state_metadata().unwrap().compiler_tier,
+            expected_tier
+        );
+        let imports = handle
+            .relocatable_code()
+            .unwrap()
+            .relocations
+            .iter()
+            .filter_map(|relocation| match &relocation.target {
+                crate::JitRelocatableTarget::Helper(symbol) => Some(symbol.as_str()),
+                crate::JitRelocatableTarget::InternalFunction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!imports.iter().any(|symbol| {
+            symbol.contains("call_dispatch")
+                || symbol.contains("reference_bind")
+                || symbol.contains("value_encode")
+                || symbol.contains("value_decode")
+        }));
+    }
+}
+
+#[test]
 fn optimizing_published_linked_reference_return_is_a_compiled_native_call() {
     let (unit, function) = external_reference_return_fixture();
     let mut backend = CraneliftNativeCompiler;

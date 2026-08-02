@@ -1118,9 +1118,7 @@ unsafe fn jit_baseline_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     .functions
                     .get(function.index())
                     .is_some_and(|definition| {
-                        definition.params.iter().any(|parameter| parameter.by_ref)
-                            || definition.returns_by_ref
-                            || native_function_requires_non_reference_trampoline(definition, false)
+                        native_function_requires_non_reference_trampoline(definition, false)
                     });
                 if !requires_cold_compatibility {
                     return Err(format!(
@@ -1129,10 +1127,9 @@ unsafe fn jit_baseline_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     )
                     .into());
                 }
-                // Retained only for reference/generator/introspection shapes
-                // until the generated binding tranche replaces them. Stable
-                // ordinary calls are rejected above and cannot execute a PHP
-                // body in this Rust boundary.
+                // Retained only for generator/introspection shapes. Stable
+                // ordinary calls, including by-reference signatures, are
+                // rejected above and cannot execute a PHP body here.
                 emit_native_deprecated_call(context, function, instruction);
                 let visible_arguments = encoded
                     .get(descriptor.argument_operand_offset..)

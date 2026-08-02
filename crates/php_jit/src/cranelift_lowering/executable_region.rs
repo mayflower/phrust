@@ -9905,9 +9905,7 @@ impl NativeRegisterLiveness {
 }
 
 fn ir_function_requires_trampoline(function: &php_ir::IrFunction) -> bool {
-    function.params.iter().any(|parameter| parameter.by_ref)
-        || function.returns_by_ref
-        || ir_function_requires_non_reference_trampoline(function)
+    ir_function_requires_non_reference_trampoline(function)
 }
 
 fn ir_function_requires_non_reference_trampoline(function: &php_ir::IrFunction) -> bool {
@@ -10145,26 +10143,23 @@ pub(super) fn compile_region_graph_native(
     let mut trampoline_functions = regions
         .iter()
         .filter_map(|(function, region)| {
-            (region.params.iter().any(|parameter| parameter.by_ref)
-                || region.returns_by_ref
-                || region_contains(region, |kind| {
-                    matches!(
-                        kind,
-                        RegionInstructionKind::NativeControl(RegionNativeControl::Throw { .. })
-                            | RegionInstructionKind::NativeDynamicCode(
-                                RegionNativeDynamicCode::MakeClosure { .. }
-                            )
-                    )
-                })
-                || region.attributes.iter().any(|attribute| {
-                    attribute
-                        .resolved_name
-                        .as_deref()
-                        .or(attribute.fallback_name.as_deref())
-                        .unwrap_or(&attribute.name)
-                        .trim_start_matches('\\')
-                        .eq_ignore_ascii_case("deprecated")
-                }))
+            (region_contains(region, |kind| {
+                matches!(
+                    kind,
+                    RegionInstructionKind::NativeControl(RegionNativeControl::Throw { .. })
+                        | RegionInstructionKind::NativeDynamicCode(
+                            RegionNativeDynamicCode::MakeClosure { .. }
+                        )
+                )
+            }) || region.attributes.iter().any(|attribute| {
+                attribute
+                    .resolved_name
+                    .as_deref()
+                    .or(attribute.fallback_name.as_deref())
+                    .unwrap_or(&attribute.name)
+                    .trim_start_matches('\\')
+                    .eq_ignore_ascii_case("deprecated")
+            }))
             .then_some(*function)
         })
         .collect::<BTreeSet<_>>();
@@ -10197,11 +10192,7 @@ pub(super) fn compile_region_graph_native(
             let RegionInstructionKind::NativeCall(call) = kind else {
                 return false;
             };
-            !matches!(call.result, RegionCallResult::ReferenceLocal(_))
-                && call
-                    .args
-                    .iter()
-                    .all(|argument| argument.name.is_none() && !argument.unpack)
+            call.args.iter().all(|argument| !argument.unpack)
                 && call.direct_compiled_target().is_some_and(resolver_target)
         })
     });
