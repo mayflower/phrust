@@ -10069,37 +10069,10 @@ pub(super) fn compile_region_graph_native(
     for candidate in regions.values_mut() {
         select_native_region_tier(candidate, &plan, &unit.constants);
     }
-    // Admission can deliberately downgrade an optimizing request when even
-    // one instruction family still belongs to the baseline-native runtime.
-    // The incoming plan was built for the requested tier and may therefore
-    // contain one large whole-region job. Re-plan the resulting graph before
-    // any CLIF construction so the downgrade cannot bypass baseline fragment
-    // ceilings or fail a valid PHP unit merely because its stale optimizing
-    // plan was oversized.
-    let replanned = split_oversized_region_blocks(
-        regions
-            .remove(&function)
-            .expect("compile group owns its requested function"),
-    );
-    regions.insert(function, replanned);
-    let plan = NativeCompilePlan::for_region(&regions[&function]);
-    if regions[&function].compile_metadata.tier == NativeCompilerTier::Generic
-        && let Some(fragment) = plan
-            .fragments
-            .iter()
-            .find(|fragment| !fragment.is_within_budget())
-    {
-        return Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_FRAGMENT_BUDGET",
-            format!(
-                "fragment {} exceeds the pre-Cranelift budget: blocks={} instructions={} estimated_clif_blocks={}",
-                fragment.id,
-                fragment.blocks.len(),
-                fragment.ir_instructions,
-                fragment.estimated_clif_blocks
-            ),
-        ));
-    }
+    // Ordinary functions remain one machine function. Region-block splitting
+    // is reserved for a measured backend limit after exact preflight; it is
+    // no longer a source-instruction chunking normal form.
+    let plan = compact_native_compile_plan(&regions[&function]);
     let region = &regions[&function];
     let compilation_mode = crate::cranelift_lowering::generic_streaming::compiler_for_tier(
         region.compile_metadata.tier,
@@ -15582,7 +15555,9 @@ pub(super) fn compile_region_graph_native(
             // underestimated fragment rejects the complete artifact only
             // after all preceding fragments have already been compiled.
             if active_fragment_layout.is_some() {
-                for replan_attempt in 0..=MAX_PRE_REGALLOC_REPLAN_ATTEMPTS {
+                let remaining_replan_attempts = MAX_PRE_REGALLOC_REPLAN_ATTEMPTS
+                    .saturating_sub(compiled_pre_regalloc_replans.get());
+                for replan_attempt in 0..=remaining_replan_attempts {
                     let mut offending_fragments = Vec::new();
                     let mut round_preflighted = BTreeMap::new();
                     if let Some(layout) = active_fragment_layout.as_ref() {
@@ -15654,11 +15629,11 @@ pub(super) fn compile_region_graph_native(
                         preflighted_fragments = round_preflighted;
                         break;
                     }
-                    if replan_attempt == MAX_PRE_REGALLOC_REPLAN_ATTEMPTS {
+                    if replan_attempt == remaining_replan_attempts {
                         return Err(CraneliftLoweringError::new(
                             "JIT_CRANELIFT_PRE_REGALLOC_REPLAN_LIMIT",
                             format!(
-                                "fragments {offending_fragments:?} still exceed the exact pre-regalloc safety margin after {MAX_PRE_REGALLOC_REPLAN_ATTEMPTS} deterministic replan rounds"
+                                "fragments {offending_fragments:?} still exceed the exact pre-regalloc safety margin after the single permitted deterministic natural split"
                             ),
                         ));
                     }
@@ -17154,10 +17129,10 @@ const MAX_OPTIMIZING_BLOCK_PARAMETERS: usize = 16_384;
 const PRE_REGALLOC_REPLAN_MARGIN_PERCENT: usize = 70;
 // The planner admits at most 64 Region blocks per fragment. Six bisection
 // rounds are therefore sufficient to reduce every splittable offender to one
-// Region block (ceil(log2(64))). A remaining offender is structurally
-// unsplittable and is rejected before regalloc; this is a proof-derived bound,
-// not a wall-time retry budget.
-const MAX_PRE_REGALLOC_REPLAN_ATTEMPTS: usize = 6;
+// Exact backend measurement may trigger one deterministic natural split. A
+// remaining offender is structurally unsplittable and is rejected before
+// regalloc; compiling progressively smaller guesses is not a routine plan.
+const MAX_PRE_REGALLOC_REPLAN_ATTEMPTS: usize = 1;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct PreRegallocMetrics {

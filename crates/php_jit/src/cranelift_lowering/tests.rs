@@ -14041,7 +14041,19 @@ fn function_scoped_compile_routes_same_unit_callee_through_entry_cell() {
     });
 
     assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    assert!(outcome.diagnostics[0].contains("plan_php_blocks="));
+    let diagnostic = &outcome.diagnostics[0];
+    assert!(diagnostic.contains("plan_php_blocks="));
+    let metric = |name: &str| {
+        diagnostic
+            .split_ascii_whitespace()
+            .find_map(|field| field.strip_prefix(name))
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("missing {name} in {diagnostic}"))
+    };
+    assert_eq!(metric("plan_fragments="), 1, "{diagnostic}");
+    assert_eq!(metric("pre_regalloc_replans="), 0, "{diagnostic}");
+    assert!(metric("clif_blocks=") <= 2_000, "{diagnostic}");
+    assert!(outcome.code_bytes <= 128 * 1_024, "{diagnostic}");
     let handle = outcome.handle.expect("direct-call region should compile");
     assert_eq!(handle.compiled_to_compiled_calls_per_invocation(), 1);
     let imports = handle
@@ -14076,6 +14088,44 @@ fn function_scoped_compile_routes_same_unit_callee_through_entry_cell() {
             .all(|entry| entry.function != callee)
     );
     assert_eq!(metadata.direct_callees, vec![callee]);
+}
+
+#[test]
+fn generic_artifact_identity_ignores_diagnostic_region_label() {
+    let (unit, function) = scalar_branch_fixture();
+    let mut backend = CraneliftNativeCompiler;
+    let first_request = JitCompileRequest::new("diagnostic-label-a")
+        .with_ir_fingerprint("stable-generic-artifact")
+        .with_dependency_identity("stable-generic-dependencies");
+    let first = backend.compile_region(&NativeCompileRequest {
+        compile: &first_request,
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+    });
+    assert_eq!(first.status, JitCompileStatus::Compiled, "{first:?}");
+    let first = first.handle.expect("first generic handle");
+
+    let second_request = JitCompileRequest::new("diagnostic-label-b")
+        .with_ir_fingerprint("stable-generic-artifact")
+        .with_dependency_identity("stable-generic-dependencies");
+    let second = backend.compile_region(&NativeCompileRequest {
+        compile: &second_request,
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+    });
+    assert_eq!(second.status, JitCompileStatus::Compiled, "{second:?}");
+    let second = second.handle.expect("reused generic handle");
+
+    assert_eq!(first.native_entry_address(), second.native_entry_address());
+    assert_eq!(
+        second
+            .code_manager_event()
+            .expect("code-manager cache disposition")
+            .process_cache_hits,
+        1
+    );
 }
 
 #[test]
@@ -16209,7 +16259,7 @@ fn ordinary_instructions_do_not_create_resume_or_clif_entry_blocks() {
 
 #[test]
 #[cfg(target_arch = "x86_64")]
-fn oversized_php_cfg_compiles_as_bounded_direct_native_fragments() {
+fn large_php_cfg_compiles_as_one_native_function() {
     let mut builder = IrBuilder::new(UnitId::new(711));
     let file = builder.add_file("native-fragments.php");
     let span = IrSpan::new(file, 0, 80);
@@ -16239,22 +16289,26 @@ fn oversized_php_cfg_compiles_as_bounded_direct_native_fragments() {
     });
     assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
     assert!(
-        outcome.diagnostics[0].contains("plan_fragments=5"),
+        outcome.diagnostics[0].contains("plan_fragments=1"),
         "{outcome:?}"
     );
-    let handle = outcome.handle.expect("fragmented function handle");
+    assert!(
+        outcome.diagnostics[0].contains("pre_regalloc_replans=0"),
+        "{outcome:?}"
+    );
+    let handle = outcome.handle.expect("function-scoped native handle");
     assert_eq!(handle.invoke_i64(&[], JIT_RUNTIME_ABI_HASH), Ok(299));
-    let metadata = handle.region_state_metadata().expect("fragment metadata");
+    let metadata = handle.region_state_metadata().expect("function metadata");
     assert_eq!(metadata.function_entries.len(), 1);
     assert_eq!(metadata.function_entries[0].function, function);
-    let relocatable = handle.relocatable_code().expect("fragment artifact");
+    let relocatable = handle.relocatable_code().expect("function artifact");
     assert_eq!(relocatable.root, function);
-    assert_eq!(relocatable.functions.len(), 6);
+    assert_eq!(relocatable.functions.len(), 1);
 }
 
 #[test]
 #[cfg(target_arch = "x86_64")]
-fn exact_preflight_fragments_planner_admitted_whole_optimizing_calls() {
+fn ordinary_optimizing_calls_need_no_pre_regalloc_replan() {
     let mut builder = IrBuilder::new(UnitId::new(4_234));
     let file = builder.add_file("native-exact-call-fragments.php");
     let span = IrSpan::new(file, 0, 1);
@@ -16276,12 +16330,12 @@ fn exact_preflight_fragments_planner_admitted_whole_optimizing_calls() {
     let caller = builder.start_function("exact_fragment_caller", FunctionFlags::default(), span);
     builder.set_entry(caller);
     builder.set_return_type(caller, Some(IrReturnType::Int));
-    let blocks = (0..200)
+    let blocks = (0..32)
         .map(|_| builder.append_block(caller))
         .collect::<Vec<_>>();
     let mut anchor_result = None;
     for (block_index, block) in blocks.iter().copied().enumerate() {
-        for _ in 0..3 {
+        for _ in 0..1 {
             let result = builder.alloc_register(caller);
             builder.emit(
                 caller,
@@ -16354,10 +16408,12 @@ fn exact_preflight_fragments_planner_admitted_whole_optimizing_calls() {
         .find_map(|field| field.strip_prefix("plan_fragments="))
         .and_then(|value| value.parse::<usize>().ok())
         .expect("compile diagnostic must report the refined fragment plan");
-    assert!(replans > 0, "{diagnostic}");
-    assert!(fragments > 1, "{diagnostic}");
+    assert_eq!(replans, 0, "{diagnostic}");
+    assert_eq!(fragments, 1, "{diagnostic}");
     let callee_handle = callee_outcome.handle.expect("native callee handle");
-    let caller_handle = outcome.handle.expect("fragmented native caller handle");
+    let caller_handle = outcome
+        .handle
+        .expect("function-scoped native caller handle");
     let mut baseline_entries = (0..unit.functions.len())
         .map(|_| std::sync::atomic::AtomicUsize::new(0))
         .collect::<Vec<_>>();
@@ -16380,13 +16436,13 @@ fn exact_preflight_fragments_planner_admitted_whole_optimizing_calls() {
     assert_eq!(
         caller_handle.invoke_i64(&[], JIT_RUNTIME_ABI_HASH),
         Ok(1),
-        "a native register live across exact fragment boundaries must retain its value"
+        "a native register live across direct calls must retain its value"
     );
 }
 
 #[test]
 #[cfg(target_arch = "x86_64")]
-fn implicit_method_receiver_survives_native_fragment_boundary() {
+fn implicit_method_receiver_survives_function_scoped_compile() {
     let mut builder = IrBuilder::new(UnitId::new(713));
     let file = builder.add_file("native-method-fragments.php");
     let span = IrSpan::new(file, 0, 80);
@@ -16457,10 +16513,10 @@ fn implicit_method_receiver_survives_native_fragment_boundary() {
     });
     assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
     assert!(
-        outcome.diagnostics[0].contains("plan_fragments=5"),
+        outcome.diagnostics[0].contains("plan_fragments=1"),
         "{outcome:?}"
     );
-    let handle = outcome.handle.expect("fragmented method handle");
+    let handle = outcome.handle.expect("function-scoped method handle");
     assert_eq!(handle.invoke_i64(&[73], JIT_RUNTIME_ABI_HASH), Ok(73));
     assert_eq!(
         handle
@@ -16469,52 +16525,6 @@ fn implicit_method_receiver_survives_native_fragment_boundary() {
             .compiler_tier,
         crate::region_ir::NativeCompilerTier::Generic
     );
-}
-
-#[test]
-#[cfg(target_arch = "x86_64")]
-fn cross_fragment_backedge_does_not_alias_osr_entry_zero() {
-    let mut builder = IrBuilder::new(UnitId::new(712));
-    let file = builder.add_file("native-fragment-backedge.php");
-    let span = IrSpan::new(file, 0, 80);
-    let function =
-        builder.start_function("native_fragment_backedge", FunctionFlags::default(), span);
-    builder.set_entry(function);
-    builder.set_return_type(function, Some(IrReturnType::Int));
-    let blocks = (0..300)
-        .map(|_| builder.append_block(function))
-        .collect::<Vec<_>>();
-    builder.terminate_jump(function, blocks[0], blocks[299], span);
-    for (index, block) in blocks.iter().copied().enumerate().skip(1).take(298) {
-        let constant = builder.add_constant(IrConstant::Int(if index == 1 { 42 } else { 0 }));
-        let value = builder.alloc_register(function);
-        builder.emit_load_const(function, block, value, constant, span);
-        builder.terminate_return(function, block, Some(Operand::Register(value)), span);
-    }
-    builder.terminate_jump(function, blocks[299], blocks[1], span);
-    let unit = builder.finish();
-    let mut backend = CraneliftNativeCompiler;
-    let outcome = backend.compile_region(&NativeCompileRequest {
-        compile: &JitCompileRequest::new("cl.region.fragment-backedge"),
-        unit: Some(&unit),
-        function: Some(function),
-        runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
-    });
-    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let plan_fragments = outcome.diagnostics[0]
-        .split_ascii_whitespace()
-        .find_map(|field| field.strip_prefix("plan_fragments="))
-        .and_then(|value| value.parse::<usize>().ok())
-        .expect("compile diagnostic must report the final fragment count");
-    assert!(plan_fragments > 1, "{outcome:?}");
-    let handle = outcome.handle.expect("fragmented backedge handle");
-    assert_eq!(handle.invoke_i64(&[], JIT_RUNTIME_ABI_HASH), Ok(42));
-    let osr = handle
-        .region_state_metadata()
-        .and_then(|metadata| metadata.osr_entries.first())
-        .expect("backedge must publish an OSR entry");
-    assert_eq!(osr.id, 0);
-    assert_eq!(osr.block, blocks[1]);
 }
 
 #[test]

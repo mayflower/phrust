@@ -97,7 +97,7 @@ use jit_abi::{
 };
 use php_runtime::api::{OutputBuffer, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Process-owned state shared by native request coordinators.
@@ -110,6 +110,7 @@ pub struct VmWorkerState {
     tiering_options: crate::tiering::TieringOptions,
     tiering_state: Arc<Mutex<BackgroundTieringState>>,
     native_request_pool: Arc<Mutex<jit_abi::NativeRequestPool>>,
+    native_compile_descriptors: Arc<Mutex<Vec<crate::counters::NativeCompileDescriptor>>>,
 }
 
 #[derive(Debug, Default)]
@@ -176,38 +177,105 @@ type NativeOptimizationJob = Box<dyn FnOnce() + Send + 'static>;
 /// independent code generators from doubling RSS and competing for the same
 /// CPU after a request boundary.
 const NATIVE_OPTIMIZATION_WORKERS: usize = 1;
-const NATIVE_OPTIMIZATION_QUEUE_CAPACITY: usize = 1;
 const NATIVE_OPTIMIZATION_BATCH_CAPACITY: usize = 128;
 
-static NATIVE_OPTIMIZATION_QUEUE: OnceLock<mpsc::SyncSender<NativeOptimizationJob>> =
-    OnceLock::new();
+struct PendingNativeOptimization {
+    heat: u64,
+    job: NativeOptimizationJob,
+}
 
-fn submit_native_optimization_job(job: impl FnOnce() + Send + 'static) -> bool {
-    let sender = NATIVE_OPTIMIZATION_QUEUE.get_or_init(|| {
-        let (sender, receiver) =
-            mpsc::sync_channel::<NativeOptimizationJob>(NATIVE_OPTIMIZATION_QUEUE_CAPACITY);
-        let receiver = Arc::new(Mutex::new(receiver));
+#[derive(Default)]
+struct NativeOptimizationSchedulerState {
+    pending: HashMap<native_compile_cache::NativeCompileCacheKey, PendingNativeOptimization>,
+    running: HashSet<native_compile_cache::NativeCompileCacheKey>,
+}
+
+struct NativeOptimizationScheduler {
+    state: Mutex<NativeOptimizationSchedulerState>,
+    ready: Condvar,
+}
+
+impl NativeOptimizationScheduler {
+    fn start(thread_prefix: &str) -> Arc<Self> {
+        let scheduler = Arc::new(Self {
+            state: Mutex::new(NativeOptimizationSchedulerState::default()),
+            ready: Condvar::new(),
+        });
         for index in 0..NATIVE_OPTIMIZATION_WORKERS {
-            let receiver = Arc::clone(&receiver);
+            let worker = Arc::clone(&scheduler);
             std::thread::Builder::new()
-                .name(format!("phrust-optimize-{index}"))
-                .spawn(move || {
-                    loop {
-                        let job = lock_unpoisoned(&receiver).recv();
-                        let Ok(job) = job else {
-                            break;
-                        };
-                        job();
-                    }
-                })
+                .name(format!("{thread_prefix}-{index}"))
+                .spawn(move || worker.run())
                 .expect("native optimization worker must start");
         }
-        sender
-    });
-    // Optimization is never allowed to delay a request. Request completion
-    // submits the hottest candidates first; a full queue rejects the colder
-    // tail and lets a later request reconsider it after more entry evidence.
-    sender.try_send(Box::new(job)).is_ok()
+        scheduler
+    }
+
+    fn submit(
+        &self,
+        key: native_compile_cache::NativeCompileCacheKey,
+        heat: u64,
+        job: NativeOptimizationJob,
+    ) {
+        let mut state = lock_unpoisoned(&self.state);
+        if state.running.contains(&key) {
+            return;
+        }
+        if let Some(pending) = state.pending.get_mut(&key) {
+            pending.heat = pending.heat.max(heat);
+            return;
+        }
+        state
+            .pending
+            .insert(key, PendingNativeOptimization { heat, job });
+        self.ready.notify_one();
+    }
+
+    fn run(&self) {
+        loop {
+            let batch = {
+                let mut state = lock_unpoisoned(&self.state);
+                while state.pending.is_empty() {
+                    state = self
+                        .ready
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                let mut candidates = state
+                    .pending
+                    .iter()
+                    .map(|(key, pending)| (*key, pending.heat))
+                    .collect::<Vec<_>>();
+                candidates.sort_unstable_by(|left, right| {
+                    right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0))
+                });
+                candidates
+                    .into_iter()
+                    .take(NATIVE_OPTIMIZATION_BATCH_CAPACITY)
+                    .filter_map(|(key, _)| {
+                        let pending = state.pending.remove(&key)?;
+                        state.running.insert(key);
+                        Some((key, pending.job))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for (key, job) in batch {
+                job();
+                lock_unpoisoned(&self.state).running.remove(&key);
+            }
+        }
+    }
+}
+
+static NATIVE_OPTIMIZATION_SCHEDULER: OnceLock<Arc<NativeOptimizationScheduler>> = OnceLock::new();
+
+fn submit_native_optimization_job(
+    decision: BackgroundTieringDecision,
+    job: impl FnOnce() + Send + 'static,
+) {
+    NATIVE_OPTIMIZATION_SCHEDULER
+        .get_or_init(|| NativeOptimizationScheduler::start("phrust-optimize"))
+        .submit(decision.key, decision.entries, Box::new(job));
 }
 
 impl Default for VmWorkerState {
@@ -225,6 +293,7 @@ impl Default for VmWorkerState {
             tiering_options,
             tiering_state: Arc::new(Mutex::new(BackgroundTieringState::default())),
             native_request_pool: Arc::new(Mutex::new(jit_abi::NativeRequestPool::default())),
+            native_compile_descriptors: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -260,6 +329,7 @@ impl VmWorkerState {
             tiering_options: crate::tiering::TieringOptions::default(),
             tiering_state: Arc::new(Mutex::new(BackgroundTieringState::default())),
             native_request_pool: Arc::new(Mutex::new(jit_abi::NativeRequestPool::default())),
+            native_compile_descriptors: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -278,6 +348,113 @@ impl VmWorkerState {
     #[must_use]
     pub fn native_compile_cache_stats(&self) -> NativeCompileCacheStats {
         self.native_compiles.stats()
+    }
+
+    fn record_native_compile_descriptor(
+        &self,
+        unit: &CompiledUnit,
+        function: php_ir::FunctionId,
+        options: &VmOptions,
+        function_ir_fingerprint: &str,
+        external_signatures_hash: u64,
+        background: bool,
+        disposition: native_compile_cache::NativeCompileCacheDisposition,
+        records: &[php_jit::JitUnitCompileRecord],
+    ) {
+        if !options.collect_counters || !disposition.compiled() {
+            return;
+        }
+        const MAX_NATIVE_COMPILE_DESCRIPTORS: usize = 4_096;
+        let Some(record) = records.iter().find(|record| record.function == function) else {
+            return;
+        };
+        let metadata = &unit.unit().functions[function.index()];
+        let receiver_layout_hash = unit
+            .prepared_method_specializations(function)
+            .into_iter()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, specialization| {
+                (hash ^ specialization.receiver_layout_id).wrapping_mul(0x0000_0100_0000_01b3)
+            });
+        let replan_index = record
+            .result
+            .diagnostics
+            .iter()
+            .filter_map(|diagnostic| {
+                diagnostic
+                    .split("pre_regalloc_replans=")
+                    .nth(1)
+                    .and_then(|value| value.split_whitespace().next())
+                    .and_then(|value| value.parse::<u32>().ok())
+            })
+            .max()
+            .unwrap_or(0);
+        let publication_result = match record.result.status {
+            php_jit::JitCompileStatus::Compiled => "compiled-awaiting-publication".to_owned(),
+            php_jit::JitCompileStatus::Rejected { ref reason } => {
+                format!("rejected:{reason}")
+            }
+        };
+        let target_isa = php_jit::cranelift_host_isa_identity().map_or_else(
+            |_| "unavailable".to_owned(),
+            |identity| {
+                format!(
+                    "{}:{}:{}",
+                    identity.target_triple, identity.isa_name, identity.feature_fingerprint
+                )
+            },
+        );
+        let mut descriptors = lock_unpoisoned(&self.native_compile_descriptors);
+        if descriptors.len() >= MAX_NATIVE_COMPILE_DESCRIPTORS {
+            return;
+        }
+        descriptors.push(crate::counters::NativeCompileDescriptor {
+            source_identity: unit.prepared_dependency_identity().to_owned(),
+            function_id: function.raw(),
+            function_name: metadata.name.clone(),
+            ir_fingerprint: function_ir_fingerprint.to_owned(),
+            tier: options.native_optimization.as_str().to_owned(),
+            generic_key: format!(
+                "{}:function:{}:generic",
+                unit.cache_identity(),
+                function.raw()
+            ),
+            specialization: format!("external-signatures-{external_signatures_hash:016x}"),
+            external_signatures_hash,
+            receiver_layout_hash,
+            trigger: if background {
+                "entry-or-backedge-heat"
+            } else {
+                "foreground-or-precompile"
+            }
+            .to_owned(),
+            cache_disposition: format!("{disposition:?}").to_ascii_lowercase(),
+            replan_index,
+            publication_result,
+            code_bytes: record.result.stats.native_code_bytes,
+            compile_time_nanos: record.result.stats.native_compile_time_nanos,
+            target_isa,
+            runtime_abi_hash: php_jit::JIT_RUNTIME_ABI_HASH,
+            helper_abi_hash: php_jit::JIT_HELPER_REGISTRY_ABI_HASH,
+            config_hash: u64::from(options.native_optimization.opt_level())
+                | (u64::from(options.collect_counters) << 8),
+        });
+    }
+
+    pub(super) fn record_native_publication_result(
+        &self,
+        unit: &CompiledUnit,
+        function: php_ir::FunctionId,
+        tier: NativeOptimizationPolicy,
+        result: &str,
+    ) {
+        let mut descriptors = lock_unpoisoned(&self.native_compile_descriptors);
+        if let Some(descriptor) = descriptors.iter_mut().rev().find(|descriptor| {
+            descriptor.source_identity == unit.prepared_dependency_identity()
+                && descriptor.function_id == function.raw()
+                && descriptor.tier == tier.as_str()
+        }) {
+            descriptor.publication_result = result.to_owned();
+        }
     }
 
     /// Returns process-worker threshold and background publication counters.
@@ -358,8 +535,14 @@ impl VmWorkerState {
         // those calls to the generic baseline dispatcher. Complete the
         // compile-time set with late-bound link records here; publication
         // fills the same slots once the target unit is declared.
-        let external_signatures =
-            linked_external_function_signatures(unit, function, external_signatures);
+        let external_signatures = if options.native_optimization.is_optimizing() {
+            linked_external_function_signatures(unit, function, external_signatures)
+        } else {
+            // Generic code owns writable link cells for every immutable source
+            // callsite. Current declaration visibility and signatures are
+            // runtime table state, not machine-code identity.
+            linked_external_function_signatures(unit, function, &[])
+        };
         let external_signatures = external_signatures.as_slice();
         let function_metadata = unit
             .unit()
@@ -438,6 +621,16 @@ impl VmWorkerState {
         } else {
             self.native_compiles.get_or_compile(key, compile)
         }?;
+        self.record_native_compile_descriptor(
+            unit,
+            function,
+            options,
+            function_ir_fingerprint,
+            external_signatures_hash,
+            background,
+            compiled.1,
+            &compiled.0,
+        );
         if !background
             && options.native_optimization == NativeOptimizationPolicy::Optimizing
             && compiled.0.iter().any(|record| {
@@ -517,13 +710,10 @@ impl VmWorkerState {
                 )
             })?;
         let previous_address = baseline_cell.load(std::sync::atomic::Ordering::Acquire);
-        if previous_address != 0 && external_signatures.is_empty() {
-            // A baseline artifact has no external ABI specialization when
-            // this function owns no linked dependencies. Its deployment cell
-            // is therefore the complete publication proof; rebuilding a
-            // worker cache key here adds one identity lookup (and, across
-            // baseline policies, an unnecessary third artifact) to every
-            // optimizing publication.
+        if previous_address != 0 {
+            // Generic code is independent of current link signatures. The
+            // deployment cell is therefore the complete publication proof;
+            // mutable link cells can change without rebuilding this body.
             let _ = preferred.compare_exchange(
                 0,
                 previous_address,
@@ -602,6 +792,12 @@ impl VmWorkerState {
         {
             unit.publish_preferred_function_metadata(function, &baseline);
         }
+        self.record_native_publication_result(
+            unit,
+            function,
+            NativeOptimizationPolicy::Generic,
+            "published-generic",
+        );
         Ok(address)
     }
 
@@ -665,12 +861,9 @@ impl VmWorkerState {
             external_signatures,
         };
         let worker = self.clone();
-        let submitted = submit_native_optimization_job(move || {
+        submit_native_optimization_job(decision, move || {
             worker.run_background_optimization(work);
         });
-        if !submitted {
-            self.reject_submitted_optimizations(std::slice::from_ref(&decision));
-        }
     }
 
     fn claim_background_optimization(&self, decision: BackgroundTieringDecision) -> bool {
@@ -702,20 +895,6 @@ impl VmWorkerState {
         state.scheduled.insert(decision.key);
         state.stats.optimized_candidates = state.stats.optimized_candidates.saturating_add(1);
         true
-    }
-
-    fn reject_submitted_optimizations(&self, decisions: &[BackgroundTieringDecision]) {
-        if decisions.is_empty() {
-            return;
-        }
-        let mut state = lock_unpoisoned(&self.tiering_state);
-        for decision in decisions {
-            state.scheduled.remove(&decision.key);
-        }
-        state.stats.native_compile_budget_rejections = state
-            .stats
-            .native_compile_budget_rejections
-            .saturating_add(u64::try_from(decisions.len()).unwrap_or(u64::MAX));
     }
 
     fn run_background_optimization(&self, work: BackgroundOptimizationWork) {
@@ -778,6 +957,12 @@ impl VmWorkerState {
                     .publish_preferred_function_metadata(work.function, handle);
             }
             cell.store(address, std::sync::atomic::Ordering::Release);
+            self.record_native_publication_result(
+                &work.unit,
+                work.function,
+                NativeOptimizationPolicy::Optimizing,
+                "published-preferred",
+            );
         }
         let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         let mut state = lock_unpoisoned(&self.tiering_state);
@@ -836,15 +1021,12 @@ impl VmWorkerState {
         if work.is_empty() {
             return;
         }
-        let decisions = work.iter().map(|work| work.decision).collect::<Vec<_>>();
-        let worker = self.clone();
-        let submitted = submit_native_optimization_job(move || {
-            for work in work {
+        for work in work {
+            let decision = work.decision;
+            let worker = self.clone();
+            submit_native_optimization_job(decision, move || {
                 worker.run_background_optimization(work);
-            }
-        });
-        if !submitted {
-            self.reject_submitted_optimizations(&decisions);
+            });
         }
     }
 
@@ -1160,10 +1342,10 @@ fn native_dependency_signature_hash(
     external_signatures: &[php_jit::JitExternalFunctionSignature],
     include_method_specializations: bool,
 ) -> u64 {
-    let mut hash = external_function_signatures_hash(external_signatures);
     if !include_method_specializations {
-        return hash;
+        return 0;
     }
+    let mut hash = external_function_signatures_hash(external_signatures);
     for specialization in unit.prepared_method_specializations(function) {
         hash =
             (hash ^ u64::from(specialization.instruction_id)).wrapping_mul(0x0000_0100_0000_01b3);
@@ -1224,60 +1406,71 @@ impl Vm {
     /// Compile and publish native entries without entering application code.
     #[must_use]
     pub fn prewarm_cranelift(&self, unit: &CompiledUnit) -> u64 {
-        let entry = unit.unit().entry;
-        if unit.unit().functions.get(entry.index()).is_none() {
+        if unit.unit().functions.is_empty() {
             return 0;
         }
         let deployment = unit.prepared_deployment_image();
+        let functions = (0..unit.unit().functions.len())
+            .map(|index| php_ir::FunctionId::new(u32::try_from(index).unwrap_or(u32::MAX)))
+            .collect::<Vec<_>>();
         if self.options.native_optimization == NativeOptimizationPolicy::Optimizing {
             let mut baseline_options = self.options.clone();
             baseline_options.native_optimization = NativeOptimizationPolicy::Generic;
             baseline_options.tiering.enabled = false;
-            let Ok(baseline) =
-                self.worker_state
-                    .resolve_native_function(unit, entry, &baseline_options, &[])
-            else {
-                return 0;
-            };
-            let Some(baseline_address) = baseline.native_entry_address() else {
-                return 0;
-            };
-            if let Some(cell) = deployment.generic_function_entries.get(entry.index()) {
-                cell.store(baseline_address, std::sync::atomic::Ordering::Release);
+            let mut compiled = Vec::with_capacity(functions.len());
+            for function in functions.iter().copied() {
+                let Ok(generic) = self.worker_state.resolve_native_function(
+                    unit,
+                    function,
+                    &baseline_options,
+                    &[],
+                ) else {
+                    return 0;
+                };
+                let Ok(optimizing) =
+                    self.worker_state
+                        .resolve_native_function(unit, function, &self.options, &[])
+                else {
+                    return 0;
+                };
+                let (Some(generic_address), Some(optimizing_address)) = (
+                    generic.native_entry_address(),
+                    optimizing.native_entry_address(),
+                ) else {
+                    return 0;
+                };
+                if !optimizing.region_state_metadata().is_some_and(|metadata| {
+                    metadata.compiler_tier == php_jit::region_ir::NativeCompilerTier::Optimizing
+                }) {
+                    return 0;
+                }
+                compiled.push((function, generic_address, optimizing_address, optimizing));
             }
-            let Ok(optimizing) =
-                self.worker_state
-                    .resolve_native_function(unit, entry, &self.options, &[])
-            else {
-                return 0;
-            };
-            let Some(address) = optimizing.native_entry_address() else {
-                return 0;
-            };
-            if !optimizing.region_state_metadata().is_some_and(|metadata| {
-                metadata.compiler_tier == php_jit::region_ir::NativeCompilerTier::Optimizing
-            }) {
-                return 0;
-            }
-            if let Some(preferred) = deployment.preferred_function_entries.get(entry.index()) {
-                unit.publish_preferred_function_metadata(entry, &optimizing);
-                preferred.store(address, std::sync::atomic::Ordering::Release);
+            for (function, generic_address, optimizing_address, optimizing) in compiled {
+                deployment.generic_function_entries[function.index()]
+                    .store(generic_address, std::sync::atomic::Ordering::Release);
+                unit.publish_preferred_function_metadata(function, &optimizing);
+                deployment.preferred_function_entries[function.index()]
+                    .store(optimizing_address, std::sync::atomic::Ordering::Release);
             }
         } else {
-            let Ok(handle) =
-                self.worker_state
-                    .resolve_native_function(unit, entry, &self.options, &[])
-            else {
-                return 0;
-            };
-            let Some(address) = handle.native_entry_address() else {
-                return 0;
-            };
-            if let Some(baseline) = deployment.generic_function_entries.get(entry.index()) {
-                baseline.store(address, std::sync::atomic::Ordering::Release);
+            let mut compiled = Vec::with_capacity(functions.len());
+            for function in functions.iter().copied() {
+                let Ok(handle) =
+                    self.worker_state
+                        .resolve_native_function(unit, function, &self.options, &[])
+                else {
+                    return 0;
+                };
+                let Some(address) = handle.native_entry_address() else {
+                    return 0;
+                };
+                compiled.push((function, address, handle));
             }
-            if let Some(preferred) = deployment.preferred_function_entries.get(entry.index())
-                && preferred
+            for (function, address, handle) in compiled {
+                deployment.generic_function_entries[function.index()]
+                    .store(address, std::sync::atomic::Ordering::Release);
+                if deployment.preferred_function_entries[function.index()]
                     .compare_exchange(
                         0,
                         address,
@@ -1285,11 +1478,12 @@ impl Vm {
                         std::sync::atomic::Ordering::Acquire,
                     )
                     .is_ok()
-            {
-                unit.publish_preferred_function_metadata(entry, &handle);
+                {
+                    unit.publish_preferred_function_metadata(function, &handle);
+                }
             }
         }
-        1
+        u64::try_from(functions.len()).unwrap_or(u64::MAX)
     }
 
     /// Compiles one selected function with the production Cranelift helper ABI
@@ -1399,15 +1593,13 @@ impl Vm {
             let mut result =
                 Vm::with_options_and_worker_state(baseline_options, self.worker_state.clone())
                     .execute_with_external_function_signatures(unit.clone(), external_signatures);
-            if result.status.is_success() {
-                self.worker_state.schedule_background_optimization(
-                    decision,
-                    unit,
-                    entry,
-                    &self.options,
-                    external_signatures.to_vec(),
-                );
-            }
+            self.worker_state.schedule_background_optimization(
+                decision,
+                unit,
+                entry,
+                &self.options,
+                external_signatures.to_vec(),
+            );
             if self.options.tiering.collect_stats {
                 result.tiering_stats = Some(Box::new(self.worker_state.tiering_stats()));
             }
@@ -1970,6 +2162,13 @@ impl Vm {
             counters.native_compile_successes = worker_cache.insertions;
             counters.native_compile_failures = worker_cache.compile_failures;
             counters.native_compile_time_nanos = result.native_compile_nanos;
+            counters.native_compile_descriptors =
+                lock_unpoisoned(&self.worker_state.native_compile_descriptors).clone();
+            counters.native_compile_code_bytes = counters
+                .native_compile_descriptors
+                .iter()
+                .map(|descriptor| descriptor.code_bytes)
+                .sum();
             counters.native_execution_entries =
                 counters.native_execution_entries.max(u64::from(executed));
             counters.native_region_entries =
@@ -2051,7 +2250,11 @@ fn native_compile_cache_key(
     external_signatures: &[php_jit::JitExternalFunctionSignature],
 ) -> native_compile_cache::NativeCompileCacheKey {
     let external_signatures =
-        linked_external_function_signatures(unit, function, external_signatures);
+        if optimization_level >= NativeOptimizationPolicy::Optimizing.opt_level() {
+            linked_external_function_signatures(unit, function, external_signatures)
+        } else {
+            linked_external_function_signatures(unit, function, &[])
+        };
     native_compile_cache::NativeCompileCacheKey::new(
         unit.cache_identity(),
         function,

@@ -80,6 +80,12 @@ impl VmWorkerState {
                 unit.publish_preferred_function_metadata(function, handle);
             }
             self.prepare_native_direct_callees(unit, handle, options, external_signatures)?;
+            self.record_native_publication_result(
+                unit,
+                function,
+                NativeOptimizationPolicy::Generic,
+                "published-generic",
+            );
             return Ok(());
         }
         let root_signatures =
@@ -115,6 +121,12 @@ impl VmWorkerState {
             })?;
         unit.publish_preferred_function_metadata(function, handle);
         preferred.store(address, std::sync::atomic::Ordering::Release);
+        self.record_native_publication_result(
+            unit,
+            function,
+            NativeOptimizationPolicy::Optimizing,
+            "published-preferred",
+        );
         Ok(())
     }
 }

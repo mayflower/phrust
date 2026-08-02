@@ -346,7 +346,6 @@ mod native_linkage;
 mod terminators;
 mod value_lowering;
 
-use module_layout::split_oversized_region_blocks;
 pub use module_layout::{NATIVE_FRAGMENT_PLAN_SCHEMA_VERSION, NativeCompilePlan};
 pub use native_linkage::{
     NativeFunctionKey, NativeFunctionTier, NativeIndirectionCell, NativeIndirectionState,
@@ -361,6 +360,28 @@ pub const fn native_compiler_mode_identity(optimizing: bool) -> &'static str {
     } else {
         native_linkage::GENERIC_FUNCTION_SPECIALIZATION
     }
+}
+
+fn compact_native_compile_plan(region: &RegionGraph) -> NativeCompilePlan {
+    let mut plan = NativeCompilePlan::for_region(region);
+    if !region.osr_entries().is_empty()
+        || plan.suspension_points != 0
+        || plan.exception_regions != 0
+    {
+        // OSR, suspension, and exception resumes are deliberate generated
+        // entry boundaries. Preserve those natural cuts while ordinary PHP
+        // functions use one source-CFG machine function.
+        return plan;
+    }
+    plan.fragments = vec![module_layout::NativeFragmentPlan {
+        id: 0,
+        blocks: region.blocks.iter().map(|block| block.id).collect(),
+        ir_instructions: plan.ir_instructions,
+        estimated_clif_blocks: plan.estimated_clif_blocks,
+        maximum_estimated_live_set: plan.maximum_estimated_live_set,
+        safepoint_live_set_sum: plan.safepoint_live_set_sum,
+    }];
+    plan
 }
 
 use call_metadata::*;
@@ -1317,15 +1338,22 @@ fn compile_managed_native(
         .dependency_identity
         .clone()
         .unwrap_or_else(|| format!("ir:{compiled_unit}"));
+    let compiler_tier = if request.opt_level < 2 {
+        "generic"
+    } else {
+        "optimizing"
+    };
     let key = CraneliftCodeKey {
         compiled_unit,
-        region: format!("{}:function:{}", request.region_id, function.raw()),
-        abi_hash: JIT_RUNTIME_ABI_HASH,
-        compiler_tier: if request.opt_level < 2 {
-            "generic".to_owned()
+        region: if request.opt_level < 2 {
+            // Generic identity is the authoritative source function, not the
+            // caller-provided compilation label used by diagnostics.
+            format!("function:{}", function.raw())
         } else {
-            "optimizing".to_owned()
+            format!("{}:function:{}", request.region_id, function.raw())
         },
+        abi_hash: JIT_RUNTIME_ABI_HASH,
+        compiler_tier: compiler_tier.to_owned(),
         helper_abi_hash: JIT_RUNTIME_ABI_HASH
             ^ crate::JIT_HELPER_REGISTRY_ABI_HASH
             ^ php_runtime::api::NATIVE_OPERATION_ABI_HASH,
@@ -1508,7 +1536,6 @@ fn compile_authoritative_region(request: &NativeCompileRequest<'_>) -> NativeCom
             );
         }
     };
-    let region = split_oversized_region_blocks(region);
     if let Err(error) = region.verify() {
         return NativeCompileOutcome::skipped(
             JitCompileStatus::Rejected {
@@ -1517,7 +1544,7 @@ fn compile_authoritative_region(request: &NativeCompileRequest<'_>) -> NativeCom
             format!("normalized native Region IR failed verification: {error}"),
         );
     }
-    let plan = NativeCompilePlan::for_region(&region);
+    let plan = compact_native_compile_plan(&region);
     if plan.function != function {
         return NativeCompileOutcome::skipped(
             JitCompileStatus::Rejected {

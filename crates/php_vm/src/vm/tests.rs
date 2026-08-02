@@ -76,6 +76,167 @@ fn background_tiering_test_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[test]
+fn optimizing_scheduler_retains_more_than_one_pending_batch() {
+    let scheduler = NativeOptimizationScheduler::start("phrust-optimize-test-batch");
+    let (completed, receiver) = std::sync::mpsc::channel();
+    let jobs = NATIVE_OPTIMIZATION_BATCH_CAPACITY + 17;
+    for function in 0..jobs {
+        let key = native_compile_cache::NativeCompileCacheKey::new(
+            0x51a7,
+            php_ir::FunctionId::new(u32::try_from(function).expect("test function id")),
+            NativeOptimizationPolicy::Optimizing.opt_level(),
+            0,
+        );
+        let completed = completed.clone();
+        scheduler.submit(
+            key,
+            u64::try_from(jobs - function).expect("test heat"),
+            Box::new(move || completed.send(function).expect("test completion receiver")),
+        );
+    }
+    drop(completed);
+    let mut observed = HashSet::new();
+    for _ in 0..jobs {
+        observed.insert(
+            receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("every queued optimizer candidate completes"),
+        );
+    }
+    assert_eq!(observed.len(), jobs);
+}
+
+#[test]
+fn generic_native_key_ignores_current_external_signature_state() {
+    let unit = external_call_unit();
+    let function = unit.unit().entry;
+    let link_index = unit.prepared_external_function_calls(function)[0].link_index;
+    let unpublished = php_jit::JitExternalFunctionSignature {
+        name: "external_helper".to_owned(),
+        link_index,
+        published: false,
+        params: Vec::new(),
+        native_params: Vec::new(),
+        native_default_constant_indices: Vec::new(),
+        native_arity: 0,
+        requires_non_reference_trampoline: false,
+        returns_by_reference: false,
+        return_type: None,
+        exception_routes: None,
+    };
+    let mut published = unpublished.clone();
+    published.published = true;
+    published.native_arity = 2;
+
+    let generic_unpublished = native_compile_cache_key(
+        &unit,
+        function,
+        NativeOptimizationPolicy::Generic.opt_level(),
+        std::slice::from_ref(&unpublished),
+    );
+    let generic_published = native_compile_cache_key(
+        &unit,
+        function,
+        NativeOptimizationPolicy::Generic.opt_level(),
+        std::slice::from_ref(&published),
+    );
+    assert_eq!(generic_unpublished, generic_published);
+
+    let optimizing_unpublished = native_compile_cache_key(
+        &unit,
+        function,
+        NativeOptimizationPolicy::Optimizing.opt_level(),
+        &[unpublished],
+    );
+    let optimizing_published = native_compile_cache_key(
+        &unit,
+        function,
+        NativeOptimizationPolicy::Optimizing.opt_level(),
+        &[published],
+    );
+    assert_ne!(optimizing_unpublished, optimizing_published);
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn native_compile_descriptor_attributes_identity_trigger_and_publication() {
+    let options = VmOptions {
+        native_optimization: NativeOptimizationPolicy::Generic,
+        native_cache: php_jit::NativeCacheMode::Off,
+        collect_counters: true,
+        ..VmOptions::default()
+    };
+    let result = Vm::with_options(options).execute(returning_unit(7_302));
+    assert_eq!(result.return_value, Some(Value::Int(7_302)), "{result:#?}");
+    let counters = result.counters.expect("native counters");
+    let descriptor = counters
+        .native_compile_descriptors
+        .first()
+        .expect("bounded compile-cause descriptor");
+    assert_eq!(descriptor.tier, "generic");
+    assert_eq!(descriptor.trigger, "foreground-or-precompile");
+    assert_eq!(descriptor.cache_disposition, "miss");
+    assert_eq!(descriptor.publication_result, "published-generic");
+    assert_eq!(descriptor.replan_index, 0);
+    assert!(descriptor.generic_key.ends_with(":generic"));
+    assert_eq!(descriptor.external_signatures_hash, 0);
+    assert!(descriptor.code_bytes > 0);
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn unsuccessful_request_still_schedules_observed_hot_entry() {
+    let _guard = background_tiering_test_guard();
+    let tiering = crate::tiering::TieringOptions {
+        collect_stats: true,
+        function_entry_threshold: 1,
+        native_max_functions: 1,
+        ..crate::tiering::TieringOptions::default()
+    };
+    let worker = VmWorkerState::new_with_background_tiering(tiering.clone());
+    let options = VmOptions {
+        native_optimization: NativeOptimizationPolicy::Optimizing,
+        native_cache: php_jit::NativeCacheMode::Off,
+        tiering,
+        ..VmOptions::default()
+    };
+    let mut builder = IrBuilder::new(UnitId::new(992));
+    let file = builder.add_file("unsuccessful-hot-entry.php");
+    let span = IrSpan::new(file, 0, 1);
+    let function = builder.start_function("main", FunctionFlags::default(), span);
+    let block = builder.append_block(function);
+    builder.emit(
+        function,
+        block,
+        InstructionKind::RuntimeError {
+            diagnostic_id: "E_HOT_FAILURE".to_owned(),
+            message: "observed failure".to_owned(),
+        },
+        span,
+    );
+    builder.terminate_return(function, block, None, span);
+    builder.set_entry(function);
+    let unit = CompiledUnit::new(builder.finish());
+
+    let result = Vm::with_options_and_worker_state(options, worker.clone()).execute(unit);
+    assert!(!result.status.is_success(), "{result:#?}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !lock_unpoisoned(&worker.tiering_state).scheduled.is_empty() && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(worker.tiering_stats().optimized_candidates, 1);
+    let state = lock_unpoisoned(&worker.tiering_state);
+    assert!(state.scheduled.is_empty());
+    assert_eq!(
+        state.stats.native_compiled_functions
+            + u64::try_from(state.failed.len()).unwrap_or(u64::MAX),
+        1,
+        "the unsuccessful request's observed entry must be processed"
+    );
+}
+
+#[test]
 #[cfg(target_arch = "x86_64")]
 fn server_worker_publishes_optimized_entry_after_hot_baseline_threshold() {
     let _guard = background_tiering_test_guard();
@@ -241,7 +402,7 @@ fn background_cross_unit_optimizer_waits_for_foreground_publication_boundary() {
 
 #[test]
 #[cfg(target_arch = "x86_64")]
-fn baseline_publication_replaces_a_stale_external_signature_variant() {
+fn baseline_publication_reuses_code_across_external_signature_changes() {
     let worker = VmWorkerState::new(crate::tiering::TieringOptions::default());
     let unit = external_call_unit();
     let function = unit.unit().entry;
@@ -284,7 +445,7 @@ fn baseline_publication_replaces_a_stale_external_signature_variant() {
         .expect("post-declaration baseline publication");
 
     assert_ne!(first, 0);
-    assert_ne!(second, 0);
+    assert_eq!(second, first);
     assert!(
         worker
             .resolved_native_function(&unit, function, &options, std::slice::from_ref(&published),)
@@ -295,19 +456,19 @@ fn baseline_publication_replaces_a_stale_external_signature_variant() {
     assert_eq!(
         deployment.generic_function_entries[function.index()]
             .load(std::sync::atomic::Ordering::Acquire),
-        second
+        first
     );
     assert_eq!(
         deployment.preferred_function_entries[function.index()]
             .load(std::sync::atomic::Ordering::Acquire),
-        second,
-        "a preferred optimizer for the stale ABI must be invalidated"
+        usize::MAX,
+        "mutable link state must not invalidate a preferred specialization"
     );
 }
 
 #[test]
 #[cfg(target_arch = "x86_64")]
-fn worker_reuses_pre_and_post_declaration_native_abi_variants() {
+fn worker_uses_one_generic_body_before_and_after_declaration() {
     let worker = VmWorkerState::new(crate::tiering::TieringOptions::default());
     let unit = external_call_unit();
     let function = unit.unit().entry;
@@ -347,8 +508,8 @@ fn worker_reuses_pre_and_post_declaration_native_abi_variants() {
         .resolve_native_function(&unit, function, &options, &[published])
         .expect("post-declaration native ABI");
     let after_both = worker.native_compile_cache_stats();
-    assert_eq!(after_both.entries, 2);
-    assert_eq!(after_both.misses, 2);
+    assert_eq!(after_both.entries, 1);
+    assert_eq!(after_both.misses, 1);
 
     let resolved_hits = worker.resolved_native_entry_hits();
     worker
@@ -387,6 +548,39 @@ fn prewarm_resolves_and_publishes_the_optimizing_entry_without_execution() {
         preferred, baseline,
         "prewarm must leave the optimizing entry preferred"
     );
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn prewarm_publishes_the_complete_function_working_set() {
+    let unit = direct_call_unit();
+    let function_count = u64::try_from(unit.unit().functions.len()).expect("function count");
+    assert!(function_count > 1);
+    let options = VmOptions {
+        native_optimization: NativeOptimizationPolicy::Optimizing,
+        native_cache: php_jit::NativeCacheMode::Off,
+        ..VmOptions::default()
+    };
+    let worker = VmWorkerState::new(crate::tiering::TieringOptions::default());
+    let vm = Vm::with_options_and_worker_state(options, worker.clone());
+
+    assert_eq!(vm.prewarm_cranelift(&unit), function_count);
+    let deployment = unit.prepared_deployment_image();
+    assert!(
+        deployment
+            .generic_function_entries
+            .iter()
+            .all(|entry| entry.load(std::sync::atomic::Ordering::Acquire) != 0)
+    );
+    assert!(
+        deployment
+            .preferred_function_entries
+            .iter()
+            .all(|entry| entry.load(std::sync::atomic::Ordering::Acquire) != 0)
+    );
+    let before = worker.native_compile_cache_stats();
+    assert_eq!(vm.prewarm_cranelift(&unit), function_count);
+    assert_eq!(worker.native_compile_cache_stats().misses, before.misses);
 }
 
 #[test]
